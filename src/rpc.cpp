@@ -1,0 +1,437 @@
+#include "rpc.h"
+#include "sha256.h"
+#include "constants.h"
+#include "util.h"
+#include "hex.h"
+#include "serialize.h"
+#include "tx.h"
+#include "log.h"
+#include "crypto/ecdsa_iface.h"
+#include "miner.h"
+#include "base58check.h"
+#include "hash160.h"
+#include "utxo.h"          // <-- fix: use UTXOEntry & list_for_pkh
+
+#include <sstream>
+#include <map>
+#include <exception>
+#include <chrono>
+#include <algorithm>
+#include <tuple>
+#include <cmath>
+#include <cctype>   // for std::isxdigit
+
+// Policy defaults (safe fallbacks if missing from constants.h)
+#ifndef MIN_RELAY_FEE_RATE
+// sat/KB (miqron per kilobyte)
+static constexpr uint64_t MIN_RELAY_FEE_RATE = 1000;
+#endif
+#ifndef DUST_THRESHOLD
+static constexpr uint64_t DUST_THRESHOLD = 1000; // 0.00001000 MIQ
+#endif
+
+namespace miq {
+
+static std::string err(const std::string& m){
+    miq::JNode n;
+    std::map<std::string,miq::JNode> o;
+    miq::JNode e; e.v = std::string(m);
+    o["error"] = e;
+    n.v = o;
+    return json_dump(n);
+}
+
+static bool is_hex(const std::string& s){
+    if(s.empty()) return false;
+    return std::all_of(s.begin(), s.end(), [](unsigned char c){ return std::isxdigit(c)!=0; });
+}
+
+static uint64_t parse_amount_str(const std::string& s){
+    // Accept "1.23" (MIQ) or "123456" (miqron)
+    if(s.find('.')!=std::string::npos){
+        long double v = std::stold(s);
+        long double sat = v * (long double)COIN;
+        if(sat < 0) throw std::runtime_error("negative");
+        return (uint64_t) std::llround(sat);
+    } else {
+        unsigned long long x = std::stoull(s);
+        return (uint64_t)x;
+    }
+}
+
+static size_t estimate_size_bytes(size_t nin, size_t nout){
+    // Conservative: ~148/vin + ~34/vout + 10
+    return nin*148 + nout*34 + 10;
+}
+
+static uint64_t min_fee_for_size(size_t sz_bytes){
+    const uint64_t rate = MIN_RELAY_FEE_RATE; // sat/kB
+    uint64_t kb = (uint64_t)((sz_bytes + 999) / 1000);
+    if(kb==0) kb=1;
+    return kb * rate;
+}
+
+void RpcService::start(uint16_t port){
+    http_.start(port, [this](const std::string& b){
+        try { return this->handle(b); }
+        catch(const std::exception& ex){ log_error(std::string("rpc exception: ")+ex.what()); return err("internal error"); }
+        catch(...){ log_error("rpc exception: unknown"); return err("internal error"); }
+    });
+}
+
+void RpcService::stop(){ http_.stop(); }
+
+std::string RpcService::handle(const std::string& body){
+    try {
+        JNode req; 
+        if(!json_parse(body, req)) return err("bad json");
+        if(!std::holds_alternative<std::map<std::string,JNode>>(req.v)) return err("bad json obj");
+        auto& obj = std::get<std::map<std::string,JNode>>(req.v);
+
+        auto it = obj.find("method");
+        if(it==obj.end() || !std::holds_alternative<std::string>(it->second.v)) return err("missing method");
+        std::string method = std::get<std::string>(it->second.v);
+
+        std::vector<JNode> params;
+        auto ip = obj.find("params");
+        if(ip!=obj.end() && std::holds_alternative<std::vector<JNode>>(ip->second.v))
+            params = std::get<std::vector<JNode>>(ip->second.v);
+
+        if(method=="getnetworkinfo"){
+            std::map<std::string,JNode> o;
+            JNode n;  n.v = std::string(CHAIN_NAME);                 o["chain"] = n;
+            JNode b;  b.v = (double)RPC_PORT;                        o["rpcport"] = b;
+            JNode be; be.v = std::string(crypto::ECDSA::backend());  o["crypto_backend"] = be;
+            JNode r;  r.v = o; return json_dump(r);
+        }
+
+        if(method=="getblockchaininfo"){
+            JNode n; std::map<std::string,JNode> o;
+            JNode a; a.v = std::string(CHAIN_NAME);              o["chain"] = a;
+            JNode h; h.v = (double)chain_.tip().height;          o["height"] = h;
+            JNode r; r.v = o; return json_dump(r);
+        }
+
+        if(method=="getblockcount"){
+            JNode n; n.v = (double)chain_.tip().height;
+            return json_dump(n);
+        }
+
+        if(method=="getbestblockhash"){
+            JNode n; n.v = std::string(to_hex(chain_.tip().hash));
+            return json_dump(n);
+        }
+
+        if(method=="getblockhash"){
+            if(params.size()<1 || !std::holds_alternative<double>(params[0].v))
+                return err("need height");
+            size_t idx = (size_t)std::get<double>(params[0].v);
+            Block b; if(!chain_.get_block_by_index(idx, b)) return err("not found");
+            JNode n; n.v = std::string(to_hex(b.block_hash()));
+            return json_dump(n);
+        }
+
+        // UPDATED: accept HEIGHT (number) or HASH (hex string)
+        // Return JSON object { hash, time, txs, hex } with FULL block hex (header + txs)
+        if(method=="getblock"){
+            if(params.size()<1) return err("need index_or_hash");
+
+            Block b;
+            bool ok = false;
+
+            // Case A: height (number)
+            if(std::holds_alternative<double>(params[0].v)){
+                size_t idx = (size_t)std::get<double>(params[0].v);
+                ok = chain_.get_block_by_index(idx, b);
+            }
+            // Case B: hash (hex string)
+            else if(std::holds_alternative<std::string>(params[0].v)){
+                const std::string hstr = std::get<std::string>(params[0].v);
+                if(!is_hex(hstr)) return err("bad hash hex");
+                std::vector<uint8_t> want;
+                try { want = from_hex(hstr); } catch(...) { return err("bad hash hex"); }
+
+                // If Chain doesn't expose get_block_by_hash, scan heights (small chain OK).
+                auto tip = chain_.tip();
+                for(size_t i=0;i<= (size_t)tip.height;i++){
+                    Block tb;
+                    if(chain_.get_block_by_index(i, tb)){
+                        if(tb.block_hash() == want){ b = tb; ok = true; break; }
+                    }
+                }
+            } else {
+                return err("bad arg");
+            }
+
+            if(!ok) return err("not found");
+
+            std::map<std::string,JNode> o;
+            JNode h;   h.v  = std::string(to_hex(b.block_hash())); o["hash"] = h;
+            JNode t;   t.v  = (double)b.header.time;               o["time"] = t;
+            JNode nt;  nt.v = (double)b.txs.size();                o["txs"]  = nt;
+            JNode raw; raw.v = std::string(to_hex(ser_block(b)));  o["hex"]  = raw;
+
+            JNode out; out.v = o; return json_dump(out);
+        }
+
+        // Helper: who does coinbase vout0 pay? Accepts height (number) or hash (hex string).
+        // Returns {"value": <miqron>, "pkh": "<20-byte hex>"}.
+        if(method=="getcoinbaserecipient"){
+            if(params.size()<1) return err("need index_or_hash");
+
+            Block b;
+            bool ok = false;
+
+            if(std::holds_alternative<double>(params[0].v)){
+                size_t idx = (size_t)std::get<double>(params[0].v);
+                ok = chain_.get_block_by_index(idx, b);
+            } else if(std::holds_alternative<std::string>(params[0].v)){
+                const std::string hstr = std::get<std::string>(params[0].v);
+                if(!is_hex(hstr)) return err("bad hash hex");
+                std::vector<uint8_t> want;
+                try { want = from_hex(hstr); } catch(...) { return err("bad hash hex"); }
+
+                auto tip = chain_.tip();
+                for(size_t i=0;i<= (size_t)tip.height;i++){
+                    Block tb;
+                    if(chain_.get_block_by_index(i, tb)){
+                        if(tb.block_hash() == want){ b = tb; ok = true; break; }
+                    }
+                }
+            } else {
+                return err("bad arg");
+            }
+
+            if(!ok) return err("not found");
+            if(b.txs.empty()) return err("no transactions in block");
+            const auto& cb = b.txs[0];
+            if(cb.vout.empty()) return err("coinbase has no outputs");
+            const auto& o0 = cb.vout[0];
+
+            std::map<std::string,JNode> o;
+            JNode val; val.v = (double)o0.value;      o["value"] = val;   // in miqron
+            JNode pk ; pk.v  = std::string(to_hex(o0.pkh)); o["pkh"] = pk;
+
+            JNode out; out.v = o; return json_dump(out);
+        }
+
+        if(method=="gettipinfo"){
+            auto tip = chain_.tip();
+            std::map<std::string,JNode> o;
+            JNode h;  h.v  = (double)tip.height;               o["height"] = h;
+            JNode b;  b.v  = (double)tip.bits;                 o["bits"]   = b;
+            JNode t;  t.v  = (double)tip.time;                 o["time"]   = t;
+            JNode hh; hh.v = std::string(to_hex(tip.hash));    o["hash"]   = hh;
+            JNode out; out.v = o; return json_dump(out);
+        }
+
+        if(method=="decodeaddress"){
+            if(params.size()<1 || !std::holds_alternative<std::string>(params[0].v))
+                return err("need address");
+            uint8_t ver=0; std::vector<uint8_t> payload;
+            if(!base58check_decode(std::get<std::string>(params[0].v), ver, payload))
+                return err("bad address");
+            std::map<std::string,JNode> o;
+            JNode v; v.v = (double)ver;               o["version"]     = v;
+            JNode p; p.v = (double)payload.size();    o["payload_size"]= p;
+            JNode out; out.v = o; return json_dump(out);
+        }
+
+        if(method=="getrawmempool"){
+            auto ids = mempool_.txids();
+            JNode arr; std::vector<JNode> v;
+            for(auto& id: ids){ JNode s; s.v = std::string(to_hex(id)); v.push_back(s); }
+            arr.v = v; return json_dump(arr);
+        }
+
+        if(method=="gettxout"){
+            if(params.size()<2) return err("need txid & vout");
+            if(!std::holds_alternative<std::string>(params[0].v)) return err("need txid");
+            if(!std::holds_alternative<double>(params[1].v))      return err("need vout");
+
+            const std::string txidhex = std::get<std::string>(params[0].v);
+            uint32_t vout = (uint32_t)std::get<double>(params[1].v);
+
+            std::vector<uint8_t> txid;
+            try { txid = from_hex(txidhex); }
+            catch(...) { return err("bad txid"); }
+
+            UTXOEntry e;
+            if(chain_.utxo().get(txid, vout, e)){
+                std::map<std::string,JNode> o;
+                JNode val; val.v = (double)e.value;  o["value"]    = val;
+                JNode cb;  cb.v  = e.coinbase;       o["coinbase"] = cb;
+                JNode n;   n.v   = o; return json_dump(n);
+            } else {
+                return "null";
+            }
+        }
+
+        if(method=="sendrawtransaction"){
+            if(params.size()<1 || !std::holds_alternative<std::string>(params[0].v))
+                return err("need txhex");
+            const std::string h = std::get<std::string>(params[0].v);
+
+            std::vector<uint8_t> raw;
+            try { raw = from_hex(h); }
+            catch(...) { return err("bad txhex"); }
+
+            Transaction tx;
+            if(!deser_tx(raw, tx)) return err("bad tx");
+
+            auto tip = chain_.tip(); std::string e;
+            if(mempool_.accept(tx, chain_.utxo(), tip.height, e)){
+                JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
+            } else {
+                return err(e);
+            }
+        }
+
+        // Miner stats (safe)
+        if(method=="getminerstats"){
+            using clock = std::chrono::steady_clock;
+            static clock::time_point prev = clock::now();
+
+            const uint64_t hashes = miner_hashes_snapshot_and_reset();
+            const auto now = clock::now();
+            double secs = std::chrono::duration<double>(now - prev).count();
+            if (secs <= 0) secs = 1e-9;
+            prev = now;
+
+            const double hps = double(hashes) / secs;
+            const uint64_t total = miner_hashes_total();
+
+            std::map<std::string,JNode> o;
+            JNode jh; jh.v = (double)hashes;         o["hashes"]  = jh;
+            JNode js; js.v = secs;                   o["seconds"] = js;
+            JNode jj; jj.v = hps;                    o["hps"]     = jj;
+            JNode jt; jt.v = (double)total;          o["total"]   = jt;
+
+            JNode out; out.v = o; return json_dump(out);
+        }
+
+        // sendtoaddress(priv_hex, to_address, amount) with auto-fee + change
+        if(method=="sendtoaddress"){
+            if(params.size()<3
+               || !std::holds_alternative<std::string>(params[0].v)
+               || !std::holds_alternative<std::string>(params[1].v)
+               || !std::holds_alternative<std::string>(params[2].v)) {
+                return err("need priv_hex, to_address, amount");
+            }
+
+            const std::string privh  = std::get<std::string>(params[0].v);
+            const std::string toaddr = std::get<std::string>(params[1].v);
+            const std::string amtstr = std::get<std::string>(params[2].v);
+
+            std::vector<uint8_t> priv;
+            try { priv = from_hex(privh); } catch(...) { return err("bad priv_hex"); }
+            std::vector<uint8_t> pub33;
+            if(!crypto::ECDSA::derive_pub(priv, pub33) || pub33.size()!=33) return err("derive_pub failed");
+            const auto my_pkh = hash160(pub33);
+
+            uint8_t ver=0; std::vector<uint8_t> to_payload;
+            if(!base58check_decode(toaddr, ver, to_payload) || to_payload.size()!=20 || ver!=VERSION_P2PKH)
+                return err("bad to_address");
+
+            uint64_t amount = 0;
+            try { amount = parse_amount_str(amtstr); }
+            catch(...) { return err("bad amount"); }
+
+            // Gather UTXOs
+            auto utxos = chain_.utxo().list_for_pkh(my_pkh);
+            if(utxos.empty()) return err("no funds");
+
+            // Smallest-first to reduce change
+            std::sort(utxos.begin(), utxos.end(),
+                      [](const auto& A, const auto& B){
+                          return std::get<2>(A).value < std::get<2>(B).value;
+                      });
+
+            Transaction tx;
+            uint64_t in_sum = 0;
+
+            for(const auto& itU : utxos){
+                const auto& txid = std::get<0>(itU);
+                uint32_t vout = std::get<1>(itU);
+                const auto& e  = std::get<2>(itU);
+
+                TxIn in; in.prev.txid = txid; in.prev.vout = vout;
+                tx.vin.push_back(in);
+                in_sum += e.value;
+
+                uint64_t change_if_two = (in_sum > amount) ? (in_sum - amount) : 0;
+                size_t nout_guess = (change_if_two > 0) ? 2 : 1;
+                size_t est_size = estimate_size_bytes(tx.vin.size(), nout_guess);
+                uint64_t fee = min_fee_for_size(est_size);
+
+                if(in_sum >= amount + fee){
+                    break;
+                }
+            }
+
+            if(tx.vin.empty()) return err("insufficient funds");
+
+            // Build outputs + fee
+            TxOut out; out.pkh = to_payload;
+
+            uint64_t fee_final = 0, change = 0;
+            {
+                size_t est_size = estimate_size_bytes(tx.vin.size(), 2);
+                fee_final = min_fee_for_size(est_size);
+                if(in_sum < amount + fee_final){
+                    est_size = estimate_size_bytes(tx.vin.size(), 1);
+                    fee_final = min_fee_for_size(est_size);
+                    if(in_sum < amount + fee_final) return err("insufficient funds (need amount+fee)");
+                    change = 0;
+                } else {
+                    change = in_sum - amount - fee_final;
+                    if(change < DUST_THRESHOLD){
+                        change = 0;
+                        size_t est2 = estimate_size_bytes(tx.vin.size(), 1);
+                        fee_final = min_fee_for_size(est2);
+                        if(in_sum < amount + fee_final) return err("insufficient after dust fold");
+                    }
+                }
+            }
+
+            out.value = amount;
+            tx.vout.push_back(out);
+
+            if(change > 0){
+                TxOut ch; ch.value = change; ch.pkh = my_pkh;
+                tx.vout.push_back(ch);
+            }
+
+            // Sign all inputs (single-key case)
+            auto sighash = [&](){
+                Transaction t=tx; for(auto& i: t.vin){ i.sig.clear(); i.pubkey.clear(); }
+                return dsha256(ser_tx(t));
+            }();
+            for(auto& in : tx.vin){
+                std::vector<uint8_t> sig64;
+                if(!crypto::ECDSA::sign(priv, sighash, sig64)) return err("sign failed");
+                in.sig = sig64;
+                in.pubkey = pub33;
+            }
+
+            // Mempool accept
+            auto tip = chain_.tip(); std::string e;
+            if(mempool_.accept(tx, chain_.utxo(), tip.height, e)){
+                JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
+            } else {
+                return err(e);
+            }
+        }
+
+        return err("unknown method");
+    } catch(const std::exception& ex){
+        log_error(std::string("rpc handle exception: ")+ex.what());
+        return err("internal error");
+    } catch(...){
+        log_error("rpc handle exception: unknown");
+        return err("internal error");
+    }
+}
+
+} // namespace miq
+

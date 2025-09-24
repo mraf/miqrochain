@@ -1,0 +1,32 @@
+diff --git a/src/chain.cpp b/src/chain.cpp
+--- a/src/chain.cpp
++++ b/src/chain.cpp
+@@ -8,7 +8,12 @@
+ #include "crypto/ecdsa_iface.h"
+ #include <sstream>
+ namespace miq {
+-bool Chain::open(const std::string& dir){ return storage_.open(dir) && utxo_.open(dir) && load_state(); }
++bool Chain::open(const std::string& dir){
++    bool ok = storage_.open(dir) && utxo_.open(dir);
++    if(!ok) return false;
++    (void)load_state();
++    return true;
++}
+ bool Chain::save_state(){ std::vector<uint8_t> b; auto P64=[&](uint64_t x){ for(int i=0;i<8;i++) b.push_back((x>>(i*8))&0xff); }; auto P32=[&](uint32_t x){ for(int i=0;i<4;i++) b.push_back((x>>(i*8))&0xff); }; b.insert(b.end(), tip_.hash.begin(), tip_.hash.end()); P64(tip_.height); P64((uint64_t)tip_.time); P32(tip_.bits); P64(tip_.issued); return storage_.write_state(b); }
+ bool Chain::load_state(){ std::vector<uint8_t> b; if(!storage_.read_state(b)) return true; if(b.size()<32+8+8+4+8) return false; size_t i=0; tip_.hash.assign(b.begin()+i,b.begin()+i+32); i+=32; tip_.height=0; for(int k=0;k<8;k++) tip_.height|=((uint64_t)b[i+k])<<(k*8); i+=8; tip_.time=0; for(int k=0;k<8;k++) tip_.time|=((uint64_t)b[i+k])<<(k*8); i+=8; tip_.bits=b[i]|(b[i+1]<<8)|(b[i+2]<<16)|(b[i+3]<<24); i+=4; tip_.issued=0; for(int k=0;k<8;k++) tip_.issued|=((uint64_t)b[i+k])<<(k*8); i+=8; return true; }
+ uint64_t Chain::subsidy_for_height(uint64_t h) const { uint64_t halv=h/ HALVING_INTERVAL; if(halv>=64) return 0; return INITIAL_SUBSIDY>>halv; }
+
+diff --git a/src/constants.h b/src/constants.h
+--- a/src/constants.h
++++ b/src/constants.h
+@@ -10,8 +10,8 @@
+ 
+ static constexpr uint64_t COIN = 100000000ULL;
+ static constexpr uint64_t BLOCK_TIME_SECS = 480; // 8 minutes
+-static constexpr uint16_t P2P_PORT = 49333;
+-static constexpr uint16_t RPC_PORT = 49443;
++static constexpr uint16_t P2P_PORT = 9833;
++static constexpr uint16_t RPC_PORT = 9834;
+ static constexpr uint32_t MAGIC = 0xA3FB9E21;
+ 
+ static constexpr uint64_t MAX_MONEY = 28260000ULL * COIN;

@@ -1,0 +1,49 @@
+# --- CMake / Build ---
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+*.ninja
+.ninja_log
+.ninja_deps
+
+# --- Visual Studio ---
+.vs/
+*.sln
+*.vcxproj*
+*.vcproj*
+*.user
+*.filters
+*.opendb
+*.VC.db
+
+# --- VS Code ---
+.vscode/
+
+# --- Binary outputs ---
+Debug/
+Release/
+x64/
+x86/
+*.obj
+*.o
+*.pdb
+*.ipdb
+*.iobj
+*.ilk
+*.lib
+*.exp
+*.dll
+*.exe
+*.log
+*.tlog
+
+# --- Local config / runtime data (don?t version these) ---
+miqro.conf
+miqdata/
+**/bans.txt
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db

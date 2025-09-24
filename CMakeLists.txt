@@ -1,0 +1,137 @@
+cmake_minimum_required(VERSION 3.16)
+
+# Enable C (for uECC.c) and C++
+project(miqrochain_core C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Options
+option(MIQ_BUILD_TESTS "Build tests" OFF)
+option(MIQ_FETCH_MICROECC "Fetch micro-ecc from GitHub if not vendored" ON)
+set(MIQ_VENDOR_MICROECC_DIR "${CMAKE_SOURCE_DIR}/third_party/micro-ecc" CACHE PATH "Path to vendored micro-ecc")
+
+# Warnings / MSVC settings
+if(MSVC)
+  add_compile_options(/O2 /Ot /Oi /GL /GF /Gy /Zc:inline)
+  add_link_options(/LTCG)
+  add_compile_options(/W4 /permissive- /Zc:__cplusplus)
+  add_definitions(/D_CRT_SECURE_NO_WARNINGS)
+else()
+  add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
+endif()
+
+# -----------------------
+# micro-ecc source setup
+# -----------------------
+set(MICRO_ECC_DIR "")
+if(EXISTS "${MIQ_VENDOR_MICROECC_DIR}/uECC.c")
+  set(MICRO_ECC_DIR "${MIQ_VENDOR_MICROECC_DIR}")
+elseif(MIQ_FETCH_MICROECC)
+  include(FetchContent)
+  FetchContent_Declare(
+    microecc
+    GIT_REPOSITORY https://github.com/kmackay/micro-ecc.git
+    GIT_TAG        master
+  )
+  # micro-ecc is a plain source repo, so just populate and use its path
+  FetchContent_Populate(microecc)
+  set(MICRO_ECC_DIR "${microecc_SOURCE_DIR}")
+else()
+  message(FATAL_ERROR "micro-ecc not found. Set MIQ_VENDOR_MICROECC_DIR or enable MIQ_FETCH_MICROECC.")
+endif()
+
+# -----------------------
+# Main daemon
+# -----------------------
+add_executable(miqrod
+    src/address.h src/address.cpp
+    src/wallet_store.h src/wallet_store.cpp
+    src/main.cpp
+    src/constants.h
+    src/config.h src/config.cpp
+    src/log.h src/log.cpp
+    src/util.h src/util.cpp
+    src/sha256.h src/sha256.cpp
+    src/hex.h src/hex.cpp
+    src/base58.h src/base58.cpp
+    src/base58check.h src/base58check.cpp
+    src/ripemd160.h src/ripemd160.cpp
+    src/hash160.h src/hash160.cpp
+    src/merkle.h src/merkle.cpp
+    src/serialize.h src/serialize.cpp
+    src/json.h src/json.cpp
+    src/tx.h src/tx.cpp
+    src/block.h src/block.cpp
+    src/difficulty.h src/difficulty.cpp
+    src/storage.h src/storage.cpp
+    src/utxo.h src/utxo.cpp
+    src/mempool.h src/mempool.cpp
+    src/hasher.h src/hasher.cpp
+    src/lut.h src/lut.cpp
+    src/blockindex.h src/blockindex.cpp
+    src/chain.h src/chain.cpp
+    src/miner.h src/miner.cpp
+    src/netmsg.h src/netmsg.cpp
+    src/p2p.h src/p2p.cpp
+    src/http.h src/http.cpp
+    src/rpc.h src/rpc.cpp
+
+    # Crypto interface
+    src/crypto/ecdsa_iface.h
+    src/crypto/ecdsa_uECC.h src/crypto/ecdsa_uECC.cpp
+    src/crypto/ecdsa_secp256k1.h
+    $<$<NOT:$<BOOL:${WIN32}>>:src/crypto/ecdsa_secp256k1.cpp>
+
+    # micro-ecc + shim (C sources)
+    ${MICRO_ECC_DIR}/uECC.c
+    src/crypto/uECC_shim.c
+)
+
+target_include_directories(miqrod PRIVATE
+    src
+    ${MICRO_ECC_DIR}
+)
+
+# micro-ecc config: enable compressed points
+target_compile_definitions(miqrod PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
+
+if(WIN32)
+  target_link_libraries(miqrod PRIVATE Ws2_32)
+endif()
+
+# -----------------------
+# Tests (optional)
+# -----------------------
+if(MIQ_BUILD_TESTS)
+  enable_testing()
+
+  add_executable(test_crypto tests/test_crypto.cpp
+      src/sha256.h src/sha256.cpp
+      src/ripemd160.h src/ripemd160.cpp
+      src/hash160.h src/hash160.cpp
+      src/base58check.h src/base58check.cpp
+      src/hex.h src/hex.cpp
+      ${MICRO_ECC_DIR}/uECC.c
+      src/crypto/uECC_shim.c
+  )
+  target_include_directories(test_crypto PRIVATE src ${MICRO_ECC_DIR})
+  target_compile_definitions(test_crypto PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
+  if(WIN32)
+    target_link_libraries(test_crypto PRIVATE Ws2_32)
+  endif()
+  add_test(NAME test_crypto COMMAND test_crypto)
+
+  add_executable(test_ser tests/test_ser.cpp
+      src/serialize.h src/serialize.cpp
+      src/tx.h src/tx.cpp
+      src/block.h src/block.cpp
+      src/sha256.h src/sha256.cpp
+  )
+  target_include_directories(test_ser PRIVATE src)
+  add_test(NAME test_ser COMMAND test_ser)
+
+  add_executable(fuzz_json tests/fuzz_json.cpp src/json.h src/json.cpp)
+  target_include_directories(fuzz_json PRIVATE src)
+  add_test(NAME fuzz_json COMMAND fuzz_json)
+endif()

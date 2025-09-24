@@ -1,0 +1,309 @@
+#include "chain.h"
+#include "sha256.h"
+#include "merkle.h"
+#include "hasher.h"
+#include "log.h"
+#include "hash160.h"
+#include "crypto/ecdsa_iface.h"
+#include "constants.h"     // BLOCK_TIME_SECS, GENESIS_BITS, etc.
+#include "difficulty.h"    // lwma_next_bits
+#include <sstream>
+
+// === Added includes for security checks ===
+#include <algorithm>       // std::any_of
+#include <chrono>          // future-time bound
+#include <cstring>         // std::memcmp
+
+namespace miq {
+
+// === Added: local constants (non-breaking) ===
+// We keep these here so this file builds even before we add them to constants.h.
+static constexpr size_t MAX_BLOCK_SIZE_LOCAL = 1 * 1024 * 1024; // 1 MiB
+
+// === Added: compact bits -> 32-byte big-endian target, and hash <= target check ===
+static inline void bits_to_target_be(uint32_t bits, uint8_t out[32]) {
+    std::memset(out, 0, 32);
+    uint32_t exp = bits >> 24;
+    uint32_t mant = bits & 0x007fffff;
+    if (mant == 0) { return; } // invalid -> zero target (will fail compare)
+
+    if (exp <= 3) {
+        // Right shift mantissa
+        uint32_t mant2 = mant >> (8 * (3 - exp));
+        out[29] = uint8_t((mant2 >> 16) & 0xff);
+        out[30] = uint8_t((mant2 >> 8)  & 0xff);
+        out[31] = uint8_t((mant2 >> 0)  & 0xff);
+    } else {
+        // Place mantissa at position (32 - exp)
+        int pos = int(32) - int(exp);
+        if (pos < 0) {
+            // Extremely large exponent -> target overflows 256 bits -> treat as max target
+            out[0] = 0xff; out[1] = 0xff; out[2] = 0xff; // effectively "always true"
+            return;
+        }
+        out[pos + 0] = uint8_t((mant >> 16) & 0xff);
+        out[pos + 1] = uint8_t((mant >> 8)  & 0xff);
+        out[pos + 2] = uint8_t((mant >> 0)  & 0xff);
+    }
+}
+
+static inline bool meets_target_be(const std::vector<uint8_t>& hash32, uint32_t bits) {
+    if (hash32.size() != 32) return false;
+    uint8_t target[32];
+    bits_to_target_be(bits, target);
+    // Interpret both as big-endian 256-bit integers: hash <= target
+    return std::memcmp(hash32.data(), target, 32) <= 0;
+}
+
+// =====================================================================
+
+bool Chain::open(const std::string& dir){
+    bool ok = storage_.open(dir) && utxo_.open(dir);
+    if(!ok) return false;
+    (void)load_state();
+    return true;
+}
+
+bool Chain::save_state(){
+    std::vector<uint8_t> b;
+    auto P64=[&](uint64_t x){ for(int i=0;i<8;i++) b.push_back((x>>(i*8))&0xff); };
+    auto P32=[&](uint32_t x){ for(int i=0;i<4;i++) b.push_back((x>>(i*8))&0xff); };
+
+    b.insert(b.end(), tip_.hash.begin(), tip_.hash.end());
+    P64(tip_.height);
+    P64((uint64_t)tip_.time);
+    P32(tip_.bits);
+    P64(tip_.issued);
+
+    return storage_.write_state(b);
+}
+
+bool Chain::load_state(){
+    std::vector<uint8_t> b;
+
+    if(!storage_.read_state(b)){
+        tip_.hash = std::vector<uint8_t>(32, 0);
+        tip_.height = 0;
+        tip_.time = 0;
+        tip_.bits = 0;
+        tip_.issued = 0;
+        return true;
+    }
+
+    if(b.size() < 32 + 8 + 8 + 4 + 8){
+        tip_.hash = std::vector<uint8_t>(32, 0);
+        tip_.height = 0;
+        tip_.time = 0;
+        tip_.bits = 0;
+        tip_.issued = 0;
+        return true;
+    }
+
+    size_t i = 0;
+    tip_.hash.assign(b.begin() + i, b.begin() + i + 32); i += 32;
+
+    tip_.height = 0;
+    for(int k=0;k<8;k++) tip_.height |= ((uint64_t)b[i+k]) << (k*8); i += 8;
+
+    tip_.time = 0;
+    for(int k=0;k<8;k++) tip_.time |= ((uint64_t)b[i+k]) << (k*8); i += 8;
+
+    tip_.bits = b[i] | (b[i+1] << 8) | (b[i+2] << 16) | (b[i+3] << 24); i += 4;
+
+    tip_.issued = 0;
+    for(int k=0;k<8;k++) tip_.issued |= ((uint64_t)b[i+k]) << (k*8); i += 8;
+
+    return true;
+}
+
+uint64_t Chain::subsidy_for_height(uint64_t h) const {
+    uint64_t halv = h / HALVING_INTERVAL;
+    if(halv >= 64) return 0;
+    return INITIAL_SUBSIDY >> halv;
+}
+
+bool Chain::init_genesis(const Block& g){
+    if(tip_.hash != std::vector<uint8_t>(32,0)) return true;
+
+    std::vector<std::vector<uint8_t>> txids;
+    for(const auto& tx : g.txs) txids.push_back(tx.txid());
+    auto mr = merkle_root(txids);
+    if(mr != g.header.merkle_root) return false;
+
+    storage_.append_block(ser_block(g), g.block_hash());
+
+    const auto& cb = g.txs[0];
+    for(size_t i=0;i<cb.vout.size();++i){
+        UTXOEntry e{cb.vout[i].value, cb.vout[i].pkh, 0, true};
+        utxo_.add(cb.txid(), (uint32_t)i, e);
+    }
+
+    tip_ = Tip{0, g.block_hash(), g.header.bits, g.header.time, cb.vout[0].value};
+    index_.reset(tip_.hash, tip_.time, tip_.bits);
+    save_state();
+    return true;
+}
+
+bool Chain::verify_block(const Block& b, std::string& err) const{
+    // Prev-hash must point to current tip
+    if(b.header.prev_hash != tip_.hash){ err="bad prev hash"; return false; }
+
+    // Time must not go backwards
+    if(b.header.time < tip_.time){ err="time went backwards"; return false; }
+
+    // === Added: future time bound ===
+    {
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        // Use MAX_TIME_SKEW if available from constants.h; otherwise 2h is typical.
+        const int64_t ALLOWED_SKEW = MAX_TIME_SKEW; // constants.h already has this in your repo
+        if (b.header.time > now + ALLOWED_SKEW) { err="time too far in future"; return false; }
+    }
+
+    // Merkle must match actual txids
+    std::vector<std::vector<uint8_t>> txids;
+    for(const auto& tx : b.txs) txids.push_back(tx.txid());
+    auto mr = merkle_root(txids);
+    if(mr != b.header.merkle_root){ err="bad merkle"; return false; }
+
+    // Coinbase must exist and be canonical
+    if(b.txs.empty()){ err="no coinbase"; return false; }
+    const auto& cb = b.txs[0];
+
+    // === Stricter coinbase checks (added, non-breaking) ===
+    if (cb.vin.size()!=1 || !cb.vin[0].sig.empty() || !cb.vin[0].pubkey.empty()) {
+        err = "bad coinbase"; return false;
+    }
+    if (cb.vin[0].prev.txid.size()!=32) { err="bad coinbase prev size"; return false; }
+    if (std::any_of(cb.vin[0].prev.txid.begin(), cb.vin[0].prev.txid.end(),
+                    [](uint8_t v){ return v!=0; })) {
+        err="bad coinbase prev"; return false;
+    }
+    if (cb.vin[0].prev.vout != 0) { err="bad coinbase vout"; return false; }
+
+    // ----- Enforce expected difficulty (LWMA with early fallback) -----
+    {
+        auto last = last_headers(90); // previous headers including tip
+        uint32_t expected;
+        if (last.size() < 2) {
+            // Not enough history yet → reuse previous bits (or genesis at height 0)
+            expected = last.empty() ? GENESIS_BITS : last.back().second;
+        } else {
+            expected = lwma_next_bits(last, BLOCK_TIME_SECS, GENESIS_BITS);
+        }
+        if (b.header.bits != expected) { err = "bad bits"; return false; }
+    }
+
+    // === Added: enforce PoW target H(header) <= target(bits) ===
+    if (!meets_target_be(b.block_hash(), b.header.bits)) {
+        err = "bad pow"; return false;
+    }
+
+    // === Added: block size cap to prevent gigantic blocks (DoS) ===
+    {
+        const auto raw = ser_block(b);
+        if (raw.size() > MAX_BLOCK_SIZE_LOCAL) {
+            err = "oversize block"; return false;
+        }
+    }
+
+    // Signature checks & fees (existing)
+    auto sigh=[&](const Transaction& t){
+        Transaction tmp=t; for(auto& i: tmp.vin) i.sig.clear();
+        return dsha256(ser_tx(tmp));
+    };
+
+    uint64_t fees = 0;
+    for(size_t ti=1; ti<b.txs.size(); ++ti){
+        const auto& tx=b.txs[ti];
+        uint64_t in=0, out=0;
+        auto hash = sigh(tx);
+
+        for(const auto& inx: tx.vin){
+            UTXOEntry e;
+            if(!utxo_.get(inx.prev.txid, inx.prev.vout, e)){ err="missing utxo"; return false; }
+            if(e.coinbase && tip_.height+1 < e.height + COINBASE_MATURITY){ err="immature coinbase"; return false; }
+            if(hash160(inx.pubkey)!=e.pkh){ err="pkh mismatch"; return false; }
+            if(!crypto::ECDSA::verify(inx.pubkey, hash, inx.sig)){ err="bad signature"; return false; }
+            in += e.value;
+        }
+
+        for(const auto& o: tx.vout) out += o.value;
+        if(out > in){ err="outputs>inputs"; return false; }
+        fees += (in - out);
+    }
+
+    uint64_t sub = subsidy_for_height(tip_.height+1);
+    uint64_t cb_sum = 0; for(const auto& o:cb.vout) cb_sum += o.value;
+
+    if(cb_sum > sub + fees){ err="coinbase too high"; return false; }
+    if(tip_.issued + cb_sum > MAX_MONEY){ err="exceeds cap"; return false; }
+    return true;
+}
+
+bool Chain::submit_block(const Block& b, std::string& err){
+    if(!verify_block(b, err)) return false;
+
+    storage_.append_block(ser_block(b), b.block_hash());
+
+    for(size_t ti=1; ti<b.txs.size(); ++ti){
+        const auto& tx=b.txs[ti];
+        for(const auto& in: tx.vin) utxo_.spend(in.prev.txid, in.prev.vout);
+        for(size_t i=0;i<tx.vout.size();++i){
+            UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, tip_.height+1, false};
+            utxo_.add(tx.txid(), (uint32_t)i, e);
+        }
+    }
+
+    const auto& cb=b.txs[0];
+    uint64_t cb_sum=0;
+    for(size_t i=0;i<cb.vout.size();++i){
+        UTXOEntry e{cb.vout[i].value, cb.vout[i].pkh, tip_.height+1, true};
+        utxo_.add(cb.txid(), (uint32_t)i, e);
+        cb_sum += cb.vout[i].value;
+    }
+
+    tip_.height += 1;
+    tip_.hash = b.block_hash();
+    tip_.bits = b.header.bits;
+    tip_.time = b.header.time;
+    tip_.issued += cb_sum;
+
+    save_state();
+    return true;
+}
+
+// Return the last n headers (time,bits) along the canonical chain via storage.
+std::vector<std::pair<int64_t,uint32_t>> Chain::last_headers(size_t n) const{
+    std::vector<std::pair<int64_t,uint32_t>> v;
+    if (tip_.time == 0) return v;
+
+    size_t start = 0;
+    if (tip_.height + 1 > n) start = (size_t)(tip_.height + 1 - n);
+
+    for (size_t idx = start; idx <= (size_t)tip_.height; ++idx) {
+        Block b;
+        if (!get_block_by_index(idx, b)) break;
+        v.emplace_back(b.header.time, b.header.bits);
+    }
+    return v;
+}
+
+bool Chain::get_block_by_index(size_t idx, Block& out) const{
+    std::vector<uint8_t> raw;
+    if(!storage_.read_block_by_index(idx, raw)) return false;
+    return deser_block(raw, out);
+}
+
+bool Chain::get_block_by_hash(const std::vector<uint8_t>& h, Block& out) const{
+    std::vector<uint8_t> raw;
+    if(!storage_.read_block_by_hash(h, raw)) return false;
+    return deser_block(raw, out);
+}
+
+bool Chain::have_block(const std::vector<uint8_t>& h) const{
+    std::vector<uint8_t> raw;
+    return storage_.read_block_by_hash(h, raw);
+}
+
+} // namespace miq
