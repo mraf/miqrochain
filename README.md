@@ -2,7 +2,7 @@
 # miqrochain C++ core v1.4 (ECDSA-P2PKH wiring, inv/getdata, bans, richer RPC)
 
 **Coin:** MIQ (unit: miqron, 1e-8)  
-**Hard cap:** 28,260,000 MIQ â€¢ **Block time:** 8 minutes  
+**Hard cap:** 28,260,000 MIQ • **Block time:** 8 minutes  
 **Ports:** P2P 9833, RPC 9834  
 **DNS seeder:** miqroseed1.dedyn.io
 
@@ -55,3 +55,4 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 This will compile against the **actual** upstream `uECC.c/uECC.h/uECC_vli.c/uECC_vli.h` (BSD-2). Your core remains under your license; keep upstream's BSD-2 notice for those files.
+
