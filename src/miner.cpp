@@ -1,12 +1,12 @@
 // src/miner.cpp — canonical binary-header miner + exact compact-target check
 // - Consensus preserved: PoW is dsha256(binary header ver|prev|merkle|time|bits|nonce)
 // - Nonce appended as LE uint64; all ints LE, hashes big-endian compare
-// - Keeps public API & stats; keeps includes (no external behavior removed)
+// - Keeps public API & stats; keeps includes
 
 #include "miner.h"
 #include "sha256.h"
 #include "merkle.h"
-#include "hasher.h"  // kept for compatibility; not used in the new path
+#include "hasher.h"  // used for accelerated double-SHA256 (salt disabled unless defined)
 #include "log.h"
 
 #include <thread>
@@ -85,6 +85,17 @@ static inline void put_u64_le(std::vector<uint8_t>& v, uint64_t x) {
     v.push_back(uint8_t((x >> 48) & 0xff));
     v.push_back(uint8_t((x >> 56) & 0xff));
 }
+// Overwrite an existing 8-byte slot with LE nonce (no reallocation)
+static inline void store_u64_le(uint8_t* p, uint64_t x) {
+    p[0] = (uint8_t)((x >> 0)  & 0xff);
+    p[1] = (uint8_t)((x >> 8)  & 0xff);
+    p[2] = (uint8_t)((x >> 16) & 0xff);
+    p[3] = (uint8_t)((x >> 24) & 0xff);
+    p[4] = (uint8_t)((x >> 32) & 0xff);
+    p[5] = (uint8_t)((x >> 40) & 0xff);
+    p[6] = (uint8_t)((x >> 48) & 0xff);
+    p[7] = (uint8_t)((x >> 56) & 0xff);
+}
 
 // Build the fixed header prefix (everything except nonce) once per block:
 //   uint32 ver | 32 prev_hash | 32 merkle_root | int64 time | uint32 bits
@@ -122,8 +133,9 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
 
     if(threads==0) threads = 1;
 
-    // === NEW: binary header prefix (everything except nonce)
+    // === Build binary header prefix once (everything except nonce)
     const std::vector<uint8_t> header_prefix = build_header_prefix(b.header);
+    const size_t nonce_off = header_prefix.size(); // LE nonce goes right after
 
     std::atomic<bool> found{false};
     std::atomic<uint64_t> best_nonce{0};
@@ -136,6 +148,11 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
             uint64_t local_hashes = 0;
             const uint64_t FLUSH_EVERY = 1ull<<15; // reduce atomic overhead
 
+            // Per-thread header buffer reused every hash (no allocations)
+            std::vector<uint8_t> hdr = header_prefix;
+            hdr.resize(header_prefix.size() + 8); // reserve LE nonce slot
+            uint8_t* nonce_ptr = hdr.data() + nonce_off;
+
             // start nonce per thread (unique-ish)
             uint64_t nonce = ((uint64_t)time(nullptr) << 32)
                            ^ (0x9e3779b97f4a7c15ull + (uint64_t)t*0x5851f42d4c957f2dull);
@@ -143,12 +160,12 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
             uint8_t h[32];
 
             while(!found.load(std::memory_order_relaxed)){
-                // Build full header = prefix + nonce(LE)
-                std::vector<uint8_t> hdr(header_prefix);
-                put_u64_le(hdr, nonce);
+                // Overwrite the 8-byte nonce in place (LE)
+                store_u64_le(nonce_ptr, nonce);
 
-                // Double-SHA256(header)
-                auto hv = dsha256(hdr);
+                // Double-SHA256(header) — accelerated path (falls back internally)
+                // NOTE: 'salted_header_hash' keeps PoW semantics unless MIQ_POW_SALT is defined.
+                auto hv = salted_header_hash(hdr);
                 std::memcpy(h, hv.data(), 32);
                 local_hashes++;
 
@@ -184,3 +201,4 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
 }
 
 } // namespace miq
+
