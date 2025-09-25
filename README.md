@@ -28,7 +28,7 @@ ctest --test-dir build --output-on-failure
 License: Apache-2.0. Clean-room: no Bitcoin Core code.
 
 
-## v1.6
+## v1.1
 - Switch ECDSA backend to **micro-ecc-compatible secp256k1** with RFC6979 (bundled).
 - You can drop-in upstream `uECC.c/uECC.h` (BSD-2) under `vendor/microecc/` to use the official micro-ecc.
 
