@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include <cstdint>
 #include <string>
 // ADDED for size_t
@@ -29,7 +29,16 @@ static constexpr uint32_t GENESIS_BITS = 0x1d00ffff;
 // Bundled genesis private key (secp256k1 32 bytes hex) for coinbase
 static constexpr const char* GENESIS_ECDSA_PRIV_HEX = "";
 
+// Kept for backward-compat: some code paths may still use this single seed
 static const std::string DNS_SEED = "185.162.238.19";
+
+// NEW: Multi-seed list (add-only). Your node can try these in order.
+static inline const char* const DNS_SEEDS[] = {
+    "s626853.name-servers.gr",
+    "miqseed1.duckdns.org",
+    "miqseed2.freeddns.org"
+};
+static constexpr size_t DNS_SEEDS_COUNT = sizeof(DNS_SEEDS) / sizeof(DNS_SEEDS[0]);
 
 // DoS/time
 static constexpr int64_t MAX_TIME_SKEW = 2*60*60; // 2 hours
@@ -47,4 +56,3 @@ static constexpr size_t MAX_MSG_SIZE   = 2 * 1024 * 1024; // 2 MiB
 // Optional: default RPC token (empty = no token unless MIQ_RPC_TOKEN env set)
 static constexpr const char* RPC_TOKEN_DEFAULT = "";
 } // namespace miq
-
