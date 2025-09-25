@@ -131,7 +131,12 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     freeaddrinfo(res);
 #endif
     char ipbuf[64] = {0};
-    sockaddr_in a{}; int alen = sizeof(a);
+    sockaddr_in a{};
+#ifdef _WIN32
+    int alen = (int)sizeof(a);
+#else
+    socklen_t alen = static_cast<socklen_t>(sizeof(a));
+#endif
     if (getpeername(s, (sockaddr*)&a, &alen) == 0) {
 #ifdef _WIN32
         InetNtopA(AF_INET, &a.sin_addr, ipbuf, (int)sizeof(ipbuf));
