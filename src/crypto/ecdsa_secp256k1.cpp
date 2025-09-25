@@ -197,17 +197,28 @@ bool Secp256k1::generate_priv(std::vector<uint8_t>& out32){
 }
 
 bool Secp256k1::derive_pub_uncompressed(const std::vector<uint8_t>& priv, std::vector<uint8_t>& out64){
-    if(priv.size()!=32) return false; U256 d=U256_from_be(priv.data()); if(U256_is_zero(d) || U256_cmp(d,N)>=0) return false;
-    Point Q = to_affine(mul(d, G())); uint8_t xb[32], yb[32]; U256_to_be(Q.X.n, xb); U256_to_be(Q.Y.n, yb);
+    if (priv.size() != 32) return false;
+    U256 d = U256_from_be(priv.data());
+    if (U256_is_zero(d) || U256_cmp(d, N) >= 0) return false;
+
+    Point Q = to_affine(mul(d, G()));
+    uint8_t xb[32], yb[32]; U256_to_be(Q.X.n, xb); U256_to_be(Q.Y.n, yb);
     out64.assign(xb, xb+32); out64.insert(out64.end(), yb, yb+32); return true;
 }
 
 bool Secp256k1::compress_pub(const std::vector<uint8_t>& pub64, std::vector<uint8_t>& out33){
-    if(pub64.size()!=64) return false; out33.resize(33); out33[0] = (pub64[63]&1)?0x03:0x02; std::copy(pub64.begin(), pub64.begin()+32, out33.begin()+1); return true;
+    if (pub64.size() != 64) return false;
+    out33.resize(33);
+    out33[0] = (pub64[63] & 1) ? 0x03 : 0x02;
+    std::copy(pub64.begin(), pub64.begin()+32, out33.begin()+1);
+    return true;
 }
 
 bool Secp256k1::decompress_pub(const std::vector<uint8_t>& in33, std::vector<uint8_t>& out64){
-    if(in33.size()!=33) return false; uint8_t prefix=in33[0]; if(prefix!=0x02 && prefix!=0x03) return false;
+    if (in33.size() != 33) return false;
+    uint8_t prefix = in33[0];
+    if (prefix != 0x02 && prefix != 0x03) return false;
+
     U256 X=U256_from_be(&in33[1]);
     Fp x = Fp_fromU(X); Fp rhs = Fp_add(Fp_mul(Fp_sqr(x), x), Fp_fromU(U256_from_be((const uint8_t*)"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x07")));
     // (p+1)/4
@@ -224,7 +235,11 @@ bool Secp256k1::decompress_pub(const std::vector<uint8_t>& in33, std::vector<uin
 }
 
 bool Secp256k1::sign_rfc6979(const std::vector<uint8_t>& priv, const std::vector<uint8_t>& msg32, std::vector<uint8_t>& sig64){
-    if(priv.size()!=32 || msg32.size()!=32) return false; U256 d=U256_from_be(priv.data()); if(U256_is_zero(d)||U256_cmp(d,N)>=0) return false; U256 z=U256_from_be(msg32.data());
+    if (priv.size()!=32 || msg32.size()!=32) return false;
+    U256 d = U256_from_be(priv.data());
+    if (U256_is_zero(d) || U256_cmp(d, N) >= 0) return false;
+    U256 z = U256_from_be(msg32.data());
+
     for(int tries=0; tries<32; ++tries){
         U256 k = rfc6979(d,z,N);
         Point R = to_affine(mul(k, G()));
