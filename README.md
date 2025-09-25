@@ -1,24 +1,10 @@
 ﻿
-# miqrochain C++ core v1.4 (ECDSA-P2PKH wiring, inv/getdata, bans, richer RPC)
+# miqrochain C++ core v1 (ECDSA-P2PKH wiring, inv/getdata, bans, richer RPC)
 
 **Coin:** MIQ (unit: miqron, 1e-8)  
 **Hard cap:** 26,280,000 MIQ • **Block time:** 8 minutes  
 **Ports:** P2P 9833, RPC 9834  
 **DNS seeder:** miqroseed1.dedyn.io
-
-Whats new in v1.4
-- **Switch to P2PKH locking** (addresses are Base58Check `version=0x35` + `HASH160(pubkey)`).
-- **ECDSA backend interface** bundled (drop-in slot for micro-ecc (BSD-2) or ed25519-donna (public domain)).
-  - `src/crypto/ecdsa_iface.h` defines the functions used by mempool/validation and CLI.
-  - `src/crypto/ecdsa_stub.*` compiles and runs but **rejects all signatures** by design.
-  - Replace the stub with a vetted ECC backend to enable spending P2PKH outputs.
-- **Mempool & block validation** updated to verify P2PKH signatures via the ECDSA interface.
-- **Richer RPC**: `getnetworkinfo`, `getblockchaininfo`, `getbestblockhash`, `getblockhash`, `getblock`, `getrawmempool`, `gettxout`, `sendrawtransaction`, `decodeaddress`.
-- **Networking**: `inv` / `getdata` / `block` relay for headers-first style block download, checksumed message framing, **persistent peer bans** (time-skew / misbehavior).
-- **Storage**: hashâ†’index map persisted for fast `getdata` service.
-- **CLI tools**:
-  - `--genaddress` (ECDSA-P2PKH) â†’ prints `priv_hex`, `pub_hex`, `address`.
-  - `--buildtx` to build & sign a P2PKH tx (works when a real ECC backend is plugged in).
 
 ### ECC backend: how to plug in (2 files)
 1. Remove `src/crypto/ecdsa_stub.*` from the target in `CMakeLists.txt` and add your backend files.
