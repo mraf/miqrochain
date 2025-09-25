@@ -6,6 +6,10 @@
 #include <cassert>
 #include <vector>
 
+#ifndef MIQ_SECP256K1_C_BRIDGE
+#define MIQ_SECP256K1_C_BRIDGE 0
+#endif
+
 #if defined(_MSC_VER)
 #include <intrin.h>
 static inline void mul128_u64(uint64_t a, uint64_t b, uint64_t* lo, uint64_t* hi){ *lo = _umul128(a,b,hi); }
@@ -254,6 +258,7 @@ std::string Secp256k1::name(){ return "secp256k1 (built-in, RFC6979)"; }
 }} // ns
 
 // -------- C bridge for vendor/microecc/uECC.c ---------
+#if MIQ_SECP256K1_C_BRIDGE
 extern "C" {
 int miq_secp_make_key(uint8_t *pub64, uint8_t *priv32){
     std::vector<uint8_t> priv; if(!miq::crypto::Secp256k1::generate_priv(priv)) return 0;
@@ -278,7 +283,7 @@ int miq_secp_decompress(const uint8_t *in33, uint8_t *out64){
     std::memcpy(out64, out.data(), 64); return 1;
 }
 int miq_secp_valid_pub(const uint8_t *pub64){
-    // simple check: decompress(compress(pub)) == pub
     uint8_t c[33]; if(!miq_secp_compress(pub64,c)) return 0; uint8_t u[64]; if(!miq_secp_decompress(c,u)) return 0; return std::memcmp(u,pub64,64)==0;
 }
 }
+#endif
