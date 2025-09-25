@@ -27,10 +27,14 @@ namespace miq {
 class Chain; // forward declaration
 
 struct PeerState {
-    int sock{-1};
+    int         sock{-1};
     std::string ip;
-    int mis{0};
-    int64_t last_ms{0};
+    int         mis{0};
+    int64_t     last_ms{0};
+
+    // ---- ADDED: lightweight sync state (non-breaking) ----
+    bool        syncing{false};     // are we currently syncing from this peer?
+    uint64_t    next_index{0};      // next block index (height) we will request
 };
 
 class P2P {
@@ -40,8 +44,15 @@ public:
 
     bool start(uint16_t port);
     void stop();
+
+    // Outbound connect to a seed (hostname or IP)
     bool connect_seed(const std::string& host, uint16_t port);
+
+    // Broadcast inventory for a new block hash we just accepted/mined
     void broadcast_inv_block(const std::vector<uint8_t>& block_hash);
+
+    // Optional: set where bans.txt is stored (kept private field)
+    inline void set_datadir(const std::string& d) { datadir_ = d; }
 
 private:
     Chain& chain_;
@@ -56,6 +67,12 @@ private:
     void handle_new_peer(int c, const std::string& ip);
     void load_bans();
     void save_bans();
+
+    // ---- ADDED: helpers for sync & block serving (definitions in p2p.cpp) ----
+    void start_sync_with_peer(PeerState& ps);
+    void request_block_index(PeerState& ps, uint64_t index);
+    void request_block_hash(PeerState& ps, const std::vector<uint8_t>& h);
+    void send_block(int s, const std::vector<uint8_t>& raw);
 };
 
 } // namespace miq
