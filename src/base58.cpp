@@ -1,5 +1,6 @@
 #include "base58.h"
 #include <cstring>  // for std::strchr
+#include <cstdint>  // for uint8_t
 
 static const char* ALPH = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
@@ -80,4 +81,3 @@ bool miq::base58_decode(const std::string& s, std::vector<uint8_t>& out) {
     }
     return true;
 }
-
