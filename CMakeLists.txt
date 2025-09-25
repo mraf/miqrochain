@@ -149,5 +149,10 @@ add_executable(miq-keygen
     ${MICRO_ECC_DIR}/uECC.c
     src/crypto/uECC_shim.c
 )
+
+if(WIN32)
+  target_link_libraries(miq-keygen PRIVATE bcrypt)
+endif()
+
 target_include_directories(miq-keygen PRIVATE src ${MICRO_ECC_DIR})
 target_compile_definitions(miq-keygen PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
