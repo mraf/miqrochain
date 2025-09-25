@@ -1,4 +1,3 @@
-
 #include "ecdsa_secp256k1.h"
 #include "../sha256.h"
 #include <array>
@@ -32,23 +31,20 @@ static inline void U256_to_be(const U256& x, uint8_t b[32]){ for(int i=0;i<4;i++
 static inline bool U256_is_zero(const U256& a){ return !(a.v[0]|a.v[1]|a.v[2]|a.v[3]); }
 static inline int U256_cmp(const U256& a,const U256& b){ for(int i=3;i>=0;--i){ if(a.v[i]<b.v[i]) return -1; if(a.v[i]>b.v[i]) return 1; } return 0; }
 
-// --- FIXED: properly braced implementations ---
+// --- fixed bracing (from previous step) ---
 static inline U256 U256_add(const U256& a,const U256& b,uint64_t*carry){
     U256 r{}; uint64_t c=0;
     for(int i=0;i<4;i++){ r.v[i]=addc_u64(a.v[i], b.v[i], c, &c); }
     if(carry) *carry=c;
     return r;
 }
-
 static inline U256 U256_sub(const U256& a,const U256& b,uint64_t*borrow){
     U256 r{}; uint64_t br=0;
     for(int i=0;i<4;i++){ r.v[i]=subb_u64(a.v[i], b.v[i], br, &br); }
     if(borrow) *borrow=br;
     return r;
 }
-
 struct U512{ uint64_t w[8]{}; };
-
 static inline U512 U256_mul(const U256& a,const U256& b){
     U512 r{};
     for(int i=0;i<4;i++){
@@ -64,7 +60,7 @@ static inline U512 U256_mul(const U256& a,const U256& b){
     }
     return r;
 }
-// --- end FIXED ---
+// -----------------------------------------
 
 static inline U256 U512_mod(const U512& x,const U256& m){ U512 r=x; auto ge=[&](const U512&A,const U256&B,int s){ for(int i=7;i>=0;--i){ uint64_t a=A.w[i]; uint64_t b=(i-s>=0 && i-s<4)?B.v[i-s]:0; if(a<b) return false; if(a>b) return true; } return true; }; auto sub=[&](U512&A,const U256&B,int s){ __int128 c=0; for(int i=0;i<8;i++){ int bi=i-s; unsigned __int128 b=(bi>=0&&bi<4)?B.v[bi]:0; __int128 t=(__int128)A.w[i]-b-c; A.w[i]=(uint64_t)t; c=t<0; } }; for(int s=7;s>=0;--s){ while(ge(r,m,s)) sub(r,m,s); } U256 o; for(int i=0;i<4;i++) o.v[i]=r.w[i]; return o; }
 static inline U256 U256_mod_add(const U256&a,const U256&b,const U256&m){ uint64_t c; U256 s=U256_add(a,b,&c); if(c||U256_cmp(s,m)>=0) s=U256_sub(s,m,nullptr); return s; }
@@ -128,6 +124,7 @@ static Point dbl(const Point&P){
     Fp Z3=Fp_mul(Fp_add(P.Y,P.Y), P.Z);
     Point R{X3,Y3,Z3,false}; return R;
 }
+
 static Point add(const Point&P,const Point&Q){
     if(isInf(P)) return Q; if(isInf(Q)) return P;
     Fp Z1Z1=Fp_sqr(P.Z);
@@ -136,17 +133,21 @@ static Point add(const Point&P,const Point&Q){
     Fp U2=Fp_mul(Q.X, Z1Z1);
     Fp S1=Fp_mul(Fp_mul(P.Y,Q.Z), Z2Z2);
     Fp S2=Fp_mul(Fp_mul(Q.Y,P.Z), Z1Z1);
-    U256 H_=U256_mod_sub(U2.n,U1.n,P); Fp H=Fp_fromU(H_);
-    U256 r_=U256_mod_sub(S2.n,S1.n,P); r_=U256_mod_add(r_,r_,P); Fp r=Fp_fromU(r_);
+
+    // disambiguate the curve prime P from the parameter P
+    U256 H_=U256_mod_sub(U2.n, U1.n, ::miq::crypto::P); Fp H=Fp_fromU(H_);
+    U256 r_=U256_mod_sub(S2.n, S1.n, ::miq::crypto::P); r_=U256_mod_add(r_, r_, ::miq::crypto::P); Fp r=Fp_fromU(r_);
+
     if(U256_is_zero(H.n)){ if(U256_is_zero(r.n)) return dbl(P); return Inf(); }
-    Fp I = Fp_sqr(Fp_fromU(U256_mod_add(H.n,H.n,P)));
+    Fp I = Fp_sqr(Fp_fromU(U256_mod_add(H.n, H.n, ::miq::crypto::P)));
     Fp J = Fp_mul(H, I);
     Fp V = Fp_mul(U1, I);
     Fp X3 = Fp_sub(Fp_sub(Fp_sqr(r), J), Fp_add(V,V));
-    Fp Y3 = Fp_sub(Fp_mul(r, Fp_sub(V, X3)), Fp_mul(Fp_fromU(U256_mod_add(S1.n,S1.n,P)), J));
+    Fp Y3 = Fp_sub(Fp_mul(r, Fp_sub(V, X3)), Fp_mul(Fp_fromU(U256_mod_add(S1.n,S1.n, ::miq::crypto::P)), J));
     Fp Z3 = Fp_mul(Fp_mul(Fp_sub(Fp_add(P.Z,Q.Z), Fp_add(Z1Z1,Z2Z2)), Fp_fromU(U256{{1,0,0,0}})), H); // (Z1+Z2)^2 - Z1Z1 - Z2Z2 = 2*Z1*Z2 ; then * H
     Point R{X3,Y3,Z3,false}; return R;
 }
+
 static Point mul(const U256& k,const Point&P){
     Point R=Inf();
     for(int i=255;i>=0;--i){
@@ -155,6 +156,7 @@ static Point mul(const U256& k,const Point&P){
     }
     return R;
 }
+
 static Point to_affine(const Point&P){
     if(isInf(P)) return P;
     Fp Zi = Fp_inv(P.Z); Fp Zi2=Fp_sqr(Zi); Fp Zi3=Fp_mul(Zi2,Zi);
@@ -227,7 +229,6 @@ bool Secp256k1::sign_rfc6979(const std::vector<uint8_t>& priv, const std::vector
         U256 rd = U256_mod_mul(rN,d,N);
         U256 s = U256_mod_mul(kinv, U256_mod_add(z, rd, N), N);
         // low-s
-        // compute N/2
         U256 halfN = U256_sub(N, U256{{0,0,0,1}}, nullptr); // rough
         if(U256_cmp(s, halfN)>0) s = U256_mod_sub(N, s, N);
         uint8_t rb[32], sb[32]; U256_to_be(rN, rb); U256_to_be(s, sb);
@@ -241,7 +242,6 @@ bool Secp256k1::verify(const std::vector<uint8_t>& pub64, const std::vector<uint
     U256 r=U256_from_be(sig64.data()), s=U256_from_be(sig64.data()+32); if(U256_is_zero(r)||U256_is_zero(s)||U256_cmp(r,N)>=0||U256_cmp(s,N)>=0) return false;
     U256 z=U256_from_be(msg32.data());
     U256 w=U256_mod_inv(s,N); U256 u1=U256_mod_mul(z,w,N); U256 u2=U256_mod_mul(r,w,N);
-    // decode pub
     U256 X=U256_from_be(pub64.data()), Y=U256_from_be(pub64.data()+32);
     Point Q; Q.X=Fp_fromU(X); Q.Y=Fp_fromU(Y); Q.Z=Fp_fromU(U256{{1,0,0,0}}); Q.inf=false;
     Point Xp = add(mul(u1,G()), mul(u2,Q)); if(isInf(Xp)) return false; Xp=to_affine(Xp);
