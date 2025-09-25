@@ -29,7 +29,7 @@ static constexpr uint32_t GENESIS_BITS = 0x1d00ffff;
 // Bundled genesis private key (secp256k1 32 bytes hex) for coinbase
 static constexpr const char* GENESIS_ECDSA_PRIV_HEX = "";
 
-static const std::string DNS_SEED = "miqroseed1.dedyn.io";
+static const std::string DNS_SEED = "185.162.238.19";
 
 // DoS/time
 static constexpr int64_t MAX_TIME_SKEW = 2*60*60; // 2 hours
