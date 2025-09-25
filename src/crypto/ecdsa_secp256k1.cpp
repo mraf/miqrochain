@@ -129,8 +129,9 @@ static Point dbl(const Point&P){
     Point R{X3,Y3,Z3,false}; return R;
 }
 
-static Point add(const Point&P,const Point&Q){
-    if(isInf(P)) return Q; if(isInf(Q)) return P;
+static Point add(const Point& P, const Point& Q){
+    if (isInf(P)) return Q;
+    if (isInf(Q)) return P;
     Fp Z1Z1=Fp_sqr(P.Z);
     Fp Z2Z2=Fp_sqr(Q.Z);
     Fp U1=Fp_mul(P.X, Z2Z2);
