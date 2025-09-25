@@ -11,7 +11,7 @@ static constexpr const char* UNIT_NAME = "miqron";
 
 static constexpr uint64_t COIN = 100000000ULL;
 static constexpr uint64_t BLOCK_TIME_SECS = 480; // 8 minutes
-static constexpr uint16_t P2P_PORT = 9833;
+static constexpr uint16_t P2P_PORT = 443;
 static constexpr uint16_t RPC_PORT = 9834;
 static constexpr uint32_t MAGIC = 0xA3FB9E21;
 
