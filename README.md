@@ -1,5 +1,5 @@
 ﻿
-# miqrochain C++ core v1 (ECDSA-P2PKH wiring, inv/getdata, bans, richer RPC)
+# miqrochain C++ core v1
 
 **Coin:** MIQ (unit: miqron, 1e-8)  
 **Hard cap:** 26,280,000 MIQ • **Block time:** 8 minutes  
