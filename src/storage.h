@@ -1,8 +1,9 @@
-
 #pragma once
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <cstdint>
+
 namespace miq {
 class Storage {
 public:
