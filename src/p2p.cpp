@@ -25,6 +25,13 @@
 #define MIQ_FALLBACK_MAX_MSG_SIZE (MAX_MSG_SIZE)
 #endif
 
+#ifndef MAX_BLOCK_SIZE
+// Fall back to 1 MiB if not defined
+#define MIQ_FALLBACK_MAX_BLOCK_SZ (1u * 1024u * 1024u)
+#else
+#define MIQ_FALLBACK_MAX_BLOCK_SZ (MAX_BLOCK_SIZE)
+#endif
+
 // Allow a bit more than a single message to accumulate
 #ifndef MIQ_P2P_MAX_BUFSZ
 #define MIQ_P2P_MAX_BUFSZ (MIQ_FALLBACK_MAX_MSG_SIZE + (512u * 1024u)) // ~2.5 MiB default
@@ -124,7 +131,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
     addrinfo* res = nullptr;
     char portstr[16]; snprintf(portstr, sizeof(portstr), "%u", (unsigned)port);
-    if (getaddrinfo(host.c_str(), portstr, &hints, &res) != 0 || !res) return false;
+    if (getaddrinfo(host.c_str(), portstr, &hints, &res) != 0 || !res) { log_warn(std::string("P2P: DNS resolve failed: ") + host); return false; }
     int s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (s < 0) { freeaddrinfo(res); return false; }
     if (connect(s, res->ai_addr, res->ai_addrlen) != 0) { CLOSESOCK(s); freeaddrinfo(res); return false; }
@@ -146,6 +153,11 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     }
     peers_[s] = PeerState{s, ipbuf[0] ? std::string(ipbuf) : std::string("unknown"), 0, now_ms()};
     log_info("P2P: connected seed " + peers_[s].ip);
+
+    // ADDED: kick off handshake for outbound too
+    auto msg = encode_msg("version", {});
+    send(s, (const char*)msg.data(), (int)msg.size(), 0);
+
     return true;
 }
 
@@ -163,6 +175,36 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
         send(s, (const char*)msg.data(), (int)msg.size(), 0);
     }
 }
+
+// =================== ADDED: helpers for sync / serving ===================
+
+void P2P::start_sync_with_peer(PeerState& ps){
+    ps.syncing = true;
+    // Ask for the next block after our current tip height
+    ps.next_index = chain_.height() + 1; // requires tiny getter in chain.h
+    request_block_index(ps, ps.next_index);
+}
+
+void P2P::request_block_index(PeerState& ps, uint64_t index){
+    uint8_t p[8];
+    for (int i=0;i<8;i++) p[i] = (uint8_t)((index >> (8*i)) & 0xFF); // little-endian
+    auto msg = encode_msg("getbi", std::vector<uint8_t>(p, p+8));
+    send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
+}
+
+void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
+    if (h.size()!=32) return;
+    auto msg = encode_msg("getb", h);
+    send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
+}
+
+void P2P::send_block(int s, const std::vector<uint8_t>& raw){
+    if (raw.empty()) return;
+    auto msg = encode_msg("block", raw);
+    send(s, (const char*)msg.data(), (int)msg.size(), 0);
+}
+
+// ========================================================================
 
 void P2P::loop(){
     std::vector<uint8_t> msgbuf;
@@ -255,12 +297,77 @@ void P2P::loop(){
             while (decode_msg(msgbuf, off, m)) {
                 std::string cmd(m.cmd, m.cmd + 12);
                 cmd.erase(cmd.find_first_of('\0'));
+
                 if (cmd == "version") {
                     auto verack = encode_msg("verack", {});
                     send(s, (const char*)verack.data(), (int)verack.size(), 0);
+
+                } else if (cmd == "verack") {
+                    // ADDED: start syncing after handshake
+                    auto& ps = it->second;
+                    ps.syncing = true;
+                    uint64_t h = chain_.height();
+                    ps.next_index = h + 1;
+                    request_block_index(ps, ps.next_index);
+
                 } else if (cmd == "ping") {
                     auto pong = encode_msg("pong", m.payload);
                     send(s, (const char*)pong.data(), (int)pong.size(), 0);
+
+                // ======= ADDED: inventory announce -> request if missing
+                } else if (cmd == "invb") {
+                    if (m.payload.size() == 32) {
+                        if (!chain_.have_block(m.payload)) {
+                            request_block_hash(it->second, m.payload);
+                        }
+                    }
+
+                // ======= ADDED: peer asks us for block by hash
+                } else if (cmd == "getb") {
+                    if (m.payload.size() == 32) {
+                        Block b;
+                        if (chain_.get_block_by_hash(m.payload, b)) {
+                            auto raw = ser_block(b);
+                            if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
+                        }
+                    }
+
+                // ======= ADDED: peer asks us for block by index (height)
+                } else if (cmd == "getbi") {
+                    if (m.payload.size() == 8) {
+                        uint64_t idx64 = 0;
+                        for (int i=0;i<8;i++) idx64 |= ((uint64_t)m.payload[i]) << (8*i);
+                        Block b;
+                        if (chain_.get_block_by_index((size_t)idx64, b)) {
+                            auto raw = ser_block(b);
+                            if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
+                        }
+                    }
+
+                // ======= ADDED: receive a block
+                } else if (cmd == "block") {
+                    if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
+                        Block b;
+                        if (deser_block(m.payload, b)) {
+                            std::string err;
+                            if (!chain_.have_block(b.block_hash())) {
+                                if (chain_.submit_block(b, err)) {
+                                    log_info("P2P: accepted block via peer " + it->second.ip);
+                                    // keep syncing forward by index if we were syncing
+                                    if (it->second.syncing) {
+                                        it->second.next_index++;
+                                        request_block_index(it->second, it->second.next_index);
+                                    }
+                                    // announce to others
+                                    broadcast_inv_block(b.block_hash());
+                                } else {
+                                    log_warn("P2P: reject block (" + err + ")");
+                                    // stop this peer's sync on error
+                                    it->second.syncing = false;
+                                }
+                            }
+                        }
+                    }
                 }
                 // Unknown commands are ignored as before.
             }
