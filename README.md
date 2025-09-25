@@ -2,7 +2,7 @@
 # miqrochain C++ core v1.4 (ECDSA-P2PKH wiring, inv/getdata, bans, richer RPC)
 
 **Coin:** MIQ (unit: miqron, 1e-8)  
-**Hard cap:** 28,260,000 MIQ • **Block time:** 8 minutes  
+**Hard cap:** 26,280,000 MIQ • **Block time:** 8 minutes  
 **Ports:** P2P 9833, RPC 9834  
 **DNS seeder:** miqroseed1.dedyn.io
 
