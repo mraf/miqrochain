@@ -24,6 +24,7 @@ public:
     std::vector<std::pair<int64_t,uint32_t>> last_headers(size_t n) const;
     UTXOSet& utxo(){ return utxo_; }
     const UTXOSet& utxo() const { return utxo_; }
+    uint64_t height() const { return tip_.height; }
     uint64_t subsidy_for_height(uint64_t height) const;
     bool get_block_by_index(size_t idx, Block& out) const;
     bool get_block_by_hash(const std::vector<uint8_t>& h, Block& out) const;
