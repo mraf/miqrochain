@@ -135,3 +135,19 @@ if(MIQ_BUILD_TESTS)
   target_include_directories(fuzz_json PRIVATE src)
   add_test(NAME fuzz_json COMMAND fuzz_json)
 endif()
+
+# --------
+# Tools
+# --------
+add_executable(miq-keygen
+    src/tools/miq_keygen.cpp
+    src/sha256.h src/sha256.cpp
+    src/ripemd160.h src/ripemd160.cpp
+    src/hash160.h src/hash160.cpp
+    src/base58.h src/base58.cpp
+    src/hex.h src/hex.cpp
+    ${MICRO_ECC_DIR}/uECC.c
+    src/crypto/uECC_shim.c
+)
+target_include_directories(miq-keygen PRIVATE src ${MICRO_ECC_DIR})
+target_compile_definitions(miq-keygen PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
