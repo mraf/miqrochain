@@ -6,7 +6,7 @@
 **Ports:** P2P 9833, RPC 9834  
 **DNS seeder:** miqroseed1.dedyn.io
 
-Whatâ€™s new in v1.4
+Whats new in v1.4
 - **Switch to P2PKH locking** (addresses are Base58Check `version=0x35` + `HASH160(pubkey)`).
 - **ECDSA backend interface** bundled (drop-in slot for micro-ecc (BSD-2) or ed25519-donna (public domain)).
   - `src/crypto/ecdsa_iface.h` defines the functions used by mempool/validation and CLI.
