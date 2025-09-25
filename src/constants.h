@@ -15,9 +15,9 @@ static constexpr uint16_t P2P_PORT = 443;
 static constexpr uint16_t RPC_PORT = 9834;
 static constexpr uint32_t MAGIC = 0xA3FB9E21;
 
-static constexpr uint64_t MAX_MONEY = 28260000ULL * COIN;
+static constexpr uint64_t MAX_MONEY = 26280000ULL * COIN;
 static constexpr uint64_t INITIAL_SUBSIDY = 50ULL * COIN;
-static constexpr uint64_t HALVING_INTERVAL = 282600ULL;
+static constexpr uint64_t HALVING_INTERVAL = 262800ULL;
 static constexpr uint32_t COINBASE_MATURITY = 100;
 
 // Address version bytes : mainnet P2PKH = 0x35 ('5')
