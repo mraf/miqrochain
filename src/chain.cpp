@@ -17,7 +17,6 @@
 namespace miq {
 
 // === Added: local constants (non-breaking) ===
-// We keep these here so this file builds even before we add them to constants.h.
 static constexpr size_t MAX_BLOCK_SIZE_LOCAL = 1 * 1024 * 1024; // 1 MiB
 
 // === Added: compact bits -> 32-byte big-endian target, and hash <= target check ===
@@ -41,6 +40,7 @@ static inline void bits_to_target_be(uint32_t bits, uint8_t out[32]) {
             out[0] = 0xff; out[1] = 0xff; out[2] = 0xff; // effectively "always true"
             return;
         }
+        if (pos > 29) pos = 29; // defensive clamp
         out[pos + 0] = uint8_t((mant >> 16) & 0xff);
         out[pos + 1] = uint8_t((mant >> 8)  & 0xff);
         out[pos + 2] = uint8_t((mant >> 0)  & 0xff);
@@ -103,15 +103,25 @@ bool Chain::load_state(){
     tip_.hash.assign(b.begin() + i, b.begin() + i + 32); i += 32;
 
     tip_.height = 0;
-    for(int k=0;k<8;k++) tip_.height |= ((uint64_t)b[i+k]) << (k*8); i += 8;
+    for (int k = 0; k < 8; ++k) {
+        tip_.height |= (uint64_t)b[i + k] << (k * 8);
+    }
+    i += 8;
 
     tip_.time = 0;
-    for(int k=0;k<8;k++) tip_.time |= ((uint64_t)b[i+k]) << (k*8); i += 8;
+    for (int k = 0; k < 8; ++k) {
+        tip_.time |= (uint64_t)b[i + k] << (k * 8);
+    }
+    i += 8;
 
-    tip_.bits = b[i] | (b[i+1] << 8) | (b[i+2] << 16) | (b[i+3] << 24); i += 4;
+    tip_.bits = b[i] | (b[i+1] << 8) | (b[i+2] << 16) | (b[i+3] << 24);
+    i += 4;
 
     tip_.issued = 0;
-    for(int k=0;k<8;k++) tip_.issued |= ((uint64_t)b[i+k]) << (k*8); i += 8;
+    for (int k = 0; k < 8; ++k) {
+        tip_.issued |= (uint64_t)b[i + k] << (k * 8);
+    }
+    i += 8;
 
     return true;
 }
@@ -155,8 +165,7 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     {
         const auto now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-        // Use MAX_TIME_SKEW if available from constants.h; otherwise 2h is typical.
-        const int64_t ALLOWED_SKEW = MAX_TIME_SKEW; // constants.h already has this in your repo
+        const int64_t ALLOWED_SKEW = MAX_TIME_SKEW; // from constants.h
         if (b.header.time > now + ALLOWED_SKEW) { err="time too far in future"; return false; }
     }
 
@@ -186,7 +195,6 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         auto last = last_headers(90); // previous headers including tip
         uint32_t expected;
         if (last.size() < 2) {
-            // Not enough history yet → reuse previous bits (or genesis at height 0)
             expected = last.empty() ? GENESIS_BITS : last.back().second;
         } else {
             expected = lwma_next_bits(last, BLOCK_TIME_SECS, GENESIS_BITS);
