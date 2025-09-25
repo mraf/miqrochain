@@ -5,6 +5,7 @@
 #include <random>
 #include <cstring>
 #include <cassert>
+#include <vector>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -30,17 +31,24 @@ static inline U256 U256_from_be(const uint8_t b[32]){ U256 x; for(int i=0;i<4;i+
 static inline void U256_to_be(const U256& x, uint8_t b[32]){ for(int i=0;i<4;i++){ uint64_t w=x.v[3-i]; b[i*8+0]=(w>>56)&0xff; b[i*8+1]=(w>>48)&0xff; b[i*8+2]=(w>>40)&0xff; b[i*8+3]=(w>>32)&0xff; b[i*8+4]=(w>>24)&0xff; b[i*8+5]=(w>>16)&0xff; b[i*8+6]=(w>>8)&0xff; b[i*8+7]=w&0xff; } }
 static inline bool U256_is_zero(const U256& a){ return !(a.v[0]|a.v[1]|a.v[2]|a.v[3]); }
 static inline int U256_cmp(const U256& a,const U256& b){ for(int i=3;i>=0;--i){ if(a.v[i]<b.v[i]) return -1; if(a.v[i]>b.v[i]) return 1; } return 0; }
+
+// --- FIXED: properly braced implementations ---
 static inline U256 U256_add(const U256& a,const U256& b,uint64_t*carry){
-    U256 r; uint64_t c=0;
+    U256 r{}; uint64_t c=0;
     for(int i=0;i<4;i++){ r.v[i]=addc_u64(a.v[i], b.v[i], c, &c); }
-    if(carry) *carry=c; return r;
-} if(carry)*carry=(uint64_t)c; return r; }
+    if(carry) *carry=c;
+    return r;
+}
+
 static inline U256 U256_sub(const U256& a,const U256& b,uint64_t*borrow){
-    U256 r; uint64_t br=0;
+    U256 r{}; uint64_t br=0;
     for(int i=0;i<4;i++){ r.v[i]=subb_u64(a.v[i], b.v[i], br, &br); }
-    if(borrow) *borrow=br; return r;
-} if(borrow)*borrow=(uint64_t)c; return r; }
+    if(borrow) *borrow=br;
+    return r;
+}
+
 struct U512{ uint64_t w[8]{}; };
+
 static inline U512 U256_mul(const U256& a,const U256& b){
     U512 r{};
     for(int i=0;i<4;i++){
@@ -55,7 +63,9 @@ static inline U512 U256_mul(const U256& a,const U256& b){
         r.w[i+4] += c;
     }
     return r;
-} r.w[i+4]+= (uint64_t)c; } return r; }
+}
+// --- end FIXED ---
+
 static inline U256 U512_mod(const U512& x,const U256& m){ U512 r=x; auto ge=[&](const U512&A,const U256&B,int s){ for(int i=7;i>=0;--i){ uint64_t a=A.w[i]; uint64_t b=(i-s>=0 && i-s<4)?B.v[i-s]:0; if(a<b) return false; if(a>b) return true; } return true; }; auto sub=[&](U512&A,const U256&B,int s){ __int128 c=0; for(int i=0;i<8;i++){ int bi=i-s; unsigned __int128 b=(bi>=0&&bi<4)?B.v[bi]:0; __int128 t=(__int128)A.w[i]-b-c; A.w[i]=(uint64_t)t; c=t<0; } }; for(int s=7;s>=0;--s){ while(ge(r,m,s)) sub(r,m,s); } U256 o; for(int i=0;i<4;i++) o.v[i]=r.w[i]; return o; }
 static inline U256 U256_mod_add(const U256&a,const U256&b,const U256&m){ uint64_t c; U256 s=U256_add(a,b,&c); if(c||U256_cmp(s,m)>=0) s=U256_sub(s,m,nullptr); return s; }
 static inline U256 U256_mod_sub(const U256&a,const U256&b,const U256&m){ uint64_t br; U256 s=U256_sub(a,b,&br); if(br) s=U256_add(s,m,nullptr); return s; }
