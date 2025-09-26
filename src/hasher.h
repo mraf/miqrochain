@@ -45,4 +45,17 @@ private:
     static void append_salt_ctx(Ctx& c); // streaming append
 };
 
+struct FastSha256Ctx {
+    uint32_t H[8];
+    uint64_t total;
+    uint8_t  buf[64];
+    size_t   blen;
+};
+
+void fastsha_init(FastSha256Ctx& c);
+void fastsha_update(FastSha256Ctx& c, const uint8_t* p, size_t n);
+void fastsha_final_copy(const FastSha256Ctx& c_in, uint8_t out32[32]);
+// Double-SHA256 using a precomputed base (e.g., first 80 bytes of a header).
+void dsha256_from_base(const FastSha256Ctx& base, const uint8_t* suffix, size_t n, uint8_t out32[32]);
+
 } // namespace miq
