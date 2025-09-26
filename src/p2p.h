@@ -24,7 +24,7 @@
 
 namespace miq {
 
-class Chain; // forward declaration
+class Chain; // fwd
 
 struct OrphanRec {
     std::vector<uint8_t> hash;
@@ -32,32 +32,17 @@ struct OrphanRec {
     std::vector<uint8_t> raw;
 };
 
-// key = hex(hash)
-std::unordered_map<std::string, OrphanRec> orphans_;
-
-// parentHex -> vector<childHex>
-std::unordered_map<std::string, std::vector<std::string>> orphan_children_;
-
-// helper: hex string for map keys
-static inline std::string hexkey(const std::vector<uint8_t>& h);
-
-// handle a raw incoming block (decoded from NetMsg)
-void handle_incoming_block(int sock, const std::vector<uint8_t>& raw);
-
-// try to connect all children who were waiting on this parent
-void try_connect_orphans(const std::string& parent_hex);
-
 struct PeerState {
     int         sock{-1};
     std::string ip;
     int         mis{0};
     int64_t     last_ms{0};
 
-    // --- sync state (existing) ---
+    // --- sync state ---
     bool        syncing{false};
     uint64_t    next_index{0};
 
-    // --- NEW: per-peer RX buffer & liveness ---
+    // --- per-peer RX & liveness ---
     std::vector<uint8_t> rx;
     bool        verack_ok{false};
     int64_t     last_ping_ms{0};
@@ -91,16 +76,28 @@ private:
     std::set<std::string> banned_;
     std::string datadir_{"./miqdata"};
 
+    // --- orphan caches (now members, not globals) ---
+    // key = hex(hash) -> orphan record
+    std::unordered_map<std::string, OrphanRec> orphans_;
+    // parentHex -> vector<childHex>
+    std::unordered_map<std::string, std::vector<std::string>> orphan_children_;
+
+    // --- main loop / peer mgmt ---
     void loop();
     void handle_new_peer(int c, const std::string& ip);
     void load_bans();
     void save_bans();
 
-    // helpers for sync & block serving
+    // --- sync & block serving ---
     void start_sync_with_peer(PeerState& ps);
     void request_block_index(PeerState& ps, uint64_t index);
     void request_block_hash(PeerState& ps, const std::vector<uint8_t>& h);
     void send_block(int s, const std::vector<uint8_t>& raw);
+
+    // --- orphan handling helpers (match p2p.cpp) ---
+    static std::string hexkey(const std::vector<uint8_t>& h);
+    void handle_incoming_block(int sock, const std::vector<uint8_t>& raw);
+    void try_connect_orphans(const std::string& parent_hex);
 };
 
 } // namespace miq
