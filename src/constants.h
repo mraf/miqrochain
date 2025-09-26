@@ -3,6 +3,7 @@
 #include <string>
 // ADDED for size_t
 #include <cstddef>
+#define MIQ_RULE_ENFORCE_LOW_S 1
 
 namespace miq {
 static constexpr const char* COIN_NAME = "miq";
