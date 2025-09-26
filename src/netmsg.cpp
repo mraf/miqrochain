@@ -28,19 +28,27 @@ static inline void get_magic(uint8_t out4[4]) {
 }
 
 static inline void put_u32_le(uint32_t x, uint8_t* p) {
-    p[0]=uint8_t(x>>0); p[1]=uint8_t(x>>8); p[2]=uint8_t(x>>16); p[3]=uint8_t(x>>24);
+    p[0] = (uint8_t)(x >> 0);
+    p[1] = (uint8_t)(x >> 8);
+    p[2] = (uint8_t)(x >> 16);
+    p[3] = (uint8_t)(x >> 24);
 }
 static inline uint32_t get_u32_le(const uint8_t* p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+    return (uint32_t)p[0]
+         | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
 }
 
 // First 4 bytes of dsha256(payload)
 static inline void checksum4(const std::vector<uint8_t>& payload, uint8_t out[4]) {
     std::vector<uint8_t> h = dsha256(payload);
-    out[0]=h[0]; out[1]=h[1]; out[2]=h[2]; out[3]=h[3];
+    out[0] = h[0]; out[1] = h[1]; out[2] = h[2]; out[3] = h[3];
 }
 
-std::vector<uint8_t> encode_msg(const char* ccmd, const std::vector<uint8_t>& payload) {
+// Serialize to: [4 magic][12 cmd][4 len (LE)][4 csum][payload]
+std::vector<uint8_t> encode_msg(const std::string& cmd,
+                                const std::vector<uint8_t>& payload) {
     // Clamp payload size defensively
     const uint32_t len = (payload.size() > MIQ_FALLBACK_MAX_MSG_SIZE)
         ? (uint32_t)MIQ_FALLBACK_MAX_MSG_SIZE
@@ -51,12 +59,12 @@ std::vector<uint8_t> encode_msg(const char* ccmd, const std::vector<uint8_t>& pa
     uint8_t header[4 + 12 + 4 + 4];
     std::memcpy(header + 0, magic, 4);
 
-    char cmd[12] = {0};
-    if (ccmd) {
-        size_t L = std::min<size_t>(11, std::strlen(ccmd));
-        std::memcpy(cmd, ccmd, L);
+    char cmdbuf[12] = {0};
+    if (!cmd.empty()) {
+        const std::size_t L = std::min<std::size_t>(sizeof(cmdbuf), cmd.size());
+        std::memcpy(cmdbuf, cmd.data(), L);
     }
-    std::memcpy(header + 4, cmd, 12);
+    std::memcpy(header + 4, cmdbuf, 12);
 
     put_u32_le(len, header + 16);
 
@@ -70,62 +78,57 @@ std::vector<uint8_t> encode_msg(const char* ccmd, const std::vector<uint8_t>& pa
     return out;
 }
 
-// Robust, scanning decoder with resync
-bool decode_msg(const std::vector<uint8_t>& buf, size_t& off, NetMsg& out) {
-    const size_t HLEN = 4 + 12 + 4 + 4;
+// Robust, scanning decoder with resync on bad magic/length/checksum
+bool decode_msg(const std::vector<uint8_t>& buf, std::size_t& off, NetMsg& out) {
+    const std::size_t HLEN = 4 + 12 + 4 + 4;
     uint8_t magic[4]; get_magic(magic);
 
-    size_t pos = off;
+    std::size_t pos = off;
     for (;;) {
         // Need at least a full header to start
-        if (buf.size() - pos < HLEN) {
-            // Not enough data; don't consume anything
-            return false;
+        if (buf.size() < pos + HLEN) {
+            return false; // not enough data yet
         }
 
         // Magic check
         if (std::memcmp(&buf[pos], magic, 4) != 0) {
-            // Resync: advance one byte and keep scanning
-            ++pos;
+            ++pos; // resync: advance one byte
             continue;
         }
 
-        // We have magic + full header available
         const uint8_t* ph = &buf[pos];
 
-        const char* pcmd = reinterpret_cast<const char*>(ph + 4);
+        // Read fields
         char cmd[12];
-        std::memcpy(cmd, pcmd, 12);
+        std::memcpy(cmd, ph + 4, 12);
 
         const uint32_t len = get_u32_le(ph + 16);
         const uint8_t* pchk = ph + 20;
 
-        // Sanity on length
+        // Length sanity
         if (len > MIQ_FALLBACK_MAX_MSG_SIZE) {
-            // Corrupt length -> skip this magic and resync at next byte
-            ++pos;
+            ++pos; // skip this magic and keep scanning
             continue;
         }
 
-        // Need full payload
-        if (buf.size() - pos < (size_t)HLEN + (size_t)len) {
-            // Wait for more; don't consume
-            return false;
+        // Need full payload present
+        if (buf.size() < pos + HLEN + (std::size_t)len) {
+            return false; // wait for more bytes
         }
 
         // Verify checksum
         std::vector<uint8_t> payload;
         if (len) {
-            payload.assign(buf.begin() + pos + HLEN, buf.begin() + pos + HLEN + len);
+            payload.assign(buf.begin() + pos + HLEN,
+                           buf.begin() + pos + HLEN + len);
         }
         uint8_t chk[4]; checksum4(payload, chk);
         if (std::memcmp(pchk, chk, 4) != 0) {
-            // Bad checksum -> skip this magic and resync
-            ++pos;
+            ++pos; // bad checksum -> resync
             continue;
         }
 
-        // OK: fill out message and advance off
+        // OK — fill result and advance off
         std::memcpy(out.cmd, cmd, 12);
         out.payload.swap(payload);
         off = pos + HLEN + len;
@@ -133,4 +136,4 @@ bool decode_msg(const std::vector<uint8_t>& buf, size_t& off, NetMsg& out) {
     }
 }
 
-} // namespace miq
+}
