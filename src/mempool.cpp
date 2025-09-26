@@ -10,7 +10,7 @@
 #include <vector>
 #include <string>
 
-// OPTIONAL include of constants (for MAX_TX_SIZE). If not present, we use a safe fallback.
+// OPTIONAL include of constants (for MAX_TX_SIZE, COINBASE_MATURITY). If not present, we use safe fallbacks.
 #ifdef __has_include
 #  if __has_include("constants.h")
 #    include "constants.h"
@@ -20,6 +20,10 @@
 #define MIQ_FALLBACK_MAX_TX_SIZE (100u * 1024u) // 100 KiB fallback
 #else
 #define MIQ_FALLBACK_MAX_TX_SIZE (MAX_TX_SIZE)
+#endif
+
+#ifndef COINBASE_MATURITY
+#define COINBASE_MATURITY 100
 #endif
 
 namespace miq {
@@ -86,6 +90,14 @@ bool Mempool::accept(const Transaction& tx, const UTXOSet& utxo, uint64_t height
 
     const auto h = sighash_simple(tx);
 
+    // Low-S threshold (secp256k1 order/2) for canonical signatures
+    static const uint8_t SECP256K1_N_HALF[32] = {
+        0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0x5D,0x57,0x6E,0xE7,0x57,0x12,0xA2,0x4F,
+        0x56,0x28,0x14,0x81,0x68,0xB9,0xC5,0x8D
+    };
+
     for (const auto& i : tx.vin) {
         const std::string k = key(i.prev.txid) + ":" + std::to_string(i.prev.vout);
         if (ins.count(k)) { err = "dup input"; return false; }
@@ -94,7 +106,28 @@ bool Mempool::accept(const Transaction& tx, const UTXOSet& utxo, uint64_t height
         UTXOEntry e;
         if (!utxo.get(i.prev.txid, i.prev.vout, e)) { err = "missing utxo"; return false; }
         if (e.coinbase && height < e.height + COINBASE_MATURITY) { err = "immature"; return false; }
+
+        // Pubkey must match output hash160
         if (hash160(i.pubkey) != e.pkh) { err = "pkh mismatch"; return false; }
+
+        // Pubkey must be compressed (33 bytes, 0x02 or 0x03)
+        if (i.pubkey.size() != 33 || (i.pubkey[0] != 0x02 && i.pubkey[0] != 0x03)) {
+            err = "bad pubkey"; return false;
+        }
+
+        // Signature must be 64 bytes (r||s)
+        if (i.sig.size() != 64) { err = "bad siglen"; return false; }
+
+        // Optional: low-S check (canonical s <= n/2). s is last 32 bytes (big-endian)
+        bool s_is_high = false;
+        const uint8_t* s_ptr = i.sig.data() + 32;
+        for (int j = 0; j < 32; ++j) {
+            if (s_ptr[j] > SECP256K1_N_HALF[j]) { s_is_high = true; break; }
+            if (s_ptr[j] < SECP256K1_N_HALF[j]) { break; }
+        }
+        if (s_is_high) { err = "non-canonical-S"; return false; }
+
+        // Backend verification
         if (!crypto::ECDSA::verify(i.pubkey, h, i.sig)) { err = "bad signature"; return false; }
 
         if (!leq_max_money(e.value)) { err = "utxo>MAX_MONEY"; return false; }
@@ -139,4 +172,3 @@ std::vector<std::vector<uint8_t>> Mempool::txids() const{
 }
 
 } // namespace miq
-
