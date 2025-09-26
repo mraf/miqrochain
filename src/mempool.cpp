@@ -42,77 +42,83 @@ void Mempool::maybe_evict(){
 }
 
 bool Mempool::accept(const Transaction& tx, const UTXOSet& utxo, uint64_t height, std::string& err){
-    auto add_u64_safe = [](uint64_t a, uint64_t b, uint64_t& out)->bool {
-        out = a + b; return out >= a;
-    };
+    if (tx.vin.empty() || tx.vout.empty()) { err = "empty vin/vout"; return false; }
+
+    // Size cap (DoS)
+    const auto raw = ser_tx(tx);
+    const size_t raw_sz = raw.size();
+    if (raw_sz > MIQ_FALLBACK_MAX_TX_SIZE) { err = "tx too large"; return false; }
+
+    // No duplicate txid in mempool
+    const std::string txk = key(tx.txid());
+    if (map_.count(txk)) { err = "duplicate"; return false; }
+
+    // Reject conflicts against already-seen spends in mempool
+    for (const auto& kv : map_) {
+        const auto& other = kv.second.tx;
+        for (const auto& i1 : tx.vin) {
+            for (const auto& i2 : other.vin) {
+                if (i1.prev.vout == i2.prev.vout && i1.prev.txid == i2.prev.txid) {
+                    err = "conflict"; return false;
+                }
+            }
+        }
+    }
+
+    // ---- Safe math helpers ----
+    auto add_u64_safe = [](uint64_t a, uint64_t b, uint64_t& out)->bool { out = a + b; return out >= a; };
+
 #ifndef MAX_MONEY
-#  define MIQ_FALLBACK_MAX_MONEY (26280000ull * 100000000ull)
+#  define MIQ_FALLBACK_MAX_MONEY (26280000ull * 100000000ull) // 26,280,000 * COIN
 #  define MIQ__USE_FALLBACK_MAX_MONEY
 #endif
     auto leq_max_money = [](uint64_t v)->bool {
-#ifdef MIQ__USE_FALLBACK_MAX_MONEY
+    #ifdef MIQ__USE_FALLBACK_MAX_MONEY
         return v <= MIQ_FALLBACK_MAX_MONEY;
-#else
+    #else
         return v <= (uint64_t)MAX_MONEY;
-#endif
+    #endif
     };
 
-    std::unordered_set<std::string> ins; 
-    uint64_t in=0, out=0, tmp=0;
+    // Dedup inputs within this tx; compute in/out with overflow checks
+    std::unordered_set<std::string> ins;
+    uint64_t in = 0, out = 0, tmp = 0;
 
-    auto h = sighash_simple(tx);
+    const auto h = sighash_simple(tx);
 
-    for(const auto& i: tx.vin){
-        std::string k=key(i.prev.txid)+":"+std::to_string(i.prev.vout);
-        if(ins.count(k)){ err="dup input"; return false; } 
+    for (const auto& i : tx.vin) {
+        const std::string k = key(i.prev.txid) + ":" + std::to_string(i.prev.vout);
+        if (ins.count(k)) { err = "dup input"; return false; }
         ins.insert(k);
 
-        UTXOEntry e; 
-        if(!utxo.get(i.prev.txid, i.prev.vout, e)){ err="missing utxo"; return false; }
-        if(e.coinbase && height < e.height + COINBASE_MATURITY){ err="immature"; return false; }
-        if(hash160(i.pubkey) != e.pkh){ err="pkh mismatch"; return false; }
-        if(!crypto::ECDSA::verify(i.pubkey, h, i.sig)){ err="bad signature"; return false; }
+        UTXOEntry e;
+        if (!utxo.get(i.prev.txid, i.prev.vout, e)) { err = "missing utxo"; return false; }
+        if (e.coinbase && height < e.height + COINBASE_MATURITY) { err = "immature"; return false; }
+        if (hash160(i.pubkey) != e.pkh) { err = "pkh mismatch"; return false; }
+        if (!crypto::ECDSA::verify(i.pubkey, h, i.sig)) { err = "bad signature"; return false; }
 
-        if(!leq_max_money(e.value)){ err="utxo>MAX_MONEY"; return false; }
-        if(!add_u64_safe(in, e.value, tmp)){ err="tx in overflow"; return false; }
+        if (!leq_max_money(e.value)) { err = "utxo>MAX_MONEY"; return false; }
+        if (!add_u64_safe(in, e.value, tmp)) { err = "tx in overflow"; return false; }
         in = tmp;
     }
-    for(const auto& o: tx.vout){
-        if(!leq_max_money(o.value)){ err="txout>MAX_MONEY"; return false; }
-        if(!add_u64_safe(out, o.value, tmp)){ err="tx out overflow"; return false; }
+
+    for (const auto& o : tx.vout) {
+        if (!leq_max_money(o.value)) { err = "txout>MAX_MONEY"; return false; }
+        if (!add_u64_safe(out, o.value, tmp)) { err = "tx out overflow"; return false; }
         out = tmp;
     }
-    if(!leq_max_money(in) || !leq_max_money(out)){ err="sum>MAX_MONEY"; return false; }
-    if(out>in){ err="outputs>inputs"; return false; }
 
-    // fee policy (unchanged)
-    size_t sz = tx.vin.size()*180 + tx.vout.size()*34 + 10;
-    uint64_t minfee=(sz/100)+1;
-    uint64_t fee=in-out;
-    if(fee<minfee){ err="low fee"; return false; }
-    std::unordered_set<std::string> ins; uint64_t in=0,out=0;
-    auto h = sighash_simple(tx);
-    for(const auto& i: tx.vin){
-        std::string k=key(i.prev.txid)+":"+std::to_string(i.prev.vout);
-        if(ins.count(k)){ err="dup input"; return false; } ins.insert(k);
-        UTXOEntry e; if(!utxo.get(i.prev.txid, i.prev.vout, e)){ err="missing utxo"; return false; }
-        if(e.coinbase && height < e.height + COINBASE_MATURITY){ err="immature"; return false; }
-        // Verify P2PKH: HASH160(pubkey) == pkh and ECDSA verify(sig, pubkey, sighash)
-        if(hash160(i.pubkey) != e.pkh){ err="pkh mismatch"; return false; }
-        if(!crypto::ECDSA::verify(i.pubkey, h, i.sig)){ err="bad signature"; return false; }
-        in+=e.value;
-    }
-    for(const auto& o: tx.vout) out+=o.value;
-    if(out>in){ err="outputs>inputs"; return false; }
+    if (!leq_max_money(in) || !leq_max_money(out)) { err = "sum>MAX_MONEY"; return false; }
+    if (out > in) { err = "outputs>inputs"; return false; }
 
-    // Keep your existing fee/minfee logic and size estimate
-    size_t sz = tx.vin.size()*180 + tx.vout.size()*34 + 10;
-    uint64_t minfee=(sz/100)+1;
-    uint64_t fee=in-out;
-    if(fee<minfee){ err="low fee"; return false; }
+    // Fee policy (unchanged)
+    const size_t sz = tx.vin.size()*180 + tx.vout.size()*34 + 10;
+    const uint64_t minfee = (sz/100) + 1;
+    const uint64_t fee = in - out;
+    if (fee < minfee) { err = "low fee"; return false; }
 
-    double fr=(double)fee/(double)sz;
-    map_[txk]=MempoolEntry{tx,fee,sz,fr};
+    const double fr = (double)fee / (double)sz;
+    map_[txk] = MempoolEntry{tx, fee, sz, fr};
     maybe_evict();
     return true;
 }
@@ -133,3 +139,4 @@ std::vector<std::vector<uint8_t>> Mempool::txids() const{
 }
 
 } // namespace miq
+
