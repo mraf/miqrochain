@@ -307,6 +307,46 @@ void P2P::send_block(int s, const std::vector<uint8_t>& raw){
     send(s, (const char*)msg.data(), (int)msg.size(), 0);
 }
 
+static std::vector<std::vector<uint8_t>> make_simple_locator(miq::Chain& chain) {
+    std::vector<std::vector<uint8_t>> loc;
+    auto tip = chain.tip();
+    if (tip.height == 0 && std::all_of(tip.hash.begin(), tip.hash.end(), [](uint8_t v){return v==0;})) return loc;
+
+    // Walk backward by index; if we fail to read, stop.
+    size_t count = 0;
+    for (int64_t h = (int64_t)tip.height; h >= 0 && count < 32; --h, ++count) {
+        Block b;
+        if (!chain.get_block_by_index((size_t)h, b)) break;
+        loc.push_back(b.block_hash());
+    }
+    return loc;
+}
+
+// Serialize header (80 bytes) to wire: version(4) | prev(32) | merkle(32) | time(8) | bits(4) | nonce(8) [LE for ints]
+static std::vector<uint8_t> ser_header80(const BlockHeader& h) {
+    std::vector<uint8_t> v; v.reserve(80);
+    // u32LE
+    v.push_back((uint8_t)((h.version >> 0) & 0xff));
+    v.push_back((uint8_t)((h.version >> 8) & 0xff));
+    v.push_back((uint8_t)((h.version >>16) & 0xff));
+    v.push_back((uint8_t)((h.version >>24) & 0xff));
+    // prev, merkle
+    v.insert(v.end(), h.prev_hash.begin(), h.prev_hash.end());
+    v.insert(v.end(), h.merkle_root.begin(), h.merkle_root.end());
+    // time (i64LE)
+    int64_t tt = h.time;
+    for (int i=0;i<8;i++) v.push_back((uint8_t)(( (uint64_t)tt >> (8*i)) & 0xff));
+    // bits (u32LE)
+    v.push_back((uint8_t)((h.bits >> 0) & 0xff));
+    v.push_back((uint8_t)((h.bits >> 8) & 0xff));
+    v.push_back((uint8_t)((h.bits >>16) & 0xff));
+    v.push_back((uint8_t)((h.bits >>24) & 0xff));
+    // nonce (u64LE)
+    uint64_t nn = h.nonce;
+    for (int i=0;i<8;i++) v.push_back((uint8_t)((nn >> (8*i)) & 0xff));
+    return v;
+}
+
 // === rate-limit helpers ======================================================
 
 void P2P::rate_refill(PeerState& ps, int64_t now){
