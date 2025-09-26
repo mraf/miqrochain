@@ -39,6 +39,8 @@ struct OrphanRec {
 };
 
 struct PeerState {
+    bool sent_getheaders{false};
+    int64_t last_headers_ms{0};
     int         sock{-1};
     std::string ip;
     int         mis{0};
