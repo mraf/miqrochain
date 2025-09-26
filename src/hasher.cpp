@@ -346,19 +346,32 @@ void fastsha_update(FastSha256Ctx& c, const uint8_t* p, size_t n){
 void fastsha_final_copy(const FastSha256Ctx& c_in, uint8_t out32[32]){
     FastSha256Ctx c = c_in;
     uint8_t pad[128];
+
+    // original buffered bytes before padding:
     size_t bl = c.blen;
+    const uint64_t msg_len_bits = (uint64_t)(c.total + bl) * 8ull; // <-- FIX: include bl
+
+    // copy buffered data and append 0x80
     std::memcpy(pad, c.buf, bl);
     pad[bl++] = 0x80;
+
+    // pad with zeros to reach 56 mod 64
     size_t padzeros = ((bl % 64) <= 56) ? (56 - (bl % 64)) : (120 - (bl % 64));
-    std::memset(pad+bl, 0, padzeros); bl += padzeros;
-    uint64_t bits = c.total * 8ull;
-    for(int i=7;i>=0;--i) pad[bl++] = (uint8_t)(bits >> (8*i));
+    std::memset(pad + bl, 0, padzeros);
+    bl += padzeros;
+
+    // append 64-bit big-endian length (bits)
+    for(int i = 7; i >= 0; --i) pad[bl++] = (uint8_t)(msg_len_bits >> (8*i));
+
+    // compress 1 or 2 final blocks
     g_sha256_compress(c.H, pad);
-    if(bl > 64) g_sha256_compress(c.H, pad+64);
+    if (bl > 64) g_sha256_compress(c.H, pad + 64);
+
+    // output big-endian digest
     for(int i=0;i<8;i++){
         out32[4*i+0] = (uint8_t)(c.H[i] >> 24);
         out32[4*i+1] = (uint8_t)(c.H[i] >> 16);
-        out32[4*i+2] = (uint8_t)(c.H[i] >> 8);
+        out32[4*i+2] = (uint8_t)(c.H[i] >>  8);
         out32[4*i+3] = (uint8_t)(c.H[i]);
     }
 }
