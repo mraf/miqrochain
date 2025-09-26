@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map> // needed for orphan maps used here
 
 #ifdef __has_include
 #  if __has_include("constants.h")
@@ -66,8 +67,10 @@
   #define CLOSESOCK(s) close(s)
 #endif
 
+namespace miq {
+
+// tiny hex helper for map keys
 std::string P2P::hexkey(const std::vector<uint8_t>& h) {
-    // tiny, local and fast; avoids extra deps
     static const char* kHex = "0123456789abcdef";
     std::string s; s.resize(h.size()*2);
     for (size_t i=0;i<h.size();++i) {
@@ -76,8 +79,6 @@ std::string P2P::hexkey(const std::vector<uint8_t>& h) {
     }
     return s;
 }
-
-namespace miq {
 
 static int64_t now_ms() {
     using namespace std::chrono;
@@ -225,6 +226,97 @@ void P2P::send_block(int s, const std::vector<uint8_t>& raw){
     send(s, (const char*)msg.data(), (int)msg.size(), 0);
 }
 
+// =================== orphan handling ===================
+
+void P2P::try_connect_orphans(const std::string& parent_hex) {
+    auto it = orphan_children_.find(parent_hex);
+    if (it == orphan_children_.end()) return;
+
+    auto kids = it->second;
+    orphan_children_.erase(it);
+
+    for (const auto& child_hex : kids) {
+        auto it2 = orphans_.find(child_hex);
+        if (it2 == orphans_.end()) continue;
+
+        Block cb;
+        if (deser_block(it2->second.raw, cb)) {
+            std::string err;
+            if (chain_.submit_block(cb, err)) {
+                broadcast_inv_block(cb.block_hash());
+                // Recursively connect grandchildren
+                try_connect_orphans(child_hex);
+            } else {
+                log_warn("P2P: orphan child invalid on connect (" + err + ")");
+            }
+        }
+        orphans_.erase(child_hex);
+    }
+}
+
+void P2P::handle_incoming_block(int sock, const std::vector<uint8_t>& raw) {
+    Block b;
+    if (!deser_block(raw, b)) {
+        log_warn("P2P: bad block payload (deserialize failed)");
+        return;
+    }
+    const auto h  = b.block_hash();
+    const auto ph = b.header.prev_hash;
+    const std::string hx  = hexkey(h);
+    const std::string phx = hexkey(ph);
+
+    // already have it?
+    if (chain_.have_block(h)) return;
+
+    // parent missing -> store orphan + request parent from same peer
+    if (!chain_.have_block(ph)) {
+        if (!orphans_.count(hx)) {
+            orphans_[hx] = OrphanRec{h, ph, raw};
+            orphan_children_[phx].push_back(hx);
+            log_info("P2P: stored orphan block (waiting for parent " + phx.substr(0,16) + "…)");
+        }
+        auto itp = peers_.find(sock);
+        if (itp != peers_.end()) request_block_hash(itp->second, ph);
+        return;
+    }
+
+    // we have parent -> try commit
+    std::string err;
+    if (!chain_.submit_block(b, err)) {
+        auto pit = peers_.find(sock);
+        if (pit != peers_.end()) {
+            pit->second.banscore += 20;
+            if (pit->second.banscore >= MIQ_P2P_MAX_BANSCORE) {
+                banned_.insert(pit->second.ip);
+                save_bans();
+                log_warn("P2P: banning " + pit->second.ip + " (invalid blocks)");
+                ::shutdown(sock, SHUT_RDWR);
+#ifdef _WIN32
+                closesocket(sock);
+#else
+                close(sock);
+#endif
+                peers_.erase(pit);
+            }
+        }
+        log_warn("P2P: reject block (" + err + ")");
+        return;
+    }
+
+    // success
+    broadcast_inv_block(h);
+
+    // advance sync window for this peer if it’s syncing
+    auto pit = peers_.find(sock);
+    if (pit != peers_.end() && pit->second.syncing) {
+        pit->second.next_index++;
+        request_block_index(pit->second, pit->second.next_index);
+    }
+
+    // try connect children that waited on this parent
+    try_connect_orphans(hx);
+}
+
 // ========================================================================
 
 void P2P::loop(){
@@ -308,7 +400,6 @@ void P2P::loop(){
                     log_warn("P2P: oversize buffer from " + ps.ip + " -> banning & dropping");
                     banned_.insert(ps.ip);
                     dead.push_back(s);
-                    // don't process further
                     goto timers_section;
                 }
 
@@ -366,26 +457,10 @@ void P2P::loop(){
 
                         } else if (cmd == "block") {
                             if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
-                                Block b;
-                                if (deser_block(m.payload, b)) {
-                                    std::string err;
-                                    if (!chain_.have_block(b.block_hash())) {
-                                        if (chain_.submit_block(b, err)) {
-                                            log_info("P2P: accepted block via peer " + ps.ip);
-                                            if (ps.syncing) {
-                                                ps.next_index++;
-                                                request_block_index(ps, ps.next_index);
-                                            }
-                                            broadcast_inv_block(b.block_hash());
-                                        } else {
-                                            log_warn("P2P: reject block (" + err + ")");
-                                            ps.syncing = false;
-                                        }
-                                    }
-                                }
+                                handle_incoming_block(s, m.payload);
                             }
                         } else {
-                            // unknown -> small mis score
+                            // unknown -> small mis score -> drop after some
                             if (++ps.mis > 10) { dead.push_back(s); }
                         }
                     }
