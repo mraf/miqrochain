@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cassert>
 
 namespace miq {
 
@@ -34,7 +35,13 @@ std::vector<uint8_t> Block::block_hash() const {
 
     put_u32_le(h, header.version);
 
-    // prev_hash (expect 32 bytes; if different length, we still serialize whatever is present)
+#ifndef NDEBUG
+    // Sanity: these fields must be exactly 32 bytes in canonical headers.
+    assert(header.prev_hash.size()   == 32 && "prev_hash must be 32 bytes");
+    assert(header.merkle_root.size() == 32 && "merkle_root must be 32 bytes");
+#endif
+
+    // prev_hash (expect 32 bytes; in Release we still serialize whatever is present)
     h.insert(h.end(), header.prev_hash.begin(), header.prev_hash.end());
 
     // merkle_root (expect 32 bytes)
