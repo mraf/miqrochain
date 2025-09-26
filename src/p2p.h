@@ -71,6 +71,7 @@ struct PeerState {
 
 class P2P {
 public:
+    void set_mempool(Mempool* mp) { mempool_ = mp; }
     explicit P2P(Chain& c);
     ~P2P();
 
