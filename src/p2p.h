@@ -167,4 +167,4 @@ private:
     void try_connect_orphans(const std::string& parent_hex);
 };
 
-} // namespace miq
+}
