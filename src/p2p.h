@@ -96,6 +96,23 @@ public:
     inline const Mempool& mempool() const { return mempool_; }
 
 private:
+    // ---- headers-first helpers ----
+    void send_getheaders(PeerState& ps);
+    void send_headers_snapshot(PeerState& ps, const std::vector<std::vector<uint8_t>>& locator);
+
+    // ---- tx relay (basic) ----
+    void broadcast_inv_tx(const std::vector<uint8_t>& txid);
+    void request_tx(PeerState& ps, const std::vector<uint8_t>& txid);
+    void send_tx(int sock, const std::vector<uint8_t>& raw);
+
+    // Small, bounded caches (in-memory)
+    std::unordered_set<std::string> seen_txids_;
+    std::unordered_map<std::string, std::vector<uint8_t>> tx_store_;
+    std::deque<std::string> tx_order_; // for eviction
+    size_t tx_store_bytes_{0};
+    size_t tx_store_limit_bytes_{4u * 1024u * 1024u}; // 4MB
+
+Mempool* mempool_{nullptr};  // nullable, safe to run without
     Chain& chain_;
     std::thread th_;
     std::atomic<bool> running_{false};
