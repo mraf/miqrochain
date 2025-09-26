@@ -34,7 +34,7 @@
 #define MIQ_P2P_MAX_BUFSZ (MIQ_FALLBACK_MAX_MSG_SIZE + (512u * 1024u))
 #endif
 
-// NEW: gentle timeouts
+// timeouts
 #ifndef MIQ_P2P_VERACK_TIMEOUT_MS
 #define MIQ_P2P_VERACK_TIMEOUT_MS 10000
 #endif
@@ -46,6 +46,31 @@
 #endif
 #ifndef MIQ_P2P_MAX_BANSCORE
 #define MIQ_P2P_MAX_BANSCORE      100
+#endif
+
+// --- NEW: rate limits (bytes/sec) and burst caps ---
+#ifndef MIQ_RATE_BLOCK_BPS
+#define MIQ_RATE_BLOCK_BPS (1024u * 1024u)   // 1 MB/s per peer for blocks
+#endif
+#ifndef MIQ_RATE_TX_BPS
+#define MIQ_RATE_TX_BPS    (256u * 1024u)    // 256 KB/s per peer for txs
+#endif
+#ifndef MIQ_RATE_BLOCK_BURST
+#define MIQ_RATE_BLOCK_BURST (MIQ_RATE_BLOCK_BPS * 2u) // 2s burst
+#endif
+#ifndef MIQ_RATE_TX_BURST
+#define MIQ_RATE_TX_BURST    (MIQ_RATE_TX_BPS * 2u)
+#endif
+
+// --- NEW: addr filtering knobs ---
+#ifndef MIQ_ADDR_MAX_BATCH
+#define MIQ_ADDR_MAX_BATCH 1000
+#endif
+#ifndef MIQ_ADDR_MIN_INTERVAL_MS
+#define MIQ_ADDR_MIN_INTERVAL_MS 120000  // 2 minutes between accepted batches per peer
+#endif
+#ifndef MIQ_ADDR_RESPONSE_MAX
+#define MIQ_ADDR_RESPONSE_MAX 200        // max addrs we return to getaddr
 #endif
 
 #ifdef _WIN32
@@ -86,6 +111,42 @@ static int create_server(uint16_t port){
     if (bind(s, (sockaddr*)&a, sizeof(a)) != 0) { CLOSESOCK(s); return -1; }
     if (listen(s, SOMAXCONN) != 0) { CLOSESOCK(s); return -1; }
     return s;
+}
+
+// tiny, local and fast hex for keys
+std::string P2P::hexkey(const std::vector<uint8_t>& h) {
+    static const char* kHex = "0123456789abcdef";
+    std::string s; s.resize(h.size()*2);
+    for (size_t i=0;i<h.size();++i) {
+        s[2*i+0] = kHex[(h[i]>>4) & 0xF];
+        s[2*i+1] = kHex[(h[i]    ) & 0xF];
+    }
+    return s;
+}
+
+// IPv4 helpers
+bool P2P::parse_ipv4(const std::string& dotted, uint32_t& be_ip){
+    sockaddr_in tmp{}; 
+#ifdef _WIN32
+    if (InetPtonA(AF_INET, dotted.c_str(), &tmp.sin_addr) != 1) return false;
+#else
+    if (inet_pton(AF_INET, dotted.c_str(), &tmp.sin_addr) != 1) return false;
+#endif
+    be_ip = tmp.sin_addr.s_addr; // already network byte order
+    return true;
+}
+static inline uint32_t be(uint8_t a, uint8_t b, uint8_t c, uint8_t d){
+    return (uint32_t(a)<<24)|(uint32_t(b)<<16)|(uint32_t(c)<<8)|uint32_t(d);
+}
+bool P2P::ipv4_is_public(uint32_t be_ip){
+    // drop: 0/8, 10/8, 127/8, 169.254/16, 172.16/12, 192.168/16, 224/4 (multicast), 240/4 (reserved)
+    uint8_t A = uint8_t(be_ip>>24), B = uint8_t(be_ip>>16);
+    if (A == 0 || A == 10 || A == 127) return false;
+    if (A == 169 && B == 254) return false;
+    if (A == 192 && B == 168) return false;
+    if (A == 172 && (uint8_t(be_ip>>20) & 0x0F) >= 1 && (uint8_t(be_ip>>20) & 0x0F) <= 15) return false; // 172.16/12
+    if (A >= 224) return false;
+    return true;
 }
 
 P2P::P2P(Chain& c) : chain_(c) {}
@@ -163,6 +224,15 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 #endif
     }
     peers_[s] = PeerState{s, ipbuf[0] ? std::string(ipbuf) : std::string("unknown"), 0, now_ms()};
+    // init RL buckets
+    peers_[s].blk_tokens = MIQ_RATE_BLOCK_BURST;
+    peers_[s].tx_tokens  = MIQ_RATE_TX_BURST;
+    peers_[s].last_refill_ms = now_ms();
+
+    // add addr if public
+    uint32_t be_ip;
+    if (ipbuf[0] && parse_ipv4(ipbuf, be_ip) && ipv4_is_public(be_ip)) addrv4_.insert(be_ip);
+
     log_info("P2P: connected seed " + peers_[s].ip);
 
     // Kick off handshake for outbound too
@@ -174,6 +244,14 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 
 void P2P::handle_new_peer(int c, const std::string& ip){
     peers_[c] = PeerState{c, ip, 0, now_ms()};
+    peers_[c].blk_tokens = MIQ_RATE_BLOCK_BURST;
+    peers_[c].tx_tokens  = MIQ_RATE_TX_BURST;
+    peers_[c].last_refill_ms = now_ms();
+
+    // learn addr
+    uint32_t be_ip;
+    if (parse_ipv4(ip, be_ip) && ipv4_is_public(be_ip)) addrv4_.insert(be_ip);
+
     log_info("P2P: inbound peer " + ip);
     auto msg = encode_msg("version", {});
     send(c, (const char*)msg.data(), (int)msg.size(), 0);
@@ -214,139 +292,89 @@ void P2P::send_block(int s, const std::vector<uint8_t>& raw){
     send(s, (const char*)msg.data(), (int)msg.size(), 0);
 }
 
-// ---- orphan helpers ------------------------------------------------
+// === NEW: rate-limit helpers =================================================
 
-std::string P2P::hexkey(const std::vector<uint8_t>& h) {
-    static const char* kHex = "0123456789abcdef";
-    std::string s; s.resize(h.size()*2);
-    for (size_t i=0;i<h.size();++i) {
-        s[2*i+0] = kHex[(h[i]>>4) & 0xF];
-        s[2*i+1] = kHex[(h[i]    ) & 0xF];
-    }
-    return s;
+void P2P::rate_refill(PeerState& ps, int64_t now){
+    int64_t dt = now - ps.last_refill_ms;
+    if (dt <= 0) return;
+    uint64_t add_blk = (uint64_t)((MIQ_RATE_BLOCK_BPS * (uint64_t)dt) / 1000ull);
+    uint64_t add_tx  = (uint64_t)((MIQ_RATE_TX_BPS    * (uint64_t)dt) / 1000ull);
+    ps.blk_tokens = std::min<uint64_t>(MIQ_RATE_BLOCK_BURST, ps.blk_tokens + add_blk);
+    ps.tx_tokens  = std::min<uint64_t>(MIQ_RATE_TX_BURST,   ps.tx_tokens  + add_tx);
+    ps.last_refill_ms = now;
+}
+bool P2P::rate_consume_block(PeerState& ps, size_t nbytes){
+    int64_t n = now_ms();
+    rate_refill(ps, n);
+    if (ps.blk_tokens < nbytes) return false;
+    ps.blk_tokens -= (uint64_t)nbytes;
+    return true;
+}
+bool P2P::rate_consume_tx(PeerState& ps, size_t nbytes){
+    int64_t n = now_ms();
+    rate_refill(ps, n);
+    if (ps.tx_tokens < nbytes) return false;
+    ps.tx_tokens -= (uint64_t)nbytes;
+    return true;
 }
 
-void P2P::evict_orphans_if_needed(size_t incoming_bytes){
-    // simple policy: while over limits, evict one arbitrary orphan (begin())
-    while (!orphans_.empty() &&
-          (orphans_.size()+1 > MIQ_ORPHAN_MAX_COUNT ||
-           orphan_bytes_ + incoming_bytes > MIQ_ORPHAN_MAX_BYTES))
-    {
-        auto it = orphans_.begin();
-        const std::string child_hex = it->first;
-        const std::string parent_hex = hexkey(it->second.prev);
-        orphan_bytes_ -= it->second.raw.size();
-        orphans_.erase(it);
+// === NEW: addr handling ======================================================
 
-        auto oc = orphan_children_.find(parent_hex);
-        if (oc != orphan_children_.end()) {
-            auto& vec = oc->second;
-            vec.erase(std::remove(vec.begin(), vec.end(), child_hex), vec.end());
-            if (vec.empty()) orphan_children_.erase(oc);
-        }
-    }
+void P2P::maybe_send_getaddr(PeerState& ps){
+    // ask once after verack to build table
+    auto msg = encode_msg("getaddr", {});
+    send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
 }
 
-void P2P::try_connect_orphans(const std::string& parent_hex){
-    // BFS queue of children to try
-    std::vector<std::string> q;
-    auto it = orphan_children_.find(parent_hex);
-    if (it != orphan_children_.end()) {
-        q = it->second;
-        orphan_children_.erase(it);
+void P2P::send_addr_snapshot(PeerState& ps){
+    // collect up to MIQ_ADDR_RESPONSE_MAX IPv4 addrs
+    std::vector<uint8_t> payload;
+    payload.reserve(MIQ_ADDR_RESPONSE_MAX * 4);
+    size_t cnt = 0;
+    for (uint32_t be_ip : addrv4_) {
+        if (cnt >= MIQ_ADDR_RESPONSE_MAX) break;
+        // filter again just in case
+        if (!ipv4_is_public(be_ip)) continue;
+        payload.push_back((uint8_t)(be_ip >> 24));
+        payload.push_back((uint8_t)(be_ip >> 16));
+        payload.push_back((uint8_t)(be_ip >> 8));
+        payload.push_back((uint8_t)(be_ip >> 0));
+        ++cnt;
     }
-
-    while (!q.empty()) {
-        const std::string child_hex = q.back(); q.pop_back();
-        auto oit = orphans_.find(child_hex);
-        if (oit == orphans_.end()) continue;
-
-        // Take ownership then erase from pool
-        OrphanRec rec = std::move(oit->second);
-        orphan_bytes_ -= rec.raw.size();
-        orphans_.erase(oit);
-
-        Block b;
-        if (!deser_block(rec.raw, b)) continue;
-
-        // If parent not present yet, put it back (rare race)
-        if (!chain_.have_block(b.header.prev_hash)) {
-            const std::string phex = hexkey(b.header.prev_hash);
-            orphans_.emplace(child_hex, OrphanRec{b.block_hash(), b.header.prev_hash, rec.raw});
-            orphan_children_[phex].push_back(child_hex);
-            orphan_bytes_ += rec.raw.size();  // <-- fixed here
-            continue;
-        }
-
-        std::string err;
-        if (chain_.submit_block(b, err)) {
-            log_info("P2P: connected orphan -> " + child_hex);
-            broadcast_inv_block(b.block_hash());
-
-            // Any children of this block?
-            const std::string nexth = hexkey(b.block_hash());
-            auto oit2 = orphan_children_.find(nexth);
-            if (oit2 != orphan_children_.end()) {
-                q.insert(q.end(), oit2->second.begin(), oit2->second.end());
-                orphan_children_.erase(oit2);
-            }
-        } else {
-            log_warn("P2P: orphan connect failed (" + err + ") for " + child_hex);
-        }
-    }
+    auto msg = encode_msg("addr", payload);
+    send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
 }
 
-
-void P2P::handle_incoming_block(PeerState& ps, const std::vector<uint8_t>& raw){
-    if (raw.empty() || raw.size() > MIQ_FALLBACK_MAX_BLOCK_SZ) return;
-
-    Block b;
-    if (!deser_block(raw, b)) return;
-
-    auto h  = b.block_hash();
-    auto ph = b.header.prev_hash;
-
-    // already have it?
-    if (chain_.have_block(h)) return;
-
-    // have the parent? if yes, try to accept immediately
-    if (chain_.have_block(ph)) {
-        std::string err;
-        if (chain_.submit_block(b, err)) {
-            log_info("P2P: accepted block via peer " + ps.ip);
-            if (ps.syncing) {
-                ps.next_index++;
-                request_block_index(ps, ps.next_index);
-            }
-            broadcast_inv_block(h);
-            // process any children waiting on this hash
-            try_connect_orphans(hexkey(h));
-        } else {
-            log_warn("P2P: reject block (" + err + ")");
-            ps.syncing = false;
-        }
+void P2P::handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload){
+    int64_t t = now_ms();
+    if (t - ps.last_addr_ms < MIQ_ADDR_MIN_INTERVAL_MS) {
+        // too chatty about addresses -> small mis
+        if (++ps.mis > 20) { banned_.insert(ps.ip); }
         return;
     }
+    ps.last_addr_ms = t;
 
-    // Parent unknown -> store as orphan & request parent
-    const std::string child_hex  = hexkey(h);
-    const std::string parent_hex = hexkey(ph);
+    if (payload.size() % 4 != 0) return;
+    size_t n = payload.size() / 4;
+    if (n > MIQ_ADDR_MAX_BATCH) n = MIQ_ADDR_MAX_BATCH;
 
-    evict_orphans_if_needed(raw.size());
-    if (orphans_.size() >= MIQ_ORPHAN_MAX_COUNT || orphan_bytes_ + raw.size() > MIQ_ORPHAN_MAX_BYTES) {
-        log_warn("P2P: orphan limits reached, dropping child " + child_hex);
-        return;
+    size_t accepted = 0;
+    for (size_t i=0;i<n;i++){
+        uint32_t be_ip =
+            (uint32_t(payload[4*i+0])<<24) |
+            (uint32_t(payload[4*i+1])<<16) |
+            (uint32_t(payload[4*i+2])<<8 ) |
+            (uint32_t(payload[4*i+3])<<0 );
+        if (!ipv4_is_public(be_ip)) continue;
+        addrv4_.insert(be_ip);
+        ++accepted;
     }
-
-    orphans_[child_hex] = OrphanRec{h, ph, raw};
-    orphan_children_[parent_hex].push_back(child_hex);
-    orphan_bytes_ += raw.size();
-
-    log_info("P2P: stored orphan " + child_hex + " waiting for " + parent_hex);
-    request_block_hash(ps, ph);
+    if (accepted == 0) {
+        if (++ps.mis > 30) banned_.insert(ps.ip);
+    }
 }
 
-// ========================================================================
+// ============================================================================
 
 void P2P::loop(){
 #ifdef _WIN32
@@ -448,6 +476,8 @@ void P2P::loop(){
                             ps.syncing = true;
                             ps.next_index = chain_.height() + 1;
                             request_block_index(ps, ps.next_index);
+                            // ask for addresses once
+                            maybe_send_getaddr(ps);
 
                         } else if (cmd == "ping") {
                             auto pong = encode_msg("pong", m.payload);
@@ -484,7 +514,45 @@ void P2P::loop(){
                             }
 
                         } else if (cmd == "block") {
-                            handle_incoming_block(ps, m.payload);
+                            // inbound block rate limiting
+                            if (!rate_consume_block(ps, m.payload.size())) {
+                                if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
+                                // silently drop
+                                continue;
+                            }
+                            if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
+                                Block b;
+                                if (deser_block(m.payload, b)) {
+                                    std::string err;
+                                    if (!chain_.have_block(b.block_hash())) {
+                                        if (chain_.submit_block(b, err)) {
+                                            log_info("P2P: accepted block via peer " + ps.ip);
+                                            if (ps.syncing) {
+                                                ps.next_index++;
+                                                request_block_index(ps, ps.next_index);
+                                            }
+                                            broadcast_inv_block(b.block_hash());
+                                        } else {
+                                            log_warn("P2P: reject block (" + err + ")");
+                                            ps.syncing = false;
+                                        }
+                                    }
+                                }
+                            }
+
+                        } else if (cmd == "tx") {
+                            // If/when you support tx relay: enforce tx rate too.
+                            if (!rate_consume_tx(ps, m.payload.size())) {
+                                if ((ps.banscore += 3) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
+                                continue;
+                            }
+                            // (No-op here; TX relay not wired yet.)
+
+                        } else if (cmd == "getaddr") {
+                            send_addr_snapshot(ps);
+
+                        } else if (cmd == "addr") {
+                            handle_addr_msg(ps, m.payload);
 
                         } else {
                             // unknown -> small mis score
@@ -501,17 +569,17 @@ void P2P::loop(){
 
         timers_section:
             // --- timeouts / pings (run regardless of readability) ---
-            int64_t now = now_ms();
-            if (!ps.verack_ok && (now - ps.last_ms) > MIQ_P2P_VERACK_TIMEOUT_MS) {
+            int64_t tnow = now_ms();
+            if (!ps.verack_ok && (tnow - ps.last_ms) > MIQ_P2P_VERACK_TIMEOUT_MS) {
                 dead.push_back(s);
                 continue;
             }
-            if (!ps.awaiting_pong && (now - ps.last_ping_ms) > MIQ_P2P_PING_EVERY_MS) {
+            if (!ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PING_EVERY_MS) {
                 auto ping = encode_msg("ping", {});
                 send(s, (const char*)ping.data(), (int)ping.size(), 0);
-                ps.last_ping_ms = now;
+                ps.last_ping_ms = tnow;
                 ps.awaiting_pong = true;
-            } else if (ps.awaiting_pong && (now - ps.last_ping_ms) > MIQ_P2P_PONG_TIMEOUT_MS) {
+            } else if (ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PONG_TIMEOUT_MS) {
                 if ((ps.banscore += 20) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
                 dead.push_back(s);
             }
