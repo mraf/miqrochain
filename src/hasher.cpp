@@ -320,4 +320,54 @@ struct ShaniInit {
     ShaniInit(){ std::call_once(g_shaniOnce, try_enable_shani); }
 } s_shani_init;
 
+void fastsha_init(FastSha256Ctx& c){
+    c.H[0]=0x6a09e667u; c.H[1]=0xbb67ae85u; c.H[2]=0x3c6ef372u; c.H[3]=0xa54ff53au;
+    c.H[4]=0x510e527fu; c.H[5]=0x9b05688cu; c.H[6]=0x1f83d9abu; c.H[7]=0x5be0cd19u;
+    c.total = 0; c.blen = 0;
+}
+void fastsha_update(FastSha256Ctx& c, const uint8_t* p, size_t n){
+    if(n==0) return;
+    if(c.blen){
+        size_t need = 64 - c.blen;
+        size_t take = (n < need) ? n : need;
+        std::memcpy(c.buf + c.blen, p, take);
+        c.blen += take; p += take; n -= take;
+        if(c.blen == 64){
+            g_sha256_compress(c.H, c.buf);
+            c.total += 64; c.blen = 0;
+        }
+    }
+    while(n >= 64){
+        g_sha256_compress(c.H, p);
+        c.total += 64; p += 64; n -= 64;
+    }
+    if(n){ std::memcpy(c.buf, p, n); c.blen = n; }
+}
+void fastsha_final_copy(const FastSha256Ctx& c_in, uint8_t out32[32]){
+    FastSha256Ctx c = c_in;
+    uint8_t pad[128];
+    size_t bl = c.blen;
+    std::memcpy(pad, c.buf, bl);
+    pad[bl++] = 0x80;
+    size_t padzeros = ((bl % 64) <= 56) ? (56 - (bl % 64)) : (120 - (bl % 64));
+    std::memset(pad+bl, 0, padzeros); bl += padzeros;
+    uint64_t bits = c.total * 8ull;
+    for(int i=7;i>=0;--i) pad[bl++] = (uint8_t)(bits >> (8*i));
+    g_sha256_compress(c.H, pad);
+    if(bl > 64) g_sha256_compress(c.H, pad+64);
+    for(int i=0;i<8;i++){
+        out32[4*i+0] = (uint8_t)(c.H[i] >> 24);
+        out32[4*i+1] = (uint8_t)(c.H[i] >> 16);
+        out32[4*i+2] = (uint8_t)(c.H[i] >> 8);
+        out32[4*i+3] = (uint8_t)(c.H[i]);
+    }
+}
+void dsha256_from_base(const FastSha256Ctx& base, const uint8_t* suffix, size_t n, uint8_t out32[32]){
+    FastSha256Ctx c = base;
+    if(n) fastsha_update(c, suffix, n);
+    uint8_t h1[32];
+    fastsha_final_copy(c, h1);
+    FastSha256Ctx c2; fastsha_init(c2); fastsha_update(c2, h1, 32); fastsha_final_copy(c2, out32);
+}
+
 } // namespace miq
