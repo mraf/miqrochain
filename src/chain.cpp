@@ -16,19 +16,43 @@
 #include <cstring>         // std::memcmp
 
 // after your existing includes in chain.cpp
+#ifdef __has_include
+#  if __has_include("constants.h")
+#    include "constants.h"
+#  endif
+#endif
+
 #ifndef MAX_TX_SIZE
 #define MIQ_FALLBACK_MAX_TX_SIZE (100u * 1024u) // 100 KiB default
 #else
 #define MIQ_FALLBACK_MAX_TX_SIZE (MAX_TX_SIZE)
 #endif
 
+#ifndef MIQ_RULE_ENFORCE_LOW_S
+#define MIQ_RULE_ENFORCE_LOW_S 0
+#endif
 
 namespace miq {
 
 // === Added: local constants (non-breaking) ===
 static constexpr size_t MAX_BLOCK_SIZE_LOCAL = 1 * 1024 * 1024; // 1 MiB
 
-// === Added: compact bits -> 32-byte big-endian target, and hash <= target check ===
+// --- Low-S helper (secp256k1 n/2, big-endian) --------------------
+static inline bool is_low_s64(const std::vector<uint8_t>& sig64){
+    if (sig64.size() != 64) return false;
+    static const uint8_t N_HALF[32] = {
+        0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0
+    };
+    const uint8_t* s = sig64.data() + 32;
+    for (int i=0;i<32;i++){
+        if (s[i] < N_HALF[i]) return true;
+        if (s[i] > N_HALF[i]) return false;
+    }
+    return true; // equal allowed
+}
+
+// === compact bits -> big-endian target, and hash <= target check ===
 static inline void bits_to_target_be(uint32_t bits, uint8_t out[32]) {
     std::memset(out, 0, 32);
     uint32_t exp = bits >> 24;
@@ -36,41 +60,25 @@ static inline void bits_to_target_be(uint32_t bits, uint8_t out[32]) {
     if (mant == 0) { return; } // invalid -> zero target (will fail compare)
 
     if (exp <= 3) {
-        // Right shift mantissa
         uint32_t mant2 = mant >> (8 * (3 - exp));
         out[29] = uint8_t((mant2 >> 16) & 0xff);
         out[30] = uint8_t((mant2 >> 8)  & 0xff);
         out[31] = uint8_t((mant2 >> 0)  & 0xff);
     } else {
-        // Place mantissa at position (32 - exp)
         int pos = int(32) - int(exp);
-        if (pos < 0) {
-            // Extremely large exponent -> target overflows 256 bits -> treat as max target
-            out[0] = 0xff; out[1] = 0xff; out[2] = 0xff; // effectively "always true"
-            return;
-        }
-        if (pos > 29) pos = 29; // defensive clamp
+        if (pos < 0) { out[0] = out[1] = out[2] = 0xff; return; }
+        if (pos > 29) pos = 29;
         out[pos + 0] = uint8_t((mant >> 16) & 0xff);
         out[pos + 1] = uint8_t((mant >> 8)  & 0xff);
         out[pos + 2] = uint8_t((mant >> 0)  & 0xff);
     }
 }
-
 static inline bool meets_target_be(const std::vector<uint8_t>& hash32, uint32_t bits) {
     if (hash32.size() != 32) return false;
     uint8_t target[32];
     bits_to_target_be(bits, target);
-    // Interpret both as big-endian 256-bit integers: hash <= target
-    return std::memcmp(hash32.data(), target, 32) <= 0;
+    return std::memcmp(hash32.data(), target, 32) <= 0; // hash <= target
 }
-
-// === Added: low-S threshold (secp256k1 order/2) for canonical signatures ===
-static const uint8_t SECP256K1_N_HALF[32] = {
-    0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-    0x5D,0x57,0x6E,0xE7,0x57,0x12,0xA2,0x4F,
-    0x56,0x28,0x14,0x81,0x68,0xB9,0xC5,0x8D
-};
 
 // =====================================================================
 
@@ -281,6 +289,9 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         auto hash = sigh(tx);
 
         for(const auto& inx: tx.vin){
+            // Strict pubkey length
+            if (inx.pubkey.size() != 33 && inx.pubkey.size() != 65) { err="bad pubkey size"; return false; }
+
             Key k{inx.prev.txid, inx.prev.vout};
             if (spent_in_block.find(k) != spent_in_block.end()){ err="in-block double-spend"; return false; }
             spent_in_block.insert(k);
@@ -289,26 +300,10 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
             if(!utxo_.get(inx.prev.txid, inx.prev.vout, e)){ err="missing utxo"; return false; }
             if(e.coinbase && tip_.height+1 < e.height + COINBASE_MATURITY){ err="immature coinbase"; return false; }
             if(hash160(inx.pubkey)!=e.pkh){ err="pkh mismatch"; return false; }
-
-            // === Strict key/sig policy (consensus) ===
-            // Compressed pubkey only (33 bytes, 0x02 or 0x03)
-            if (inx.pubkey.size() != 33 || (inx.pubkey[0] != 0x02 && inx.pubkey[0] != 0x03)) {
-                err = "bad pubkey"; return false;
-            }
-            // Signature must be 64 bytes (r||s)
-            if (inx.sig.size() != 64) { err = "bad siglen"; return false; }
-            // Optional: low-S canonical (s <= n/2). s is last 32 bytes (big-endian)
-            {
-                const uint8_t* s_ptr = inx.sig.data() + 32;
-                bool s_is_high = false;
-                for (int j = 0; j < 32; ++j) {
-                    if (s_ptr[j] > SECP256K1_N_HALF[j]) { s_is_high = true; break; }
-                    if (s_ptr[j] < SECP256K1_N_HALF[j]) { break; }
-                }
-                if (s_is_high) { err = "non-canonical-S"; return false; }
-            }
-
             if(!crypto::ECDSA::verify(inx.pubkey, hash, inx.sig)){ err="bad signature"; return false; }
+        #if MIQ_RULE_ENFORCE_LOW_S
+            if (!is_low_s64(inx.sig)) { err="high-S signature"; return false; }
+        #endif
 
             if (!leq_max_money(e.value)) { err="utxo>MAX_MONEY"; return false; }
             if (!add_u64_safe(in, e.value, tmp)) { err="tx in overflow"; return false; }
