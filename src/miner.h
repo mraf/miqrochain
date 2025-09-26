@@ -1,50 +1,52 @@
 #pragma once
-#include <atomic>
-#include <thread>
 #include <vector>
 #include <cstdint>
-#include <string>
-
+#include <atomic>
+#include <thread>
 #include "block.h"
-#include "chain.h"
-#include "mempool.h"
-#include "p2p.h"
 
 namespace miq {
 
+// === Public miner stats API (kept stable) ===
+struct MinerStats { double hps; uint64_t total; double window_secs; };
+
+uint64_t miner_hashes_snapshot_and_reset();
+uint64_t miner_hashes_total();
+MinerStats miner_stats_now();
+bool meets_target(const std::vector<uint8_t>& hv, uint32_t bits);
+
+class Chain;
+class P2P;
+
+// Integrated, network-aware background miner
 class Miner {
 public:
-    // p2p may be null; when present we’ll use its mempool and broadcast
-    Miner(Chain& chain, P2P* p2p = nullptr);
+    explicit Miner(Chain& chain, P2P* p2p = nullptr);
     ~Miner();
 
-    // Set the payout pubkey-hash for the coinbase output (20 bytes expected).
-    void set_reward_pkh(const std::vector<uint8_t>& pkh);
+    void set_reward_pkh(const std::vector<uint8_t>& pkh20);  // 20-byte PKH
+    void set_threads(unsigned t);                             // 0 => auto (hw_concurrency)
+    void set_max_txs(size_t n);                               // txs to include from mempool
+    void set_rebuild_interval_ms(int64_t ms);                 // refresh template (time/txs)
 
-    // Start/stop a single mining thread.
-    bool start();
+    void start();
     void stop();
-    bool running() const { return running_.load(); }
+    bool running() const { return running_; }
 
 private:
     Chain& chain_;
-    P2P*   p2p_{nullptr};
-
+    P2P*   p2p_;
     std::thread th_;
     std::atomic<bool> running_{false};
 
-    // where to pay the subsidy+fees
-    std::vector<uint8_t> reward_pkh_;
+    std::vector<uint8_t> reward_pkh20_;
+    unsigned threads_{0};
+    size_t   max_txs_{2000};
+    int64_t  rebuild_ms_{5000}; // rebuild header/time/tx set every ~5s
 
-    // Build a block template (coinbase + selected mempool txs), return expected bits.
-    bool build_template(Block& out, uint32_t& bits_out);
-
-    // Main mining loop.
-    void mine_loop();
-
-    // Helpers: difficulty target checks
-    static void bits_to_target_be(uint32_t bits, uint8_t out[32]);
-    static bool meets_target_be(const std::vector<uint8_t>& hash32, uint32_t bits);
+    void run();
+    bool build_template(Block& b, uint32_t& bits);
+    bool pow_loop(Block& b, uint32_t bits); // returns true if found (fills nonce)
 };
 
 } // namespace miq
