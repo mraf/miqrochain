@@ -275,7 +275,7 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
             const std::string phex = hexkey(b.header.prev_hash);
             orphans_.emplace(child_hex, OrphanRec{b.block_hash(), b.header.prev_hash, std::move(rec.raw)});
             orphan_children_[phex].push_back(child_hex);
-            orphan_bytes_ += b.raw().size(); // not available; fallback to rec.raw.size()
+            orphan_bytes_ += rec.raw.size();
             continue;
         }
 
