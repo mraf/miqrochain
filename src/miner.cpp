@@ -1,15 +1,3 @@
-// miner.cpp — optimized hot path (no consensus/ABI changes, no warnings on MSVC/GCC/Clang)
-//
-// - Keeps public behavior identical (header layout, PoW hash, meets_target signature).
-// - Optimizations:
-//     * Per-thread cached difficulty target
-//     * Disjoint nonce strides per thread (no collisions)
-//     * Fewer atomics (batched counters)
-//     * Direct hash-vs-target compare (no intermediate copy)
-//     * Optional Windows thread affinity behind MIQ_SET_AFFINITY
-//
-// Build tips: Release x64, /O2 or -O3, consider LTO. Define MIQ_SET_AFFINITY on Windows if you want core pinning.
-
 #include "miner.h"
 #include "sha256.h"
 #include "merkle.h"
@@ -24,6 +12,8 @@
 #include <ctime>
 #include <cstring>
 #include <string>
+#include <chrono>
+#include <array>
 
 #if defined(_WIN32) && defined(MIQ_SET_AFFINITY)
   #define NOMINMAX
@@ -45,6 +35,24 @@ uint64_t miner_hashes_snapshot_and_reset(){
 }
 uint64_t miner_hashes_total(){
     return g_hashes_total.load(std::memory_order_relaxed);
+}
+
+// Optional instantaneous stats window (header declares this)
+MinerStats miner_stats_now() {
+    using clock = std::chrono::steady_clock;
+    static auto last_t = clock::now();
+    static uint64_t last_total = miner_hashes_total();
+
+    const auto  now   = clock::now();
+    const double secs = std::chrono::duration<double>(now - last_t).count();
+    const uint64_t tot = miner_hashes_total();
+    const uint64_t dif = (tot >= last_total) ? (tot - last_total) : 0ULL;
+
+    const double hps = (secs > 0.0) ? static_cast<double>(dif) / secs : 0.0;
+
+    last_t = now;
+    last_total = tot;
+    return MinerStats{ hps, tot, secs };
 }
 
 // --------- difficulty: compact -> 32-byte big-endian target ---------
@@ -150,8 +158,8 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
     if(threads==0) threads = 1;
 
     // === Build binary header prefix once (everything except nonce)
-    const std::vector<uint8_t> header_prefix = build_header_prefix(b.header);
-    const size_t nonce_off = header_prefix.size(); // LE nonce goes right after
+    const std::vector<uint8_t> header_prefix = build_header_prefix(b.header); // 80 bytes
+    const size_t nonce_off = header_prefix.size(); // LE nonce goes right after (offset 80)
 
     std::atomic<bool> found{false};
     std::atomic<uint64_t> best_nonce{0};
@@ -162,6 +170,19 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
     // Precompute target once (shared read-only)
     unsigned char Tglob[HASH_LEN];
     target_from_compact(bits, Tglob);
+
+    // Precompute header midstate for first SHA-256 (first 80 bytes)
+    // Only used when MIQ_POW_SALT is NOT defined; otherwise we use salted_header_hash().
+#if !defined(MIQ_POW_SALT)
+    std::array<uint8_t,64> first64;
+    std::array<uint8_t,16> tail16;
+    // header_prefix is always 80 bytes by construction
+    std::memcpy(first64.data(), header_prefix.data(), 64);
+    std::memcpy(tail16 .data(), header_prefix.data()+64, 16);
+
+    SHA256 base64; base64.init(); base64.update(first64.data(), first64.size());
+    SHA256 base80 = base64;       base80.update(tail16 .data(), tail16 .size());
+#endif
 
     // Make a common, well-distributed base
     const uint64_t base_nonce =
@@ -180,7 +201,7 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
             uint64_t local_hashes = 0;
             const uint64_t FLUSH_EVERY = (1ull<<18); // fewer atomics, better throughput
 
-            // Per-thread header buffer reused every hash (no allocations)
+            // Per-thread header buffer reused every hash (for salted fallback path)
             std::vector<uint8_t> hdr = header_prefix;
             hdr.resize(header_prefix.size() + 8); // reserve LE nonce slot
             uint8_t* nonce_ptr = hdr.data() + nonce_off;
@@ -189,16 +210,38 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
             const uint64_t stride = static_cast<uint64_t>(threads);
             uint64_t nonce = (base_nonce + static_cast<uint64_t>(t));
 
+            // Local copy of base80 for this thread (immutable template we copy per nonce)
+#if !defined(MIQ_POW_SALT)
+            const SHA256 base80_local = base80;
+#endif
+
             while(!found.load(std::memory_order_relaxed)){
-                // Overwrite the 8-byte nonce in place (LE)
+                // Overwrite the 8-byte nonce in place (LE) for fallback path and for nonce_le
                 store_u64_le(nonce_ptr, nonce);
 
-                // Double-SHA256(header) — accelerated path (falls back internally)
-                // NOTE: 'salted_header_hash' keeps PoW semantics unless MIQ_POW_SALT is defined.
-                const auto hv = salted_header_hash(hdr);
+                uint8_t h[HASH_LEN];
 
-                // Compare directly without copying; Tglob is constant per block
-                if(hv.size()==HASH_LEN && hash_leq_target(hv.data(), Tglob)){
+            #if !defined(MIQ_POW_SALT)
+                // ---- Fast path with header midstate (no salt) ----
+                // First hash: copy base80, update with nonce, finalize
+                SHA256 ctx = base80_local;
+                uint8_t nonce_le[8];
+                store_u64_le(nonce_le, nonce);
+                ctx.update(nonce_le, sizeof(nonce_le));
+                uint8_t mid[HASH_LEN];
+                ctx.final(mid);
+
+                // Second hash (over 32 bytes)
+                SHA256 s2; s2.init();
+                s2.update(mid, sizeof(mid));
+                s2.final(h);
+            #else
+                // ---- Salted build or other semantics: use canonical hasher ----
+                const auto hv = salted_header_hash(hdr);
+                std::memcpy(h, hv.data(), HASH_LEN);
+            #endif
+
+                if(hash_leq_target(h, Tglob)){
                     best_nonce.store(nonce, std::memory_order_relaxed);
                     found.store(true, std::memory_order_relaxed);
                     // final flush (count this attempt)
