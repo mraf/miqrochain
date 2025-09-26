@@ -32,9 +32,16 @@ struct PeerState {
     int         mis{0};
     int64_t     last_ms{0};
 
-    // ---- ADDED: lightweight sync state (non-breaking) ----
-    bool        syncing{false};     // are we currently syncing from this peer?
-    uint64_t    next_index{0};      // next block index (height) we will request
+    // --- sync state (existing) ---
+    bool        syncing{false};
+    uint64_t    next_index{0};
+
+    // --- NEW: per-peer RX buffer & liveness ---
+    std::vector<uint8_t> rx;
+    bool        verack_ok{false};
+    int64_t     last_ping_ms{0};
+    bool        awaiting_pong{false};
+    int         banscore{0};
 };
 
 class P2P {
@@ -51,7 +58,7 @@ public:
     // Broadcast inventory for a new block hash we just accepted/mined
     void broadcast_inv_block(const std::vector<uint8_t>& block_hash);
 
-    // Optional: set where bans.txt is stored (kept private field)
+    // Optional: where to store bans.txt
     inline void set_datadir(const std::string& d) { datadir_ = d; }
 
 private:
@@ -68,7 +75,7 @@ private:
     void load_bans();
     void save_bans();
 
-    // ---- ADDED: helpers for sync & block serving (definitions in p2p.cpp) ----
+    // helpers for sync & block serving
     void start_sync_with_peer(PeerState& ps);
     void request_block_index(PeerState& ps, uint64_t index);
     void request_block_hash(PeerState& ps, const std::vector<uint8_t>& h);
