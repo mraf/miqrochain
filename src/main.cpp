@@ -406,7 +406,7 @@ int main(int argc, char** argv){
                             } else {
                                 nb = lwma_next_bits(headers, BLOCK_TIME_SECS, GENESIS_BITS);
                             }
-                            b = mine_block(t.hash, nb, cbt, txs, threads);
+                            b = miq::mine_block(t.hash, nb, cbt, txs, threads);
                         } catch (const std::exception& ex) {
                             log_error(std::string("miner D(mine_block) fatal: ") + ex.what());
                             continue; // loop again
