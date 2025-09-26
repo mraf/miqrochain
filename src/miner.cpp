@@ -341,4 +341,4 @@ void Miner::run(){
     log_info("miner: stopped");
 }
 
-} // namespace miq
+}
