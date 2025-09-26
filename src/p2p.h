@@ -24,6 +24,8 @@
   #include <unistd.h>
 #endif
 
+#include "mempool.h"  // we embed a Mempool instance
+
 namespace miq {
 
 class Chain; // fwd
@@ -58,6 +60,9 @@ struct PeerState {
 
     // addr throttling
     int64_t     last_addr_ms{0};
+
+    // tx relay: which txids we’ve requested and await
+    std::unordered_set<std::string> inflight_tx;
 };
 
 class P2P {
@@ -71,14 +76,19 @@ public:
     // Outbound connect to a seed (hostname or IP)
     bool connect_seed(const std::string& host, uint16_t port);
 
-    // Broadcast inventory for a new block hash we just accepted/mined
+    // Broadcast inventory for a new block/tx we just accepted/mined
     void broadcast_inv_block(const std::vector<uint8_t>& block_hash);
+    void broadcast_inv_tx(const std::vector<uint8_t>& txid);
 
     // Optional: where to store bans.txt
     inline void set_datadir(const std::string& d) { datadir_ = d; }
 
     // tiny, local and fast hex for keys
     static std::string hexkey(const std::vector<uint8_t>& h);
+
+    // expose mempool if callers need it later (optional)
+    inline Mempool& mempool() { return mempool_; }
+    inline const Mempool& mempool() const { return mempool_; }
 
 private:
     Chain& chain_;
@@ -100,6 +110,14 @@ private:
     size_t orphan_bytes_limit_{0};
     size_t orphan_count_limit_{0};
 
+    // tx relay cache & dedupe
+    std::unordered_map<std::string, std::vector<uint8_t>> tx_store_;
+    std::deque<std::string> tx_order_;
+    std::unordered_set<std::string> seen_txids_;
+
+    // local mempool
+    Mempool mempool_;
+
     // core
     void loop();
     void handle_new_peer(int c, const std::string& ip);
@@ -111,6 +129,10 @@ private:
     void request_block_index(PeerState& ps, uint64_t index);
     void request_block_hash(PeerState& ps, const std::vector<uint8_t>& h);
     void send_block(int s, const std::vector<uint8_t>& raw);
+
+    // tx relay helpers
+    void request_tx(PeerState& ps, const std::vector<uint8_t>& txid);
+    void send_tx(int sock, const std::vector<uint8_t>& raw);
 
     // rate-limit helpers
     void rate_refill(PeerState& ps, int64_t now);
