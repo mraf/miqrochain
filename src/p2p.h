@@ -27,28 +27,30 @@ namespace miq {
 
 class Chain; // forward declaration
 
-struct OrphanRec {
-    std::vector<uint8_t> hash;  // block hash (32 bytes)
-    std::vector<uint8_t> prev;  // prev hash (32 bytes)
-    std::vector<uint8_t> raw;   // serialized block
-};
-
 struct PeerState {
     int         sock{-1};
     std::string ip;
     int         mis{0};
     int64_t     last_ms{0};
 
-    // --- sync state ---
+    // sync state
     bool        syncing{false};
     uint64_t    next_index{0};
 
-    // --- per-peer RX buffer & liveness ---
+    // per-peer RX buffer & liveness
     std::vector<uint8_t> rx;
     bool        verack_ok{false};
     int64_t     last_ping_ms{0};
     bool        awaiting_pong{false};
     int         banscore{0};
+
+    // --- NEW: per-peer rate-limiting (token buckets) ---
+    uint64_t    blk_tokens{0};        // bytes available for blocks
+    uint64_t    tx_tokens{0};         // bytes available for txs
+    int64_t     last_refill_ms{0};    // last refill timestamp
+
+    // --- NEW: addr anti-spam ---
+    int64_t     last_addr_ms{0};      // last time we accepted an addr batch
 };
 
 class P2P {
@@ -77,22 +79,10 @@ private:
     std::set<std::string> banned_;
     std::string datadir_{"./miqdata"};
 
-    // ---- Orphan management (BTC-style) ----
-    // key = hex(childHash) -> orphan record
-    std::unordered_map<std::string, OrphanRec> orphans_;
-    // key = hex(parentHash) -> vector of child hex hashes waiting on it
-    std::unordered_map<std::string, std::vector<std::string>> orphan_children_;
-    size_t orphan_bytes_{0};
+    // addr table (IPv4, network byte order)
+    std::unordered_set<uint32_t> addrv4_;
+    int64_t last_addr_broadcast_ms_{0};
 
-    // Limits (tweakable at compile time)
-#ifndef MIQ_ORPHAN_MAX_COUNT
-#define MIQ_ORPHAN_MAX_COUNT  4096u
-#endif
-#ifndef MIQ_ORPHAN_MAX_BYTES
-#define MIQ_ORPHAN_MAX_BYTES  (64u * 1024u * 1024u) // 64 MiB
-#endif
-
-    // --- main loop & helpers ---
     void loop();
     void handle_new_peer(int c, const std::string& ip);
     void load_bans();
@@ -104,11 +94,20 @@ private:
     void request_block_hash(PeerState& ps, const std::vector<uint8_t>& h);
     void send_block(int s, const std::vector<uint8_t>& raw);
 
-    // orphan helpers
+    // --- NEW: rate limiting helpers ---
+    void rate_refill(PeerState& ps, int64_t now_ms);
+    bool rate_consume_block(PeerState& ps, size_t nbytes); // true = ok
+    bool rate_consume_tx(PeerState& ps, size_t nbytes);    // true = ok
+
+    // --- NEW: addr filtering / handling ---
+    void maybe_send_getaddr(PeerState& ps);
+    void handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload);
+    void send_addr_snapshot(PeerState& ps);
+
+    // utils
     static std::string hexkey(const std::vector<uint8_t>& h);
-    void handle_incoming_block(PeerState& ps, const std::vector<uint8_t>& raw);
-    void try_connect_orphans(const std::string& parent_hex);
-    void evict_orphans_if_needed(size_t incoming_bytes);
+    static bool ipv4_is_public(uint32_t be_ip);
+    static bool parse_ipv4(const std::string& dotted, uint32_t& be_ip);
 };
 
 } // namespace miq
