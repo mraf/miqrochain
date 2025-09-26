@@ -66,6 +66,17 @@
   #define CLOSESOCK(s) close(s)
 #endif
 
+std::string P2P::hexkey(const std::vector<uint8_t>& h) {
+    // tiny, local and fast; avoids extra deps
+    static const char* kHex = "0123456789abcdef";
+    std::string s; s.resize(h.size()*2);
+    for (size_t i=0;i<h.size();++i) {
+        s[2*i+0] = kHex[(h[i]>>4) & 0xF];
+        s[2*i+1] = kHex[(h[i]    ) & 0xF];
+    }
+    return s;
+}
+
 namespace miq {
 
 static int64_t now_ms() {
