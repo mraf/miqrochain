@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <vector>
 #include <unordered_set>
-#include <unordered_map> // needed for orphan maps used here
 
 #ifdef __has_include
 #  if __has_include("constants.h")
@@ -68,17 +67,6 @@
 #endif
 
 namespace miq {
-
-// tiny hex helper for map keys
-std::string P2P::hexkey(const std::vector<uint8_t>& h) {
-    static const char* kHex = "0123456789abcdef";
-    std::string s; s.resize(h.size()*2);
-    for (size_t i=0;i<h.size();++i) {
-        s[2*i+0] = kHex[(h[i]>>4) & 0xF];
-        s[2*i+1] = kHex[(h[i]    ) & 0xF];
-    }
-    return s;
-}
 
 static int64_t now_ms() {
     using namespace std::chrono;
@@ -226,95 +214,137 @@ void P2P::send_block(int s, const std::vector<uint8_t>& raw){
     send(s, (const char*)msg.data(), (int)msg.size(), 0);
 }
 
-// =================== orphan handling ===================
+// ---- orphan helpers ------------------------------------------------
 
-void P2P::try_connect_orphans(const std::string& parent_hex) {
-    auto it = orphan_children_.find(parent_hex);
-    if (it == orphan_children_.end()) return;
+std::string P2P::hexkey(const std::vector<uint8_t>& h) {
+    static const char* kHex = "0123456789abcdef";
+    std::string s; s.resize(h.size()*2);
+    for (size_t i=0;i<h.size();++i) {
+        s[2*i+0] = kHex[(h[i]>>4) & 0xF];
+        s[2*i+1] = kHex[(h[i]    ) & 0xF];
+    }
+    return s;
+}
 
-    auto kids = it->second;
-    orphan_children_.erase(it);
+void P2P::evict_orphans_if_needed(size_t incoming_bytes){
+    // simple policy: while over limits, evict one arbitrary orphan (begin())
+    while (!orphans_.empty() &&
+          (orphans_.size()+1 > MIQ_ORPHAN_MAX_COUNT ||
+           orphan_bytes_ + incoming_bytes > MIQ_ORPHAN_MAX_BYTES))
+    {
+        auto it = orphans_.begin();
+        const std::string child_hex = it->first;
+        const std::string parent_hex = hexkey(it->second.prev);
+        orphan_bytes_ -= it->second.raw.size();
+        orphans_.erase(it);
 
-    for (const auto& child_hex : kids) {
-        auto it2 = orphans_.find(child_hex);
-        if (it2 == orphans_.end()) continue;
-
-        Block cb;
-        if (deser_block(it2->second.raw, cb)) {
-            std::string err;
-            if (chain_.submit_block(cb, err)) {
-                broadcast_inv_block(cb.block_hash());
-                // Recursively connect grandchildren
-                try_connect_orphans(child_hex);
-            } else {
-                log_warn("P2P: orphan child invalid on connect (" + err + ")");
-            }
+        auto oc = orphan_children_.find(parent_hex);
+        if (oc != orphan_children_.end()) {
+            auto& vec = oc->second;
+            vec.erase(std::remove(vec.begin(), vec.end(), child_hex), vec.end());
+            if (vec.empty()) orphan_children_.erase(oc);
         }
-        orphans_.erase(child_hex);
     }
 }
 
-void P2P::handle_incoming_block(int sock, const std::vector<uint8_t>& raw) {
-    Block b;
-    if (!deser_block(raw, b)) {
-        log_warn("P2P: bad block payload (deserialize failed)");
-        return;
+void P2P::try_connect_orphans(const std::string& parent_hex){
+    // BFS queue of children to try
+    std::vector<std::string> q;
+    auto it = orphan_children_.find(parent_hex);
+    if (it != orphan_children_.end()) {
+        q = it->second;
+        orphan_children_.erase(it);
     }
-    const auto h  = b.block_hash();
-    const auto ph = b.header.prev_hash;
-    const std::string hx  = hexkey(h);
-    const std::string phx = hexkey(ph);
+
+    while (!q.empty()) {
+        const std::string child_hex = q.back(); q.pop_back();
+        auto oit = orphans_.find(child_hex);
+        if (oit == orphans_.end()) continue;
+
+        // Take ownership then erase from pool
+        OrphanRec rec = std::move(oit->second);
+        orphan_bytes_ -= rec.raw.size();
+        orphans_.erase(oit);
+
+        Block b;
+        if (!deser_block(rec.raw, b)) continue;
+
+        // If parent not present yet, put it back (unlikely due to race)
+        if (!chain_.have_block(b.header.prev_hash)) {
+            // Requeue as orphan
+            const std::string phex = hexkey(b.header.prev_hash);
+            orphans_.emplace(child_hex, OrphanRec{b.block_hash(), b.header.prev_hash, std::move(rec.raw)});
+            orphan_children_[phex].push_back(child_hex);
+            orphan_bytes_ += b.raw().size(); // not available; fallback to rec.raw.size()
+            continue;
+        }
+
+        std::string err;
+        if (chain_.submit_block(b, err)) {
+            log_info("P2P: connected orphan -> " + child_hex);
+            broadcast_inv_block(b.block_hash());
+
+            // Any children of this block?
+            const std::string nexth = hexkey(b.block_hash());
+            auto oit2 = orphan_children_.find(nexth);
+            if (oit2 != orphan_children_.end()) {
+                // append their children into the queue
+                q.insert(q.end(), oit2->second.begin(), oit2->second.end());
+                orphan_children_.erase(oit2);
+            }
+        } else {
+            log_warn("P2P: orphan connect failed (" + err + ") for " + child_hex);
+        }
+    }
+}
+
+void P2P::handle_incoming_block(PeerState& ps, const std::vector<uint8_t>& raw){
+    if (raw.empty() || raw.size() > MIQ_FALLBACK_MAX_BLOCK_SZ) return;
+
+    Block b;
+    if (!deser_block(raw, b)) return;
+
+    auto h  = b.block_hash();
+    auto ph = b.header.prev_hash;
 
     // already have it?
     if (chain_.have_block(h)) return;
 
-    // parent missing -> store orphan + request parent from same peer
-    if (!chain_.have_block(ph)) {
-        if (!orphans_.count(hx)) {
-            orphans_[hx] = OrphanRec{h, ph, raw};
-            orphan_children_[phx].push_back(hx);
-            log_info("P2P: stored orphan block (waiting for parent " + phx.substr(0,16) + "…)");
-        }
-        auto itp = peers_.find(sock);
-        if (itp != peers_.end()) request_block_hash(itp->second, ph);
-        return;
-    }
-
-    // we have parent -> try commit
-    std::string err;
-    if (!chain_.submit_block(b, err)) {
-        auto pit = peers_.find(sock);
-        if (pit != peers_.end()) {
-            pit->second.banscore += 20;
-            if (pit->second.banscore >= MIQ_P2P_MAX_BANSCORE) {
-                banned_.insert(pit->second.ip);
-                save_bans();
-                log_warn("P2P: banning " + pit->second.ip + " (invalid blocks)");
-                ::shutdown(sock, SHUT_RDWR);
-#ifdef _WIN32
-                closesocket(sock);
-#else
-                close(sock);
-#endif
-                peers_.erase(pit);
+    // have the parent? if yes, try to accept immediately
+    if (chain_.have_block(ph)) {
+        std::string err;
+        if (chain_.submit_block(b, err)) {
+            log_info("P2P: accepted block via peer " + ps.ip);
+            if (ps.syncing) {
+                ps.next_index++;
+                request_block_index(ps, ps.next_index);
             }
+            broadcast_inv_block(h);
+            // process any children waiting on this hash
+            try_connect_orphans(hexkey(h));
+        } else {
+            log_warn("P2P: reject block (" + err + ")");
+            ps.syncing = false;
         }
-        log_warn("P2P: reject block (" + err + ")");
         return;
     }
 
-    // success
-    broadcast_inv_block(h);
+    // Parent unknown -> store as orphan & request parent
+    const std::string child_hex  = hexkey(h);
+    const std::string parent_hex = hexkey(ph);
 
-    // advance sync window for this peer if it’s syncing
-    auto pit = peers_.find(sock);
-    if (pit != peers_.end() && pit->second.syncing) {
-        pit->second.next_index++;
-        request_block_index(pit->second, pit->second.next_index);
+    evict_orphans_if_needed(raw.size());
+    if (orphans_.size() >= MIQ_ORPHAN_MAX_COUNT || orphan_bytes_ + raw.size() > MIQ_ORPHAN_MAX_BYTES) {
+        log_warn("P2P: orphan limits reached, dropping child " + child_hex);
+        return;
     }
 
-    // try connect children that waited on this parent
-    try_connect_orphans(hx);
+    orphans_[child_hex] = OrphanRec{h, ph, raw};
+    orphan_children_[parent_hex].push_back(child_hex);
+    orphan_bytes_ += raw.size();
+
+    log_info("P2P: stored orphan " + child_hex + " waiting for " + parent_hex);
+    request_block_hash(ps, ph);
 }
 
 // ========================================================================
@@ -381,7 +411,6 @@ void P2P::loop(){
             int s = it->first;
             auto &ps = it->second;
 
-            // is this socket readable?
             bool ready = (fds[base + p].revents & POLL_RD) != 0;
 
             if (ready) {
@@ -456,11 +485,10 @@ void P2P::loop(){
                             }
 
                         } else if (cmd == "block") {
-                            if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
-                                handle_incoming_block(s, m.payload);
-                            }
+                            handle_incoming_block(ps, m.payload);
+
                         } else {
-                            // unknown -> small mis score -> drop after some
+                            // unknown -> small mis score
                             if (++ps.mis > 10) { dead.push_back(s); }
                         }
                     }
