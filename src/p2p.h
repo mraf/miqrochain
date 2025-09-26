@@ -74,6 +74,14 @@ private:
         int64_t     last_ping_ms{0};
         bool        awaiting_pong{false};
         int         banscore{0};
+
+        // --- rate limiting buckets ---
+        uint64_t    blk_tokens{0};
+        uint64_t    tx_tokens{0};
+        int64_t     last_refill_ms{0};
+
+        // --- addr cadence ---
+        int64_t     last_addr_ms{0};
     };
 
     std::unordered_map<int, PeerState> peers_;
@@ -85,9 +93,11 @@ private:
     std::unordered_map<std::string, std::vector<std::string>> orphan_children_; // parentHex -> [childHex...]
     std::deque<std::string> orphan_order_;                            // insertion order for eviction
     size_t orphan_bytes_{0};
-    // defaults; can be adjusted by compile-time macros in .cpp
     size_t orphan_bytes_limit_{32u * 1024u * 1024u};  // 32 MiB
     size_t orphan_count_limit_{4096};
+
+    // Address table (IPv4 only here: network byte order)
+    std::unordered_set<uint32_t> addrv4_;
 
     // ---- main loop & helpers ----
     void loop();
@@ -107,6 +117,20 @@ private:
     void try_connect_orphans(const std::string& parent_hex);
     void evict_orphans_if_needed();
     void remove_orphan_by_hex(const std::string& child_hex);
+
+    // rate limiting
+    void rate_refill(PeerState& ps, int64_t now);
+    bool rate_consume_block(PeerState& ps, size_t nbytes);
+    bool rate_consume_tx(PeerState& ps, size_t nbytes);
+
+    // addr handling
+    void maybe_send_getaddr(PeerState& ps);
+    void send_addr_snapshot(PeerState& ps);
+    void handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload);
+
+    // IPv4 parse/filter
+    static bool parse_ipv4(const std::string& dotted, uint32_t& be_ip);
+    static bool ipv4_is_public(uint32_t be_ip);
 };
 
 } // namespace miq
