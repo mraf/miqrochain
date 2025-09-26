@@ -358,6 +358,44 @@ void P2P::rate_refill(PeerState& ps, int64_t now){
     ps.tx_tokens  = std::min<uint64_t>(MIQ_RATE_TX_BURST,   ps.tx_tokens  + add_tx);
     ps.last_refill_ms = now;
 }
+
+void RpcService::ensure_cookie() {
+    const std::string path = datadir_ + "/.cookie";
+    std::ifstream in(path);
+    if (in.good()) {
+        std::getline(in, rpc_token_);
+        in.close();
+        if (!rpc_token_.empty()) return;
+    }
+    // generate new token
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint64_t> dist;
+    std::ostringstream os;
+    os << std::hex << dist(gen) << dist(gen) << dist(gen);
+    rpc_token_ = os.str();
+    std::ofstream out(path, std::ios::trunc);
+    out << rpc_token_ << "\n";
+    out.flush();
+}
+
+bool RpcService::check_auth_header(const std::string& raw_request) {
+    if (!require_auth_) return true;
+    if (rpc_token_.empty()) ensure_cookie();
+    // naive scan for "Authorization: Bearer <token>"
+    const std::string needle = "Authorization: Bearer ";
+    auto pos = raw_request.find(needle);
+    if (pos == std::string::npos) return false;
+    pos += needle.size();
+    auto end = raw_request.find_first_of("\r\n", pos);
+    if (end == std::string::npos) end = raw_request.size();
+    std::string tok = raw_request.substr(pos, end - pos);
+    // trim
+    tok.erase(tok.find_last_not_of(" \t\r\n")+1);
+    return tok == rpc_token_;
+}
+
+
 bool P2P::rate_consume_block(PeerState& ps, size_t nbytes){
     int64_t n = now_ms();
     rate_refill(ps, n);
