@@ -16,6 +16,20 @@
 #include <cstring>
 #include <chrono>
 #include <algorithm>
+#include <limits>
+
+// Kill Windows min/max macros if they slipped in
+#ifdef _WIN32
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
+#endif
+#ifdef max
+#undef max
+#endif
+#ifdef min
+#undef min
+#endif
 
 #if defined(_WIN32) && defined(MIQ_SET_AFFINITY)
   #define NOMINMAX
