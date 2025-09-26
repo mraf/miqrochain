@@ -110,4 +110,18 @@ bool miq::Storage::write_state(const std::vector<uint8_t>& b){
     flush_path(path_state_);
     return true;
 }
+
+bool miq::Storage::read_state(std::vector<uint8_t>& out) const {
+    std::ifstream f(path_state_, std::ios::binary);
+    if (!f) return false;                 // no state file → caller may treat as "fresh"
+    f.seekg(0, std::ios::end);
+    std::streamoff end = f.tellg();
+    if (end < 0) return false;
+    size_t sz = static_cast<size_t>(end);
+    f.seekg(0, std::ios::beg);
+    out.resize(sz);
+    if (sz == 0) return true;             // empty state is valid
+    return (bool)f.read(reinterpret_cast<char*>(out.data()), sz);
 }
+
+} // namespace miq
