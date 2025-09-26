@@ -3,7 +3,7 @@
 
 **Coin:** MIQ (unit: miqron, 1e-8)  
 **Hard cap:** 26,280,000 MIQ • **Block time:** 8 minutes  
-**Ports:** P2P 9833, RPC 9834  
+**Ports:** P2P 443, RPC 9834  
 **DNS seeder:** miqroseed1.freeddns.org
 
 ### ECC backend: how to plug in (2 files)
