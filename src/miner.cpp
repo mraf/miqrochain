@@ -191,7 +191,9 @@ bool Miner::build_template(Block& b, uint32_t& bits){
 
     if (p2p_) {
         // Pull high-fee txs (already policy-checked by mempool)
-        auto picked = p2p_->mempool().collect(max_txs_);
+        auto picked = (p2p_ && p2p_->mempool())
+                ? p2p_->mempool()->collect(max_txs_)
+                : std::vector<Transaction>{};
         b.txs.insert(b.txs.end(), picked.begin(), picked.end());
     }
 
