@@ -174,14 +174,10 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
     // Precompute header midstate for first SHA-256 (first 80 bytes)
     // Only used when MIQ_POW_SALT is NOT defined; otherwise we use salted_header_hash().
 #if !defined(MIQ_POW_SALT)
-    std::array<uint8_t,64> first64;
-    std::array<uint8_t,16> tail16;
-    // header_prefix is always 80 bytes by construction
-    std::memcpy(first64.data(), header_prefix.data(), 64);
-    std::memcpy(tail16 .data(), header_prefix.data()+64, 16);
-
-    SHA256 base64; base64.init(); base64.update(first64.data(), first64.size());
-    SHA256 base80 = base64;       base80.update(tail16 .data(), tail16 .size());
+    // Use the fast SHA-NI accelerated streaming API from hasher.cpp
+    FastSha256Ctx base1;
+    fastsha_init(base1);
+    fastsha_update(base1, header_prefix.data(), header_prefix.size()); // 80 bytes
 #endif
 
     // Make a common, well-distributed base
@@ -210,10 +206,7 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
             const uint64_t stride = static_cast<uint64_t>(threads);
             uint64_t nonce = (base_nonce + static_cast<uint64_t>(t));
 
-            // Local copy of base80 for this thread (immutable template we copy per nonce)
-#if !defined(MIQ_POW_SALT)
-            const SHA256 base80_local = base80;
-#endif
+            // Local copy of base midstate is not needed with fast API (we pass by const&)
 
             while(!found.load(std::memory_order_relaxed)){
                 // Overwrite the 8-byte nonce in place (LE) for fallback path and for nonce_le
@@ -222,19 +215,10 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
                 uint8_t h[HASH_LEN];
 
             #if !defined(MIQ_POW_SALT)
-                // ---- Fast path with header midstate (no salt) ----
-                // First hash: copy base80, update with nonce, finalize
-                SHA256 ctx = base80_local;
+                // ---- Fast path with header midstate (no salt): hash only the 8-byte nonce ----
                 uint8_t nonce_le[8];
                 store_u64_le(nonce_le, nonce);
-                ctx.update(nonce_le, sizeof(nonce_le));
-                uint8_t mid[HASH_LEN];
-                ctx.final(mid);
-
-                // Second hash (over 32 bytes)
-                SHA256 s2; s2.init();
-                s2.update(mid, sizeof(mid));
-                s2.final(h);
+                dsha256_from_base(base1, nonce_le, sizeof(nonce_le), h);
             #else
                 // ---- Salted build or other semantics: use canonical hasher ----
                 const auto hv = salted_header_hash(hdr);
