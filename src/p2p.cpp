@@ -705,14 +705,4 @@ void P2P::loop(){
                 ps.last_ping_ms = tnow;
                 ps.awaiting_pong = true;
             } else if (ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PONG_TIMEOUT_MS) {
-                if ((ps.banscore += 20) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
-                dead.push_back(s);
-            }
-        }
 
-        for (int s : dead) { CLOSESOCK(s); peers_.erase(s); }
-    }
-    save_bans();
-}
-
-} // namespace miq
