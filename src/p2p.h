@@ -30,6 +30,8 @@ namespace miq {
 
 class Chain; // fwd
 
+class Mempool; // optional for tx relay
+
 struct OrphanRec {
     std::vector<uint8_t> hash;
     std::vector<uint8_t> prev;
