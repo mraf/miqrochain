@@ -24,13 +24,9 @@
   #include <unistd.h>
 #endif
 
-#include "mempool.h"
-#include "block.h"
-#include "serialize.h"
-
 namespace miq {
 
-class Chain; // forward declaration
+class Chain; // fwd
 
 struct OrphanRec {
     std::vector<uint8_t> hash;
@@ -44,27 +40,24 @@ struct PeerState {
     int         mis{0};
     int64_t     last_ms{0};
 
-    // sync state
+    // sync
     bool        syncing{false};
     uint64_t    next_index{0};
 
-    // rx buffer & liveness
+    // per-peer RX buffer & liveness
     std::vector<uint8_t> rx;
     bool        verack_ok{false};
     int64_t     last_ping_ms{0};
     bool        awaiting_pong{false};
     int         banscore{0};
 
-    // rate-limit buckets
+    // rate-limit tokens
     uint64_t    blk_tokens{0};
     uint64_t    tx_tokens{0};
     int64_t     last_refill_ms{0};
 
-    // addr filtering
+    // addr throttling
     int64_t     last_addr_ms{0};
-
-    // optional: in-flight tx requests
-    std::unordered_set<std::string> inflight_tx;
 };
 
 class P2P {
@@ -75,14 +68,19 @@ public:
     bool start(uint16_t port);
     void stop();
 
+    // Outbound connect to a seed (hostname or IP)
     bool connect_seed(const std::string& host, uint16_t port);
 
+    // Broadcast inventory for a new block hash we just accepted/mined
     void broadcast_inv_block(const std::vector<uint8_t>& block_hash);
 
+    // Optional: where to store bans.txt
     inline void set_datadir(const std::string& d) { datadir_ = d; }
 
+    // tiny, local and fast hex for keys
+    static std::string hexkey(const std::vector<uint8_t>& h);
+
 private:
-    // ---------- core ----------
     Chain& chain_;
     std::thread th_;
     std::atomic<bool> running_{false};
@@ -91,31 +89,10 @@ private:
     std::set<std::string> banned_;
     std::string datadir_{"./miqdata"};
 
-    void loop();
-    void handle_new_peer(int c, const std::string& ip);
-    void load_bans();
-    void save_bans();
-
-    // ---------- rate limiting ----------
-    void rate_refill(PeerState& ps, int64_t now);
-    bool rate_consume_block(PeerState& ps, size_t nbytes);
-    bool rate_consume_tx(PeerState& ps, size_t nbytes);
-
-    // ---------- address table ----------
-    void maybe_send_getaddr(PeerState& ps);
-    void send_addr_snapshot(PeerState& ps);
-    void handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload);
+    // address manager: IPv4s in network byte order
     std::unordered_set<uint32_t> addrv4_;
 
-    static bool parse_ipv4(const std::string& dotted, uint32_t& be_ip);
-    static bool ipv4_is_public(uint32_t be_ip);
-
-    // ---------- orphan block manager ----------
-    void evict_orphans_if_needed();
-    void remove_orphan_by_hex(const std::string& child_hex);
-    void handle_incoming_block(int sock, const std::vector<uint8_t>& raw);
-    void try_connect_orphans(const std::string& parent_hex);
-
+    // orphan manager
     std::unordered_map<std::string, OrphanRec> orphans_;
     std::unordered_map<std::string, std::vector<std::string>> orphan_children_;
     std::deque<std::string> orphan_order_;
@@ -123,21 +100,37 @@ private:
     size_t orphan_bytes_limit_{0};
     size_t orphan_count_limit_{0};
 
-    // ---------- tx relay ----------
-    void broadcast_inv_tx(const std::vector<uint8_t>& txid);
-    void request_tx(PeerState& ps, const std::vector<uint8_t>& txid);
-    void send_tx(int sock, const std::vector<uint8_t>& raw);
+    // core
+    void loop();
+    void handle_new_peer(int c, const std::string& ip);
+    void load_bans();
+    void save_bans();
 
-    // local mempool (policy layer)
-    Mempool mempool_;
+    // helpers for sync & block serving
+    void start_sync_with_peer(PeerState& ps);
+    void request_block_index(PeerState& ps, uint64_t index);
+    void request_block_hash(PeerState& ps, const std::vector<uint8_t>& h);
+    void send_block(int s, const std::vector<uint8_t>& raw);
 
-    // dedupe + serving
-    std::unordered_set<std::string> seen_txids_;
-    std::unordered_map<std::string, std::vector<uint8_t>> tx_store_;
-    std::deque<std::string> tx_order_; // to prune cache
+    // rate-limit helpers
+    void rate_refill(PeerState& ps, int64_t now);
+    bool rate_consume_block(PeerState& ps, size_t nbytes);
+    bool rate_consume_tx(PeerState& ps, size_t nbytes);
 
-    // ---------- utils ----------
-    static std::string hexkey(const std::vector<uint8_t>& h);
+    // addr handling
+    void maybe_send_getaddr(PeerState& ps);
+    void send_addr_snapshot(PeerState& ps);
+    void handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload);
+
+    // IPv4 helpers
+    bool parse_ipv4(const std::string& dotted, uint32_t& be_ip);
+    bool ipv4_is_public(uint32_t be_ip);
+
+    // orphan handlers
+    void evict_orphans_if_needed();
+    void remove_orphan_by_hex(const std::string& child_hex);
+    void handle_incoming_block(int sock, const std::vector<uint8_t>& raw);
+    void try_connect_orphans(const std::string& parent_hex);
 };
 
 } // namespace miq
