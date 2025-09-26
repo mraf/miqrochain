@@ -73,12 +73,17 @@
 #define MIQ_ADDR_RESPONSE_MAX 200        // max addrs we return to getaddr
 #endif
 
-// Orphan pool caps (can be overridden at compile time)
+// Orphan pool caps
 #ifndef MIQ_ORPHAN_MAX_BYTES
 #define MIQ_ORPHAN_MAX_BYTES (32u * 1024u * 1024u)
 #endif
 #ifndef MIQ_ORPHAN_MAX_COUNT
 #define MIQ_ORPHAN_MAX_COUNT (4096u)
+#endif
+
+// TX cache cap
+#ifndef MIQ_TX_STORE_MAX
+#define MIQ_TX_STORE_MAX 10000
 #endif
 
 #ifdef _WIN32
@@ -140,14 +145,13 @@ bool P2P::parse_ipv4(const std::string& dotted, uint32_t& be_ip){
 #else
     if (inet_pton(AF_INET, dotted.c_str(), &tmp.sin_addr) != 1) return false;
 #endif
-    be_ip = tmp.sin_addr.s_addr; // already network byte order
+    be_ip = tmp.sin_addr.s_addr; // network byte order
     return true;
 }
 static inline uint32_t be(uint8_t a, uint8_t b, uint8_t c, uint8_t d){
     return (uint32_t(a)<<24)|(uint32_t(b)<<16)|(uint32_t(c)<<8)|uint32_t(d);
 }
 bool P2P::ipv4_is_public(uint32_t be_ip){
-    // drop: 0/8, 10/8, 127/8, 169.254/16, 172.16/12, 192.168/16, 224/4 (multicast), 240/4 (reserved)
     uint8_t A = uint8_t(be_ip>>24), B = uint8_t(be_ip>>16);
     if (A == 0 || A == 10 || A == 127) return false;
     if (A == 169 && B == 254) return false;
@@ -516,6 +520,28 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
     }
 }
 
+// =================== TX relay ===============================================
+
+void P2P::broadcast_inv_tx(const std::vector<uint8_t>& txid){
+    auto msg = encode_msg("invtx", txid);
+    for (auto& kv : peers_) {
+        send(kv.first, (const char*)msg.data(), (int)msg.size(), 0);
+    }
+}
+
+void P2P::request_tx(PeerState& ps, const std::vector<uint8_t>& txid){
+    auto key = hexkey(txid);
+    if (!ps.inflight_tx.insert(key).second) return; // already requested from this peer
+    auto msg = encode_msg("gettx", txid);
+    send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
+}
+
+void P2P::send_tx(int sock, const std::vector<uint8_t>& raw){
+    if (raw.empty()) return;
+    auto msg = encode_msg("tx", raw);
+    send(sock, (const char*)msg.data(), (int)msg.size(), 0);
+}
+
 // ============================================================================
 
 void P2P::loop(){
@@ -581,133 +607,173 @@ void P2P::loop(){
             auto &ps = it->second;
 
             bool ready = (fds[base + p].revents & POLL_RD) != 0;
-            bool sock_dead = false;
 
             if (ready) {
                 uint8_t buf[65536];
 #ifdef _WIN32
                 int n = recv(s, (char*)buf, (int)sizeof(buf), 0);
-                if (n <= 0) { dead.push_back(s); sock_dead = true; }
+                if (n <= 0) { dead.push_back(s); goto timers_section; }
 #else
                 ssize_t n = recv(s, (char*)buf, sizeof(buf), 0);
-                if (n <= 0) { dead.push_back(s); sock_dead = true; }
+                if (n <= 0) { dead.push_back(s); goto timers_section; }
 #endif
-                if (!sock_dead) {
-                    ps.last_ms = now_ms();
-                    ps.rx.insert(ps.rx.end(), buf, buf + n);
-                    if (ps.rx.size() > MIQ_P2P_MAX_BUFSZ) {
-                        log_warn("P2P: oversize buffer from " + ps.ip + " -> banning & dropping");
-                        banned_.insert(ps.ip);
-                        dead.push_back(s);
-                        sock_dead = true;
-                    } else {
-                        // parse all messages
-                        size_t off = 0;
-                        miq::NetMsg m;
-                        while (decode_msg(ps.rx, off, m)) {
-                            std::string cmd(m.cmd, m.cmd + 12);
-                            cmd.erase(cmd.find_first_of('\0'));
+                ps.last_ms = now_ms();
 
-                            if (cmd == "version") {
-                                auto verack = encode_msg("verack", {});
-                                send(s, (const char*)verack.data(), (int)verack.size(), 0);
+                ps.rx.insert(ps.rx.end(), buf, buf + n);
+                if (ps.rx.size() > MIQ_P2P_MAX_BUFSZ) {
+                    log_warn("P2P: oversize buffer from " + ps.ip + " -> banning & dropping");
+                    banned_.insert(ps.ip);
+                    dead.push_back(s);
+                    goto timers_section;
+                }
 
-                            } else if (cmd == "verack") {
-                                ps.verack_ok = true;
-                                ps.syncing = true;
-                                ps.next_index = chain_.height() + 1;
-                                request_block_index(ps, ps.next_index);
-                                // ask for addresses once
-                                maybe_send_getaddr(ps);
+                // parse all messages
+                {
+                    size_t off = 0;
+                    miq::NetMsg m;
+                    while (decode_msg(ps.rx, off, m)) {
+                        std::string cmd(m.cmd, m.cmd + 12);
+                        cmd.erase(cmd.find_first_of('\0'));
 
-                            } else if (cmd == "ping") {
-                                auto pong = encode_msg("pong", m.payload);
-                                send(s, (const char*)pong.data(), (int)pong.size(), 0);
+                        if (cmd == "version") {
+                            auto verack = encode_msg("verack", {});
+                            send(s, (const char*)verack.data(), (int)verack.size(), 0);
 
-                            } else if (cmd == "pong") {
-                                ps.awaiting_pong = false;
+                        } else if (cmd == "verack") {
+                            ps.verack_ok = true;
+                            ps.syncing = true;
+                            ps.next_index = chain_.height() + 1;
+                            request_block_index(ps, ps.next_index);
+                            maybe_send_getaddr(ps);
 
-                            } else if (cmd == "invb") {
-                                if (m.payload.size() == 32) {
-                                    if (!chain_.have_block(m.payload)) {
-                                        request_block_hash(ps, m.payload);
-                                    }
+                        } else if (cmd == "ping") {
+                            auto pong = encode_msg("pong", m.payload);
+                            send(s, (const char*)pong.data(), (int)pong.size(), 0);
+
+                        } else if (cmd == "pong") {
+                            ps.awaiting_pong = false;
+
+                        } else if (cmd == "invb") {
+                            if (m.payload.size() == 32) {
+                                if (!chain_.have_block(m.payload)) {
+                                    request_block_hash(ps, m.payload);
                                 }
-
-                            } else if (cmd == "getb") {
-                                if (m.payload.size() == 32) {
-                                    Block b;
-                                    if (chain_.get_block_by_hash(m.payload, b)) {
-                                        auto raw = ser_block(b);
-                                        if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
-                                    }
-                                }
-
-                            } else if (cmd == "getbi") {
-                                if (m.payload.size() == 8) {
-                                    uint64_t idx64 = 0;
-                                    for (int i=0;i<8;i++) idx64 |= ((uint64_t)m.payload[i]) << (8*i);
-                                    Block b;
-                                    if (chain_.get_block_by_index((size_t)idx64, b)) {
-                                        auto raw = ser_block(b);
-                                        if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
-                                    }
-                                }
-
-                            } else if (cmd == "block") {
-                                // inbound block rate limiting
-                                if (!rate_consume_block(ps, m.payload.size())) {
-                                    if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
-                                    continue;
-                                }
-                                if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
-                                    // Orphan-aware path
-                                    handle_incoming_block(s, m.payload);
-                                }
-
-                            } else if (cmd == "tx") {
-                                if (!rate_consume_tx(ps, m.payload.size())) {
-                                    if ((ps.banscore += 3) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
-                                    continue;
-                                }
-                                // TX relay not wired yet.
-
-                            } else if (cmd == "getaddr") {
-                                send_addr_snapshot(ps);
-
-                            } else if (cmd == "addr") {
-                                handle_addr_msg(ps, m.payload);
-
-                            } else {
-                                // unknown -> small mis score
-                                if (++ps.mis > 10) { dead.push_back(s); sock_dead = true; }
                             }
+
+                        } else if (cmd == "getb") {
+                            if (m.payload.size() == 32) {
+                                Block b;
+                                if (chain_.get_block_by_hash(m.payload, b)) {
+                                    auto raw = ser_block(b);
+                                    if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
+                                }
+                            }
+
+                        } else if (cmd == "getbi") {
+                            if (m.payload.size() == 8) {
+                                uint64_t idx64 = 0;
+                                for (int i=0;i<8;i++) idx64 |= ((uint64_t)m.payload[i]) << (8*i);
+                                Block b;
+                                if (chain_.get_block_by_index((size_t)idx64, b)) {
+                                    auto raw = ser_block(b);
+                                    if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
+                                }
+                            }
+
+                        } else if (cmd == "block") {
+                            if (!rate_consume_block(ps, m.payload.size())) {
+                                if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
+                                continue;
+                            }
+                            if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
+                                handle_incoming_block(s, m.payload);
+                            }
+
+                        } else if (cmd == "invtx") {
+                            if (m.payload.size() == 32) {
+                                auto key = hexkey(m.payload);
+                                if (!seen_txids_.count(key)) {
+                                    seen_txids_.insert(key);
+                                    request_tx(ps, m.payload);
+                                }
+                            }
+
+                        } else if (cmd == "gettx") {
+                            if (m.payload.size() == 32) {
+                                auto key = hexkey(m.payload);
+                                auto itx = tx_store_.find(key);
+                                if (itx != tx_store_.end()) {
+                                    if (rate_consume_tx(ps, itx->second.size())) {
+                                        send_tx(s, itx->second);
+                                    }
+                                }
+                            }
+
+                        } else if (cmd == "tx") {
+                            if (!rate_consume_tx(ps, m.payload.size())) {
+                                if ((ps.banscore += 3) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
+                                continue;
+                            }
+                            Transaction tx;
+                            if (!deser_tx(m.payload, tx)) continue;
+                            auto key = hexkey(tx.txid());
+
+                            // clear inflight if any
+                            ps.inflight_tx.erase(key);
+
+                            if (seen_txids_.insert(key).second) {
+                                std::string err;
+                                if (mempool_.accept(tx, chain_.utxo(), chain_.height(), err)) {
+                                    // cache raw for serving
+                                    tx_store_[key] = m.payload;
+                                    tx_order_.push_back(key);
+                                    if (tx_store_.size() > MIQ_TX_STORE_MAX) {
+                                        // prune oldest
+                                        auto victim = tx_order_.front();
+                                        tx_order_.pop_front();
+                                        tx_store_.erase(victim);
+                                    }
+                                    // announce
+                                    broadcast_inv_tx(tx.txid());
+                                } else {
+                                    // mildly penalize spammy bad txs
+                                    if (++ps.mis > 25) banned_.insert(ps.ip);
+                                }
+                            }
+
+                        } else if (cmd == "getaddr") {
+                            send_addr_snapshot(ps);
+
+                        } else if (cmd == "addr") {
+                            handle_addr_msg(ps, m.payload);
+
+                        } else {
+                            if (++ps.mis > 10) { dead.push_back(s); }
                         }
-                        // drop consumed prefix
-                        if (!sock_dead && off > 0) {
-                            std::vector<uint8_t> rest(ps.rx.begin() + off, ps.rx.end());
-                            ps.rx.swap(rest);
-                        }
+                    }
+                    // drop consumed prefix
+                    if (off > 0) {
+                        std::vector<uint8_t> rest(ps.rx.begin() + off, ps.rx.end());
+                        ps.rx.swap(rest);
                     }
                 }
             }
 
-            // --- timeouts / pings (run even if not readable, but skip dead) ---
-            if (!sock_dead) {
-                int64_t tnow = now_ms();
-                if (!ps.verack_ok && (tnow - ps.last_ms) > MIQ_P2P_VERACK_TIMEOUT_MS) {
-                    dead.push_back(s);
-                    continue;
-                }
-                if (!ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PING_EVERY_MS) {
-                    auto ping = encode_msg("ping", {});
-                    send(s, (const char*)ping.data(), (int)ping.size(), 0);
-                    ps.last_ping_ms = tnow;
-                    ps.awaiting_pong = true;
-                } else if (ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PONG_TIMEOUT_MS) {
-                    if ((ps.banscore += 20) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
-                    dead.push_back(s);
-                }
+        timers_section:
+            // --- timeouts / pings ---
+            int64_t tnow = now_ms();
+            if (!ps.verack_ok && (tnow - ps.last_ms) > MIQ_P2P_VERACK_TIMEOUT_MS) {
+                dead.push_back(s);
+                continue;
+            }
+            if (!ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PING_EVERY_MS) {
+                auto ping = encode_msg("ping", {});
+                send(s, (const char*)ping.data(), (int)ping.size(), 0);
+                ps.last_ping_ms = tnow;
+                ps.awaiting_pong = true;
+            } else if (ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PONG_TIMEOUT_MS) {
+                if ((ps.banscore += 20) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
+                dead.push_back(s);
             }
         }
 
@@ -715,4 +781,5 @@ void P2P::loop(){
     }
     save_bans();
 }
-}
+
+} // namespace miq
