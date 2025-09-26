@@ -184,3 +184,4 @@ if(WIN32)
   # bcrypt is useful if you later switch RNGs for key generation; harmless to link.
   target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
+add_compile_definitions(COMPRESSED_POINT=1)
