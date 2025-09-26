@@ -26,6 +26,27 @@ namespace miq {
 
 class Chain; // forward declaration
 
+struct OrphanRec {
+    std::vector<uint8_t> hash;
+    std::vector<uint8_t> prev;
+    std::vector<uint8_t> raw;
+};
+
+// key = hex(hash)
+std::unordered_map<std::string, OrphanRec> orphans_;
+
+// parentHex -> vector<childHex>
+std::unordered_map<std::string, std::vector<std::string>> orphan_children_;
+
+// helper: hex string for map keys
+static inline std::string hexkey(const std::vector<uint8_t>& h);
+
+// handle a raw incoming block (decoded from NetMsg)
+void handle_incoming_block(int sock, const std::vector<uint8_t>& raw);
+
+// try to connect all children who were waiting on this parent
+void try_connect_orphans(const std::string& parent_hex);
+
 struct PeerState {
     int         sock{-1};
     std::string ip;
