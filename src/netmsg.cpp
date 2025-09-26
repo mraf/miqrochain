@@ -68,9 +68,25 @@ bool decode_msg(const std::vector<uint8_t>& in, size_t& off, NetMsg& out){
     if(magic != MAGIC) return false;
     off += 4;
 
-    // cmd
-    std::memcpy(out.cmd, &in[off], 12);
+    // cmd (validate: ASCII [A-Za-z0-9_], zero-padded after first NUL)
+    unsigned char cbuf[12];
+    std::memcpy(cbuf, &in[off], 12);
     off += 12;
+
+    // find first zero; everything after must be zero
+    size_t n = 0;
+    while (n < 12 && cbuf[n] != 0) {
+        unsigned char ch = cbuf[n];
+        bool ok = (ch == '_') ||
+                  (ch >= '0' && ch <= '9') ||
+                  (ch >= 'A' && ch <= 'Z') ||
+                  (ch >= 'a' && ch <= 'z');
+        if (!ok) return false;
+        ++n;
+    }
+    for (size_t i = n; i < 12; ++i) if (cbuf[i] != 0) return false;
+
+    std::memcpy(out.cmd, cbuf, 12);
 
     // length
     uint32_t len = get_u32_le(&in[off]);
@@ -80,10 +96,8 @@ bool decode_msg(const std::vector<uint8_t>& in, size_t& off, NetMsg& out){
     uint32_t cc = get_u32_le(&in[off]);
     off += 4;
 
-    // basic sanity: cap message size to avoid OOM/DoS
+    // cap message size
     if(len > MIQ_FALLBACK_MAX_MSG_SIZE) return false;
-
-    // ensure full payload present
     if(off + len > in.size()) return false;
 
     // payload
