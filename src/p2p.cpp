@@ -219,26 +219,26 @@ void P2P::send_block(int s, const std::vector<uint8_t>& raw){
 void P2P::loop(){
 #ifdef _WIN32
     using PollFD = WSAPOLLFD;
-    auto POLL_RD = POLLRDNORM;
+    static const short POLL_RD = POLLRDNORM;
 #else
     using PollFD = pollfd;
-    auto POLL_RD = POLLIN;
+    static const short POLL_RD = POLLIN;
 #endif
 
     while (running_) {
         std::vector<PollFD> fds;
         size_t base = 0;
 #ifdef _WIN32
-        if (srv_ >= 0) fds.push_back(PollFD{ (SOCKET)srv_, POLL_RD, 0 });
+        if (srv_ >= 0) fds.push_back(PollFD{ (SOCKET)srv_, (short)POLL_RD, 0 });
 #else
-        if (srv_ >= 0) fds.push_back(PollFD{ srv_, POLL_RD, 0 });
+        if (srv_ >= 0) fds.push_back(PollFD{ srv_, (short)POLL_RD, 0 });
 #endif
         base = fds.size();
         for (auto& kv : peers_) {
 #ifdef _WIN32
-            fds.push_back(PollFD{ (SOCKET)kv.first, POLL_RD, 0 });
+            fds.push_back(PollFD{ (SOCKET)kv.first, (short)POLL_RD, 0 });
 #else
-            fds.push_back(PollFD{ kv.first, POLL_RD, 0 });
+            fds.push_back(PollFD{ kv.first, (short)POLL_RD, 0 });
 #endif
         }
 
@@ -278,111 +278,116 @@ void P2P::loop(){
             int s = it->first;
             auto &ps = it->second;
 
-            // readiness?
-            if (!(fds[base + p].revents & (POLL_RD))) goto timers;
+            // is this socket readable?
+            bool ready = (fds[base + p].revents & POLL_RD) != 0;
 
-            // recv
-            uint8_t buf[65536];
+            if (ready) {
+                uint8_t buf[65536];
 #ifdef _WIN32
-            int n = recv(s, (char*)buf, (int)sizeof(buf), 0);
+                int n = recv(s, (char*)buf, (int)sizeof(buf), 0);
+                if (n <= 0) { dead.push_back(s); goto timers_section; }
 #else
-            ssize_t n = recv(s, (char*)buf, sizeof(buf), 0);
+                ssize_t n = recv(s, (char*)buf, sizeof(buf), 0);
+                if (n <= 0) { dead.push_back(s); goto timers_section; }
 #endif
-            if (n <= 0) { dead.push_back(s); continue; }
-            ps.last_ms = now_ms();
+                ps.last_ms = now_ms();
 
-            ps.rx.insert(ps.rx.end(), buf, buf + n);
-            if (ps.rx.size() > MIQ_P2P_MAX_BUFSZ) {
-                log_warn("P2P: oversize buffer from " + ps.ip + " -> banning & dropping");
-                banned_.insert(ps.ip);
-                dead.push_back(s);
-                continue;
-            }
+                ps.rx.insert(ps.rx.end(), buf, buf + n);
+                if (ps.rx.size() > MIQ_P2P_MAX_BUFSZ) {
+                    log_warn("P2P: oversize buffer from " + ps.ip + " -> banning & dropping");
+                    banned_.insert(ps.ip);
+                    dead.push_back(s);
+                    // don't process further
+                    goto timers_section;
+                }
 
-            // parse all messages
-            size_t off = 0;
-            miq::NetMsg m;
-            while (decode_msg(ps.rx, off, m)) {
-                std::string cmd(m.cmd, m.cmd + 12);
-                cmd.erase(cmd.find_first_of('\0'));
+                // parse all messages
+                {
+                    size_t off = 0;
+                    miq::NetMsg m;
+                    while (decode_msg(ps.rx, off, m)) {
+                        std::string cmd(m.cmd, m.cmd + 12);
+                        cmd.erase(cmd.find_first_of('\0'));
 
-                if (cmd == "version") {
-                    auto verack = encode_msg("verack", {});
-                    send(s, (const char*)verack.data(), (int)verack.size(), 0);
+                        if (cmd == "version") {
+                            auto verack = encode_msg("verack", {});
+                            send(s, (const char*)verack.data(), (int)verack.size(), 0);
 
-                } else if (cmd == "verack") {
-                    ps.verack_ok = true;
-                    ps.syncing = true;
-                    ps.next_index = chain_.height() + 1;
-                    request_block_index(ps, ps.next_index);
+                        } else if (cmd == "verack") {
+                            ps.verack_ok = true;
+                            ps.syncing = true;
+                            ps.next_index = chain_.height() + 1;
+                            request_block_index(ps, ps.next_index);
 
-                } else if (cmd == "ping") {
-                    auto pong = encode_msg("pong", m.payload);
-                    send(s, (const char*)pong.data(), (int)pong.size(), 0);
+                        } else if (cmd == "ping") {
+                            auto pong = encode_msg("pong", m.payload);
+                            send(s, (const char*)pong.data(), (int)pong.size(), 0);
 
-                } else if (cmd == "pong") {
-                    ps.awaiting_pong = false;
+                        } else if (cmd == "pong") {
+                            ps.awaiting_pong = false;
 
-                } else if (cmd == "invb") {
-                    if (m.payload.size() == 32) {
-                        if (!chain_.have_block(m.payload)) {
-                            request_block_hash(ps, m.payload);
-                        }
-                    }
-
-                } else if (cmd == "getb") {
-                    if (m.payload.size() == 32) {
-                        Block b;
-                        if (chain_.get_block_by_hash(m.payload, b)) {
-                            auto raw = ser_block(b);
-                            if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
-                        }
-                    }
-
-                } else if (cmd == "getbi") {
-                    if (m.payload.size() == 8) {
-                        uint64_t idx64 = 0;
-                        for (int i=0;i<8;i++) idx64 |= ((uint64_t)m.payload[i]) << (8*i);
-                        Block b;
-                        if (chain_.get_block_by_index((size_t)idx64, b)) {
-                            auto raw = ser_block(b);
-                            if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
-                        }
-                    }
-
-                } else if (cmd == "block") {
-                    if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
-                        Block b;
-                        if (deser_block(m.payload, b)) {
-                            std::string err;
-                            if (!chain_.have_block(b.block_hash())) {
-                                if (chain_.submit_block(b, err)) {
-                                    log_info("P2P: accepted block via peer " + ps.ip);
-                                    if (ps.syncing) {
-                                        ps.next_index++;
-                                        request_block_index(ps, ps.next_index);
-                                    }
-                                    broadcast_inv_block(b.block_hash());
-                                } else {
-                                    log_warn("P2P: reject block (" + err + ")");
-                                    ps.syncing = false;
+                        } else if (cmd == "invb") {
+                            if (m.payload.size() == 32) {
+                                if (!chain_.have_block(m.payload)) {
+                                    request_block_hash(ps, m.payload);
                                 }
                             }
+
+                        } else if (cmd == "getb") {
+                            if (m.payload.size() == 32) {
+                                Block b;
+                                if (chain_.get_block_by_hash(m.payload, b)) {
+                                    auto raw = ser_block(b);
+                                    if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
+                                }
+                            }
+
+                        } else if (cmd == "getbi") {
+                            if (m.payload.size() == 8) {
+                                uint64_t idx64 = 0;
+                                for (int i=0;i<8;i++) idx64 |= ((uint64_t)m.payload[i]) << (8*i);
+                                Block b;
+                                if (chain_.get_block_by_index((size_t)idx64, b)) {
+                                    auto raw = ser_block(b);
+                                    if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
+                                }
+                            }
+
+                        } else if (cmd == "block") {
+                            if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
+                                Block b;
+                                if (deser_block(m.payload, b)) {
+                                    std::string err;
+                                    if (!chain_.have_block(b.block_hash())) {
+                                        if (chain_.submit_block(b, err)) {
+                                            log_info("P2P: accepted block via peer " + ps.ip);
+                                            if (ps.syncing) {
+                                                ps.next_index++;
+                                                request_block_index(ps, ps.next_index);
+                                            }
+                                            broadcast_inv_block(b.block_hash());
+                                        } else {
+                                            log_warn("P2P: reject block (" + err + ")");
+                                            ps.syncing = false;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // unknown -> small mis score
+                            if (++ps.mis > 10) { dead.push_back(s); }
                         }
                     }
-                } else {
-                    // unknown -> small mis score
-                    if (++ps.mis > 10) { dead.push_back(s); }
+                    // drop consumed prefix
+                    if (off > 0) {
+                        std::vector<uint8_t> rest(ps.rx.begin() + off, ps.rx.end());
+                        ps.rx.swap(rest);
+                    }
                 }
             }
-            // drop consumed prefix
-            if (off > 0) {
-                std::vector<uint8_t> rest(ps.rx.begin() + off, ps.rx.end());
-                ps.rx.swap(rest);
-            }
 
-        timers:
-            // --- timeouts / pings ---
+        timers_section:
+            // --- timeouts / pings (run regardless of readability) ---
             int64_t now = now_ms();
             if (!ps.verack_ok && (now - ps.last_ms) > MIQ_P2P_VERACK_TIMEOUT_MS) {
                 dead.push_back(s);
