@@ -49,4 +49,4 @@ private:
     bool pow_loop(Block& b, uint32_t bits); // returns true if found (fills nonce)
 };
 
-} // namespace miq
+}
