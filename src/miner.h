@@ -49,4 +49,10 @@ private:
     bool pow_loop(Block& b, uint32_t bits); // returns true if found (fills nonce)
 };
 
+Block mine_block(const std::vector<uint8_t>& prev_hash,
+                 uint32_t bits,
+                 const Transaction& coinbase,
+                 const std::vector<Transaction>& mempool_txs,
+                 unsigned threads);
+
 }
