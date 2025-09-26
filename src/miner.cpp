@@ -26,6 +26,12 @@ namespace {
 
 namespace miq {
 
+// ---- Fallback definition if header didn’t expose MinerStats ----
+#ifndef MIQ_MINER_STATS_STRUCT_DEFINED
+#define MIQ_MINER_STATS_STRUCT_DEFINED
+struct MinerStats { double hps; uint64_t total; double window_secs; };
+#endif
+
 // --------- miner stats (public API as before) ---------
 static std::atomic<uint64_t> g_hashes{0};
 static std::atomic<uint64_t> g_hashes_total{0};
@@ -174,7 +180,7 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
     // Precompute header midstate for first SHA-256 (first 80 bytes)
     // Only used when MIQ_POW_SALT is NOT defined; otherwise we use salted_header_hash().
 #if !defined(MIQ_POW_SALT)
-    // Use the fast SHA-NI accelerated streaming API from hasher.cpp
+    // Fast SHA-NI streaming midstate (from hasher.cpp)
     FastSha256Ctx base1;
     fastsha_init(base1);
     fastsha_update(base1, header_prefix.data(), header_prefix.size()); // 80 bytes
@@ -205,8 +211,6 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
             // Each thread walks a disjoint arithmetic progression of nonces
             const uint64_t stride = static_cast<uint64_t>(threads);
             uint64_t nonce = (base_nonce + static_cast<uint64_t>(t));
-
-            // Local copy of base midstate is not needed with fast API (we pass by const&)
 
             while(!found.load(std::memory_order_relaxed)){
                 // Overwrite the 8-byte nonce in place (LE) for fallback path and for nonce_le
