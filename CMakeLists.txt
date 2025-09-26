@@ -5,13 +5,20 @@ project(miqrochain_core C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# ------------------------------------------------------------------
 # Options
-option(MIQ_BUILD_TESTS "Build tests" OFF)
-option(MIQ_FETCH_MICROECC "Fetch micro-ecc from GitHub if not vendored" ON)
-set(MIQ_VENDOR_MICROECC_DIR "${CMAKE_SOURCE_DIR}/third_party/micro-ecc" CACHE PATH "Path to vendored micro-ecc")
+# ------------------------------------------------------------------
+option(MIQ_BUILD_TESTS        "Build tests"                               OFF)
+option(MIQ_FETCH_MICROECC     "Fetch micro-ecc from GitHub if not vendored" ON)
+set(MIQ_VENDOR_MICROECC_DIR   "${CMAKE_SOURCE_DIR}/third_party/micro-ecc"
+    CACHE PATH "Path to vendored micro-ecc")
 
-# Warnings / MSVC settings
+# ------------------------------------------------------------------
+# Warnings / Optimization
+# ------------------------------------------------------------------
 if(MSVC)
   add_compile_options(/O2 /Ot /Oi /GL /GF /Gy /Zc:inline)
   add_link_options(/LTCG)
@@ -21,9 +28,9 @@ else()
   add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 endif()
 
-# -----------------------
+# ------------------------------------------------------------------
 # micro-ecc source setup
-# -----------------------
+# ------------------------------------------------------------------
 set(MICRO_ECC_DIR "")
 if(EXISTS "${MIQ_VENDOR_MICROECC_DIR}/uECC.c")
   set(MICRO_ECC_DIR "${MIQ_VENDOR_MICROECC_DIR}")
@@ -34,16 +41,38 @@ elseif(MIQ_FETCH_MICROECC)
     GIT_REPOSITORY https://github.com/kmackay/micro-ecc.git
     GIT_TAG        master
   )
-  # micro-ecc is a plain source repo, so just populate and use its path
+  # micro-ecc is a plain C repo; just fetch the sources to a folder
   FetchContent_Populate(microecc)
   set(MICRO_ECC_DIR "${microecc_SOURCE_DIR}")
 else()
   message(FATAL_ERROR "micro-ecc not found. Set MIQ_VENDOR_MICROECC_DIR or enable MIQ_FETCH_MICROECC.")
 endif()
 
-# -----------------------
+# Give the 3rd-party C files gentle, localized warning silencing
+set_source_files_properties(
+  ${MICRO_ECC_DIR}/uECC.c
+  PROPERTIES
+    COMPILE_OPTIONS "$<$<C_COMPILER_ID:GNU,Clang>:-Wno-sign-compare;-Wno-type-limits;-Wno-unused-function;-Wno-unused-parameter>"
+)
+if(MSVC)
+  set_source_files_properties(
+    ${MICRO_ECC_DIR}/uECC.c
+    PROPERTIES
+      COMPILE_OPTIONS "/wd4244;/wd4267;/wd4334"
+  )
+endif()
+
+# Also mark our shim as C and keep it quiet if needed
+set_source_files_properties(
+  src/crypto/uECC_shim.c
+  PROPERTIES
+    LANGUAGE C
+    COMPILE_OPTIONS "$<$<C_COMPILER_ID:GNU,Clang>:-Wno-unused-parameter>"
+)
+
+# ------------------------------------------------------------------
 # Main daemon
-# -----------------------
+# ------------------------------------------------------------------
 add_executable(miqrod
     src/address.h src/address.cpp
     src/wallet_store.h src/wallet_store.cpp
@@ -77,7 +106,7 @@ add_executable(miqrod
     src/http.h src/http.cpp
     src/rpc.h src/rpc.cpp
 
-    # Crypto interface
+    # Crypto interface and backends
     src/crypto/ecdsa_iface.h
     src/crypto/ecdsa_uECC.h src/crypto/ecdsa_uECC.cpp
     src/crypto/ecdsa_secp256k1.h
@@ -93,16 +122,16 @@ target_include_directories(miqrod PRIVATE
     ${MICRO_ECC_DIR}
 )
 
-# micro-ecc config: enable compressed points
+# micro-ecc config: enable compressed points (safe, no consensus change)
 target_compile_definitions(miqrod PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
 
 if(WIN32)
   target_link_libraries(miqrod PRIVATE Ws2_32)
 endif()
 
-# -----------------------
+# ------------------------------------------------------------------
 # Tests (optional)
-# -----------------------
+# ------------------------------------------------------------------
 if(MIQ_BUILD_TESTS)
   enable_testing()
 
@@ -136,9 +165,9 @@ if(MIQ_BUILD_TESTS)
   add_test(NAME fuzz_json COMMAND fuzz_json)
 endif()
 
-# --------
+# ------------------------------------------------------------------
 # Tools
-# --------
+# ------------------------------------------------------------------
 add_executable(miq-keygen
     src/tools/miq_keygen.cpp
     src/sha256.h src/sha256.cpp
@@ -149,10 +178,9 @@ add_executable(miq-keygen
     ${MICRO_ECC_DIR}/uECC.c
     src/crypto/uECC_shim.c
 )
-
-if(WIN32)
-  target_link_libraries(miq-keygen PRIVATE bcrypt)
-endif()
-
 target_include_directories(miq-keygen PRIVATE src ${MICRO_ECC_DIR})
 target_compile_definitions(miq-keygen PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
+if(WIN32)
+  # bcrypt is useful if you later switch RNGs for key generation; harmless to link.
+  target_link_libraries(miq-keygen PRIVATE bcrypt)
+endif()
