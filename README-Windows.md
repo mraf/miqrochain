@@ -20,4 +20,4 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DMIQ_BUILD_TESTS=ON
 cmake --build build --config Release --target test_crypto
 ```
 
-Ports: P2P 9833, RPC 9834.
+Ports: P2P 442, RPC 9834.
