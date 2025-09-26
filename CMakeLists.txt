@@ -11,7 +11,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # ------------------------------------------------------------------
 # Options
 # ------------------------------------------------------------------
-option(MIQ_BUILD_TESTS        "Build tests"                               OFF)
+option(MIQ_BUILD_TESTS        "Build tests"                                 OFF)
 option(MIQ_FETCH_MICROECC     "Fetch micro-ecc from GitHub if not vendored" ON)
 set(MIQ_VENDOR_MICROECC_DIR   "${CMAKE_SOURCE_DIR}/third_party/micro-ecc"
     CACHE PATH "Path to vendored micro-ecc")
@@ -184,4 +184,3 @@ if(WIN32)
   # bcrypt is useful if you later switch RNGs for key generation; harmless to link.
   target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
-add_compile_definitions(COMPRESSED_POINT=1)
