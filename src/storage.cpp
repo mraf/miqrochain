@@ -110,4 +110,4 @@ bool miq::Storage::write_state(const std::vector<uint8_t>& b){
     flush_path(path_state_);
     return true;
 }
-
+}
