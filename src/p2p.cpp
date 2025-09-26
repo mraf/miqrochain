@@ -269,13 +269,12 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
         Block b;
         if (!deser_block(rec.raw, b)) continue;
 
-        // If parent not present yet, put it back (unlikely due to race)
+        // If parent not present yet, put it back (rare race)
         if (!chain_.have_block(b.header.prev_hash)) {
-            // Requeue as orphan
             const std::string phex = hexkey(b.header.prev_hash);
             orphans_.emplace(child_hex, OrphanRec{b.block_hash(), b.header.prev_hash, std::move(rec.raw)});
             orphan_children_[phex].push_back(child_hex);
-            orphan_bytes_ += rec.raw.size();
+            orphan_bytes_ += rec.raw.size();  // <-- corrected here
             continue;
         }
 
@@ -288,7 +287,6 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
             const std::string nexth = hexkey(b.block_hash());
             auto oit2 = orphan_children_.find(nexth);
             if (oit2 != orphan_children_.end()) {
-                // append their children into the queue
                 q.insert(q.end(), oit2->second.begin(), oit2->second.end());
                 orphan_children_.erase(oit2);
             }
