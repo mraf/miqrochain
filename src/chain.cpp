@@ -8,6 +8,7 @@
 #include "constants.h"     // BLOCK_TIME_SECS, GENESIS_BITS, etc.
 #include "difficulty.h"    // lwma_next_bits
 #include <sstream>
+#include <unordered_set>
 
 // === Added includes for security checks ===
 #include <algorithm>       // std::any_of
