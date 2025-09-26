@@ -238,11 +238,17 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
         inet_ntop(AF_INET, &a.sin_addr, ipbuf, (socklen_t)sizeof(ipbuf));
 #endif
     }
-    peers_[s] = PeerState{s, ipbuf[0] ? std::string(ipbuf) : std::string("unknown"), 0, now_ms()};
-    // init RL buckets
-    peers_[s].blk_tokens = MIQ_RATE_BLOCK_BURST;
-    peers_[s].tx_tokens  = MIQ_RATE_TX_BURST;
-    peers_[s].last_refill_ms = now_ms();
+
+    // Build PeerState explicitly (aggregate order was wrong before)
+    PeerState ps;
+    ps.sock = s;
+    ps.ip   = ipbuf[0] ? std::string(ipbuf) : std::string("unknown");
+    ps.mis  = 0;
+    ps.last_ms = now_ms();
+    ps.blk_tokens = MIQ_RATE_BLOCK_BURST;
+    ps.tx_tokens  = MIQ_RATE_TX_BURST;
+    ps.last_refill_ms = ps.last_ms;
+    peers_[s] = ps;
 
     // add addr if public
     uint32_t be_ip;
@@ -258,10 +264,15 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 }
 
 void P2P::handle_new_peer(int c, const std::string& ip){
-    peers_[c] = PeerState{c, ip, 0, now_ms()};
-    peers_[c].blk_tokens = MIQ_RATE_BLOCK_BURST;
-    peers_[c].tx_tokens  = MIQ_RATE_TX_BURST;
-    peers_[c].last_refill_ms = now_ms();
+    PeerState ps;
+    ps.sock = c;
+    ps.ip   = ip;
+    ps.mis  = 0;
+    ps.last_ms = now_ms();
+    ps.blk_tokens = MIQ_RATE_BLOCK_BURST;
+    ps.tx_tokens  = MIQ_RATE_TX_BURST;
+    ps.last_refill_ms = ps.last_ms;
+    peers_[c] = ps;
 
     // learn addr
     uint32_t be_ip;
@@ -332,7 +343,6 @@ static std::vector<std::vector<uint8_t>> make_simple_locator(miq::Chain& chain) 
     auto tip = chain.tip();
     if (tip.height == 0 && std::all_of(tip.hash.begin(), tip.hash.end(), [](uint8_t v){return v==0;})) return loc;
 
-    // Walk backward by index; if we fail to read, stop.
     size_t count = 0;
     for (int64_t h = (int64_t)tip.height; h >= 0 && count < 32; --h, ++count) {
         Block b;
@@ -342,7 +352,7 @@ static std::vector<std::vector<uint8_t>> make_simple_locator(miq::Chain& chain) 
     return loc;
 }
 
-// Serialize header (80 bytes) to wire: version(4) | prev(32) | merkle(32) | time(8) | bits(4) | nonce(8) [LE for ints]
+// Serialize header (80 bytes) to wire: version(4) | prev(32) | merkle(32) | time(8) | bits(4) | nonce(8)
 static std::vector<uint8_t> ser_header80(const BlockHeader& h) {
     std::vector<uint8_t> v; v.reserve(80);
     // u32LE
@@ -378,43 +388,6 @@ void P2P::rate_refill(PeerState& ps, int64_t now){
     ps.tx_tokens  = std::min<uint64_t>(MIQ_RATE_TX_BURST,   ps.tx_tokens  + add_tx);
     ps.last_refill_ms = now;
 }
-
-void RpcService::ensure_cookie() {
-    const std::string path = datadir_ + "/.cookie";
-    std::ifstream in(path);
-    if (in.good()) {
-        std::getline(in, rpc_token_);
-        in.close();
-        if (!rpc_token_.empty()) return;
-    }
-    // generate new token
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    std::uniform_int_distribution<uint64_t> dist;
-    std::ostringstream os;
-    os << std::hex << dist(gen) << dist(gen) << dist(gen);
-    rpc_token_ = os.str();
-    std::ofstream out(path, std::ios::trunc);
-    out << rpc_token_ << "\n";
-    out.flush();
-}
-
-bool RpcService::check_auth_header(const std::string& raw_request) {
-    if (!require_auth_) return true;
-    if (rpc_token_.empty()) ensure_cookie();
-    // naive scan for "Authorization: Bearer <token>"
-    const std::string needle = "Authorization: Bearer ";
-    auto pos = raw_request.find(needle);
-    if (pos == std::string::npos) return false;
-    pos += needle.size();
-    auto end = raw_request.find_first_of("\r\n", pos);
-    if (end == std::string::npos) end = raw_request.size();
-    std::string tok = raw_request.substr(pos, end - pos);
-    // trim
-    tok.erase(tok.find_last_not_of(" \t\r\n")+1);
-    return tok == rpc_token_;
-}
-
 
 bool P2P::rate_consume_block(PeerState& ps, size_t nbytes){
     int64_t n = now_ms();
@@ -618,28 +591,6 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
     }
 }
 
-// =================== TX relay ===============================================
-
-void P2P::broadcast_inv_tx(const std::vector<uint8_t>& txid){
-    auto msg = encode_msg("invtx", txid);
-    for (auto& kv : peers_) {
-        send(kv.first, (const char*)msg.data(), (int)msg.size(), 0);
-    }
-}
-
-void P2P::request_tx(PeerState& ps, const std::vector<uint8_t>& txid){
-    auto key = hexkey(txid);
-    if (!ps.inflight_tx.insert(key).second) return; // already requested from this peer
-    auto msg = encode_msg("gettx", txid);
-    send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
-}
-
-void P2P::send_tx(int sock, const std::vector<uint8_t>& raw){
-    if (raw.empty()) return;
-    auto msg = encode_msg("tx", raw);
-    send(sock, (const char*)msg.data(), (int)msg.size(), 0);
-}
-
 // ============================================================================
 
 void P2P::loop(){
@@ -710,11 +661,11 @@ void P2P::loop(){
                 uint8_t buf[65536];
 #ifdef _WIN32
                 int n = recv(s, (char*)buf, (int)sizeof(buf), 0);
-                if (n <= 0) { dead.push_back(s); goto timers_section; }
 #else
                 ssize_t n = recv(s, (char*)buf, sizeof(buf), 0);
-                if (n <= 0) { dead.push_back(s); goto timers_section; }
 #endif
+                if (n <= 0) { dead.push_back(s); continue; }
+
                 ps.last_ms = now_ms();
 
                 ps.rx.insert(ps.rx.end(), buf, buf + n);
@@ -722,247 +673,142 @@ void P2P::loop(){
                     log_warn("P2P: oversize buffer from " + ps.ip + " -> banning & dropping");
                     banned_.insert(ps.ip);
                     dead.push_back(s);
-                    goto timers_section;
+                    continue;
                 }
 
                 // parse all messages
-                {
-                    size_t off = 0;
-                    miq::NetMsg m;
-                    while (decode_msg(ps.rx, off, m)) {
-                        } else if (cmd == "verack") {
-                    ps.verack_ok = true;
-                    ps.syncing = true;
-                    ps.next_index = chain_.height() + 1;
-                    request_block_index(ps, ps.next_index); // keep existing
-                    if (!ps.sent_getheaders) send_getheaders(ps); // NEW
-                    maybe_send_getaddr(ps);
+                size_t off = 0;
+                miq::NetMsg m;
+                while (decode_msg(ps.rx, off, m)) {
+                    std::string cmd(m.cmd, m.cmd + 12);
+                    cmd.erase(cmd.find_first_of('\0'));
 
-                    // handle getheaders -> send headers
-                    } else if (cmd == "getheaders") {
-                    // payload = concatenated 32-byte hashes (locator)
-                std::vector<std::vector<uint8_t>> loc;
-                if (m.payload.size() % 32 == 0) {
-                    size_t n = m.payload.size() / 32;
-                    loc.reserve(n);
-                for (size_t i=0;i<n;i++){
-                    loc.emplace_back(m.payload.begin()+i*32, m.payload.begin()+(i+1)*32);
-                }
-            }
-              send_headers_snapshot(ps, loc);
+                    if (cmd == "version") {
+                        auto verack = encode_msg("verack", {});
+                        send(s, (const char*)verack.data(), (int)verack.size(), 0);
 
-            // handle headers -> request missing blocks (canonical only)
-            } else if (cmd == "headers") {
-            // parse 80-byte headers
-            if (m.payload.size() % 80 != 0) continue;
-                size_t n = m.payload.size() / 80;
-                size_t fetched = 0;
-            for (size_t i=0;i<n;i++){
-                const uint8_t* p = m.payload.data() + i*80;
-                BlockHeader hh;
-                // version
-                hh.version = (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
-                // prev, merkle
-                hh.prev_hash.assign(p+4,   p+4+32);
-                hh.merkle_root.assign(p+36, p+36+32);
-                // time
-                int64_t tt = 0; for (int k=0;k<8;k++) tt |= (int64_t)((uint64_t)p[68+k] << (8*k));
-                hh.time = tt;
-                // bits
-                hh.bits = (uint32_t)p[76] | ((uint32_t)p[77]<<8) | ((uint32_t)p[78]<<16) | ((uint32_t)p[79]<<24);
-                // nonce
-            uint64_t nn = 0; for (int k=0;k<8;k++) nn |= ((uint64_t)p[80+k]) << (8*k);
-                hh.nonce = nn;
+                    } else if (cmd == "verack") {
+                        ps.verack_ok = true;
+                        ps.syncing = true;
+                        ps.next_index = chain_.height() + 1;
+                        request_block_index(ps, ps.next_index);
+                        maybe_send_getaddr(ps);
 
-            // If we don't have the block, ask for it (we’ll still keep your getbi flow)
-            // Use block hash equality from header (recompute)
-            Block tmp; tmp.header = hh;
-            auto h = tmp.block_hash();
-                if (!chain_.have_block(h)) {
-                    request_block_hash(ps, h);
-                    ++fetched;
-                if (fetched >= 64) break; // don't burst
-        }
-            } else if (cmd == "invtx") {
-    if (m.payload.size() == 32) {
-        const std::string key((const char*)m.payload.data(), 32);
-        if (!seen_txids_.count(key)) {
-            seen_txids_.insert(key);
-            request_tx(ps, m.payload);
-        }
-    }
-} else if (cmd == "gettx") {
-    if (m.payload.size() == 32) {
-        const std::string key((const char*)m.payload.data(), 32);
-        auto it = tx_store_.find(key);
-        if (it != tx_store_.end()) send_tx(s, it->second);
-    }
-} else if (cmd == "tx") {
-    // apply tx rate-limit already present in your code
-    if (!rate_consume_tx(ps, m.payload.size())) {
-        if ((ps.banscore += 3) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
-        continue;
-    }
-    Transaction tx;
-    if (deser_tx(m.payload, tx)) {
-        std::string err;
-        bool accepted = false;
-        if (mempool_) {
-            accepted = mempool_->accept(tx, chain_.utxo(), chain_.height(), err);
-        }
-        // cache regardless (bounded)
-        const std::string key((const char*)tx.txid().data(), 32);
-        if (tx_store_.find(key) == tx_store_.end()) {
-            tx_store_[key] = m.payload;
-            tx_order_.push_back(key);
-            tx_store_bytes_ += m.payload.size();
-            while (tx_store_bytes_ > tx_store_limit_bytes_ && !tx_order_.empty()) {
-                const auto& old = tx_order_.front();
-                auto it = tx_store_.find(old);
-                if (it != tx_store_.end()) {
-                    tx_store_bytes_ -= it->second.size();
-                    tx_store_.erase(it);
-                }
-                tx_order_.pop_front();
-            }
-        }
-        if (accepted) {
-            broadcast_inv_tx(tx.txid());
-        } else if (!err.empty()) {
-            // mild penalty for invalid
-            if ((ps.banscore += 2) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
-        }
-    }
+                    } else if (cmd == "ping") {
+                        auto pong = encode_msg("pong", m.payload);
+                        send(s, (const char*)pong.data(), (int)pong.size(), 0);
 
-    }
-                        std::string cmd(m.cmd, m.cmd + 12);
-                        cmd.erase(cmd.find_first_of('\0'));
+                    } else if (cmd == "pong") {
+                        ps.awaiting_pong = false;
 
-                        if (cmd == "version") {
-                            auto verack = encode_msg("verack", {});
-                            send(s, (const char*)verack.data(), (int)verack.size(), 0);
-
-                        } else if (cmd == "verack") {
-                            ps.verack_ok = true;
-                            ps.syncing = true;
-                            ps.next_index = chain_.height() + 1;
-                            request_block_index(ps, ps.next_index);
-                            maybe_send_getaddr(ps);
-
-                        } else if (cmd == "ping") {
-                            auto pong = encode_msg("pong", m.payload);
-                            send(s, (const char*)pong.data(), (int)pong.size(), 0);
-
-                        } else if (cmd == "pong") {
-                            ps.awaiting_pong = false;
-
-                        } else if (cmd == "invb") {
-                            if (m.payload.size() == 32) {
-                                if (!chain_.have_block(m.payload)) {
-                                    request_block_hash(ps, m.payload);
-                                }
+                    } else if (cmd == "invb") {
+                        if (m.payload.size() == 32) {
+                            if (!chain_.have_block(m.payload)) {
+                                request_block_hash(ps, m.payload);
                             }
-
-                        } else if (cmd == "getb") {
-                            if (m.payload.size() == 32) {
-                                Block b;
-                                if (chain_.get_block_by_hash(m.payload, b)) {
-                                    auto raw = ser_block(b);
-                                    if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
-                                }
-                            }
-
-                        } else if (cmd == "getbi") {
-                            if (m.payload.size() == 8) {
-                                uint64_t idx64 = 0;
-                                for (int i=0;i<8;i++) idx64 |= ((uint64_t)m.payload[i]) << (8*i);
-                                Block b;
-                                if (chain_.get_block_by_index((size_t)idx64, b)) {
-                                    auto raw = ser_block(b);
-                                    if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
-                                }
-                            }
-
-                        } else if (cmd == "block") {
-                            if (!rate_consume_block(ps, m.payload.size())) {
-                                if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
-                                continue;
-                            }
-                            if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
-                                handle_incoming_block(s, m.payload);
-                            }
-
-                        } else if (cmd == "invtx") {
-                            if (m.payload.size() == 32) {
-                                auto key = hexkey(m.payload);
-                                if (!seen_txids_.count(key)) {
-                                    seen_txids_.insert(key);
-                                    request_tx(ps, m.payload);
-                                }
-                            }
-
-                        } else if (cmd == "gettx") {
-                            if (m.payload.size() == 32) {
-                                auto key = hexkey(m.payload);
-                                auto itx = tx_store_.find(key);
-                                if (itx != tx_store_.end()) {
-                                    if (rate_consume_tx(ps, itx->second.size())) {
-                                        send_tx(s, itx->second);
-                                    }
-                                }
-                            }
-
-                        } else if (cmd == "tx") {
-                            if (!rate_consume_tx(ps, m.payload.size())) {
-                                if ((ps.banscore += 3) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
-                                continue;
-                            }
-                            Transaction tx;
-                            if (!deser_tx(m.payload, tx)) continue;
-                            auto key = hexkey(tx.txid());
-
-                            // clear inflight if any
-                            ps.inflight_tx.erase(key);
-
-                            if (seen_txids_.insert(key).second) {
-                                std::string err;
-                                if (mempool_.accept(tx, chain_.utxo(), chain_.height(), err)) {
-                                    // cache raw for serving
-                                    tx_store_[key] = m.payload;
-                                    tx_order_.push_back(key);
-                                    if (tx_store_.size() > MIQ_TX_STORE_MAX) {
-                                        // prune oldest
-                                        auto victim = tx_order_.front();
-                                        tx_order_.pop_front();
-                                        tx_store_.erase(victim);
-                                    }
-                                    // announce
-                                    broadcast_inv_tx(tx.txid());
-                                } else {
-                                    // mildly penalize spammy bad txs
-                                    if (++ps.mis > 25) banned_.insert(ps.ip);
-                                }
-                            }
-
-                        } else if (cmd == "getaddr") {
-                            send_addr_snapshot(ps);
-
-                        } else if (cmd == "addr") {
-                            handle_addr_msg(ps, m.payload);
-
-                        } else {
-                            if (++ps.mis > 10) { dead.push_back(s); }
                         }
+
+                    } else if (cmd == "getb") {
+                        if (m.payload.size() == 32) {
+                            Block b;
+                            if (chain_.get_block_by_hash(m.payload, b)) {
+                                auto raw = ser_block(b);
+                                if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
+                            }
+                        }
+
+                    } else if (cmd == "getbi") {
+                        if (m.payload.size() == 8) {
+                            uint64_t idx64 = 0;
+                            for (int i=0;i<8;i++) idx64 |= ((uint64_t)m.payload[i]) << (8*i);
+                            Block b;
+                            if (chain_.get_block_by_index((size_t)idx64, b)) {
+                                auto raw = ser_block(b);
+                                if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
+                            }
+                        }
+
+                    } else if (cmd == "block") {
+                        if (!rate_consume_block(ps, m.payload.size())) {
+                            if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
+                            continue;
+                        }
+                        if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
+                            handle_incoming_block(s, m.payload);
+                        }
+
+                    } else if (cmd == "invtx") {
+                        if (m.payload.size() == 32) {
+                            auto key = hexkey(m.payload);
+                            if (!seen_txids_.count(key)) {
+                                seen_txids_.insert(key);
+                                request_tx(ps, m.payload);
+                            }
+                        }
+
+                    } else if (cmd == "gettx") {
+                        if (m.payload.size() == 32) {
+                            auto key = hexkey(m.payload);
+                            auto itx = tx_store_.find(key);
+                            if (itx != tx_store_.end()) {
+                                if (rate_consume_tx(ps, itx->second.size())) {
+                                    send_tx(s, itx->second);
+                                }
+                            }
+                        }
+
+                    } else if (cmd == "tx") {
+                        if (!rate_consume_tx(ps, m.payload.size())) {
+                            if ((ps.banscore += 3) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
+                            continue;
+                        }
+                        Transaction tx;
+                        if (!deser_tx(m.payload, tx)) continue;
+                        auto key = hexkey(tx.txid());
+
+                        // clear inflight if any
+                        ps.inflight_tx.erase(key);
+
+                        if (seen_txids_.insert(key).second) {
+                            std::string err;
+                            bool accepted = true;
+                            if (mempool_) {
+                                accepted = mempool_->accept(tx, chain_.utxo(), chain_.height(), err);
+                            }
+                            // cache raw for serving (bounded by count)
+                            if (tx_store_.find(key) == tx_store_.end()) {
+                                tx_store_[key] = m.payload;
+                                tx_order_.push_back(key);
+                                if (tx_store_.size() > MIQ_TX_STORE_MAX) {
+                                    auto victim = tx_order_.front();
+                                    tx_order_.pop_front();
+                                    tx_store_.erase(victim);
+                                }
+                            }
+                            if (accepted) {
+                                broadcast_inv_tx(tx.txid());
+                            } else if (!err.empty()) {
+                                if (++ps.mis > 25) banned_.insert(ps.ip);
+                            }
+                        }
+
+                    } else if (cmd == "getaddr") {
+                        send_addr_snapshot(ps);
+
+                    } else if (cmd == "addr") {
+                        handle_addr_msg(ps, m.payload);
+
+                    } else {
+                        if (++ps.mis > 10) { dead.push_back(s); }
                     }
-                    // drop consumed prefix
-                    if (off > 0) {
-                        std::vector<uint8_t> rest(ps.rx.begin() + off, ps.rx.end());
-                        ps.rx.swap(rest);
-                    }
+                }
+
+                // drop consumed prefix
+                if (off > 0 && off <= ps.rx.size()) {
+                    ps.rx.erase(ps.rx.begin(), ps.rx.begin() + (ptrdiff_t)off);
                 }
             }
 
-        timers_section:
             // --- timeouts / pings ---
             int64_t tnow = now_ms();
             if (!ps.verack_ok && (tnow - ps.last_ms) > MIQ_P2P_VERACK_TIMEOUT_MS) {
@@ -985,4 +831,4 @@ void P2P::loop(){
     save_bans();
 }
 
-}
+} // namespace miq
