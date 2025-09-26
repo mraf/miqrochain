@@ -782,4 +782,4 @@ void P2P::loop(){
     save_bans();
 }
 
-} // namespace miq
+}
