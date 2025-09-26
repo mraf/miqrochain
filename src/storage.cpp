@@ -46,7 +46,9 @@ bool Storage::open(const std::string& dir){
     }
     return true;
 }
-bool Storage::append_block(const std::vector<uint8_t>& raw, const std::vector<uint8_t>& hash){
+// Append a block, update offsets and hash->index, then fsync all files.
+bool miq::Storage::append_block(const std::vector<uint8_t>& raw,
+                                const std::vector<uint8_t>& hash){
     std::ofstream f(path_blocks_, std::ios::app|std::ios::binary);
     if(!f) return false;
 
@@ -59,10 +61,10 @@ bool Storage::append_block(const std::vector<uint8_t>& raw, const std::vector<ui
 
     offsets_.push_back(off);
     uint32_t idx = (uint32_t)offsets_.size()-1;
-    auto hexh = to_hex(hash);
+    const std::string hexh = miq::to_hex(hash);
     hash_to_index_[hexh] = idx;
 
-    // persist index and hashmap append-only
+    // persist index and hashmap append-only (with flush)
     {
         std::ofstream idxf(path_index_, std::ios::app|std::ios::binary);
         idxf.write((const char*)&off, sizeof(off));
@@ -80,17 +82,27 @@ bool Storage::append_block(const std::vector<uint8_t>& raw, const std::vector<ui
     }
     return true;
 }
+
+bool miq::Storage::read_block_by_index(size_t index, std::vector<uint8_t>& out) const{
+    if(index >= offsets_.size()) return false;
+    std::ifstream f(path_blocks_, std::ios::binary);
+    if(!f) return false;
+
+    f.seekg((std::streamoff)offsets_[index], std::ios::beg);
+    uint32_t sz = 0;
+    if(!f.read((char*)&sz, sizeof(sz))) return false;
+    out.resize(sz);
+    return (bool)f.read((char*)out.data(), sz);
 }
-bool Storage::read_block_by_index(size_t index, std::vector<uint8_t>& out) const{
-    if(index>=offsets_.size()) return false;
-    std::ifstream f(path_blocks_, std::ios::binary); f.seekg(offsets_[index]);
-    uint32_t sz=0; f.read((char*)&sz,sizeof(sz)); out.resize(sz); f.read((char*)out.data(), sz); return (bool)f;
-}
-bool Storage::read_block_by_hash(const std::vector<uint8_t>& hash, std::vector<uint8_t>& out) const{
-    auto it = hash_to_index_.find(to_hex(hash)); if(it==hash_to_index_.end()) return false;
+
+bool miq::Storage::read_block_by_hash(const std::vector<uint8_t>& hash,
+                                      std::vector<uint8_t>& out) const{
+    auto it = hash_to_index_.find(miq::to_hex(hash));
+    if(it == hash_to_index_.end()) return false;
     return read_block_by_index(it->second, out);
 }
-bool Storage::write_state(const std::vector<uint8_t>& b){
+
+bool miq::Storage::write_state(const std::vector<uint8_t>& b){
     std::ofstream f(path_state_, std::ios::binary|std::ios::trunc);
     if(!f) return false;
     f.write((const char*)b.data(), b.size());
@@ -98,3 +110,4 @@ bool Storage::write_state(const std::vector<uint8_t>& b){
     flush_path(path_state_);
     return true;
 }
+
