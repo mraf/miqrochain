@@ -731,58 +731,109 @@ void P2P::loop(){
                     miq::NetMsg m;
                     while (decode_msg(ps.rx, off, m)) {
                         } else if (cmd == "verack") {
-    ps.verack_ok = true;
-    ps.syncing = true;
-    ps.next_index = chain_.height() + 1;
-    request_block_index(ps, ps.next_index); // keep existing
-    if (!ps.sent_getheaders) send_getheaders(ps); // NEW
-    maybe_send_getaddr(ps);
+                    ps.verack_ok = true;
+                    ps.syncing = true;
+                    ps.next_index = chain_.height() + 1;
+                    request_block_index(ps, ps.next_index); // keep existing
+                    if (!ps.sent_getheaders) send_getheaders(ps); // NEW
+                    maybe_send_getaddr(ps);
 
-// handle getheaders -> send headers
-} else if (cmd == "getheaders") {
-    // payload = concatenated 32-byte hashes (locator)
-    std::vector<std::vector<uint8_t>> loc;
-    if (m.payload.size() % 32 == 0) {
-        size_t n = m.payload.size() / 32;
-        loc.reserve(n);
-        for (size_t i=0;i<n;i++){
-            loc.emplace_back(m.payload.begin()+i*32, m.payload.begin()+(i+1)*32);
+                    // handle getheaders -> send headers
+                    } else if (cmd == "getheaders") {
+                    // payload = concatenated 32-byte hashes (locator)
+                std::vector<std::vector<uint8_t>> loc;
+                if (m.payload.size() % 32 == 0) {
+                    size_t n = m.payload.size() / 32;
+                    loc.reserve(n);
+                for (size_t i=0;i<n;i++){
+                    loc.emplace_back(m.payload.begin()+i*32, m.payload.begin()+(i+1)*32);
+                }
+            }
+              send_headers_snapshot(ps, loc);
+
+            // handle headers -> request missing blocks (canonical only)
+            } else if (cmd == "headers") {
+            // parse 80-byte headers
+            if (m.payload.size() % 80 != 0) continue;
+                size_t n = m.payload.size() / 80;
+                size_t fetched = 0;
+            for (size_t i=0;i<n;i++){
+                const uint8_t* p = m.payload.data() + i*80;
+                BlockHeader hh;
+                // version
+                hh.version = (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+                // prev, merkle
+                hh.prev_hash.assign(p+4,   p+4+32);
+                hh.merkle_root.assign(p+36, p+36+32);
+                // time
+                int64_t tt = 0; for (int k=0;k<8;k++) tt |= (int64_t)((uint64_t)p[68+k] << (8*k));
+                hh.time = tt;
+                // bits
+                hh.bits = (uint32_t)p[76] | ((uint32_t)p[77]<<8) | ((uint32_t)p[78]<<16) | ((uint32_t)p[79]<<24);
+                // nonce
+            uint64_t nn = 0; for (int k=0;k<8;k++) nn |= ((uint64_t)p[80+k]) << (8*k);
+                hh.nonce = nn;
+
+            // If we don't have the block, ask for it (we’ll still keep your getbi flow)
+            // Use block hash equality from header (recompute)
+            Block tmp; tmp.header = hh;
+            auto h = tmp.block_hash();
+                if (!chain_.have_block(h)) {
+                    request_block_hash(ps, h);
+                    ++fetched;
+                if (fetched >= 64) break; // don't burst
+        }
+            } else if (cmd == "invtx") {
+    if (m.payload.size() == 32) {
+        const std::string key((const char*)m.payload.data(), 32);
+        if (!seen_txids_.count(key)) {
+            seen_txids_.insert(key);
+            request_tx(ps, m.payload);
         }
     }
-    send_headers_snapshot(ps, loc);
-
-// handle headers -> request missing blocks (canonical only)
-} else if (cmd == "headers") {
-    // parse 80-byte headers
-    if (m.payload.size() % 80 != 0) continue;
-    size_t n = m.payload.size() / 80;
-    size_t fetched = 0;
-    for (size_t i=0;i<n;i++){
-        const uint8_t* p = m.payload.data() + i*80;
-        BlockHeader hh;
-        // version
-        hh.version = (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
-        // prev, merkle
-        hh.prev_hash.assign(p+4,   p+4+32);
-        hh.merkle_root.assign(p+36, p+36+32);
-        // time
-        int64_t tt = 0; for (int k=0;k<8;k++) tt |= (int64_t)((uint64_t)p[68+k] << (8*k));
-        hh.time = tt;
-        // bits
-        hh.bits = (uint32_t)p[76] | ((uint32_t)p[77]<<8) | ((uint32_t)p[78]<<16) | ((uint32_t)p[79]<<24);
-        // nonce
-        uint64_t nn = 0; for (int k=0;k<8;k++) nn |= ((uint64_t)p[80+k]) << (8*k);
-        hh.nonce = nn;
-
-        // If we don't have the block, ask for it (we’ll still keep your getbi flow)
-        // Use block hash equality from header (recompute)
-        Block tmp; tmp.header = hh;
-        auto h = tmp.block_hash();
-        if (!chain_.have_block(h)) {
-            request_block_hash(ps, h);
-            ++fetched;
-            if (fetched >= 64) break; // don't burst
+} else if (cmd == "gettx") {
+    if (m.payload.size() == 32) {
+        const std::string key((const char*)m.payload.data(), 32);
+        auto it = tx_store_.find(key);
+        if (it != tx_store_.end()) send_tx(s, it->second);
+    }
+} else if (cmd == "tx") {
+    // apply tx rate-limit already present in your code
+    if (!rate_consume_tx(ps, m.payload.size())) {
+        if ((ps.banscore += 3) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
+        continue;
+    }
+    Transaction tx;
+    if (deser_tx(m.payload, tx)) {
+        std::string err;
+        bool accepted = false;
+        if (mempool_) {
+            accepted = mempool_->accept(tx, chain_.utxo(), chain_.height(), err);
         }
+        // cache regardless (bounded)
+        const std::string key((const char*)tx.txid().data(), 32);
+        if (tx_store_.find(key) == tx_store_.end()) {
+            tx_store_[key] = m.payload;
+            tx_order_.push_back(key);
+            tx_store_bytes_ += m.payload.size();
+            while (tx_store_bytes_ > tx_store_limit_bytes_ && !tx_order_.empty()) {
+                const auto& old = tx_order_.front();
+                auto it = tx_store_.find(old);
+                if (it != tx_store_.end()) {
+                    tx_store_bytes_ -= it->second.size();
+                    tx_store_.erase(it);
+                }
+                tx_order_.pop_front();
+            }
+        }
+        if (accepted) {
+            broadcast_inv_tx(tx.txid());
+        } else if (!err.empty()) {
+            // mild penalty for invalid
+            if ((ps.banscore += 2) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
+        }
+    }
+
     }
                         std::string cmd(m.cmd, m.cmd + 12);
                         cmd.erase(cmd.find_first_of('\0'));
