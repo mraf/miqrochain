@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <set>
 #include <deque>
 #include <cstdint>
@@ -23,9 +24,19 @@
   #include <unistd.h>
 #endif
 
+#include "mempool.h"
+#include "block.h"
+#include "serialize.h"
+
 namespace miq {
 
 class Chain; // forward declaration
+
+struct OrphanRec {
+    std::vector<uint8_t> hash;
+    std::vector<uint8_t> prev;
+    std::vector<uint8_t> raw;
+};
 
 struct PeerState {
     int         sock{-1};
@@ -37,27 +48,23 @@ struct PeerState {
     bool        syncing{false};
     uint64_t    next_index{0};
 
-    // RX buffer & liveness
+    // rx buffer & liveness
     std::vector<uint8_t> rx;
     bool        verack_ok{false};
     int64_t     last_ping_ms{0};
     bool        awaiting_pong{false};
     int         banscore{0};
 
-    // addr throttling
-    int64_t     last_addr_ms{0};
-
-    // rate limiting
+    // rate-limit buckets
     uint64_t    blk_tokens{0};
     uint64_t    tx_tokens{0};
     int64_t     last_refill_ms{0};
-};
 
-// Orphan block record
-struct OrphanRec {
-    std::vector<uint8_t> hash;  // child block hash
-    std::vector<uint8_t> prev;  // parent hash
-    std::vector<uint8_t> raw;   // serialized block
+    // addr filtering
+    int64_t     last_addr_ms{0};
+
+    // optional: in-flight tx requests
+    std::unordered_set<std::string> inflight_tx;
 };
 
 class P2P {
@@ -68,29 +75,20 @@ public:
     bool start(uint16_t port);
     void stop();
 
-    // Outbound connect to a seed (hostname or IP)
     bool connect_seed(const std::string& host, uint16_t port);
 
-    // Broadcast inventory for a new block hash we just accepted/mined
     void broadcast_inv_block(const std::vector<uint8_t>& block_hash);
 
-    // Optional: where to store bans.txt
     inline void set_datadir(const std::string& d) { datadir_ = d; }
 
-    // hex for keys (small helper)
-    static std::string hexkey(const std::vector<uint8_t>& h);
-
 private:
+    // ---------- core ----------
     Chain& chain_;
     std::thread th_;
     std::atomic<bool> running_{false};
     int srv_{-1};
     std::unordered_map<int, PeerState> peers_;
     std::set<std::string> banned_;
-
-    // known IPv4 addrs (network byte order) learned from peers
-    std::set<uint32_t> addrv4_;
-
     std::string datadir_{"./miqdata"};
 
     void loop();
@@ -98,39 +96,48 @@ private:
     void load_bans();
     void save_bans();
 
-    // helpers for sync & block serving
-    void start_sync_with_peer(PeerState& ps);
-    void request_block_index(PeerState& ps, uint64_t index);
-    void request_block_hash(PeerState& ps, const std::vector<uint8_t>& h);
-    void send_block(int s, const std::vector<uint8_t>& raw);
-
-    // rate limiting
+    // ---------- rate limiting ----------
     void rate_refill(PeerState& ps, int64_t now);
     bool rate_consume_block(PeerState& ps, size_t nbytes);
     bool rate_consume_tx(PeerState& ps, size_t nbytes);
 
-    // addr handling
+    // ---------- address table ----------
     void maybe_send_getaddr(PeerState& ps);
     void send_addr_snapshot(PeerState& ps);
     void handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload);
+    std::unordered_set<uint32_t> addrv4_;
 
-    // IPv4 helpers
     static bool parse_ipv4(const std::string& dotted, uint32_t& be_ip);
     static bool ipv4_is_public(uint32_t be_ip);
 
-    // ---- Orphan manager (matches your p2p.cpp) ----
+    // ---------- orphan block manager ----------
     void evict_orphans_if_needed();
     void remove_orphan_by_hex(const std::string& child_hex);
     void handle_incoming_block(int sock, const std::vector<uint8_t>& raw);
     void try_connect_orphans(const std::string& parent_hex);
 
-    // orphan state
-    std::unordered_map<std::string, OrphanRec> orphans_;                 // child_hex -> record
-    std::unordered_map<std::string, std::vector<std::string>> orphan_children_; // parent_hex -> list of child_hex
-    std::deque<std::string> orphan_order_;                               // FIFO for eviction
+    std::unordered_map<std::string, OrphanRec> orphans_;
+    std::unordered_map<std::string, std::vector<std::string>> orphan_children_;
+    std::deque<std::string> orphan_order_;
     size_t orphan_bytes_{0};
     size_t orphan_bytes_limit_{0};
     size_t orphan_count_limit_{0};
+
+    // ---------- tx relay ----------
+    void broadcast_inv_tx(const std::vector<uint8_t>& txid);
+    void request_tx(PeerState& ps, const std::vector<uint8_t>& txid);
+    void send_tx(int sock, const std::vector<uint8_t>& raw);
+
+    // local mempool (policy layer)
+    Mempool mempool_;
+
+    // dedupe + serving
+    std::unordered_set<std::string> seen_txids_;
+    std::unordered_map<std::string, std::vector<uint8_t>> tx_store_;
+    std::deque<std::string> tx_order_; // to prune cache
+
+    // ---------- utils ----------
+    static std::string hexkey(const std::vector<uint8_t>& h);
 };
 
 } // namespace miq
