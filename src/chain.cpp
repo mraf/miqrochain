@@ -64,6 +64,14 @@ static inline bool meets_target_be(const std::vector<uint8_t>& hash32, uint32_t 
     return std::memcmp(hash32.data(), target, 32) <= 0;
 }
 
+// === Added: low-S threshold (secp256k1 order/2) for canonical signatures ===
+static const uint8_t SECP256K1_N_HALF[32] = {
+    0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0x5D,0x57,0x6E,0xE7,0x57,0x12,0xA2,0x4F,
+    0x56,0x28,0x14,0x81,0x68,0xB9,0xC5,0x8D
+};
+
 // =====================================================================
 
 bool Chain::open(const std::string& dir){
@@ -281,6 +289,25 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
             if(!utxo_.get(inx.prev.txid, inx.prev.vout, e)){ err="missing utxo"; return false; }
             if(e.coinbase && tip_.height+1 < e.height + COINBASE_MATURITY){ err="immature coinbase"; return false; }
             if(hash160(inx.pubkey)!=e.pkh){ err="pkh mismatch"; return false; }
+
+            // === Strict key/sig policy (consensus) ===
+            // Compressed pubkey only (33 bytes, 0x02 or 0x03)
+            if (inx.pubkey.size() != 33 || (inx.pubkey[0] != 0x02 && inx.pubkey[0] != 0x03)) {
+                err = "bad pubkey"; return false;
+            }
+            // Signature must be 64 bytes (r||s)
+            if (inx.sig.size() != 64) { err = "bad siglen"; return false; }
+            // Optional: low-S canonical (s <= n/2). s is last 32 bytes (big-endian)
+            {
+                const uint8_t* s_ptr = inx.sig.data() + 32;
+                bool s_is_high = false;
+                for (int j = 0; j < 32; ++j) {
+                    if (s_ptr[j] > SECP256K1_N_HALF[j]) { s_is_high = true; break; }
+                    if (s_ptr[j] < SECP256K1_N_HALF[j]) { break; }
+                }
+                if (s_is_high) { err = "non-canonical-S"; return false; }
+            }
+
             if(!crypto::ECDSA::verify(inx.pubkey, hash, inx.sig)){ err="bad signature"; return false; }
 
             if (!leq_max_money(e.value)) { err="utxo>MAX_MONEY"; return false; }
