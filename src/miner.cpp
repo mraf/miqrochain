@@ -304,6 +304,124 @@ bool Miner::pow_loop(Block& b, uint32_t bits){
     return true;
 }
 
+Block mine_block(const std::vector<uint8_t>& prev_hash,
+                 uint32_t bits,
+                 const Transaction& coinbase,
+                 const std::vector<Transaction>& mempool_txs,
+                 unsigned threads)
+{
+    Block b;
+    b.header.prev_hash = prev_hash;
+    b.header.bits      = bits;
+    b.header.time      = static_cast<int64_t>(time(nullptr));
+
+    b.txs.clear();
+    b.txs.push_back(coinbase);
+    for (const auto& tx : mempool_txs) b.txs.push_back(tx);
+
+    // Merkle
+    std::vector<std::vector<uint8_t>> txids;
+    txids.reserve(b.txs.size());
+    for (const auto& t : b.txs) txids.push_back(t.txid());
+    b.header.merkle_root = merkle_root(txids);
+
+    if (threads == 0) threads = 1;
+
+    // Header prefix (80 bytes): ver|prev|merkle|time|bits
+    const std::vector<uint8_t> header_prefix = [&]{
+        std::vector<uint8_t> v;
+        v.reserve(4 + 32 + 32 + 8 + 4);
+        // reuse local helpers declared earlier in this file
+        // put_u32_le, put_u64_le
+        put_u32_le(v, b.header.version);
+        v.insert(v.end(), b.header.prev_hash.begin(),   b.header.prev_hash.end());
+        v.insert(v.end(), b.header.merkle_root.begin(), b.header.merkle_root.end());
+        put_u64_le(v, static_cast<uint64_t>(b.header.time));
+        put_u32_le(v, b.header.bits);
+        return v;
+    }();
+    const size_t nonce_off = header_prefix.size();
+
+    std::atomic<bool> found{false};
+    std::atomic<uint64_t> best_nonce{0};
+
+    // Precompute target
+    unsigned char Tglob[32];
+    target_from_compact(bits, Tglob);
+
+#if !defined(MIQ_POW_SALT)
+    // Fast midstate for first SHA256
+    FastSha256Ctx base1;
+    fastsha_init(base1);
+    fastsha_update(base1, header_prefix.data(), header_prefix.size());
+#endif
+
+    // Disjoint nonce streams per thread
+    const uint64_t base_nonce =
+        (static_cast<uint64_t>(time(nullptr)) << 32) ^ 0x9e3779b97f4a7c15ull;
+
+    std::vector<std::thread> ths;
+    ths.reserve(threads);
+
+    for (unsigned t = 0; t < threads; ++t) {
+        ths.emplace_back([&, t](){
+        #if defined(_WIN32) && defined(MIQ_SET_AFFINITY)
+            const int maskBits = static_cast<int>(sizeof(DWORD_PTR) * 8);
+            const int cpu = static_cast<int>(t % static_cast<unsigned>(maskBits));
+            const DWORD_PTR mask = (DWORD_PTR(1) << cpu);
+            SetThreadAffinityMask(GetCurrentThread(), mask);
+        #endif
+            uint64_t local_hashes = 0;
+            const uint64_t FLUSH_EVERY = (1ull<<18);
+
+            std::vector<uint8_t> hdr = header_prefix;
+            hdr.resize(header_prefix.size() + 8);
+            uint8_t* nonce_ptr = hdr.data() + nonce_off;
+
+            const uint64_t stride = (uint64_t)threads;
+            uint64_t nonce = base_nonce + (uint64_t)t;
+
+            while (!found.load(std::memory_order_relaxed)) {
+                store_u64_le(nonce_ptr, nonce);
+
+                uint8_t h[32];
+            #if !defined(MIQ_POW_SALT)
+                uint8_t nonce_le[8];
+                store_u64_le(nonce_le, nonce);
+                dsha256_from_base(base1, nonce_le, sizeof(nonce_le), h);
+            #else
+                const auto hv = salted_header_hash(hdr);
+                std::memcpy(h, hv.data(), 32);
+            #endif
+                if (hash_leq_target(h, Tglob)) {
+                    best_nonce.store(nonce, std::memory_order_relaxed);
+                    found.store(true, std::memory_order_relaxed);
+                    g_hashes.fetch_add(++local_hashes, std::memory_order_relaxed);
+                    g_hashes_total.fetch_add(local_hashes, std::memory_order_relaxed);
+                    return;
+                }
+
+                if ((++local_hashes & (FLUSH_EVERY-1)) == 0) {
+                    g_hashes.fetch_add(local_hashes, std::memory_order_relaxed);
+                    g_hashes_total.fetch_add(local_hashes, std::memory_order_relaxed);
+                    local_hashes = 0;
+                }
+                nonce += stride;
+            }
+
+            if (local_hashes) {
+                g_hashes.fetch_add(local_hashes, std::memory_order_relaxed);
+                g_hashes_total.fetch_add(local_hashes, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    for (auto& th : ths) th.join();
+
+    b.header.nonce = best_nonce.load(std::memory_order_relaxed);
+    return b;
+}
+
 void Miner::run(){
     log_info("miner: started");
     while (running_) {
