@@ -1,4 +1,4 @@
-﻿# miqrochain v1.7.8 â€” Windows Build
+﻿# miqrochain v1.0 Build
 
 **Requirements**
 - Visual Studio 2022 Build Tools (C++), x64 Native Tools command prompt
@@ -7,7 +7,7 @@
 
 **Build (daemon only)**
 ```powershell
-Set-Location C:\miqrochain_v0.1
+Set-Location C:\miqrochain
 if (Test-Path .\build) { Remove-Item -Recurse -Force .\build }
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release --target miqrod --parallel
