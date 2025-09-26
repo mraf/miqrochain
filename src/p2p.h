@@ -24,13 +24,11 @@
   #include <unistd.h>
 #endif
 
-#include "mempool.h"  // we embed a Mempool instance
+#include "mempool.h"   // we use a (nullable) mempool pointer
 
 namespace miq {
 
 class Chain; // fwd
-
-class Mempool; // optional for tx relay
 
 struct OrphanRec {
     std::vector<uint8_t> hash;
@@ -39,10 +37,15 @@ struct OrphanRec {
 };
 
 struct PeerState {
-    bool sent_getheaders{false};
-    int64_t last_headers_ms{0};
+    // headers-first (future use)
+    bool     sent_getheaders{false};
+    int64_t  last_headers_ms{0};
+
+    // identity/socket
     int         sock{-1};
     std::string ip;
+
+    // misc tracking
     int         mis{0};
     int64_t     last_ms{0};
 
@@ -71,9 +74,13 @@ struct PeerState {
 
 class P2P {
 public:
-    void set_mempool(Mempool* mp) { mempool_ = mp; }
     explicit P2P(Chain& c);
     ~P2P();
+
+    // Optional mempool hookup (nullable = tx relay disabled but node runs fine)
+    inline void set_mempool(Mempool* mp) { mempool_ = mp; }
+    inline Mempool*       mempool()       { return mempool_; }
+    inline const Mempool* mempool() const { return mempool_; }
 
     bool start(uint16_t port);
     void stop();
@@ -91,17 +98,12 @@ public:
     // tiny, local and fast hex for keys
     static std::string hexkey(const std::vector<uint8_t>& h);
 
-    // expose mempool if callers need it later (optional)
-    inline Mempool& mempool() { return mempool_; }
-    inline const Mempool& mempool() const { return mempool_; }
-
 private:
-    // ---- headers-first helpers ----
+    // ---- headers-first helpers (present for future use) ----
     void send_getheaders(PeerState& ps);
     void send_headers_snapshot(PeerState& ps, const std::vector<std::vector<uint8_t>>& locator);
 
     // ---- tx relay (basic) ----
-    void broadcast_inv_tx(const std::vector<uint8_t>& txid);
     void request_tx(PeerState& ps, const std::vector<uint8_t>& txid);
     void send_tx(int sock, const std::vector<uint8_t>& raw);
 
@@ -112,7 +114,7 @@ private:
     size_t tx_store_bytes_{0};
     size_t tx_store_limit_bytes_{4u * 1024u * 1024u}; // 4MB
 
-Mempool* mempool_{nullptr};  // nullable, safe to run without
+    Mempool* mempool_{nullptr};  // nullable, safe to run without
     Chain& chain_;
     std::thread th_;
     std::atomic<bool> running_{false};
@@ -132,14 +134,6 @@ Mempool* mempool_{nullptr};  // nullable, safe to run without
     size_t orphan_bytes_limit_{0};
     size_t orphan_count_limit_{0};
 
-    // tx relay cache & dedupe
-    std::unordered_map<std::string, std::vector<uint8_t>> tx_store_;
-    std::deque<std::string> tx_order_;
-    std::unordered_set<std::string> seen_txids_;
-
-    // local mempool
-    Mempool mempool_;
-
     // core
     void loop();
     void handle_new_peer(int c, const std::string& ip);
@@ -151,10 +145,6 @@ Mempool* mempool_{nullptr};  // nullable, safe to run without
     void request_block_index(PeerState& ps, uint64_t index);
     void request_block_hash(PeerState& ps, const std::vector<uint8_t>& h);
     void send_block(int s, const std::vector<uint8_t>& raw);
-
-    // tx relay helpers
-    void request_tx(PeerState& ps, const std::vector<uint8_t>& txid);
-    void send_tx(int sock, const std::vector<uint8_t>& raw);
 
     // rate-limit helpers
     void rate_refill(PeerState& ps, int64_t now);
