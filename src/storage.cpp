@@ -3,6 +3,24 @@
 #include <cstdint>
 #include <fstream>
 #include <filesystem>
+
+#if defined(_WIN32)
+  #include <windows.h>
+  static inline void flush_path(const std::string& p){
+      HANDLE h = CreateFileA(p.c_str(), GENERIC_WRITE,
+                             FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+      if (h != INVALID_HANDLE_VALUE) { FlushFileBuffers(h); CloseHandle(h); }
+  }
+#else
+  #include <unistd.h>
+  #include <fcntl.h>
+  static inline void flush_path(const std::string& p){
+      int fd = ::open(p.c_str(), O_RDWR | O_CLOEXEC);
+      if (fd >= 0) { ::fsync(fd); ::close(fd); }
+  }
+#endif
+
 namespace fs = std::filesystem;
 namespace miq {
 bool Storage::open(const std::string& dir){
@@ -31,16 +49,37 @@ bool Storage::open(const std::string& dir){
 bool Storage::append_block(const std::vector<uint8_t>& raw, const std::vector<uint8_t>& hash){
     std::ofstream f(path_blocks_, std::ios::app|std::ios::binary);
     if(!f) return false;
-    auto off = (uint64_t)std::filesystem::file_size(path_blocks_);
-    uint32_t sz=(uint32_t)raw.size();
-    f.write((const char*)&sz,sizeof(sz)); f.write((const char*)raw.data(), sz);
+
+    uint64_t off = (uint64_t)std::filesystem::file_size(path_blocks_);
+    uint32_t sz  = (uint32_t)raw.size();
+    f.write((const char*)&sz, sizeof(sz));
+    f.write((const char*)raw.data(), sz);
+    f.flush();
+    flush_path(path_blocks_);
+
     offsets_.push_back(off);
     uint32_t idx = (uint32_t)offsets_.size()-1;
-    hash_to_index_[to_hex(hash)] = idx;
+    auto hexh = to_hex(hash);
+    hash_to_index_[hexh] = idx;
+
     // persist index and hashmap append-only
-    std::ofstream idxf(path_index_, std::ios::app|std::ios::binary); idxf.write((const char*)&off, sizeof(off));
-    std::ofstream hm(path_hashmap_, std::ios::app|std::ios::binary); uint32_t ksz=(uint32_t)to_hex(hash).size(); hm.write((const char*)&ksz,sizeof(ksz)); hm.write(to_hex(hash).c_str(), ksz); hm.write((const char*)&idx,sizeof(idx));
+    {
+        std::ofstream idxf(path_index_, std::ios::app|std::ios::binary);
+        idxf.write((const char*)&off, sizeof(off));
+        idxf.flush();
+        flush_path(path_index_);
+    }
+    {
+        std::ofstream hm(path_hashmap_, std::ios::app|std::ios::binary);
+        uint32_t ksz = (uint32_t)hexh.size();
+        hm.write((const char*)&ksz, sizeof(ksz));
+        hm.write(hexh.c_str(), ksz);
+        hm.write((const char*)&idx, sizeof(idx));
+        hm.flush();
+        flush_path(path_hashmap_);
+    }
     return true;
+}
 }
 bool Storage::read_block_by_index(size_t index, std::vector<uint8_t>& out) const{
     if(index>=offsets_.size()) return false;
@@ -51,6 +90,11 @@ bool Storage::read_block_by_hash(const std::vector<uint8_t>& hash, std::vector<u
     auto it = hash_to_index_.find(to_hex(hash)); if(it==hash_to_index_.end()) return false;
     return read_block_by_index(it->second, out);
 }
-bool Storage::write_state(const std::vector<uint8_t>& b){ std::ofstream f(path_state_, std::ios::binary|std::ios::trunc); if(!f) return false; f.write((const char*)b.data(), b.size()); return true; }
-bool Storage::read_state(std::vector<uint8_t>& b) const{ std::ifstream f(path_state_, std::ios::binary); if(!f) return false; b.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()); return true; }
+bool Storage::write_state(const std::vector<uint8_t>& b){
+    std::ofstream f(path_state_, std::ios::binary|std::ios::trunc);
+    if(!f) return false;
+    f.write((const char*)b.data(), b.size());
+    f.flush();
+    flush_path(path_state_);
+    return true;
 }
