@@ -1,129 +1,194 @@
-#include "ecdsa_uECC.h"
-#include "ecdsa_iface.h"
-#include <uECC.h>
+#include "crypto/ecdsa_iface.h"   // declares class ECDSA (public API)
+#include "crypto/ecdsa_uECC.h"    // backend declarations
 
 #include <vector>
-#include <cstring>
-#include <random>
-#include <atomic>
-#include <mutex>
 #include <cstdint>
+#include <cstring>
 
-namespace miq { namespace crypto {
-
-// -----------------------------------------------------------------------------
-// Default RNG for micro-ecc (OS-backed)
-static int uecc_rng(uint8_t* dest, unsigned size) {
-    std::random_device rd;
-    for (unsigned i = 0; i < size; ++i) dest[i] = static_cast<uint8_t>(rd());
-    return 1;
+extern "C" {
+#include "uECC.h"                 // micro-ecc
 }
 
-// Set default RNG exactly once (first use)
-static void ensure_rng_once() {
-    static std::atomic<bool> done{false};
-    bool expected = false;
-    if (done.compare_exchange_strong(expected, true)) {
-        uECC_set_rng(&uecc_rng);
+namespace miq {
+namespace crypto {
+
+// secp256k1 order N (big-endian)
+static const uint8_t SECP256K1_N[32] = {
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFE,0xBA,0xAE,0xDC,
+    0xE6,0xAF,0x48,0xA0,0x3B,0xBF,0xD2,0x5E,
+    0x8C,0xD0,0x36,0x41,0x41,0x00,0x00,0x00
+};
+// N/2 (big-endian)
+static const uint8_t SECP256K1_N_HALF[32] = {
+    0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0x5D,0x57,0x6E,
+    0x73,0x57,0xA4,0x50,0x1D,0xDF,0xE9,0x2F,
+    0x46,0x68,0x1B,0x20,0xA0,0x80,0x00,0x00
+};
+
+static inline int cmp_be_32(const uint8_t* a, const uint8_t* b) {
+    // big-endian lexicographic compare for 32 bytes
+    return std::memcmp(a, b, 32);
+}
+static inline bool is_zero32(const uint8_t* x){
+    uint32_t acc = 0;
+    for(int i=0;i<32;i++) acc |= x[i];
+    return acc==0;
+}
+static inline void be_sub_32(uint8_t out[32], const uint8_t a[32], const uint8_t b[32]){
+    // out = a - b (big-endian)
+    int borrow = 0;
+    for(int i=31;i>=0;--i){
+        int v = (int)a[i] - (int)b[i] - borrow;
+        borrow = (v < 0);
+        out[i] = (uint8_t)(v + (borrow ? 256 : 0));
     }
 }
 
-// -----------------------------------------------------------------------------
-// Bounded-forced RNG: try provided priv once; otherwise OS RNG.
-// Lets us compute pub = priv·G via uECC_make_key() without uECC_compute_public_key.
-static std::mutex g_rng_mx;
-static thread_local const uint8_t* g_try_priv = nullptr;
-static thread_local unsigned       g_try_len  = 0;
-static thread_local bool           g_tried    = false;
-
-static int uecc_rng_try_then_os(uint8_t* dest, unsigned size) {
-    if (!g_tried && g_try_priv && g_try_len >= size) {
-        std::memcpy(dest, g_try_priv, size);
-        g_tried = true;
-        return 1;
+// ----- OS RNG (portable) for private key generation -----
+static bool os_random_bytes(uint8_t* dst, size_t len) {
+#if defined(_WIN32)
+    // BCryptGenRandom with system-preferred RNG
+    #include <windows.h>
+    #include <bcrypt.h>
+    NTSTATUS s = BCryptGenRandom(nullptr, dst, (ULONG)len, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    return s >= 0;
+#else
+    // /dev/urandom
+    #include <fcntl.h>
+    #include <unistd.h>
+    int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = ::read(fd, dst + got, len - got);
+        if (n <= 0) { ::close(fd); return false; }
+        got += (size_t)n;
     }
-    return uecc_rng(dest, size);
+    ::close(fd);
+    return true;
+#endif
 }
 
-// micro-ecc uses 64-byte uncompressed pubkeys internally
-static void compress64to33(const uint8_t* pub64, std::vector<uint8_t>& out33){
-    out33.resize(33);
-    uECC_compress(pub64, out33.data(), uECC_secp256k1());
-}
-
-static bool decompress33to64(const std::vector<uint8_t>& in33, std::vector<uint8_t>& out64){
-    out64.resize(64);
-    // Some micro-ecc versions return void here; validate afterward:
-    uECC_decompress(in33.data(), out64.data(), uECC_secp256k1());
-    return uECC_valid_public_key(out64.data(), uECC_secp256k1()) == 1;
-}
-
-// -----------------------------------------------------------------------------
-// ECDSA_uECC backend (secp256k1)
-
-bool ECDSA_uECC::generate_priv(std::vector<uint8_t>& out){
-    ensure_rng_once();
-    out.resize(32);
-    std::vector<uint8_t> pub64(64);
-    return uECC_make_key(pub64.data(), out.data(), uECC_secp256k1()) == 1;
-}
-
-// Derive public key (33B compressed) from a given 32B private key.
-// Strategy:
-//  - Temporarily set RNG to "try provided priv once, else OS RNG".
-//  - Call uECC_make_key(); if priv is valid, it succeeds with pub=priv·G and tmp_priv==priv.
-//  - If priv is invalid, the lib picks a random key; we detect mismatch and fail.
-bool ECDSA_uECC::derive_pub(const std::vector<uint8_t>& priv, std::vector<uint8_t>& out33){
-    if(priv.size()!=32) return false;
-
-    std::lock_guard<std::mutex> lock(g_rng_mx);
-
-    // Install bounded RNG
-    const uint8_t* save_ptr = g_try_priv;
-    unsigned       save_len = g_try_len;
-    bool           save_tr  = g_tried;
-    g_try_priv = priv.data();
-    g_try_len  = 32;
-    g_tried    = false;
-    uECC_set_rng(&uecc_rng_try_then_os);
-
-    std::vector<uint8_t> pub64(64), tmp_priv(32);
-    const int ok = uECC_make_key(pub64.data(), tmp_priv.data(), uECC_secp256k1());
-
-    // Restore default RNG immediately (do not rely on ensure_rng_once here)
-    g_try_priv = save_ptr; g_try_len = save_len; g_tried = save_tr;
-    uECC_set_rng(&uecc_rng);
-
-    if(ok != 1) return false;
-
-    // Confirm the library used our exact private key
-    if(std::memcmp(tmp_priv.data(), priv.data(), 32) != 0){
-        return false; // provided private key is invalid for the curve
+// Normalize pubkey to 64-byte XY (uncompressed) for uECC_verify/uECC_valid_public_key.
+// Supports 33-byte compressed (02/03 + X), 65-byte uncompressed (04 + X + Y),
+// or 64-byte raw XY (no prefix). Returns false if invalid.
+static bool normalize_pubkey_xy(const std::vector<uint8_t>& in, uint8_t out_xy[64]){
+    const uECC_Curve curve = uECC_secp256k1();
+    if (in.size()==33 && (in[0]==0x02 || in[0]==0x03)) {
+        // micro-ecc decompress() returns void; perform then validate
+        uECC_decompress(in.data(), out_xy, curve);
+        return uECC_valid_public_key(out_xy, curve) == 1;
     }
+    if (in.size()==65 && in[0]==0x04) {
+        std::memcpy(out_xy, &in[1], 64);
+        return uECC_valid_public_key(out_xy, curve) == 1;
+    }
+    if (in.size()==64) {
+        std::memcpy(out_xy, in.data(), 64);
+        return uECC_valid_public_key(out_xy, curve) == 1;
+    }
+    return false;
+}
 
-    compress64to33(pub64.data(), out33);
+// Check (r,s) are in [1..N-1] and S is low (s <= N/2)
+static bool sig_is_canonical_lows(const uint8_t sig64[64]){
+    const uint8_t* r = sig64 + 0;
+    const uint8_t* s = sig64 + 32;
+    if (is_zero32(r) || is_zero32(s)) return false;
+    if (cmp_be_32(r, SECP256K1_N) >= 0) return false;
+    if (cmp_be_32(s, SECP256K1_N) >= 0) return false;
+    if (cmp_be_32(s, SECP256K1_N_HALF) > 0) return false; // high-S -> reject
     return true;
 }
 
-bool ECDSA_uECC::sign(const std::vector<uint8_t>& priv, const std::vector<uint8_t>& msg32, std::vector<uint8_t>& sig64){
-    if(priv.size()!=32 || msg32.size()!=32) return false;
-    // Ensure a sane RNG (not strictly needed if derive_pub already restored it)
-    ensure_rng_once();
-    sig64.resize(64);
-    return uECC_sign(priv.data(), msg32.data(), 32, sig64.data(), uECC_secp256k1()) == 1;
+// ---- Backend: generate/derive/sign/verify -----------------------------------
+
+bool ECDSA_uECC::generate_priv(std::vector<uint8_t>& out32){
+    out32.assign(32, 0);
+    // Sample until 0 < priv < N
+    for (int tries=0; tries<32; ++tries) {
+        if (!os_random_bytes(out32.data(), 32)) return false;
+        if (!is_zero32(out32.data()) && cmp_be_32(out32.data(), SECP256K1_N) < 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
-bool ECDSA_uECC::verify(const std::vector<uint8_t>& pub33, const std::vector<uint8_t>& msg32, const std::vector<uint8_t>& sig64){
-    if(pub33.size()!=33 || msg32.size()!=32 || sig64.size()!=64) return false;
-    std::vector<uint8_t> pub64; if(!decompress33to64(pub33, pub64)) return false;
-    return uECC_verify(pub64.data(), msg32.data(), 32, sig64.data(), uECC_secp256k1()) == 1;
+bool ECDSA_uECC::derive_pub(const std::vector<uint8_t>& priv32, std::vector<uint8_t>& out33){
+    if (priv32.size() != 32) return false;
+    const uECC_Curve curve = uECC_secp256k1();
+
+    uint8_t pub_xy[64] = {0};
+    if (!uECC_compute_public_key(priv32.data(), pub_xy, curve)) {
+        return false;
+    }
+
+    out33.assign(33, 0);
+    // compress XY to 33 bytes (02/03 + X)
+    uECC_compress(pub_xy, out33.data(), curve);
+    return true;
 }
 
-// ---- Wire into the generic iface -------------------------------------------
-bool ECDSA::generate_priv(std::vector<uint8_t>& out){ return ECDSA_uECC::generate_priv(out); }
-bool ECDSA::derive_pub(const std::vector<uint8_t>& priv, std::vector<uint8_t>& out33){ return ECDSA_uECC::derive_pub(priv, out33); }
-bool ECDSA::sign(const std::vector<uint8_t>& priv, const std::vector<uint8_t>& msg32, std::vector<uint8_t>& sig64){ return ECDSA_uECC::sign(priv, msg32, sig64); }
-bool ECDSA::verify(const std::vector<uint8_t>& pub33, const std::vector<uint8_t>& msg32, const std::vector<uint8_t>& sig64){ return ECDSA_uECC::verify(pub33, msg32, sig64); }
-std::string ECDSA::backend(){ return "micro-ecc (secp256k1)"; }
+bool ECDSA_uECC::sign(const std::vector<uint8_t>& priv32,
+                      const std::vector<uint8_t>& msg32,
+                      std::vector<uint8_t>& sig64)
+{
+    if (priv32.size()!=32 || msg32.size()!=32) return false;
+    sig64.assign(64, 0);
 
-}} // namespace miq::crypto
+    const uECC_Curve curve = uECC_secp256k1();
+    // uECC_sign uses RNG set by uECC_set_rng (provided by your uECC_shim.c)
+    if (!uECC_sign(priv32.data(), msg32.data(), 32, sig64.data(), curve)) {
+        return false;
+    }
+
+    // Enforce low-S: if s > N/2, set s := N - s
+    uint8_t* s = sig64.data() + 32;
+    if (cmp_be_32(s, SECP256K1_N_HALF) > 0) {
+        uint8_t s_fix[32];
+        be_sub_32(s_fix, SECP256K1_N, s);
+        std::memcpy(s, s_fix, 32);
+    }
+    return true;
+}
+
+bool ECDSA_uECC::verify(const std::vector<uint8_t>& pubkey,
+                        const std::vector<uint8_t>& msg32,
+                        const std::vector<uint8_t>& sig64)
+{
+    if (msg32.size()!=32 || sig64.size()!=64) return false;
+    if (!sig_is_canonical_lows(sig64.data())) return false;
+
+    uint8_t pub_xy[64];
+    if (!normalize_pubkey_xy(pubkey, pub_xy)) return false;
+
+    const uECC_Curve curve = uECC_secp256k1();
+    int ok = uECC_verify(pub_xy, msg32.data(), 32, sig64.data(), curve);
+    return ok == 1;
+}
+
+} // namespace crypto
+} // namespace miq
+
+// ---- Public API adapters (from ecdsa_iface.h) --------------------------------
+namespace miq {
+namespace crypto {
+
+bool ECDSA::generate_priv(std::vector<uint8_t>& out) {
+    return ECDSA_uECC::generate_priv(out);
+}
+bool ECDSA::derive_pub(const std::vector<uint8_t>& priv, std::vector<uint8_t>& out33) {
+    return ECDSA_uECC::derive_pub(priv, out33);
+}
+bool ECDSA::sign(const std::vector<uint8_t>& priv, const std::vector<uint8_t>& msg32, std::vector<uint8_t>& sig64) {
+    return ECDSA_uECC::sign(priv, msg32, sig64);
+}
+bool ECDSA::verify(const std::vector<uint8_t>& pubkey, const std::vector<uint8_t>& msg32, const std::vector<uint8_t>& sig64) {
+    return ECDSA_uECC::verify(pubkey, msg32, sig64);
+}
+
+} // namespace crypto
+} // namespace miq
