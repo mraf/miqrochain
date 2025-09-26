@@ -6,9 +6,6 @@
 namespace miq {
 
 // ---- Network magic configuration -------------------------------------------
-// Option A: define MIQ_NET_MAGIC_STR to a 4-byte string (e.g., "miq1")
-// Option B: define MIQ_NET_MAGIC to a 32-bit constant (e.g., 0xD9B4BEF9u)
-// Defaults to literal bytes: 'm','i','q','1'
 static inline void get_magic(uint8_t out4[4]) {
 #ifdef MIQ_NET_MAGIC_STR
     static_assert(sizeof(MIQ_NET_MAGIC_STR) >= 4, "MIQ_NET_MAGIC_STR must be at least 4 chars");
@@ -17,7 +14,7 @@ static inline void get_magic(uint8_t out4[4]) {
     out4[2] = (uint8_t)MIQ_NET_MAGIC_STR[2];
     out4[3] = (uint8_t)MIQ_NET_MAGIC_STR[3];
 #elif defined(MIQ_NET_MAGIC)
-    uint32_t m = (uint32_t)MIQ_NET_MAGIC; // emit in little-endian to match BTC-like layouts
+    uint32_t m = (uint32_t)MIQ_NET_MAGIC; // little-endian to match BTC-like layouts
     out4[0] = (uint8_t)(m >> 0);
     out4[1] = (uint8_t)(m >> 8);
     out4[2] = (uint8_t)(m >> 16);
@@ -49,7 +46,6 @@ static inline void checksum4(const std::vector<uint8_t>& payload, uint8_t out[4]
 // Serialize to: [4 magic][12 cmd][4 len (LE)][4 csum][payload]
 std::vector<uint8_t> encode_msg(const std::string& cmd,
                                 const std::vector<uint8_t>& payload) {
-    // Clamp payload size defensively
     const uint32_t len = (payload.size() > MIQ_FALLBACK_MAX_MSG_SIZE)
         ? (uint32_t)MIQ_FALLBACK_MAX_MSG_SIZE
         : (uint32_t)payload.size();
@@ -78,17 +74,14 @@ std::vector<uint8_t> encode_msg(const std::string& cmd,
     return out;
 }
 
-// Robust, scanning decoder with resync on bad magic/length/checksum
+// Robust, scanning decoder with resync
 bool decode_msg(const std::vector<uint8_t>& buf, std::size_t& off, NetMsg& out) {
     const std::size_t HLEN = 4 + 12 + 4 + 4;
     uint8_t magic[4]; get_magic(magic);
 
     std::size_t pos = off;
     for (;;) {
-        // Need at least a full header to start
-        if (buf.size() < pos + HLEN) {
-            return false; // not enough data yet
-        }
+        if (buf.size() < pos + HLEN) return false; // not enough data for header
 
         // Magic check
         if (std::memcmp(&buf[pos], magic, 4) != 0) {
@@ -98,22 +91,16 @@ bool decode_msg(const std::vector<uint8_t>& buf, std::size_t& off, NetMsg& out) 
 
         const uint8_t* ph = &buf[pos];
 
-        // Read fields
         char cmd[12];
         std::memcpy(cmd, ph + 4, 12);
 
         const uint32_t len = get_u32_le(ph + 16);
         const uint8_t* pchk = ph + 20;
 
-        // Length sanity
-        if (len > MIQ_FALLBACK_MAX_MSG_SIZE) {
-            ++pos; // skip this magic and keep scanning
-            continue;
-        }
+        if (len > MIQ_FALLBACK_MAX_MSG_SIZE) { ++pos; continue; } // insane length
 
-        // Need full payload present
         if (buf.size() < pos + HLEN + (std::size_t)len) {
-            return false; // wait for more bytes
+            return false; // wait for more payload bytes
         }
 
         // Verify checksum
@@ -128,7 +115,7 @@ bool decode_msg(const std::vector<uint8_t>& buf, std::size_t& off, NetMsg& out) 
             continue;
         }
 
-        // OK — fill result and advance off
+        // OK
         std::memcpy(out.cmd, cmd, 12);
         out.payload.swap(payload);
         off = pos + HLEN + len;
