@@ -5,11 +5,22 @@
 namespace miq {
 static std::string K(const std::vector<uint8_t>& h){ return hex(h); }
 static long double work_from_bits(uint32_t bits){
-    // Approximate chainwork: 2^(256) / (target+1) -> approximate via exponent/mantissa
-    uint32_t exp = bits>>24; uint32_t mant = bits & 0x007fffff; long double t = (long double)mant * std::pow((long double)2.0, (int)8*(int)(exp-3));
-    long double w = std::pow((long double)2.0, 256) / (t + 1.0L);
+    // bits = (exp << 24) | mant (23 bits)
+    const uint32_t exp  = bits >> 24;
+    const uint32_t mant = bits & 0x007fffff;
+
+    // target ≈ mant * 2^(8*(exp-3))
+    // work  ≈ 2^256 / (target+1)
+    // Use ldexp for stable scalings.
+    long double target = (long double)mant;
+    int shift = 8 * ((int)exp - 3);
+    target = std::ldexp(target, shift);
+
+    long double two256 = std::ldexp(1.0L, 256);
+    long double w = two256 / (target + 1.0L);
     return w;
 }
+
 void BlockIndex::reset(const std::vector<uint8_t>& genesis_hash, int64_t time, uint32_t bits){
     map_.clear(); tip_.reset();
     auto g = std::make_shared<HeaderRec>(); g->hash=genesis_hash; g->prev=std::vector<uint8_t>(32,0); g->time=time; g->bits=bits; g->height=0; g->chainwork=work_from_bits(bits); map_[K(g->hash)]=g; tip_=g;
