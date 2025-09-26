@@ -158,14 +158,12 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     // Prev-hash must point to current tip
     if(b.header.prev_hash != tip_.hash){ err="bad prev hash"; return false; }
 
-    // Time must not go backwards
+    // Time monotonicity + future bound
     if(b.header.time < tip_.time){ err="time went backwards"; return false; }
-
-    // === Added: future time bound ===
     {
         const auto now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-        const int64_t ALLOWED_SKEW = MAX_TIME_SKEW; // from constants.h
+        const int64_t ALLOWED_SKEW = MAX_TIME_SKEW;
         if (b.header.time > now + ALLOWED_SKEW) { err="time too far in future"; return false; }
     }
 
@@ -175,24 +173,30 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     auto mr = merkle_root(txids);
     if(mr != b.header.merkle_root){ err="bad merkle"; return false; }
 
-    // Coinbase must exist and be canonical
+    // Must have exactly one coinbase at index 0, with canonical null prev
     if(b.txs.empty()){ err="no coinbase"; return false; }
     const auto& cb = b.txs[0];
-
-    // === Stricter coinbase checks (added, non-breaking) ===
     if (cb.vin.size()!=1 || !cb.vin[0].sig.empty() || !cb.vin[0].pubkey.empty()) {
         err = "bad coinbase"; return false;
     }
     if (cb.vin[0].prev.txid.size()!=32) { err="bad coinbase prev size"; return false; }
     if (std::any_of(cb.vin[0].prev.txid.begin(), cb.vin[0].prev.txid.end(),
-                    [](uint8_t v){ return v!=0; })) {
-        err="bad coinbase prev"; return false;
-    }
+                    [](uint8_t v){ return v!=0; })) { err="bad coinbase prev"; return false; }
     if (cb.vin[0].prev.vout != 0) { err="bad coinbase vout"; return false; }
 
-    // ----- Enforce expected difficulty (LWMA with early fallback) -----
+    // Forbid coinbase-like txs elsewhere; also require normal txs to have vin/vout
+    for (size_t ti=1; ti<b.txs.size(); ++ti) {
+        const auto& tx = b.txs[ti];
+        if (tx.vin.empty() || tx.vout.empty()) { err="empty tx"; return false; }
+        if (tx.vin.size()==1 && tx.vin[0].prev.vout==0 &&
+            tx.vin[0].prev.txid.size()==32 &&
+            std::all_of(tx.vin[0].prev.txid.begin(), tx.vin[0].prev.txid.end(),
+                        [](uint8_t v){return v==0;})) { err="multiple coinbase"; return false; }
+    }
+
+    // Difficulty bits must match our retarget rule
     {
-        auto last = last_headers(90); // previous headers including tip
+        auto last = last_headers(90);
         uint32_t expected;
         if (last.size() < 2) {
             expected = last.empty() ? GENESIS_BITS : last.back().second;
@@ -202,20 +206,44 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         if (b.header.bits != expected) { err = "bad bits"; return false; }
     }
 
-    // === Added: enforce PoW target H(header) <= target(bits) ===
-    if (!meets_target_be(b.block_hash(), b.header.bits)) {
-        err = "bad pow"; return false;
-    }
+    // POW: H(header) <= target(bits)
+    if (!meets_target_be(b.block_hash(), b.header.bits)) { err = "bad pow"; return false; }
 
-    // === Added: block size cap to prevent gigantic blocks (DoS) ===
+    // Block raw size cap (DoS)
     {
         const auto raw = ser_block(b);
-        if (raw.size() > MAX_BLOCK_SIZE_LOCAL) {
-            err = "oversize block"; return false;
-        }
+        if (raw.size() > MAX_BLOCK_SIZE_LOCAL) { err = "oversize block"; return false; }
     }
 
-    // Signature checks & fees (existing)
+    // ---- Safe math helpers ----
+    auto add_u64_safe = [](uint64_t a, uint64_t b, uint64_t& out)->bool {
+        out = a + b; return out >= a;
+    };
+    auto leq_max_money = [](uint64_t v)->bool {
+        return v <= (uint64_t)MAX_MONEY;
+    };
+
+    // Track outpoints spent inside this block to prevent intra-block double-spends
+    struct Key { std::vector<uint8_t> txid; uint32_t vout; };
+    struct KH {
+        size_t operator()(Key const& k) const noexcept {
+            // cheap mixer
+            size_t h = k.vout * 1315423911u;
+            if(!k.txid.empty()){
+                h ^= (size_t)k.txid.front() * 2654435761u;
+                h ^= (size_t)k.txid.back()  * 2246822519u;
+            }
+            return h;
+        }
+    };
+    struct KE {
+        bool operator()(Key const& a, Key const& b) const noexcept {
+            return a.vout==b.vout && a.txid==b.txid;
+        }
+    };
+    std::unordered_set<Key, KH, KE> spent_in_block;
+
+    // Signature checks & fees
     auto sigh=[&](const Transaction& t){
         Transaction tmp=t; for(auto& i: tmp.vin) i.sig.clear();
         return dsha256(ser_tx(tmp));
@@ -225,27 +253,59 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     for(size_t ti=1; ti<b.txs.size(); ++ti){
         const auto& tx=b.txs[ti];
         uint64_t in=0, out=0;
+        uint64_t tmp=0;
+
+        // Per-output range and overflow-safe sum
+        for (const auto& o : tx.vout) {
+            if (!leq_max_money(o.value)) { err="txout>MAX_MONEY"; return false; }
+            if (!add_u64_safe(out, o.value, tmp)) { err="tx out overflow"; return false; }
+            out = tmp;
+        }
+        if (!leq_max_money(out)) { err="sum(out)>MAX_MONEY"; return false; }
+
         auto hash = sigh(tx);
 
+        // Inputs: exist, mature, signature valid, AND not double-spent in this block
         for(const auto& inx: tx.vin){
+            // duplicate input within tx or across txs in this block
+            Key k{inx.prev.txid, inx.prev.vout};
+            if (spent_in_block.find(k) != spent_in_block.end()){ err="in-block double-spend"; return false; }
+            spent_in_block.insert(k);
+
             UTXOEntry e;
             if(!utxo_.get(inx.prev.txid, inx.prev.vout, e)){ err="missing utxo"; return false; }
             if(e.coinbase && tip_.height+1 < e.height + COINBASE_MATURITY){ err="immature coinbase"; return false; }
             if(hash160(inx.pubkey)!=e.pkh){ err="pkh mismatch"; return false; }
             if(!crypto::ECDSA::verify(inx.pubkey, hash, inx.sig)){ err="bad signature"; return false; }
-            in += e.value;
-        }
 
-        for(const auto& o: tx.vout) out += o.value;
+            if (!leq_max_money(e.value)) { err="utxo>MAX_MONEY"; return false; }
+            if (!add_u64_safe(in, e.value, tmp)) { err="tx in overflow"; return false; }
+            in = tmp;
+        }
+        if (!leq_max_money(in)) { err="sum(in)>MAX_MONEY"; return false; }
+
         if(out > in){ err="outputs>inputs"; return false; }
-        fees += (in - out);
+        uint64_t fee = in - out;
+        if (!leq_max_money(fee)) { err="fee>MAX_MONEY"; return false; }
+
+        // (policy fee/minfee is mempool-level; block validity doesn’t require it)
+        if (!add_u64_safe(fees, fee, tmp)) { err="fees overflow"; return false; }
+        fees = tmp;
     }
 
+    // Coinbase payout checks
     uint64_t sub = subsidy_for_height(tip_.height+1);
-    uint64_t cb_sum = 0; for(const auto& o:cb.vout) cb_sum += o.value;
-
+    uint64_t cb_sum = 0, tmp2 = 0;
+    for(const auto& o:cb.vout){
+        if (!leq_max_money(o.value)) { err="coinbase out>MAX_MONEY"; return false; }
+        if (!add_u64_safe(cb_sum, o.value, tmp2)) { err="coinbase overflow"; return false; }
+        cb_sum = tmp2;
+    }
     if(cb_sum > sub + fees){ err="coinbase too high"; return false; }
-    if(tip_.issued + cb_sum > MAX_MONEY){ err="exceeds cap"; return false; }
+    if(!leq_max_money(cb_sum)){ err="coinbase>MAX_MONEY"; return false; }
+    // Total issued cap
+    if(tip_.issued > (uint64_t)MAX_MONEY - cb_sum){ err="exceeds cap"; return false; }
+
     return true;
 }
 
