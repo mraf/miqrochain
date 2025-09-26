@@ -209,8 +209,8 @@ std::string RpcService::handle(const std::string& body){
             const auto& o0 = cb.vout[0];
 
             std::map<std::string,JNode> o;
-            JNode val; val.v = (double)o0.value;      o["value"] = val;   // in miqron
-            JNode pk ; pk.v  = std::string(to_hex(o0.pkh)); o["pkh"] = pk;
+            JNode val; val.v = (double)o0.value;            o["value"] = val;   // in miqron
+            JNode pk ; pk.v  = std::string(to_hex(o0.pkh)); o["pkh"]   = pk;
 
             JNode out; out.v = o; return json_dump(out);
         }
@@ -287,7 +287,15 @@ std::string RpcService::handle(const std::string& body){
             }
         }
 
-        // Miner stats (safe)
+        // --------------------------------------------------------------------
+        // Miner stats (safe; matches dashboard expectations)
+        // Returns:
+        //   { "hps": <float>, "hashes": <uint64 snapshot>, "seconds": <float>, "total": <uint64> }
+        // - 'hashes' is a rolling snapshot since last call (atomic counter reset)
+        // - 'seconds' is wall time since last snapshot
+        // - 'hps' is computed as hashes/seconds (client can recompute)
+        // - 'total' is the monotonic total since process start
+        // --------------------------------------------------------------------
         if(method=="getminerstats"){
             using clock = std::chrono::steady_clock;
             static clock::time_point prev = clock::now();
@@ -434,4 +442,3 @@ std::string RpcService::handle(const std::string& body){
 }
 
 } // namespace miq
-
