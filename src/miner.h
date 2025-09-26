@@ -41,6 +41,9 @@ struct MinerStats {
     double   seconds;  // seconds covered by this sample window
 };
 
+// Expose that MinerStats is defined so miner.cpp won't declare a fallback
+#define MIQ_MINER_STATS_DEFINED 1
+
 // Snapshot the current miner statistics. Purely diagnostic; no consensus effect.
 MinerStats miner_stats_now();
 
