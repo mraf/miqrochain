@@ -272,9 +272,9 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
         // If parent not present yet, put it back (rare race)
         if (!chain_.have_block(b.header.prev_hash)) {
             const std::string phex = hexkey(b.header.prev_hash);
-            orphans_.emplace(child_hex, OrphanRec{b.block_hash(), b.header.prev_hash, std::move(rec.raw)});
+            orphans_.emplace(child_hex, OrphanRec{b.block_hash(), b.header.prev_hash, rec.raw});
             orphan_children_[phex].push_back(child_hex);
-            orphan_bytes_ += rec.raw.size();  // <-- corrected here
+            orphan_bytes_ += rec.raw.size();  // <-- fixed here
             continue;
         }
 
@@ -295,6 +295,7 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
         }
     }
 }
+
 
 void P2P::handle_incoming_block(PeerState& ps, const std::vector<uint8_t>& raw){
     if (raw.empty() || raw.size() > MIQ_FALLBACK_MAX_BLOCK_SZ) return;
