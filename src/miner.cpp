@@ -26,6 +26,11 @@ namespace {
 
 namespace miq {
 
+// ---- Fallback only if miner.h didn't define MinerStats (Windows case) ----
+#ifndef MIQ_MINER_STATS_DEFINED
+struct MinerStats { double hps; uint64_t total; double window_secs; };
+#endif
+
 // --------- miner stats (public API as before) ---------
 static std::atomic<uint64_t> g_hashes{0};
 static std::atomic<uint64_t> g_hashes_total{0};
