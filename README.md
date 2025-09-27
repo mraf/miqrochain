@@ -18,7 +18,7 @@ Halving interval: 262,800 blocks (≈4 years at 8 min)
 
 Coinbase maturity: 100 blocks
 
-Address type: P2PKH, version byte 0x35 (addresses typically start with 5)
+Address type: P2PKH, version byte 0x35 (addresses typically start with N)
 
 Network magic: 0xA3FB9E21 (4-byte header constant on the wire)
 
