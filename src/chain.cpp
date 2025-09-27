@@ -72,10 +72,6 @@ static std::unordered_map<std::string, OrphanRec> g_orphans; // key = hash (bina
 static std::deque<std::string> g_orphan_order;               // FIFO/LRU-ish
 static size_t g_orphan_bytes = 0;
 
-static inline std::string hk(const std::vector<uint8_t>& h){
-    return std::string(reinterpret_cast<const char*>(h.data()), h.size());
-}
-
 static void orphan_prune_if_needed(){
     while ( (g_orphans.size() > ORPHAN_MAX_BLOCKS) || (g_orphan_bytes > ORPHAN_MAX_BYTES) ){
         if (g_orphan_order.empty()) break;
