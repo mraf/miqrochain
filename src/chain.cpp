@@ -18,16 +18,9 @@
 #include <unordered_set>
 
 // === Added includes for security checks ===
-#include <algorithm>       // std::any_of
+#include <algorithm>       // std::any_of, std::sort
 #include <chrono>          // future-time bound
-#include <cstring>         // std::memcmp
-
-// after your existing includes in chain.cpp
-#ifdef __has_include
-#  if __has_include("constants.h")
-#    include "constants.h"
-#  endif
-#endif
+#include <cstring>         // std::memcmp, std::memset
 
 #ifndef MAX_TX_SIZE
 #define MIQ_FALLBACK_MAX_TX_SIZE (100u * 1024u) // 100 KiB default
@@ -35,8 +28,9 @@
 #define MIQ_FALLBACK_MAX_TX_SIZE (MAX_TX_SIZE)
 #endif
 
+// Default ON: enforce Low-S in consensus (may be overridden in constants.h)
 #ifndef MIQ_RULE_ENFORCE_LOW_S
-#define MIQ_RULE_ENFORCE_LOW_S 0
+#define MIQ_RULE_ENFORCE_LOW_S 1
 #endif
 
 #include <cstdio>
@@ -56,11 +50,6 @@
 #endif
 
 namespace miq {
-
-if(!miq::IsCanonicalDERSig_LowS(der_sig_ptr, der_sig_len)) {
-    state.Invalid("bad-txns-non-canonical-sig"); // or your error mechanism
-    return false; // consensus: block invalid
-}
 
 struct UndoIn {
     std::vector<uint8_t> prev_txid;
@@ -281,10 +270,10 @@ static std::unordered_map<std::string, std::vector<UndoIn>> g_undo;
 
 static miq::ReorgManager g_reorg;
 
-// === Added: local constants (non-breaking) ===
+// === Local constants (non-breaking) ===
 static constexpr size_t MAX_BLOCK_SIZE_LOCAL = 1 * 1024 * 1024; // 1 MiB
 
-// --- Low-S helper (secp256k1 n/2, big-endian) --------------------
+// --- Low-S helper (RAW-64 r||s) --------------------------------------------
 static inline bool is_low_s64(const std::vector<uint8_t>& sig64){
     if (sig64.size() != 64) return false;
     static const uint8_t N_HALF[32] = {
@@ -299,7 +288,7 @@ static inline bool is_low_s64(const std::vector<uint8_t>& sig64){
     return true; // equal allowed
 }
 
-// === compact bits -> big-endian target, and hash <= target check ===
+// === compact bits -> big-endian target, and hash <= target check ============
 static inline void bits_to_target_be(uint32_t bits, uint8_t out[32]) {
     std::memset(out, 0, 32);
     uint32_t exp = bits >> 24;
@@ -327,16 +316,13 @@ static inline bool meets_target_be(const std::vector<uint8_t>& hash32, uint32_t 
     return std::memcmp(hash32.data(), target, 32) <= 0; // hash <= target
 }
 
-// =====================================================================
+// ===========================================================================
 
 long double Chain::work_from_bits(uint32_t bits) {
-    // Interpret compact target ~= mant * 256^(exp-3)
     uint32_t exp  = bits >> 24;
     uint32_t mant = bits & 0x007fffff;
     if (mant == 0) return 0.0L;
 
-    // relative "difficulty": base_target / target.
-    // Use genesis as base for stable scaling.
     uint32_t bexp  = GENESIS_BITS >> 24;
     uint32_t bmant = GENESIS_BITS & 0x007fffff;
 
@@ -346,13 +332,13 @@ long double Chain::work_from_bits(uint32_t bits) {
 
     long double difficulty = base_target / target;
     if (difficulty < 0.0L) difficulty = 0.0L;
-    return difficulty; // we sum these for chain selection
+    return difficulty;
 }
 
 bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
     // Parent must exist in header index (except genesis)
     if (tip_.height == 0 && tip_.hash == std::vector<uint8_t>(32,0)) {
-        // before genesis init: allow caller to handle genesis specially
+        // before genesis init
     } else {
         if (!header_exists(h.prev_hash) && h.prev_hash != tip_.hash && !have_block(h.prev_hash)) {
             err = "unknown parent header";
@@ -360,7 +346,7 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         }
     }
 
-    // MTP: compute using last up to 11 header times from header_index_ (fall back to tip_.time)
+    // MTP
     int64_t mtp = tip_.time;
     {
         auto hdrs = last_headers(11);
@@ -378,7 +364,7 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         std::chrono::system_clock::now().time_since_epoch()).count();
     if (h.time > now + (int64_t)MAX_TIME_SKEW) { err="header time too far in future"; return false; }
 
-    // Bits: LWMA expected from recent headers (or fallback to prev bits for height<2)
+    // Bits: LWMA
     {
         auto last = last_headers(90);
         uint32_t expected;
@@ -398,7 +384,7 @@ bool Chain::header_exists(const std::vector<uint8_t>& h) const {
 }
 
 std::vector<uint8_t> Chain::best_header_hash() const {
-    if (best_header_key_.empty()) return tip_.hash; // fall back to current block tip
+    if (best_header_key_.empty()) return tip_.hash;
     const auto& m = header_index_.at(best_header_key_);
     return m.hash;
 }
@@ -408,14 +394,14 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
 
     const auto hh = header_hash_of(h);
     const auto key = hk(hh);
-    if (header_index_.find(key) != header_index_.end()) return true; // already have
+    if (header_index_.find(key) != header_index_.end()) return true;
 
     HeaderMeta m;
     m.hash   = hh;
     m.prev   = h.prev_hash;
     m.bits   = h.bits;
     m.time   = h.time;
-    m.have_block = have_block(m.hash); // block body present?
+    m.have_block = have_block(m.hash);
     // Height & cumulative work
     uint64_t parent_height = 0;
     long double parent_work = 0.0L;
@@ -425,14 +411,12 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
         parent_work   = itp->second.work_sum;
     } else if (h.prev_hash == tip_.hash) {
         parent_height = tip_.height;
-        // treat current tip as known header with work_sum 0 baseline
     }
     m.height   = parent_height + 1;
     m.work_sum = parent_work + work_from_bits(h.bits);
 
     header_index_.emplace(key, std::move(m));
 
-    // Update best-header tip
     if (best_header_key_.empty()) best_header_key_ = key;
     else {
         const auto& cur = header_index_.at(best_header_key_);
@@ -452,13 +436,10 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
     out.clear();
     if (best_header_key_.empty()) return;
 
-    // Walk down from best-header to current block tip, collect missing blocks
     std::vector<uint8_t> bh = header_index_.at(best_header_key_).hash;
-    // build path from tip_.hash -> bh (downwards in header tree)
     std::vector<std::vector<uint8_t>> up, down;
     if (!find_header_fork(tip_.hash, bh, up, down)) return;
 
-    // down now contains headers after the fork that should be connected; pick those we don't have blocks for
     for (const auto& hh : down) {
         if (out.size() >= max) break;
         if (!have_block(hh) && orphan_blocks_.find(hk(hh)) == orphan_blocks_.end()) out.push_back(hh);
@@ -472,7 +453,6 @@ bool Chain::find_header_fork(const std::vector<uint8_t>& a,
     path_up_from_b.clear();
     path_down_from_a.clear();
 
-    // Map for quick height lookups
     auto getH = [&](const std::vector<uint8_t>& h)->std::optional<HeaderMeta>{
         auto it = header_index_.find(hk(h));
         if (it != header_index_.end()) return it->second;
@@ -482,15 +462,14 @@ bool Chain::find_header_fork(const std::vector<uint8_t>& a,
 
     auto A = getH(a);
     auto B = getH(b);
-    if (!B) return false; // need target present
+    if (!B) return false;
 
     std::vector<uint8_t> x = B->hash;
     std::vector<uint8_t> y = a;
 
     auto hx = *B;
-    auto hy = A ? *A : hx; // if unknown, approximate
+    auto hy = A ? *A : hx;
 
-    // Raise the lower to the higher height
     while (A && hx.height > hy.height) {
         path_up_from_b.push_back(x);
         auto it = header_index_.find(hk(hx.prev));
@@ -505,7 +484,6 @@ bool Chain::find_header_fork(const std::vector<uint8_t>& a,
         hy = it->second;
         y = hy.hash;
     }
-    // Now climb together until common
     while (x != y) {
         path_up_from_b.push_back(x);
         path_down_from_a.push_back(y);
@@ -515,27 +493,22 @@ bool Chain::find_header_fork(const std::vector<uint8_t>& a,
         hx = itx->second; x = hx.hash;
         hy = ity->second; y = hy.hash;
     }
-    // path_down_from_a currently includes ancestors from a backward; we want forward order after fork
     std::reverse(path_down_from_a.begin(), path_down_from_a.end());
-    // Also we want path_down_from_a to be headers AFTER the fork (not including fork point). That’s already the case here.
     return true;
 }
 
 bool Chain::reconsider_best_chain(std::string& err){
     if (best_header_key_.empty()) return true;
     const auto& best = header_index_.at(best_header_key_);
-    if (best.hash == tip_.hash) return true; // already on best
+    if (best.hash == tip_.hash) return true;
 
-    // Build reorg plan
     std::vector<std::vector<uint8_t>> up, down;
     if (!find_header_fork(tip_.hash, best.hash, up, down)) return true;
 
-    // Disconnect current tip until fork point
     for (size_t i = 0; i < up.size(); ++i) {
-        if (!disconnect_tip_once(err)) return false; // you already implemented this
+        if (!disconnect_tip_once(err)) return false;
     }
 
-    // Connect blocks along best path
     for (const auto& hh : down) {
         Block blk;
         if (!read_block_any(hh, blk)) {
@@ -559,7 +532,6 @@ bool Chain::get_hash_by_index(size_t idx, std::vector<uint8_t>& out) const{
 void Chain::build_locator(std::vector<std::vector<uint8_t>>& out) const{
     out.clear();
     if (tip_.time == 0) return;
-    // Exponential backoff: 0,1,2,4,8,... to genesis
     uint64_t step = 1;
     uint64_t h = tip_.height;
     while (true){
@@ -578,11 +550,9 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
                                      std::vector<BlockHeader>& out) const
 {
     out.clear();
-    // Build a quick lookup for the locator set
     std::unordered_map<std::string, int> lset;
     for (const auto& h : locators) lset[hk(h)] = 1;
 
-    // Find the highest common ancestor on our active chain by scanning back
     uint64_t start_h = 0;
     bool found=false;
     if (tip_.time != 0){
@@ -596,9 +566,8 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
             }
         }
     }
-    if (!found) start_h = 0; // no common ancestor; start from genesis
+    if (!found) start_h = 0;
 
-    // Emit up to `max` headers AFTER start_h
     uint64_t h = start_h + 1;
     for (size_t i=0; i<max; ++i){
         if (h > tip_.height) break;
@@ -627,12 +596,10 @@ bool Chain::open(const std::string& dir){
 }
 
 bool Chain::accept_block_for_reorg(const Block& b, std::string& err){
-    // Cheap DOS bounds
     auto raw = ser_block(b);
     if (raw.size() > MAX_BLOCK_SIZE_LOCAL) { err = "oversize block"; return false; }
-    if (have_block(b.block_hash())) return true; // already have on disk
+    if (have_block(b.block_hash())) return true;
 
-    // Merkle + duplicate-tx guard
     if (b.txs.empty()) { err = "no coinbase"; return false; }
     {
         std::unordered_set<std::string> seen;
@@ -648,12 +615,10 @@ bool Chain::accept_block_for_reorg(const Block& b, std::string& err){
         if (mr != b.header.merkle_root) { err = "bad merkle"; return false; }
     }
 
-    // Require valid PoW (header) before caching anything
     if (!meets_target_be(b.block_hash(), b.header.bits)) { err = "bad pow"; return false; }
 
     orphan_put(b.block_hash(), std::move(raw));
 
-    // Register header in the header tree (ok if parent unknown; we'll reorg when possible)
     miq::HeaderView hv;
     hv.hash   = b.block_hash();
     hv.prev   = b.header.prev_hash;
@@ -662,25 +627,21 @@ bool Chain::accept_block_for_reorg(const Block& b, std::string& err){
     hv.height = 0;
     (void)g_reorg.on_validated_header(hv);
 
-    // If the best known chainwork beats our active tip, plan & execute reorg
     std::vector<miq::HashBytes> to_disconnect, to_connect;
     if (g_reorg.plan_reorg(tip_.hash, to_disconnect, to_connect)) {
-        // Walk back to fork
         for (size_t i = 0; i < to_disconnect.size(); ++i) {
             if (!disconnect_tip_once(err)) return false;
         }
-        // Connect forward (read from disk or orphan cache)
         for (const auto& h : to_connect) {
             Block blk;
             if (!read_block_any(h, blk)) { err = "reorg missing block body"; return false; }
-            if (!submit_block(blk, err)) return false; // full validation + writes to disk
+            if (!submit_block(blk, err)) return false;
             if (have_block(b.block_hash())) { return true; }
-            orphan_erase(h); // we just persisted it via submit_block()
+            orphan_erase(h);
         }
     }
     return true;
 }
-
 
 bool Chain::save_state(){
     std::vector<uint8_t> b;
@@ -761,7 +722,6 @@ bool Chain::init_genesis(const Block& g){
 
     storage_.append_block(ser_block(g), g.block_hash());
 
-    // Add coinbase UTXOs and compute total issued at height 0
     const auto& cb = g.txs[0];
     uint64_t cb_sum = 0;
     for(size_t i=0;i<cb.vout.size();++i){
@@ -777,10 +737,9 @@ bool Chain::init_genesis(const Block& g){
 }
 
 bool Chain::verify_block(const Block& b, std::string& err) const{
-    // Prev-hash must point to current tip (linear chain for now)
     if(b.header.prev_hash != tip_.hash){ err="bad prev hash"; return false; }
 
-    // ---- Median-Time-Past (median of last up to 11 blocks) ----
+    // MTP
     auto hdrs = last_headers(11);
     int64_t mtp = tip_.time;
     if (!hdrs.empty()) {
@@ -798,10 +757,9 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         if (b.header.time > now + (int64_t)MAX_TIME_SKEW) { err="time too far in future"; return false; }
     }
 
-    // Merkle must match actual txids
+    // Merkle + duplicate guard
     if (b.txs.empty()){ err="no coinbase"; return false; }
     {
-        // also reject duplicate txids (merkle-mutation guard)
         std::unordered_set<std::string> seen;
         std::vector<std::vector<uint8_t>> txids;
         txids.reserve(b.txs.size());
@@ -822,7 +780,7 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     if (std::any_of(cb.vin[0].prev.txid.begin(), cb.vin[0].prev.txid.end(), [](uint8_t v){ return v!=0; })) { err="bad coinbase prev"; return false; }
     if (cb.vin[0].prev.vout != 0) { err="bad coinbase vout"; return false; }
 
-    // Forbid coinbase-like txs elsewhere; require vin/vout and cap tx size
+    // Non-coinbase tx checks
     for (size_t ti=1; ti<b.txs.size(); ++ti) {
         const auto& tx = b.txs[ti];
         if (tx.vin.empty() || tx.vout.empty()) { err="empty tx"; return false; }
@@ -835,7 +793,7 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         if (raw.size() > MIQ_FALLBACK_MAX_TX_SIZE) { err="tx too large"; return false; }
     }
 
-    // Difficulty bits must match expected LWMA
+    // Difficulty bits must match LWMA
     {
         auto last = last_headers(90);
         uint32_t expected;
@@ -844,7 +802,7 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         if (b.header.bits != expected) { err = "bad bits"; return false; }
     }
 
-    // POW: H(header) <= target(bits)
+    // POW
     if (!meets_target_be(b.block_hash(), b.header.bits)) { err = "bad pow"; return false; }
 
     // Block raw size cap
@@ -854,7 +812,6 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     auto add_u64_safe = [](uint64_t a, uint64_t b, uint64_t& out)->bool { out = a + b; return out >= a; };
     auto leq_max_money = [](uint64_t v)->bool { return v <= (uint64_t)MAX_MONEY; };
 
-    // Track outpoints spent inside this block to prevent intra-block double-spends
     struct Key { std::vector<uint8_t> txid; uint32_t vout; };
     struct KH { size_t operator()(Key const& k) const noexcept {
         size_t h = k.vout * 1315423911u;
@@ -864,13 +821,12 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     struct KE { bool operator()(Key const& a, Key const& b) const noexcept { return a.vout==b.vout && a.txid==b.txid; } };
     std::unordered_set<Key, KH, KE> spent_in_block;
 
-    // Sig checks & fees
     auto sigh=[&](const Transaction& t){ Transaction tmp=t; for(auto& i: tmp.vin) i.sig.clear(); return dsha256(ser_tx(tmp)); };
 
-    uint64_t fees = 0;
+    uint64_t fees = 0, tmp = 0;
     for(size_t ti=1; ti<b.txs.size(); ++ti){
         const auto& tx=b.txs[ti];
-        uint64_t in=0, out=0, tmp=0;
+        uint64_t in=0, out=0;
 
         for (const auto& o : tx.vout) {
             if (!leq_max_money(o.value)) { err="txout>MAX_MONEY"; return false; }
@@ -882,7 +838,6 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         auto hash = sigh(tx);
 
         for(const auto& inx: tx.vin){
-            // Strict pubkey length
             if (inx.pubkey.size() != 33 && inx.pubkey.size() != 65) { err="bad pubkey size"; return false; }
 
             Key k{inx.prev.txid, inx.prev.vout};
@@ -895,6 +850,7 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
             if(hash160(inx.pubkey)!=e.pkh){ err="pkh mismatch"; return false; }
             if(!crypto::ECDSA::verify(inx.pubkey, hash, inx.sig)){ err="bad signature"; return false; }
         #if MIQ_RULE_ENFORCE_LOW_S
+            // Consensus: reject non-low-S signatures in blocks
             if (!is_low_s64(inx.sig)) { err="high-S signature"; return false; }
         #endif
 
@@ -929,14 +885,12 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
 bool Chain::disconnect_tip_once(std::string& err){
     if (tip_.height == 0) { err = "cannot disconnect genesis"; return false; }
 
-    // Current tip block
     Block cur;
     if (!get_block_by_hash(tip_.hash, cur)) {
         err = "failed to read tip block";
         return false;
     }
 
-    // Load undo: prefer RAM, else disk
     std::vector<UndoIn> undo_tmp;
     auto it_ram = g_undo.find(hk(tip_.hash));
     if (it_ram != g_undo.end()) {
@@ -949,21 +903,18 @@ bool Chain::disconnect_tip_once(std::string& err){
     }
     const std::vector<UndoIn>& undo = undo_tmp;
 
-    // 1) Remove UTXOs created by non-coinbase txs (reverse order)
     for (size_t ti = cur.txs.size(); ti-- > 1; ){
         const auto& tx = cur.txs[ti];
         for (size_t i = 0; i < tx.vout.size(); ++i) {
-            (void)utxo_.spend(tx.txid(), (uint32_t)i); // erase
+            (void)utxo_.spend(tx.txid(), (uint32_t)i);
         }
     }
 
-    // 2) Restore UTXOs that were spent by this block (reverse)
     for (size_t i = undo.size(); i-- > 0; ){
         const auto& u = undo[i];
         utxo_.add(u.prev_txid, u.prev_vout, u.prev_entry);
     }
 
-    // 3) Remove coinbase outputs & adjust issued
     const auto& cb = cur.txs[0];
     uint64_t cb_sum = 0;
     for (size_t i = 0; i < cb.vout.size(); ++i) {
@@ -972,7 +923,6 @@ bool Chain::disconnect_tip_once(std::string& err){
     }
     if (tip_.issued < cb_sum) { err = "issued underflow"; return false; }
 
-    // 4) Previous block to update tip metadata
     Block prev;
     if (!get_block_by_hash(cur.header.prev_hash, prev)) {
         err = "failed to read prev block";
@@ -985,7 +935,6 @@ bool Chain::disconnect_tip_once(std::string& err){
     tip_.time   = prev.header.time;
     tip_.issued -= cb_sum;
 
-    // 5) Drop RAM undo (if present) and delete persistent undo file for the disconnected block
     if (it_ram != g_undo.end()) g_undo.erase(it_ram);
     remove_undo_file(datadir_, (uint64_t)(tip_.height + 1), cur.block_hash());
 
@@ -993,15 +942,11 @@ bool Chain::disconnect_tip_once(std::string& err){
     return true;
 }
 
-// make sure this is inside:  namespace miq {  ...  }
-
 bool Chain::submit_block(const Block& b, std::string& err){
     if (!verify_block(b, err)) return false;
 
-    // Idempotent: if we already have this block on disk, just succeed.
     if (have_block(b.block_hash())) return true;
 
-    // Prepare undo: capture all spent inputs BEFORE we mutate the UTXO set.
     std::vector<UndoIn> undo;
     undo.reserve(b.txs.size() * 2);
 
@@ -1017,10 +962,8 @@ bool Chain::submit_block(const Block& b, std::string& err){
         }
     }
 
-    // Persist the block body
     storage_.append_block(ser_block(b), b.block_hash());
 
-    // Connect non-coinbase txs: spend inputs, add new outputs
     for (size_t ti = 1; ti < b.txs.size(); ++ti){
         const auto& tx = b.txs[ti];
 
@@ -1033,7 +976,6 @@ bool Chain::submit_block(const Block& b, std::string& err){
         }
     }
 
-    // Add coinbase outputs & compute cb_sum
     const auto& cb = b.txs[0];
     uint64_t cb_sum = 0;
     for (size_t i = 0; i < cb.vout.size(); ++i){
@@ -1042,7 +984,6 @@ bool Chain::submit_block(const Block& b, std::string& err){
         cb_sum += cb.vout[i].value;
     }
 
-    // Advance tip
     tip_.height += 1;
     tip_.hash   = b.block_hash();
     tip_.bits   = b.header.bits;
@@ -1051,10 +992,8 @@ bool Chain::submit_block(const Block& b, std::string& err){
 
     g_undo[hk(tip_.hash)] = std::move(undo);
 
-    // Persist undo to disk (survives restart)
     write_undo_file(datadir_, tip_.height, tip_.hash, g_undo[hk(tip_.hash)]);
 
-    // Prune old undo files outside the rolling window
     if (tip_.height >= UNDO_WINDOW) {
         size_t prune_h = (size_t)(tip_.height - UNDO_WINDOW);
         std::vector<uint8_t> prune_hash;
@@ -1063,7 +1002,6 @@ bool Chain::submit_block(const Block& b, std::string& err){
         }
     }
 
-    // Register header with reorg manager (keeps header tree complete)
     miq::HeaderView hv;
     hv.hash   = tip_.hash;
     hv.prev   = b.header.prev_hash;
@@ -1107,4 +1045,5 @@ bool Chain::have_block(const std::vector<uint8_t>& h) const{
     std::vector<uint8_t> raw;
     return storage_.read_block_by_hash(h, raw);
 }
+
 }
