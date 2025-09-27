@@ -1,126 +1,185 @@
+// src/netmsg.cpp
 #include "netmsg.h"
-#include "sha256.h"  // dsha256(payload)
+
+#include <vector>
+#include <string>
+#include <cstdint>
 #include <cstring>
 #include <algorithm>
 
+#ifdef __has_include
+#  if __has_include("constants.h")
+#    include "constants.h"
+#  endif
+#endif
+
+#ifndef MAX_BLOCK_SIZE
+#define MIQ_FALLBACK_MAX_BLOCK_SZ (1u * 1024u * 1024u)   // 1 MiB
+#else
+#define MIQ_FALLBACK_MAX_BLOCK_SZ (MAX_BLOCK_SIZE)
+#endif
+
+#ifndef MAX_MSG_SIZE
+#define MIQ_FALLBACK_MAX_MSG_SIZE (2u * 1024u * 1024u)   // 2 MiB
+#else
+#define MIQ_FALLBACK_MAX_MSG_SIZE (MAX_MSG_SIZE)
+#endif
+
+#ifndef MAX_TX_SIZE
+#define MIQ_FALLBACK_MAX_TX_SIZE  (1024u * 1024u)        // 1 MiB cap for tx wire payloads
+#else
+#define MIQ_FALLBACK_MAX_TX_SIZE  (MAX_TX_SIZE)
+#endif
+
+#ifndef MIQ_ADDR_MAX_BATCH
+#define MIQ_ADDR_MAX_BATCH 1000
+#endif
+
 namespace miq {
 
-// ---- Network magic configuration -------------------------------------------
-static inline void get_magic(uint8_t out4[4]) {
-#ifdef MIQ_NET_MAGIC_STR
-    static_assert(sizeof(MIQ_NET_MAGIC_STR) >= 4, "MIQ_NET_MAGIC_STR must be at least 4 chars");
-    out4[0] = (uint8_t)MIQ_NET_MAGIC_STR[0];
-    out4[1] = (uint8_t)MIQ_NET_MAGIC_STR[1];
-    out4[2] = (uint8_t)MIQ_NET_MAGIC_STR[2];
-    out4[3] = (uint8_t)MIQ_NET_MAGIC_STR[3];
-#elif defined(MIQ_NET_MAGIC)
-    uint32_t m = (uint32_t)MIQ_NET_MAGIC; // little-endian to match BTC-like layouts
-    out4[0] = (uint8_t)(m >> 0);
-    out4[1] = (uint8_t)(m >> 8);
-    out4[2] = (uint8_t)(m >> 16);
-    out4[3] = (uint8_t)(m >> 24);
-#else
-    out4[0] = 'm'; out4[1] = 'i'; out4[2] = 'q'; out4[3] = '1';
-#endif
-}
+// ---- local helpers ---------------------------------------------------------
 
-static inline void put_u32_le(uint32_t x, uint8_t* p) {
-    p[0] = (uint8_t)(x >> 0);
-    p[1] = (uint8_t)(x >> 8);
-    p[2] = (uint8_t)(x >> 16);
-    p[3] = (uint8_t)(x >> 24);
-}
-static inline uint32_t get_u32_le(const uint8_t* p) {
+static inline uint32_t rd32le(const uint8_t* p){
     return (uint32_t)p[0]
          | ((uint32_t)p[1] << 8)
          | ((uint32_t)p[2] << 16)
          | ((uint32_t)p[3] << 24);
 }
-
-// First 4 bytes of dsha256(payload)
-static inline void checksum4(const std::vector<uint8_t>& payload, uint8_t out[4]) {
-    std::vector<uint8_t> h = dsha256(payload);
-    out[0] = h[0]; out[1] = h[1]; out[2] = h[2]; out[3] = h[3];
+static inline void wr32le(uint8_t* p, uint32_t v){
+    p[0] = (uint8_t)(v >> 0);
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
 }
 
-// Serialize to: [4 magic][12 cmd][4 len (LE)][4 csum][payload]
-std::vector<uint8_t> encode_msg(const std::string& cmd,
-                                const std::vector<uint8_t>& payload) {
-    const uint32_t len = (payload.size() > MIQ_FALLBACK_MAX_MSG_SIZE)
-        ? (uint32_t)MIQ_FALLBACK_MAX_MSG_SIZE
-        : (uint32_t)payload.size();
+// Strict ASCII-lowercase command allowlist (zero-padded to 12 in the header)
+static bool cmd_is_allowed(const std::string& c){
+    static const char* k[] = {
+        "version","verack","ping","pong",
+        "invb","getb","getbi","block",
+        "invtx","gettx","tx",
+        "getaddr","addr"
+    };
+    for (auto* s : k) if (c == s) return true;
+    return false;
+}
 
-    uint8_t magic[4]; get_magic(magic);
+// Per-command payload length guard (does not trust peer-supplied length blindly)
+static bool length_ok_for_command(const std::string& cmd, size_t n){
+    if (n > MIQ_FALLBACK_MAX_MSG_SIZE) return false;
 
-    uint8_t header[4 + 12 + 4 + 4];
-    std::memcpy(header + 0, magic, 4);
-
-    char cmdbuf[12] = {0};
-    if (!cmd.empty()) {
-        const std::size_t L = std::min<std::size_t>(sizeof(cmdbuf), cmd.size());
-        std::memcpy(cmdbuf, cmd.data(), L);
+    if (cmd == "version" || cmd == "verack" || cmd == "getaddr" ||
+        cmd == "ping"    || cmd == "pong")
+    {
+        return n == 0;
     }
-    std::memcpy(header + 4, cmdbuf, 12);
 
-    put_u32_le(len, header + 16);
+    if (cmd == "invb" || cmd == "getb" || cmd == "invtx" || cmd == "gettx"){
+        return n == 32;
+    }
 
-    uint8_t csum[4]; checksum4(payload, csum);
-    std::memcpy(header + 20, csum, 4);
+    if (cmd == "getbi"){
+        return n == 8;
+    }
+
+    if (cmd == "addr"){
+        // 4 bytes per IPv4, up to MIQ_ADDR_MAX_BATCH
+        return (n % 4 == 0) && (n <= (size_t)MIQ_ADDR_MAX_BATCH * 4u);
+    }
+
+    if (cmd == "block"){
+        return n > 0 && n <= (size_t)MIQ_FALLBACK_MAX_BLOCK_SZ;
+    }
+
+    if (cmd == "tx"){
+        // allow up to configured tx size (or 1 MiB fallback)
+        return n > 0 && n <= (size_t)MIQ_FALLBACK_MAX_TX_SIZE;
+    }
+
+    // Unknown command: reject
+    return false;
+}
+
+// ---- public API ------------------------------------------------------------
+
+// Wire format (unchanged): command[12] (ASCII, NUL-padded) | len[4-le] | payload[len]
+std::vector<uint8_t> encode_msg(const std::string& cmd_in, const std::vector<uint8_t>& payload){
+    // Normalize command: lower-case, max 12 chars, ASCII
+    std::string cmd = cmd_in;
+    std::transform(cmd.begin(), cmd.end(), cmd.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+
+    // Safety: if not in allowlist or size invalid, emit empty vector (caller should not send)
+    if (!cmd_is_allowed(cmd)) return {};
+    if (!length_ok_for_command(cmd, payload.size())) return {};
 
     std::vector<uint8_t> out;
-    out.reserve(sizeof(header) + len);
-    out.insert(out.end(), header, header + sizeof(header));
-    out.insert(out.end(), payload.begin(), payload.begin() + len);
+    out.resize(12 + 4 + payload.size());
+
+    // cmd (12, NUL-padded)
+    std::memset(out.data(), 0, 12);
+    std::memcpy(out.data(), cmd.data(), std::min<size_t>(12, cmd.size()));
+
+    // length
+    wr32le(out.data() + 12, (uint32_t)payload.size());
+
+    // payload
+    if (!payload.empty()){
+        std::memcpy(out.data() + 16, payload.data(), payload.size());
+    }
     return out;
 }
 
-// Robust, scanning decoder with resync
-bool decode_msg(const std::vector<uint8_t>& buf, std::size_t& off, NetMsg& out) {
-    const std::size_t HLEN = 4 + 12 + 4 + 4;
-    uint8_t magic[4]; get_magic(magic);
+// Streaming decoder:
+// - Parses a single message starting at buf[off].
+// - On success: fills out, advances off to end-of-message, returns true.
+// - On incomplete frame: returns false and DOES NOT change off.
+// - On malformed frame (bad cmd/length): advances off by 1 (resync) and returns false.
+bool decode_msg(const std::vector<uint8_t>& buf, size_t& off, NetMsg& out){
+    const size_t n = buf.size();
+    size_t i = off;
 
-    std::size_t pos = off;
-    for (;;) {
-        if (buf.size() < pos + HLEN) return false; // not enough data for header
+    // Need header
+    if (n < i + 16) return false;
 
-        // Magic check
-        if (std::memcmp(&buf[pos], magic, 4) != 0) {
-            ++pos; // resync: advance one byte
-            continue;
-        }
+    // Read header
+    char cmd_raw[12];
+    std::memcpy(cmd_raw, buf.data() + i, 12);
+    i += 12;
 
-        const uint8_t* ph = &buf[pos];
+    uint32_t len = rd32le(buf.data() + i);
+    i += 4;
 
-        char cmd[12];
-        std::memcpy(cmd, ph + 4, 12);
-
-        const uint32_t len = get_u32_le(ph + 16);
-        const uint8_t* pchk = ph + 20;
-
-        if (len > MIQ_FALLBACK_MAX_MSG_SIZE) { ++pos; continue; } // insane length
-
-        if (buf.size() < pos + HLEN + (std::size_t)len) {
-            return false; // wait for more payload bytes
-        }
-
-        // Verify checksum
-        std::vector<uint8_t> payload;
-        if (len) {
-            payload.assign(buf.begin() + pos + HLEN,
-                           buf.begin() + pos + HLEN + len);
-        }
-        uint8_t chk[4]; checksum4(payload, chk);
-        if (std::memcmp(pchk, chk, 4) != 0) {
-            ++pos; // bad checksum -> resync
-            continue;
-        }
-
-        // OK
-        std::memcpy(out.cmd, cmd, 12);
-        out.payload.swap(payload);
-        off = pos + HLEN + len;
-        return true;
+    // Fast sanity: cap huge claims early
+    if (len > MIQ_FALLBACK_MAX_MSG_SIZE) {
+        // drop a byte to resync
+        off += 1;
+        return false;
     }
+
+    // Need full payload
+    if (n < i + (size_t)len) return false;
+
+    // Canonicalize command (strip trailing NULs)
+    std::string cmd(cmd_raw, cmd_raw + 12);
+    size_t z = cmd.find('\0');
+    if (z != std::string::npos) cmd.resize(z);
+    std::transform(cmd.begin(), cmd.end(), cmd.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+
+    // Validate command + length
+    if (!cmd_is_allowed(cmd) || !length_ok_for_command(cmd, len)) {
+        // Skip just this header byte-by-byte until next round; conservative
+        off += 1;
+        return false;
+    }
+
+    // Fill NetMsg
+    std::memset(out.cmd, 0, sizeof(out.cmd));
+    std::memcpy(out.cmd, cmd.data(), std::min<size_t>(sizeof(out.cmd), cmd.size()));
+    out.payload.assign(buf.begin() + (i), buf.begin() + (i + len));
+
+    // Advance consumer offset to end of this frame
+    off = i + len;
+    return true;
 }
 
 }
