@@ -50,7 +50,6 @@ static inline std::string hk(const std::vector<uint8_t>& h){
 static std::unordered_map<std::string, std::vector<UndoIn>> g_undo;
 
 // keep your other statics (e.g., the reorg manager) here too:
-static miq::ReorgManager g_reorg;
 
 static miq::ReorgManager g_reorg;
 
