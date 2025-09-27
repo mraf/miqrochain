@@ -22,7 +22,7 @@ Address type: P2PKH, version byte 0x35 (addresses typically start with 5)
 
 Network magic: 0xA3FB9E21 (4-byte header constant on the wire)
 
-Default ports: P2P 443, RPC 9834 (see security notes)
+Default ports: P2P 55001, RPC 9834 (see security notes)
 
 ℹ️ Genesis behavior (important): On first boot, the node creates and stores a block at height 0 (“genesis”) with a single coinbase paying 50 MIQ to a genesis key. If GENESIS_ECDSA_PRIV_HEX is empty (default), a random 32-byte key is generated. That means each clean node will produce a different genesis unless you pin the same key everywhere. Peers with different genesis blocks will not interoperate.
 
