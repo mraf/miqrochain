@@ -296,6 +296,9 @@ int main(int argc, char** argv){
         }
 
         if(!cfg.no_rpc){
+            // Enable RPC cookie auth (.cookie in datadir) before starting RPC
+            miq::rpc_enable_auth_cookie(cfg.datadir);
+
             rpc.start(RPC_PORT);
             log_info("RPC listening on " + std::to_string(RPC_PORT));
         }
