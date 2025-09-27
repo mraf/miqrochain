@@ -66,7 +66,7 @@ static inline std::string hk(const std::vector<uint8_t>& h){
 }
 
 static inline std::vector<uint8_t> header_hash_of(const BlockHeader& h) {
-    Block tmp;
+    Block tmp; 
     tmp.header = h;
     return tmp.block_hash();
 }
@@ -150,7 +150,6 @@ static bool write_undo_file(const std::string& base_dir,
         std::remove(tmp.c_str());
         return false;
     }
-
 #ifndef _WIN32
     // fsync parent directory to make the rename durable
     {
@@ -649,7 +648,8 @@ bool Chain::accept_block_for_reorg(const Block& b, std::string& err){
 
     if (!meets_target_be(b.block_hash(), b.header.bits)) { err = "bad pow"; return false; }
 
-    orphan_put(b.block_hash(), std::move(raw));
+    // Explicitly use the file-scope orphan cache (stores parent, used by reorg planner)
+    ::miq::orphan_put(b.block_hash(), b.header.prev_hash, std::move(raw));
 
     miq::HeaderView hv;
     hv.hash   = b.block_hash();
@@ -990,7 +990,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
                 err = "missing utxo during undo-capture";
                 return false;
             }
-            undo.push_back(UndoIn{in.prev_txid, in.prev_vout, e});
+            undo.push_back(UndoIn{in.prev.txid, in.prev.vout, e});
         }
     }
 
@@ -1000,7 +1000,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
         const auto& tx = b.txs[ti];
 
         for (const auto& in : tx.vin){
-            (void)utxo_.spend(in.prev_txid, in.prev_vout);
+            (void)utxo_.spend(in.prev.txid, in.prev.vout);
         }
         for (size_t i = 0; i < tx.vout.size(); ++i){
             UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, tip_.height + 1, false};
