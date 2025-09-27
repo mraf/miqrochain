@@ -1,4 +1,6 @@
 #include "chain.h"
+#include <cmath>      // std::powl
+#include <optional>
 #include "sha256.h"
 #include <deque>
 #include "reorg_manager.h"
@@ -63,6 +65,12 @@ struct UndoIn {
 // Binary-safe key for unordered_map (store raw 32 bytes)
 static inline std::string hk(const std::vector<uint8_t>& h){
     return std::string(reinterpret_cast<const char*>(h.data()), h.size());
+}
+
+static inline std::vector<uint8_t> header_hash_of(const BlockHeader& h) {
+    Block tmp; 
+    tmp.header = h;
+    return tmp.block_hash();
 }
 
 static inline size_t env_szt(const char* name, size_t defv){
@@ -326,8 +334,8 @@ long double Chain::work_from_bits(uint32_t bits) {
     uint32_t bexp  = GENESIS_BITS >> 24;
     uint32_t bmant = GENESIS_BITS & 0x007fffff;
 
-    long double target      = (long double)mant  * powl(256.0L, (long double)((int)exp - 3));
-    long double base_target = (long double)bmant * powl(256.0L, (long double)((int)bexp - 3));
+    long double target      = (long double)mant  * std::powl(256.0L, (long double)((int)exp - 3));
+    long double base_target = (long double)bmant * std::powl(256.0L, (long double)((int)bexp - 3));
     if (target <= 0.0L) return 0.0L;
 
     long double difficulty = base_target / target;
@@ -374,7 +382,7 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
     }
 
     // POW
-    if (!meets_target_be(h.header_hash(), h.bits)) { err = "bad header pow"; return false; }
+    if (!meets_target_be(header_hash_of(h), h.bits)) { err = "bad header pow"; return false; }
 
     return true;
 }
@@ -392,11 +400,12 @@ std::vector<uint8_t> Chain::best_header_hash() const {
 bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     if (!validate_header(h, err)) return false;
 
-    const auto key = hk(h.header_hash());
+    const auto hh = header_hash_of(h);
+    const auto key = hk(hh);
     if (header_index_.find(key) != header_index_.end()) return true; // already have
 
     HeaderMeta m;
-    m.hash   = h.header_hash();
+    m.hash   = hh;
     m.prev   = h.prev_hash;
     m.bits   = h.bits;
     m.time   = h.time;
@@ -636,7 +645,7 @@ bool Chain::accept_block_for_reorg(const Block& b, std::string& err){
     // Require valid PoW (header) before caching anything
     if (!meets_target_be(b.block_hash(), b.header.bits)) { err = "bad pow"; return false; }
 
-    orphan_put(b.block_hash(), b.header.prev_hash, std::move(raw));
+    orphan_put(b.block_hash(), std::move(raw));
 
     // Register header in the header tree (ok if parent unknown; we'll reorg when possible)
     miq::HeaderView hv;
