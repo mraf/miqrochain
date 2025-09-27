@@ -643,6 +643,18 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
 }
 
 bool Chain::disconnect_tip_once(std::string& err){
+    std::vector<UndoIn> undo_tmp;
+    auto it = g_undo.find(hk(tip_.hash));
+    if (it == g_undo.end()) {
+        if (!read_undo_file(datadir_, tip_.height, tip_.hash, undo_tmp)) {
+            err = "no undo data for tip (restart or missing undo)";
+            return false;
+        }
+      
+} else {
+    undo_tmp = it->second;
+}
+const auto& undo = undo_tmp;
     // Can't roll back genesis
     if (tip_.height == 0) { err = "cannot disconnect genesis"; return false; }
 
@@ -747,6 +759,9 @@ bool Chain::submit_block(const Block& b, std::string& err){
         utxo_.add(cb.txid(), (uint32_t)i, e);
         cb_sum += cb.vout[i].value;
     }
+
+    g_undo.erase(hk(blk.block_hash()));
+    remove_undo_file(datadir_, (uint64_t)(tip_.height + 1), blk.block_hash());
 
     // Advance tip
     tip_.height += 1;
