@@ -759,6 +759,8 @@ bool Chain::disconnect_tip_once(std::string& err){
     return true;
 }
 
+// make sure this is inside:  namespace miq {  ...  }
+
 bool Chain::submit_block(const Block& b, std::string& err){
     if (!verify_block(b, err)) return false;
 
@@ -777,7 +779,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
                 err = "missing utxo during undo-capture";
                 return false;
             }
-            undo.push_back(UndoIn{in.prev.txid, in.prev.vout, e});
+            undo.push_back(UndoIn{in.prev.txid, in.prev_vout, e});
         }
     }
 
@@ -789,7 +791,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
         const auto& tx = b.txs[ti];
 
         for (const auto& in : tx.vin){
-            (void)utxo_.spend(in.prev.txid, in.prev.vout); // erase
+            (void)utxo_.spend(in.prev_txid, in.prev_vout); // erase
         }
         for (size_t i = 0; i < tx.vout.size(); ++i){
             UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, tip_.height + 1, false};
@@ -839,50 +841,6 @@ bool Chain::submit_block(const Block& b, std::string& err){
 
     save_state();
     return true;
-}
-
-
-    // Persist the block body
-    storage_.append_block(ser_block(b), b.block_hash());
-
-    // Connect: spend inputs, add new outputs (non-coinbase first)
-    for(size_t ti=1; ti<b.txs.size(); ++ti){
-        const auto& tx=b.txs[ti];
-
-        for(const auto& in: tx.vin){
-            (void)utxo_.spend(in.prev.txid, in.prev.vout);
-        }
-        for(size_t i=0;i<tx.vout.size();++i){
-            UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, tip_.height+1, false};
-            utxo_.add(tx.txid(), (uint32_t)i, e);
-        }
-    }
-
-    // Add coinbase outputs
-    const auto& cb=b.txs[0];
-    uint64_t cb_sum=0;
-    for(size_t i=0;i<cb.vout.size();++i){
-        UTXOEntry e{cb.vout[i].value, cb.vout[i].pkh, tip_.height+1, true};
-        utxo_.add(cb.txid(), (uint32_t)i, e);
-        cb_sum += cb.vout[i].value;
-    }
-    // Advance tip
-    tip_.height += 1;
-    tip_.hash = b.block_hash();
-    tip_.bits = b.header.bits;
-    tip_.time = b.header.time;
-    tip_.issued += cb_sum;
-
-    // Store undo in memory (session-only)
-    write_undo_file(datadir_, tip_.height, tip_.hash, g_undo[hk(tip_.hash)]);
-    g_undo[hk(tip_.hash)] = std::move(undo);
-
-    if (tip_.height >= UNDO_WINDOW) {
-    size_t prune_h = (size_t)(tip_.height - UNDO_WINDOW);
-    std::vector<uint8_t> prune_hash;
-    if (get_hash_by_index(prune_h, prune_hash)) {
-        remove_undo_file(datadir_, prune_h, prune_hash);
-    }
 }
 
     // ✅ Register this header with the reorg manager so the header tree stays complete
