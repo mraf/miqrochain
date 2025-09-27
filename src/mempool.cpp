@@ -28,6 +28,8 @@
 #define MIQ_RULE_ENFORCE_LOW_S 0
 #endif
 
+
+
 namespace miq {
 
 // --- Low-S helper (secp256k1 n/2, big-endian) --------------------
@@ -49,6 +51,11 @@ static std::vector<uint8_t> sighash_simple(const Transaction& tx){
     // Simple SIGHASH: hash of serialized tx without signatures
     Transaction t=tx; for(auto& in: t.vin){ in.sig.clear(); }
     return dsha256(ser_tx(t));
+}
+
+if(!miq::IsCanonicalDERSig_LowS(der_sig_ptr, der_sig_len)) {
+    err = "non-canonical or high-S signature";
+    return false; // policy: do not admit to mempool
 }
 
 std::string Mempool::key(const std::vector<uint8_t>& txid) const { return hex(txid); }
