@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <array>
+#include <cstring> // for std::memcpy
 
 namespace miq {
 
@@ -85,25 +86,26 @@ static inline bool ParseDERSignature(const uint8_t* sig, size_t len,
     size_t pos = 2;
     pos += 1; // 0x02
     rlen = sig[pos]; ++pos;
-    R = sig + pos; pos += rlen;
+    const uint8_t* Rptr = sig + pos; pos += rlen;
     pos += 1; // 0x02
     slen = sig[pos]; ++pos;
-    S = sig + pos;
-    return (pos + slen == len);
+    const uint8_t* Sptr = sig + pos;
+    if(pos + slen != len) return false;
+    // assign out params at the end to keep them consistent
+    R = Rptr; S = Sptr;
+    return true;
 }
 
 // True if S <= N/2 (Low-S rule)
 static inline bool IsLowS(const uint8_t* S, size_t slen){
-    // Left-pad S to 32 bytes for comparison
-    if(slen == 0 || slen > 33) return false; // should be <=33 with leading zero possible
     // Normalize possible leading zero (due to DER positivity)
-    size_t off = (slen == 33 && S[0]==0x00) ? 1 : 0;
-    if(slen - off > 32) return false;
+    size_t off = (slen == 33 && S && S[0]==0x00) ? 1 : 0;
+    if(slen == 0 || (slen - off) > 32) return false;
 
     uint8_t S32[32] = {0};
     // copy to right-align
     size_t copy = slen - off;
-    std::memcpy(S32 + (32 - copy), S + off, copy);
+    if(copy) std::memcpy(S32 + (32 - copy), S + off, copy);
 
     return be_cmp(S32, Secp256k1_N_Half().data(), 32) <= 0;
 }
