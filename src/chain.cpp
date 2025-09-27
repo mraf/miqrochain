@@ -706,52 +706,44 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
 }
 
 bool Chain::disconnect_tip_once(std::string& err){
-    std::vector<UndoIn> undo_tmp;
-    auto it = g_undo.find(hk(tip_.hash));
-    if (it == g_undo.end()) {
-        if (!read_undo_file(datadir_, tip_.height, tip_.hash, undo_tmp)) {
-            err = "no undo data for tip (restart or missing undo)";
-            return false;
-        }
-      
-} else {
-    undo_tmp = it->second;
-}
-const auto& undo = undo_tmp;
-    // Can't roll back genesis
     if (tip_.height == 0) { err = "cannot disconnect genesis"; return false; }
 
-    // Load the tip block we’re about to disconnect
-    Block blk;
-    if (!get_block_by_hash(tip_.hash, blk)) {
+    // Current tip block
+    Block cur;
+    if (!get_block_by_hash(tip_.hash, cur)) {
         err = "failed to read tip block";
         return false;
     }
 
-    // Load undo captured when we connected this block
-    auto it = g_undo.find(hk(tip_.hash));
-    if (it == g_undo.end()) {
-        err = "no undo data for tip (restart or no-undo session)";
-        return false;
+    // Load undo: prefer RAM, else disk
+    std::vector<UndoIn> undo_tmp;
+    auto it_ram = g_undo.find(hk(tip_.hash));
+    if (it_ram != g_undo.end()) {
+        undo_tmp = it_ram->second;
+    } else {
+        if (!read_undo_file(datadir_, tip_.height, tip_.hash, undo_tmp)) {
+            err = "no undo data for tip (restart or missing undo)";
+            return false;
+        }
     }
-    const auto& undo = it->second;
+    const std::vector<UndoIn>& undo = undo_tmp;
 
     // 1) Remove UTXOs created by non-coinbase txs (reverse order)
-    for (size_t ti = blk.txs.size(); ti-- > 1; ){
-        const auto& tx = blk.txs[ti];
+    for (size_t ti = cur.txs.size(); ti-- > 1; ){
+        const auto& tx = cur.txs[ti];
         for (size_t i = 0; i < tx.vout.size(); ++i) {
-            (void)utxo_.spend(tx.txid(), (uint32_t)i); // acts as erase; ignore missing
+            (void)utxo_.spend(tx.txid(), (uint32_t)i); // erase
         }
     }
 
-    // 2) Restore UTXOs spent by this block (reverse order)
+    // 2) Restore UTXOs that were spent by this block (reverse)
     for (size_t i = undo.size(); i-- > 0; ){
         const auto& u = undo[i];
         utxo_.add(u.prev_txid, u.prev_vout, u.prev_entry);
     }
 
     // 3) Remove coinbase outputs & adjust issued
-    const auto& cb = blk.txs[0];
+    const auto& cb = cur.txs[0];
     uint64_t cb_sum = 0;
     for (size_t i = 0; i < cb.vout.size(); ++i) {
         (void)utxo_.spend(cb.txid(), (uint32_t)i);
@@ -759,21 +751,22 @@ const auto& undo = undo_tmp;
     }
     if (tip_.issued < cb_sum) { err = "issued underflow"; return false; }
 
-    // 4) Move tip back to previous block
+    // 4) Previous block to update tip metadata
     Block prev;
-    if (!get_block_by_hash(blk.header.prev_hash, prev)) {
+    if (!get_block_by_hash(cur.header.prev_hash, prev)) {
         err = "failed to read prev block";
         return false;
     }
 
     tip_.height -= 1;
-    tip_.hash   = blk.header.prev_hash;
+    tip_.hash   = cur.header.prev_hash;
     tip_.bits   = prev.header.bits;
     tip_.time   = prev.header.time;
     tip_.issued -= cb_sum;
 
-    // Drop undo for disconnected block
-    g_undo.erase(it);
+    // 5) Drop RAM undo (if present) and delete persistent undo file for the disconnected block
+    if (it_ram != g_undo.end()) g_undo.erase(it_ram);
+    remove_undo_file(datadir_, (uint64_t)(tip_.height + 1), cur.block_hash());
 
     save_state();
     return true;
