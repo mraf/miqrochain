@@ -378,12 +378,8 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
 
 bool Chain::read_block_any(const std::vector<uint8_t>& h, Block& out) const{
     std::vector<uint8_t> raw;
-    if (storage_.read_block_by_hash(h, raw)) {
-        return deser_block(raw, out);
-    }
-    if (orphan_get(h, raw)) {
-        return deser_block(raw, out);
-    }
+    if (storage_.read_block_by_hash(h, raw)) return deser_block(raw, out);
+    if (orphan_get(h, raw)) return deser_block(raw, out);
     return false;
 }
 
@@ -844,6 +840,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
     save_state();
     return true;
 }
+
 
     // Persist the block body
     storage_.append_block(ser_block(b), b.block_hash());
