@@ -36,6 +36,22 @@
 #define MIQ_RULE_ENFORCE_LOW_S 0
 #endif
 
+#include <cstdio>
+#include <string>
+#include <vector>
+#include <sys/types.h>
+#ifdef _WIN32
+  #include <direct.h>
+  #include <io.h>
+  #define miq_mkdir(p) _mkdir(p)
+  #define miq_fsync(fd) _commit(fd)
+#else
+  #include <sys/stat.h>
+  #include <unistd.h>
+  #define miq_mkdir(p) mkdir(p, 0755)
+  #define miq_fsync(fd) fsync(fd)
+#endif
+
 namespace miq {
 
 struct UndoIn {
@@ -47,6 +63,137 @@ struct UndoIn {
 // Binary-safe key for unordered_map (store raw 32 bytes)
 static inline std::string hk(const std::vector<uint8_t>& h){
     return std::string(reinterpret_cast<const char*>(h.data()), h.size());
+}
+
+static inline size_t env_szt(const char* name, size_t defv){
+    const char* v = std::getenv(name);
+    if(!v || !*v) return defv;
+    char* end=nullptr; long long x = std::strtoll(v, &end, 10);
+    if(end==v || x < 0) return defv;
+    return (size_t)x;
+}
+static const size_t UNDO_WINDOW = env_szt("MIQ_UNDO_WINDOW", 2000); // keep last N blocks' undo
+
+static inline std::string hexstr(const std::vector<uint8_t>& v){
+    static const char* hexd="0123456789abcdef";
+    std::string s; s.resize(v.size()*2);
+    for(size_t i=0;i<v.size();++i){ unsigned b=v[i]; s[2*i]=hexd[b>>4]; s[2*i+1]=hexd[b&15]; }
+    return s;
+}
+static inline std::string join_path(const std::string& a, const std::string& b){
+#ifdef _WIN32
+    const char sep='\\';
+#else
+    const char sep='/';
+#endif
+    if(a.empty()) return b;
+    if(a.back()==sep) return a+b;
+    return a + sep + b;
+}
+static inline std::string undo_dir(const std::string& base){ return join_path(base, "undo"); }
+
+static void ensure_dir_exists(const std::string& path){
+#ifdef _WIN32
+    _mkdir(path.c_str()); // ok if exists
+#else
+    mkdir(path.c_str(), 0755); // ok if exists
+#endif
+}
+
+static bool write_undo_file(const std::string& base_dir,
+                            uint64_t height,
+                            const std::vector<uint8_t>& block_hash,
+                            const std::vector<UndoIn>& undo_vec)
+{
+    std::string dir = undo_dir(base_dir);
+    ensure_dir_exists(dir);
+    char name[64];
+    std::snprintf(name, sizeof(name), "%08llu_%s.undo",
+                  (unsigned long long)height, hexstr(block_hash).c_str());
+    std::string path = join_path(dir, name);
+    std::string tmp  = path + ".tmp";
+
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if(!f) return false;
+
+    auto W8  =[&](uint8_t v){ std::fwrite(&v,1,1,f); };
+    auto W32 =[&](uint32_t v){ uint8_t b[4]; for(int i=0;i<4;i++) b[i]=(v>>(i*8))&0xff; std::fwrite(b,1,4,f); };
+    auto W64 =[&](uint64_t v){ uint8_t b[8]; for(int i=0;i<8;i++) b[i]=(v>>(i*8))&0xff; std::fwrite(b,1,8,f); };
+    auto WVS =[&](const std::vector<uint8_t>& s){ W8((uint8_t)s.size()); if(!s.empty()) std::fwrite(s.data(),1,s.size(),f); };
+
+    // format: magic "MIQU", version=1, height, hash(32), count, then entries
+    std::fwrite("MIQU",1,4,f); W32(1);
+    W64((uint64_t)height);
+    std::fwrite(block_hash.data(),1,block_hash.size(),f);
+    W32((uint32_t)undo_vec.size());
+    for(const auto& u : undo_vec){
+        std::fwrite(u.prev_txid.data(),1,u.prev_txid.size(),f);
+        W32(u.prev_vout);
+        W64(u.prev_entry.value);
+        W64((uint64_t)u.prev_entry.height);
+        W8( u.prev_entry.coinbase ? 1 : 0 );
+        WVS(u.prev_entry.pkh);
+    }
+    std::fflush(f);
+    miq_fsync(fileno(f));
+    std::fclose(f);
+
+    // atomic-ish rename
+    std::remove(path.c_str()); // ignore failure
+    if(std::rename(tmp.c_str(), path.c_str()) != 0){
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool read_undo_file(const std::string& base_dir,
+                           uint64_t height,
+                           const std::vector<uint8_t>& block_hash,
+                           std::vector<UndoIn>& out)
+{
+    char name[64];
+    std::snprintf(name, sizeof(name), "%08llu_%s.undo",
+                  (unsigned long long)height, hexstr(block_hash).c_str());
+    std::string path = join_path(undo_dir(base_dir), name);
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if(!f) return false;
+
+    auto R8  =[&]()->uint8_t { uint8_t v; if(std::fread(&v,1,1,f)!=1) return 0; return v; };
+    auto R32 =[&]()->uint32_t{ uint8_t b[4]; if(std::fread(b,1,4,f)!=4) return 0; uint32_t v=0; for(int i=0;i<4;i++) v|=((uint32_t)b[i])<<(i*8); return v; };
+    auto R64 =[&]()->uint64_t{ uint8_t b[8]; if(std::fread(b,1,8,f)!=8) return 0; uint64_t v=0; for(int i=0;i<8;i++) v|=((uint64_t)b[i])<<(i*8); return v; };
+    auto RVS =[&]()->std::vector<uint8_t>{ uint8_t n=R8(); std::vector<uint8_t> s(n); if(n) std::fread(s.data(),1,n,f); return s; };
+
+    char magic[4]; if(std::fread(magic,1,4,f)!=4 || std::memcmp(magic,"MIQU",4)!=0){ std::fclose(f); return false; }
+    uint32_t ver = R32(); (void)ver;
+    uint64_t h   = R64(); (void)h;
+    std::vector<uint8_t> hh(32,0); std::fread(hh.data(),1,32,f); (void)hh;
+    uint32_t cnt = R32();
+    out.clear(); out.reserve(cnt);
+    for(uint32_t i=0;i<cnt;i++){
+        UndoIn u;
+        u.prev_txid.resize(32);
+        std::fread(u.prev_txid.data(),1,32,f);
+        u.prev_vout = R32();
+        u.prev_entry.value  = R64();
+        u.prev_entry.height = R64();
+        u.prev_entry.coinbase = (R8()!=0);
+        u.prev_entry.pkh = RVS();
+        out.push_back(std::move(u));
+    }
+    std::fclose(f);
+    return true;
+}
+
+static void remove_undo_file(const std::string& base_dir,
+                             uint64_t height,
+                             const std::vector<uint8_t>& block_hash)
+{
+    char name[64];
+    std::snprintf(name, sizeof(name), "%08llu_%s.undo",
+                  (unsigned long long)height, hexstr(block_hash).c_str());
+    std::string path = join_path(undo_dir(base_dir), name);
+    std::remove(path.c_str());
 }
 
 static inline bool env_truthy(const char* v){ return v && (*v=='1'||*v=='t'||*v=='T'||*v=='y'||*v=='Y'); }
@@ -187,6 +334,8 @@ bool Chain::read_block_any(const std::vector<uint8_t>& h, Block& out) const{
 }
 
 bool Chain::open(const std::string& dir){
+    datadir_ = dir;
+    ensure_dir_exists(undo_dir(datadir_));
     bool ok = storage_.open(dir) && utxo_.open(dir);
     if(!ok) return false;
     (void)load_state();
@@ -607,7 +756,16 @@ bool Chain::submit_block(const Block& b, std::string& err){
     tip_.issued += cb_sum;
 
     // Store undo in memory (session-only)
+    write_undo_file(datadir_, tip_.height, tip_.hash, g_undo[hk(tip_.hash)]);
     g_undo[hk(tip_.hash)] = std::move(undo);
+
+    if (tip_.height >= UNDO_WINDOW) {
+    size_t prune_h = (size_t)(tip_.height - UNDO_WINDOW);
+    std::vector<uint8_t> prune_hash;
+    if (get_hash_by_index(prune_h, prune_hash)) {
+        remove_undo_file(datadir_, prune_h, prune_hash);
+    }
+}
 
     // ✅ Register this header with the reorg manager so the header tree stays complete
     miq::HeaderView hv;
