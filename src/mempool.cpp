@@ -2,7 +2,7 @@
 
 #include "mempool.h"
 #include "util.h"
-#include "sig_encoding.h"
+#include "sig_encoding.h"     // Secp256k1_N(), Secp256k1_N_Half()
 #include "sha256.h"
 #include "crypto/ecdsa_iface.h"
 #include "hash160.h"
@@ -24,38 +24,52 @@
 #define MIQ_FALLBACK_MAX_TX_SIZE (MAX_TX_SIZE)
 #endif
 
+// Default: ENFORCE Low-S & canonical RAW-64 in mempool (policy)
 #ifndef MIQ_RULE_ENFORCE_LOW_S
-#define MIQ_RULE_ENFORCE_LOW_S 0
+#define MIQ_RULE_ENFORCE_LOW_S 1
 #endif
-
-
 
 namespace miq {
 
-// --- Low-S helper (secp256k1 n/2, big-endian) --------------------
-static inline bool is_low_s64(const std::vector<uint8_t>& sig64){
-    if (sig64.size() != 64) return false;
-    static const uint8_t N_HALF[32] = {
-        0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-        0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0
-    };
-    const uint8_t* s = sig64.data() + 32;
-    for (int i=0;i<32;i++){
-        if (s[i] < N_HALF[i]) return true;
-        if (s[i] > N_HALF[i]) return false;
+// --- Canonical RAW-64 (r||s) + Low-S checks ---------------------------------
+
+// Big-endian compare (32B)
+static inline int be_cmp32(const uint8_t* a, const uint8_t* b){
+    for(int i=0;i<32;i++){
+        if(a[i] < b[i]) return -1;
+        if(a[i] > b[i]) return 1;
     }
-    return true; // equal allowed
+    return 0;
 }
+
+static inline bool be_is_zero32(const uint8_t* a){
+    for(int i=0;i<32;i++) if(a[i]!=0) return false;
+    return true;
+}
+
+// Check r in [1, n-1], s in [1, n/2] (Low-S) for RAW-64 signature
+static inline bool is_canonical_raw64_lows(const std::vector<uint8_t>& sig64){
+    if (sig64.size() != 64) return false;
+    const uint8_t* r = sig64.data();
+    const uint8_t* s = sig64.data() + 32;
+
+    // r != 0 and r < n
+    if (be_is_zero32(r)) return false;
+    if (be_cmp32(r, Secp256k1_N().data()) >= 0) return false;
+
+    // s != 0 and s <= n/2  (low-S)
+    if (be_is_zero32(s)) return false;
+    if (be_cmp32(s, Secp256k1_N_Half().data()) > 0) return false;
+
+    return true;
+}
+
+// --- Sighash for verify ------------------------------------------------------
 
 static std::vector<uint8_t> sighash_simple(const Transaction& tx){
     // Simple SIGHASH: hash of serialized tx without signatures
     Transaction t=tx; for(auto& in: t.vin){ in.sig.clear(); }
     return dsha256(ser_tx(t));
-}
-
-if(!miq::IsCanonicalDERSig_LowS(der_sig_ptr, der_sig_len)) {
-    err = "non-canonical or high-S signature";
-    return false; // policy: do not admit to mempool
 }
 
 std::string Mempool::key(const std::vector<uint8_t>& txid) const { return hex(txid); }
@@ -127,9 +141,13 @@ bool Mempool::accept(const Transaction& tx, const UTXOSet& utxo, uint64_t height
         if (e.coinbase && height < e.height + COINBASE_MATURITY) { err = "immature"; return false; }
         if (hash160(i.pubkey) != e.pkh) { err = "pkh mismatch"; return false; }
 
+        // Signature verification against simple sighash
+        if (i.sig.size() != 64) { err = "bad sig size"; return false; }
         if (!crypto::ECDSA::verify(i.pubkey, h, i.sig)) { err = "bad signature"; return false; }
+
     #if MIQ_RULE_ENFORCE_LOW_S
-        if (!is_low_s64(i.sig)) { err = "high-S signature"; return false; }
+        // Enforce canonical RAW-64 (r||s) + Low-S in mempool (policy)
+        if (!is_canonical_raw64_lows(i.sig)) { err = "non-canonical or high-S signature"; return false; }
     #endif
 
         if (!leq_max_money(e.value)) { err = "utxo>MAX_MONEY"; return false; }
@@ -173,4 +191,4 @@ std::vector<std::vector<uint8_t>> Mempool::txids() const{
     return v;
 }
 
-} // namespace miq
+}
