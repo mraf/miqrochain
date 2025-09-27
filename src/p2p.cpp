@@ -296,8 +296,101 @@ static int dial_be_ipv4(uint32_t be_ip, uint16_t port){
 namespace miq {
 
 #if MIQ_ENABLE_HEADERS_FIRST_WIP
-// (unchanged, omitted for brevity) ...
-#endif
+// ---- headers-first wire helpers -------------------------------------------
+namespace {
+    static constexpr size_t HEADER_WIRE_BYTES = 88;
+
+    static inline void put_u32le(std::vector<uint8_t>& v, uint32_t x){
+        v.push_back((uint8_t)((x>>0)&0xff));
+        v.push_back((uint8_t)((x>>8)&0xff));
+        v.push_back((uint8_t)((x>>16)&0xff));
+        v.push_back((uint8_t)((x>>24)&0xff));
+    }
+    static inline void put_u64le(std::vector<uint8_t>& v, uint64_t x){
+        for(int i=0;i<8;i++) v.push_back((uint8_t)((x>>(8*i))&0xff));
+    }
+    static inline void put_i64le(std::vector<uint8_t>& v, int64_t x){
+        put_u64le(v, (uint64_t)x);
+    }
+    static inline uint32_t get_u32le(const uint8_t* p){ return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24); }
+    static inline uint64_t get_u64le(const uint8_t* p){ uint64_t z=0; for(int i=0;i<8;i++) z|=((uint64_t)p[i])<<(8*i); return z; }
+    static inline int64_t  get_i64le(const uint8_t* p){ return (int64_t)get_u64le(p); }
+
+    static std::vector<uint8_t> ser_header(const BlockHeader& h){
+        std::vector<uint8_t> v; v.reserve(HEADER_WIRE_BYTES);
+        put_u32le(v, h.version);
+        v.insert(v.end(), h.prev_hash.begin(),   h.prev_hash.end());
+        v.insert(v.end(), h.merkle_root.begin(), h.merkle_root.end());
+        put_i64le(v, h.time);
+        put_u32le(v, h.bits);
+        put_u64le(v, h.nonce);
+        return v;
+    }
+    static bool deser_header(const uint8_t* p, size_t n, BlockHeader& h){
+        if (n < HEADER_WIRE_BYTES) return false;
+        h.version = get_u32le(p+0);
+        h.prev_hash.assign(p+4,   p+4+32);
+        h.merkle_root.assign(p+36, p+36+32);
+        h.time = get_i64le(p+68);
+        h.bits = get_u32le(p+76);
+        h.nonce= get_u64le(p+80);
+        return true;
+    }
+
+    // getheaders payload: u8 count | count*32 locator hashes | 32 stop-hash
+    static std::vector<uint8_t> build_getheaders_payload(const std::vector<std::vector<uint8_t>>& locator,
+                                                         const std::vector<uint8_t>& stop){
+        const uint8_t n = (uint8_t)std::min<size_t>(locator.size(), 32);
+        std::vector<uint8_t> v; v.reserve(1 + n*32 + 32);
+        v.push_back(n);
+        for (size_t i=0;i<n;i++) v.insert(v.end(), locator[i].begin(), locator[i].end());
+        if (stop.size()==32) v.insert(v.end(), stop.begin(), stop.end());
+        else v.insert(v.end(), 32, 0);
+        return v;
+    }
+    static bool parse_getheaders_payload(const std::vector<uint8_t>& p,
+                                         std::vector<std::vector<uint8_t>>& locator,
+                                         std::vector<uint8_t>& stop){
+        if (p.size() < 1+32) return false;
+        uint8_t n = p[0];
+        size_t need = 1 + (size_t)n*32 + 32;
+        if (p.size() < need) return false;
+        locator.clear();
+        size_t off = 1;
+        for (uint8_t i=0;i<n;i++){ locator.emplace_back(p.begin()+off, p.begin()+off+32); off+=32; }
+        stop.assign(p.begin()+off, p.begin()+off+32);
+        return true;
+    }
+
+    // headers payload: u16le count | count * HEADER_WIRE_BYTES
+    static std::vector<uint8_t> build_headers_payload(const std::vector<BlockHeader>& hs){
+        const uint16_t n = (uint16_t)std::min<size_t>(hs.size(), 2000);
+        std::vector<uint8_t> v; v.reserve(2 + (size_t)n*HEADER_WIRE_BYTES);
+        v.push_back((uint8_t)(n & 0xff));
+        v.push_back((uint8_t)((n >> 8) & 0xff));
+        for (size_t i=0;i<n;i++){
+            auto h = ser_header(hs[i]);
+            v.insert(v.end(), h.begin(), h.end());
+        }
+        return v;
+    }
+    static bool parse_headers_payload(const std::vector<uint8_t>& p, std::vector<BlockHeader>& out){
+        if (p.size() < 2) return false;
+        uint16_t n = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+        size_t need = 2 + (size_t)n*HEADER_WIRE_BYTES;
+        if (p.size() < need) return false;
+        out.clear(); out.reserve(n);
+        size_t off = 2;
+        for (uint16_t i=0;i<n;i++){
+            BlockHeader h;
+            if (!deser_header(p.data()+off, p.size()-off, h)) return false;
+            out.push_back(std::move(h));
+            off += HEADER_WIRE_BYTES;
+        }
+        return true;
+    }
+} // anon
+#endif // MIQ_ENABLE_HEADERS_FIRST_WIP
 
 static int64_t now_ms() {
     using namespace std::chrono;
@@ -541,45 +634,6 @@ void P2P::send_block(int s, const std::vector<uint8_t>& raw){
     if (raw.empty()) return;
     auto msg = encode_msg("block", raw);
     send(s, (const char*)msg.data(), (int)msg.size(), 0);
-}
-
-static std::vector<std::vector<uint8_t>> make_simple_locator(miq::Chain& chain) {
-    std::vector<std::vector<uint8_t>> loc;
-    auto tip = chain.tip();
-    if (tip.height == 0 && std::all_of(tip.hash.begin(), tip.hash.end(), [](uint8_t v){return v==0;})) return loc;
-
-    size_t count = 0;
-    for (int64_t h = (int64_t)tip.height; h >= 0 && count < 32; --h, ++count) {
-        Block b;
-        if (!chain.get_block_by_index((size_t)h, b)) break;
-        loc.push_back(b.block_hash());
-    }
-    return loc;
-}
-
-// Serialize header (80 bytes) to wire: version(4) | prev(32) | merkle(32) | time(8) | bits(4) | nonce(8)
-static std::vector<uint8_t> ser_header80(const BlockHeader& h) {
-    std::vector<uint8_t> v; v.reserve(80);
-    // u32LE
-    v.push_back((uint8_t)((h.version >> 0) & 0xff));
-    v.push_back((uint8_t)((h.version >> 8) & 0xff));
-    v.push_back((uint8_t)((h.version >>16) & 0xff));
-    v.push_back((uint8_t)((h.version >>24) & 0xff));
-    // prev, merkle
-    v.insert(v.end(), h.prev_hash.begin(), h.prev_hash.end());
-    v.insert(v.end(), h.merkle_root.begin(), h.merkle_root.end());
-    // time (i64LE)
-    int64_t tt = h.time;
-    for (int i=0;i<8;i++) v.push_back((uint8_t)(( (uint64_t)tt >> (8*i)) & 0xff));
-    // bits (u32LE)
-    v.push_back((uint8_t)((h.bits >> 0) & 0xff));
-    v.push_back((uint8_t)((h.bits >> 8)  & 0xff));
-    v.push_back((uint8_t)((h.bits >>16) & 0xff));
-    v.push_back((uint8_t)((h.bits >>24) & 0xff));
-    // nonce (u64LE)
-    uint64_t nn = h.nonce;
-    for (int i=0;i<8;i++) v.push_back((uint8_t)((nn >> (8*i)) & 0xff));
-    return v;
 }
 
 // === rate-limit helpers ======================================================
@@ -958,9 +1012,20 @@ void P2P::loop(){
 
                     } else if (cmd == "verack") {
                         ps.verack_ok = true;
+#if MIQ_ENABLE_HEADERS_FIRST_WIP
+                        // headers-first: send getheaders(locator, stop=0)
+                        std::vector<std::vector<uint8_t>> locator;
+                        chain_.build_locator(locator);
+                        std::vector<uint8_t> stop(32, 0);
+                        auto pl = build_getheaders_payload(locator, stop);
+                        auto msg = encode_msg("getheaders", pl);
+                        send(s, (const char*)msg.data(), (int)msg.size(), 0);
+#else
+                        // existing block-first
                         ps.syncing = true;
                         ps.next_index = chain_.height() + 1;
                         request_block_index(ps, ps.next_index);
+#endif
                         maybe_send_getaddr(ps);
 
                     } else if (cmd == "ping") {
@@ -1066,6 +1131,51 @@ void P2P::loop(){
 
                     } else if (cmd == "addr") {
                         handle_addr_msg(ps, m.payload);
+
+#if MIQ_ENABLE_HEADERS_FIRST_WIP
+                    } else if (cmd == "getheaders") {
+                        // Peer wants headers after a locator
+                        std::vector<std::vector<uint8_t>> locator;
+                        std::vector<uint8_t> stop;
+                        if (!parse_getheaders_payload(m.payload, locator, stop)) {
+                            if (++ps.mis > 10) { dead.push_back(s); }
+                            continue;
+                        }
+                        // Ask chain which headers to serve
+                        std::vector<BlockHeader> hs;
+                        chain_.get_headers_from_locator(locator, 2000, hs);
+                        auto out = build_headers_payload(hs);
+                        auto msg = encode_msg("headers", out);
+                        send(s, (const char*)msg.data(), (int)msg.size(), 0);
+
+                    } else if (cmd == "headers") {
+                        // Accept headers into header tree, then request missing blocks
+                        std::vector<BlockHeader> hs;
+                        if (!parse_headers_payload(m.payload, hs)) {
+                            if (++ps.mis > 10) { dead.push_back(s); }
+                            continue;
+                        }
+                        size_t accepted = 0;
+                        std::string herr;
+                        for (const auto& h : hs) {
+                            if (chain_.accept_header(h, herr)) accepted++;
+                        }
+
+                        // Ask for missing blocks on best-header path
+                        std::vector<std::vector<uint8_t>> want;
+                        chain_.next_block_fetch_targets(want, /*max*/32);
+                        for (const auto& w : want) request_block_hash(ps, w);
+
+                        // If batch full, peer likely has more — request next batch
+                        if (hs.size() >= 2000) {
+                            std::vector<std::vector<uint8_t>> locator;
+                            chain_.build_locator(locator);
+                            std::vector<uint8_t> stop(32, 0);
+                            auto pl = build_getheaders_payload(locator, stop);
+                            auto msg = encode_msg("getheaders", pl);
+                            send(s, (const char*)msg.data(), (int)msg.size(), 0);
+                        }
+#endif
 
                     } else {
                         if (++ps.mis > 10) { dead.push_back(s); }
