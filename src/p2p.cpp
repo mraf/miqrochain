@@ -11,6 +11,9 @@
 #include <algorithm>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
+#include <string>
+#include <cstdio>
 
 #ifndef MIQ_ENABLE_HEADERS_FIRST_WIP
 #define MIQ_ENABLE_HEADERS_FIRST_WIP 0
@@ -223,14 +226,8 @@ static void send_getheaders(Peer& p, miq::Chain& chain){
     send_getheaders_message(p, locator, stop);
 }
 
-static void send_getheaders(Peer& p, miq::Chain& chain){
-    auto locator = make_simple_locator(chain);
-    std::vector<uint8_t> stop(32, 0); // zero = no stop
-    // encode "getheaders" with your message framing: [command|"getheaders"][payload...]
-    // payload: protocol_version, locator count + hashes, stop_hash
-    // ... use your existing wire format helpers ...
-    send_getheaders_message(p, locator, stop);
-}
+// The following message handlers are placeholders and must live inside your
+// normal dispatch. They are compiled out until the full plumbing exists.
 
 else if (cmd == "headers") {
     std::string err;
@@ -280,6 +277,7 @@ else if (cmd == "block") {
     chain.next_block_fetch_targets(want, /*max*/32);
     if (!want.empty()) send_getdata_for_blocks(peer, want);
 }
+#endif // MIQ_ENABLE_HEADERS_FIRST_WIP
 
 static int64_t now_ms() {
     using namespace std::chrono;
