@@ -35,6 +35,8 @@
 
 namespace miq {
 
+static miq::ReorgManager g_reorg;
+
 // === Added: local constants (non-breaking) ===
 static constexpr size_t MAX_BLOCK_SIZE_LOCAL = 1 * 1024 * 1024; // 1 MiB
 
