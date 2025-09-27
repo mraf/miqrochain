@@ -2,6 +2,7 @@
 #include "sha256.h"
 #include "reorg_manager.h"
 #include "merkle.h"
+#include <unordered_map>
 #include "hasher.h"
 #include "log.h"
 #include "hash160.h"
@@ -34,6 +35,22 @@
 #endif
 
 namespace miq {
+
+struct UndoIn {
+    std::vector<uint8_t> prev_txid;
+    uint32_t             prev_vout{0};
+    UTXOEntry            prev_entry;
+};
+
+// Binary-safe key for unordered_map (store raw 32 bytes)
+static inline std::string hk(const std::vector<uint8_t>& h){
+    return std::string(reinterpret_cast<const char*>(h.data()), h.size());
+}
+
+static std::unordered_map<std::string, std::vector<UndoIn>> g_undo;
+
+// keep your other statics (e.g., the reorg manager) here too:
+static miq::ReorgManager g_reorg;
 
 static miq::ReorgManager g_reorg;
 
