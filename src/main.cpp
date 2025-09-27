@@ -279,12 +279,13 @@ int main(int argc, char** argv){
         // --- Services ---
         Mempool mempool;
         RpcService rpc(chain, mempool);
-        if(!cfg.no_rpc){
-            rpc.start(RPC_PORT);
-            log_info("RPC listening on " + std::to_string(RPC_PORT));
-        }
 
         P2P p2p(chain);
+        p2p.set_datadir(cfg.datadir);   // persist peers/bans in datadir
+        p2p.set_mempool(&mempool);      // enable tx relay from mempool
+        rpc.set_p2p(&p2p);              // RPC can report peer info/conn count
+
+        // Start P2P first so RPC has a valid P2P pointer immediately
         if(!cfg.no_p2p){
             if(p2p.start(P2P_PORT)){
                 log_info("P2P listening on " + std::to_string(P2P_PORT));
@@ -292,6 +293,11 @@ int main(int argc, char** argv){
             } else {
                 log_warn("P2P failed to start on port " + std::to_string(P2P_PORT));
             }
+        }
+
+        if(!cfg.no_rpc){
+            rpc.start(RPC_PORT);
+            log_info("RPC listening on " + std::to_string(RPC_PORT));
         }
 
         // --- Miner (off if no_mine or no address). Keep coinbase prev.vout=0.
