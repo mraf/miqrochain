@@ -179,6 +179,17 @@ static inline bool meets_target_be(const std::vector<uint8_t>& hash32, uint32_t 
 
 // =====================================================================
 
+bool Chain::read_block_any(const std::vector<uint8_t>& h, Block& out) const{
+    std::vector<uint8_t> raw;
+    if (storage_.read_block_by_hash(h, raw)) {
+        return deser_block(raw, out);
+    }
+    if (orphan_get(h, raw)) {
+        return deser_block(raw, out);
+    }
+    return false;
+}
+
 bool Chain::open(const std::string& dir){
     bool ok = storage_.open(dir) && utxo_.open(dir);
     if(!ok) return false;
