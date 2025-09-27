@@ -42,11 +42,14 @@
   #include <io.h>
   #define miq_mkdir(p) _mkdir(p)
   #define miq_fsync(fd) _commit(fd)
+  #define miq_fileno _fileno
 #else
   #include <sys/stat.h>
   #include <unistd.h>
+  #include <fcntl.h>
   #define miq_mkdir(p) mkdir(p, 0755)
   #define miq_fsync(fd) fsync(fd)
+  #define miq_fileno fileno
 #endif
 
 namespace miq {
@@ -63,7 +66,7 @@ static inline std::string hk(const std::vector<uint8_t>& h){
 }
 
 static inline std::vector<uint8_t> header_hash_of(const BlockHeader& h) {
-    Block tmp; 
+    Block tmp;
     tmp.header = h;
     return tmp.block_hash();
 }
@@ -138,7 +141,7 @@ static bool write_undo_file(const std::string& base_dir,
         WVS(u.prev_entry.pkh);
     }
     std::fflush(f);
-    miq_fsync(fileno(f));
+    miq_fsync(miq_fileno(f));
     std::fclose(f);
 
     // atomic-ish rename
@@ -147,7 +150,19 @@ static bool write_undo_file(const std::string& base_dir,
         std::remove(tmp.c_str());
         return false;
     }
+
+#ifndef _WIN32
+    // fsync parent directory to make the rename durable
+    {
+        int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+        if (dfd >= 0) { ::fsync(dfd); ::close(dfd); }
+    }
+#endif
     return true;
+}
+
+static bool read_exact(FILE* f, void* buf, size_t n){
+    return std::fread(buf, 1, n, f) == n;
 }
 
 static bool read_undo_file(const std::string& base_dir,
@@ -162,26 +177,43 @@ static bool read_undo_file(const std::string& base_dir,
     FILE* f = std::fopen(path.c_str(), "rb");
     if(!f) return false;
 
-    auto R8  =[&]()->uint8_t { uint8_t v; if(std::fread(&v,1,1,f)!=1) return 0; return v; };
-    auto R32 =[&]()->uint32_t{ uint8_t b[4]; if(std::fread(b,1,4,f)!=4) return 0; uint32_t v=0; for(int i=0;i<4;i++) v|=((uint32_t)b[i])<<(i*8); return v; };
-    auto R64 =[&]()->uint64_t{ uint8_t b[8]; if(std::fread(b,1,8,f)!=8) return 0; uint64_t v=0; for(int i=0;i<8;i++) v|=((uint64_t)b[i])<<(i*8); return v; };
-    auto RVS =[&]()->std::vector<uint8_t>{ uint8_t n=R8(); std::vector<uint8_t> s(n); if(n) std::fread(s.data(),1,n,f); return s; };
+    char magic[4];
+    if(!read_exact(f, magic, 4) || std::memcmp(magic,"MIQU",4)!=0){ std::fclose(f); return false; }
 
-    char magic[4]; if(std::fread(magic,1,4,f)!=4 || std::memcmp(magic,"MIQU",4)!=0){ std::fclose(f); return false; }
-    uint32_t ver = R32(); (void)ver;
-    uint64_t h   = R64(); (void)h;
-    std::vector<uint8_t> hh(32,0); std::fread(hh.data(),1,32,f); (void)hh;
-    uint32_t cnt = R32();
+    uint32_t ver=0; if(!read_exact(f, &ver, sizeof(ver))) { std::fclose(f); return false; }
+    (void)ver;
+
+    uint64_t h=0; if(!read_exact(f, &h, sizeof(h))) { std::fclose(f); return false; }
+    (void)h;
+
+    std::vector<uint8_t> hh(32,0);
+    if(!read_exact(f, hh.data(), 32)) { std::fclose(f); return false; }
+
+    uint32_t cnt=0; if(!read_exact(f, &cnt, sizeof(cnt))) { std::fclose(f); return false; }
+
     out.clear(); out.reserve(cnt);
+
     for(uint32_t i=0;i<cnt;i++){
         UndoIn u;
         u.prev_txid.resize(32);
-        std::fread(u.prev_txid.data(),1,32,f);
-        u.prev_vout = R32();
-        u.prev_entry.value  = R64();
-        u.prev_entry.height = R64();
-        u.prev_entry.coinbase = (R8()!=0);
-        u.prev_entry.pkh = RVS();
+        if(!read_exact(f, u.prev_txid.data(), 32)) { std::fclose(f); return false; }
+
+        if(!read_exact(f, &u.prev_vout, sizeof(u.prev_vout))) { std::fclose(f); return false; }
+
+        if(!read_exact(f, &u.prev_entry.value, sizeof(u.prev_entry.value))) { std::fclose(f); return false; }
+        if(!read_exact(f, &u.prev_entry.height, sizeof(u.prev_entry.height))) { std::fclose(f); return false; }
+
+        uint8_t coinbase_flag=0;
+        if(!read_exact(f, &coinbase_flag, 1)) { std::fclose(f); return false; }
+        u.prev_entry.coinbase = (coinbase_flag != 0);
+
+        uint8_t n=0;
+        if(!read_exact(f, &n, 1)) { std::fclose(f); return false; }
+        u.prev_entry.pkh.resize(n);
+        if(n){
+            if(!read_exact(f, u.prev_entry.pkh.data(), n)) { std::fclose(f); return false; }
+        }
+
         out.push_back(std::move(u));
     }
     std::fclose(f);
@@ -791,12 +823,6 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         }
         auto raw = ser_tx(tx);
         if (raw.size() > MIQ_FALLBACK_MAX_TX_SIZE) { err="tx too large"; return false; }
-        auto raw = ser_tx(tx);
-        if (raw.size() > MIQ_FALLBACK_MAX_TX_SIZE) {
-        err = "tx too large (policy)";
-        return false;
-}
-
     }
 
     // Difficulty bits must match LWMA
@@ -855,13 +881,6 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
             if(e.coinbase && tip_.height+1 < e.height + COINBASE_MATURITY){ err="immature coinbase"; return false; }
             if(hash160(inx.pubkey)!=e.pkh){ err="pkh mismatch"; return false; }
             if(!crypto::ECDSA::verify(inx.pubkey, hash, inx.sig)){ err="bad signature"; return false; }
-            #if MIQ_RULE_ENFORCE_LOW_S
-            extern bool is_low_s64(const std::vector<uint8_t>&); // or include chain.h/sig_encoding.h
-            if (!is_low_s64(inx.sig)) {
-            err = "high-S signature (policy)";
-            return false;
-}
-        #endif
         #if MIQ_RULE_ENFORCE_LOW_S
             // Consensus: reject non-low-S signatures in blocks
             if (!is_low_s64(inx.sig)) { err="high-S signature"; return false; }
@@ -971,7 +990,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
                 err = "missing utxo during undo-capture";
                 return false;
             }
-            undo.push_back(UndoIn{in.prev.txid, in.prev.vout, e});
+            undo.push_back(UndoIn{in.prev_txid, in.prev_vout, e});
         }
     }
 
@@ -981,7 +1000,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
         const auto& tx = b.txs[ti];
 
         for (const auto& in : tx.vin){
-            (void)utxo_.spend(in.prev.txid, in.prev.vout);
+            (void)utxo_.spend(in.prev_txid, in.prev_vout);
         }
         for (size_t i = 0; i < tx.vout.size(); ++i){
             UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, tip_.height + 1, false};
