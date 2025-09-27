@@ -1,3 +1,4 @@
+// src/rpc.cpp
 #include "rpc.h"
 #include "sha256.h"
 #include "constants.h"
@@ -10,7 +11,7 @@
 #include "miner.h"
 #include "base58check.h"
 #include "hash160.h"
-#include "utxo.h"          // <-- fix: use UTXOEntry & list_for_pkh
+#include "utxo.h"          // UTXOEntry & list_for_pkh
 
 #include <sstream>
 #include <map>
@@ -19,9 +20,10 @@
 #include <algorithm>
 #include <tuple>
 #include <cmath>
-#include <cctype>   // for std::isxdigit
+#include <cctype>   // std::isxdigit
+#include <string>
+#include <vector>
 
-// Policy defaults (safe fallbacks if missing from constants.h)
 #ifndef MIN_RELAY_FEE_RATE
 // sat/KB (miqron per kilobyte)
 static constexpr uint64_t MIN_RELAY_FEE_RATE = 1000;
@@ -81,6 +83,16 @@ void RpcService::start(uint16_t port){
 
 void RpcService::stop(){ http_.stop(); }
 
+// simple uptime base
+static std::chrono::steady_clock::time_point& rpc_start_time(){
+    static auto t0 = std::chrono::steady_clock::now();
+    return t0;
+}
+
+static JNode jbool(bool v){ JNode n; n.v = v; return n; }
+static JNode jnum(double v){ JNode n; n.v = v; return n; }
+static JNode jstr(const std::string& s){ JNode n; n.v = s; return n; }
+
 std::string RpcService::handle(const std::string& body){
     try {
         JNode req; 
@@ -97,6 +109,39 @@ std::string RpcService::handle(const std::string& body){
         if(ip!=obj.end() && std::holds_alternative<std::vector<JNode>>(ip->second.v))
             params = std::get<std::vector<JNode>>(ip->second.v);
 
+        // ---------------- basic/info ----------------
+
+        if(method=="help"){
+            static const char* k[] = {
+                "help","version","ping","uptime",
+                "getnetworkinfo","getblockchaininfo","getblockcount","getbestblockhash",
+                "getblock","getblockhash","getcoinbaserecipient",
+                "getrawmempool","gettxout",
+                "validateaddress","decodeaddress","decoderawtx",
+                "getminerstats","sendrawtransaction","sendtoaddress",
+                "estimatemediantime","getdifficulty","getchaintips",
+                "getpeerinfo","getconnectioncount"
+            };
+            std::vector<JNode> v;
+            for(const char* s: k){ v.push_back(jstr(s)); }
+            JNode out; out.v = v; return json_dump(out);
+        }
+
+        if(method=="version"){
+            JNode n; n.v = std::string("miqrochain-rpc/1");
+            return json_dump(n);
+        }
+
+        if(method=="ping"){
+            return "\"pong\"";
+        }
+
+        if(method=="uptime"){
+            using clock = std::chrono::steady_clock;
+            auto secs = std::chrono::duration<double>(clock::now() - rpc_start_time()).count();
+            return json_dump(jnum(secs));
+        }
+
         if(method=="getnetworkinfo"){
             std::map<std::string,JNode> o;
             JNode n;  n.v = std::string(CHAIN_NAME);                 o["chain"] = n;
@@ -109,6 +154,7 @@ std::string RpcService::handle(const std::string& body){
             JNode n; std::map<std::string,JNode> o;
             JNode a; a.v = std::string(CHAIN_NAME);              o["chain"] = a;
             JNode h; h.v = (double)chain_.tip().height;          o["height"] = h;
+            JNode d; d.v = chain_.work_from_bits(chain_.tip().bits); o["difficulty"] = d;
             JNode r; r.v = o; return json_dump(r);
         }
 
@@ -131,27 +177,22 @@ std::string RpcService::handle(const std::string& body){
             return json_dump(n);
         }
 
-        // UPDATED: accept HEIGHT (number) or HASH (hex string)
-        // Return JSON object { hash, time, txs, hex } with FULL block hex (header + txs)
+        // getblock(height or hex_hash) -> {hash,time,txs,hex}
         if(method=="getblock"){
             if(params.size()<1) return err("need index_or_hash");
 
             Block b;
             bool ok = false;
 
-            // Case A: height (number)
             if(std::holds_alternative<double>(params[0].v)){
                 size_t idx = (size_t)std::get<double>(params[0].v);
                 ok = chain_.get_block_by_index(idx, b);
-            }
-            // Case B: hash (hex string)
-            else if(std::holds_alternative<std::string>(params[0].v)){
+            } else if(std::holds_alternative<std::string>(params[0].v)){
                 const std::string hstr = std::get<std::string>(params[0].v);
                 if(!is_hex(hstr)) return err("bad hash hex");
                 std::vector<uint8_t> want;
                 try { want = from_hex(hstr); } catch(...) { return err("bad hash hex"); }
 
-                // If Chain doesn't expose get_block_by_hash, scan heights (small chain OK).
                 auto tip = chain_.tip();
                 for(size_t i=0;i<= (size_t)tip.height;i++){
                     Block tb;
@@ -174,8 +215,7 @@ std::string RpcService::handle(const std::string& body){
             JNode out; out.v = o; return json_dump(out);
         }
 
-        // Helper: who does coinbase vout0 pay? Accepts height (number) or hash (hex string).
-        // Returns {"value": <miqron>, "pkh": "<20-byte hex>"}.
+        // who gets the coinbase vout0?
         if(method=="getcoinbaserecipient"){
             if(params.size()<1) return err("need index_or_hash");
 
@@ -237,6 +277,56 @@ std::string RpcService::handle(const std::string& body){
             JNode out; out.v = o; return json_dump(out);
         }
 
+        if(method=="validateaddress"){
+            if(params.size()<1 || !std::holds_alternative<std::string>(params[0].v))
+                return err("need address");
+            uint8_t ver=0; std::vector<uint8_t> payload;
+            bool ok = base58check_decode(std::get<std::string>(params[0].v), ver, payload);
+            std::map<std::string,JNode> o;
+            o["isvalid"] = jbool(ok && ver==VERSION_P2PKH && payload.size()==20);
+            o["version"] = jnum((double)ver);
+            if(ok && payload.size()==20){ o["pkh"] = jstr(to_hex(payload)); }
+            JNode out; out.v = o; return json_dump(out);
+        }
+
+        if(method=="decoderawtx"){
+            if(params.size()<1 || !std::holds_alternative<std::string>(params[0].v))
+                return err("need txhex");
+            std::vector<uint8_t> raw;
+            try { raw = from_hex(std::get<std::string>(params[0].v)); }
+            catch(...) { return err("bad txhex"); }
+            Transaction tx;
+            if(!deser_tx(raw, tx)) return err("bad tx");
+            std::map<std::string,JNode> o;
+            o["txid"] = jstr(to_hex(tx.txid()));
+            o["size"] = jnum((double)raw.size());
+            // vin
+            {
+                std::vector<JNode> arr;
+                for(const auto& in: tx.vin){
+                    std::map<std::string,JNode> i;
+                    i["prev_txid"] = jstr(to_hex(in.prev.txid));
+                    i["vout"]      = jnum((double)in.prev.vout);
+                    i["pubkey"]    = jstr(to_hex(in.pubkey));
+                    i["siglen"]    = jnum((double)in.sig.size());
+                    JNode n; n.v = i; arr.push_back(n);
+                }
+                JNode n; n.v = arr; o["vin"] = n;
+            }
+            // vout
+            {
+                std::vector<JNode> arr;
+                for(const auto& out: tx.vout){
+                    std::map<std::string,JNode> v;
+                    v["value"] = jnum((double)out.value);
+                    v["pkh"]   = jstr(to_hex(out.pkh));
+                    JNode n; n.v = v; arr.push_back(n);
+                }
+                JNode n; n.v = arr; o["vout"] = n;
+            }
+            JNode out; out.v = o; return json_dump(out);
+        }
+
         if(method=="getrawmempool"){
             auto ids = mempool_.txids();
             JNode arr; std::vector<JNode> v;
@@ -280,22 +370,14 @@ std::string RpcService::handle(const std::string& body){
             if(!deser_tx(raw, tx)) return err("bad tx");
 
             auto tip = chain_.tip(); std::string e;
-            if(mempool_.accept(tx, chain_.utxo(), tip.height, e)){
+            if(mempool_.accept(tx, chain_.utxo(), (size_t)tip.height, e)){
                 JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
             } else {
                 return err(e);
             }
         }
 
-        // --------------------------------------------------------------------
-        // Miner stats (safe; matches dashboard expectations)
-        // Returns:
-        //   { "hps": <float>, "hashes": <uint64 snapshot>, "seconds": <float>, "total": <uint64> }
-        // - 'hashes' is a rolling snapshot since last call (atomic counter reset)
-        // - 'seconds' is wall time since last snapshot
-        // - 'hps' is computed as hashes/seconds (client can recompute)
-        // - 'total' is the monotonic total since process start
-        // --------------------------------------------------------------------
+        // Miner stats
         if(method=="getminerstats"){
             using clock = std::chrono::steady_clock;
             static clock::time_point prev = clock::now();
@@ -424,11 +506,56 @@ std::string RpcService::handle(const std::string& body){
 
             // Mempool accept
             auto tip = chain_.tip(); std::string e;
-            if(mempool_.accept(tx, chain_.utxo(), tip.height, e)){
+            if(mempool_.accept(tx, chain_.utxo(), (size_t)tip.height, e)){
                 JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
             } else {
                 return err(e);
             }
+        }
+
+        // ---------------- chain-related helpers ----------------
+
+        if(method=="estimatemediantime"){
+            auto hdrs = chain_.last_headers(11);
+            if(hdrs.empty()){
+                return json_dump(jnum(0.0));
+            }
+            std::vector<int64_t> ts;
+            ts.reserve(hdrs.size());
+            for(auto& p : hdrs) ts.push_back(p.first);
+            std::sort(ts.begin(), ts.end());
+            double mtp = (double)ts[ts.size()/2];
+            return json_dump(jnum(mtp));
+        }
+
+        if(method=="getdifficulty"){
+            double d = (double)chain_.work_from_bits(chain_.tip().bits);
+            return json_dump(jnum(d));
+        }
+
+        if(method=="getchaintips"){
+            // Minimal: only the active tip (we don't expose side branches here)
+            auto tip = chain_.tip();
+            std::map<std::string,JNode> t;
+            t["height"]    = jnum((double)tip.height);
+            t["hash"]      = jstr(to_hex(tip.hash));
+            t["branchlen"] = jnum(0.0);
+            t["status"]    = jstr("active");
+            JNode obj; obj.v = t;
+            std::vector<JNode> arr; arr.push_back(obj);
+            JNode out; out.v = arr; return json_dump(out);
+        }
+
+        // ---------------- p2p stubs (no P2P reference here) ----------------
+
+        if(method=="getpeerinfo"){
+            // Return empty list if P2P service isn't injected here
+            std::vector<JNode> v; JNode out; out.v = v; return json_dump(out);
+        }
+
+        if(method=="getconnectioncount"){
+            // Return 0 if not wired to P2P
+            return json_dump(jnum(0.0));
         }
 
         return err("unknown method");
@@ -441,4 +568,4 @@ std::string RpcService::handle(const std::string& body){
     }
 }
 
-} // namespace miq
+}
