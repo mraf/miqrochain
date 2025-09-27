@@ -43,7 +43,7 @@ static std::string err(const std::string& m){
     return json_dump(n);
 }
 
-// Local difficulty helper (public here; avoids depending on Chain internals)
+// Local difficulty helper (same formula as Chain::work_from_bits, but public here)
 static double difficulty_from_bits(uint32_t bits){
     uint32_t exp  = bits >> 24;
     uint32_t mant = bits & 0x007fffff;
@@ -57,8 +57,8 @@ static double difficulty_from_bits(uint32_t bits){
     if (target <= 0.0L) return 0.0;
 
     long double difficulty = base_target / target;
-    if (difficulty < 0.0L || !std::isfinite((double)difficulty)) difficulty = 0.0L;
-    return (double)difficulty;
+    if (difficulty < 0.0L) difficulty = 0.0L;
+    return (double)difficulty; // cast to double for JNode
 }
 
 static bool is_hex(const std::string& s){
@@ -172,7 +172,7 @@ std::string RpcService::handle(const std::string& body){
             JNode n; std::map<std::string,JNode> o;
             JNode a; a.v = std::string(CHAIN_NAME);              o["chain"] = a;
             JNode h; h.v = (double)chain_.tip().height;          o["height"] = h;
-            JNode d; d.v = (double)difficulty_from_bits(chain_.tip().bits); o["difficulty"] = d;
+            JNode d; d.v = (double)Chain::work_from_bits_public(chain_.tip().bits); o["difficulty"] = d;
             JNode r; r.v = o; return json_dump(r);
         }
 
@@ -547,7 +547,7 @@ std::string RpcService::handle(const std::string& body){
         }
 
         if(method=="getdifficulty"){
-            double d = difficulty_from_bits(chain_.tip().bits);
+            double d = (double)Chain::work_from_bits_public(chain_.tip().bits);
             return json_dump(jnum(d));
         }
 
