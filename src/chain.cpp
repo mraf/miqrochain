@@ -197,13 +197,6 @@ static void remove_undo_file(const std::string& base_dir,
 }
 
 static inline bool env_truthy(const char* v){ return v && (*v=='1'||*v=='t'||*v=='T'||*v=='y'||*v=='Y'); }
-static inline size_t env_szt(const char* name, size_t defv){
-    const char* v = std::getenv(name);
-    if(!v || !*v) return defv;
-    char* end=nullptr; long long x = std::strtoll(v, &end, 10);
-    if(end==v || x < 0) return defv;
-    return (size_t)x;
-}
 
 // Limits (override via env if you like)
 static const size_t ORPHAN_MAX_BLOCKS = env_szt("MIQ_ORPHAN_MAX_BLOCKS", 1024);        // 1k blocks
@@ -899,4 +892,4 @@ bool Chain::have_block(const std::vector<uint8_t>& h) const{
     return storage_.read_block_by_hash(h, raw);
 }
 
-} // namespace miq
+}
