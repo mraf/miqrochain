@@ -355,17 +355,39 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
 bool Chain::submit_block(const Block& b, std::string& err){
     if(!verify_block(b, err)) return false;
 
-    storage_.append_block(ser_block(b), b.block_hash());
+    // Prepare undo: capture all spent inputs BEFORE we mutate the UTXO set.
+    std::vector<UndoIn> undo;
+    undo.reserve(b.txs.size() * 2);
 
     for(size_t ti=1; ti<b.txs.size(); ++ti){
+        const auto& tx = b.txs[ti];
+        for(const auto& in : tx.vin){
+            UTXOEntry e;
+            if(!utxo_.get(in.prev.txid, in.prev.vout, e)){
+                err = "missing utxo during undo-capture";
+                return false;
+            }
+            undo.push_back(UndoIn{in.prev.txid, in.prev.vout, e});
+        }
+    }
+
+    // Persist the block body
+    storage_.append_block(ser_block(b), b.block_hash());
+
+    // Connect: spend inputs, add new outputs (non-coinbase first)
+    for(size_t ti=1; ti<b.txs.size(); ++ti){
         const auto& tx=b.txs[ti];
-        for(const auto& in: tx.vin) utxo_.spend(in.prev.txid, in.prev.vout);
+
+        for(const auto& in: tx.vin){
+            (void)utxo_.spend(in.prev.txid, in.prev.vout);
+        }
         for(size_t i=0;i<tx.vout.size();++i){
             UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, tip_.height+1, false};
             utxo_.add(tx.txid(), (uint32_t)i, e);
         }
     }
 
+    // Add coinbase outputs
     const auto& cb=b.txs[0];
     uint64_t cb_sum=0;
     for(size_t i=0;i<cb.vout.size();++i){
@@ -374,15 +396,29 @@ bool Chain::submit_block(const Block& b, std::string& err){
         cb_sum += cb.vout[i].value;
     }
 
+    // Advance tip
     tip_.height += 1;
     tip_.hash = b.block_hash();
     tip_.bits = b.header.bits;
     tip_.time = b.header.time;
     tip_.issued += cb_sum;
 
+    // Store undo in memory (session-only)
+    g_undo[hk(tip_.hash)] = std::move(undo);
+
+    // ✅ Register this header with the reorg manager so the header tree stays complete
+    miq::HeaderView hv;
+    hv.hash   = tip_.hash;
+    hv.prev   = b.header.prev_hash;
+    hv.bits   = b.header.bits;
+    hv.time   = b.header.time;
+    hv.height = (uint32_t)tip_.height;
+    g_reorg.on_validated_header(hv);
+
     save_state();
     return true;
 }
+
 
 // Return the last n headers (time,bits) along the canonical chain via storage.
 std::vector<std::pair<int64_t,uint32_t>> Chain::last_headers(size_t n) const{
