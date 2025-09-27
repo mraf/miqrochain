@@ -5,7 +5,6 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <set>
 #include <deque>
 #include <cstdint>
 
@@ -24,7 +23,7 @@
   #include <unistd.h>
 #endif
 
-#include "mempool.h"   // we use a (nullable) mempool pointer
+#include "mempool.h"
 
 namespace miq {
 
@@ -37,7 +36,7 @@ struct OrphanRec {
 };
 
 struct PeerState {
-    // headers-first (future use)
+    // headers-first (reserved / future use)
     bool     sent_getheaders{false};
     int64_t  last_headers_ms{0};
 
@@ -72,6 +71,21 @@ struct PeerState {
     std::unordered_set<std::string> inflight_tx;
 };
 
+// Lightweight read-only snapshot for RPC/UI
+struct PeerSnapshot {
+    std::string  ip;
+    bool         verack_ok;
+    bool         awaiting_pong;
+    int          mis;
+    uint64_t     next_index;
+    bool         syncing;
+    double       last_seen_ms;
+    uint64_t     blk_tokens;
+    uint64_t     tx_tokens;
+    size_t       rx_buf;
+    size_t       inflight;
+};
+
 class P2P {
 public:
     explicit P2P(Chain& c);
@@ -92,14 +106,18 @@ public:
     void broadcast_inv_block(const std::vector<uint8_t>& block_hash);
     void broadcast_inv_tx(const std::vector<uint8_t>& txid);
 
-    // Optional: where to store bans.txt
+    // Optional: where to store bans.txt and peers.dat
     inline void set_datadir(const std::string& d) { datadir_ = d; }
 
     // tiny, local and fast hex for keys
-    static std::string hexkey(const std::vector<uint8_t>& h);
+    std::string hexkey(const std::vector<uint8_t>& h);
+
+    // Read-only stats for RPC/UI
+    size_t connection_count() const { return peers_.size(); }
+    std::vector<PeerSnapshot> snapshot_peers() const;
 
 private:
-    // ---- headers-first helpers (present for future use) ----
+    // ---- headers-first helpers (present for future use; not enabled) ----
     void send_getheaders(PeerState& ps);
     void send_headers_snapshot(PeerState& ps, const std::vector<std::vector<uint8_t>>& locator);
 
@@ -111,8 +129,6 @@ private:
     std::unordered_set<std::string> seen_txids_;
     std::unordered_map<std::string, std::vector<uint8_t>> tx_store_;
     std::deque<std::string> tx_order_; // for eviction
-    size_t tx_store_bytes_{0};
-    size_t tx_store_limit_bytes_{4u * 1024u * 1024u}; // 4MB
 
     Mempool* mempool_{nullptr};  // nullable, safe to run without
     Chain& chain_;
@@ -120,7 +136,7 @@ private:
     std::atomic<bool> running_{false};
     int srv_{-1};
     std::unordered_map<int, PeerState> peers_;
-    std::set<std::string> banned_;
+    std::unordered_set<std::string> banned_;
     std::string datadir_{"./miqdata"};
 
     // address manager: IPv4s in network byte order
