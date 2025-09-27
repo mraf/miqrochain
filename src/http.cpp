@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <cstdlib>   // getenv
 #include <cstdio>
+#include <unordered_set>
 
 #ifdef _WIN32
   #define _WINSOCK_DEPRECATED_NO_WARNINGS
@@ -45,7 +46,7 @@ static inline bool is_loopback_sockaddr(const sockaddr* sa){
     if(sa->sa_family == AF_INET){
         const sockaddr_in* s4 = reinterpret_cast<const sockaddr_in*>(sa);
         unsigned long a = ntohl(s4->sin_addr.s_addr);
-        return ( (a >> 24) == 127 ); // 127.0.0.0/8
+        return ((a >> 24) == 127); // 127.0.0.0/8
     }
 #ifdef AF_INET6
     if(sa->sa_family == AF_INET6){
@@ -162,6 +163,51 @@ static void send_http_simple(sock_t fd, int code, const char* status,
     send(fd, resp.data(), (int)resp.size(), 0);
 }
 
+// Extract "method":"..." (very small tolerant extractor, not a full JSON parser)
+static std::string extract_json_method(const std::string& body){
+    // find "method"
+    size_t mpos = body.find("\"method\"");
+    if(mpos == std::string::npos) return {};
+    // find colon after
+    size_t cpos = body.find(':', mpos);
+    if(cpos == std::string::npos) return {};
+    // skip whitespace
+    size_t i = cpos+1; while(i<body.size() && (body[i]==' '||body[i]=='\t'||body[i]=='\r'||body[i]=='\n')) ++i;
+    if(i>=body.size() || body[i] != '\"') return {};
+    ++i;
+    // capture until closing quote (no unescape handling; fine for alnum/underscore)
+    size_t j = i;
+    while(j<body.size() && body[j] != '\"') ++j;
+    if(j>=body.size()) return {};
+    return body.substr(i, j-i);
+}
+
+// Build default safe allowlist (read-only & introspection)
+static std::unordered_set<std::string> default_safe_methods(){
+    return {
+        "getblockcount","gettipinfo","getblockhash","getblock","getrawblock",
+        "getrawmempool","getpeerinfo","getminerstats","getconnectioncount",
+        "validateaddress","decoderawtx","estimatemediantime","getdifficulty",
+        "getchaintips","ping","uptime","help","version"
+    };
+}
+
+// Parse a comma-separated list from env to override/extend allowlist
+static void load_env_allowlist(std::unordered_set<std::string>& allow){
+    const char* env = std::getenv("MIQ_RPC_SAFE_METHODS");
+    if(!env || !*env) return;
+    std::string s(env);
+    size_t p=0;
+    while(p < s.size()){
+        size_t q = s.find(',', p);
+        if(q == std::string::npos) q = s.size();
+        std::string item = s.substr(p, q-p);
+        trim(item);
+        if(!item.empty()) allow.insert(item);
+        p = q + 1;
+    }
+}
+
 // ---- HttpServer ------------------------------------------------------------
 
 void HttpServer::start(uint16_t port, std::function<std::string(const std::string&)> on_json){
@@ -194,6 +240,9 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
         host = "127.0.0.1";
         if(getaddrinfo(host.c_str(), port_str, &hints, &res) != 0){
             running_.store(false);
+#ifdef _WIN32
+            WSACleanup();
+#endif
             return;
         }
     }
@@ -218,7 +267,6 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
 
         if(bind(s, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0){
             if(listen(s, 16) == 0){
-                // Remember the bound address
                 if(ai->ai_addrlen <= sizeof(bound_sa)){
                     std::memcpy(&bound_sa, ai->ai_addr, ai->ai_addrlen);
                     bound_len = (socklen_t)ai->ai_addrlen;
@@ -244,6 +292,11 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
     auto thread_fn = [this, s, bound_sa, bound_len, on_json, env_token, env_req](){
         bool bound_loopback = is_loopback_sockaddr((const sockaddr*)&bound_sa);
         bool require_always = env_truthy(env_req);
+
+        // Build allowlist for unauthenticated access
+        std::unordered_set<std::string> safe = default_safe_methods();
+        load_env_allowlist(safe);
+
         for(;;){
             if(!running_.load()){
                 break;
@@ -270,7 +323,7 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
             sock_t fd = accept(s, (sockaddr*)&cli, &clen);
             if(fd < 0){ continue; }
 #endif
-            std::thread([fd, on_json, env_token, bound_loopback, require_always](){
+            std::thread([fd, on_json, env_token, bound_loopback, require_always, safe](){
                 // Parse one request
                 std::string method, path, body;
                 std::vector<std::pair<std::string,std::string>> headers;
@@ -298,24 +351,34 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
                     closesocket(fd);
                 };
 
+                bool token_present = false;
+
                 if(token_required){
                     if(token.empty()){
                         unauthorized();
                         return;
                     }
                     // Expect "Bearer <token>"
-                    std::string a = auth;
-                    trim(a);
+                    std::string a = auth; trim(a);
                     if(a.size() < 7 || lc(a.substr(0,6)) != "bearer"){
                         unauthorized();
                         return;
                     }
-                    // Skip scheme and spaces
                     size_t sp = a.find(' ');
                     if(sp == std::string::npos){ unauthorized(); return; }
-                    std::string presented = a.substr(sp+1);
-                    trim(presented);
+                    std::string presented = a.substr(sp+1); trim(presented);
                     if(presented != token){ unauthorized(); return; }
+                    token_present = true;
+                } else {
+                    // Not required (loopback), but if provided and valid, mark present
+                    std::string a = auth; trim(a);
+                    if(!token.empty() && a.size() >= 7 && lc(a.substr(0,6)) == "bearer"){
+                        size_t sp = a.find(' ');
+                        if(sp != std::string::npos){
+                            std::string presented = a.substr(sp+1); trim(presented);
+                            if(presented == token) token_present = true;
+                        }
+                    }
                 }
 
                 // Method check
@@ -324,6 +387,17 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
                         std::string("{\"error\":\"only POST\"}"));
                     closesocket(fd);
                     return;
+                }
+
+                // If unauthenticated (no valid token), enforce allowlist:
+                if(!token_present){
+                    std::string m = extract_json_method(body);
+                    if(m.empty() || safe.find(m) == safe.end()){
+                        send_http_simple(fd, 403, "Forbidden", "application/json",
+                            std::string("{\"error\":\"forbidden\",\"reason\":\"method requires token\"}"));
+                        closesocket(fd);
+                        return;
+                    }
                 }
 
                 // Invoke handler
@@ -351,4 +425,4 @@ void HttpServer::stop(){
     running_.store(false);
 }
 
-}
+} // namespace miq
