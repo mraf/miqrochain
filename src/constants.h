@@ -24,6 +24,26 @@ static constexpr uint32_t COINBASE_MATURITY = 100;
 // Address version bytes : mainnet P2PKH = 0x35 ('5')
 static constexpr uint8_t VERSION_P2PKH = 0x35;
 
+struct Genesis {
+    // From GENESIS_DUMP:
+    static constexpr const char* HASH_HEX        = "PASTE_HASH";
+    static constexpr const char* MERKLE_HEX      = "PASTE_MERKLE";
+    static constexpr uint32_t    TIME            = PASTE_TIME;  
+    static constexpr uint32_t    BITS            = PASTE_BITS;   
+    static constexpr uint32_t    NONCE           = PASTE_NONCE;   
+    static constexpr const char* COINBASE_TXID   = "PASTE_CB_TXID";
+
+    // Entire serialized genesis block (from GENESIS_RAW).
+    // This is the simplest, bullet-proof way to reconstruct exactly.
+    static constexpr const char* RAW_BLOCK_HEX   = "PASTE_GENESIS_RAW_HEX";
+
+    // Optional info:
+    static constexpr const char* COINBASE_PKH_HEX = "00c649e06c60278501aad8a3b05d345fe8008836";
+    static constexpr uint64_t    COINBASE_VALUE   = 50ull * 100000000ull;
+};
+
+} } // namespace
+
 static constexpr int64_t GENESIS_TIME = 1758230400; // 2025-09-19 00:00:00Z approx
 static constexpr uint32_t GENESIS_BITS = 0x1d00ffff;
 
