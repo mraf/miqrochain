@@ -34,9 +34,7 @@ public:
                               size_t max,
                               std::vector<BlockHeader>& out) const;
     bool disconnect_tip_once(std::string& err);
-    bool read_block_any(const std::vector<uint8_t>& h, Block& out) const;
     bool accept_block_for_reorg(const Block& b, std::string& err);
-    bool disconnect_tip_once(std::string& err);
     bool open(const std::string& dir);
     bool init_genesis(const Block& genesis);
     bool verify_block(const Block& b, std::string& err) const;
