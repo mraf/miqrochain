@@ -2,6 +2,7 @@
 
 #include "mempool.h"
 #include "util.h"
+#include "sig_encoding.h"
 #include "sha256.h"
 #include "crypto/ecdsa_iface.h"
 #include "hash160.h"
