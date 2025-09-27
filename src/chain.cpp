@@ -315,6 +315,225 @@ static inline bool meets_target_be(const std::vector<uint8_t>& hash32, uint32_t 
 
 // =====================================================================
 
+long double Chain::work_from_bits(uint32_t bits) {
+    // Interpret compact target ~= mant * 256^(exp-3)
+    uint32_t exp  = bits >> 24;
+    uint32_t mant = bits & 0x007fffff;
+    if (mant == 0) return 0.0L;
+
+    // relative "difficulty": base_target / target.
+    // Use genesis as base for stable scaling.
+    uint32_t bexp  = GENESIS_BITS >> 24;
+    uint32_t bmant = GENESIS_BITS & 0x007fffff;
+
+    long double target      = (long double)mant  * powl(256.0L, (long double)((int)exp - 3));
+    long double base_target = (long double)bmant * powl(256.0L, (long double)((int)bexp - 3));
+    if (target <= 0.0L) return 0.0L;
+
+    long double difficulty = base_target / target;
+    if (difficulty < 0.0L) difficulty = 0.0L;
+    return difficulty; // we sum these for chain selection
+}
+
+bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
+    // Parent must exist in header index (except genesis)
+    if (tip_.height == 0 && tip_.hash == std::vector<uint8_t>(32,0)) {
+        // before genesis init: allow caller to handle genesis specially
+    } else {
+        if (!header_exists(h.prev_hash) && h.prev_hash != tip_.hash && !have_block(h.prev_hash)) {
+            err = "unknown parent header";
+            return false;
+        }
+    }
+
+    // MTP: compute using last up to 11 header times from header_index_ (fall back to tip_.time)
+    int64_t mtp = tip_.time;
+    {
+        auto hdrs = last_headers(11);
+        if (!hdrs.empty()) {
+            std::vector<int64_t> ts; ts.reserve(hdrs.size());
+            for (auto& p : hdrs) ts.push_back(p.first);
+            std::sort(ts.begin(), ts.end());
+            mtp = ts[ts.size()/2];
+        }
+    }
+    if (h.time <= mtp) { err = "header time <= MTP"; return false; }
+
+    // Future bound
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (h.time > now + (int64_t)MAX_TIME_SKEW) { err="header time too far in future"; return false; }
+
+    // Bits: LWMA expected from recent headers (or fallback to prev bits for height<2)
+    {
+        auto last = last_headers(90);
+        uint32_t expected;
+        if (last.size() < 2) expected = last.empty() ? GENESIS_BITS : last.back().second;
+        else expected = lwma_next_bits(last, BLOCK_TIME_SECS, GENESIS_BITS);
+        if (h.bits != expected) { err = "bad header bits"; return false; }
+    }
+
+    // POW
+    if (!meets_target_be(h.header_hash(), h.bits)) { err = "bad header pow"; return false; }
+
+    return true;
+}
+
+bool Chain::header_exists(const std::vector<uint8_t>& h) const {
+    return header_index_.find(hk(h)) != header_index_.end();
+}
+
+std::vector<uint8_t> Chain::best_header_hash() const {
+    if (best_header_key_.empty()) return tip_.hash; // fall back to current block tip
+    const auto& m = header_index_.at(best_header_key_);
+    return m.hash;
+}
+
+bool Chain::accept_header(const BlockHeader& h, std::string& err) {
+    if (!validate_header(h, err)) return false;
+
+    const auto key = hk(h.header_hash());
+    if (header_index_.find(key) != header_index_.end()) return true; // already have
+
+    HeaderMeta m;
+    m.hash   = h.header_hash();
+    m.prev   = h.prev_hash;
+    m.bits   = h.bits;
+    m.time   = h.time;
+    m.have_block = have_block(m.hash); // block body present?
+    // Height & cumulative work
+    uint64_t parent_height = 0;
+    long double parent_work = 0.0L;
+    auto itp = header_index_.find(hk(h.prev_hash));
+    if (itp != header_index_.end()) {
+        parent_height = itp->second.height;
+        parent_work   = itp->second.work_sum;
+    } else if (h.prev_hash == tip_.hash) {
+        parent_height = tip_.height;
+        // treat current tip as known header with work_sum 0 baseline
+    }
+    m.height   = parent_height + 1;
+    m.work_sum = parent_work + work_from_bits(h.bits);
+
+    header_index_.emplace(key, std::move(m));
+
+    // Update best-header tip
+    if (best_header_key_.empty()) best_header_key_ = key;
+    else {
+        const auto& cur = header_index_.at(best_header_key_);
+        const auto& neu = header_index_.at(key);
+        if (neu.work_sum > cur.work_sum || (neu.work_sum == cur.work_sum && neu.height > cur.height)) {
+            best_header_key_ = key;
+        }
+    }
+    return true;
+}
+
+void Chain::orphan_put(const std::vector<uint8_t>& h, const std::vector<uint8_t>& raw){
+    orphan_blocks_[hk(h)] = raw;
+}
+
+void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, size_t max) const {
+    out.clear();
+    if (best_header_key_.empty()) return;
+
+    // Walk down from best-header to current block tip, collect missing blocks
+    std::vector<uint8_t> bh = header_index_.at(best_header_key_).hash;
+    // build path from tip_.hash -> bh (downwards in header tree)
+    std::vector<std::vector<uint8_t>> up, down;
+    if (!find_header_fork(tip_.hash, bh, up, down)) return;
+
+    // down now contains headers after the fork that should be connected; pick those we don't have blocks for
+    for (const auto& hh : down) {
+        if (out.size() >= max) break;
+        if (!have_block(hh) && orphan_blocks_.find(hk(hh)) == orphan_blocks_.end()) out.push_back(hh);
+    }
+}
+
+bool Chain::find_header_fork(const std::vector<uint8_t>& a,
+                             const std::vector<uint8_t>& b,
+                             std::vector<std::vector<uint8_t>>& path_up_from_b,
+                             std::vector<std::vector<uint8_t>>& path_down_from_a) const {
+    path_up_from_b.clear();
+    path_down_from_a.clear();
+
+    // Map for quick height lookups
+    auto getH = [&](const std::vector<uint8_t>& h)->std::optional<HeaderMeta>{
+        auto it = header_index_.find(hk(h));
+        if (it != header_index_.end()) return it->second;
+        if (h == tip_.hash) { HeaderMeta t; t.hash=h; t.prev=std::vector<uint8_t>(32,0); t.height=tip_.height; t.work_sum=0; return t; }
+        return std::nullopt;
+    };
+
+    auto A = getH(a);
+    auto B = getH(b);
+    if (!B) return false; // need target present
+
+    std::vector<uint8_t> x = B->hash;
+    std::vector<uint8_t> y = a;
+
+    auto hx = *B;
+    auto hy = A ? *A : hx; // if unknown, approximate
+
+    // Raise the lower to the higher height
+    while (A && hx.height > hy.height) {
+        path_up_from_b.push_back(x);
+        auto it = header_index_.find(hk(hx.prev));
+        if (it == header_index_.end()) break;
+        hx = it->second;
+        x = hx.hash;
+    }
+    while (A && hy.height > hx.height) {
+        path_down_from_a.push_back(y);
+        auto it = header_index_.find(hk(hy.prev));
+        if (it == header_index_.end()) break;
+        hy = it->second;
+        y = hy.hash;
+    }
+    // Now climb together until common
+    while (x != y) {
+        path_up_from_b.push_back(x);
+        path_down_from_a.push_back(y);
+        auto itx = header_index_.find(hk(hx.prev));
+        auto ity = header_index_.find(hk(hy.prev));
+        if (itx == header_index_.end() || ity == header_index_.end()) break;
+        hx = itx->second; x = hx.hash;
+        hy = ity->second; y = hy.hash;
+    }
+    // path_down_from_a currently includes ancestors from a backward; we want forward order after fork
+    std::reverse(path_down_from_a.begin(), path_down_from_a.end());
+    // Also we want path_down_from_a to be headers AFTER the fork (not including fork point). That’s already the case here.
+    return true;
+}
+
+bool Chain::reconsider_best_chain(std::string& err){
+    if (best_header_key_.empty()) return true;
+    const auto& best = header_index_.at(best_header_key_);
+    if (best.hash == tip_.hash) return true; // already on best
+
+    // Build reorg plan
+    std::vector<std::vector<uint8_t>> up, down;
+    if (!find_header_fork(tip_.hash, best.hash, up, down)) return true;
+
+    // Disconnect current tip until fork point
+    for (size_t i = 0; i < up.size(); ++i) {
+        if (!disconnect_tip_once(err)) return false; // you already implemented this
+    }
+
+    // Connect blocks along best path
+    for (const auto& hh : down) {
+        Block blk;
+        if (!read_block_any(hh, blk)) {
+            // missing block body: stop here; p2p should fetch it, we’ll retry later
+            return true;
+        }
+        if (!submit_block(blk, err)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool Chain::get_hash_by_index(size_t idx, std::vector<uint8_t>& out) const{
     Block b;
     if (!get_block_by_index(idx, b)) return false;
