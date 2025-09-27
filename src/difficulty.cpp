@@ -4,6 +4,7 @@
 
 namespace miq {
 
+// Convert big-endian 32-byte target -> compact "bits"
 static inline uint32_t compact_from_target(const unsigned char* t) {
     int i = 0;
     while (i < 32 && t[i] == 0) ++i;
@@ -19,6 +20,7 @@ static inline uint32_t compact_from_target(const unsigned char* t) {
     return (exp << 24) | (mant & 0x007fffff);
 }
 
+// Convert compact "bits" -> big-endian 32-byte target
 static inline void target_from_compact(uint32_t bits, unsigned char* out) {
     for (int i = 0; i < 32; i++) out[i] = 0;
 
@@ -48,6 +50,7 @@ uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
     size_t window = (last.size() < 90) ? last.size() : 90;
     int64_t sum = 0;
 
+    // Sum clamped inter-block times over the window
     for (size_t i = last.size() - window + 1; i < last.size(); ++i) {
         int64_t dt = last[i].first - last[i - 1].first;
         if (dt < 1) dt = 1;
@@ -58,6 +61,7 @@ uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
 
     int64_t avg = sum / (int64_t)(window - 1);
 
+    // Scale target by avg/target_spacing in big-endian space
     unsigned char t[32];
     target_from_compact(last.back().second, t);
 
@@ -70,4 +74,4 @@ uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
     return compact_from_target(t);
 }
 
-} // namespace miq
+}
