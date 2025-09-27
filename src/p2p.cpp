@@ -205,6 +205,64 @@ static inline bool gate_on_command(int fd, const std::string& cmd,
 
 namespace miq {
 
+static void send_getheaders(Peer& p, miq::Chain& chain){
+    auto locator = make_simple_locator(chain);
+    std::vector<uint8_t> stop(32, 0); // zero = no stop
+    // encode "getheaders" with your message framing: [command|"getheaders"][payload...]
+    // payload: protocol_version, locator count + hashes, stop_hash
+    // ... use your existing wire format helpers ...
+    send_getheaders_message(p, locator, stop);
+}
+
+else if (cmd == "headers") {
+    std::string err;
+    size_t accepted = 0;
+
+    std::vector<BlockHeader> headers = parse_headers_payload(msg); // your existing deserializer
+    for (const auto& h : headers) {
+        if (chain.accept_header(h, err)) accepted++;
+        else {
+            // benign failures like unknown-parent are okay; we’ll get parent later
+        }
+    }
+
+    // Schedule block fetch for best-header path
+    std::vector<std::vector<uint8_t>> want;
+    chain.next_block_fetch_targets(want, /*max*/32);
+
+    if (!want.empty()) {
+        send_getdata_for_blocks(peer, want); // construct getdata invs for these block hashes
+    }
+
+    // Ask for more headers if we got a full batch (peer likely has more)
+    if (headers.size() >= 2000) {
+        send_getheaders(peer, chain);
+    }
+}
+
+else if (cmd == "block") {
+    Block b = parse_block_payload(msg);
+    std::string err;
+
+    // If parent is current tip, connect now (full UTXO+sig verify):
+    if (b.header.prev_hash == chain.tip_hash()) {
+        if (!chain.submit_block(b, err)) {
+            // drop/penalize peer if invalid; log err
+        }
+    } else {
+        // Store as orphan; we’ll connect after headers say it’s time
+        chain.orphan_put(b.block_hash(), ser_block(b));
+    }
+
+    // Try to advance toward best-header chain
+    chain.reconsider_best_chain(err);
+
+    // Ask for next blocks along best header chain
+    std::vector<std::vector<uint8_t>> want;
+    chain.next_block_fetch_targets(want, /*max*/32);
+    if (!want.empty()) send_getdata_for_blocks(peer, want);
+}
+
 static int64_t now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
