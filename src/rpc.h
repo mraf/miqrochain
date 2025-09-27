@@ -8,7 +8,7 @@
 #include "mempool.h"
 
 namespace miq {
-
+    void rpc_enable_auth_cookie(const std::string& datadir);
 class P2P;  // <-- add this
 
 class RpcService {
