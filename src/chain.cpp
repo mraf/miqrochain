@@ -1,5 +1,5 @@
 #include "chain.h"
-#include <cmath>      // std::powl
+#include <cmath>      // std::pow
 #include <optional>
 #include "sha256.h"
 #include <deque>
@@ -334,8 +334,8 @@ long double Chain::work_from_bits(uint32_t bits) {
     uint32_t bexp  = GENESIS_BITS >> 24;
     uint32_t bmant = GENESIS_BITS & 0x007fffff;
 
-    long double target      = (long double)mant  * std::powl(256.0L, (long double)((int)exp - 3));
-    long double base_target = (long double)bmant * std::powl(256.0L, (long double)((int)bexp - 3));
+    long double target      = (long double)mant  * std::pow(256.0L, (long double)((int)exp - 3));
+    long double base_target = (long double)bmant * std::pow(256.0L, (long double)((int)bexp - 3));
     if (target <= 0.0L) return 0.0L;
 
     long double difficulty = base_target / target;
@@ -532,6 +532,9 @@ bool Chain::reconsider_best_chain(std::string& err){
     // Connect blocks along best path
     for (const auto& hh : down) {
         Block blk;
+        if (!read_block_any(hh, blk)) {
+            err = "reorg missing block body";
+            return false;
         }
         if (!submit_block(blk, err)) {
             return false;
@@ -1003,8 +1006,8 @@ bool Chain::submit_block(const Block& b, std::string& err){
             if (!utxo_.get(in.prev.txid, in.prev.vout, e)){
                 err = "missing utxo during undo-capture";
                 return false;
-                undo.push_back(UndoIn{in.prev.txid, in.prev.vout, e});
             }
+            undo.push_back(UndoIn{in.prev_txid, in.prev_vout, e});
         }
     }
 
@@ -1042,29 +1045,29 @@ bool Chain::submit_block(const Block& b, std::string& err){
 
     g_undo[hk(tip_.hash)] = std::move(undo);
 
-// Persist undo to disk (survives restart)
-write_undo_file(datadir_, tip_.height, tip_.hash, g_undo[hk(tip_.hash)]);
+    // Persist undo to disk (survives restart)
+    write_undo_file(datadir_, tip_.height, tip_.hash, g_undo[hk(tip_.hash)]);
 
-// Prune old undo files outside the rolling window
-if (tip_.height >= UNDO_WINDOW) {
-    size_t prune_h = (size_t)(tip_.height - UNDO_WINDOW);
-    std::vector<uint8_t> prune_hash;
-    if (get_hash_by_index(prune_h, prune_hash)) {
-        remove_undo_file(datadir_, prune_h, prune_hash);
+    // Prune old undo files outside the rolling window
+    if (tip_.height >= UNDO_WINDOW) {
+        size_t prune_h = (size_t)(tip_.height - UNDO_WINDOW);
+        std::vector<uint8_t> prune_hash;
+        if (get_hash_by_index(prune_h, prune_hash)) {
+            remove_undo_file(datadir_, prune_h, prune_hash);
+        }
     }
-}
 
-// Register header with reorg manager (keeps header tree complete)
-miq::HeaderView hv;
-hv.hash   = tip_.hash;
-hv.prev   = b.header.prev_hash;
-hv.bits   = b.header.bits;
-hv.time   = b.header.time;
-hv.height = (uint32_t)tip_.height;
-g_reorg.on_validated_header(hv);
+    // Register header with reorg manager (keeps header tree complete)
+    miq::HeaderView hv;
+    hv.hash   = tip_.hash;
+    hv.prev   = b.header.prev_hash;
+    hv.bits   = b.header.bits;
+    hv.time   = b.header.time;
+    hv.height = (uint32_t)tip_.height;
+    g_reorg.on_validated_header(hv);
 
-save_state();
-return true;
+    save_state();
+    return true;
 }
 
 std::vector<std::pair<int64_t,uint32_t>> Chain::last_headers(size_t n) const{
