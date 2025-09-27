@@ -779,7 +779,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
                 err = "missing utxo during undo-capture";
                 return false;
             }
-            undo.push_back(UndoIn{in.prev.txid, in.prev_vout, e});
+            undo.push_back(UndoIn{in.prev.txid, in.prev.vout, e});
         }
     }
 
@@ -791,7 +791,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
         const auto& tx = b.txs[ti];
 
         for (const auto& in : tx.vin){
-            (void)utxo_.spend(in.prev_txid, in.prev_vout); // erase
+            (void)utxo_.spend(in.prev.txid, in.prev.vout);
         }
         for (size_t i = 0; i < tx.vout.size(); ++i){
             UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, tip_.height + 1, false};
@@ -822,37 +822,25 @@ bool Chain::submit_block(const Block& b, std::string& err){
     write_undo_file(datadir_, tip_.height, tip_.hash, g_undo[hk(tip_.hash)]);
 
     // Prune old undo files outside the rolling window
-    if (tip_.height >= UNDO_WINDOW) {
-        size_t prune_h = (size_t)(tip_.height - UNDO_WINDOW);
-        std::vector<uint8_t> prune_hash;
-        if (get_hash_by_index(prune_h, prune_hash)) {
-            remove_undo_file(datadir_, prune_h, prune_hash);
-        }
+   if (tip_.height >= UNDO_WINDOW) {
+    size_t prune_h = (size_t)(tip_.height - UNDO_WINDOW);
+    std::vector<uint8_t> prune_hash;
+    if (get_hash_by_index(prune_h, prune_hash)) {
+        remove_undo_file(datadir_, prune_h, prune_hash);
     }
-
-    // Register header with reorg manager (keeps header tree complete)
-    miq::HeaderView hv;
-    hv.hash   = tip_.hash;
-    hv.prev   = b.header.prev_hash;
-    hv.bits   = b.header.bits;
-    hv.time   = b.header.time;
-    hv.height = (uint32_t)tip_.height;
-    g_reorg.on_validated_header(hv);
-
-    save_state();
-    return true;
 }
 
-    // ✅ Register this header with the reorg manager so the header tree stays complete
-    miq::HeaderView hv;
-    hv.hash   = tip_.hash;
-    hv.prev   = b.header.prev_hash;
-    hv.bits   = b.header.bits;
-    hv.time   = b.header.time;
-    hv.height = (uint32_t)tip_.height;
-    g_reorg.on_validated_header(hv);
+   miq::HeaderView hv;
+hv.hash   = tip_.hash;
+hv.prev   = b.header.prev_hash;
+hv.bits   = b.header.bits;
+hv.time   = b.header.time;
+hv.height = (uint32_t)tip_.height;
+g_reorg.on_validated_header(hv);
 
-    save_state();
+save_state();
+return true;
+}
     return true;
 // Return the last n headers (time,bits) along the canonical chain via storage.
 std::vector<std::pair<int64_t,uint32_t>> Chain::last_headers(size_t n) const{
