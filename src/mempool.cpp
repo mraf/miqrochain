@@ -3,7 +3,7 @@
 
 #include "mempool.h"
 #include "util.h"
-#include "sig_encoding.h"     // Secp256k1_N(), Secp256k1_N_Half()
+#include "sig_encoding.h"     // still used for other helpers elsewhere
 #include "sha256.h"
 #include "crypto/ecdsa_iface.h"
 #include "hash160.h"
@@ -33,6 +33,28 @@
 
 namespace miq {
 
+// ---- secp256k1 order constants (big-endian), local to mempool --------------
+static inline const uint8_t* SECP256K1_N_BE(){
+    // n = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    static const uint8_t N[32] = {
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,
+        0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B,
+        0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41
+    };
+    return N;
+}
+static inline const uint8_t* SECP256K1_N_HALF_BE(){
+    // n/2 = 7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+    static const uint8_t H[32] = {
+        0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,
+        0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0
+    };
+    return H;
+}
+
 // --- Canonical RAW-64 (r||s) + Low-S checks ---------------------------------
 
 // Big-endian compare (32B)
@@ -57,11 +79,11 @@ static inline bool is_canonical_raw64_lows(const std::vector<uint8_t>& sig64){
 
     // r != 0 and r < n
     if (be_is_zero32(r)) return false;
-    if (be_cmp32(r, Secp256k1_N().data()) >= 0) return false;
+    if (be_cmp32(r, SECP256K1_N_BE()) >= 0) return false;
 
     // s != 0 and s <= n/2  (low-S)
     if (be_is_zero32(s)) return false;
-    if (be_cmp32(s, Secp256k1_N_Half().data()) > 0) return false;
+    if (be_cmp32(s, SECP256K1_N_HALF_BE()) > 0) return false;
 
     return true;
 }
