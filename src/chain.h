@@ -16,6 +16,18 @@
 
 namespace miq {
 
+static inline std::string hk(const std::vector<uint8_t>& h){
+    return std::string(reinterpret_cast<const char*>(h.data()), h.size());
+}
+
+static std::unordered_map<std::string, std::vector<UndoIn>> g_undo;
+
+struct UndoIn {
+    std::vector<uint8_t> prev_txid;
+    uint32_t             prev_vout{0};
+    UTXOEntry            prev_entry;
+};
+
 struct Tip {
     uint64_t             height;
     std::vector<uint8_t> hash;
