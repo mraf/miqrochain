@@ -16,12 +16,6 @@
 
 namespace miq {
 
-struct UndoIn {
-    std::vector<uint8_t> prev_txid;
-    uint32_t             prev_vout{0};
-    UTXOEntry            prev_entry;
-};
-
 struct Tip {
     uint64_t             height;
     std::vector<uint8_t> hash;
