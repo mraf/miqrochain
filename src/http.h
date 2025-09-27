@@ -16,4 +16,4 @@ private:
     std::atomic<bool> running_{false};
 };
 
-} // namespace miq
+}
