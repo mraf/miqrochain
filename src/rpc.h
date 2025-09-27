@@ -1,23 +1,32 @@
-
+// rpc.h
 #pragma once
+#include <cstdint>
+#include <string>
+#include "http.h"     // whatever your HTTP server header is
+#include "json.h"
 #include "chain.h"
 #include "mempool.h"
-#include "http.h"
-#include "json.h"
-#include "base58check.h"
-#include "hash160.h"
-#include "crypto/ecdsa_iface.h"
-#include <string>
+
 namespace miq {
+
+class P2P;  // <-- add this
+
 class RpcService {
 public:
-    RpcService(Chain& c, Mempool& m): chain_(c), mempool_(m) {}
+    RpcService(Chain& c, Mempool& m) : chain_(c), mempool_(m) {}
     void start(uint16_t port);
     void stop();
+
+    // optional: let main() wire P2P here after both are constructed
+    void set_p2p(P2P* p) { p2p_ = p; }
+
 private:
-    Chain& chain_;
-    Mempool& mempool_;
-    HttpServer http_;
     std::string handle(const std::string& body);
+
+    HttpServer http_;
+    Chain&     chain_;
+    Mempool&   mempool_;
+    P2P*       p2p_{nullptr};   // <-- add this
 };
+
 }
