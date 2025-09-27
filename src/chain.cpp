@@ -162,6 +162,7 @@ uint64_t Chain::subsidy_for_height(uint64_t h) const {
 
 bool Chain::init_genesis(const Block& g){
     if(tip_.hash != std::vector<uint8_t>(32,0)) return true;
+    g_reorg.init_genesis(tip_.hash, tip_.bits, tip_.time);
 
     std::vector<std::vector<uint8_t>> txids;
     for(const auto& tx : g.txs) txids.push_back(tx.txid());
