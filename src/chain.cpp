@@ -896,9 +896,6 @@ bool Chain::submit_block(const Block& b, std::string& err){
 
     save_state();
     return true;
-}
-
-
 // Return the last n headers (time,bits) along the canonical chain via storage.
 std::vector<std::pair<int64_t,uint32_t>> Chain::last_headers(size_t n) const{
     std::vector<std::pair<int64_t,uint32_t>> v;
@@ -931,5 +928,4 @@ bool Chain::have_block(const std::vector<uint8_t>& h) const{
     std::vector<uint8_t> raw;
     return storage_.read_block_by_hash(h, raw);
 }
-
 }
