@@ -1,5 +1,4 @@
 #include "constants.h"
-#include "reorg_manager.h"   // <— add this
 #include "address.h"
 #include "wallet_store.h"
 #include <exception>
@@ -31,8 +30,6 @@
 #include <cstdlib> // getenv
 
 using namespace miq;
-
-static miq::ReorgManager g_reorg;
 
 static std::vector<uint8_t> g_mine_pkh;
 
