@@ -17,6 +17,7 @@
 #endif
 
 
+
 #ifdef __has_include
 #  if __has_include("constants.h")
 #    include "constants.h"
@@ -209,6 +210,18 @@ static inline bool gate_on_command(int fd, const std::string& cmd,
 }
 
 namespace miq {
+
+#if MIQ_ENABLE_HEADERS_FIRST_WIP
+// WIP: headers-first sync helpers (disabled by default until fully wired)
+static std::vector<std::vector<uint8_t>> make_simple_locator(miq::Chain& chain);
+static void send_getheaders(Peer& p, miq::Chain& chain){
+    auto locator = make_simple_locator(chain);
+    std::vector<uint8_t> stop(32, 0); // zero = no stop
+    // encode "getheaders" with your message framing: [command|"getheaders"][payload...]
+    // payload: protocol_version, locator count + hashes, stop_hash
+    // ... use your existing wire format helpers ...
+    send_getheaders_message(p, locator, stop);
+}
 
 static void send_getheaders(Peer& p, miq::Chain& chain){
     auto locator = make_simple_locator(chain);
