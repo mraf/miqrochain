@@ -99,8 +99,5 @@ private:
                           const std::vector<uint8_t>& b,
                           std::vector<std::vector<uint8_t>>& path_up_from_b,
                           std::vector<std::vector<uint8_t>>& path_down_from_a) const;
-
-    bool read_block_any(const std::vector<uint8_t>& h, Block& out) const; // you already have this
 };
-
 }
