@@ -18,6 +18,10 @@
 #  endif
 #endif
 
+#if MIQ_ENABLE_HEADERS_FIRST_WIP
+#define MIQ_ENABLE_HEADERS_FIRST_WIP 0
+#endif
+
 #ifndef MAX_MSG_SIZE
 #define MIQ_FALLBACK_MAX_MSG_SIZE (2u * 1024u * 1024u)
 #else
