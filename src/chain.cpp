@@ -9,6 +9,7 @@
 #include "hasher.h"
 #include <cstdlib>
 #include "log.h"
+#include "sig_encoding.h"
 #include "hash160.h"
 #include "crypto/ecdsa_iface.h"
 #include "constants.h"     // BLOCK_TIME_SECS, GENESIS_BITS, etc.
@@ -55,6 +56,11 @@
 #endif
 
 namespace miq {
+
+if(!miq::IsCanonicalDERSig_LowS(der_sig_ptr, der_sig_len)) {
+    state.Invalid("bad-txns-non-canonical-sig"); // or your error mechanism
+    return false; // consensus: block invalid
+}
 
 struct UndoIn {
     std::vector<uint8_t> prev_txid;
