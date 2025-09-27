@@ -28,6 +28,13 @@ class Chain {
 public:
     const std::vector<uint8_t>& tip_hash() const { return tip_.hash; }
     bool read_block_any(const std::vector<uint8_t>& h, Block& out) const;
+    bool get_hash_by_index(size_t idx, std::vector<uint8_t>& out) const;
+    void build_locator(std::vector<std::vector<uint8_t>>& out) const;
+    bool get_headers_from_locator(const std::vector<std::vector<uint8_t>>& locators,
+                              size_t max,
+                              std::vector<BlockHeader>& out) const;
+    bool disconnect_tip_once(std::string& err);
+    bool read_block_any(const std::vector<uint8_t>& h, Block& out) const;
     bool accept_block_for_reorg(const Block& b, std::string& err);
     bool disconnect_tip_once(std::string& err);
     bool open(const std::string& dir);
@@ -51,6 +58,7 @@ public:
 
 private:
     Storage  storage_;
+    std::string datadir_;
     UTXOSet  utxo_;
     Tip      tip_{0, std::vector<uint8_t>(32,0), GENESIS_BITS, GENESIS_TIME, 0};
     BlockIndex index_;
