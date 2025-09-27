@@ -43,6 +43,25 @@ static std::string err(const std::string& m){
     return json_dump(n);
 }
 
+// Local difficulty helper (same formula as Chain::work_from_bits, but public here)
+static double difficulty_from_bits(uint32_t bits){
+    uint32_t exp  = bits >> 24;
+    uint32_t mant = bits & 0x007fffff;
+    if (mant == 0) return 0.0;
+
+    uint32_t bexp  = GENESIS_BITS >> 24;
+    uint32_t bmant = GENESIS_BITS & 0x007fffff;
+
+    long double target      = (long double)mant  * std::pow(256.0L, (long double)((int)exp - 3));
+    long double base_target = (long double)bmant * std::pow(256.0L, (long double)((int)bexp - 3));
+    if (target <= 0.0L) return 0.0;
+
+    long double difficulty = base_target / target;
+    if (difficulty < 0.0L) difficulty = 0.0L;
+    return (double)difficulty; // cast to double for JNode
+}
+
+
 static bool is_hex(const std::string& s){
     if(s.empty()) return false;
     return std::all_of(s.begin(), s.end(), [](unsigned char c){ return std::isxdigit(c)!=0; });
