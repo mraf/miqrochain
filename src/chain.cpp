@@ -322,6 +322,76 @@ static inline bool meets_target_be(const std::vector<uint8_t>& hash32, uint32_t 
 
 // =====================================================================
 
+bool Chain::get_hash_by_index(size_t idx, std::vector<uint8_t>& out) const{
+    Block b;
+    if (!get_block_by_index(idx, b)) return false;
+    out = b.block_hash();
+    return true;
+}
+
+void Chain::build_locator(std::vector<std::vector<uint8_t>>& out) const{
+    out.clear();
+    if (tip_.time == 0) return;
+    // Exponential backoff: 0,1,2,4,8,... to genesis
+    uint64_t step = 1;
+    uint64_t h = tip_.height;
+    while (true){
+        std::vector<uint8_t> hh;
+        if (!get_hash_by_index((size_t)h, hh)) break;
+        out.push_back(std::move(hh));
+        if (h == 0) break;
+        if (out.size() > 10) step *= 2;
+        if (h > step) h -= step;
+        else h = 0;
+    }
+}
+
+bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& locators,
+                                     size_t max,
+                                     std::vector<BlockHeader>& out) const
+{
+    out.clear();
+    // Build a quick lookup for the locator set
+    std::unordered_map<std::string, int> lset;
+    for (const auto& h : locators) lset[hk(h)] = 1;
+
+    // Find the highest common ancestor on our active chain by scanning back
+    uint64_t start_h = 0;
+    bool found=false;
+    if (tip_.time != 0){
+        for (int64_t h=(int64_t)tip_.height; h>=0; --h){
+            std::vector<uint8_t> hh;
+            if (!get_hash_by_index((size_t)h, hh)) break;
+            if (lset.find(hk(hh)) != lset.end()){
+                start_h = (uint64_t)h;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) start_h = 0; // no common ancestor; start from genesis
+
+    // Emit up to `max` headers AFTER start_h
+    uint64_t h = start_h + 1;
+    for (size_t i=0; i<max; ++i){
+        if (h > tip_.height) break;
+        Block b;
+        if (!get_block_by_index((size_t)h, b)) break;
+        out.push_back(b.header);
+        ++h;
+    }
+    return !out.empty();
+}
+
+// Already provided earlier in A:
+bool Chain::read_block_any(const std::vector<uint8_t>& h, Block& out) const{
+    std::vector<uint8_t> raw;
+    if (storage_.read_block_by_hash(h, raw)) return deser_block(raw, out);
+    if (orphan_get(h, raw)) return deser_block(raw, out);
+    return false;
+}
+
+
 bool Chain::read_block_any(const std::vector<uint8_t>& h, Block& out) const{
     std::vector<uint8_t> raw;
     if (storage_.read_block_by_hash(h, raw)) {
