@@ -173,7 +173,7 @@ std::string RpcService::handle(const std::string& body){
             JNode n; std::map<std::string,JNode> o;
             JNode a; a.v = std::string(CHAIN_NAME);              o["chain"] = a;
             JNode h; h.v = (double)chain_.tip().height;          o["height"] = h;
-            JNode d; d.v = chain_.work_from_bits(chain_.tip().bits); o["difficulty"] = d;
+            JNode d; d.v = difficulty_from_bits(chain_.tip().bits); o["difficulty"] = d;
             JNode r; r.v = o; return json_dump(r);
         }
 
@@ -548,7 +548,7 @@ std::string RpcService::handle(const std::string& body){
         }
 
         if(method=="getdifficulty"){
-            double d = (double)chain_.work_from_bits(chain_.tip().bits);
+            double d = difficulty_from_bits(chain_.tip().bits);
             return json_dump(jnum(d));
         }
 
