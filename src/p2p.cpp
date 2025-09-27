@@ -104,6 +104,105 @@
   #define CLOSESOCK(s) close(s)
 #endif
 
+namespace {
+using Clock = std::chrono::steady_clock;
+
+struct PeerGate {
+    bool got_version{false};
+    bool sent_verack{false};
+    bool got_verack{false};
+    int  banscore{0};
+    size_t rx_bytes{0};
+    Clock::time_point t_conn{Clock::now()};
+    Clock::time_point t_last{Clock::now()};
+};
+
+// Keyed by a stable per-connection integer (socket FD/handle).
+static std::unordered_map<int, PeerGate> g_gate;
+
+// Tunables (can make env-configurable later)
+static const size_t MAX_MSG_BYTES = 2 * 1024 * 1024; // 2 MiB per message
+static const int    MAX_BANSCORE  = 100;
+static const int    HANDSHAKE_MS  = 5000;            // must complete within 5s
+
+// Call on new inbound/outbound connection with its FD/handle
+static inline void gate_on_connect(int fd){
+    PeerGate pg;
+    pg.t_conn = Clock::now();
+    pg.t_last = pg.t_conn;
+    g_gate[fd] = pg;
+}
+
+// Call when the connection is closing
+static inline void gate_on_close(int fd){
+    g_gate.erase(fd);
+}
+
+// Return true if you should drop immediately
+static inline bool gate_on_bytes(int fd, size_t add){
+    auto it = g_gate.find(fd);
+    if (it == g_gate.end()) return false;
+    it->second.rx_bytes += add;
+    it->second.t_last = Clock::now();
+    if (it->second.rx_bytes > MAX_MSG_BYTES){
+        it->second.banscore += 20;
+        return it->second.banscore >= MAX_BANSCORE;
+    }
+    return false;
+}
+
+// Minimal command classifier. You pass the textual command if you have it,
+// otherwise pass empty string ("") and only size/time checks will apply.
+static inline bool gate_on_command(int fd, const std::string& cmd,
+                                   /*out*/ bool& should_send_verack,
+                                   /*out*/ int& close_code){
+    should_send_verack = false;
+    close_code = 0;
+    auto it = g_gate.find(fd);
+    if (it == g_gate.end()) return false;
+    auto& g = it->second;
+
+    // Handshake timeout
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - g.t_conn).count();
+    if (!g.got_verack && ms > HANDSHAKE_MS){
+        close_code = 408; // timeout
+        return true;
+    }
+
+    // If we know the command string, enforce order
+    if (!cmd.empty()){
+        if (cmd == "version"){
+            if (!g.got_version){
+                g.got_version = true;
+                should_send_verack = true; // reply once to version
+            } else {
+                g.banscore += 10; // duplicate version
+            }
+        } else if (cmd == "verack"){
+            if (g.got_version && !g.got_verack){
+                g.got_verack = true;
+            } else {
+                g.banscore += 10; // unexpected verack
+            }
+        } else {
+            // Any other command before handshake completes → drop
+            if (!g.got_version || !g.got_verack){
+                g.banscore += 50;
+                close_code = 400; // bad sequence
+                return true;
+            }
+        }
+    }
+
+    // Ban threshold
+    if (g.banscore >= MAX_BANSCORE){
+        close_code = 400;
+        return true;
+    }
+    return false;
+}
+}
+
 namespace miq {
 
 static int64_t now_ms() {
