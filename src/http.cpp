@@ -351,4 +351,4 @@ void HttpServer::stop(){
     running_.store(false);
 }
 
-} // namespace miq
+}
