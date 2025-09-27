@@ -376,15 +376,6 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
     return !out.empty();
 }
 
-// Already provided earlier in A:
-bool Chain::read_block_any(const std::vector<uint8_t>& h, Block& out) const{
-    std::vector<uint8_t> raw;
-    if (storage_.read_block_by_hash(h, raw)) return deser_block(raw, out);
-    if (orphan_get(h, raw)) return deser_block(raw, out);
-    return false;
-}
-
-
 bool Chain::read_block_any(const std::vector<uint8_t>& h, Block& out) const{
     std::vector<uint8_t> raw;
     if (storage_.read_block_by_hash(h, raw)) {
@@ -773,28 +764,85 @@ bool Chain::disconnect_tip_once(std::string& err){
 }
 
 bool Chain::submit_block(const Block& b, std::string& err){
-    if(!verify_block(b, err)) return false;
+    if (!verify_block(b, err)) return false;
+
+    // Idempotent: if we already have this block on disk, just succeed.
+    if (have_block(b.block_hash())) return true;
 
     // Prepare undo: capture all spent inputs BEFORE we mutate the UTXO set.
     std::vector<UndoIn> undo;
     undo.reserve(b.txs.size() * 2);
 
-    for(size_t ti=1; ti<b.txs.size(); ++ti){
+    for (size_t ti = 1; ti < b.txs.size(); ++ti){
         const auto& tx = b.txs[ti];
-        for(const auto& in : tx.vin){
+        for (const auto& in : tx.vin){
             UTXOEntry e;
-            if(!utxo_.get(in.prev.txid, in.prev.vout, e)){
+            if (!utxo_.get(in.prev.txid, in.prev.vout, e)){
                 err = "missing utxo during undo-capture";
                 return false;
             }
-            write_undo_file(datadir_, tip_.height, tip_.hash, g_undo[hk(tip_.hash)]);
             undo.push_back(UndoIn{in.prev.txid, in.prev.vout, e});
-if (tip_.height >= UNDO_WINDOW) {
-    size_t prune_h = (size_t)(tip_.height - UNDO_WINDOW);
-    std::vector<uint8_t> prune_hash;
-    if (get_hash_by_index(prune_h, prune_hash)) {
-        remove_undo_file(datadir_, prune_h, prune_hash);
+        }
     }
+
+    // Persist the block body
+    storage_.append_block(ser_block(b), b.block_hash());
+
+    // Connect non-coinbase txs: spend inputs, add new outputs
+    for (size_t ti = 1; ti < b.txs.size(); ++ti){
+        const auto& tx = b.txs[ti];
+
+        for (const auto& in : tx.vin){
+            (void)utxo_.spend(in.prev.txid, in.prev.vout); // erase
+        }
+        for (size_t i = 0; i < tx.vout.size(); ++i){
+            UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, tip_.height + 1, false};
+            utxo_.add(tx.txid(), (uint32_t)i, e);
+        }
+    }
+
+    // Add coinbase outputs & compute cb_sum
+    const auto& cb = b.txs[0];
+    uint64_t cb_sum = 0;
+    for (size_t i = 0; i < cb.vout.size(); ++i){
+        UTXOEntry e{cb.vout[i].value, cb.vout[i].pkh, tip_.height + 1, true};
+        utxo_.add(cb.txid(), (uint32_t)i, e);
+        cb_sum += cb.vout[i].value;
+    }
+
+    // Advance tip
+    tip_.height += 1;
+    tip_.hash   = b.block_hash();
+    tip_.bits   = b.header.bits;
+    tip_.time   = b.header.time;
+    tip_.issued += cb_sum;
+
+    // Store undo (RAM) for fast same-session reorgs
+    g_undo[hk(tip_.hash)] = std::move(undo);
+
+    // Persist undo to disk (survives restart)
+    write_undo_file(datadir_, tip_.height, tip_.hash, g_undo[hk(tip_.hash)]);
+
+    // Prune old undo files outside the rolling window
+    if (tip_.height >= UNDO_WINDOW) {
+        size_t prune_h = (size_t)(tip_.height - UNDO_WINDOW);
+        std::vector<uint8_t> prune_hash;
+        if (get_hash_by_index(prune_h, prune_hash)) {
+            remove_undo_file(datadir_, prune_h, prune_hash);
+        }
+    }
+
+    // Register header with reorg manager (keeps header tree complete)
+    miq::HeaderView hv;
+    hv.hash   = tip_.hash;
+    hv.prev   = b.header.prev_hash;
+    hv.bits   = b.header.bits;
+    hv.time   = b.header.time;
+    hv.height = (uint32_t)tip_.height;
+    g_reorg.on_validated_header(hv);
+
+    save_state();
+    return true;
 }
 
     // Persist the block body
