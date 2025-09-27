@@ -117,6 +117,12 @@ add_executable(miqrod
     src/crypto/uECC_shim.c
 )
 
+# somewhere after add_executable(miqrod ...)
+target_sources(miqrod PRIVATE
+    src/reorg_manager.cpp
+)
+
+
 target_include_directories(miqrod PRIVATE
     src
     ${MICRO_ECC_DIR}
