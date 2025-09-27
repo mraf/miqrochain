@@ -1046,4 +1046,8 @@ bool Chain::have_block(const std::vector<uint8_t>& h) const{
     return storage_.read_block_by_hash(h, raw);
 }
 
+long double Chain::work_from_bits_public(uint32_t bits) {
+    return work_from_bits(bits);
+}
+
 }
