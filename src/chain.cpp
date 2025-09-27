@@ -14,6 +14,7 @@
 #include "crypto/ecdsa_iface.h"
 #include "constants.h"     // BLOCK_TIME_SECS, GENESIS_BITS, etc.
 #include "difficulty.h"    // lwma_next_bits
+#include "supply.h"        // MAX_SUPPLY helpers (GetBlockSubsidy, WouldExceedMaxSupply, CoinbaseWithinLimits)
 #include <sstream>
 #include <unordered_set>
 
@@ -96,6 +97,7 @@ static inline std::string join_path(const std::string& a, const std::string& b){
     if(a.back()==sep) return a+b;
     return a + sep + b;
 }
+
 static inline std::string undo_dir(const std::string& base){ return join_path(base, "undo"); }
 
 static void ensure_dir_exists(const std::string& path){
@@ -909,6 +911,16 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     }
     if(cb_sum > sub + fees){ err="coinbase too high"; return false; }
     if(!leq_max_money(cb_sum)){ err="coinbase>MAX_MONEY"; return false; }
+
+    // *** NEW: Hard MAX_SUPPLY enforcement (subsidy-only against remaining supply) ***
+    {
+        uint64_t coinbase_without_fees = (cb_sum > fees) ? (cb_sum - fees) : 0;
+        if (WouldExceedMaxSupply((uint32_t)(tip_.height + 1), coinbase_without_fees)) {
+            err = "exceeds max supply";
+            return false;
+        }
+    }
+
     if(tip_.issued > (uint64_t)MAX_MONEY - cb_sum){ err="exceeds cap"; return false; }
 
     return true;
