@@ -28,10 +28,13 @@
 #include <chrono>
 #include <cstring> // memcpy
 #include <cstdlib> // getenv
+#include <csignal> // signal handling
+#include <atomic>
 
 using namespace miq;
 
 static std::vector<uint8_t> g_mine_pkh;
+static std::atomic<bool> g_shutdown_requested{false};
 
 static void print_usage(){
     std::cout
@@ -110,6 +113,12 @@ static bool resolve_mining_address(std::vector<uint8_t>& out_pkh, bool mining_en
     return false;
 }
 
+// POSIX-style simple signal handler (safe operations only).
+static void handle_signal(int sig){
+    (void)sig;
+    g_shutdown_requested.store(true);
+}
+
 int main(int argc, char** argv){
     try {
         // Install terminate hook first (catches background thread aborts)
@@ -117,6 +126,10 @@ int main(int argc, char** argv){
             std::fputs("[FATAL] std::terminate() called (likely from a background thread)\n", stderr);
             std::abort();
         });
+
+        // Register SIGINT/SIGTERM for graceful shutdown
+        std::signal(SIGINT,  handle_signal);
+        std::signal(SIGTERM, handle_signal);
 
         std::fprintf(stderr, "[BOOT] enter main()\n");
 
@@ -311,7 +324,7 @@ int main(int argc, char** argv){
             const auto mine_pkh = g_mine_pkh; // require user/address (no fallback)
 
             std::thread miner([&, mine_pkh, threads](){
-                while (true) {
+                while (!g_shutdown_requested.load()) {
                     try {
                         // ---- A) get tip
                         decltype(chain.tip()) t;
@@ -429,10 +442,9 @@ int main(int argc, char** argv){
                             std::string err;
                             if (chain.submit_block(b, err)) {
                                 log_info("mined block accepted, height=" + std::to_string(t.height + 1));
-                                if (!cfg.no_p2p) {
-                                    try { p2p.broadcast_inv_block(b.block_hash()); }
-                                    catch(...) { /* ignore */ }
-                                }
+                                // broadcast if P2P is up
+                                try { if (!g_shutdown_requested.load()) p2p.broadcast_inv_block(b.block_hash()); }
+                                catch(...) { /* ignore */ }
                             } else {
                                 log_warn(std::string("mined block rejected: ") + err);
                             }
@@ -456,8 +468,19 @@ int main(int argc, char** argv){
 
         log_info(std::string(CHAIN_NAME) + " core running. RPC " + std::to_string(RPC_PORT) +
                  ", P2P " + std::to_string(P2P_PORT));
-        while(true) std::this_thread::sleep_for(std::chrono::seconds(60));
+
+        // Wait loop, responsive to shutdown signals
+        while(!g_shutdown_requested.load()){
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+
+        // Begin shutdown
+        log_info("Shutdown requested — stopping services...");
+        try { rpc.stop(); } catch(...) {}
+        try { p2p.stop(); } catch(...) {}
+        log_info("Shutdown complete.");
         return 0;
+
     } catch(const std::exception& ex){
         std::fprintf(stderr, "[FATAL] %s\n", ex.what());
         return 1;
