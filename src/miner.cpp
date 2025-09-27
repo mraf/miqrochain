@@ -17,6 +17,7 @@
 #include <chrono>
 #include <algorithm>
 #include <limits>
+#include <ctime>   // time()
 
 // Kill Windows min/max macros if they slipped in
 #ifdef _WIN32
@@ -195,6 +196,7 @@ bool Miner::build_template(Block& b, uint32_t& bits){
     bits = calc_bits_now(chain_);
 
     b = Block{};
+    b.header.version   = 1;          // explicit
     b.header.prev_hash = tip.hash;
     b.header.bits      = bits;
     b.header.time      = static_cast<int64_t>(time(nullptr));
@@ -327,6 +329,7 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
                  unsigned threads)
 {
     Block b;
+    b.header.version   = 1;  // explicit
     b.header.prev_hash = prev_hash;
     b.header.bits      = bits;
     b.header.time      = static_cast<int64_t>(time(nullptr));
@@ -347,8 +350,6 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
     const std::vector<uint8_t> header_prefix = [&]{
         std::vector<uint8_t> v;
         v.reserve(4 + 32 + 32 + 8 + 4);
-        // reuse local helpers declared earlier in this file
-        // put_u32_le, put_u64_le
         put_u32_le(v, b.header.version);
         v.insert(v.end(), b.header.prev_hash.begin(),   b.header.prev_hash.end());
         v.insert(v.end(), b.header.merkle_root.begin(), b.header.merkle_root.end());
