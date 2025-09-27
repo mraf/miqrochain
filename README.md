@@ -1,238 +1,160 @@
-miqrochain — C++ PoW node (single-binary)
+README — Windows Quickstart (MIQROCHAIN)
 
-Minimal Bitcoin-style UTXO blockchain in modern C++ with a bundled secp256k1 ECDSA implementation and a lightweight HTTP JSON-RPC server. One executable: miqrod.
+This guide helps you run a full node on Windows safely, with correct ports and locked-down RPC.
 
-Protocol & economics (as coded)
+Defaults (confirmed)
 
-Ticker / unit: MIQ (smallest unit miqron = 1e-8 MIQ)
+RPC: 127.0.0.1:9834
 
-Hard cap: 26,280,000 MIQ (MAX_MONEY = 26,280,000 * COIN)
+P2P: 55001/tcp
 
-Block time target: 480 s (8 minutes)
-
-Difficulty: LWMA over recent blocks (difficulty.cpp)
-
-Initial subsidy: 50 MIQ (INITIAL_SUBSIDY)
-
-Halving interval: 262,800 blocks (≈4 years at 8 min)
+Block time target: 8 minutes
 
 Coinbase maturity: 100 blocks
 
-Address type: P2PKH, version byte 0x35 (addresses typically start with N)
+Max supply: 26,280,000 MIQ
 
-Network magic: 0xA3FB9E21 (4-byte header constant on the wire)
+Difficulty: LWMA
 
-Default ports: P2P 55001, RPC 9834 (see security notes)
+Wallet: basic (keygen + send/receive); (advanced features WIP)
 
-What’s included
+If you see any old docs that say P2P 442, ignore them. Use 55001.
 
-Consensus & validation
+1) Install & first run
 
-UTXO set with replay on load, coinbase maturity, value overflows prevented, max-money guards
+Unzip the release somewhere like C:\miqrochain\.
 
-LWMA difficulty; Median-Time-Past & future-time bounds
+(Recommended) Set an RPC token so tools can authenticate:
 
-Low-S signature rule behind compile-time switch (MIQ_RULE_ENFORCE_LOW_S)
-
-Size caps: block ≤ 1 MiB, tx ≤ 100 KiB
-
-P2P (TCP)
-
-Message framing with magic/command/length/checksum (netmsg.*)
-
-INV/GETDATA/BLOCK/TX/ADDR, ping/pong, basic headers-first helpers
-
-Token-bucket rate limits (blocks ~1 MB/s, tx ~256 KB/s, 2s bursts)
-
-Orphan cache with bounded bytes & eviction, simple ban-score
-
-Seed connect: one boot seed is used (DNS_SEED = 185.162.238.19)
-
-Mining
-
-Multi-threaded header hasher (SHA-256), SHA-NI fast path on x86
-
-On each start (if mining enabled) it prompts for a mining address
-
-RPC getminerstats for hashrate snapshots
-
-RPC (HTTP JSON)
-
-Endpoints:
-getnetworkinfo, getblockchaininfo, getblockcount, getbestblockhash,
-getblockhash, getblock (by height or hash),
-getcoinbaserecipient (first output of coinbase), gettipinfo,
-decodeaddress, getrawmempool, gettxout,
-sendrawtransaction, getminerstats,
-sendtoaddress (single-key, auto-fee & change)
-
-Storage
-
-Append-only blocks.dat with blocks.idx offsets and hash.map (hash→index)
-
-state.dat persists tip hash/height/bits/time/issued
-
-Security defaults (read before exposing)
-
-RPC bind: by default binds 0.0.0.0:9834 (all interfaces).
-Auth is off unless you set a token.
-
-Enable auth: set MIQ_RPC_TOKEN (checked as Authorization: Bearer <token>).
-
-Local-only modes:
-
-MIQ_RPC_BIND_LOOPBACK=1 → bind 127.0.0.1 only
-
-MIQ_RPC_LOCALONLY=1 → reject non-loopback remote peers even if bound wider
-
-P2P port 443: on Linux, binding <1024 usually requires root. Consider running behind a firewall/NAT or changing the port at build time if needed.
-
-Recommended for development:
-Run RPC on localhost only and set a token:
-
-export MIQ_RPC_BIND_LOOPBACK=1
-export MIQ_RPC_TOKEN="superlongrandom"
-
-Build
-Windows (VS 2022)
-
-Requirements: Visual Studio 2022 C++ Build Tools, CMake 3.20+, Windows SDK.
-
-# From a "x64 Native Tools" shell in repo root
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release --target miqrod --parallel
-.\build\Release\miqrod.exe --help
+setx MIQ_RPC_TOKEN "PUT-A-LONG-RANDOM-TOKEN-HERE"
+# Keep default: require token unless bound to loopback; to always require:
+# setx MIQ_RPC_REQUIRE_TOKEN "1"
 
 
-Optional tests:
+Start the node (PowerShell):
 
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DMIQ_BUILD_TESTS=ON
-cmake --build build --config Release --target RUN_TESTS
-
-Linux (GCC/Clang)
-sudo apt-get update && sudo apt-get install -y build-essential cmake
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel --target miqrod
-./build/miqrod --help
-
-Running the node
-
-Create a mining address (two options)
-
-Quick via node:
-
-./miqrod --genaddress
-# prints: priv_hex=..., pub_hex=..., address=...
+cd C:\miqrochain\build\Release
+.\miqrod
 
 
-Or via tool (uses micro-ecc directly):
+If you use a config file:
 
-cmake --build build --target miq-keygen
-./build/miq-keygen
+.\miqrod --conf "C:\miqrochain\miq.conf"
 
 
-Write a config file (note: --conf= uses equals, not a space)
+Minimal miq.conf example:
 
-# miq.conf
-datadir=./miqdata
-miner_threads=0          # 0 = auto (all logical CPUs)
-no_p2p=0
-no_rpc=0
+# C:\miqrochain\miq.conf
+datadir=C:\miqrochain\miqdata
+rpc_port=9834
+p2p_port=55001
+# no_p2p=0
+# no_rpc=0
+# no_mine=0
+# miner_threads=6
+
+
+Tip: The node binds RPC to loopback by default. If you expose RPC beyond your PC, always keep a token and put RPC behind TLS (reverse proxy).
+
+2) Allow through Windows Firewall (P2P only)
+
+RPC is local-only by default; you don’t need a firewall rule for it.
+
+To accept inbound peers:
+
+New-NetFirewallRule -DisplayName "MIQ P2P 55001" -Direction Inbound -Protocol TCP -LocalPort 55001 -Action Allow
+
+
+If you forward from your router, forward TCP 55001 → your PC.
+
+3) RPC usage
+
+Authenticated call (PowerShell):
+
+$env:MIQ_RPC_TOKEN  # should show your token if set with setx and new shell
+curl.exe -s -H @{"Authorization"="Bearer $env:MIQ_RPC_TOKEN";"Content-Type"="application/json"} `
+  -d '{"method":"getblockcount","params":[]}' http://127.0.0.1:9834/
+
+
+Alternate header supported:
+
+X-Auth-Token: <your token>
+
+
+Optional CORS for local web UIs (off by default). To enable:
+
+setx MIQ_RPC_CORS "1"
+
+4) Data directory
+
+Default (if set in conf):
+
+C:\miqrochain\miqdata
+
+
+Typical layout:
+
+miqdata\
+  blocks\          # append-only block files
+  chainstate\      # UTXO/state DB
+  indexes\         # header/block indexes
+  peers.dat        # (future) persisted peers/banlist
+  miq.log          # node log (if enabled)
+  miq.conf         # your config (optional)
+
+
+Back up the wallet keys (if you generate any) and your miq.conf.
+
+5) Mining (CPU, basic)
+
+Use built-in miner via config:
+
 no_mine=0
-mining_address=5...      # Base58 P2PKH
+miner_threads=6
 
 
-Start
+Or toggle at runtime via RPC (token required). Example:
 
-./build/miqrod --conf=miq.conf
-
-
-Startup sequence (fresh data dir):
-
-Initializes storage
-
-Creates genesis (height 0) with 50 MIQ to the genesis key
-
-Starts RPC (9834) and P2P (443), connects the single seed
-
-Prompts for mining address (if no_mine=0)
-
-RPC quickstart
-
-Default URL: http://<host>:9834/ (POST, JSON body).
-If MIQ_RPC_TOKEN is set, include header: Authorization: Bearer <token>.
-
-Examples:
-
-# Tip info
-curl -s -H 'Content-Type: application/json' \
-  -d '{"method":"gettipinfo","params":[]}' http://127.0.0.1:9834/
-
-# Miner stats (hashes since last call, seconds, hps, total)
-curl -s -H 'Content-Type: application/json' \
+curl.exe -s -H @{"Authorization"="Bearer $env:MIQ_RPC_TOKEN";"Content-Type"="application/json"} `
   -d '{"method":"getminerstats","params":[]}' http://127.0.0.1:9834/
 
-# Send coins from a single private key (auto-fee & change)
-curl -s -H 'Content-Type: application/json' \
-  -d '{"method":"sendtoaddress","params":["<priv_hex>","<to_address>", 123456789]}' \
-  http://127.0.0.1:9834/
 
+You should see hashrate, template info, and tip height.
 
-Supported methods:
-getnetworkinfo, getblockchaininfo, getblockcount, getbestblockhash, getblockhash,
-getblock (height or hash), getcoinbaserecipient, gettipinfo, decodeaddress,
-getrawmempool, gettxout, sendrawtransaction, getminerstats, sendtoaddress.
+6) Safe remote access (optional)
 
-Data & files
+If you must access RPC remotely:
 
-datadir (default ./miqdata):
+Keep MIQ_RPC_TOKEN set (don’t use blank tokens).
 
-blocks.dat — append-only raw blocks
+Do not bind RPC on 0.0.0.0 directly to the internet.
 
-blocks.idx — u32 offsets into blocks.dat
+Put it behind a TLS reverse proxy (e.g., Caddy/Nginx) with an allowlist/VPN.
 
-hash.map — hash(hex) → block index
+7) Troubleshooting
 
-state.dat — tip hash/height/bits/time/issued
+“Unauthorized” → Set MIQ_RPC_TOKEN and send Authorization: Bearer <token> or X-Auth-Token.
 
-Wallet (helper store): %APPDATA%\miqro\wallets\…\wallet.kv (Windows helper for address persistence; node primarily asks interactively each run when mining)
+Port mismatch → Ensure p2p_port=55001 everywhere (docs, conf, firewall, router).
 
-P2P details
+“Unknown option: --conf” → Use the correct flag set for your build; or just run without --conf and place miq.conf in the data dir.
 
-Header magic: 4 bytes (MAGIC), command (12 bytes, ASCII), length (LE u32), checksum (4 bytes of dSHA256(payload))
+No peers → Open/forward TCP 55001; confirm you can reach DNS seeds; try adding a known peer via addnode RPC (if available).
 
-Commands implemented: version, verack, ping, pong, inv, getdata, block, tx, addr (+ scaffolding for headers)
+8) Security model (quick)
 
-Rate limits (per peer, token bucket):
+RPC is loopback-only by default; token is required if bound wider.
 
-Blocks ≈ 1 MB/s (burst 2 MB)
+Read-only RPC methods can be allowed without a token on loopback.
 
-Tx ≈ 256 KB/s (burst 512 KB)
+P2P accepts inbound on 55001/tcp; mine and relay blocks/txs.
 
-Orphans: cached with bounded memory & LRU-like eviction
+9) Version & build info
 
-Seed used at boot: 185.162.238.19 (the DNS_SEEDS[] list is present but not used on startup)
+C++17, single-binary node miqrod
 
-Known behaviors & caveats (current code)
+JSON-RPC over minimal HTTP with rate limiting
 
-Genesis must be pinned for a public network. With default empty GENESIS_ECDSA_PRIV_HEX, each node mints a different genesis block on first run → networks will not connect. To share a network, set the same 32-byte hex key in src/constants.h, rebuild, and start all nodes from a clean data dir.
+LWMA difficulty, 8-minute targets
 
-RPC exposure is open by default (binds all interfaces, no auth). Use MIQ_RPC_BIND_LOOPBACK=1 and set MIQ_RPC_TOKEN before running anywhere untrusted.
-
-P2P port 443 may require elevated privileges on Linux. If you don’t want that, change the constant and rebuild (or run behind NAT/port-forwarding).
-
-Building tests
-
-Enable with -DMIQ_BUILD_TESTS=ON:
-
-test_crypto (ECDSA backend sanity)
-
-test_ser (serializer)
-
-fuzz_json (tiny JSON fuzzer)
-
-License
-
-Apache-2.0 for project code (see LICENSE).
-
-Bundled/optional micro-ecc sources are BSD-2 (kept under their original license when fetched).
+Coinbase maturity: 100
