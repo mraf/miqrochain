@@ -26,6 +26,7 @@ struct Tip {
 
 class Chain {
 public:
+    bool disconnect_tip_once(std::string& err);
     bool open(const std::string& dir);
     bool init_genesis(const Block& genesis);
     bool verify_block(const Block& b, std::string& err) const;
