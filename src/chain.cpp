@@ -1,5 +1,6 @@
 #include "chain.h"
 #include "sha256.h"
+#include "reorg_manager.h"
 #include "merkle.h"
 #include "hasher.h"
 #include "log.h"
