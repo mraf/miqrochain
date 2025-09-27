@@ -1239,3 +1239,4 @@ std::vector<PeerSnapshot> P2P::snapshot_peers() const {
     }
     return out;
 }
+}
