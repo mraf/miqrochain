@@ -409,6 +409,68 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     return true;
 }
 
+bool Chain::disconnect_tip_once(std::string& err){
+    // Can't roll back genesis
+    if (tip_.height == 0) { err = "cannot disconnect genesis"; return false; }
+
+    // Load the tip block we’re about to disconnect
+    Block blk;
+    if (!get_block_by_hash(tip_.hash, blk)) {
+        err = "failed to read tip block";
+        return false;
+    }
+
+    // Load undo captured when we connected this block
+    auto it = g_undo.find(hk(tip_.hash));
+    if (it == g_undo.end()) {
+        err = "no undo data for tip (restart or no-undo session)";
+        return false;
+    }
+    const auto& undo = it->second;
+
+    // 1) Remove UTXOs created by non-coinbase txs (reverse order)
+    for (size_t ti = blk.txs.size(); ti-- > 1; ){
+        const auto& tx = blk.txs[ti];
+        for (size_t i = 0; i < tx.vout.size(); ++i) {
+            (void)utxo_.spend(tx.txid(), (uint32_t)i); // acts as erase; ignore missing
+        }
+    }
+
+    // 2) Restore UTXOs spent by this block (reverse order)
+    for (size_t i = undo.size(); i-- > 0; ){
+        const auto& u = undo[i];
+        utxo_.add(u.prev_txid, u.prev_vout, u.prev_entry);
+    }
+
+    // 3) Remove coinbase outputs & adjust issued
+    const auto& cb = blk.txs[0];
+    uint64_t cb_sum = 0;
+    for (size_t i = 0; i < cb.vout.size(); ++i) {
+        (void)utxo_.spend(cb.txid(), (uint32_t)i);
+        cb_sum += cb.vout[i].value;
+    }
+    if (tip_.issued < cb_sum) { err = "issued underflow"; return false; }
+
+    // 4) Move tip back to previous block
+    Block prev;
+    if (!get_block_by_hash(blk.header.prev_hash, prev)) {
+        err = "failed to read prev block";
+        return false;
+    }
+
+    tip_.height -= 1;
+    tip_.hash   = blk.header.prev_hash;
+    tip_.bits   = prev.header.bits;
+    tip_.time   = prev.header.time;
+    tip_.issued -= cb_sum;
+
+    // Drop undo for disconnected block
+    g_undo.erase(it);
+
+    save_state();
+    return true;
+}
+
 bool Chain::submit_block(const Block& b, std::string& err){
     if(!verify_block(b, err)) return false;
 
