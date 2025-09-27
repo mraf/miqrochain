@@ -1,9 +1,28 @@
 #pragma once
+#pragma once
 #include <cstdint>
-#include <string>
-// ADDED for size_t
-#include <cstddef>
-#define MIQ_RULE_ENFORCE_LOW_S 1
+
+// === Pinned genesis (Option A: keep your current chain) ===
+// Fill these with YOUR values (from your logs/dump). Leave strings quoted.
+#define MIQ_GENESIS_HASH_HEX        "PASTE_HASH"
+#define MIQ_GENESIS_MERKLE_HEX      "PASTE_MERKLE"
+static constexpr std::uint32_t MIQ_GENESIS_TIME  = /* e.g. 1738023456 */ 0u;
+static constexpr std::uint32_t MIQ_GENESIS_BITS  = /* e.g. 0x1e0ffff0 */ 0u;
+static constexpr std::uint32_t MIQ_GENESIS_NONCE = /* e.g. 2083236893 */ 0u;
+#define MIQ_GENESIS_CB_TXID         "PASTE_CB_TXID"
+
+// Coinbase recipient (your PKH for NKz...)
+// You already confirmed: 00c649e06c60278501aad8a3b05d345fe8008836
+#define MIQ_GENESIS_COINBASE_PKH_HEX "00c649e06c60278501aad8a3b05d345fe8008836"
+static constexpr std::uint64_t MIQ_GENESIS_COINBASE_VALUE = 50ull * 100000000ull;
+
+// --- Optional: tiny hex helper (header-only, no deps) ---
+inline static std::string miq_to_hex(const unsigned char* p, std::size_t n) {
+    static const char* H="0123456789abcdef";
+    std::string s; s.resize(n*2);
+    for (std::size_t i=0;i<n;++i){ s[2*i]=H[(p[i]>>4)&0xF]; s[2*i+1]=H[p[i]&0xF]; }
+    return s;
+}
 
 namespace miq {
 static constexpr const char* COIN_NAME = "miq";
