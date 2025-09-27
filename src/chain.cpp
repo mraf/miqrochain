@@ -252,6 +252,60 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         uint32_t expected;
         if (last.size() < 2) expected = last.empty() ? GENESIS_BITS : last.back().second;
         else expected = lwma_next_bits(last, BLOCK_TIME_SECS, GENESIS_BITS);
+            // 1) Announce validated header to the reorg manager
+miq::HeaderView hv;
+hv.hash   = new_block_hash;        // std::vector<uint8_t> (32 bytes)
+hv.prev   = b.header.prev_hash;    // same type your BlockHeader uses
+hv.bits   = b.header.bits;
+hv.time   = b.header.time;
+hv.height = tip_.height + 1;       // height if it were extending tip (approx)
+
+g_reorg.on_validated_header(hv);
+
+// 2) Decide if a reorg is needed
+std::vector<miq::HashBytes> to_disconnect, to_connect;
+if (g_reorg.plan_reorg(tip_.hash, to_disconnect, to_connect)) {
+    // Disconnect current chain down to fork
+    for (const auto& h : to_disconnect) {
+        // Load block to disconnect if your undo logic needs it (optional)
+        // Block blk; storage_.read_block(h, blk);
+        // 2a) Roll back UTXO using your existing undo logic:
+        if (!utxo_.disconnect_tip(storage_)) {
+            // handle fatal error (I/O, corruption)
+            return false;
+        }
+        // 2b) Update tip_ metadata (height, hash, bits, time) from the new last block on disk
+        Tip nt = storage_.load_tip_meta(); // If you have a helper; otherwise compute
+        tip_ = nt;
+    }
+
+    // Connect the better side chain forward
+    for (const auto& h : to_connect) {
+        Block blk;
+        if (!storage_.read_block(h, blk)) {
+            // Can't read the block we need to connect; treat as transient failure
+            return false;
+        }
+        std::string err;
+        if (!apply_block_and_index(blk, /*persist=*/true, err)) {
+            // Validation or I/O failed while connecting — abort (node stays consistent)
+            return false;
+        }
+        // update tip_ to this block (apply_block_and_index should be doing it already)
+    }
+} else {
+    // No reorg: if this block directly extends tip, connect normally (your existing path)
+    if (b.header.prev_hash == tip_.hash) {
+        std::string err;
+        if (!apply_block_and_index(b, /*persist=*/true, err)) {
+            return false;
+        }
+    } else {
+        // Side chain or orphan without better work — persist header if desired, ignore body for now
+        // (Optional) store orphan for later; do not change active tip
+    }
+}
+
         if (b.header.bits != expected) { err = "bad bits"; return false; }
     }
 
