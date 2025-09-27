@@ -245,6 +245,7 @@ bool Chain::accept_block_for_reorg(const Block& b, std::string& err){
             Block blk;
             if (!read_block_any(h, blk)) { err = "reorg missing block body"; return false; }
             if (!submit_block(blk, err)) return false; // full validation + writes to disk
+            if (have_block(b.block_hash())) { return true; }
             orphan_erase(h); // we just persisted it via submit_block()
         }
     }
