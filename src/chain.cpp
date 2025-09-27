@@ -532,9 +532,6 @@ bool Chain::reconsider_best_chain(std::string& err){
     // Connect blocks along best path
     for (const auto& hh : down) {
         Block blk;
-        if (!read_block_any(hh, blk)) {
-            // missing block body: stop here; p2p should fetch it, we’ll retry later
-            return true;
         }
         if (!submit_block(blk, err)) {
             return false;
