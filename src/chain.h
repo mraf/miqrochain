@@ -27,6 +27,7 @@ struct Tip {
 class Chain {
 public:
     const std::vector<uint8_t>& tip_hash() const { return tip_.hash; }
+    bool read_block_any(const std::vector<uint8_t>& h, Block& out) const;
     bool accept_block_for_reorg(const Block& b, std::string& err);
     bool disconnect_tip_once(std::string& err);
     bool open(const std::string& dir);
