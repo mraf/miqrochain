@@ -1,6 +1,5 @@
 // src/rpc.cpp
 #include "rpc.h"
-#include "p2p.h"
 #include "sha256.h"
 #include "constants.h"
 #include "util.h"
@@ -25,6 +24,15 @@
 #include <string>
 #include <vector>
 
+#include <fstream>
+#include <random>
+#include <cerrno>
+
+#ifndef _WIN32
+  #include <sys/stat.h>
+  #include <unistd.h>
+#endif
+
 #ifndef MIN_RELAY_FEE_RATE
 // sat/KB (miqron per kilobyte)
 static constexpr uint64_t MIN_RELAY_FEE_RATE = 1000;
@@ -33,7 +41,105 @@ static constexpr uint64_t MIN_RELAY_FEE_RATE = 1000;
 static constexpr uint64_t DUST_THRESHOLD = 1000; // 0.00001000 MIQ
 #endif
 
+// --- RPC request limits ---
+static constexpr size_t RPC_MAX_BODY_BYTES = 512 * 1024; // 512 KiB
+
 namespace miq {
+
+// ======== Simple global cookie-auth gate (no header support in http shim) ========
+
+static std::string& rpc_cookie_token() {
+    static std::string tok;
+    return tok;
+}
+static std::string& rpc_cookie_path() {
+    static std::string p;
+    return p;
+}
+static bool& rpc_auth_enabled() {
+    static bool b = false;
+    return b;
+}
+
+static std::string join_path(const std::string& a, const std::string& b){
+#ifdef _WIN32
+    const char sep='\\';
+#else
+    const char sep='/';
+#endif
+    if(a.empty()) return b;
+    if(a.back()==sep) return a+b;
+    return a + sep + b;
+}
+
+static std::string hex32_random() {
+    std::array<uint8_t,32> buf{};
+    std::random_device rd;
+    for (auto &b : buf) b = static_cast<uint8_t>(rd());
+    return to_hex(std::vector<uint8_t>(buf.begin(), buf.end()));
+}
+
+static bool file_exists(const std::string& p) {
+    std::ifstream f(p, std::ios::in | std::ios::binary);
+    return f.good();
+}
+
+static bool read_first_line_trim(const std::string& p, std::string& out) {
+    std::ifstream f(p, std::ios::in | std::ios::binary);
+    if(!f.good()) return false;
+    std::string s;
+    std::getline(f, s);
+    // trim spaces and newlines
+    while(!s.empty() && (s.back()=='\r' || s.back()=='\n' || s.back()==' ' || s.back()=='\t')) s.pop_back();
+    out = s;
+    return true;
+}
+
+static bool write_cookie_file_secure(const std::string& p, const std::string& tok) {
+#ifndef _WIN32
+    // best-effort: 0600
+    umask(0077);
+#endif
+    std::ofstream f(p, std::ios::out | std::ios::trunc | std::ios::binary);
+    if(!f.good()) return false;
+    f << tok << "\n";
+    f.flush();
+#ifndef _WIN32
+    ::chmod(p.c_str(), 0600);
+#endif
+    return f.good();
+}
+
+void rpc_enable_auth_cookie(const std::string& datadir) {
+    auto& enabled = rpc_auth_enabled();
+    enabled = true;
+
+    std::string path = join_path(datadir, ".cookie");
+    rpc_cookie_path() = path;
+
+    std::string tok;
+    if (file_exists(path)) {
+        if (read_first_line_trim(path, tok) && !tok.empty()) {
+            rpc_cookie_token() = tok;
+            log_info("RPC auth cookie loaded from " + path);
+            return;
+        } else {
+            log_warn("RPC cookie file exists but unreadable/empty; recreating: " + path);
+        }
+    }
+
+    tok = hex32_random();
+    if (!write_cookie_file_secure(path, tok)) {
+        log_error("Failed to write RPC cookie file at " + path + " (errno=" + std::to_string(errno) + ")");
+        // As a fallback, still enable with in-memory token (not persisted).
+        rpc_cookie_token() = tok;
+        return;
+    }
+    rpc_cookie_token() = tok;
+    log_info("RPC auth cookie created at " + path + " (600 perms).");
+}
+
+// ==============================================================================
 
 static std::string err(const std::string& m){
     miq::JNode n;
@@ -61,6 +167,7 @@ static double difficulty_from_bits(uint32_t bits){
     if (difficulty < 0.0L) difficulty = 0.0L;
     return (double)difficulty; // cast to double for JNode
 }
+
 
 static bool is_hex(const std::string& s){
     if(s.empty()) return false;
@@ -113,11 +220,28 @@ static JNode jnum(double v){ JNode n; n.v = v; return n; }
 static JNode jstr(const std::string& s){ JNode n; n.v = s; return n; }
 
 std::string RpcService::handle(const std::string& body){
+    // Request-size guard (defense-in-depth)
+    if (body.size() > RPC_MAX_BODY_BYTES) {
+        return err("request too large");
+    }
+
     try {
         JNode req; 
         if(!json_parse(body, req)) return err("bad json");
         if(!std::holds_alternative<std::map<std::string,JNode>>(req.v)) return err("bad json obj");
         auto& obj = std::get<std::map<std::string,JNode>>(req.v);
+
+        // ---- Cookie auth (payload-level; header passthrough unavailable in simple HTTP shim) ----
+        if (rpc_auth_enabled()) {
+            auto ia = obj.find("auth");
+            if (ia == obj.end() || !std::holds_alternative<std::string>(ia->second.v)) {
+                return err("unauthorized");
+            }
+            const std::string provided = std::get<std::string>(ia->second.v);
+            if (provided != rpc_cookie_token()) {
+                return err("unauthorized");
+            }
+        }
 
         auto it = obj.find("method");
         if(it==obj.end() || !std::holds_alternative<std::string>(it->second.v)) return err("missing method");
@@ -567,40 +691,15 @@ std::string RpcService::handle(const std::string& body){
 
         // ---------------- p2p stubs (no P2P reference here) ----------------
 
-        if (method == "getpeerinfo") {
-    std::vector<JNode> arr;
-
-    if (p2p_) {
-        auto peers = p2p_->snapshot_peers();
-        arr.reserve(peers.size());
-        for (const auto& p : peers) {
-            std::map<std::string, JNode> o;
-            o["addr"]          = jstr(p.ip);
-            o["verack_ok"]     = jbool(p.verack_ok);
-            o["awaiting_pong"] = jbool(p.awaiting_pong);
-            o["misbehavior"]   = jnum((double)p.mis);
-            o["syncing"]       = jbool(p.syncing);
-            o["next_index"]    = jnum((double)p.next_index);
-            o["last_seen_ms"]  = jnum(p.last_seen_ms);
-            o["blk_tokens"]    = jnum((double)p.blk_tokens);
-            o["tx_tokens"]     = jnum((double)p.tx_tokens);
-            o["rx_buf"]        = jnum((double)p.rx_buf);
-            o["inflight"]      = jnum((double)p.inflight);
-
-            JNode n; n.v = o;
-            arr.push_back(n);
+        if(method=="getpeerinfo"){
+            // Return empty list if P2P service isn't injected here
+            std::vector<JNode> v; JNode out; out.v = v; return json_dump(out);
         }
-    }
-    JNode out; out.v = arr; return json_dump(out);
-}
 
-if (method == "getconnectioncount") {
-    double n = 0.0;
-    if (p2p_) {
-        n = (double)p2p_->snapshot_peers().size();
-    }
-    return json_dump(jnum(n));
-}
+        if(method=="getconnectioncount"){
+            // Return 0 if not wired to P2P
+            return json_dump(jnum(0.0));
+        }
 
         return err("unknown method");
     } catch(const std::exception& ex){
