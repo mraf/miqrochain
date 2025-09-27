@@ -108,6 +108,63 @@ bool Chain::open(const std::string& dir){
     return true;
 }
 
+bool Chain::accept_block_for_reorg(const Block& b, std::string& err){
+    // Basic DOS bounds first
+    auto raw = ser_block(b);
+    if (raw.size() > MAX_BLOCK_SIZE_LOCAL) { err = "oversize block"; return false; }
+
+    // Cheap integrity checks (no UTXO validation yet)
+    if (b.txs.empty()) { err = "no coinbase"; return false; }
+    {
+        std::unordered_set<std::string> seen;
+        std::vector<std::vector<uint8_t>> txids;
+        txids.reserve(b.txs.size());
+        for (const auto& tx : b.txs) {
+            auto id = tx.txid();
+            std::string key(reinterpret_cast<const char*>(id.data()), id.size());
+            if (!seen.insert(key).second) { err="duplicate txid"; return false; }
+            txids.push_back(std::move(id));
+        }
+        auto mr = merkle_root(txids);
+        if (mr != b.header.merkle_root) { err = "bad merkle"; return false; }
+    }
+
+    // Header PoW must be valid (we'll enforce retarget rules when/if we connect)
+    if (!meets_target_be(b.block_hash(), b.header.bits)) { err = "bad pow"; return false; }
+
+    // Store the block body so we can connect it later if needed
+    storage_.append_block(raw, b.block_hash());
+
+    // Add/chain the header in the header tree (if parent known)
+    miq::HeaderView hv;
+    hv.hash   = b.block_hash();
+    hv.prev   = b.header.prev_hash;
+    hv.bits   = b.header.bits;
+    hv.time   = b.header.time;
+    hv.height = 0; // optional; not used by reorg manager logic
+    (void)g_reorg.on_validated_header(hv);
+
+    // If the best known chainwork beats our active tip, plan & execute reorg
+    std::vector<miq::HashBytes> to_disconnect, to_connect;
+    if (g_reorg.plan_reorg(tip_.hash, to_disconnect, to_connect)) {
+        // Roll back current tip until the fork point
+        for (size_t i = 0; i < to_disconnect.size(); ++i) {
+            if (!disconnect_tip_once(err)) return false;
+        }
+        // Connect the better branch forward
+        for (const auto& h : to_connect) {
+            Block blk;
+            if (!get_block_by_hash(h, blk)) {
+                err = "reorg missing block body";
+                return false;
+            }
+            if (!submit_block(blk, err)) return false; // full validation here
+        }
+    }
+
+    return true;
+}
+
 bool Chain::save_state(){
     std::vector<uint8_t> b;
     auto P64=[&](uint64_t x){ for(int i=0;i<8;i++) b.push_back((x>>(i*8))&0xff); };
