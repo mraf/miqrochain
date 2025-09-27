@@ -397,10 +397,10 @@ bool Chain::read_block_any(const std::vector<uint8_t>& h, Block& out) const{
 }
 
 bool Chain::open(const std::string& dir){
-    datadir_ = dir;
-    ensure_dir_exists(undo_dir(datadir_));
     bool ok = storage_.open(dir) && utxo_.open(dir);
     if(!ok) return false;
+    datadir_ = dir;
+    ensure_dir_exists(undo_dir(datadir_));
     (void)load_state();
     return true;
 }
@@ -787,9 +787,15 @@ bool Chain::submit_block(const Block& b, std::string& err){
                 err = "missing utxo during undo-capture";
                 return false;
             }
+            write_undo_file(datadir_, tip_.height, tip_.hash, g_undo[hk(tip_.hash)]);
             undo.push_back(UndoIn{in.prev.txid, in.prev.vout, e});
-        }
+if (tip_.height >= UNDO_WINDOW) {
+    size_t prune_h = (size_t)(tip_.height - UNDO_WINDOW);
+    std::vector<uint8_t> prune_hash;
+    if (get_hash_by_index(prune_h, prune_hash)) {
+        remove_undo_file(datadir_, prune_h, prune_hash);
     }
+}
 
     // Persist the block body
     storage_.append_block(ser_block(b), b.block_hash());
