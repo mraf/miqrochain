@@ -11,6 +11,29 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # ------------------------------------------------------------------
 # Options
 # ------------------------------------------------------------------
+option(MIQ_ENABLE_WALLET_ENC "Enable wallet at-rest encryption" OFF)
+
+if(MIQ_ENABLE_WALLET_ENC)
+  find_package(OpenSSL REQUIRED)
+  target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_WALLET_ENC=1)
+  target_link_libraries(miqrod PRIVATE OpenSSL::Crypto)
+  # Add sources (adjust target name if different)
+  target_sources(miqrod PRIVATE
+      src/wallet_encryptor.cpp
+      src/crypto/secure_random.cpp
+  )
+  target_include_directories(miqrod PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  message(STATUS "Wallet encryption: ENABLED (OpenSSL)")
+else()
+  # Even when disabled, you may add the sources; they compile to lightweight stubs.
+  target_sources(miqrod PRIVATE
+      src/wallet_encryptor.cpp
+      src/crypto/secure_random.cpp
+  )
+  target_include_directories(miqrod PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  message(STATUS "Wallet encryption: DISABLED (default)")
+endif()
+
 option(MIQ_BUILD_TESTS        "Build tests"                                 OFF)
 option(MIQ_FETCH_MICROECC     "Fetch micro-ecc from GitHub if not vendored" ON)
 set(MIQ_VENDOR_MICROECC_DIR   "${CMAKE_SOURCE_DIR}/third_party/micro-ecc"
