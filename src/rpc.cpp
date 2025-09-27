@@ -551,8 +551,6 @@ std::string RpcService::handle(const std::string& body){
             return json_dump(jnum(d));
         }
 
-        }
-
         if(method=="getchaintips"){
             // Minimal: only the active tip (we don't expose side branches here)
             auto tip = chain_.tip();
