@@ -791,6 +791,12 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         }
         auto raw = ser_tx(tx);
         if (raw.size() > MIQ_FALLBACK_MAX_TX_SIZE) { err="tx too large"; return false; }
+        auto raw = ser_tx(tx);
+        if (raw.size() > MIQ_FALLBACK_MAX_TX_SIZE) {
+        err = "tx too large (policy)";
+        return false;
+}
+
     }
 
     // Difficulty bits must match LWMA
@@ -849,6 +855,13 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
             if(e.coinbase && tip_.height+1 < e.height + COINBASE_MATURITY){ err="immature coinbase"; return false; }
             if(hash160(inx.pubkey)!=e.pkh){ err="pkh mismatch"; return false; }
             if(!crypto::ECDSA::verify(inx.pubkey, hash, inx.sig)){ err="bad signature"; return false; }
+            #if MIQ_RULE_ENFORCE_LOW_S
+            extern bool is_low_s64(const std::vector<uint8_t>&); // or include chain.h/sig_encoding.h
+            if (!is_low_s64(inx.sig)) {
+            err = "high-S signature (policy)";
+            return false;
+}
+        #endif
         #if MIQ_RULE_ENFORCE_LOW_S
             // Consensus: reject non-low-S signatures in blocks
             if (!is_low_s64(inx.sig)) { err="high-S signature"; return false; }
