@@ -1,9 +1,11 @@
 #include "chain.h"
 #include "sha256.h"
+#include <deque>
 #include "reorg_manager.h"
 #include "merkle.h"
 #include <unordered_map>
 #include "hasher.h"
+#include <cstdlib>
 #include "log.h"
 #include "hash160.h"
 #include "crypto/ecdsa_iface.h"
@@ -45,6 +47,82 @@ struct UndoIn {
 // Binary-safe key for unordered_map (store raw 32 bytes)
 static inline std::string hk(const std::vector<uint8_t>& h){
     return std::string(reinterpret_cast<const char*>(h.data()), h.size());
+}
+
+static inline bool env_truthy(const char* v){ return v && (*v=='1'||*v=='t'||*v=='T'||*v=='y'||*v=='Y'); }
+static inline size_t env_szt(const char* name, size_t defv){
+    const char* v = std::getenv(name);
+    if(!v || !*v) return defv;
+    char* end=nullptr; long long x = std::strtoll(v, &end, 10);
+    if(end==v || x < 0) return defv;
+    return (size_t)x;
+}
+
+// Limits (override via env if you like)
+static const size_t ORPHAN_MAX_BLOCKS = env_szt("MIQ_ORPHAN_MAX_BLOCKS", 1024);        // 1k blocks
+static const size_t ORPHAN_MAX_BYTES  = env_szt("MIQ_ORPHAN_MAX_BYTES",  64ull<<20);   // 64 MiB
+
+struct OrphanRec {
+    std::vector<uint8_t> raw;     // serialized block
+    std::vector<uint8_t> parent;  // prev_hash
+    size_t bytes{0};
+};
+
+static std::unordered_map<std::string, OrphanRec> g_orphans; // key = hash (binary string)
+static std::deque<std::string> g_orphan_order;               // FIFO/LRU-ish
+static size_t g_orphan_bytes = 0;
+
+static inline std::string hk(const std::vector<uint8_t>& h){
+    return std::string(reinterpret_cast<const char*>(h.data()), h.size());
+}
+
+static void orphan_prune_if_needed(){
+    while ( (g_orphans.size() > ORPHAN_MAX_BLOCKS) || (g_orphan_bytes > ORPHAN_MAX_BYTES) ){
+        if (g_orphan_order.empty()) break;
+        auto key = g_orphan_order.front();
+        g_orphan_order.pop_front();
+        auto it = g_orphans.find(key);
+        if (it != g_orphans.end()){
+            g_orphan_bytes -= it->second.bytes;
+            g_orphans.erase(it);
+        }
+    }
+}
+
+static bool orphan_put(const std::vector<uint8_t>& hash32,
+                       const std::vector<uint8_t>& prev32,
+                       std::vector<uint8_t>&& raw)
+{
+    std::string key = hk(hash32);
+    if (g_orphans.find(key) != g_orphans.end()) return true; // already cached
+
+    OrphanRec rec;
+    rec.bytes  = raw.size();
+    rec.raw    = std::move(raw);
+    rec.parent = prev32;
+
+    g_orphan_order.push_back(key);
+    g_orphan_bytes += rec.bytes;
+    g_orphans.emplace(std::move(key), std::move(rec));
+
+    orphan_prune_if_needed();
+    return true;
+}
+
+static bool orphan_get(const std::vector<uint8_t>& hash32, std::vector<uint8_t>& out_raw){
+    auto it = g_orphans.find(hk(hash32));
+    if (it == g_orphans.end()) return false;
+    out_raw = it->second.raw; // copy out (cheap enough at this size)
+    return true;
+}
+
+static void orphan_erase(const std::vector<uint8_t>& hash32){
+    std::string key = hk(hash32);
+    auto it = g_orphans.find(key);
+    if (it == g_orphans.end()) return;
+    g_orphan_bytes -= it->second.bytes;
+    g_orphans.erase(it);
+    // note: we leave a stale key in g_orphan_order; harmless for pruning
 }
 
 static std::unordered_map<std::string, std::vector<UndoIn>> g_undo;
