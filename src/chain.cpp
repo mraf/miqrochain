@@ -1007,7 +1007,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
                 err = "missing utxo during undo-capture";
                 return false;
             }
-            undo.push_back(UndoIn{in.prev_txid, in.prev_vout, e});
+            undo.push_back(UndoIn{in.prev.txid, in.prev.vout, e});
         }
     }
 
