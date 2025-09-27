@@ -11,13 +11,34 @@
 namespace miq {
 
 // === secp256k1 constants (big-endian) =======================================
-// order n/2 (half of curve order) for low-S comparison
-static inline const uint8_t* secp256k1_n_half_be(){
-    static const uint8_t N_HALF[32] = {
-        0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-        0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0
+
+// Full group order n (big-endian):
+// n = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+inline const std::array<uint8_t,32>& Secp256k1_N(){
+    static const std::array<uint8_t,32> N = {
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,
+        0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B,
+        0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41
     };
-    return N_HALF;
+    return N;
+}
+
+// Half order n/2 (big-endian):
+// n/2 = 7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+inline const std::array<uint8_t,32>& Secp256k1_N_Half(){
+    static const std::array<uint8_t,32> N2 = {
+        0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,
+        0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0
+    };
+    return N2;
+}
+
+// Back-compat pointer accessor (historical usage in some call sites)
+static inline const uint8_t* secp256k1_n_half_be(){
+    return Secp256k1_N_Half().data();
 }
 
 // === helpers ================================================================
@@ -102,8 +123,7 @@ static inline bool IsCanonicalDERSig(const uint8_t* der, size_t der_len){
 static inline bool IsLowS_RS64(const uint8_t* sig64, size_t len){
     if(len != 64) return false;
     const uint8_t* S = sig64 + 32;
-    const uint8_t* HALF = secp256k1_n_half_be();
-    return be_cmp_le(S, HALF, 32);
+    return be_cmp_le(S, Secp256k1_N_Half().data(), 32);
 }
 
 // Exported: low-S check for DER signature (strict parse first)
@@ -112,7 +132,7 @@ static inline bool IsLowS(const uint8_t* der, size_t der_len){
     if(!ParseDERSignature(der, der_len, ro, rl, so, sl)) return false;
     uint8_t S32[32];
     be_pad_to_32(der + so, sl, S32);
-    return be_cmp_le(S32, secp256k1_n_half_be(), 32);
+    return be_cmp_le(S32, Secp256k1_N_Half().data(), 32);
 }
 
 // Exported: full canonical: strict DER + low-S
@@ -121,7 +141,7 @@ static inline bool IsCanonicalDERSig_LowS(const uint8_t* der, size_t der_len){
     if(!ParseDERSignature(der, der_len, ro, rl, so, sl)) return false;
     uint8_t S32[32];
     be_pad_to_32(der + so, sl, S32);
-    return be_cmp_le(S32, secp256k1_n_half_be(), 32);
+    return be_cmp_le(S32, Secp256k1_N_Half().data(), 32);
 }
 
 // Exported: Convert strict DER to compact 64-byte (r||s). Returns false if DER invalid.
