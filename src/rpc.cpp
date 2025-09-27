@@ -1,5 +1,6 @@
 // src/rpc.cpp
 #include "rpc.h"
+#include "p2p.h"
 #include "sha256.h"
 #include "constants.h"
 #include "util.h"
@@ -566,15 +567,40 @@ std::string RpcService::handle(const std::string& body){
 
         // ---------------- p2p stubs (no P2P reference here) ----------------
 
-        if(method=="getpeerinfo"){
-            // Return empty list if P2P service isn't injected here
-            std::vector<JNode> v; JNode out; out.v = v; return json_dump(out);
-        }
+        if (method == "getpeerinfo") {
+    std::vector<JNode> arr;
 
-        if(method=="getconnectioncount"){
-            // Return 0 if not wired to P2P
-            return json_dump(jnum(0.0));
+    if (p2p_) {
+        auto peers = p2p_->snapshot_peers();
+        arr.reserve(peers.size());
+        for (const auto& p : peers) {
+            std::map<std::string, JNode> o;
+            o["addr"]          = jstr(p.ip);
+            o["verack_ok"]     = jbool(p.verack_ok);
+            o["awaiting_pong"] = jbool(p.awaiting_pong);
+            o["misbehavior"]   = jnum((double)p.mis);
+            o["syncing"]       = jbool(p.syncing);
+            o["next_index"]    = jnum((double)p.next_index);
+            o["last_seen_ms"]  = jnum(p.last_seen_ms);
+            o["blk_tokens"]    = jnum((double)p.blk_tokens);
+            o["tx_tokens"]     = jnum((double)p.tx_tokens);
+            o["rx_buf"]        = jnum((double)p.rx_buf);
+            o["inflight"]      = jnum((double)p.inflight);
+
+            JNode n; n.v = o;
+            arr.push_back(n);
         }
+    }
+    JNode out; out.v = arr; return json_dump(out);
+}
+
+if (method == "getconnectioncount") {
+    double n = 0.0;
+    if (p2p_) {
+        n = (double)p2p_->snapshot_peers().size();
+    }
+    return json_dump(jnum(n));
+}
 
         return err("unknown method");
     } catch(const std::exception& ex){
