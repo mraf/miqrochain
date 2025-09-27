@@ -815,14 +815,13 @@ bool Chain::submit_block(const Block& b, std::string& err){
     tip_.time   = b.header.time;
     tip_.issued += cb_sum;
 
-    // Store undo (RAM) for fast same-session reorgs
     g_undo[hk(tip_.hash)] = std::move(undo);
 
-    // Persist undo to disk (survives restart)
-    write_undo_file(datadir_, tip_.height, tip_.hash, g_undo[hk(tip_.hash)]);
+// Persist undo to disk (survives restart)
+write_undo_file(datadir_, tip_.height, tip_.hash, g_undo[hk(tip_.hash)]);
 
-    // Prune old undo files outside the rolling window
-   if (tip_.height >= UNDO_WINDOW) {
+// Prune old undo files outside the rolling window
+if (tip_.height >= UNDO_WINDOW) {
     size_t prune_h = (size_t)(tip_.height - UNDO_WINDOW);
     std::vector<uint8_t> prune_hash;
     if (get_hash_by_index(prune_h, prune_hash)) {
@@ -830,7 +829,8 @@ bool Chain::submit_block(const Block& b, std::string& err){
     }
 }
 
-   miq::HeaderView hv;
+// Register header with reorg manager (keeps header tree complete)
+miq::HeaderView hv;
 hv.hash   = tip_.hash;
 hv.prev   = b.header.prev_hash;
 hv.bits   = b.header.bits;
@@ -841,8 +841,7 @@ g_reorg.on_validated_header(hv);
 save_state();
 return true;
 }
-    return true;
-// Return the last n headers (time,bits) along the canonical chain via storage.
+
 std::vector<std::pair<int64_t,uint32_t>> Chain::last_headers(size_t n) const{
     std::vector<std::pair<int64_t,uint32_t>> v;
     if (tip_.time == 0) return v;
