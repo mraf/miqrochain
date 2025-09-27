@@ -866,10 +866,6 @@ bool Chain::submit_block(const Block& b, std::string& err){
         utxo_.add(cb.txid(), (uint32_t)i, e);
         cb_sum += cb.vout[i].value;
     }
-
-    g_undo.erase(hk(blk.block_hash()));
-    remove_undo_file(datadir_, (uint64_t)(tip_.height + 1), blk.block_hash());
-
     // Advance tip
     tip_.height += 1;
     tip_.hash = b.block_hash();
