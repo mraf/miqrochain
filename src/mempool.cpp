@@ -1,194 +1,167 @@
-#include "serialize.h"
-
-#include "mempool.h"
-#include "util.h"
-#include "sig_encoding.h"     // Secp256k1_N(), Secp256k1_N_Half()
-#include "sha256.h"
-#include "crypto/ecdsa_iface.h"
-#include "hash160.h"
-#include <unordered_set>
-#include <algorithm>
+// src/sig_encoding.h
+#pragma once
+#include <cstdint>
+#include <cstddef>
 #include <vector>
+#include <array>
 #include <string>
-
-// OPTIONAL include of constants (for MAX_TX_SIZE or toggles).
-#ifdef __has_include
-#  if __has_include("constants.h")
-#    include "constants.h"
-#  endif
-#endif
-
-#ifndef MAX_TX_SIZE
-#define MIQ_FALLBACK_MAX_TX_SIZE (100u * 1024u) // 100 KiB fallback
-#else
-#define MIQ_FALLBACK_MAX_TX_SIZE (MAX_TX_SIZE)
-#endif
-
-// Default: ENFORCE Low-S & canonical RAW-64 in mempool (policy)
-#ifndef MIQ_RULE_ENFORCE_LOW_S
-#define MIQ_RULE_ENFORCE_LOW_S 1
-#endif
+#include <algorithm>
+#include <cstring>
 
 namespace miq {
 
-// --- Canonical RAW-64 (r||s) + Low-S checks ---------------------------------
+// ============================================================================
+// secp256k1 constants (big-endian) — canonical sources:
+//   n  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+//   n/2= 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+// ============================================================================
 
-// Big-endian compare (32B)
-static inline int be_cmp32(const uint8_t* a, const uint8_t* b){
-    for(int i=0;i<32;i++){
-        if(a[i] < b[i]) return -1;
-        if(a[i] > b[i]) return 1;
-    }
-    return 0;
-}
-
-static inline bool be_is_zero32(const uint8_t* a){
-    for(int i=0;i<32;i++) if(a[i]!=0) return false;
-    return true;
-}
-
-// Check r in [1, n-1], s in [1, n/2] (Low-S) for RAW-64 signature
-static inline bool is_canonical_raw64_lows(const std::vector<uint8_t>& sig64){
-    if (sig64.size() != 64) return false;
-    const uint8_t* r = sig64.data();
-    const uint8_t* s = sig64.data() + 32;
-
-    // r != 0 and r < n
-    if (be_is_zero32(r)) return false;
-    if (be_cmp32(r, Secp256k1_N().data()) >= 0) return false;
-
-    // s != 0 and s <= n/2  (low-S)
-    if (be_is_zero32(s)) return false;
-    if (be_cmp32(s, Secp256k1_N_Half().data()) > 0) return false;
-
-    return true;
-}
-
-// --- Sighash for verify ------------------------------------------------------
-
-static std::vector<uint8_t> sighash_simple(const Transaction& tx){
-    // Simple SIGHASH: hash of serialized tx without signatures
-    Transaction t=tx; for(auto& in: t.vin){ in.sig.clear(); }
-    return dsha256(ser_tx(t));
-}
-
-std::string Mempool::key(const std::vector<uint8_t>& txid) const { return hex(txid); }
-
-void Mempool::maybe_evict(){
-    if(map_.size()<=max_) return;
-    std::vector<std::pair<std::string,double>> v; v.reserve(map_.size());
-    for(const auto& kv: map_) v.push_back({kv.first, kv.second.feerate});
-    std::sort(v.begin(),v.end(),[](auto&a,auto&b){return a.second<b.second;});
-    size_t rm=map_.size()-max_;
-    for(size_t i=0;i<rm;i++) map_.erase(v[i].first);
-}
-
-bool Mempool::accept(const Transaction& tx, const UTXOSet& utxo, uint64_t height, std::string& err){
-    if (tx.vin.empty() || tx.vout.empty()) { err = "empty vin/vout"; return false; }
-
-    // Size cap (DoS)
-    const auto raw = ser_tx(tx);
-    const size_t raw_sz = raw.size();
-    if (raw_sz > MIQ_FALLBACK_MAX_TX_SIZE) { err = "tx too large"; return false; }
-
-    // No duplicate txid in mempool
-    const std::string txk = key(tx.txid());
-    if (map_.count(txk)) { err = "duplicate"; return false; }
-
-    // Reject conflicts against already-seen spends in mempool
-    for (const auto& kv : map_) {
-        const auto& other = kv.second.tx;
-        for (const auto& i1 : tx.vin) {
-            for (const auto& i2 : other.vin) {
-                if (i1.prev.vout == i2.prev.vout && i1.prev.txid == i2.prev.txid) {
-                    err = "conflict"; return false;
-                }
-            }
-        }
-    }
-
-    // ---- Safe math helpers ----
-    auto add_u64_safe = [](uint64_t a, uint64_t b, uint64_t& out)->bool { out = a + b; return out >= a; };
-
-#ifndef MAX_MONEY
-#  define MIQ_FALLBACK_MAX_MONEY (26280000ull * 100000000ull) // 26,280,000 * COIN
-#  define MIQ__USE_FALLBACK_MAX_MONEY
-#endif
-    auto leq_max_money = [](uint64_t v)->bool {
-    #ifdef MIQ__USE_FALLBACK_MAX_MONEY
-        return v <= MIQ_FALLBACK_MAX_MONEY;
-    #else
-        return v <= (uint64_t)MAX_MONEY;
-    #endif
+static inline const std::array<uint8_t,32>& Secp256k1_N() {
+    static const std::array<uint8_t,32> N = {
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,
+        0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B,
+        0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41
     };
+    return N;
+}
 
-    // Dedup inputs within this tx; compute in/out with overflow checks
-    std::unordered_set<std::string> ins;
-    uint64_t in = 0, out = 0, tmp = 0;
+static inline const std::array<uint8_t,32>& Secp256k1_N_Half() {
+    static const std::array<uint8_t,32> HALF = {
+        0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,
+        0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0
+    };
+    return HALF;
+}
 
-    const auto h = sighash_simple(tx);
+// Back-compat raw pointer accessor (if any old code used it)
+static inline const uint8_t* secp256k1_n_half_be(){
+    return Secp256k1_N_Half().data();
+}
 
-    for (const auto& i : tx.vin) {
-        // Strict pubkey length (compressed 33B or uncompressed 65B)
-        if (i.pubkey.size() != 33 && i.pubkey.size() != 65) { err = "bad pubkey size"; return false; }
+// ============================================================================
+// Helpers
+// ============================================================================
 
-        const std::string k = key(i.prev.txid) + ":" + std::to_string(i.prev.vout);
-        if (ins.count(k)) { err = "dup input"; return false; }
-        ins.insert(k);
-
-        UTXOEntry e;
-        if (!utxo.get(i.prev.txid, i.prev.vout, e)) { err = "missing utxo"; return false; }
-        if (e.coinbase && height < e.height + COINBASE_MATURITY) { err = "immature"; return false; }
-        if (hash160(i.pubkey) != e.pkh) { err = "pkh mismatch"; return false; }
-
-        // Signature verification against simple sighash
-        if (i.sig.size() != 64) { err = "bad sig size"; return false; }
-        if (!crypto::ECDSA::verify(i.pubkey, h, i.sig)) { err = "bad signature"; return false; }
-
-    #if MIQ_RULE_ENFORCE_LOW_S
-        // Enforce canonical RAW-64 (r||s) + Low-S in mempool (policy)
-        if (!is_canonical_raw64_lows(i.sig)) { err = "non-canonical or high-S signature"; return false; }
-    #endif
-
-        if (!leq_max_money(e.value)) { err = "utxo>MAX_MONEY"; return false; }
-        if (!add_u64_safe(in, e.value, tmp)) { err = "tx in overflow"; return false; }
-        in = tmp;
+static inline bool be_cmp_le(const uint8_t* a, const uint8_t* b, size_t n){
+    // return (a <= b) for big-endian byte arrays of length n
+    for (size_t i=0;i<n;i++){
+        if (a[i] < b[i]) return true;
+        if (a[i] > b[i]) return false;
     }
+    return true; // equal
+}
 
-    for (const auto& o : tx.vout) {
-        if (!leq_max_money(o.value)) { err = "txout>MAX_MONEY"; return false; }
-        if (!add_u64_safe(out, o.value, tmp)) { err = "tx out overflow"; return false; }
-        out = tmp;
+static inline void be_pad_to_32(const uint8_t* src, size_t len, uint8_t out32[32]){
+    std::memset(out32, 0, 32);
+    if (len > 32) {
+        std::memcpy(out32, src + (len - 32), 32); // keep least-significant 32B
+    } else {
+        std::memcpy(out32 + (32 - len), src, len);
     }
+}
 
-    if (!leq_max_money(in) || !leq_max_money(out)) { err = "sum>MAX_MONEY"; return false; }
-    if (out > in) { err = "outputs>inputs"; return false; }
-
-    // Fee policy (unchanged)
-    const size_t sz = tx.vin.size()*180 + tx.vout.size()*34 + 10;
-    const uint64_t minfee = (sz/100) + 1;
-    const uint64_t fee = in - out;
-    if (fee < minfee) { err = "low fee"; return false; }
-
-    const double fr = (double)fee / (double)sz;
-    map_[txk] = MempoolEntry{tx, fee, sz, fr};
-    maybe_evict();
+// Strict minimal DER INTEGER rules (positive, minimal)
+static inline bool der_minimal_positive_integer(const uint8_t* p, size_t len){
+    if (len == 0) return false;
+    if (len == 1) {
+        // single byte 0x00..0x7f acceptable here; negatives are filtered upstream
+        return true;
+    }
+    if (p[0] & 0x80) return false;              // negative
+    if (p[0] == 0x00 && !(p[1] & 0x80)) return false; // unnecessary leading zero
     return true;
 }
 
-std::vector<Transaction> Mempool::collect(size_t n) const{
-    std::vector<std::pair<double,const Transaction*>> v;
-    for(const auto& kv: map_) v.push_back({kv.second.feerate,&kv.second.tx});
-    std::sort(v.begin(),v.end(),[](auto&a,auto&b){return a.first>b.first;});
-    std::vector<Transaction> out;
-    for(const auto& p:v){ out.push_back(*p.second); if(out.size()>=n) break; }
-    return out;
+// ============================================================================
+// Strict BIP66 DER parsing (no sighash mode byte here)
+// 0x30 <len> 0x02 <rlen> <r> 0x02 <slen> <s>
+// ============================================================================
+
+static inline bool ParseDERSignature(const uint8_t* der, size_t der_len,
+                                     /*out*/ size_t& r_off, /*out*/ size_t& r_len,
+                                     /*out*/ size_t& s_off, /*out*/ size_t& s_len)
+{
+    r_off = r_len = s_off = s_len = 0;
+    if (der_len < 8 || der_len > 72) return false;
+    if (der[0] != 0x30) return false;
+    if (der[1] != der_len - 2) return false;
+
+    if (der[2] != 0x02) return false;
+    uint8_t rlen = der[3];
+    if (rlen == 0) return false;
+    if ((size_t)4 + rlen + 2 > der_len) return false;
+    r_off = 4; r_len = rlen;
+    if (!der_minimal_positive_integer(der + r_off, r_len)) return false;
+
+    size_t s_hdr = r_off + r_len;
+    if (s_hdr + 2 > der_len) return false;
+    if (der[s_hdr] != 0x02) return false;
+    uint8_t slen = der[s_hdr + 1];
+    if (slen == 0) return false;
+    s_off = s_hdr + 2; s_len = slen;
+    if (s_off + s_len != der_len) return false;
+    if (!der_minimal_positive_integer(der + s_off, s_len)) return false;
+
+    if (r_len > 33 || s_len > 33) return false; // at most 33 with leading 0x00
+    return true;
 }
 
-std::vector<std::vector<uint8_t>> Mempool::txids() const{
-    std::vector<std::vector<uint8_t>> v;
-    for(const auto& kv: map_) v.push_back(kv.second.tx.txid());
-    return v;
+static inline bool IsCanonicalDERSig(const uint8_t* der, size_t der_len){
+    size_t ro=0, rl=0, so=0, sl=0;
+    return ParseDERSignature(der, der_len, ro, rl, so, sl);
+}
+
+static inline bool IsLowS_RS64(const uint8_t* sig64, size_t len){
+    if (len != 64) return false;
+    const uint8_t* S = sig64 + 32;
+    return be_cmp_le(S, Secp256k1_N_Half().data(), 32);
+}
+
+static inline bool IsLowS(const uint8_t* der, size_t der_len){
+    size_t ro=0, rl=0, so=0, sl=0;
+    if (!ParseDERSignature(der, der_len, ro, rl, so, sl)) return false;
+    uint8_t S32[32];
+    be_pad_to_32(der + so, sl, S32);
+    return be_cmp_le(S32, Secp256k1_N_Half().data(), 32);
+}
+
+static inline bool IsCanonicalDERSig_LowS(const uint8_t* der, size_t der_len){
+    size_t ro=0, rl=0, so=0, sl=0;
+    if (!ParseDERSignature(der, der_len, ro, rl, so, sl)) return false;
+    uint8_t S32[32];
+    be_pad_to_32(der + so, sl, S32);
+    return be_cmp_le(S32, Secp256k1_N_Half().data(), 32);
+}
+
+static inline bool DER_To_Compact64(const uint8_t* der, size_t der_len, uint8_t out64[64]){
+    size_t ro=0, rl=0, so=0, sl=0;
+    if (!ParseDERSignature(der, der_len, ro, rl, so, sl)) return false;
+    uint8_t R32[32], S32[32];
+    be_pad_to_32(der + ro, rl, R32);
+    be_pad_to_32(der + so, sl, S32);
+    std::memcpy(out64 + 0,  R32, 32);
+    std::memcpy(out64 + 32, S32, 32);
+    return true;
+}
+
+// Vector overloads
+static inline bool IsCanonicalDERSig(const std::vector<uint8_t>& der){
+    return IsCanonicalDERSig(der.data(), der.size());
+}
+static inline bool IsCanonicalDERSig_LowS(const std::vector<uint8_t>& der){
+    return IsCanonicalDERSig_LowS(der.data(), der.size());
+}
+static inline bool IsLowS(const std::vector<uint8_t>& der){
+    return IsLowS(der.data(), der.size());
+}
+static inline bool IsLowS_RS64(const std::vector<uint8_t>& rs64){
+    return IsLowS_RS64(rs64.data(), rs64.size());
+}
+static inline bool DER_To_Compact64(const std::vector<uint8_t>& der, std::array<uint8_t,64>& out){
+    return DER_To_Compact64(der.data(), der.size(), out.data());
 }
 
 }
