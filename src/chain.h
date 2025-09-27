@@ -36,6 +36,7 @@ struct Tip {
 
 class Chain {
 public:
+    static long double work_from_bits_public(uint32_t bits);
     const std::vector<uint8_t>& tip_hash() const { return tip_.hash; }
     bool read_block_any(const std::vector<uint8_t>& h, Block& out) const;
     bool validate_header(const BlockHeader& h, std::string& err) const;
