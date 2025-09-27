@@ -12,14 +12,15 @@
 #include <vector>
 #include <unordered_set>
 
+#ifndef MIQ_ENABLE_HEADERS_FIRST_WIP
+#define MIQ_ENABLE_HEADERS_FIRST_WIP 0
+#endif
+
+
 #ifdef __has_include
 #  if __has_include("constants.h")
 #    include "constants.h"
 #  endif
-#endif
-
-#if MIQ_ENABLE_HEADERS_FIRST_WIP
-#define MIQ_ENABLE_HEADERS_FIRST_WIP 0
 #endif
 
 #ifndef MAX_MSG_SIZE
