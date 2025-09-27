@@ -20,6 +20,7 @@ set(MIQ_VENDOR_MICROECC_DIR   "${CMAKE_SOURCE_DIR}/third_party/micro-ecc"
 # Warnings / Optimization
 # ------------------------------------------------------------------
 if(MSVC)
+  target_compile_definitions(miqrod PRIVATE MIQ_RULE_ENFORCE_LOW_S=1)
   target_compile_options(miqrod PRIVATE /guard:cf /GS /sdl /Zi)
   target_link_options(miqrod PRIVATE /guard:cf /DYNAMICBASE /NXCOMPAT)
   add_compile_options(/O2 /Ot /Oi /GL /GF /Gy /Zc:inline)
