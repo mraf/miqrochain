@@ -1,4 +1,4 @@
-// src/http.cpp
+// src/http.cpp  (hardened, backward-compatible)
 #include "http.h"
 #include <thread>
 #include <string>
@@ -110,6 +110,14 @@ static inline void trim(std::string& s){
     s.assign(s.data()+i, j-i);
 }
 
+static inline std::string get_header(const std::vector<std::pair<std::string,std::string>>& headers,
+                                     const std::string& key_lc){
+    for(const auto& kv : headers){
+        if(lc(kv.first) == key_lc) return kv.second;
+    }
+    return {};
+}
+
 // ================= HTTP parsing & response ==================================
 
 static bool parse_http_request(sock_t fd,
@@ -198,9 +206,10 @@ static bool parse_http_request(sock_t fd,
                 setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
                 int n = recv(fd, tmp, (int)std::min(remain, sizeof(tmp)), 0);
-                if(n <= 0) return false;
+                if(n <= 0){ return false; }
                 body.append(tmp, tmp+n);
                 remain -= (size_t)n;
+                if(body.size() > max_body_bytes) return false;
             }
         }
     } else {
@@ -224,7 +233,17 @@ static void send_http_simple(sock_t fd, int code, const char* status,
     }
     resp += "Connection: close\r\n\r\n";
     resp += body;
+#ifdef _WIN32
     send(fd, resp.data(), (int)resp.size(), 0);
+#else
+    // Best-effort send all
+    const char* p = resp.data(); size_t left = resp.size();
+    while(left){
+        ssize_t n = ::send(fd, p, left, 0);
+        if(n <= 0) break;
+        p += n; left -= (size_t)n;
+    }
+#endif
 }
 
 // Extract "method":"..." (tiny extractor; ok for alnum/underscore names)
@@ -248,7 +267,7 @@ static std::unordered_set<std::string> default_safe_methods(){
         "getblockcount","gettipinfo","getblockhash","getblock","getrawblock",
         "getrawmempool","getpeerinfo","getminerstats","getconnectioncount",
         "validateaddress","decoderawtx","estimatemediantime","getdifficulty",
-        "getchaintips","ping","uptime","help","version"
+        "getchaintips","ping","uptime","help","version","getblockchaininfo"
     };
 }
 
@@ -318,9 +337,10 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
     const int max_conn          = env_int("MIQ_RPC_MAX_CONN", 64);      // global simultaneous connections
     const int ip_rps            = env_int("MIQ_RPC_RPS", 10);           // requests/sec per IP
     const int ip_burst          = env_int("MIQ_RPC_BURST", 30);         // burst size
-    const size_t max_hdr_bytes  = env_szt("MIQ_RPC_MAX_HEADER", 1<<20); // 1 MiB
-    const size_t max_body_bytes = env_szt("MIQ_RPC_MAX_BODY",   1<<20); // 1 MiB
+    const size_t max_hdr_bytes  = env_szt("MIQ_RPC_MAX_HEADER", 16*1024); // 16 KiB (safer default)
+    const size_t max_body_bytes = env_szt("MIQ_RPC_MAX_BODY",   2*1024*1024); // 2 MiB
     const int recv_timeout_ms   = env_int("MIQ_RPC_RECV_TIMEOUT_MS", 5000); // header+body total window
+    const bool allow_cors       = env_truthy(std::getenv("MIQ_RPC_CORS"));
 
     // Binding logic
     const char* env_bind_any = std::getenv("MIQ_RPC_BIND_ANY");
@@ -370,8 +390,8 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
         setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 #endif
 
-        // Small listen socket timeouts to help with slowloris on accept socket
 #ifndef _WIN32
+        // Small listen socket timeouts to help with slowloris on accept socket
         timeval tvl; tvl.tv_sec = 0; tvl.tv_usec = 200000;
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tvl, sizeof(tvl));
 #endif
@@ -400,10 +420,10 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
 #endif
 
     // Main accept loop
-    auto thread_fn = [this, s, bound_sa, bound_len, on_json, env_token, env_req,
+    auto thread_fn = [this, s, bound_sa, bound_len, on_json, env_token, env_req, allow_cors,
                       max_conn, ip_rps, ip_burst, max_hdr_bytes, max_body_bytes, recv_timeout_ms](){
         bool bound_loopback = is_loopback_sockaddr((const sockaddr*)&bound_sa);
-        bool require_always = env_truthy(env_req);
+        bool require_always = env_truthy(env_req); // keep backward-compat default
 
         // Build allowlist for unauthenticated access
         std::unordered_set<std::string> safe = default_safe_methods();
@@ -446,7 +466,7 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
             }
 
             std::thread([fd, on_json, env_token, bound_loopback, require_always, safe,
-                         ip_rps, ip_burst, max_hdr_bytes, max_body_bytes, recv_timeout_ms, cli]() {
+                         ip_rps, ip_burst, max_hdr_bytes, max_body_bytes, recv_timeout_ms, cli, allow_cors]() {
                 auto guard = std::unique_ptr<void, void(*)(void*)>(nullptr, [](void*){ --g_live_conns; });
 
                 // Per-IP token bucket
@@ -468,57 +488,70 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
                 }
 
                 // Collect headers
-                std::string auth;
-                std::string content_type = "application/json";
-                for(auto& kv : headers){
-                    std::string k = lc(kv.first);
-                    if(k == "authorization") auth = kv.second;
-                    else if(k == "content-type") content_type = kv.second;
-                }
+                std::string auth = get_header(headers, "authorization");
+                std::string xauth = get_header(headers, "x-auth-token");
+                std::string content_type = get_header(headers, "content-type");
+                if(content_type.empty()) content_type = "application/json";
 
                 // Token policy
                 bool token_required = require_always || !bound_loopback;
                 std::string token = env_token ? std::string(env_token) : std::string();
-                auto unauthorized = [&](){
+                auto unauthorized = [&](const char* why){
+                    std::vector<std::pair<std::string,std::string>> hdrs = {{"WWW-Authenticate","Bearer"}};
+                    if(allow_cors){
+                        hdrs.emplace_back("Access-Control-Allow-Origin","*");
+                        hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type");
+                    }
                     send_http_simple(fd, 401, "Unauthorized", "application/json",
-                        std::string("{\"error\":\"unauthorized\"}"),
-                        {{"WWW-Authenticate","Bearer"}});
+                        std::string("{\"error\":\"unauthorized\",\"reason\":\"") + why + "\"}", hdrs);
                     closesocket(fd);
                 };
 
                 bool token_present = false;
 
+                auto check_bearer = [&](const std::string& a)->bool{
+                    std::string s = a; trim(s);
+                    if(s.size() >= 7 && lc(s.substr(0,6)) == "bearer"){
+                        size_t sp = s.find(' ');
+                        if(sp != std::string::npos){
+                            std::string presented = s.substr(sp+1); trim(presented);
+                            return (!token.empty() && presented == token);
+                        }
+                    }
+                    return false;
+                };
+
                 if(token_required){
                     if(token.empty()){
-                        unauthorized();
+                        unauthorized("token-required");
                         return;
                     }
-                    std::string a = auth; trim(a);
-                    if(a.size() < 7 || lc(a.substr(0,6)) != "bearer"){
-                        unauthorized();
+                    if(!(check_bearer(auth) || (!xauth.empty() && xauth == token))){
+                        unauthorized("invalid-token");
                         return;
                     }
-                    size_t sp = a.find(' ');
-                    if(sp == std::string::npos){ unauthorized(); return; }
-                    std::string presented = a.substr(sp+1); trim(presented);
-                    if(presented != token){ unauthorized(); return; }
                     token_present = true;
                 } else {
                     // Not required (loopback), but if provided and valid, mark present
-                    std::string a = auth; trim(a);
-                    if(!token.empty() && a.size() >= 7 && lc(a.substr(0,6)) == "bearer"){
-                        size_t sp = a.find(' ');
-                        if(sp != std::string::npos){
-                            std::string presented = a.substr(sp+1); trim(presented);
-                            if(presented == token) token_present = true;
-                        }
-                    }
+                    if(check_bearer(auth) || (!xauth.empty() && xauth == token)) token_present = true;
                 }
 
                 // Method check
                 if(lc(method) != "post"){
+                    std::vector<std::pair<std::string,std::string>> hdrs;
+                    if(allow_cors){
+                        hdrs.emplace_back("Access-Control-Allow-Origin","*");
+                        hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type");
+                        hdrs.emplace_back("Access-Control-Allow-Methods","POST, OPTIONS");
+                    }
+                    if(lc(method) == "options"){
+                        // CORS preflight (no body)
+                        send_http_simple(fd, 204, "No Content", "text/plain", "", hdrs);
+                        closesocket(fd);
+                        return;
+                    }
                     send_http_simple(fd, 405, "Method Not Allowed", "application/json",
-                        std::string("{\"error\":\"only POST\"}"));
+                        std::string("{\"error\":\"only POST\"}"), hdrs);
                     closesocket(fd);
                     return;
                 }
@@ -527,8 +560,13 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
                 if(!token_present){
                     std::string m = extract_json_method(body);
                     if(m.empty() || safe.find(m) == safe.end()){
+                        std::vector<std::pair<std::string,std::string>> hdrs;
+                        if(allow_cors){
+                            hdrs.emplace_back("Access-Control-Allow-Origin","*");
+                            hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type");
+                        }
                         send_http_simple(fd, 403, "Forbidden", "application/json",
-                            std::string("{\"error\":\"forbidden\",\"reason\":\"method requires token\"}"));
+                            std::string("{\"error\":\"forbidden\",\"reason\":\"method requires token\"}"), hdrs);
                         closesocket(fd);
                         return;
                     }
@@ -538,15 +576,20 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
                 std::string resp_body;
                 try{
                     resp_body = on_json(body);
+                    if(resp_body.empty()) resp_body = "{\"result\":null}";
                 } catch(...){
                     resp_body = "{\"error\":\"internal error\"}";
                 }
 
-                // Return ratelimit headers (best-effort; not exact)
-                send_http_simple(fd, 200, "OK", "application/json", resp_body, {
+                std::vector<std::pair<std::string,std::string>> out_hdrs = {
                     {"X-RateLimit-Limit", std::to_string(ip_rps)},
                     {"X-RateLimit-Policy", "token-bucket"},
-                });
+                };
+                if(allow_cors){
+                    out_hdrs.emplace_back("Access-Control-Allow-Origin","*");
+                    out_hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type");
+                }
+                send_http_simple(fd, 200, "OK", "application/json", resp_body, out_hdrs);
                 closesocket(fd);
             }).detach();
         }
