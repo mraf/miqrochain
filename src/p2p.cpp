@@ -1218,7 +1218,7 @@ void P2P::loop(){
     save_addrs_to_disk(datadir_, addrv4_);
 }
 
-std::vector<P2P::PeerSnapshot> P2P::snapshot_peers() const {
+std::vector<PeerSnapshot> P2P::snapshot_peers() const {
     std::vector<PeerSnapshot> out;
     out.reserve(peers_.size());
     for (const auto& kv : peers_) {
@@ -1230,7 +1230,7 @@ std::vector<P2P::PeerSnapshot> P2P::snapshot_peers() const {
         s.mis           = ps.mis;
         s.next_index    = ps.next_index;
         s.syncing       = ps.syncing;
-        s.last_seen_ms  = static_cast<double>(ps.last_ms);
+        s.last_seen_ms  = static_cast<double>(now_ms() - ps.last_ms);
         s.blk_tokens    = ps.blk_tokens;
         s.tx_tokens     = ps.tx_tokens;
         s.rx_buf        = ps.rx.size();
@@ -1238,6 +1238,4 @@ std::vector<P2P::PeerSnapshot> P2P::snapshot_peers() const {
         out.push_back(std::move(s));
     }
     return out;
-}
-}
 }
