@@ -10,6 +10,9 @@
 #include <cstdlib>   // getenv
 #include <cstdio>
 #include <unordered_set>
+#include <unordered_map>
+#include <chrono>
+#include <atomic>
 
 #ifdef _WIN32
   #define _WINSOCK_DEPRECATED_NO_WARNINGS
@@ -34,11 +37,29 @@
 
 namespace miq {
 
-// ---- helpers ---------------------------------------------------------------
+// ====================== helpers =============================================
 
 static inline bool env_truthy(const char* v){
     if(!v || !*v) return false;
     return (*v=='1'||*v=='t'||*v=='T'||*v=='y'||*v=='Y');
+}
+
+static inline int env_int(const char* name, int defv){
+    const char* v = std::getenv(name);
+    if(!v || !*v) return defv;
+    char* end=nullptr; long x = std::strtol(v, &end, 10);
+    if(end==v) return defv;
+    if(x < 0) x = 0;
+    if(x > 1000000) x = 1000000;
+    return (int)x;
+}
+
+static inline size_t env_szt(const char* name, size_t defv){
+    const char* v = std::getenv(name);
+    if(!v || !*v) return defv;
+    char* end=nullptr; long long x = std::strtoll(v, &end, 10);
+    if(end==v || x < 0) return defv;
+    return (size_t)x;
 }
 
 static inline bool is_loopback_sockaddr(const sockaddr* sa){
@@ -58,6 +79,23 @@ static inline bool is_loopback_sockaddr(const sockaddr* sa){
     return false;
 }
 
+static inline std::string sock_ntop(const sockaddr_storage& sa){
+    char buf[128] = {0};
+    if(sa.ss_family == AF_INET){
+        const sockaddr_in* s4 = reinterpret_cast<const sockaddr_in*>(&sa);
+        inet_ntop(AF_INET, &s4->sin_addr, buf, sizeof(buf));
+        return std::string(buf);
+    }
+#ifdef AF_INET6
+    if(sa.ss_family == AF_INET6){
+        const sockaddr_in6* s6 = reinterpret_cast<const sockaddr_in6*>(&sa);
+        inet_ntop(AF_INET6, &s6->sin6_addr, buf, sizeof(buf));
+        return std::string(buf);
+    }
+#endif
+    return "unknown";
+}
+
 // lowercase ASCII
 static inline std::string lc(std::string s){
     for(char& c : s) c = (char)std::tolower((unsigned char)c);
@@ -72,19 +110,37 @@ static inline void trim(std::string& s){
     s.assign(s.data()+i, j-i);
 }
 
-static bool parse_http_request(sock_t fd, std::string& method, std::string& path, std::string& body,
-                               std::vector<std::pair<std::string,std::string>>& headers){
-    // Read until we have headers
+// ================= HTTP parsing & response ==================================
+
+static bool parse_http_request(sock_t fd,
+                               std::string& method, std::string& path, std::string& body,
+                               std::vector<std::pair<std::string,std::string>>& headers,
+                               size_t max_header_bytes,
+                               size_t max_body_bytes,
+                               int recv_timeout_ms)
+{
     std::string buf;
     char tmp[4096];
     size_t header_end_pos = std::string::npos;
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(recv_timeout_ms);
+
+    // Read until we have headers or timeout/limits reached
     for(;;){
+        if(std::chrono::steady_clock::now() > deadline) return false;
+#ifdef _WIN32
+        // Set small recv timeout (slowloris guard)
+        DWORD tv = 200; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
+        timeval tv; tv.tv_sec = 0; tv.tv_usec = 200000;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
         int n = recv(fd, tmp, (int)sizeof(tmp), 0);
         if(n <= 0) return false;
         buf.append(tmp, tmp+n);
+        if(buf.size() > max_header_bytes) return false;
         size_t pos = buf.find("\r\n\r\n");
         if(pos != std::string::npos){ header_end_pos = pos + 4; break; }
-        if(buf.size() > (1<<20)) return false; // 1MB header cap
     }
 
     // Parse request line
@@ -122,6 +178,7 @@ static bool parse_http_request(sock_t fd, std::string& method, std::string& path
             content_len = (size_t)std::strtoull(kv.second.c_str(), nullptr, 10);
         }
     }
+    if(content_len > max_body_bytes) return false;
 
     // Consume body: may already include part after header_end_pos
     if(content_len > 0){
@@ -133,6 +190,13 @@ static bool parse_http_request(sock_t fd, std::string& method, std::string& path
             body.assign(buf.data() + header_end_pos, already);
             size_t remain = content_len - already;
             while(remain > 0){
+                if(std::chrono::steady_clock::now() > deadline) return false;
+#ifdef _WIN32
+                DWORD tv = 200; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
+                timeval tv; tv.tv_sec = 0; tv.tv_usec = 200000;
+                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
                 int n = recv(fd, tmp, (int)std::min(remain, sizeof(tmp)), 0);
                 if(n <= 0) return false;
                 body.append(tmp, tmp+n);
@@ -163,26 +227,22 @@ static void send_http_simple(sock_t fd, int code, const char* status,
     send(fd, resp.data(), (int)resp.size(), 0);
 }
 
-// Extract "method":"..." (very small tolerant extractor, not a full JSON parser)
+// Extract "method":"..." (tiny extractor; ok for alnum/underscore names)
 static std::string extract_json_method(const std::string& body){
-    // find "method"
     size_t mpos = body.find("\"method\"");
     if(mpos == std::string::npos) return {};
-    // find colon after
     size_t cpos = body.find(':', mpos);
     if(cpos == std::string::npos) return {};
-    // skip whitespace
     size_t i = cpos+1; while(i<body.size() && (body[i]==' '||body[i]=='\t'||body[i]=='\r'||body[i]=='\n')) ++i;
     if(i>=body.size() || body[i] != '\"') return {};
     ++i;
-    // capture until closing quote (no unescape handling; fine for alnum/underscore)
     size_t j = i;
     while(j<body.size() && body[j] != '\"') ++j;
     if(j>=body.size()) return {};
     return body.substr(i, j-i);
 }
 
-// Build default safe allowlist (read-only & introspection)
+// Default safe (read-only) allowlist
 static std::unordered_set<std::string> default_safe_methods(){
     return {
         "getblockcount","gettipinfo","getblockhash","getblock","getrawblock",
@@ -192,7 +252,7 @@ static std::unordered_set<std::string> default_safe_methods(){
     };
 }
 
-// Parse a comma-separated list from env to override/extend allowlist
+// Extend safe allowlist via env
 static void load_env_allowlist(std::unordered_set<std::string>& allow){
     const char* env = std::getenv("MIQ_RPC_SAFE_METHODS");
     if(!env || !*env) return;
@@ -208,7 +268,44 @@ static void load_env_allowlist(std::unordered_set<std::string>& allow){
     }
 }
 
-// ---- HttpServer ------------------------------------------------------------
+// ================= Rate limit state =========================================
+
+struct TokenBucket {
+    double tokens{0.0};
+    double rate_per_sec{1.0};
+    double burst{10.0};
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+
+static std::unordered_map<std::string, TokenBucket> g_buckets;
+static std::chrono::steady_clock::time_point g_last_cleanup = std::chrono::steady_clock::now();
+static std::atomic<int> g_live_conns{0};
+
+// Refill & check token bucket
+static bool rl_allow(const std::string& ip, int rps, int burst){
+    auto now = std::chrono::steady_clock::now();
+    TokenBucket& b = g_buckets[ip];
+    double dt = std::chrono::duration<double>(now - b.last).count();
+    b.last = now;
+    if(b.rate_per_sec <= 0.0){ b.rate_per_sec = (double)rps; }
+    if(b.burst <= 0.0){ b.burst = (double)burst; }
+    b.tokens = std::min(b.burst, b.tokens + dt * b.rate_per_sec);
+    if(b.tokens >= 1.0){
+        b.tokens -= 1.0;
+        // periodic cleanup
+        if(now - g_last_cleanup > std::chrono::minutes(5)){
+            for(auto it = g_buckets.begin(); it != g_buckets.end();){
+                if(now - it->second.last > std::chrono::minutes(10)) it = g_buckets.erase(it);
+                else ++it;
+            }
+            g_last_cleanup = now;
+        }
+        return true;
+    }
+    return false;
+}
+
+// ================= HttpServer ===============================================
 
 void HttpServer::start(uint16_t port, std::function<std::string(const std::string&)> on_json){
     if(running_.exchange(true)) return;
@@ -216,6 +313,14 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
+
+    // Tunables (with sane defaults)
+    const int max_conn          = env_int("MIQ_RPC_MAX_CONN", 64);      // global simultaneous connections
+    const int ip_rps            = env_int("MIQ_RPC_RPS", 10);           // requests/sec per IP
+    const int ip_burst          = env_int("MIQ_RPC_BURST", 30);         // burst size
+    const size_t max_hdr_bytes  = env_szt("MIQ_RPC_MAX_HEADER", 1<<20); // 1 MiB
+    const size_t max_body_bytes = env_szt("MIQ_RPC_MAX_BODY",   1<<20); // 1 MiB
+    const int recv_timeout_ms   = env_int("MIQ_RPC_RECV_TIMEOUT_MS", 5000); // header+body total window
 
     // Binding logic
     const char* env_bind_any = std::getenv("MIQ_RPC_BIND_ANY");
@@ -265,8 +370,14 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
         setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 #endif
 
+        // Small listen socket timeouts to help with slowloris on accept socket
+#ifndef _WIN32
+        timeval tvl; tvl.tv_sec = 0; tvl.tv_usec = 200000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tvl, sizeof(tvl));
+#endif
+
         if(bind(s, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0){
-            if(listen(s, 16) == 0){
+            if(listen(s, 64) == 0){
                 if(ai->ai_addrlen <= sizeof(bound_sa)){
                     std::memcpy(&bound_sa, ai->ai_addr, ai->ai_addrlen);
                     bound_len = (socklen_t)ai->ai_addrlen;
@@ -288,8 +399,9 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
     if(s < 0){ running_.store(false); return; }
 #endif
 
-    // Non-blocking accept loop via select
-    auto thread_fn = [this, s, bound_sa, bound_len, on_json, env_token, env_req](){
+    // Main accept loop
+    auto thread_fn = [this, s, bound_sa, bound_len, on_json, env_token, env_req,
+                      max_conn, ip_rps, ip_burst, max_hdr_bytes, max_body_bytes, recv_timeout_ms](){
         bool bound_loopback = is_loopback_sockaddr((const sockaddr*)&bound_sa);
         bool require_always = env_truthy(env_req);
 
@@ -323,11 +435,34 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
             sock_t fd = accept(s, (sockaddr*)&cli, &clen);
             if(fd < 0){ continue; }
 #endif
-            std::thread([fd, on_json, env_token, bound_loopback, require_always, safe](){
-                // Parse one request
+            // Hard connection cap
+            int live = ++g_live_conns;
+            if(live > max_conn){
+                send_http_simple(fd, 503, "Service Unavailable", "application/json",
+                                 std::string("{\"error\":\"too many connections\"}"));
+                closesocket(fd);
+                --g_live_conns;
+                continue;
+            }
+
+            std::thread([fd, on_json, env_token, bound_loopback, require_always, safe,
+                         ip_rps, ip_burst, max_hdr_bytes, max_body_bytes, recv_timeout_ms, cli]() {
+                auto guard = std::unique_ptr<void, void(*)(void*)>(nullptr, [](void*){ --g_live_conns; });
+
+                // Per-IP token bucket
+                std::string ip = sock_ntop(cli);
+                if(!rl_allow(ip, ip_rps, ip_burst)){
+                    send_http_simple(fd, 429, "Too Many Requests", "application/json",
+                                     std::string("{\"error\":\"rate limit\"}"),
+                                     {{"Retry-After","1"}});
+                    closesocket(fd);
+                    return;
+                }
+
+                // Parse one request (with time/size caps)
                 std::string method, path, body;
                 std::vector<std::pair<std::string,std::string>> headers;
-                if(!parse_http_request(fd, method, path, body, headers)){
+                if(!parse_http_request(fd, method, path, body, headers, max_hdr_bytes, max_body_bytes, recv_timeout_ms)){
                     closesocket(fd);
                     return;
                 }
@@ -358,7 +493,6 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
                         unauthorized();
                         return;
                     }
-                    // Expect "Bearer <token>"
                     std::string a = auth; trim(a);
                     if(a.size() < 7 || lc(a.substr(0,6)) != "bearer"){
                         unauthorized();
@@ -408,7 +542,11 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
                     resp_body = "{\"error\":\"internal error\"}";
                 }
 
-                send_http_simple(fd, 200, "OK", "application/json", resp_body);
+                // Return ratelimit headers (best-effort; not exact)
+                send_http_simple(fd, 200, "OK", "application/json", resp_body, {
+                    {"X-RateLimit-Limit", std::to_string(ip_rps)},
+                    {"X-RateLimit-Policy", "token-bucket"},
+                });
                 closesocket(fd);
             }).detach();
         }
