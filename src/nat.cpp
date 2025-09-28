@@ -1,10 +1,21 @@
 #include "nat.h"
+
+// Try to use project logging if available; otherwise fall back to stderr.
 #include "log.h"
+#include <cstdio>
+
+#ifndef LOG_INFO
+  #define LOG_INFO(...) do { std::fprintf(stderr, __VA_ARGS__); std::fprintf(stderr, "\n"); } while(0)
+#endif
+#ifndef LOG_WARN
+  #define LOG_WARN(...) do { std::fprintf(stderr, __VA_ARGS__); std::fprintf(stderr, "\n"); } while(0)
+#endif
 
 #if defined(MIQ_ENABLE_UPNP)
   #include <miniupnpc/miniupnpc.h>
   #include <miniupnpc/upnpcommands.h>
   #include <cstring>
+  #include <cstdio>
 #endif
 
 namespace miq {
