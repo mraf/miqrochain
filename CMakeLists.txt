@@ -17,10 +17,11 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Options
 # ------------------------------------------------------------------
 option(MIQ_ENABLE_WALLET_ENC "Enable wallet at-rest encryption" OFF)
-option(MIQ_BUILD_TESTS        "Build tests"                                 OFF)
-option(MIQ_FETCH_MICROECC     "Fetch micro-ecc from GitHub if not vendored" ON)
+option(MIQ_ENABLE_UPNP       "Enable UPnP/NAT-PMP port mapping" OFF)
+option(MIQ_BUILD_TESTS       "Build tests"                                 OFF)
+option(MIQ_FETCH_MICROECC    "Fetch micro-ecc from GitHub if not vendored" ON)
 
-set(MIQ_VENDOR_MICROECC_DIR   "${CMAKE_SOURCE_DIR}/third_party/micro-ecc"
+set(MIQ_VENDOR_MICROECC_DIR  "${CMAKE_SOURCE_DIR}/third_party/micro-ecc"
     CACHE PATH "Path to vendored micro-ecc")
 
 # ------------------------------------------------------------------
@@ -127,6 +128,7 @@ add_executable(miqrod
 # Extra sources (kept separate)
 target_sources(miqrod PRIVATE
     src/reorg_manager.cpp
+    src/nat.cpp                 # UPnP helper (no-op unless MIQ_ENABLE_UPNP=1)
 )
 
 target_include_directories(miqrod PRIVATE
@@ -167,6 +169,24 @@ target_sources(miqrod PRIVATE
     src/crypto/secure_random.cpp
 )
 target_include_directories(miqrod PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# ------------------------------------------------------------------
+# Optional UPnP/NAT-PMP (miniupnpc)
+# ------------------------------------------------------------------
+if(MIQ_ENABLE_UPNP)
+  find_path(MINIUPNP_INCLUDE_DIR miniupnpc/miniupnpc.h)
+  find_library(MINIUPNP_LIBRARY NAMES miniupnpc)
+  if(MINIUPNP_INCLUDE_DIR AND MINIUPNP_LIBRARY)
+    target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_UPNP=1)
+    target_include_directories(miqrod PRIVATE ${MINIUPNP_INCLUDE_DIR})
+    target_link_libraries(miqrod PRIVATE ${MINIUPNP_LIBRARY})
+    message(STATUS "UPnP enabled (miniupnpc)")
+  else()
+    message(FATAL_ERROR "MIQ_ENABLE_UPNP=ON but miniupnpc not found (e.g., libminiupnpc-dev / brew install miniupnpc / vcpkg).")
+  endif()
+else()
+  message(STATUS "UPnP disabled (default)")
+endif()
 
 # ------------------------------------------------------------------
 # Tests (optional)
