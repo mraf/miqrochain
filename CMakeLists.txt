@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 
+# Silence FetchContent_Populate deprecation for now (keeps current behavior)
+if(POLICY CMP0169)
+  cmake_policy(SET CMP0169 OLD)
+endif()
+
 # Enable C (for uECC.c) and C++
 project(miqrochain_core C CXX)
 
@@ -12,30 +17,9 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Options
 # ------------------------------------------------------------------
 option(MIQ_ENABLE_WALLET_ENC "Enable wallet at-rest encryption" OFF)
-
-if(MIQ_ENABLE_WALLET_ENC)
-  find_package(OpenSSL REQUIRED)
-  target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_WALLET_ENC=1)
-  target_link_libraries(miqrod PRIVATE OpenSSL::Crypto)
-  # Add sources (adjust target name if different)
-  target_sources(miqrod PRIVATE
-      src/wallet_encryptor.cpp
-      src/crypto/secure_random.cpp
-  )
-  target_include_directories(miqrod PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  message(STATUS "Wallet encryption: ENABLED (OpenSSL)")
-else()
-  # Even when disabled, you may add the sources; they compile to lightweight stubs.
-  target_sources(miqrod PRIVATE
-      src/wallet_encryptor.cpp
-      src/crypto/secure_random.cpp
-  )
-  target_include_directories(miqrod PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  message(STATUS "Wallet encryption: DISABLED (default)")
-endif()
-
 option(MIQ_BUILD_TESTS        "Build tests"                                 OFF)
 option(MIQ_FETCH_MICROECC     "Fetch micro-ecc from GitHub if not vendored" ON)
+
 set(MIQ_VENDOR_MICROECC_DIR   "${CMAKE_SOURCE_DIR}/third_party/micro-ecc"
     CACHE PATH "Path to vendored micro-ecc")
 
@@ -43,9 +27,6 @@ set(MIQ_VENDOR_MICROECC_DIR   "${CMAKE_SOURCE_DIR}/third_party/micro-ecc"
 # Warnings / Optimization
 # ------------------------------------------------------------------
 if(MSVC)
-  target_compile_definitions(miqrod PRIVATE MIQ_RULE_ENFORCE_LOW_S=1)
-  target_compile_options(miqrod PRIVATE /guard:cf /GS /sdl /Zi)
-  target_link_options(miqrod PRIVATE /guard:cf /DYNAMICBASE /NXCOMPAT)
   add_compile_options(/O2 /Ot /Oi /GL /GF /Gy /Zc:inline)
   add_link_options(/LTCG)
   add_compile_options(/W4 /permissive- /Zc:__cplusplus)
@@ -143,11 +124,10 @@ add_executable(miqrod
     src/crypto/uECC_shim.c
 )
 
-# somewhere after add_executable(miqrod ...)
+# Extra sources (kept separate)
 target_sources(miqrod PRIVATE
     src/reorg_manager.cpp
 )
-
 
 target_include_directories(miqrod PRIVATE
     src
@@ -157,9 +137,36 @@ target_include_directories(miqrod PRIVATE
 # micro-ecc config: enable compressed points (safe, no consensus change)
 target_compile_definitions(miqrod PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
 
+# MSVC target-specific hardening (after target exists)
+if(MSVC)
+  target_compile_definitions(miqrod PRIVATE MIQ_RULE_ENFORCE_LOW_S=1)
+  target_compile_options(miqrod PRIVATE /guard:cf /GS /sdl /Zi)
+  target_link_options(miqrod PRIVATE /guard:cf /DYNAMICBASE /NXCOMPAT)
+endif()
+
 if(WIN32)
   target_link_libraries(miqrod PRIVATE Ws2_32)
 endif()
+
+# ------------------------------------------------------------------
+# Optional Wallet Encryption (OpenSSL AES-256-GCM + PBKDF2)
+# (Sources compile into real impl when enabled, or stubs when disabled)
+# ------------------------------------------------------------------
+if(MIQ_ENABLE_WALLET_ENC)
+  find_package(OpenSSL REQUIRED)
+  target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_WALLET_ENC=1)
+  target_link_libraries(miqrod PRIVATE OpenSSL::Crypto)
+  message(STATUS "Wallet encryption: ENABLED (OpenSSL)")
+else()
+  message(STATUS "Wallet encryption: DISABLED (default)")
+endif()
+
+# Add sources unconditionally; implementation switches via the define above.
+target_sources(miqrod PRIVATE
+    src/wallet_encryptor.cpp
+    src/crypto/secure_random.cpp
+)
+target_include_directories(miqrod PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # ------------------------------------------------------------------
 # Tests (optional)
