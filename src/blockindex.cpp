@@ -1,70 +1,153 @@
-#pragma once
-#include <vector>
-#include <unordered_map>
-#include <memory>
-#include <string>
-#include "block.h"
+#include "blockindex.h"
+#include "util.h"      // hex(), to_hex helpers consistent with your codebase
+#include <cmath>
+#include <algorithm>
 
 namespace miq {
 
-// Header record stored in-memory for headers-first sync and chain selection.
-struct HeaderRec {
-    std::vector<uint8_t> hash;     // 32-byte block header hash (little-endian bytes as used in your codebase)
-    std::vector<uint8_t> prev;     // 32-byte prev hash
-    int64_t  time{0};              // header timestamp
-    uint32_t bits{0};              // nBits compact target
-    uint64_t height{0};            // header height (0 = genesis)
-    long double chainwork{0};      // cumulative work (monotonic on best header chain)
-    std::shared_ptr<HeaderRec> parent;
+// Convert 32-byte hash vector to hex key for maps.
+static std::string K(const std::vector<uint8_t>& h){ return hex(h); }
 
-    // True once the full block body has been received/validated/connected.
-    bool have_body{false};
-};
+// Convert compact 'bits' to an approximate "work" measure.
+// work ≈ 2^256 / (target + 1)
+static long double work_from_bits(uint32_t bits){
+    // bits = (exp << 24) | mant (23 bits)
+    const uint32_t exp  = bits >> 24;
+    const uint32_t mant = bits & 0x007fffff;
 
-// In-memory index for block headers (and which headers already have bodies).
-class BlockIndex {
-public:
-    // Initialize with genesis header info.
-    // genesis_hash: 32-byte hash; time/bits from the genesis header.
-    void reset(const std::vector<uint8_t>& genesis_hash, int64_t time, uint32_t bits);
+    // target ≈ mant * 2^(8*(exp-3))
+    long double target = static_cast<long double>(mant);
+    int shift = 8 * (static_cast<int>(exp) - 3);
+    target = std::ldexp(target, shift); // target *= 2^shift
 
-    // Add a new header that links to a known parent.
-    // Returns the created HeaderRec, or nullptr if parent is unknown.
-    std::shared_ptr<HeaderRec> add_header(const BlockHeader& h,
-                                          const std::vector<uint8_t>& real_hash);
+    long double two256 = std::ldexp(1.0L, 256);
+    long double w = two256 / (target + 1.0L);
+    return w;
+}
 
-    // Mark that we have validated/connected the full block body for hash 'h'.
-    void set_have_body(const std::vector<uint8_t>& h);
+void BlockIndex::reset(const std::vector<uint8_t>& genesis_hash, int64_t time, uint32_t bits){
+    map_.clear();
+    children_.clear();
+    tip_.reset();
+    best_body_.reset();
 
-    // Best header by cumulative work (tip of the headers chain).
-    std::shared_ptr<HeaderRec> tip() const { return tip_; }
+    auto g = std::make_shared<HeaderRec>();
+    g->hash  = genesis_hash;
+    g->prev  = std::vector<uint8_t>(32, 0);
+    g->time  = time;
+    g->bits  = bits;
+    g->height = 0;
+    g->chainwork = work_from_bits(bits);
+    g->parent.reset();
+    g->have_body = false; // set to true by caller after connecting genesis
 
-    // Best connected block body (tip of the fully-connected chain).
-    std::shared_ptr<HeaderRec> best_connected_body() const { return best_body_; }
+    map_[K(g->hash)] = g;
+    tip_ = g;
+}
 
-    // Build a classic "locator" (back by powers of two) from best header tip.
-    std::vector<std::vector<uint8_t>> locator() const;
+std::shared_ptr<HeaderRec> BlockIndex::add_header(const BlockHeader& h,
+                                                  const std::vector<uint8_t>& real_hash){
+    // Parent must be known for a well-formed extension.
+    auto pit = map_.find(K(h.prev_hash));
+    if(pit == map_.end()){
+        return nullptr; // unknown parent; caller can queue for later
+    }
 
-    // Given a peer's locator, find our first known HeaderRec on that path.
-    // Falls back to our genesis (root) if nothing matches.
-    std::shared_ptr<HeaderRec> find_fork(const std::vector<std::vector<uint8_t>>& locator) const;
+    auto rec = std::make_shared<HeaderRec>();
+    rec->hash   = real_hash;
+    rec->prev   = h.prev_hash;
+    rec->time   = h.time;
+    rec->bits   = h.bits;
+    rec->parent = pit->second;
+    rec->height = rec->parent->height + 1;
+    rec->chainwork = rec->parent->chainwork + work_from_bits(h.bits);
+    rec->have_body = false;
 
-    // Find the next header **towards the best header chain** from 'cur'.
-    // Returns nullptr if no child exists on (or toward) the best-work path.
-    std::shared_ptr<HeaderRec> next_on_best_header_chain(const std::shared_ptr<HeaderRec>& cur) const;
+    // Insert into maps.
+    map_[K(rec->hash)] = rec;
+    children_[K(rec->parent->hash)].push_back(rec);
 
-private:
-    // hash(hex) -> HeaderRec
-    std::unordered_map<std::string, std::shared_ptr<HeaderRec>> map_;
+    // Update best header tip by cumulative work.
+    if(!tip_ || rec->chainwork > tip_->chainwork){
+        tip_ = rec;
+    }
+    return rec;
+}
 
-    // Parent->children adjacency for forward walking.
-    std::unordered_map<std::string, std::vector<std::shared_ptr<HeaderRec>>> children_;
+void BlockIndex::set_have_body(const std::vector<uint8_t>& h){
+    auto it = map_.find(K(h));
+    if(it == map_.end()) return;
 
-    // Best header by chainwork.
-    std::shared_ptr<HeaderRec> tip_;
+    auto& rec = it->second;
+    rec->have_body = true;
 
-    // Best fully-connected block (body) tip.
-    std::shared_ptr<HeaderRec> best_body_;
-};
+    // Track best connected body tip by height (you could also compare chainwork).
+    if(!best_body_ || rec->height > best_body_->height){
+        best_body_ = rec;
+    }
+}
+
+std::vector<std::vector<uint8_t>> BlockIndex::locator() const{
+    std::vector<std::vector<uint8_t>> v;
+    auto cur = tip_;
+    int step = 1;
+    int count = 0;
+
+    while(cur && count < 32){
+        v.push_back(cur->hash);
+
+        // Walk back 'step' times if possible
+        for(int i=0; i<step && cur->parent; ++i){
+            cur = cur->parent;
+        }
+        if(count >= 10) step <<= 1; // powers of two after the first 10
+        ++count;
+    }
+
+    // Optionally include genesis (root)
+    // Find root by walking up from tip_
+    if(tip_){
+        auto root = tip_;
+        while(root->parent) root = root->parent;
+        if(v.empty() || K(v.back()) != K(root->hash)){
+            v.push_back(root->hash);
+        }
+    }
+
+    return v;
+}
+
+std::shared_ptr<HeaderRec> BlockIndex::find_fork(const std::vector<std::vector<uint8_t>>& locator) const{
+    // Return the first locator hash we know about; otherwise fall back to root.
+    for(const auto& h : locator){
+        auto it = map_.find(K(h));
+        if(it != map_.end()){
+            return it->second;
+        }
+    }
+    // Fallback: return root (walk parents from tip_)
+    if(!tip_) return nullptr;
+    auto cur = tip_;
+    while(cur->parent) cur = cur->parent;
+    return cur;
+}
+
+std::shared_ptr<HeaderRec> BlockIndex::next_on_best_header_chain(const std::shared_ptr<HeaderRec>& cur) const{
+    if(!cur) return nullptr;
+    auto it = children_.find(K(cur->hash));
+    if(it == children_.end() || it->second.empty()) return nullptr;
+
+    // Heuristic: pick the child with the greatest chainwork.
+    // Since tip_ is the highest chainwork header, repeatedly choosing the
+    // greatest chainwork child walks toward tip_ along a best-work path.
+    const auto& kids = it->second;
+    auto best = kids.front();
+    for(const auto& c : kids){
+        if(c->chainwork > best->chainwork){
+            best = c;
+        }
+    }
+    return best;
+}
 
 }
