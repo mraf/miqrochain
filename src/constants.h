@@ -77,4 +77,4 @@ static constexpr size_t MAX_MSG_SIZE   = 2 * 1024 * 1024; // 2 MiB
 // Optional: default RPC token (empty = no token unless MIQ_RPC_TOKEN env set)
 static constexpr const char* RPC_TOKEN_DEFAULT = "";
 
-} // namespace miq
+}
