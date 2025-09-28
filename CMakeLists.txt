@@ -128,7 +128,8 @@ add_executable(miqrod
 # Extra sources (kept separate)
 target_sources(miqrod PRIVATE
     src/reorg_manager.cpp
-    src/nat.cpp                 # UPnP helper (no-op unless MIQ_ENABLE_UPNP=1)
+    src/nat.cpp # UPnP helper (no-op unless MIQ_ENABLE_UPNP=1)
+    src/seeds.cpp
 )
 
 target_include_directories(miqrod PRIVATE
