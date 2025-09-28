@@ -1,9 +1,13 @@
 #include "mempool.h"
-#include "hash160.h"
 #include "serialize.h"
 #include "constants.h"
+#include "block.h"   // Block type for connect/disconnect
+#include "utxo.h"    // UTXOSet + UTXOEntry definition
+
 #include <algorithm>
 #include <queue>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace miq {
 
@@ -22,7 +26,7 @@ bool Mempool::exists(const std::vector<uint8_t>& txid) const {
 }
 
 size_t Mempool::est_tx_size(const Transaction& tx){
-    // Rough but stable estimate: serialized length
+    // Use actual serialized size for stability
     return ser_tx(tx).size();
 }
 
@@ -65,7 +69,7 @@ bool Mempool::validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView
             in_sum = tmp;
             continue;
         }
-        // Then UTXO set
+        // Then UTXO set via interface
         UTXOEntry e;
         if (!utxo.get(in.prev.txid, in.prev.vout, e)) {
             // Not found in UTXO or mempool -> orphan candidate
@@ -100,7 +104,7 @@ bool Mempool::compute_ancestor_stats(const Key& root, size_t& cnt, size_t& bytes
         cnt++;
         bytes += i2->second.size_bytes;
         for (const auto& pp : i2->second.parents) q.push_back(pp);
-        if (cnt > 4096) break; // sanity cap to avoid degenerate graphs
+        if (cnt > 4096) break; // sanity cap
     }
     return true;
 }
@@ -217,6 +221,7 @@ bool Mempool::enforce_limits_and_insert(const Transaction& tx, uint64_t fee, std
     return true;
 }
 
+// Generic accept
 bool Mempool::accept(const Transaction& tx, const UTXOView& utxo, uint32_t height, std::string& err){
     (void)height; // reserved for future height-based rules
 
@@ -236,7 +241,7 @@ bool Mempool::accept(const Transaction& tx, const UTXOView& utxo, uint32_t heigh
         return false;
     }
 
-    // Non-negative, reasonable fee
+    // Reasonable fee
     if (fee > (uint64_t)MAX_MONEY) { err="fee>MAX_MONEY"; return false; }
 
     if (!enforce_limits_and_insert(tx, fee, err)) return false;
@@ -244,6 +249,19 @@ bool Mempool::accept(const Transaction& tx, const UTXOView& utxo, uint32_t heigh
     // Accepting a tx may unblock orphans
     try_promote_orphans_depending_on(k(tx.txid()), utxo, height);
     return true;
+}
+
+// Overload for UTXOSet to keep existing call sites compiling
+struct UTXOAdapter : public UTXOView {
+    const UTXOSet& u;
+    explicit UTXOAdapter(const UTXOSet& uu) : u(uu) {}
+    bool get(const std::vector<uint8_t>& txid, uint32_t vout, UTXOEntry& out) const override {
+        return u.get(txid, vout, out);
+    }
+};
+bool Mempool::accept(const Transaction& tx, const UTXOSet& utxo, uint32_t height, std::string& err){
+    UTXOAdapter a(utxo);
+    return accept(tx, static_cast<const UTXOView&>(a), height, err);
 }
 
 void Mempool::add_orphan(const Transaction& tx){
@@ -360,42 +378,20 @@ void Mempool::on_block_connect(const Block& b){
         }
         // Remove any mempool txs that spend the same inputs (now conflicting with the block)
         for (const auto& in : tx.vin){
-            Key pk = k(in.prev.txid);
-            // Any direct children in the mempool parent graph?
-            auto pit = map_.find(pk);
-            if (pit != map_.end()){
-                // Children of this parent might include our conflicting spenders
-                std::vector<Key> to_remove;
-                for (const auto& child : pit->second.children) {
-                    const auto& mchild = map_[child].tx;
-                    for (const auto& cin : mchild.vin){
-                        if (cin.prev.txid == in.prev.txid && cin.prev.vout == in.prev.vout) {
-                            to_remove.push_back(child);
-                            break;
-                        }
+            // conservative scan for conflicts
+            std::vector<Key> victims;
+            for (const auto& kv : map_){
+                for (const auto& cin : kv.second.tx.vin){
+                    if (cin.prev.txid == in.prev.txid && cin.prev.vout == in.prev.vout) {
+                        victims.push_back(kv.first);
+                        break;
                     }
                 }
-                for (const auto& r : to_remove){
-                    unlink_entry(r);
-                    total_bytes_ -= map_[r].size_bytes;
-                    map_.erase(r);
-                }
-            } else {
-                // parent not in mempool; scan conservatively
-                std::vector<Key> victims;
-                for (const auto& kv : map_){
-                    for (const auto& cin : kv.second.tx.vin){
-                        if (cin.prev.txid == in.prev.txid && cin.prev.vout == in.prev.vout) {
-                            victims.push_back(kv.first);
-                            break;
-                        }
-                    }
-                }
-                for (const auto& r : victims){
-                    unlink_entry(r);
-                    total_bytes_ -= map_[r].size_bytes;
-                    map_.erase(r);
-                }
+            }
+            for (const auto& r : victims){
+                unlink_entry(r);
+                total_bytes_ -= map_[r].size_bytes;
+                map_.erase(r);
             }
         }
     }
@@ -408,6 +404,57 @@ void Mempool::on_block_disconnect(const Block& b, const UTXOView& utxo, uint32_t
         std::string err;
         (void)accept(tx, utxo, height, err); // if orphan/hard-reject, accept() handles it
     }
+}
+void Mempool::on_block_disconnect(const Block& b, const UTXOSet& utxo, uint32_t height){
+    UTXOAdapter a(utxo);
+    on_block_disconnect(b, static_cast<const UTXOView&>(a), height);
+}
+
+std::vector<Transaction> Mempool::collect(size_t max) const{
+    // Parents-first, highest feerate preference.
+    // Strategy: greedy passes—each pass select the best-fee tx whose parents
+    // are either not in mempool or already selected.
+    struct NodeRef {
+        const MempoolEntry* e;
+    };
+    std::vector<NodeRef> nodes;
+    nodes.reserve(map_.size());
+    for (const auto& kv : map_) nodes.push_back(NodeRef{&kv.second});
+
+    // Sort by fee rate (desc)
+    std::sort(nodes.begin(), nodes.end(), [](const NodeRef& a, const NodeRef& b){
+        if (a.e->fee_rate == b.e->fee_rate) return a.e->size_bytes < b.e->size_bytes;
+        return a.e->fee_rate > b.e->fee_rate;
+    });
+
+    std::unordered_set<std::string> selected_keys;
+    std::vector<Transaction> out; out.reserve(std::min(max, nodes.size()));
+    bool progress = true;
+
+    while (out.size() < max && progress) {
+        progress = false;
+        for (const auto& n : nodes) {
+            if (out.size() >= max) break;
+            const auto& e = *n.e;
+            const std::string myk = key_from_vec(e.tx.txid());
+            if (selected_keys.count(myk)) continue;
+
+            bool parents_ok = true;
+            for (const auto& pk : e.parents) {
+                // allow if parent not in mempool (spends confirmed UTXO) or already selected
+                if (map_.find(pk) != map_.end() && !selected_keys.count(pk)) {
+                    parents_ok = false; break;
+                }
+            }
+            if (!parents_ok) continue;
+
+            // select
+            out.push_back(e.tx);
+            selected_keys.insert(myk);
+            progress = true;
+        }
+    }
+    return out;
 }
 
 std::vector<std::vector<uint8_t>> Mempool::txids() const{
