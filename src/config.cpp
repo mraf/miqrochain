@@ -3,7 +3,7 @@
 #include <sstream>
 #include <algorithm>
 
-using namespace miq;{
+using namespace miq;
 
 static inline std::string trim(const std::string& s){
     auto a = s.find_first_not_of(" \t\r\n");
@@ -41,5 +41,4 @@ bool miq::load_config_from_file(const std::string& path, Config& out){
         else if(k=="rpc_tls_client_ca") out.rpc_tls_client_ca = v;
     }
     return true;
-}
 }
