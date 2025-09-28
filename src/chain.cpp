@@ -960,9 +960,6 @@ bool Chain::disconnect_tip_once(std::string& err){
         utxo_.add(u.prev_txid, u.prev_vout, u.prev_entry);
     }
 
-    const std::vector<UndoIn>*
-    ; // (no-op; keeps same structure as earlier diff)
-
     const auto& cb = cur.txs[0];
     uint64_t cb_sum = 0;
     for (size_t i = 0; i < cb.vout.size(); ++i) {
