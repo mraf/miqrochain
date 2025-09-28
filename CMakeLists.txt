@@ -130,6 +130,7 @@ target_sources(miqrod PRIVATE
     src/reorg_manager.cpp
     src/nat.cpp # UPnP helper (no-op unless MIQ_ENABLE_UPNP=1)
     src/seeds.cpp
+    src/mtp.cpp
 )
 
 target_include_directories(miqrod PRIVATE
