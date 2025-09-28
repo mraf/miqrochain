@@ -1,6 +1,8 @@
 // src/rpc.cpp
 #include "rpc.h"
 #include "sha256.h"
+#include "ibd_monitor.h"
+#include "ibd_monitor.h"
 #include "constants.h"
 #include "util.h"
 #include "hex.h"
@@ -95,6 +97,25 @@ static bool read_first_line_trim(const std::string& p, std::string& out) {
     out = s;
     return true;
 }
+
+static Json::Value rpc_getibdinfo(const Json::Value& params){
+    (void)params;
+    auto s = miq::get_ibd_info_snapshot();
+    Json::Value r(Json::objectValue);
+    r["ibd_active"] = s.ibd_active;
+    r["best_block_height"] = s.best_block_height;
+    r["est_best_header_height"] = s.est_best_header_height;
+    r["headers_ahead"] = s.headers_ahead;
+    r["peers"] = s.peers;
+    r["phase"] = s.phase;
+    r["started_ms"] = Json::UInt64(s.started_ms);
+    r["last_update_ms"] = Json::UInt64(s.last_update_ms);
+    return r;
+}
+
+// Registration (where you build your rpc_table):
+rpc_table["getibdinfo"] = rpc_getibdinfo;
+// === getibdinfo (END) ===
 
 static bool write_cookie_file_secure(const std::string& p, const std::string& tok) {
 #ifndef _WIN32
