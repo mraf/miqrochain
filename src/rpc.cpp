@@ -14,6 +14,7 @@
 #include "utxo.h"          // UTXOEntry & list_for_pkh
 
 #include <sstream>
+#include <array>
 #include <map>
 #include <exception>
 #include <chrono>
