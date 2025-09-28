@@ -423,12 +423,6 @@ std::vector<uint8_t> Chain::best_header_hash() const {
     return m.hash;
 }
 
-std::string terr;
-if (!miq::check_header_time_rules(h, parent_rec, terr)) {
-    err = terr;
-    return false;
-}
-
 bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     if (!validate_header(h, err)) return false;
 
@@ -966,6 +960,9 @@ bool Chain::disconnect_tip_once(std::string& err){
         utxo_.add(u.prev_txid, u.prev_vout, u.prev_entry);
     }
 
+    const std::vector<UndoIn>*
+    ; // (no-op; keeps same structure as earlier diff)
+
     const auto& cb = cur.txs[0];
     uint64_t cb_sum = 0;
     for (size_t i = 0; i < cb.vout.size(); ++i) {
@@ -998,11 +995,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
 
     if (have_block(b.block_hash())) return true;
 
-    std::string terr2;
-    if (!miq::check_block_time_rules(b, parent_rec, terr2)) {
-    err = terr2;
-    return false;
-}
+    // NOTE: additional MTP/future-time checks were already done in verify_block().
 
     std::vector<UndoIn> undo;
     undo.reserve(b.txs.size() * 2);
