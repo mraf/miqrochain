@@ -39,6 +39,9 @@ endif()
 # ------------------------------------------------------------------
 # micro-ecc source setup
 # ------------------------------------------------------------------
+# Choose one:
+find_package(LevelDB REQUIRED)
+target_link_libraries(miqrod PRIVATE LevelDB::LevelDB) # or rocksdb
 set(MICRO_ECC_DIR "")
 if(EXISTS "${MIQ_VENDOR_MICROECC_DIR}/uECC.c")
   set(MICRO_ECC_DIR "${MIQ_VENDOR_MICROECC_DIR}")
