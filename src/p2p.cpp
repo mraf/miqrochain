@@ -18,8 +18,13 @@
 #include <cstdio>
 #include <random>
 
-#ifndef MIQ_ENABLE_HEADERS_FIRST_WIP
-#define MIQ_ENABLE_HEADERS_FIRST_WIP 1  // ENABLED
+// ---- Feature flag (renamed, with backward-compat) --------------------------
+#ifndef MIQ_ENABLE_HEADERS_FIRST
+  #ifdef MIQ_ENABLE_HEADERS_FIRST_WIP
+    #define MIQ_ENABLE_HEADERS_FIRST MIQ_ENABLE_HEADERS_FIRST_WIP
+  #else
+    #define MIQ_ENABLE_HEADERS_FIRST 1  // ENABLED by default
+  #endif
 #endif
 
 #ifdef __has_include
@@ -151,6 +156,10 @@ static std::unordered_map<int, PeerGate> g_gate;
 static const size_t MAX_MSG_BYTES = 2 * 1024 * 1024; // 2 MiB per message (soft)
 static const int    MAX_BANSCORE  = 100;
 static const int    HANDSHAKE_MS  = 5000;            // must complete within 5s
+
+// IBD phase logging flags (log once per node lifetime)
+static bool g_logged_headers_started = false;
+static bool g_logged_headers_done    = false;
 
 static inline void gate_on_connect(int fd){
     PeerGate pg;
@@ -297,7 +306,7 @@ static int dial_be_ipv4(uint32_t be_ip, uint16_t port){
 
 namespace miq {
 
-#if MIQ_ENABLE_HEADERS_FIRST_WIP
+#if MIQ_ENABLE_HEADERS_FIRST
 // ---- headers-first wire helpers -------------------------------------------
 namespace {
     static constexpr size_t HEADER_WIRE_BYTES = 88;
@@ -392,7 +401,7 @@ namespace {
         return true;
     }
 } // anon
-#endif // MIQ_ENABLE_HEADERS_FIRST_WIP
+#endif // MIQ_ENABLE_HEADERS_FIRST
 
 static int64_t now_ms() {
     using namespace std::chrono;
@@ -1063,7 +1072,7 @@ void P2P::loop(){
                         ps.inv_in_window += add;
                         if (ps.inv_in_window > MIQ_P2P_INV_WINDOW_CAP) {
                             if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
-                            return false; // drop excess silently
+                            return false; // drop excess INV
                         }
                         return true;
                     };
@@ -1083,7 +1092,7 @@ void P2P::loop(){
 
                     } else if (cmd == "verack") {
                         ps.verack_ok = true;
-#if MIQ_ENABLE_HEADERS_FIRST_WIP
+#if MIQ_ENABLE_HEADERS_FIRST
                         // headers-first: send getheaders(locator, stop=0)
                         std::vector<std::vector<uint8_t>> locator;
                         chain_.build_locator(locator);
@@ -1091,6 +1100,12 @@ void P2P::loop(){
                         auto pl = build_getheaders_payload(locator, stop);
                         auto msg = encode_msg("getheaders", pl);
                         send(s, (const char*)msg.data(), (int)msg.size(), 0);
+
+                        // --- IBD log: started (once) ---
+                        if (!g_logged_headers_started) {
+                            g_logged_headers_started = true;
+                            log_info("[IBD] headers phase started");
+                        }
 #else
                         // existing block-first
                         ps.syncing = true;
@@ -1208,7 +1223,7 @@ void P2P::loop(){
                     } else if (cmd == "addr") {
                         handle_addr_msg(ps, m.payload);
 
-#if MIQ_ENABLE_HEADERS_FIRST_WIP
+#if MIQ_ENABLE_HEADERS_FIRST
                     } else if (cmd == "getheaders") {
                         // Peer wants headers after a locator
                         std::vector<std::vector<uint8_t>> locator;
@@ -1241,6 +1256,12 @@ void P2P::loop(){
                         std::vector<std::vector<uint8_t>> want;
                         chain_.next_block_fetch_targets(want, /*max*/32);
                         for (const auto& w : want) request_block_hash(ps, w);
+
+                        // --- IBD log: switching to blocks (once) ---
+                        if (!g_logged_headers_done && !want.empty()) {
+                            g_logged_headers_done = true;
+                            log_info("[IBD] headers phase complete; switching to blocks");
+                        }
 
                         // If batch full, peer likely has more — request next batch
                         if (hs.size() >= 2000) {
