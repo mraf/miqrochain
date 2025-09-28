@@ -27,6 +27,23 @@
 
 namespace miq {
 
+// === Optional hardening knobs (can be overridden at compile time) ============
+#ifndef MIQ_P2P_INV_WINDOW_MS
+#define MIQ_P2P_INV_WINDOW_MS 3000    // window for INV rate checks
+#endif
+#ifndef MIQ_P2P_INV_WINDOW_CAP
+#define MIQ_P2P_INV_WINDOW_CAP 200    // max invs we accept per window per peer
+#endif
+#ifndef MIQ_P2P_GETADDR_INTERVAL_MS
+#define MIQ_P2P_GETADDR_INTERVAL_MS 60000  // throttle our getaddr requests per peer
+#endif
+#ifndef MIQ_P2P_ADDR_BATCH_CAP
+#define MIQ_P2P_ADDR_BATCH_CAP 1000   // max addrs we accept per addr message
+#endif
+#ifndef MIQ_P2P_NEW_INBOUND_CAP_PER_MIN
+#define MIQ_P2P_NEW_INBOUND_CAP_PER_MIN 30 // soft cap: new inbound per minute
+#endif
+
 class Chain; // fwd
 
 struct OrphanRec {
@@ -69,6 +86,17 @@ struct PeerState {
 
     // tx relay: which txids we’ve requested and await
     std::unordered_set<std::string> inflight_tx;
+
+    // --- New: INV/ADDR throttling state (DoS hardening) --------------------
+    // Rolling INV window (basic storm damping)
+    int64_t     inv_win_start_ms{0};
+    uint32_t    inv_in_window{0};
+
+    // throttle how often we send getaddr to this peer
+    int64_t     last_getaddr_ms{0};
+
+    // Per-peer duplicate INV suppression (keys are hex txid/block-hash)
+    std::unordered_set<std::string> recent_inv_keys;
 };
 
 // Lightweight read-only snapshot for RPC/UI
@@ -149,6 +177,10 @@ private:
     size_t orphan_bytes_{0};
     size_t orphan_bytes_limit_{0};
     size_t orphan_count_limit_{0};
+
+    // Inbound rate gating (soft Sybil friction)
+    int64_t inbound_win_start_ms_{0};
+    uint32_t inbound_accepts_in_window_{0};
 
     // core
     void loop();
