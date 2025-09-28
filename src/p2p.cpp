@@ -1,4 +1,6 @@
 #include "p2p.h"
+#include "nat.h"
+#include "seeds.h"
 #include "log.h"
 #include "netmsg.h"
 #include "serialize.h"
@@ -473,9 +475,38 @@ bool P2P::start(uint16_t port){
     // load persisted addrs (best-effort)
     load_addrs_from_disk(datadir_, addrv4_);
 
-    srv_ = create_server(port);
-    if (srv_ < 0) { log_error("P2P: failed to create server"); return false; }
-    g_listen_port = port;
+srv_ = create_server(port);
+if (srv_ < 0) { log_error("P2P: failed to create server"); return false; }
+g_listen_port = port;
+
+// Try UPnP/NAT-PMP (no-op unless built with -DMIQ_ENABLE_UPNP=ON)
+{
+    std::string ext_ip;
+    miq::TryOpenP2PPort(port, &ext_ip);
+    if (!ext_ip.empty()) log_info("P2P: external IP (UPnP): " + ext_ip);
+}
+
+// Resolve bootstrap seeds from constants.h and stash into addr store
+{
+    std::vector<miq::SeedEndpoint> seeds;
+    if (miq::resolve_dns_seeds(seeds, port, /*include_single_dns_seed=*/true)) {
+        size_t added = 0;
+        for (const auto& s : seeds) {
+            uint32_t be_ip;
+            if (parse_ipv4(s.ip, be_ip) && ipv4_is_public(be_ip)) {
+                added += addrv4_.insert(be_ip).second ? 1 : 0;
+            }
+        }
+        if (added) log_info("P2P: loaded " + std::to_string(added) + " seed addrs");
+        // Optionally connect a few immediately to speed first sync:
+        size_t boots = std::min<size_t>(seeds.size(), 3);
+        for (size_t i = 0; i < boots; ++i) {
+            (void)connect_seed(seeds[i].ip, port); // best-effort
+        }
+    } else {
+        log_warn("P2P: no seeds resolved");
+    }
+}
 
     running_ = true;
     th_ = std::thread([this]{ loop(); });
