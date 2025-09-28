@@ -20,6 +20,7 @@
 using namespace miq;
 
 namespace {
+
 static void split_host_port(const std::string& s, std::string& host, int& port){
     auto p = s.find(':');
     if(p==std::string::npos){ host=s; port=0; return; }
@@ -75,9 +76,11 @@ static int connect_plain(const std::string& host, int port){
 static void proxy_once(SSL* ssl, int plain_sock){
     std::vector<unsigned char> buf(16*1024);
 
+    // Read HTTPS request
     int r = SSL_read(ssl, buf.data(), (int)buf.size());
     if(r<=0) return;
 
+    // Forward to RPC
     int off=0;
     while(off<r){
         int w=(int)send(plain_sock, (const char*)buf.data()+off, r-off, 0);
@@ -85,9 +88,11 @@ static void proxy_once(SSL* ssl, int plain_sock){
         off+=w;
     }
 
+    // Read RPC response
     int rr = recv(plain_sock, (char*)buf.data(), (int)buf.size(), 0);
     if(rr<=0) return;
 
+    // Send back over TLS
     off=0;
     while(off<rr){
         int ww=SSL_write(ssl, (const char*)buf.data()+off, rr-off);
@@ -95,7 +100,8 @@ static void proxy_once(SSL* ssl, int plain_sock){
         off+=ww;
     }
 }
-}
+
+} // anon
 
 TlsProxy::TlsProxy(const std::string& bind_hp,
                    const std::string& cert,
@@ -115,8 +121,8 @@ bool TlsProxy::start(std::string& err){
     if(bind_port_==0){ err="rpc_tls_bind missing port"; return false; }
     if(cert_.empty()||key_.empty()){ err="rpc_tls_cert/key required"; return false; }
 
-    run_=true;
-    th_=std::thread([this](){
+    run_ = true;
+    th_ = std::thread([this](){
         SSL_library_init();
         SSL_load_error_strings();
         const SSL_METHOD* method = TLS_server_method();
@@ -161,7 +167,6 @@ bool TlsProxy::start(std::string& err){
                 continue;
             }
 
-            // One req/resp per TCP — perfectly fine for JSON-RPC usage pattern.
             proxy_once(ssl, plain);
 
 #ifdef _WIN32
@@ -187,6 +192,6 @@ bool TlsProxy::start(std::string& err){
 
 void TlsProxy::stop(){
     if(!run_.load()) return;
-    run_=false;
+    run_ = false;
     if(th_.joinable()) th_.join();
 }
