@@ -475,38 +475,38 @@ bool P2P::start(uint16_t port){
     // load persisted addrs (best-effort)
     load_addrs_from_disk(datadir_, addrv4_);
 
-srv_ = create_server(port);
-if (srv_ < 0) { log_error("P2P: failed to create server"); return false; }
-g_listen_port = port;
+    srv_ = create_server(port);
+    if (srv_ < 0) { log_error("P2P: failed to create server"); return false; }
+    g_listen_port = port;
 
-// Try UPnP/NAT-PMP (no-op unless built with -DMIQ_ENABLE_UPNP=ON)
-{
-    std::string ext_ip;
-    miq::TryOpenP2PPort(port, &ext_ip);
-    if (!ext_ip.empty()) log_info("P2P: external IP (UPnP): " + ext_ip);
-}
-
-// Resolve bootstrap seeds from constants.h and stash into addr store
-{
-    std::vector<miq::SeedEndpoint> seeds;
-    if (miq::resolve_dns_seeds(seeds, port, /*include_single_dns_seed=*/true)) {
-        size_t added = 0;
-        for (const auto& s : seeds) {
-            uint32_t be_ip;
-            if (parse_ipv4(s.ip, be_ip) && ipv4_is_public(be_ip)) {
-                added += addrv4_.insert(be_ip).second ? 1 : 0;
-            }
-        }
-        if (added) log_info("P2P: loaded " + std::to_string(added) + " seed addrs");
-        // Optionally connect a few immediately to speed first sync:
-        size_t boots = std::min<size_t>(seeds.size(), 3);
-        for (size_t i = 0; i < boots; ++i) {
-            (void)connect_seed(seeds[i].ip, port); // best-effort
-        }
-    } else {
-        log_warn("P2P: no seeds resolved");
+    // Try UPnP/NAT-PMP (no-op unless built with -DMIQ_ENABLE_UPNP=ON)
+    {
+        std::string ext_ip;
+        miq::TryOpenP2PPort(port, &ext_ip);
+        if (!ext_ip.empty()) log_info("P2P: external IP (UPnP): " + ext_ip);
     }
-}
+
+    // Resolve bootstrap seeds from constants.h and stash into addr store
+    {
+        std::vector<miq::SeedEndpoint> seeds;
+        if (miq::resolve_dns_seeds(seeds, port, /*include_single_dns_seed=*/true)) {
+            size_t added = 0;
+            for (const auto& s : seeds) {
+                uint32_t be_ip;
+                if (parse_ipv4(s.ip, be_ip) && ipv4_is_public(be_ip)) {
+                    added += addrv4_.insert(be_ip).second ? 1 : 0;
+                }
+            }
+            if (added) log_info("P2P: loaded " + std::to_string(added) + " seed addrs");
+            // Optionally connect a few immediately to speed first sync:
+            size_t boots = std::min<size_t>(seeds.size(), 3);
+            for (size_t i = 0; i < boots; ++i) {
+                (void)connect_seed(seeds[i].ip, port); // best-effort
+            }
+        } else {
+            log_warn("P2P: no seeds resolved");
+        }
+    }
 
     running_ = true;
     th_ = std::thread([this]{ loop(); });
@@ -697,6 +697,10 @@ bool P2P::rate_consume_tx(PeerState& ps, size_t nbytes){
 // === addr handling ===========================================================
 
 void P2P::maybe_send_getaddr(PeerState& ps){
+    // Throttle how often we ask each peer for addrs
+    int64_t t = now_ms();
+    if (t - ps.last_getaddr_ms < (int64_t)MIQ_P2P_GETADDR_INTERVAL_MS) return;
+    ps.last_getaddr_ms = t;
     auto msg = encode_msg("getaddr", {});
     send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
 }
@@ -962,7 +966,7 @@ void P2P::loop(){
 #endif
         if (rc < 0) continue;
 
-        // Accept new peers
+        // Accept new peers (with soft inbound rate cap)
         if (srv_ >= 0) {
 #ifdef _WIN32
             if (fds[0].revents & POLLRDNORM) {
@@ -972,6 +976,18 @@ void P2P::loop(){
                 sockaddr_in ca{}; socklen_t clen = sizeof(ca);
                 int c = (int)accept(srv_, (sockaddr*)&ca, &clen);
                 if (c >= 0) {
+                    int64_t tnow = now_ms();
+                    if (tnow - inbound_win_start_ms_ > 60000) {
+                        inbound_win_start_ms_ = tnow;
+                        inbound_accepts_in_window_ = 0;
+                    }
+                    if (inbound_accepts_in_window_ >= MIQ_P2P_NEW_INBOUND_CAP_PER_MIN) {
+                        // Soft drop excess inbound to add Sybil friction
+                        CLOSESOCK(c);
+                        continue;
+                    }
+                    inbound_accepts_in_window_++;
+
                     char ipbuf[64] = {0};
 #ifdef _WIN32
                     InetNtopA(AF_INET, &ca.sin_addr, ipbuf, (int)sizeof(ipbuf));
@@ -1037,9 +1053,33 @@ void P2P::loop(){
                         send(s, (const char*)verack.data(), (int)verack.size(), 0);
                     }
 
+                    // --- INV storm damping helpers ---
+                    auto inv_tick = [&](unsigned add)->bool{
+                        int64_t tnow = now_ms();
+                        if (tnow - ps.inv_win_start_ms > (int64_t)MIQ_P2P_INV_WINDOW_MS) {
+                            ps.inv_win_start_ms = tnow;
+                            ps.inv_in_window = 0;
+                        }
+                        ps.inv_in_window += add;
+                        if (ps.inv_in_window > MIQ_P2P_INV_WINDOW_CAP) {
+                            if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
+                            return false; // drop excess silently
+                        }
+                        return true;
+                    };
+                    auto remember_inv = [&](const std::string& key)->bool{
+                        // return true if new; false if duplicate
+                        if (!ps.recent_inv_keys.insert(key).second) return false;
+                        // bound memory
+                        if (ps.recent_inv_keys.size() > 4096) {
+                            // crude clean: clear all to keep structure simple
+                            ps.recent_inv_keys.clear();
+                        }
+                        return true;
+                    };
+
                     if (cmd == "version") {
                         // also send our verack (done above via gate)
-                        // nothing else to do here
 
                     } else if (cmd == "verack") {
                         ps.verack_ok = true;
@@ -1068,6 +1108,9 @@ void P2P::loop(){
 
                     } else if (cmd == "invb") {
                         if (m.payload.size() == 32) {
+                            if (!inv_tick(1)) { /* drop excess INV */ continue; }
+                            auto k = hexkey(m.payload);
+                            if (!remember_inv(k)) { continue; } // duplicate INV from this peer
                             if (!chain_.have_block(m.payload)) {
                                 request_block_hash(ps, m.payload);
                             }
@@ -1104,7 +1147,9 @@ void P2P::loop(){
 
                     } else if (cmd == "invtx") {
                         if (m.payload.size() == 32) {
+                            if (!inv_tick(1)) { continue; }
                             auto key = hexkey(m.payload);
+                            if (!remember_inv(key)) { continue; }
                             if (!seen_txids_.count(key)) {
                                 seen_txids_.insert(key);
                                 request_tx(ps, m.payload);
