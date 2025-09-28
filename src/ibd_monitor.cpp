@@ -4,7 +4,6 @@
 #include <mutex>
 #include <chrono>
 
-// Forward-declared types are from your codebase:
 #include "chain.h"
 #include "p2p.h"
 
@@ -22,26 +21,27 @@ static uint64_t now_ms(){
 namespace miq {
 
 void start_ibd_monitor(Chain* chain, P2P* p2p){
+    (void)p2p; // not used yet; keep for future peer metrics
     if(g_run.exchange(true)) return;
     g_info.started_ms = now_ms();
 
-    // We only rely on methods that exist in your current main.cpp usage:
-    // - chain.tip() returns a struct with .height
-    // If you later add header-tip or peer counters, feel free to extend here.
-    std::thread([chain,p2p](){
+    std::thread([chain](){
         for(;;){
             if(!g_run.load()) break;
-            IBDInfo cur{};
-            cur.best_block_height = 0;
-            try {
-                auto t = chain->tip();
-                cur.best_block_height = t.height;
-            } catch(...) {}
 
-            // Conservative defaults (we don't assume header-tip API exists)
+            IBDInfo cur{};
+            // Minimal safe sampling: only use methods we know exist.
+            try {
+                auto t = chain->tip(); // your tip struct has .height
+                cur.best_block_height = t.height;
+            } catch(...) {
+                cur.best_block_height = 0;
+            }
+
+            // Without a header-tip API, use block height as conservative estimate.
             cur.est_best_header_height = cur.best_block_height;
             cur.headers_ahead = 0;
-            cur.peers = 0; // if P2P exposes a getter later, wire it here.
+            cur.peers = 0;
 
             cur.phase = (cur.best_block_height==0) ? "blocks" : "steady";
             cur.ibd_active = (cur.phase!="steady");
