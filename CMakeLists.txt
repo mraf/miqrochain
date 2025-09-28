@@ -103,7 +103,6 @@ else()
       message(FATAL_ERROR "LevelDB not found. Install a LevelDB dev package, set LevelDB_DIR, or enable MIQ_FETCH_LEVELDB.")
     endif()
     # Fetch LevelDB from upstream
-    # (Google LevelDB provides CMake targets named 'leveldb')
     FetchContent_Declare(
       leveldb_src
       GIT_REPOSITORY https://github.com/google/leveldb.git
@@ -113,13 +112,18 @@ else()
     set(LEVELDB_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(leveldb_src)
-    # Upstream target is 'leveldb'; create a namespaced alias to match find_package usage
     if(NOT TARGET LevelDB::LevelDB)
       add_library(LevelDB::LevelDB ALIAS leveldb)
     endif()
     set(MIQ_DB_TARGET LevelDB::LevelDB)
   endif()
 endif()
+
+# ------------------------------------------------------------------
+# TLS / Threads (for RPC TLS proxy & background threads)
+# ------------------------------------------------------------------
+find_package(OpenSSL REQUIRED)         # << NEW (needed for tls_proxy)
+find_package(Threads REQUIRED)         # << NEW (std::thread on POSIX)
 
 # ------------------------------------------------------------------
 # Main daemon
@@ -173,6 +177,10 @@ add_executable(miqrod
     # micro-ecc + shim (C sources)
     ${MICRO_ECC_DIR}/uECC.c
     src/crypto/uECC_shim.c
+
+    # --- NEW: TLS proxy & IBD monitor ---
+    src/tls_proxy.h src/tls_proxy.cpp
+    src/ibd_monitor.h src/ibd_monitor.cpp
 )
 
 # Extra sources (kept separate)
@@ -192,24 +200,22 @@ target_include_directories(miqrod PRIVATE
 target_compile_definitions(miqrod PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
 
 # Link DB backend
-if(MIQ_USE_ROCKSDB)
-  target_link_libraries(miqrod PRIVATE ${MIQ_DB_TARGET})
-else()
-  target_link_libraries(miqrod PRIVATE ${MIQ_DB_TARGET})
-endif()
+target_link_libraries(miqrod PRIVATE ${MIQ_DB_TARGET})
 
-# Windows sockets
+# Platform libs
 if(WIN32)
   target_link_libraries(miqrod PRIVATE Ws2_32)
 endif()
+
+# --- NEW: link TLS + Threads (needed regardless of wallet enc) ---
+target_link_libraries(miqrod PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 
 # ------------------------------------------------------------------
 # Optional Wallet Encryption (OpenSSL AES-256-GCM + PBKDF2)
 # ------------------------------------------------------------------
 if(MIQ_ENABLE_WALLET_ENC)
-  find_package(OpenSSL REQUIRED)
+  # OpenSSL already found above; this just adds the compile def and ensures libcrypto is linked (it already is).
   target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_WALLET_ENC=1)
-  target_link_libraries(miqrod PRIVATE OpenSSL::Crypto)
   message(STATUS "Wallet encryption: ENABLED (OpenSSL)")
 else()
   message(STATUS "Wallet encryption: DISABLED (default)")
