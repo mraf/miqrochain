@@ -2,6 +2,7 @@
 #include <cmath>      // std::pow
 #include <optional>
 #include "sha256.h"
+#include "mtp.h"
 #include <deque>
 #include "reorg_manager.h"
 #include "merkle.h"
@@ -420,6 +421,12 @@ std::vector<uint8_t> Chain::best_header_hash() const {
     if (best_header_key_.empty()) return tip_.hash;
     const auto& m = header_index_.at(best_header_key_);
     return m.hash;
+}
+
+std::string terr;
+if (!miq::check_header_time_rules(h, parent_rec, terr)) {
+    err = terr;
+    return false;
 }
 
 bool Chain::accept_header(const BlockHeader& h, std::string& err) {
@@ -990,6 +997,12 @@ bool Chain::submit_block(const Block& b, std::string& err){
     if (!verify_block(b, err)) return false;
 
     if (have_block(b.block_hash())) return true;
+
+    std::string terr2;
+    if (!miq::check_block_time_rules(b, parent_rec, terr2)) {
+    err = terr2;
+    return false;
+}
 
     std::vector<UndoIn> undo;
     undo.reserve(b.txs.size() * 2);
