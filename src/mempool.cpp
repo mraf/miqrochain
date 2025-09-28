@@ -12,6 +12,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <cstdlib>   // getenv, strtoull
 
 // OPTIONAL include of constants (for MAX_TX_SIZE or toggles).
 #ifdef __has_include
@@ -33,7 +34,26 @@
 
 namespace miq {
 
-// ---- secp256k1 order constants (big-endian), local to mempool --------------
+// =================== env helpers (policy, non-consensus) =====================
+
+static inline uint64_t env_u64(const char* name, uint64_t defv){
+    const char* v = std::getenv(name);
+    if(!v || !*v) return defv;
+    char* end=nullptr;
+    unsigned long long x = std::strtoull(v, &end, 10);
+    if(end==v) return defv;
+    return (uint64_t)x;
+}
+static inline size_t env_szt(const char* name, size_t defv){
+    const char* v = std::getenv(name);
+    if(!v || !*v) return defv;
+    char* end=nullptr; unsigned long long x = std::strtoull(v, &end, 10);
+    if(end==v) return defv;
+    return (size_t)x;
+}
+
+// =================== secp256k1 order constants ===============================
+
 static inline const uint8_t* SECP256K1_N_BE(){
     // n = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
     static const uint8_t N[32] = {
@@ -55,7 +75,7 @@ static inline const uint8_t* SECP256K1_N_HALF_BE(){
     return H;
 }
 
-// --- Canonical RAW-64 (r||s) + Low-S checks ---------------------------------
+// =================== Canonical RAW-64 (r||s) + Low-S =========================
 
 // Big-endian compare (32B)
 static inline int be_cmp32(const uint8_t* a, const uint8_t* b){
@@ -88,13 +108,15 @@ static inline bool is_canonical_raw64_lows(const std::vector<uint8_t>& sig64){
     return true;
 }
 
-// --- Sighash for verify ------------------------------------------------------
+// =================== Sighash for verify =====================================
 
 static std::vector<uint8_t> sighash_simple(const Transaction& tx){
     // Simple SIGHASH: hash of serialized tx without signatures
     Transaction t=tx; for(auto& in: t.vin){ in.sig.clear(); }
     return dsha256(ser_tx(t));
 }
+
+// =================== Mempool impl ===========================================
 
 std::string Mempool::key(const std::vector<uint8_t>& txid) const { return hex(txid); }
 
@@ -111,10 +133,20 @@ void Mempool::maybe_evict(){
 bool Mempool::accept(const Transaction& tx, const UTXOSet& utxo, size_t height, std::string& err){
     if (tx.vin.empty() || tx.vout.empty()) { err = "empty vin/vout"; return false; }
 
+    // Policy knobs (env-overridable)
+    const uint64_t DUST_SAT           = env_u64("MIQ_DUST_SAT", 546ULL);               // default ~BTC P2PKH dust
+    const uint64_t MIN_RELAY_PER_KB   = env_u64("MIQ_MIN_RELAY_PER_KB", 1000ULL);      // 1000 sat/kB == 1 sat/vB
+    const size_t   MAX_VIN_POLICY     = env_szt("MIQ_MEMPOOL_MAX_VIN",  256);
+    const size_t   MAX_VOUT_POLICY    = env_szt("MIQ_MEMPOOL_MAX_VOUT", 128);
+
     // Size cap (DoS)
     const auto raw = ser_tx(tx);
     const size_t raw_sz = raw.size();
     if (raw_sz > MIQ_FALLBACK_MAX_TX_SIZE) { err = "tx too large"; return false; }
+
+    // Simple structural caps (policy)
+    if (tx.vin.size()  > MAX_VIN_POLICY)  { err = "too many inputs";  return false; }
+    if (tx.vout.size() > MAX_VOUT_POLICY) { err = "too many outputs"; return false; }
 
     // No duplicate txid in mempool
     const std::string txk = key(tx.txid());
@@ -182,6 +214,7 @@ bool Mempool::accept(const Transaction& tx, const UTXOSet& utxo, size_t height, 
 
     for (const auto& o : tx.vout) {
         if (!leq_max_money(o.value)) { err = "txout>MAX_MONEY"; return false; }
+        if (o.value < DUST_SAT)      { err = "dust output";     return false; }
         if (!add_u64_safe(out, o.value, tmp)) { err = "tx out overflow"; return false; }
         out = tmp;
     }
@@ -189,14 +222,24 @@ bool Mempool::accept(const Transaction& tx, const UTXOSet& utxo, size_t height, 
     if (!leq_max_money(in) || !leq_max_money(out)) { err = "sum>MAX_MONEY"; return false; }
     if (out > in) { err = "outputs>inputs"; return false; }
 
-    // Fee policy (unchanged)
-    const size_t sz = tx.vin.size()*180 + tx.vout.size()*34 + 10;
-    const uint64_t minfee = (sz/100) + 1;
-    const uint64_t fee = in - out;
+    // ---- Fee policy (non-consensus; env-tunable) ----------------------------
+    // Old heuristic (kept for compatibility): ~1 sat/byte using rough estimator.
+    const size_t est_sz = tx.vin.size()*180 + tx.vout.size()*34 + 10;
+    const uint64_t legacy_minfee = (est_sz/100) + 1; // (~1 sat/100B + 1)
+
+    // New policy: sat/kilobyte floor on *actual serialized size*.
+    // MIN_RELAY_PER_KB=1000 ⇒ 1 sat/vB.
+    uint64_t kb = (uint64_t)((raw_sz + 999) / 1000);
+    if (kb == 0) kb = 1;
+    const uint64_t env_minfee = MIN_RELAY_PER_KB * kb;
+
+    const uint64_t minfee = std::max(legacy_minfee, env_minfee);
+    const uint64_t fee    = in - out;
+
     if (fee < minfee) { err = "low fee"; return false; }
 
-    const double fr = (double)fee / (double)sz;
-    map_[txk] = MempoolEntry{tx, fee, sz, fr};
+    const double fr = (double)fee / (double)raw_sz; // feerate by real size
+    map_[txk] = MempoolEntry{tx, fee, raw_sz, fr};
     maybe_evict();
     return true;
 }
