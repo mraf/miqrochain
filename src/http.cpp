@@ -14,8 +14,8 @@
 #include <chrono>
 #include <atomic>
 
+// --- platform sockets + sleep -----------------------------------------------
 #ifdef _WIN32
-  // Prevent Windows headers from defining min/max macros that break std::min/std::max
   #ifndef NOMINMAX
   #define NOMINMAX 1
   #endif
@@ -25,7 +25,7 @@
   #pragma comment(lib, "Ws2_32.lib")
   using socklen_t = int;
   using sock_t = SOCKET;
-  static inline void miq_sleep_ms(unsigned ms){ Sleep(ms); }
+  // no macro remap; native closesocket() exists on Windows
 #else
   #include <sys/types.h>
   #include <sys/socket.h>
@@ -35,31 +35,17 @@
   #include <fcntl.h>
   #include <arpa/inet.h>
   using sock_t = int;
-  static inline void miq_sleep_ms(unsigned ms){ usleep(ms*1000); }
   #define closesocket ::close
 #endif
 
-
+static inline void miq_sleep_ms(unsigned ms){
 #ifdef _WIN32
-  #define _WINSOCK_DEPRECATED_NO_WARNINGS
-  #include <winsock2.h>
-  #include <ws2tcpip.h>
-  #pragma comment(lib, "Ws2_32.lib")
-  using socklen_t = int;
-  using sock_t = SOCKET;
-  static inline void miq_sleep_ms(unsigned ms){ Sleep(ms); }
+  Sleep(ms);
 #else
-  #include <sys/types.h>
-  #include <sys/socket.h>
-  #include <netinet/in.h>
-  #include <netdb.h>
-  #include <unistd.h>
-  #include <fcntl.h>
-  #include <arpa/inet.h>
-  using sock_t = int;
-  static inline void miq_sleep_ms(unsigned ms){ usleep(ms*1000); }
-  #define closesocket ::close
+  usleep(ms * 1000);
 #endif
+}
+
 
 namespace miq {
 
