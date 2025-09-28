@@ -1,261 +1,421 @@
-// src/mempool.cpp
-#include "serialize.h"
-
 #include "mempool.h"
-#include "util.h"
-#include "sig_encoding.h"     // still used for other helpers elsewhere
-#include "sha256.h"
-#include "crypto/ecdsa_iface.h"
 #include "hash160.h"
-#include <unordered_set>
+#include "serialize.h"
+#include "constants.h"
 #include <algorithm>
-#include <vector>
-#include <string>
-#include <cstdint>
-#include <cstdlib>   // getenv, strtoull
-
-// OPTIONAL include of constants (for MAX_TX_SIZE or toggles).
-#ifdef __has_include
-#  if __has_include("constants.h")
-#    include "constants.h"
-#  endif
-#endif
-
-#ifndef MAX_TX_SIZE
-#define MIQ_FALLBACK_MAX_TX_SIZE (100u * 1024u) // 100 KiB fallback
-#else
-#define MIQ_FALLBACK_MAX_TX_SIZE (MAX_TX_SIZE)
-#endif
-
-// Default: ENFORCE Low-S & canonical RAW-64 in mempool (policy)
-#ifndef MIQ_RULE_ENFORCE_LOW_S
-#define MIQ_RULE_ENFORCE_LOW_S 1
-#endif
+#include <queue>
 
 namespace miq {
 
-// =================== env helpers (policy, non-consensus) =====================
-
-static inline uint64_t env_u64(const char* name, uint64_t defv){
-    const char* v = std::getenv(name);
-    if(!v || !*v) return defv;
-    char* end=nullptr;
-    unsigned long long x = std::strtoull(v, &end, 10);
-    if(end==v) return defv;
-    return (uint64_t)x;
-}
-static inline size_t env_szt(const char* name, size_t defv){
-    const char* v = std::getenv(name);
-    if(!v || !*v) return defv;
-    char* end=nullptr; unsigned long long x = std::strtoull(v, &end, 10);
-    if(end==v) return defv;
-    return (size_t)x;
+static inline std::string key_from_vec(const std::vector<uint8_t>& v){
+    return std::string(reinterpret_cast<const char*>(v.data()), v.size());
 }
 
-// =================== secp256k1 order constants ===============================
+Mempool::Mempool() {}
 
-static inline const uint8_t* SECP256K1_N_BE(){
-    // n = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-    static const uint8_t N[32] = {
-        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,
-        0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B,
-        0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41
-    };
-    return N;
-}
-static inline const uint8_t* SECP256K1_N_HALF_BE(){
-    // n/2 = 7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
-    static const uint8_t H[32] = {
-        0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-        0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,
-        0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0
-    };
-    return H;
+Mempool::Key Mempool::k(const std::vector<uint8_t>& txid){
+    return key_from_vec(txid);
 }
 
-// =================== Canonical RAW-64 (r||s) + Low-S =========================
+bool Mempool::exists(const std::vector<uint8_t>& txid) const {
+    return map_.find(k(txid)) != map_.end();
+}
 
-// Big-endian compare (32B)
-static inline int be_cmp32(const uint8_t* a, const uint8_t* b){
-    for(int i=0;i<32;i++){
-        if(a[i] < b[i]) return -1;
-        if(a[i] > b[i]) return 1;
+size_t Mempool::est_tx_size(const Transaction& tx){
+    // Rough but stable estimate: serialized length
+    return ser_tx(tx).size();
+}
+
+uint64_t Mempool::sum_outputs(const Transaction& tx){
+    uint64_t out=0;
+    for (const auto& o: tx.vout){
+        uint64_t tmp = out + o.value;
+        if (tmp < out) return (uint64_t)-1; // overflow guard
+        out = tmp;
     }
-    return 0;
+    return out;
 }
 
-static inline bool be_is_zero32(const uint8_t* a){
-    for(int i=0;i<32;i++) if(a[i]!=0) return false;
+int64_t Mempool::now_ms(){
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+bool Mempool::validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView& utxo, uint64_t& fee, std::string& err) const {
+    // coinbase cannot be in mempool
+    if (tx.vin.size()==1 &&
+        tx.vin[0].prev.vout==0 &&
+        tx.vin[0].prev.txid.size()==32 &&
+        std::all_of(tx.vin[0].prev.txid.begin(), tx.vin[0].prev.txid.end(), [](uint8_t v){return v==0;})) {
+        err = "coinbase in mempool";
+        return false;
+    }
+
+    // Sum inputs using UTXO or mempool-provided outputs
+    uint64_t in_sum = 0;
+    for (const auto& in : tx.vin) {
+        // Try mempool parent first
+        auto pit = map_.find(k(in.prev.txid));
+        if (pit != map_.end()) {
+            const auto& ptx = pit->second.tx;
+            if (in.prev.vout >= ptx.vout.size()) { err="bad prev vout"; return false; }
+            uint64_t val = ptx.vout[in.prev.vout].value;
+            uint64_t tmp = in_sum + val;
+            if (tmp < in_sum) { err="input overflow"; return false; }
+            in_sum = tmp;
+            continue;
+        }
+        // Then UTXO set
+        UTXOEntry e;
+        if (!utxo.get(in.prev.txid, in.prev.vout, e)) {
+            // Not found in UTXO or mempool -> orphan candidate
+            err.clear();
+            return false; // caller treats empty err as orphan
+        }
+        uint64_t tmp = in_sum + e.value;
+        if (tmp < in_sum) { err="input overflow"; return false; }
+        in_sum = tmp;
+    }
+
+    uint64_t out_sum = sum_outputs(tx);
+    if (out_sum == (uint64_t)-1) { err="output overflow"; return false; }
+    if (out_sum > in_sum) { err="fees negative"; return false; }
+    fee = in_sum - out_sum;
     return true;
 }
 
-// Check r in [1, n-1], s in [1, n/2] (Low-S) for RAW-64 signature
-static inline bool is_canonical_raw64_lows(const std::vector<uint8_t>& sig64){
-    if (sig64.size() != 64) return false;
-    const uint8_t* r = sig64.data();
-    const uint8_t* s = sig64.data() + 32;
+bool Mempool::compute_ancestor_stats(const Key& root, size_t& cnt, size_t& bytes) const {
+    cnt = 0; bytes = 0;
+    std::unordered_set<Key> seen;
+    std::deque<Key> q;
+    auto it = map_.find(root);
+    if (it == map_.end()) return false;
+    for (const auto& p : it->second.parents) q.push_back(p);
 
-    // r != 0 and r < n
-    if (be_is_zero32(r)) return false;
-    if (be_cmp32(r, SECP256K1_N_BE()) >= 0) return false;
+    while (!q.empty()){
+        Key u = q.front(); q.pop_front();
+        if (!seen.insert(u).second) continue;
+        auto i2 = map_.find(u);
+        if (i2 == map_.end()) continue; // parent might have left; ignore
+        cnt++;
+        bytes += i2->second.size_bytes;
+        for (const auto& pp : i2->second.parents) q.push_back(pp);
+        if (cnt > 4096) break; // sanity cap to avoid degenerate graphs
+    }
+    return true;
+}
+bool Mempool::compute_descendant_stats(const Key& root, size_t& cnt, size_t& bytes) const {
+    cnt = 0; bytes = 0;
+    std::unordered_set<Key> seen;
+    std::deque<Key> q;
+    q.push_back(root);
+    while (!q.empty()){
+        Key u = q.front(); q.pop_front();
+        auto it = map_.find(u);
+        if (it == map_.end()) continue;
+        for (const auto& ch : it->second.children) {
+            if (!seen.insert(ch).second) continue;
+            auto c2 = map_.find(ch);
+            if (c2 == map_.end()) continue;
+            cnt++;
+            bytes += c2->second.size_bytes;
+            q.push_back(ch);
+            if (cnt > 4096) break;
+        }
+        if (cnt > 4096) break;
+    }
+    return true;
+}
 
-    // s != 0 and s <= n/2  (low-S)
-    if (be_is_zero32(s)) return false;
-    if (be_cmp32(s, SECP256K1_N_HALF_BE()) > 0) return false;
+void Mempool::link_child_to_parents(const Key& child, const std::vector<TxIn>& vin){
+    auto cit = map_.find(child);
+    if (cit == map_.end()) return;
+    for (const auto& in : vin) {
+        Key pk = k(in.prev.txid);
+        auto pit = map_.find(pk);
+        if (pit != map_.end()) {
+            cit->second.parents.insert(pk);
+            pit->second.children.insert(child);
+        }
+    }
+    // Recompute ancestor/descendant aggregates
+    size_t ac=0, ab=0, dc=0, db=0;
+    compute_ancestor_stats(child, ac, ab);
+    compute_descendant_stats(child, dc, db);
+    cit->second.ancestor_count = ac;
+    cit->second.ancestor_size  = ab;
+    cit->second.descendant_count = dc;
+    cit->second.descendant_size  = db;
+}
+
+void Mempool::unlink_entry(const Key& kk){
+    auto it = map_.find(kk);
+    if (it == map_.end()) return;
+    // Remove child link from all parents
+    for (const auto& pk : it->second.parents) {
+        auto pit = map_.find(pk);
+        if (pit != map_.end()) pit->second.children.erase(kk);
+    }
+    // Remove parent link from all children
+    for (const auto& ck : it->second.children) {
+        auto cit = map_.find(ck);
+        if (cit != map_.end()) cit->second.parents.erase(kk);
+    }
+}
+
+bool Mempool::enforce_limits_and_insert(const Transaction& tx, uint64_t fee, std::string& err){
+    Key kk = k(tx.txid());
+    if (map_.find(kk) != map_.end()) return true; // already in
+
+    size_t sz = est_tx_size(tx);
+    // Build entry
+    MempoolEntry e;
+    e.tx = tx;
+    e.size_bytes = sz;
+    e.fee = fee;
+    e.fee_rate = sz ? (double)fee / (double)sz : 0.0;
+    e.added_ms = now_ms();
+
+    // Temporarily stage it to compute ancestry limits
+    map_.emplace(kk, std::move(e));
+    total_bytes_ += sz;
+
+    link_child_to_parents(kk, tx.vin);
+
+    // Enforce ancestor/descendant limits
+    size_t ac=0, ab=0, dc=0, db=0;
+    compute_ancestor_stats(kk, ac, ab);
+    compute_descendant_stats(kk, dc, db);
+    if (ac > MIQ_MEMPOOL_MAX_ANCESTORS) {
+        err = "too many ancestors";
+        unlink_entry(kk);
+        map_.erase(kk);
+        total_bytes_ -= sz;
+        return false;
+    }
+    if (dc > MIQ_MEMPOOL_MAX_DESCENDANTS) {
+        err = "too many descendants";
+        unlink_entry(kk);
+        map_.erase(kk);
+        total_bytes_ -= sz;
+        return false;
+    }
+
+    // Trim pool if needed based on fee rate
+    if (total_bytes_ > MIQ_MEMPOOL_MAX_BYTES) {
+        evict_lowest_feerate_until(MIQ_MEMPOOL_MAX_BYTES);
+        if (total_bytes_ > MIQ_MEMPOOL_MAX_BYTES) {
+            // Couldn’t make space (fee too low)
+            err = "mempool full (low feerate)";
+            unlink_entry(kk);
+            map_.erase(kk);
+            total_bytes_ -= sz;
+            return false;
+        }
+    }
 
     return true;
 }
 
-// =================== Sighash for verify =====================================
+bool Mempool::accept(const Transaction& tx, const UTXOView& utxo, uint32_t height, std::string& err){
+    (void)height; // reserved for future height-based rules
 
-static std::vector<uint8_t> sighash_simple(const Transaction& tx){
-    // Simple SIGHASH: hash of serialized tx without signatures
-    Transaction t=tx; for(auto& in: t.vin){ in.sig.clear(); }
-    return dsha256(ser_tx(t));
+    // Quick dup check
+    if (exists(tx.txid())) return true;
+
+    // Calculate fee; if missing inputs, store as orphan
+    uint64_t fee = 0;
+    std::string terr;
+    if (!validate_inputs_and_calc_fee(tx, utxo, fee, terr)) {
+        if (terr.empty()) {
+            // Orphan path: cache and index by missing parents
+            add_orphan(tx);
+            return true; // not a hard reject
+        }
+        err = terr;
+        return false;
+    }
+
+    // Non-negative, reasonable fee
+    if (fee > (uint64_t)MAX_MONEY) { err="fee>MAX_MONEY"; return false; }
+
+    if (!enforce_limits_and_insert(tx, fee, err)) return false;
+
+    // Accepting a tx may unblock orphans
+    try_promote_orphans_depending_on(k(tx.txid()), utxo, height);
+    return true;
 }
 
-// =================== Mempool impl ===========================================
-
-std::string Mempool::key(const std::vector<uint8_t>& txid) const { return hex(txid); }
-
-void Mempool::maybe_evict(){
-    if(map_.size()<=max_) return;
-    std::vector<std::pair<std::string,double>> v; v.reserve(map_.size());
-    for(const auto& kv: map_) v.push_back({kv.first, kv.second.feerate});
-    std::sort(v.begin(),v.end(),[](auto&a,auto&b){return a.second<b.second;});
-    size_t rm=map_.size()-max_;
-    for(size_t i=0;i<rm;i++) map_.erase(v[i].first);
+void Mempool::add_orphan(const Transaction& tx){
+    Key ck = k(tx.txid());
+    if (orphans_.find(ck) != orphans_.end()) return;
+    orphans_.emplace(ck, tx);
+    for (const auto& in : tx.vin){
+        Key pk = k(in.prev.txid);
+        waiting_on_[pk].insert(ck);
+    }
 }
 
-// NOTE: height type is size_t to match callers (avoids ABI mismatch)
-bool Mempool::accept(const Transaction& tx, const UTXOSet& utxo, size_t height, std::string& err){
-    if (tx.vin.empty() || tx.vout.empty()) { err = "empty vin/vout"; return false; }
+void Mempool::remove_orphan(const Key& ck){
+    auto it = orphans_.find(ck);
+    if (it == orphans_.end()) return;
+    for (const auto& in : it->second.vin){
+        Key pk = k(in.prev.txid);
+        auto wit = waiting_on_.find(pk);
+        if (wit != waiting_on_.end()){
+            wit->second.erase(ck);
+            if (wit->second.empty()) waiting_on_.erase(wit);
+        }
+    }
+    orphans_.erase(it);
+}
 
-    // Policy knobs (env-overridable)
-    const uint64_t DUST_SAT           = env_u64("MIQ_DUST_SAT", 546ULL);               // default ~BTC P2PKH dust
-    const uint64_t MIN_RELAY_PER_KB   = env_u64("MIQ_MIN_RELAY_PER_KB", 1000ULL);      // 1000 sat/kB == 1 sat/vB
-    const size_t   MAX_VIN_POLICY     = env_szt("MIQ_MEMPOOL_MAX_VIN",  256);
-    const size_t   MAX_VOUT_POLICY    = env_szt("MIQ_MEMPOOL_MAX_VOUT", 128);
+void Mempool::try_promote_orphans_depending_on(const Key& parent, const UTXOView& utxo, uint32_t height){
+    auto wit = waiting_on_.find(parent);
+    if (wit == waiting_on_.end()) return;
 
-    // Size cap (DoS)
-    const auto raw = ser_tx(tx);
-    const size_t raw_sz = raw.size();
-    if (raw_sz > MIQ_FALLBACK_MAX_TX_SIZE) { err = "tx too large"; return false; }
+    // Copy to avoid iterator invalidation if we mutate maps
+    std::vector<Key> cands(wit->second.begin(), wit->second.end());
+    // Clear the waiting list for this parent (children may re-register if still missing other inputs)
+    waiting_on_.erase(wit);
 
-    // Simple structural caps (policy)
-    if (tx.vin.size()  > MAX_VIN_POLICY)  { err = "too many inputs";  return false; }
-    if (tx.vout.size() > MAX_VOUT_POLICY) { err = "too many outputs"; return false; }
+    for (const auto& ck : cands){
+        auto oit = orphans_.find(ck);
+        if (oit == orphans_.end()) continue;
+        std::string err;
+        if (accept(oit->second, utxo, height, err)) {
+            remove_orphan(ck);
+        } else {
+            // Hard rejected, drop it
+            remove_orphan(ck);
+        }
+    }
+}
 
-    // No duplicate txid in mempool
-    const std::string txk = key(tx.txid());
-    if (map_.count(txk)) { err = "duplicate"; return false; }
+void Mempool::evict_lowest_feerate_until(size_t target_bytes){
+    if (total_bytes_ <= target_bytes) return;
 
-    // Reject conflicts against already-seen spends in mempool
+    // Build a min-heap by fee rate
+    struct Item { double fr; Key k; size_t sz; };
+    auto cmp = [](const Item& a, const Item& b){ return a.fr > b.fr; };
+    std::priority_queue<Item, std::vector<Item>, decltype(cmp)> pq(cmp);
+
     for (const auto& kv : map_) {
-        const auto& other = kv.second.tx;
-        for (const auto& i1 : tx.vin) {
-            for (const auto& i2 : other.vin) {
-                if (i1.prev.vout == i2.prev.vout && i1.prev.txid == i2.prev.txid) {
-                    err = "conflict"; return false;
+        pq.push(Item{kv.second.fee_rate, kv.first, kv.second.size_bytes});
+    }
+
+    // Evict until under target
+    while (total_bytes_ > target_bytes && !pq.empty()){
+        auto it = map_.find(pq.top().k);
+        pq.pop();
+        if (it == map_.end()) continue; // already evicted by linkage cascade
+
+        // Prefer evicting leaf descendants first to reduce churn
+        if (!it->second.children.empty()) {
+            // Requeue with slight penalty to try others first
+            pq.push(Item{it->second.fee_rate * 1.01, it->first, it->second.size_bytes});
+            continue;
+        }
+
+        // Unlink and erase
+        unlink_entry(it->first);
+        total_bytes_ -= it->second.size_bytes;
+        map_.erase(it);
+    }
+}
+
+void Mempool::trim_to_size(size_t max_bytes){
+    if (total_bytes_ <= max_bytes) return;
+    evict_lowest_feerate_until(max_bytes);
+}
+
+void Mempool::maintenance(){
+    // Expire very old entries
+    int64_t cutoff = now_ms() - (int64_t)MIQ_MEMPOOL_TX_EXPIRY_SECS * 1000;
+    std::vector<Key> expired;
+    for (const auto& kv : map_) {
+        if (kv.second.added_ms < cutoff) expired.push_back(kv.first);
+    }
+    for (const auto& kx : expired) {
+        unlink_entry(kx);
+        total_bytes_ -= map_[kx].size_bytes;
+        map_.erase(kx);
+    }
+    // Trim to size (in case)
+    trim_to_size(MIQ_MEMPOOL_MAX_BYTES);
+}
+
+void Mempool::on_block_connect(const Block& b){
+    // Remove all txs that were confirmed and any in-mempool conflicts
+    // (coinbase is never in mempool)
+    for (size_t i=1; i<b.txs.size(); ++i){
+        const auto& tx = b.txs[i];
+        Key kk = k(tx.txid());
+        // Remove this tx if present
+        auto it = map_.find(kk);
+        if (it != map_.end()) {
+            unlink_entry(kk);
+            total_bytes_ -= it->second.size_bytes;
+            map_.erase(it);
+        }
+        // Remove any mempool txs that spend the same inputs (now conflicting with the block)
+        for (const auto& in : tx.vin){
+            Key pk = k(in.prev.txid);
+            // Any direct children in the mempool parent graph?
+            auto pit = map_.find(pk);
+            if (pit != map_.end()){
+                // Children of this parent might include our conflicting spenders
+                std::vector<Key> to_remove;
+                for (const auto& child : pit->second.children) {
+                    const auto& mchild = map_[child].tx;
+                    for (const auto& cin : mchild.vin){
+                        if (cin.prev.txid == in.prev.txid && cin.prev.vout == in.prev.vout) {
+                            to_remove.push_back(child);
+                            break;
+                        }
+                    }
+                }
+                for (const auto& r : to_remove){
+                    unlink_entry(r);
+                    total_bytes_ -= map_[r].size_bytes;
+                    map_.erase(r);
+                }
+            } else {
+                // parent not in mempool; scan conservatively
+                std::vector<Key> victims;
+                for (const auto& kv : map_){
+                    for (const auto& cin : kv.second.tx.vin){
+                        if (cin.prev.txid == in.prev.txid && cin.prev.vout == in.prev.vout) {
+                            victims.push_back(kv.first);
+                            break;
+                        }
+                    }
+                }
+                for (const auto& r : victims){
+                    unlink_entry(r);
+                    total_bytes_ -= map_[r].size_bytes;
+                    map_.erase(r);
                 }
             }
         }
     }
-
-    // ---- Safe math helpers ----
-    auto add_u64_safe = [](uint64_t a, uint64_t b, uint64_t& out)->bool { out = a + b; return out >= a; };
-
-#ifndef MAX_MONEY
-#  define MIQ_FALLBACK_MAX_MONEY (26280000ull * 100000000ull) // 26,280,000 * COIN
-#  define MIQ__USE_FALLBACK_MAX_MONEY
-#endif
-    auto leq_max_money = [](uint64_t v)->bool {
-    #ifdef MIQ__USE_FALLBACK_MAX_MONEY
-        return v <= MIQ_FALLBACK_MAX_MONEY;
-    #else
-        return v <= (uint64_t)MAX_MONEY;
-    #endif
-    };
-
-    // Dedup inputs within this tx; compute in/out with overflow checks
-    std::unordered_set<std::string> ins;
-    uint64_t in = 0, out = 0, tmp = 0;
-
-    const auto h = sighash_simple(tx);
-
-    for (const auto& i : tx.vin) {
-        // Strict pubkey length (compressed 33B or uncompressed 65B)
-        if (i.pubkey.size() != 33 && i.pubkey.size() != 65) { err = "bad pubkey size"; return false; }
-
-        const std::string k = key(i.prev.txid) + ":" + std::to_string(i.prev.vout);
-        if (ins.count(k)) { err = "dup input"; return false; }
-        ins.insert(k);
-
-        UTXOEntry e;
-        if (!utxo.get(i.prev.txid, i.prev.vout, e)) { err = "missing utxo"; return false; }
-        if (e.coinbase && height < e.height + COINBASE_MATURITY) { err = "immature"; return false; }
-        if (hash160(i.pubkey) != e.pkh) { err = "pkh mismatch"; return false; }
-
-        // Signature verification against simple sighash
-        if (i.sig.size() != 64) { err = "bad sig size"; return false; }
-        if (!crypto::ECDSA::verify(i.pubkey, h, i.sig)) { err = "bad signature"; return false; }
-
-    #if MIQ_RULE_ENFORCE_LOW_S
-        // Enforce canonical RAW-64 (r||s) + Low-S in mempool (policy)
-        if (!is_canonical_raw64_lows(i.sig)) { err = "non-canonical or high-S signature"; return false; }
-    #endif
-
-        if (!leq_max_money(e.value)) { err = "utxo>MAX_MONEY"; return false; }
-        if (!add_u64_safe(in, e.value, tmp)) { err = "tx in overflow"; return false; }
-        in = tmp;
-    }
-
-    for (const auto& o : tx.vout) {
-        if (!leq_max_money(o.value)) { err = "txout>MAX_MONEY"; return false; }
-        if (o.value < DUST_SAT)      { err = "dust output";     return false; }
-        if (!add_u64_safe(out, o.value, tmp)) { err = "tx out overflow"; return false; }
-        out = tmp;
-    }
-
-    if (!leq_max_money(in) || !leq_max_money(out)) { err = "sum>MAX_MONEY"; return false; }
-    if (out > in) { err = "outputs>inputs"; return false; }
-
-    // ---- Fee policy (non-consensus; env-tunable) ----------------------------
-    // Old heuristic (kept for compatibility): ~1 sat/byte using rough estimator.
-    const size_t est_sz = tx.vin.size()*180 + tx.vout.size()*34 + 10;
-    const uint64_t legacy_minfee = (est_sz/100) + 1; // (~1 sat/100B + 1)
-
-    // New policy: sat/kilobyte floor on *actual serialized size*.
-    // MIN_RELAY_PER_KB=1000 ⇒ 1 sat/vB.
-    uint64_t kb = (uint64_t)((raw_sz + 999) / 1000);
-    if (kb == 0) kb = 1;
-    const uint64_t env_minfee = MIN_RELAY_PER_KB * kb;
-
-    const uint64_t minfee = std::max(legacy_minfee, env_minfee);
-    const uint64_t fee    = in - out;
-
-    if (fee < minfee) { err = "low fee"; return false; }
-
-    const double fr = (double)fee / (double)raw_sz; // feerate by real size
-    map_[txk] = MempoolEntry{tx, fee, raw_sz, fr};
-    maybe_evict();
-    return true;
 }
 
-std::vector<Transaction> Mempool::collect(size_t n) const{
-    std::vector<std::pair<double,const Transaction*>> v;
-    for(const auto& kv: map_) v.push_back({kv.second.feerate,&kv.second.tx});
-    std::sort(v.begin(),v.end(),[](auto&a,auto&b){return a.first>b.first;});
-    std::vector<Transaction> out;
-    for(const auto& p:v){ out.push_back(*p.second); if(out.size()>=n) break; }
-    return out;
+void Mempool::on_block_disconnect(const Block& b, const UTXOView& utxo, uint32_t height){
+    // Try to re-accept all non-coinbase txs in block order
+    for (size_t i=1; i<b.txs.size(); ++i){
+        const auto& tx = b.txs[i];
+        std::string err;
+        (void)accept(tx, utxo, height, err); // if orphan/hard-reject, accept() handles it
+    }
 }
 
 std::vector<std::vector<uint8_t>> Mempool::txids() const{
     std::vector<std::vector<uint8_t>> v;
-    for(const auto& kv: map_) v.push_back(kv.second.tx.txid());
+    v.reserve(map_.size());
+    for (const auto& kv : map_){
+        v.push_back(kv.second.tx.txid());
+    }
     return v;
 }
 
