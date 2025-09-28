@@ -15,10 +15,14 @@ static inline std::string trim(const std::string& s){
 bool miq::load_config(const std::string& path, Config& out){
     std::ifstream f(path);
     if(!f.is_open()) return false;
+
     std::string line;
     while(std::getline(f, line)){
         line = trim(line);
-        if(line.empty() || line[0]=='#' || line.rfind("//",0)==0) continue;
+        if(line.empty()) continue;
+        if(line[0]=='#') continue;
+        if(line.rfind("//",0)==0) continue;
+
         auto kpos = line.find('=');
         if(kpos==std::string::npos) continue;
         std::string k = trim(line.substr(0,kpos));
@@ -29,7 +33,7 @@ bool miq::load_config(const std::string& path, Config& out){
         else if(k=="no_p2p") out.no_p2p = (v=="1"||v=="true");
         else if(k=="no_rpc") out.no_rpc = (v=="1"||v=="true");
         else if(k=="no_mine") out.no_mine = (v=="1"||v=="true");
-        else if(k=="miner_threads") { try { out.miner_threads = (unsigned)std::stoul(v); } catch(...){} }
+        else if(k=="miner_threads"){ try{ out.miner_threads = (unsigned)std::stoul(v); }catch(...){} }
         else if(k=="mining_address") out.mining_address = v;
 
         // TLS
