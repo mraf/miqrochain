@@ -25,17 +25,24 @@
 
 #include "mempool.h"
 
-#ifndef MIQ_PEER_MAX_BLOCKS_INFLIGHT
-#define MIQ_PEER_MAX_BLOCKS_INFLIGHT 8
-#endif
-#ifndef MIQ_GLOBAL_MAX_BLOCKS_INFLIGHT
-#define MIQ_GLOBAL_MAX_BLOCKS_INFLIGHT 64
-#endif
-#ifndef MIQ_BLOCK_REQ_TIMEOUT_MS
-#define MIQ_BLOCK_REQ_TIMEOUT_MS 15000
-#endif
-
 namespace miq {
+
+// === Optional hardening knobs (can be overridden at compile time) ============
+#ifndef MIQ_P2P_INV_WINDOW_MS
+#define MIQ_P2P_INV_WINDOW_MS 3000    // window for INV rate checks
+#endif
+#ifndef MIQ_P2P_INV_WINDOW_CAP
+#define MIQ_P2P_INV_WINDOW_CAP 200    // max invs we accept per window per peer
+#endif
+#ifndef MIQ_P2P_GETADDR_INTERVAL_MS
+#define MIQ_P2P_GETADDR_INTERVAL_MS 60000  // throttle our getaddr requests per peer
+#endif
+#ifndef MIQ_P2P_ADDR_BATCH_CAP
+#define MIQ_P2P_ADDR_BATCH_CAP 1000   // max addrs we accept per addr message
+#endif
+#ifndef MIQ_P2P_NEW_INBOUND_CAP_PER_MIN
+#define MIQ_P2P_NEW_INBOUND_CAP_PER_MIN 30 // soft cap: new inbound per minute
+#endif
 
 class Chain; // fwd
 
@@ -80,10 +87,16 @@ struct PeerState {
     // tx relay: which txids we’ve requested and await
     std::unordered_set<std::string> inflight_tx;
 
-    // ---- NEW: block fetch scheduler state (per peer) ----
-    std::unordered_set<std::string> inflight_blocks;            // hex(blockhash)
-    std::unordered_map<std::string, int64_t> req_time_ms;       // hex(blockhash) -> sent_ms
-    size_t inflight_bytes{0};                                   // optional future use
+    // --- New: INV/ADDR throttling state (DoS hardening) --------------------
+    // Rolling INV window (basic storm damping)
+    int64_t     inv_win_start_ms{0};
+    uint32_t    inv_in_window{0};
+
+    // throttle how often we send getaddr to this peer
+    int64_t     last_getaddr_ms{0};
+
+    // Per-peer duplicate INV suppression (keys are hex txid/block-hash)
+    std::unordered_set<std::string> recent_inv_keys;
 };
 
 // Lightweight read-only snapshot for RPC/UI
@@ -165,13 +178,9 @@ private:
     size_t orphan_bytes_limit_{0};
     size_t orphan_count_limit_{0};
 
-    // ---- NEW: global block fetch scheduler state ----
-    // map hex(blockhash) -> owning socket (or -1 if unassigned)
-    std::unordered_map<std::string, int>   blk_owner_;
-    // quick presence set of inflight (same keys as blk_owner_)
-    std::unordered_set<std::string>        blk_inflight_;
-    // global counter for simple cap
-    size_t                                 global_inflight_{0};
+    // Inbound rate gating (soft Sybil friction)
+    int64_t inbound_win_start_ms_{0};
+    uint32_t inbound_accepts_in_window_{0};
 
     // core
     void loop();
@@ -184,13 +193,6 @@ private:
     void request_block_index(PeerState& ps, uint64_t index);
     void request_block_hash(PeerState& ps, const std::vector<uint8_t>& h);
     void send_block(int s, const std::vector<uint8_t>& raw);
-
-    // ---- NEW: scheduler helpers ----
-    void pump_block_scheduler(); // figure out next wanted hashes and assign across peers
-    bool assign_block_to_peer(PeerState& ps, const std::vector<uint8_t>& h);
-    void mark_block_inflight(PeerState& ps, const std::string& hex, int64_t now);
-    void clear_block_inflight_any(const std::string& hex); // remove from whichever peer had it
-    void reap_stalled_requests(int64_t now);
 
     // rate-limit helpers
     void rate_refill(PeerState& ps, int64_t now);
