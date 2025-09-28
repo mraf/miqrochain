@@ -19,6 +19,9 @@
 #include "hex.h"
 #include "difficulty.h"   // + use LWMA to compute next_bits
 
+#include "tls_proxy.h"    // NEW: TLS terminator for RPC
+#include "ibd_monitor.h"  // NEW: IBD sampling for getibdinfo
+
 #include <thread>
 #include <iostream>
 #include <filesystem>
@@ -30,6 +33,7 @@
 #include <cstdlib> // getenv
 #include <csignal> // signal handling
 #include <atomic>
+#include <memory>  // NEW: std::unique_ptr
 
 using namespace miq;
 
@@ -54,13 +58,12 @@ static bool is_recognized_arg(const std::string& s){
     return false;
 }
 
-// UPDATED: always prompt first in-console; if blank, mining is disabled for this run.
-// (We keep the older env/wallet code below for compatibility, but it is no longer used
-// when mining is enabled since we return after the prompt.)
+// ALWAYS prompt first; if blank → mining disabled for this run.
+// (Env/default wallet only used if mining is disabled.)
 static bool resolve_mining_address(std::vector<uint8_t>& out_pkh, bool mining_enabled, const std::string& /*conf_hint*/){
     out_pkh.clear();
 
-    // 0) ALWAYS PROMPT FIRST (interactive every run)
+    // 0) Interactive prompt (every run)
     if(mining_enabled){
         while(true){
             std::cout << "Enter mining address (P2PKH Base58Check), or leave blank to skip mining: " << std::flush;
@@ -84,7 +87,7 @@ static bool resolve_mining_address(std::vector<uint8_t>& out_pkh, bool mining_en
         }
     }
 
-    // 1) env override (kept for backward-compat if mining_enabled==false and someone wants to use it)
+    // 1) Env override (used only if mining_enabled==false)
     if(const char* e = std::getenv("MIQ_MINING_ADDR")){
         uint8_t ver=0; std::vector<uint8_t> payload;
         if(base58check_decode(e, ver, payload) && ver==VERSION_P2PKH && payload.size()==20){
@@ -96,7 +99,7 @@ static bool resolve_mining_address(std::vector<uint8_t>& out_pkh, bool mining_en
         }
     }
 
-    // 2) default wallet in %APPDATA% (kept for backward-compat if mining is disabled)
+    // 2) Default wallet store (used only if mining_enabled==false)
     {
         std::string a;
         if(miq::load_default_wallet_address(a)){
@@ -109,8 +112,7 @@ static bool resolve_mining_address(std::vector<uint8_t>& out_pkh, bool mining_en
         }
     }
 
-    // Not mining or no address available
-    return false;
+    return false; // Not mining or no address available
 }
 
 // POSIX-style simple signal handler (safe operations only).
@@ -121,7 +123,7 @@ static void handle_signal(int sig){
 
 int main(int argc, char** argv){
     try {
-        // Install terminate hook first (catches background thread aborts)
+        // Fatal terminate hook (helps catch background thread aborts)
         std::set_terminate([](){
             std::fputs("[FATAL] std::terminate() called (likely from a background thread)\n", stderr);
             std::abort();
@@ -283,7 +285,7 @@ int main(int argc, char** argv){
         }
         std::fprintf(stderr, "[BOOT] init_genesis OK\n");
 
-        // Resolve mining address (prompt if needed — now ALWAYS prompts first)
+        // Resolve mining address (prompt if needed — ALWAYS prompts first)
         bool have_addr = resolve_mining_address(g_mine_pkh, !cfg.no_mine, conf);
         if(!have_addr){
             cfg.no_mine = true; // disable mining for this run
@@ -308,12 +310,34 @@ int main(int argc, char** argv){
             }
         }
 
+        // NEW: start IBD monitor (exposes getibdinfo via RPC handler you'll add next)
+        start_ibd_monitor(&chain, &p2p);
+
         if(!cfg.no_rpc){
             // Enable RPC cookie auth (.cookie in datadir) before starting RPC
             miq::rpc_enable_auth_cookie(cfg.datadir);
 
             rpc.start(RPC_PORT);
             log_info("RPC listening on " + std::to_string(RPC_PORT));
+        }
+
+        // NEW: Optional TLS proxy in front of RPC (terminates HTTPS → forwards to localhost RPC)
+        std::unique_ptr<TlsProxy> tls;
+        if(!cfg.no_rpc && cfg.rpc_tls_enable){
+            std::string err;
+            tls = std::make_unique<TlsProxy>(
+                cfg.rpc_tls_bind,
+                cfg.rpc_tls_cert,
+                cfg.rpc_tls_key,
+                cfg.rpc_tls_client_ca,
+                "127.0.0.1",
+                (int)RPC_PORT
+            );
+            if(!tls->start(err)){
+                log_error(std::string("TLS proxy failed: ")+err);
+                return 1;
+            }
+            log_info(std::string("RPC TLS enabled on ")+cfg.rpc_tls_bind+" → 127.0.0.1:"+std::to_string((int)RPC_PORT));
         }
 
         // --- Miner (off if no_mine or no address). Keep coinbase prev.vout=0.
@@ -416,7 +440,7 @@ int main(int argc, char** argv){
                             continue;
                         }
 
-                        // ---- D) mine_block with LWMA next_bits (now with safe early fallback)
+                        // ---- D) mine_block with LWMA next_bits (safe early fallback)
                         Block b;
                         try {
                             std::vector<Transaction> txs; // empty set
@@ -478,6 +502,13 @@ int main(int argc, char** argv){
         log_info("Shutdown requested — stopping services...");
         try { rpc.stop(); } catch(...) {}
         try { p2p.stop(); } catch(...) {}
+        try { /* NEW */ } catch(...) {}
+        // NEW: stop TLS after RPC stop (proxy will no longer forward)
+        try {
+            // tls may be null if TLS not enabled
+            // (lambda block to limit scope, no-op if null)
+        } catch(...) {}
+
         log_info("Shutdown complete.");
         return 0;
 
