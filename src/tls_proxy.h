@@ -6,9 +6,9 @@
 
 namespace miq {
 
-// Tiny TLS terminator that accepts HTTPS on rpc_tls_bind and forwards
-// plaintext HTTP to localhost:RPC_PORT. Single-request-per-connection is enough
-// for JSON-RPC. Uses OpenSSL. Runs in its own thread.
+// Minimal HTTPS → HTTP proxy for JSON-RPC.
+// Accepts TLS on rpc_tls_bind, forwards to 127.0.0.1:RPC_PORT.
+// One request/response per TCP connection (fits JSON-RPC usage).
 class TlsProxy {
 public:
     TlsProxy(const std::string& tls_bind_hostport,
@@ -19,19 +19,19 @@ public:
              int forward_port);
     ~TlsProxy();
 
-    bool start(std::string& err);
-    void stop();
+    bool start(std::string& err); // returns false on immediate failure
+    void stop();                  // waits for thread to join
 
 private:
     std::string bind_host_;
-    int bind_port_ = 0;
+    int         bind_port_ = 0;
     std::string cert_;
     std::string key_;
     std::string ca_;
     std::string fwd_host_;
-    int fwd_port_ = 0;
+    int         fwd_port_ = 0;
 
-    std::thread th_;
+    std::thread       th_;
     std::atomic<bool> run_{false};
 };
 
