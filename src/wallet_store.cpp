@@ -2,6 +2,7 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdlib>
+#include "wallet_encryptor.h"
 
 namespace fs = std::filesystem;
 namespace miq {
@@ -13,6 +14,27 @@ static std::string appdata_dir() {
     p /= "miqro";
     fs::create_directories(p);
     return p.string();
+}
+
+std::string err;
+if(!passphrase.empty()){
+    std::vector<uint8_t> plain = /* serialize current wallet */;
+    if(!miq::wallet_encrypt_to_file(path, plain, passphrase, err)){
+        LOG_ERROR("wallet encrypt failed: %s", err.c_str());
+        return false;
+    }
+} else {
+    // legacy plaintext path (unchanged behavior)
+}
+
+// when loading:
+if(detected_encrypted_wallet_file){
+    std::vector<uint8_t> plain;
+    if(!miq::wallet_decrypt_from_file(path, plain, passphrase, err)){
+        LOG_ERROR("wallet decrypt failed: %s", err.c_str());
+        return false;
+    }
+    /* parse plain */
 }
 
 std::string default_wallet_file() {
