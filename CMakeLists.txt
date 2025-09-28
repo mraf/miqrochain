@@ -5,7 +5,6 @@ if(POLICY CMP0169)
   cmake_policy(SET CMP0169 OLD)
 endif()
 
-# Enable C (for uECC.c) and C++
 project(miqrochain_core C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -21,6 +20,9 @@ option(MIQ_ENABLE_UPNP       "Enable UPnP/NAT-PMP port mapping" OFF)
 option(MIQ_BUILD_TESTS       "Build tests"                                 OFF)
 option(MIQ_FETCH_MICROECC    "Fetch micro-ecc from GitHub if not vendored" ON)
 
+# DB backend options
+option(MIQ_USE_ROCKSDB       "Use RocksDB instead of LevelDB"              OFF)
+option(MIQ_FETCH_LEVELDB     "Automatically fetch/build LevelDB if missing" ON)
 set(MIQ_VENDOR_MICROECC_DIR  "${CMAKE_SOURCE_DIR}/third_party/micro-ecc"
     CACHE PATH "Path to vendored micro-ecc")
 
@@ -36,24 +38,21 @@ else()
   add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 endif()
 
+include(FetchContent)
+
 # ------------------------------------------------------------------
 # micro-ecc source setup
 # ------------------------------------------------------------------
-# Choose one:
-find_package(LevelDB REQUIRED)
-target_link_libraries(miqrod PRIVATE LevelDB::LevelDB) # or rocksdb
 set(MICRO_ECC_DIR "")
 if(EXISTS "${MIQ_VENDOR_MICROECC_DIR}/uECC.c")
   set(MICRO_ECC_DIR "${MIQ_VENDOR_MICROECC_DIR}")
 elseif(MIQ_FETCH_MICROECC)
-  include(FetchContent)
   FetchContent_Declare(
     microecc
     GIT_REPOSITORY https://github.com/kmackay/micro-ecc.git
     GIT_TAG        master
   )
-  # micro-ecc is a plain C repo; just fetch the sources to a folder
-  FetchContent_Populate(microecc)
+  FetchContent_MakeAvailable(microecc)
   set(MICRO_ECC_DIR "${microecc_SOURCE_DIR}")
 else()
   message(FATAL_ERROR "micro-ecc not found. Set MIQ_VENDOR_MICROECC_DIR or enable MIQ_FETCH_MICROECC.")
@@ -82,6 +81,47 @@ set_source_files_properties(
 )
 
 # ------------------------------------------------------------------
+# Key-Value DB backend (LevelDB default, or RocksDB if opted)
+# Exposes targets:
+#   LevelDB::LevelDB  (or) RocksDB::rocksdb
+# ------------------------------------------------------------------
+set(MIQ_DB_TARGET "")
+if(MIQ_USE_ROCKSDB)
+  find_package(rocksdb QUIET)
+  if(NOT rocksdb_FOUND)
+    message(FATAL_ERROR "MIQ_USE_ROCKSDB=ON but RocksDB package not found. Install it or turn MIQ_USE_ROCKSDB OFF to use LevelDB.")
+  endif()
+  set(MIQ_DB_TARGET RocksDB::rocksdb)
+  add_compile_definitions(MIQ_USE_ROCKSDB=1)
+else()
+  # Try system LevelDB first
+  find_package(LevelDB QUIET)
+  if(LevelDB_FOUND)
+    set(MIQ_DB_TARGET LevelDB::LevelDB)
+  else()
+    if(NOT MIQ_FETCH_LEVELDB)
+      message(FATAL_ERROR "LevelDB not found. Install a LevelDB dev package, set LevelDB_DIR, or enable MIQ_FETCH_LEVELDB.")
+    endif()
+    # Fetch LevelDB from upstream
+    # (Google LevelDB provides CMake targets named 'leveldb')
+    FetchContent_Declare(
+      leveldb_src
+      GIT_REPOSITORY https://github.com/google/leveldb.git
+      GIT_TAG        1.23
+    )
+    set(LEVELDB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(LEVELDB_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(leveldb_src)
+    # Upstream target is 'leveldb'; create a namespaced alias to match find_package usage
+    if(NOT TARGET LevelDB::LevelDB)
+      add_library(LevelDB::LevelDB ALIAS leveldb)
+    endif()
+    set(MIQ_DB_TARGET LevelDB::LevelDB)
+  endif()
+endif()
+
+# ------------------------------------------------------------------
 # Main daemon
 # ------------------------------------------------------------------
 add_executable(miqrod
@@ -105,7 +145,14 @@ add_executable(miqrod
     src/block.h src/block.cpp
     src/difficulty.h src/difficulty.cpp
     src/storage.h src/storage.cpp
+
+    # If you keep the old utxo backend, leave these; otherwise comment them out.
     src/utxo.h src/utxo.cpp
+
+    # New durable KV-backed chainstate
+    src/kvdb.h src/kvdb.cpp
+    src/utxo_kv.h src/utxo_kv.cpp
+
     src/mempool.h src/mempool.cpp
     src/hasher.h src/hasher.cpp
     src/lut.h src/lut.cpp
@@ -144,20 +191,20 @@ target_include_directories(miqrod PRIVATE
 # micro-ecc config: enable compressed points (safe, no consensus change)
 target_compile_definitions(miqrod PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
 
-# MSVC target-specific hardening (after target exists)
-if(MSVC)
-  target_compile_definitions(miqrod PRIVATE MIQ_RULE_ENFORCE_LOW_S=1)
-  target_compile_options(miqrod PRIVATE /guard:cf /GS /sdl /Zi)
-  target_link_options(miqrod PRIVATE /guard:cf /DYNAMICBASE /NXCOMPAT)
+# Link DB backend
+if(MIQ_USE_ROCKSDB)
+  target_link_libraries(miqrod PRIVATE ${MIQ_DB_TARGET})
+else()
+  target_link_libraries(miqrod PRIVATE ${MIQ_DB_TARGET})
 endif()
 
+# Windows sockets
 if(WIN32)
   target_link_libraries(miqrod PRIVATE Ws2_32)
 endif()
 
 # ------------------------------------------------------------------
 # Optional Wallet Encryption (OpenSSL AES-256-GCM + PBKDF2)
-# (Sources compile into real impl when enabled, or stubs when disabled)
 # ------------------------------------------------------------------
 if(MIQ_ENABLE_WALLET_ENC)
   find_package(OpenSSL REQUIRED)
@@ -245,6 +292,5 @@ add_executable(miq-keygen
 target_include_directories(miq-keygen PRIVATE src ${MICRO_ECC_DIR})
 target_compile_definitions(miq-keygen PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
 if(WIN32)
-  # bcrypt is useful if you later switch RNGs for key generation; harmless to link.
   target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
