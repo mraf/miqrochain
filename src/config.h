@@ -6,21 +6,21 @@ namespace miq {
 
 struct Config {
     std::string datadir;
-    bool no_p2p = false;
-    bool no_rpc = false;
-    bool no_mine = false;
-    unsigned miner_threads = 0;
-    std::string mining_address; // kept for future use
+    bool        no_p2p = false;
+    bool        no_rpc = false;
+    bool        no_mine = false;
+    unsigned    miner_threads = 0;
+    std::string mining_address; // kept for future use / compatibility
 
-    // === NEW: TLS for RPC (TLS terminator binding) ===
-    bool        rpc_tls_enable = false;
-    std::string rpc_tls_bind   = "0.0.0.0:9835"; // external HTTPS
-    std::string rpc_tls_cert;                    // PEM path
-    std::string rpc_tls_key;                     // PEM path
-    std::string rpc_tls_client_ca;               // optional client-auth CA PEM
+    // === TLS for RPC (via local TLS terminator) ===
+    bool        rpc_tls_enable = false;          // enable TLS listener
+    std::string rpc_tls_bind   = "0.0.0.0:9835"; // external HTTPS bind (host:port)
+    std::string rpc_tls_cert;                    // server cert chain (PEM)
+    std::string rpc_tls_key;                     // server private key (PEM)
+    std::string rpc_tls_client_ca;               // optional client-auth CA (PEM); empty = no client auth
 };
 
-// Parses simple key=value lines. Unknown keys are ignored.
+// Simple key=value loader. Unknown keys are ignored. Returns false if file not found.
 bool load_config(const std::string& path, Config& out);
 
 }
