@@ -19,7 +19,7 @@
 #include <random>
 
 #ifndef MIQ_ENABLE_HEADERS_FIRST_WIP
-#define MIQ_ENABLE_HEADERS_FIRST_WIP 0
+#define MIQ_ENABLE_HEADERS_FIRST_WIP 1  // ENABLED
 #endif
 
 #ifdef __has_include
