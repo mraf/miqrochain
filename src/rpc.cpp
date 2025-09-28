@@ -1,4 +1,3 @@
-// src/rpc.cpp
 #include "rpc.h"
 #include "sha256.h"
 #include "ibd_monitor.h"
@@ -98,24 +97,7 @@ static bool read_first_line_trim(const std::string& p, std::string& out) {
     return true;
 }
 
-static Json::Value rpc_getibdinfo(const Json::Value& params){
-    (void)params;
-    auto s = miq::get_ibd_info_snapshot();
-    Json::Value r(Json::objectValue);
-    r["ibd_active"] = s.ibd_active;
-    r["best_block_height"] = s.best_block_height;
-    r["est_best_header_height"] = s.est_best_header_height;
-    r["headers_ahead"] = s.headers_ahead;
-    r["peers"] = s.peers;
-    r["phase"] = s.phase;
-    r["started_ms"] = Json::UInt64(s.started_ms);
-    r["last_update_ms"] = Json::UInt64(s.last_update_ms);
-    return r;
-}
-
-// Registration (where you build your rpc_table):
-rpc_table["getibdinfo"] = rpc_getibdinfo;
-// === getibdinfo (END) ===
+// ==============================================================================
 
 static bool write_cookie_file_secure(const std::string& p, const std::string& tok) {
 #ifndef _WIN32
@@ -286,6 +268,7 @@ std::string RpcService::handle(const std::string& body){
                 "getminerstats","sendrawtransaction","sendtoaddress",
                 "estimatemediantime","getdifficulty","getchaintips",
                 "getpeerinfo","getconnectioncount"
+                // (getibdinfo exists but not listed here to keep help stable)
             };
             std::vector<JNode> v;
             for(const char* s: k){ v.push_back(jstr(s)); }
@@ -321,6 +304,21 @@ std::string RpcService::handle(const std::string& body){
             JNode h; h.v = (double)chain_.tip().height;          o["height"] = h;
             JNode d; d.v = (double)Chain::work_from_bits_public(chain_.tip().bits); o["difficulty"] = d;
             JNode r; r.v = o; return json_dump(r);
+        }
+
+        // --- NEW: IBD snapshot (machine-readable) ---
+        if(method=="getibdinfo"){
+            auto s = miq::get_ibd_info_snapshot();
+            std::map<std::string,JNode> o;
+            o["ibd_active"]                = jbool(s.ibd_active);
+            o["best_block_height"]         = jnum((double)s.best_block_height);
+            o["est_best_header_height"]    = jnum((double)s.est_best_header_height);
+            o["headers_ahead"]             = jnum((double)s.headers_ahead);
+            o["peers"]                     = jnum((double)s.peers);
+            o["phase"]                     = jstr(s.phase);
+            o["started_ms"]                = jnum((double)s.started_ms);
+            o["last_update_ms"]            = jnum((double)s.last_update_ms);
+            JNode out; out.v = o; return json_dump(out);
         }
 
         if(method=="getblockcount"){
