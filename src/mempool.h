@@ -7,10 +7,14 @@
 #include <deque>
 #include <chrono>
 
-#include "tx.h"
-#include "hash160.h"
+#include "tx.h"          // Transaction
 
 namespace miq {
+
+// Forward declarations to avoid heavy includes here.
+struct UTXOEntry;        // defined in utxo.h / utxo_kv.h
+struct Block;            // defined in block.h
+class  UTXOSet;          // defined in utxo.h
 
 // Tunables (can be overridden via -D or constants.h if you expose them there)
 #ifndef MIQ_MEMPOOL_MAX_BYTES
@@ -26,8 +30,6 @@ namespace miq {
 #define MIQ_MEMPOOL_TX_EXPIRY_SECS (14u * 24u * 60u * 60u) // 14 days
 #endif
 
-struct UTXOEntry; // forward from utxo.h / utxo_kv.h
-
 // Lightweight UTXO view interface (Chain passes its UTXO backend)
 class UTXOView {
 public:
@@ -35,13 +37,13 @@ public:
     virtual bool get(const std::vector<uint8_t>& txid, uint32_t vout, UTXOEntry& out) const = 0;
 };
 
-// Policy parameters for acceptance
+// Policy parameters for acceptance (reserved for future extension)
 struct AcceptPolicy {
     uint32_t current_height{0};
     size_t   max_ancestors{MIQ_MEMPOOL_MAX_ANCESTORS};
     size_t   max_descendants{MIQ_MEMPOOL_MAX_DESCENDANTS};
     size_t   max_pool_bytes{MIQ_MEMPOOL_MAX_BYTES};
-    bool     require_standard{false}; // placeholder for future stdness rules
+    bool     require_standard{false};
 };
 
 struct MempoolEntry {
@@ -65,15 +67,18 @@ public:
     Mempool();
     ~Mempool() = default;
 
-    // Accept a tx into the mempool (or orphan pool), returns true if accepted.
-    // If returns false and err is set, it was rejected (not just orphaned).
+    // Primary accept (generic UTXOView)
     bool accept(const Transaction& tx, const UTXOView& utxo, uint32_t height, std::string& err);
+    // Convenience overload for existing call sites that pass UTXOSet directly.
+    bool accept(const Transaction& tx, const UTXOSet& utxo, uint32_t height, std::string& err);
 
     // When a block connects: remove its transactions and any conflicts.
     void on_block_connect(const Block& b);
 
     // When a block disconnects (reorg): try re-adding its non-coinbase txs.
     void on_block_disconnect(const Block& b, const UTXOView& utxo, uint32_t height);
+    // Convenience overload for UTXOSet
+    void on_block_disconnect(const Block& b, const UTXOSet& utxo, uint32_t height);
 
     // Periodic house-keeping: expire old txs and trim to max size.
     void maintenance();
@@ -86,7 +91,10 @@ public:
     size_t bytes_used()  const { return total_bytes_; }
     bool   exists(const std::vector<uint8_t>& txid) const;
 
-    // For P2P serving (raw cache is in P2P; here we expose ids)
+    // For miner: collect up to `max` txs (parents-first, highest feerate)
+    std::vector<Transaction> collect(size_t max) const;
+
+    // For P2P serving (ids only)
     std::vector<std::vector<uint8_t>> txids() const;
 
 private:
