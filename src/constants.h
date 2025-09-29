@@ -3,6 +3,49 @@
 #include <cstddef>
 #include <string>
 
+// ==== P2P/addrman tuning (macros picked up by p2p.cpp) =====================
+// These are optional overrides; p2p.cpp only defines its own defaults if these
+// are *not* defined here. Adjust as you like without touching code.
+
+// Enable the new persistent addrman path
+#ifndef MIQ_ENABLE_ADDRMAN
+#define MIQ_ENABLE_ADDRMAN 1
+#endif
+
+// Addrman persistence file name (distinct from legacy peers.dat)
+#ifndef MIQ_ADDRMAN_FILE
+#define MIQ_ADDRMAN_FILE "peers2.dat"
+#endif
+
+// Outbound peer target
+#ifndef MIQ_OUTBOUND_TARGET
+#define MIQ_OUTBOUND_TARGET 4
+#endif
+
+// Outbound dialing cadence (ms)
+#ifndef MIQ_DIAL_INTERVAL_MS
+#define MIQ_DIAL_INTERVAL_MS 15000
+#endif
+
+// Feeler cadence (ms) for probing NEW addresses
+#ifndef MIQ_FEELER_INTERVAL_MS
+#define MIQ_FEELER_INTERVAL_MS 60000
+#endif
+
+// Max outbounds per IPv4 /16 group (anti-eclipse)
+#ifndef MIQ_GROUP_OUTBOUND_MAX
+#define MIQ_GROUP_OUTBOUND_MAX 2
+#endif
+
+// Legacy addrset autosave interval & cap (used by current code)
+#ifndef MIQ_ADDR_SAVE_INTERVAL_MS
+#define MIQ_ADDR_SAVE_INTERVAL_MS 60000
+#endif
+#ifndef MIQ_ADDR_MAX_STORE
+#define MIQ_ADDR_MAX_STORE 10000
+#endif
+// ===========================================================================
+
 namespace miq {
 
 // ---------------------------------------------------------------------
@@ -13,7 +56,7 @@ static constexpr const char* UNIT_NAME  = "miqron";
 
 static constexpr uint64_t COIN = 100000000ULL;
 static constexpr uint64_t BLOCK_TIME_SECS = 480; // 8 minutes
-static constexpr uint16_t P2P_PORT = 55001;        // (kept as-is per your current config)
+static constexpr uint16_t P2P_PORT = 55001;      // (kept as-is per your current config)
 static constexpr uint16_t RPC_PORT = 9834;
 static constexpr uint32_t MAGIC    = 0xA3FB9E21;
 
