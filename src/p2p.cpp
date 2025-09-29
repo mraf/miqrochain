@@ -797,7 +797,7 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
 // Trickle enqueue for tx announcements (per-peer)
 static inline void trickle_enqueue(int sock, const std::vector<uint8_t>& txid){
     if (txid.size()!=32) return;
-    auto& q = g_trickle_q[s];
+    auto& q = g_trickle_q[sock];   // <-- fixed (was using 's')
     if (q.size() < 4096) q.push_back(txid); // simple bound; drop if queue grows too big
 }
 
@@ -809,38 +809,22 @@ void P2P::broadcast_inv_tx(const std::vector<uint8_t>& txid){
     }
 }
 
-// Flush pending INV/tx trickle queues respecting per-peer INV windows
-static void trickle_flush(P2P& self){
+// Flush pending INV/tx trickle queues respecting time/batch limits
+static void trickle_flush(){
     int64_t tnow = now_ms();
-    for (auto& kv : self.peers_) {
+    for (auto& kv : g_trickle_q) {
         int s = kv.first;
-        auto& ps = kv.second;
+        auto& q = kv.second;
 
+        int64_t last = 0;
         auto it_last = g_trickle_last_ms.find(s);
-        int64_t last = (it_last==g_trickle_last_ms.end()?0:it_last->second);
+        if (it_last != g_trickle_last_ms.end()) last = it_last->second;
+
         if (tnow - last < MIQ_P2P_TRICKLE_MS) continue;
 
-        auto itq = g_trickle_q.find(s);
-        if (itq == g_trickle_q.end() || itq->second.empty()) {
-            g_trickle_last_ms[s] = tnow;
-            continue;
-        }
-
         size_t n_send = 0;
-        auto& q = itq->second;
-        // send up to batch, respecting inv window accounting
         while (!q.empty() && n_send < MIQ_P2P_TRICKLE_BATCH) {
             const auto& txid = q.back();
-
-            // INV window accounting (shared with main loop helper)
-            int64_t tnow2 = now_ms();
-            if (tnow2 - ps.inv_win_start_ms > (int64_t)MIQ_P2P_INV_WINDOW_MS) {
-                ps.inv_win_start_ms = tnow2;
-                ps.inv_in_window = 0;
-            }
-            if (ps.inv_in_window + 1 > MIQ_P2P_INV_WINDOW_CAP) break;
-            ps.inv_in_window += 1;
-
             auto m = encode_msg("invtx", txid);
             send(s, (const char*)m.data(), (int)m.size(), 0);
             q.pop_back();
@@ -1681,7 +1665,7 @@ void P2P::loop(){
         for (int s : dead) { gate_on_close(s); CLOSESOCK(s); peers_.erase(s); }
 
         // Tx INV trickle flush (time-based)
-        trickle_flush(*this);
+        trickle_flush();  // <-- now free function; no private access
 
         // Autosave legacy addrs periodically if we’ve learned new ones
         if (now_ms() - last_addr_save_ms > MIQ_ADDR_SAVE_INTERVAL_MS) {
@@ -1730,4 +1714,3 @@ std::vector<PeerSnapshot> P2P::snapshot_peers() const {
     return out;
 }
 }
-
