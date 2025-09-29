@@ -948,6 +948,7 @@ bool Chain::disconnect_tip_once(std::string& err){
     }
     const std::vector<UndoIn>& undo = undo_tmp;
 
+    // Spend non-coinbase created outs
     for (size_t ti = cur.txs.size(); ti-- > 1; ){
         const auto& tx = cur.txs[ti];
         for (size_t i = 0; i < tx.vout.size(); ++i) {
@@ -955,11 +956,13 @@ bool Chain::disconnect_tip_once(std::string& err){
         }
     }
 
+    // Restore previous inputs from undo (reverse order)
     for (size_t i = undo.size(); i-- > 0; ){
         const auto& u = undo[i];
         utxo_.add(u.prev_txid, u.prev_vout, u.prev_entry);
     }
 
+    // Remove coinbase outs and compute sum
     const auto& cb = cur.txs[0];
     uint64_t cb_sum = 0;
     for (size_t i = 0; i < cb.vout.size(); ++i) {
@@ -994,6 +997,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
 
     // NOTE: additional MTP/future-time checks were already done in verify_block().
 
+    // --- Collect undo BEFORE mutating UTXO ---
     std::vector<UndoIn> undo;
     undo.reserve(b.txs.size() * 2);
 
@@ -1009,8 +1013,19 @@ bool Chain::submit_block(const Block& b, std::string& err){
         }
     }
 
+    // Persist the block body (unchanged order wrt previous code)
     storage_.append_block(ser_block(b), b.block_hash());
 
+    // --- NEW ORDERING FOR CRASH-SAFETY ---
+    // Write & fsync the undo file for (height+1, block_hash) BEFORE mutating UTXO.
+    const uint64_t new_height = tip_.height + 1;
+    const auto     new_hash   = b.block_hash();
+    if (!write_undo_file(datadir_, new_height, new_hash, undo)) {
+        err = "failed to write undo";
+        return false;
+    }
+
+    // --- Apply UTXO changes (same logic, just happens AFTER durable undo) ---
     for (size_t ti = 1; ti < b.txs.size(); ++ti){
         const auto& tx = b.txs[ti];
 
@@ -1018,7 +1033,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
             (void)utxo_.spend(in.prev.txid, in.prev.vout);
         }
         for (size_t i = 0; i < tx.vout.size(); ++i){
-            UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, tip_.height + 1, false};
+            UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, new_height, false};
             utxo_.add(tx.txid(), (uint32_t)i, e);
         }
     }
@@ -1026,21 +1041,22 @@ bool Chain::submit_block(const Block& b, std::string& err){
     const auto& cb = b.txs[0];
     uint64_t cb_sum = 0;
     for (size_t i = 0; i < cb.vout.size(); ++i){
-        UTXOEntry e{cb.vout[i].value, cb.vout[i].pkh, tip_.height + 1, true};
+        UTXOEntry e{cb.vout[i].value, cb.vout[i].pkh, new_height, true};
         utxo_.add(cb.txid(), (uint32_t)i, e);
         cb_sum += cb.vout[i].value;
     }
 
-    tip_.height += 1;
-    tip_.hash   = b.block_hash();
+    // Advance tip
+    tip_.height = new_height;
+    tip_.hash   = new_hash;
     tip_.bits   = b.header.bits;
     tip_.time   = b.header.time;
     tip_.issued += cb_sum;
 
+    // Cache undo in RAM map (unchanged behavior)
     g_undo[hk(tip_.hash)] = std::move(undo);
 
-    write_undo_file(datadir_, tip_.height, tip_.hash, g_undo[hk(tip_.hash)]);
-
+    // Prune old undo if beyond window
     if (tip_.height >= UNDO_WINDOW) {
         size_t prune_h = (size_t)(tip_.height - UNDO_WINDOW);
         std::vector<uint8_t> prune_hash;
@@ -1049,6 +1065,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
         }
     }
 
+    // Notify reorg manager
     miq::HeaderView hv;
     hv.hash   = tip_.hash;
     hv.prev   = b.header.prev_hash;
