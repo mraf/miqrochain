@@ -23,6 +23,7 @@
 #include <algorithm>       // std::any_of, std::sort
 #include <chrono>          // future-time bound
 #include <cstring>         // std::memcmp, std::memset
+#include <type_traits>     // compile-time detection (SFINAE)
 
 #ifndef MAX_TX_SIZE
 #define MIQ_FALLBACK_MAX_TX_SIZE (100u * 1024u) // 100 KiB default
@@ -927,6 +928,55 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     return true;
 }
 
+// ---------- UTXO atomic-apply helper (uses batch if available) ----------
+struct UtxoOp {
+    bool is_add{false};
+    std::vector<uint8_t> txid;
+    uint32_t vout{0};
+    UTXOEntry entry; // valid only when is_add=true
+};
+
+template<typename DB>
+static auto has_make_batch_impl(int) -> decltype(std::declval<DB&>().make_batch(), std::true_type{});
+template<typename DB>
+static auto has_make_batch_impl(...) -> std::false_type;
+template<typename DB>
+static constexpr bool has_make_batch_v = decltype(has_make_batch_impl<DB>(0))::value;
+
+template<typename DB>
+static bool utxo_apply_ops(DB& db, const std::vector<UtxoOp>& ops, std::string& err) {
+    if constexpr (has_make_batch_v<DB>) {
+        auto batch = db.make_batch();
+        for (const auto& op : ops) {
+            if (op.is_add) batch.add(op.txid, op.vout, op.entry);
+            else           batch.spend(op.txid, op.vout);
+        }
+        std::string kv_err;
+        if (!batch.commit(/*sync=*/true, &kv_err)) {
+            err = kv_err.empty() ? "utxo batch commit failed" : kv_err;
+            return false;
+        }
+        return true;
+    } else {
+        // Fallback: immediate fsynced writes (existing behavior)
+        for (const auto& op : ops) {
+            if (op.is_add) {
+                if (!db.add(op.txid, op.vout, op.entry)) {
+                    err = "utxo add failed";
+                    return false;
+                }
+            } else {
+                if (!db.spend(op.txid, op.vout)) {
+                    err = "utxo spend failed";
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+}
+// -----------------------------------------------------------------------
+
 bool Chain::disconnect_tip_once(std::string& err){
     if (tip_.height == 0) { err = "cannot disconnect genesis"; return false; }
 
@@ -948,40 +998,35 @@ bool Chain::disconnect_tip_once(std::string& err){
     }
     const std::vector<UndoIn>& undo = undo_tmp;
 
-    // --- Apply disconnect atomically via batch ---
-    auto utxo_batch = utxo_.make_batch();
+    // Build UTXO reversal ops
+    std::vector<UtxoOp> ops;
+    ops.reserve(64);
 
     // Spend non-coinbase created outs
     for (size_t ti = cur.txs.size(); ti-- > 1; ){
         const auto& tx = cur.txs[ti];
         for (size_t i = 0; i < tx.vout.size(); ++i) {
-            utxo_batch.spend(tx.txid(), (uint32_t)i);
+            ops.push_back(UtxoOp{false, tx.txid(), (uint32_t)i, {}});
         }
     }
 
     // Restore previous inputs from undo (reverse order)
     for (size_t i = undo.size(); i-- > 0; ){
         const auto& u = undo[i];
-        utxo_batch.add(u.prev_txid, u.prev_vout, u.prev_entry);
+        ops.push_back(UtxoOp{true, u.prev_txid, u.prev_vout, u.prev_entry});
     }
 
     // Remove coinbase outs and compute sum
     const auto& cb = cur.txs[0];
     uint64_t cb_sum = 0;
     for (size_t i = 0; i < cb.vout.size(); ++i) {
-        utxo_batch.spend(cb.txid(), (uint32_t)i);
+        ops.push_back(UtxoOp{false, cb.txid(), (uint32_t)i, {}});
         cb_sum += cb.vout[i].value;
     }
     if (tip_.issued < cb_sum) { err = "issued underflow"; return false; }
 
-    // Commit all UTXO reversals atomically
-    {
-        std::string kv_err;
-        if (!utxo_batch.commit(/*sync=*/true, &kv_err)) {
-            err = kv_err.empty() ? "utxo batch commit failed (disconnect)" : kv_err;
-            return false;
-        }
-    }
+    // Commit reversals atomically if backend supports it
+    if (!utxo_apply_ops(utxo_, ops, err)) return false;
 
     Block prev;
     if (!get_block_by_hash(cur.header.prev_hash, prev)) {
@@ -1037,20 +1082,21 @@ bool Chain::submit_block(const Block& b, std::string& err){
         return false;
     }
 
-    // --- Apply UTXO changes atomically via batch ---
-    auto utxo_batch = utxo_.make_batch();
+    // Build UTXO apply ops
+    std::vector<UtxoOp> ops;
+    ops.reserve(64);
 
     for (size_t ti = 1; ti < b.txs.size(); ++ti){
         const auto& tx = b.txs[ti];
 
         // spends
         for (const auto& in : tx.vin){
-            utxo_batch.spend(in.prev.txid, in.prev.vout);
+            ops.push_back(UtxoOp{false, in.prev.txid, in.prev.vout, {}});
         }
         // adds
         for (size_t i = 0; i < tx.vout.size(); ++i){
             UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, new_height, false};
-            utxo_batch.add(tx.txid(), (uint32_t)i, e);
+            ops.push_back(UtxoOp{true, tx.txid(), (uint32_t)i, e});
         }
     }
 
@@ -1059,18 +1105,12 @@ bool Chain::submit_block(const Block& b, std::string& err){
     uint64_t cb_sum = 0;
     for (size_t i = 0; i < cb.vout.size(); ++i){
         UTXOEntry e{cb.vout[i].value, cb.vout[i].pkh, new_height, true};
-        utxo_batch.add(cb.txid(), (uint32_t)i, e);
+        ops.push_back(UtxoOp{true, cb.txid(), (uint32_t)i, e});
         cb_sum += cb.vout[i].value;
     }
 
-    // single durable commit of all UTXO changes
-    {
-        std::string kv_err;
-        if (!utxo_batch.commit(/*sync=*/true, &kv_err)){
-            err = kv_err.empty() ? "utxo batch commit failed" : kv_err;
-            return false;
-        }
-    }
+    // Apply all UTXO changes (atomically if supported)
+    if (!utxo_apply_ops(utxo_, ops, err)) return false;
 
     // Advance tip
     tip_.height = new_height;
