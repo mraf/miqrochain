@@ -723,26 +723,11 @@ void P2P::handle_new_peer(int c, const std::string& ip){
     uint32_t be_ip;
     if (parse_ipv4(ip, be_ip) && ipv4_is_public(be_ip)) {
         addrv4_.insert(be_ip);
-#if MIQ_ENABLE_ADDRMAN
-    {
-        // Try to pull up to MIQ_ADDR_RESPONSE_MAX unique public IPv4 addrs
-        // by repeatedly sampling addrman’s selection (tried→new).
-        std::unordered_set<uint32_t> emitted;
-        for (int tries = 0; tries < (int)(MIQ_ADDR_RESPONSE_MAX * 3) && cnt < MIQ_ADDR_RESPONSE_MAX; ++tries) {
-            auto cand = g_addrman.select_for_outbound(g_am_rng, /*prefer_tried=*/true);
-            if (!cand) break;
-            uint32_t be_ip;
-            if (!P2P::parse_ipv4(cand->host, be_ip) || !P2P::ipv4_is_public(be_ip)) continue;
-            if (!emitted.insert(be_ip).second) continue;
-
-            payload.push_back((uint8_t)(be_ip >> 24));
-            payload.push_back((uint8_t)(be_ip >> 16));
-            payload.push_back((uint8_t)(be_ip >> 8));
-            payload.push_back((uint8_t)(be_ip >> 0));
-            ++cnt;
-        }
+    #if MIQ_ENABLE_ADDRMAN
+        miq::NetAddr na; na.host=ip; na.port=g_listen_port; na.is_ipv6=false; na.tried=false;
+        g_addrman.add(na, /*from_dns=*/false);
+    #endif
     }
-#endif
 
     log_info("P2P: inbound peer " + ip);
 
@@ -853,11 +838,15 @@ void P2P::send_addr_snapshot(PeerState& ps){
     // Prefer returning samples known to addrman (if enabled), fallback to legacy set
 #if MIQ_ENABLE_ADDRMAN
     {
-        auto sample = g_addrman.sample_for_relay(g_am_rng, MIQ_ADDR_RESPONSE_MAX);
-        for (const auto& na : sample) {
+        // Pull up to MIQ_ADDR_RESPONSE_MAX unique public IPv4 addrs
+        std::unordered_set<uint32_t> emitted;
+        for (int tries = 0; tries < (int)(MIQ_ADDR_RESPONSE_MAX * 3) && cnt < MIQ_ADDR_RESPONSE_MAX; ++tries) {
+            auto cand = g_addrman.select_for_outbound(g_am_rng, /*prefer_tried=*/true);
+            if (!cand) break;
             uint32_t be_ip;
-            if (!P2P::parse_ipv4(na.host, be_ip) || !P2P::ipv4_is_public(be_ip)) continue;
-            if (cnt >= MIQ_ADDR_RESPONSE_MAX) break;
+            if (!P2P::parse_ipv4(cand->host, be_ip) || !P2P::ipv4_is_public(be_ip)) continue;
+            if (!emitted.insert(be_ip).second) continue;
+
             payload.push_back((uint8_t)(be_ip >> 24));
             payload.push_back((uint8_t)(be_ip >> 16));
             payload.push_back((uint8_t)(be_ip >> 8));
@@ -866,6 +855,7 @@ void P2P::send_addr_snapshot(PeerState& ps){
         }
     }
 #endif
+
     for (uint32_t be_ip : addrv4_) {
         if (cnt >= MIQ_ADDR_RESPONSE_MAX) break;
         if (!ipv4_is_public(be_ip)) continue;
@@ -878,7 +868,6 @@ void P2P::send_addr_snapshot(PeerState& ps){
     auto msg = encode_msg("addr", payload);
     send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
 }
-
 void P2P::handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload){
     int64_t t = now_ms();
     if (t - ps.last_addr_ms < MIQ_ADDR_MIN_INTERVAL_MS) {
