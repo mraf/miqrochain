@@ -163,6 +163,40 @@ static bool write_undo_file(const std::string& base_dir,
     return true;
 }
 
+auto utxo_batch = utxo_.make_batch();
+
+for (size_t ti = 1; ti < b.txs.size(); ++ti){
+    const auto& tx = b.txs[ti];
+
+    // spends
+    for (const auto& in : tx.vin){
+        utxo_batch.spend(in.prev.txid, in.prev.vout);
+    }
+    // adds
+    for (size_t i = 0; i < tx.vout.size(); ++i){
+        UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, new_height, false};
+        utxo_batch.add(tx.txid(), (uint32_t)i, e);
+    }
+}
+
+// coinbase adds + sum
+const auto& cb = b.txs[0];
+uint64_t cb_sum = 0;
+for (size_t i = 0; i < cb.vout.size(); ++i){
+    UTXOEntry e{cb.vout[i].value, cb.vout[i].pkh, new_height, true};
+    utxo_batch.add(cb.txid(), (uint32_t)i, e);
+    cb_sum += cb.vout[i].value;
+}
+
+// single durable commit of all UTXO changes
+{
+    std::string kv_err;
+    if (!utxo_batch.commit(/*sync=*/true, &kv_err)){
+        err = kv_err.empty() ? "utxo batch commit failed" : kv_err;
+        return false;
+    }
+}
+
 static bool read_exact(FILE* f, void* buf, size_t n){
     return std::fread(buf, 1, n, f) == n;
 }
