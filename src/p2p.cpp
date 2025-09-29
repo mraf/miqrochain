@@ -18,6 +18,35 @@
 #include <cstdio>
 #include <random>
 
+// === Optional persisted addrman =============================================
+// This block is 100% backward compatible: if addrman.h is absent, we disable it.
+#if defined(__has_include)
+#  if __has_include("addrman.h")
+#    include "addrman.h"
+#    ifndef MIQ_ENABLE_ADDRMAN
+#      define MIQ_ENABLE_ADDRMAN 1
+#    endif
+#  else
+#    ifndef MIQ_ENABLE_ADDRMAN
+#      define MIQ_ENABLE_ADDRMAN 0
+#    endif
+#  endif
+#else
+#  ifndef MIQ_ENABLE_ADDRMAN
+#    define MIQ_ENABLE_ADDRMAN 0
+#  endif
+#endif
+
+#ifndef MIQ_ADDRMAN_FILE
+#define MIQ_ADDRMAN_FILE "peers2.dat"  // keep distinct from legacy "peers.dat"
+#endif
+#ifndef MIQ_FEELER_INTERVAL_MS
+#define MIQ_FEELER_INTERVAL_MS 60000   // 60s feeler cadence (with jitter)
+#endif
+#ifndef MIQ_GROUP_OUTBOUND_MAX
+#define MIQ_GROUP_OUTBOUND_MAX 2       // at most 2 outbounds per /16 group
+#endif
+
 // ---- Feature flag (renamed, with backward-compat) --------------------------
 #ifndef MIQ_ENABLE_HEADERS_FIRST
   #ifdef MIQ_ENABLE_HEADERS_FIRST_WIP
@@ -88,12 +117,12 @@
 #define MIQ_ADDR_RESPONSE_MAX 200        // max addrs we return to getaddr
 #endif
 
-// Persisted addrman tuning
+// Persisted addr store/addrman tuning
 #ifndef MIQ_ADDR_SAVE_INTERVAL_MS
-#define MIQ_ADDR_SAVE_INTERVAL_MS 60000  // save peers.dat every 60s if changed
+#define MIQ_ADDR_SAVE_INTERVAL_MS 60000  // save peers files every 60s if changed
 #endif
 #ifndef MIQ_ADDR_MAX_STORE
-#define MIQ_ADDR_MAX_STORE 10000         // cap stored addrs
+#define MIQ_ADDR_MAX_STORE 10000         // cap stored addrs (legacy store)
 #endif
 
 // Outbound dialing target
@@ -227,7 +256,7 @@ static inline bool gate_on_command(int fd, const std::string& cmd,
     return false;
 }
 
-// === persisted addrman helpers (peers.dat) ==================================
+// === legacy persisted IPv4 addr set (kept for backward compat) ==============
 static void save_addrs_to_disk(const std::string& datadir,
                                const std::unordered_set<uint32_t>& addrv4){
     std::string path = datadir + "/peers.dat";
@@ -281,6 +310,12 @@ static std::string be_ip_to_string(uint32_t be_ip){
     inet_ntop(AF_INET, &a.sin_addr, buf, (socklen_t)sizeof(buf));
 #endif
     return std::string(buf[0]?buf:"0.0.0.0");
+}
+
+// Compute IPv4 /16 group key from BE ip
+static inline uint16_t v4_group16(uint32_t be_ip){
+    uint8_t A = uint8_t(be_ip>>24), B = uint8_t(be_ip>>16);
+    return (uint16_t(A) << 8) | uint16_t(B);
 }
 
 // Global listen port for outbound dials (set in start())
@@ -403,6 +438,17 @@ namespace {
 } // anon
 #endif // MIQ_ENABLE_HEADERS_FIRST
 
+// === AddrMan state (TU-local) ===============================================
+#if MIQ_ENABLE_ADDRMAN
+namespace {
+    static miq::AddrMan g_addrman;
+    static std::string  g_addrman_path;      // datadir + "/" + MIQ_ADDRMAN_FILE
+    static int64_t      g_last_addrman_save = 0;
+    static int64_t      g_next_feeler_ms    = 0;
+    static miq::FastRand g_am_rng{0xC0FFEEULL};
+}
+#endif
+
 static int64_t now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
@@ -474,15 +520,30 @@ void P2P::save_bans(){
     for (auto& ip : banned_) f << ip << "\n";
 }
 
-// === start/stop now also load/save peers.dat =================================
+// === start/stop now also load/save peers files ===============================
 bool P2P::start(uint16_t port){
     if (running_) return true;
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
     load_bans();
-    // load persisted addrs (best-effort)
+    // load legacy persisted addrs (best-effort)
     load_addrs_from_disk(datadir_, addrv4_);
+
+#if MIQ_ENABLE_ADDRMAN
+    // addrman: load from disk (ok if first run)
+    g_addrman_path = datadir_ + "/" + std::string(MIQ_ADDRMAN_FILE);
+    {
+        std::string err;
+        if (g_addrman.load(g_addrman_path, err)) {
+            log_info("P2P: addrman loaded (" + std::to_string(g_addrman.size()) + " addrs)");
+        } else {
+            log_info("P2P: addrman load: " + err);
+        }
+        g_last_addrman_save = now_ms();
+        g_next_feeler_ms = now_ms() + MIQ_FEELER_INTERVAL_MS;
+    }
+#endif
 
     srv_ = create_server(port);
     if (srv_ < 0) { log_error("P2P: failed to create server"); return false; }
@@ -495,7 +556,7 @@ bool P2P::start(uint16_t port){
         if (!ext_ip.empty()) log_info("P2P: external IP (UPnP): " + ext_ip);
     }
 
-    // Resolve bootstrap seeds from constants.h and stash into addr store
+    // Resolve bootstrap seeds from constants.h and stash into stores
     {
         std::vector<miq::SeedEndpoint> seeds;
         if (miq::resolve_dns_seeds(seeds, port, /*include_single_dns_seed=*/true)) {
@@ -504,6 +565,11 @@ bool P2P::start(uint16_t port){
                 uint32_t be_ip;
                 if (parse_ipv4(s.ip, be_ip) && ipv4_is_public(be_ip)) {
                     added += addrv4_.insert(be_ip).second ? 1 : 0;
+#if MIQ_ENABLE_ADDRMAN
+                    miq::NetAddr na;
+                    na.host = s.ip; na.port = port; na.is_ipv6 = false; na.tried = false;
+                    g_addrman.add(na, /*from_dns=*/true);
+#endif
                 }
             }
             if (added) log_info("P2P: loaded " + std::to_string(added) + " seed addrs");
@@ -533,8 +599,17 @@ void P2P::stop(){
     WSACleanup();
 #endif
     save_bans();
-    // persist addrs on clean shutdown
+    // persist legacy addrs on clean shutdown
     save_addrs_to_disk(datadir_, addrv4_);
+#if MIQ_ENABLE_ADDRMAN
+    // persist addrman on clean shutdown
+    {
+        std::string err;
+        if (!g_addrman.save(g_addrman_path, err)) {
+            log_warn("P2P: addrman save failed: " + err);
+        }
+    }
+#endif
 }
 
 // === outbound connect helpers ===============================================
@@ -581,6 +656,11 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     uint32_t be_ip;
     if (ipbuf[0] && parse_ipv4(ipbuf, be_ip) && ipv4_is_public(be_ip)) {
         addrv4_.insert(be_ip);
+#if MIQ_ENABLE_ADDRMAN
+        miq::NetAddr na; na.host = ps.ip; na.port = port; na.tried = true; na.is_ipv6=false;
+        g_addrman.mark_good(na);
+        g_addrman.add_anchor(na);
+#endif
     }
 
     log_info("P2P: connected seed " + peers_[s].ip);
@@ -598,6 +678,24 @@ static std::mt19937& rng(){
     return gen;
 }
 
+// === group-diversity helper =================================================
+static bool violates_group_diversity(const std::unordered_map<int, P2P::PeerState>& peers,
+                                     uint32_t candidate_be_ip){
+    // Count per /16 among current OUTBOUND peers (in this code, all peers_ are in one map;
+    // we apply diversity anyway to lower eclipse risk)
+    std::unordered_map<uint16_t,int> group_counts;
+    for (const auto& kv : peers){
+        const auto& ps = kv.second;
+        uint32_t be_ip;
+        if (!P2P::parse_ipv4(ps.ip, be_ip)) continue;
+        uint16_t g = v4_group16(be_ip);
+        group_counts[g]++;
+    }
+    uint16_t cg = v4_group16(candidate_be_ip);
+    auto it = group_counts.find(cg);
+    return (it != group_counts.end() && it->second >= MIQ_GROUP_OUTBOUND_MAX);
+}
+
 void P2P::handle_new_peer(int c, const std::string& ip){
     PeerState ps;
     ps.sock = c;
@@ -611,7 +709,13 @@ void P2P::handle_new_peer(int c, const std::string& ip){
 
     // learn addr
     uint32_t be_ip;
-    if (parse_ipv4(ip, be_ip) && ipv4_is_public(be_ip)) addrv4_.insert(be_ip);
+    if (parse_ipv4(ip, be_ip) && ipv4_is_public(be_ip)) {
+        addrv4_.insert(be_ip);
+#if MIQ_ENABLE_ADDRMAN
+        miq::NetAddr na; na.host=ip; na.port=g_listen_port; na.is_ipv6=false; na.tried=false;
+        g_addrman.add(na, /*from_dns=*/false);
+#endif
+    }
 
     log_info("P2P: inbound peer " + ip);
 
@@ -718,6 +822,23 @@ void P2P::send_addr_snapshot(PeerState& ps){
     std::vector<uint8_t> payload;
     payload.reserve(MIQ_ADDR_RESPONSE_MAX * 4);
     size_t cnt = 0;
+
+    // Prefer returning samples known to addrman (if enabled), fallback to legacy set
+#if MIQ_ENABLE_ADDRMAN
+    {
+        auto sample = g_addrman.sample_for_relay(g_am_rng, MIQ_ADDR_RESPONSE_MAX);
+        for (const auto& na : sample) {
+            uint32_t be_ip;
+            if (!P2P::parse_ipv4(na.host, be_ip) || !P2P::ipv4_is_public(be_ip)) continue;
+            if (cnt >= MIQ_ADDR_RESPONSE_MAX) break;
+            payload.push_back((uint8_t)(be_ip >> 24));
+            payload.push_back((uint8_t)(be_ip >> 16));
+            payload.push_back((uint8_t)(be_ip >> 8));
+            payload.push_back((uint8_t)(be_ip >> 0));
+            ++cnt;
+        }
+    }
+#endif
     for (uint32_t be_ip : addrv4_) {
         if (cnt >= MIQ_ADDR_RESPONSE_MAX) break;
         if (!ipv4_is_public(be_ip)) continue;
@@ -752,6 +873,17 @@ void P2P::handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload){
             (uint32_t(payload[4*i+3])<<0 );
         if (!ipv4_is_public(be_ip)) continue;
         addrv4_.insert(be_ip);
+#if MIQ_ENABLE_ADDRMAN
+        char buf[64]={0};
+        sockaddr_in a{}; a.sin_family=AF_INET; a.sin_addr.s_addr=be_ip;
+#ifdef _WIN32
+        InetNtopA(AF_INET, &a.sin_addr, buf, (int)sizeof(buf));
+#else
+        inet_ntop(AF_INET, &a.sin_addr, buf, (socklen_t)sizeof(buf));
+#endif
+        miq::NetAddr na; na.host=buf; na.port=g_listen_port; na.is_ipv6=false; na.tried=false;
+        g_addrman.add(na, /*from_dns=*/false);
+#endif
         ++accepted;
     }
     if (accepted == 0) {
@@ -912,45 +1044,126 @@ void P2P::loop(){
         // Opportunistic outbound dials to reach MIQ_OUTBOUND_TARGET
         if ((int)peers_.size() < MIQ_OUTBOUND_TARGET && g_listen_port != 0) {
             int64_t tnow = now_ms();
-            if (tnow - last_dial_ms > MIQ_DIAL_INTERVAL_MS && !addrv4_.empty()) {
+            if (tnow - last_dial_ms > MIQ_DIAL_INTERVAL_MS) {
                 last_dial_ms = tnow;
 
-                // pick a random stored addr not already connected/banned
-                std::vector<uint32_t> candidates;
-                candidates.reserve(addrv4_.size());
-                for (uint32_t ip : addrv4_) {
-                    std::string dotted = be_ip_to_string(ip);
-                    if (banned_.count(dotted)) continue;
-                    bool connected = false;
-                    for (auto& kv : peers_) {
-                        if (kv.second.ip == dotted) { connected = true; break; }
+                // Select candidate address:
+                // 1) Prefer addrman (tried → new), enforcing group diversity.
+                // 2) Fallback to legacy addrv4_ set.
+#if MIQ_ENABLE_ADDRMAN
+                bool dialed = false;
+                // Try a few picks to satisfy group diversity without loops
+                for (int attempts=0; attempts<8 && !dialed; ++attempts){
+                    auto cand = g_addrman.select_for_outbound(g_am_rng, /*prefer_tried=*/true);
+                    if (!cand) break;
+                    uint32_t be_ip;
+                    if (!parse_ipv4(cand->host, be_ip) || !ipv4_is_public(be_ip)) {
+                        g_addrman.mark_attempt(*cand);
+                        continue;
                     }
-                    if (!connected) candidates.push_back(ip);
-                }
-                if (!candidates.empty()) {
-                    std::uniform_int_distribution<size_t> dist(0, candidates.size()-1);
-                    uint32_t pick = candidates[dist(rng())];
-                    int s = dial_be_ipv4(pick, g_listen_port);
-                    if (s >= 0) {
-                        // Build PeerState
-                        PeerState ps;
-                        ps.sock = s;
-                        ps.ip   = be_ip_to_string(pick);
-                        ps.mis  = 0;
-                        ps.last_ms = now_ms();
-                        ps.blk_tokens = MIQ_RATE_BLOCK_BURST;
-                        ps.tx_tokens  = MIQ_RATE_TX_BURST;
-                        ps.last_refill_ms = ps.last_ms;
-                        peers_[s] = ps;
+                    if (violates_group_diversity(peers_, be_ip)) {
+                        g_addrman.mark_attempt(*cand);
+                        continue;
+                    }
+                    // avoid duplicates and bans
+                    std::string dotted = be_ip_to_string(be_ip);
+                    if (banned_.count(dotted)) { g_addrman.mark_attempt(*cand); continue; }
+                    bool connected = false;
+                    for (auto& kv : peers_) if (kv.second.ip == dotted) { connected = true; break; }
+                    if (connected) { g_addrman.mark_attempt(*cand); continue; }
 
-                        log_info("P2P: outbound to known " + ps.ip);
+                    int s = dial_be_ipv4(be_ip, g_listen_port);
+                    if (s >= 0) {
+                        PeerState ps; ps.sock = s; ps.ip = dotted; ps.mis=0; ps.last_ms=now_ms();
+                        ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
+                        peers_[s] = ps;
+                        log_info("P2P: outbound (addrman) " + ps.ip);
                         gate_on_connect(s);
                         auto msg = encode_msg("version", {});
                         send(s, (const char*)msg.data(), (int)msg.size(), 0);
+                        dialed = true;
+                    } else {
+                        g_addrman.mark_attempt(*cand);
+                    }
+                }
+
+                if (!dialed && !addrv4_.empty()) {
+#endif
+                    // legacy fallback: pick a random stored addr not already connected/banned
+                    std::vector<uint32_t> candidates;
+                    candidates.reserve(addrv4_.size());
+                    for (uint32_t ip : addrv4_) {
+                        std::string dotted = be_ip_to_string(ip);
+                        if (banned_.count(dotted)) continue;
+                        bool connected = false;
+                        for (auto& kv : peers_) {
+                            if (kv.second.ip == dotted) { connected = true; break; }
+                        }
+                        if (connected) continue;
+                        if (violates_group_diversity(peers_, ip)) continue;
+                        candidates.push_back(ip);
+                    }
+                    if (!candidates.empty()) {
+                        std::uniform_int_distribution<size_t> dist(0, candidates.size()-1);
+                        uint32_t pick = candidates[dist(rng())];
+                        int s = dial_be_ipv4(pick, g_listen_port);
+                        if (s >= 0) {
+                            // Build PeerState
+                            PeerState ps;
+                            ps.sock = s;
+                            ps.ip   = be_ip_to_string(pick);
+                            ps.mis  = 0;
+                            ps.last_ms = now_ms();
+                            ps.blk_tokens = MIQ_RATE_BLOCK_BURST;
+                            ps.tx_tokens  = MIQ_RATE_TX_BURST;
+                            ps.last_refill_ms = ps.last_ms;
+                            peers_[s] = ps;
+
+                            log_info("P2P: outbound to known " + ps.ip);
+                            gate_on_connect(s);
+                            auto msg = encode_msg("version", {});
+                            send(s, (const char*)msg.data(), (int)msg.size(), 0);
+                        }
+                    }
+#if MIQ_ENABLE_ADDRMAN
+                }
+#endif
+            }
+        }
+
+        // === Feeler connection scheduler (addrman-only; harmless if no slot) ==
+#if MIQ_ENABLE_ADDRMAN
+        {
+            int64_t tnow = now_ms();
+            if (tnow >= g_next_feeler_ms) {
+                g_next_feeler_ms = tnow + MIQ_FEELER_INTERVAL_MS + (int)(g_am_rng.next()%5000); // + jitter
+                // Only if we already have outbound peers; feeler is a short probe
+                auto cand = g_addrman.select_feeler(g_am_rng);
+                if (cand) {
+                    uint32_t be_ip;
+                    if (parse_ipv4(cand->host, be_ip) && ipv4_is_public(be_ip) && !violates_group_diversity(peers_, be_ip)) {
+                        std::string dotted = be_ip_to_string(be_ip);
+                        if (!banned_.count(dotted)) {
+                            bool connected=false; for (auto& kv:peers_) if (kv.second.ip==dotted) { connected=true; break; }
+                            if (!connected) {
+                                int s = dial_be_ipv4(be_ip, g_listen_port);
+                                if (s >= 0) {
+                                    // We treat it like an outbound; on verack we will mark_good (see below)
+                                    PeerState ps; ps.sock=s; ps.ip=dotted; ps.mis=0; ps.last_ms=now_ms();
+                                    ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
+                                    peers_[s]=ps;
+                                    log_info("P2P: feeler " + dotted);
+                                    gate_on_connect(s);
+                                    auto msg = encode_msg("version", {});
+                                    send(s, (const char*)msg.data(), (int)msg.size(), 0);
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+#endif
 
         std::vector<PollFD> fds;
         size_t base = 0;
@@ -1092,6 +1305,15 @@ void P2P::loop(){
 
                     } else if (cmd == "verack") {
                         ps.verack_ok = true;
+#if MIQ_ENABLE_ADDRMAN
+                        // Mark successful connection good
+                        uint32_t be_ip;
+                        if (parse_ipv4(ps.ip, be_ip)) {
+                            miq::NetAddr na; na.host = ps.ip; na.port = g_listen_port; na.is_ipv6=false; na.tried=true;
+                            g_addrman.mark_good(na);
+                            g_addrman.add_anchor(na); // keep a few last-good peers
+                        }
+#endif
 #if MIQ_ENABLE_HEADERS_FIRST
                         // headers-first: send getheaders(locator, stop=0)
                         std::vector<std::vector<uint8_t>> locator;
@@ -1304,15 +1526,29 @@ void P2P::loop(){
 
         for (int s : dead) { gate_on_close(s); CLOSESOCK(s); peers_.erase(s); }
 
-        // Autosave addrs periodically if we’ve learned new ones
+        // Autosave legacy addrs periodically if we’ve learned new ones
         if (now_ms() - last_addr_save_ms > MIQ_ADDR_SAVE_INTERVAL_MS) {
             last_addr_save_ms = now_ms();
             save_addrs_to_disk(datadir_, addrv4_);
+#if MIQ_ENABLE_ADDRMAN
+            std::string err;
+            if (!g_addrman.save(g_addrman_path, err)) {
+                log_warn("P2P: addrman autosave failed: " + err);
+            }
+#endif
         }
     }
 
     save_bans();
     save_addrs_to_disk(datadir_, addrv4_);
+#if MIQ_ENABLE_ADDRMAN
+    {
+        std::string err;
+        if (!g_addrman.save(g_addrman_path, err)) {
+            log_warn("P2P: addrman final save failed: " + err);
+        }
+    }
+#endif
 }
 
 std::vector<PeerSnapshot> P2P::snapshot_peers() const {
