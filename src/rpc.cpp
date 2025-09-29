@@ -48,7 +48,7 @@ static constexpr size_t RPC_MAX_BODY_BYTES = 512 * 1024; // 512 KiB
 
 namespace miq {
 
-// ======== Simple global cookie-auth gate (no header support in http shim) ========
+// ======== Simple global cookie-auth gate (payload-level for current HTTP shim) ========
 
 static std::string& rpc_cookie_token() {
     static std::string tok;
@@ -95,6 +95,14 @@ static bool read_first_line_trim(const std::string& p, std::string& out) {
     while(!s.empty() && (s.back()=='\r' || s.back()=='\n' || s.back()==' ' || s.back()=='\t')) s.pop_back();
     out = s;
     return true;
+}
+
+// Constant-time compare to avoid token timing leaks
+static bool timing_safe_eq(const std::string& a, const std::string& b){
+    if (a.size() != b.size()) return false;
+    unsigned char acc = 0;
+    for (size_t i=0;i<a.size();++i) acc |= (unsigned char)(a[i] ^ b[i]);
+    return acc == 0;
 }
 
 // ==============================================================================
@@ -235,14 +243,20 @@ std::string RpcService::handle(const std::string& body){
         if(!std::holds_alternative<std::map<std::string,JNode>>(req.v)) return err("bad json obj");
         auto& obj = std::get<std::map<std::string,JNode>>(req.v);
 
-        // ---- Cookie auth (payload-level; header passthrough unavailable in simple HTTP shim) ----
+        // ---- Cookie/token auth (payload-level for now; HTTP headers not available here) ----
         if (rpc_auth_enabled()) {
+            // Accept either "auth" or "token" fields (strings)
+            std::string provided;
             auto ia = obj.find("auth");
-            if (ia == obj.end() || !std::holds_alternative<std::string>(ia->second.v)) {
-                return err("unauthorized");
+            if (ia != obj.end() && std::holds_alternative<std::string>(ia->second.v)) {
+                provided = std::get<std::string>(ia->second.v);
+            } else {
+                auto itok = obj.find("token");
+                if (itok != obj.end() && std::holds_alternative<std::string>(itok->second.v)) {
+                    provided = std::get<std::string>(itok->second.v);
+                }
             }
-            const std::string provided = std::get<std::string>(ia->second.v);
-            if (provided != rpc_cookie_token()) {
+            if (provided.empty() || !timing_safe_eq(provided, rpc_cookie_token())) {
                 return err("unauthorized");
             }
         }
