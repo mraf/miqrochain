@@ -22,6 +22,11 @@
 #include "tls_proxy.h"    // NEW: TLS terminator for RPC
 #include "ibd_monitor.h"  // NEW: IBD sampling for getibdinfo
 
+// === NEW: UTXO KV + Reindex =================================================
+#include "utxo_kv.h"
+#include "reindex_utxo.h"
+// ============================================================================
+
 #include <thread>
 #include <iostream>
 #include <filesystem>
@@ -46,6 +51,8 @@ static void print_usage(){
       << "  --conf=<path>                                config file (key=value)\n"
       << "  --genaddress                                generate ECDSA-P2PKH address (priv/pk/address)\n"
       << "  --buildtx <priv_hex> <prev_txid_hex> <vout> <value> <to_address>  (prints txhex)\n"
+      << "  --reindex_utxo                              rebuild chainstate/UTXO from current chain\n"
+      << "  --utxo_kv                                   (reserved) enable KV-backed UTXO at runtime if supported\n"
       << "Env:\n"
       << "  MIQ_MINING_ADDR     If set, node will mine to this address (Base58 P2PKH)\n";
 }
@@ -54,6 +61,8 @@ static bool is_recognized_arg(const std::string& s){
     if(s.rfind("--conf=",0)==0) return true;
     if(s=="--genaddress") return true;
     if(s=="--buildtx") return true; // expects more args after
+    if(s=="--reindex_utxo") return true;   // NEW
+    if(s=="--utxo_kv") return true;        // NEW (harmless if unused)
     if(s=="--help") return true;
     return false;
 }
@@ -138,6 +147,10 @@ int main(int argc, char** argv){
         Config cfg;
         std::string conf;
         bool genaddr=false, buildtx=false;
+        // NEW flags
+        bool flag_reindex_utxo = false;
+        bool flag_utxo_kv      = false;
+
         std::string privh, prevtxid_hex, toaddr;
         uint32_t vout=0;
         uint64_t value=0;
@@ -165,6 +178,10 @@ int main(int argc, char** argv){
                 vout        = (uint32_t)std::stoul(argv[++i]);
                 value       = (uint64_t)std::stoull(argv[++i]);
                 toaddr      = argv[++i];
+            } else if(a=="--reindex_utxo"){
+                flag_reindex_utxo = true;            // NEW
+            } else if(a=="--utxo_kv"){
+                flag_utxo_kv = true;                 // NEW (reserved)
             } else if(a=="--help"){
                 print_usage();
                 return 0;
@@ -284,6 +301,19 @@ int main(int argc, char** argv){
             return 1;
         }
         std::fprintf(stderr, "[BOOT] init_genesis OK\n");
+
+        // === NEW: Optional UTXO reindex BEFORE starting services ===============
+        if (flag_reindex_utxo) {
+            log_info("ReindexUTXO: rebuilding chainstate from active chain...");
+            UTXOKV utxo_kv;
+            std::string err;
+            if (!ReindexUTXO(chain, utxo_kv, /*compact_after=*/true, err)) {
+                log_error(std::string("ReindexUTXO failed: ") + (err.empty() ? "unknown error" : err));
+                return 1;
+            }
+            log_info("ReindexUTXO: done");
+        }
+        // =========================================================================
 
         // Resolve mining address (prompt if needed — ALWAYS prompts first)
         bool have_addr = resolve_mining_address(g_mine_pkh, !cfg.no_mine, conf);
