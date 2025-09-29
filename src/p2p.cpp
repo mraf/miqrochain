@@ -6,6 +6,7 @@
 #include "serialize.h"
 #include "chain.h"
 #include "constants.h"
+#include "utxo.h"   // fee calc (UTXOEntry)
 
 #include <chrono>
 #include <fstream>
@@ -17,6 +18,7 @@
 #include <string>
 #include <cstdio>
 #include <random>
+#include <cstdlib>  // getenv
 
 // === Optional persisted addrman =============================================
 // This block is 100% backward compatible: if addrman.h is absent, we disable it.
@@ -225,6 +227,55 @@ static int64_t g_next_stall_probe_ms = 0;
 static std::unordered_map<int, std::vector<std::vector<uint8_t>>> g_trickle_q;
 static std::unordered_map<int, int64_t> g_trickle_last_ms;
 
+// ---- env helper (u64) ------------------------------------------------------
+static inline uint64_t env_u64(const char* name, uint64_t defv){
+    const char* v = std::getenv(name);
+    if(!v || !*v) return defv;
+    char* end=nullptr; unsigned long long x = std::strtoull(v, &end, 10);
+    if(end==v) return defv;
+    return (uint64_t)x;
+}
+
+// ---- Fee filter state (miqron/kB) ------------------------------------------
+static inline uint64_t local_min_relay_kb(){
+    // default aligns with MIN_RELAY_FEE_RATE logic elsewhere (1000 miqron/kB)
+    static uint64_t v = env_u64("MIQ_MIN_RELAY_FEE_RATE", 1000ULL);
+    return v;
+}
+// per-peer feefilter (socket -> min relay per kB) and last announce time
+static std::unordered_map<int, uint64_t> g_peer_minrelay_kb;
+static std::unordered_map<int, int64_t>  g_peer_last_ff_ms;
+
+static inline void set_peer_feefilter(int fd, uint64_t kb){
+    g_peer_minrelay_kb[fd] = kb;
+    g_peer_last_ff_ms[fd]  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                Clock::now().time_since_epoch()).count();
+}
+static inline uint64_t peer_feefilter_kb(int fd){
+    auto it = g_peer_minrelay_kb.find(fd);
+    return (it==g_peer_minrelay_kb.end()) ? 0ULL : it->second;
+}
+
+// ---- DNS seed backoff (per-host) -------------------------------------------
+static std::unordered_map<std::string, std::pair<int64_t,int64_t>> g_seed_backoff;
+// map host -> {next_allowed_ms, current_backoff_ms}
+
+static inline int64_t now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+static inline int64_t seed_backoff_base_ms(){
+    return (int64_t)env_u64("MIQ_SEED_BACKOFF_MS_BASE", 15000ULL); // 15s
+}
+static inline int64_t seed_backoff_max_ms(){
+    return (int64_t)env_u64("MIQ_SEED_BACKOFF_MS_MAX", 300000ULL); // 5m
+}
+static inline int64_t jitter_ms(int64_t max_jitter){
+    static thread_local std::mt19937 gen{std::random_device{}()};
+    std::uniform_int_distribution<int64_t> d(0, max_jitter);
+    return d(gen);
+}
+
 static inline void gate_on_connect(int fd){
     PeerGate pg;
     pg.t_conn = Clock::now();
@@ -237,6 +288,9 @@ static inline void gate_on_close(int fd){
     g_gate.erase(fd);
     g_trickle_q.erase(fd);
     g_trickle_last_ms.erase(fd);
+    // clear feefilter state
+    g_peer_minrelay_kb.erase(fd);
+    g_peer_last_ff_ms.erase(fd);
 }
 static inline bool gate_on_bytes(int fd, size_t add){
     auto it = g_gate.find(fd);
@@ -373,7 +427,7 @@ static int dial_be_ipv4(uint32_t be_ip, uint16_t port){
     return s;
 }
 
-}
+} // anon
 
 namespace miq {
 
@@ -484,11 +538,6 @@ namespace {
     static miq::FastRand g_am_rng{0xC0FFEEULL};
 }
 #endif
-
-static int64_t now_ms() {
-    using namespace std::chrono;
-    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
-}
 
 static int create_server(uint16_t port){
 #ifdef _WIN32
@@ -656,15 +705,51 @@ void P2P::stop(){
 // === outbound connect helpers ===============================================
 
 bool P2P::connect_seed(const std::string& host, uint16_t port){
+    // respect per-host cooldown
+    {
+        int64_t now = now_ms();
+        auto it = g_seed_backoff.find(host);
+        if (it != g_seed_backoff.end() && it->second.first > now) {
+            return false;
+        }
+    }
+
 #ifdef _WIN32
     ADDRINFOA hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
     PADDRINFOA res = nullptr;
     char portstr[16]; sprintf_s(portstr, "%u", (unsigned)port);
     int rc = getaddrinfo(host.c_str(), portstr, &hints, &res);
-    if (rc != 0 || !res) { log_warn("P2P: DNS resolve failed: " + host); return false; }
+    if (rc != 0 || !res) {
+        int64_t now = now_ms();
+        auto &st = g_seed_backoff[host];
+        int64_t cur = st.second > 0 ? st.second : seed_backoff_base_ms();
+        cur = std::min<int64_t>(cur * 2, seed_backoff_max_ms());
+        cur += jitter_ms(5000);
+        st = { now + cur, cur };
+        log_warn("P2P: DNS resolve failed: " + host + " (backoff " + std::to_string(cur) + "ms)");
+        return false;
+    }
     int s = (int)socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s < 0) { freeaddrinfo(res); return false; }
-    if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) { CLOSESOCK(s); freeaddrinfo(res); return false; }
+    if (s < 0) {
+        freeaddrinfo(res);
+        int64_t now = now_ms();
+        auto &st = g_seed_backoff[host];
+        int64_t cur = st.second > 0 ? st.second : seed_backoff_base_ms();
+        cur = std::min<int64_t>(cur * 2, seed_backoff_max_ms());
+        cur += jitter_ms(5000);
+        st = { now + cur, cur };
+        return false;
+    }
+    if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
+        CLOSESOCK(s); freeaddrinfo(res);
+        int64_t now = now_ms();
+        auto &st = g_seed_backoff[host];
+        int64_t cur = st.second > 0 ? st.second : seed_backoff_base_ms();
+        cur = std::min<int64_t>(cur * 2, seed_backoff_max_ms());
+        cur += jitter_ms(5000);
+        st = { now + cur, cur };
+        return false;
+    }
     sockaddr_in a{}; int alen = (int)sizeof(a);
     char ipbuf[64] = {0};
     if (getpeername(s, (sockaddr*)&a, &alen) == 0) InetNtopA(AF_INET, &a.sin_addr, ipbuf, (int)sizeof(ipbuf));
@@ -673,15 +758,45 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
     addrinfo* res = nullptr;
     char portstr[16]; snprintf(portstr, sizeof(portstr), "%u", (unsigned)port);
-    if (getaddrinfo(host.c_str(), portstr, &hints, &res) != 0 || !res) { log_warn(std::string("P2P: DNS resolve failed: ") + host); return false; }
+    if (getaddrinfo(host.c_str(), portstr, &hints, &res) != 0 || !res) {
+        int64_t now = now_ms();
+        auto &st = g_seed_backoff[host];
+        int64_t cur = st.second > 0 ? st.second : seed_backoff_base_ms();
+        cur = std::min<int64_t>(cur * 2, seed_backoff_max_ms());
+        cur += jitter_ms(5000);
+        st = { now + cur, cur };
+        log_warn(std::string("P2P: DNS resolve failed: ") + host + " (backoff " + std::to_string(cur) + "ms)");
+        return false;
+    }
     int s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s < 0) { freeaddrinfo(res); return false; }
-    if (connect(s, res->ai_addr, res->ai_addrlen) != 0) { CLOSESOCK(s); freeaddrinfo(res); return false; }
+    if (s < 0) { 
+        freeaddrinfo(res);
+        int64_t now = now_ms();
+        auto &st = g_seed_backoff[host];
+        int64_t cur = st.second > 0 ? st.second : seed_backoff_base_ms();
+        cur = std::min<int64_t>(cur * 2, seed_backoff_max_ms());
+        cur += jitter_ms(5000);
+        st = { now + cur, cur };
+        return false; 
+    }
+    if (connect(s, res->ai_addr, res->ai_addrlen) != 0) { 
+        CLOSESOCK(s); freeaddrinfo(res);
+        int64_t now = now_ms();
+        auto &st = g_seed_backoff[host];
+        int64_t cur = st.second > 0 ? st.second : seed_backoff_base_ms();
+        cur = std::min<int64_t>(cur * 2, seed_backoff_max_ms());
+        cur += jitter_ms(5000);
+        st = { now + cur, cur };
+        return false; 
+    }
     sockaddr_in a{}; socklen_t alen = static_cast<socklen_t>(sizeof(a));
     char ipbuf[64] = {0};
     if (getpeername(s, (sockaddr*)&a, &alen) == 0) inet_ntop(AF_INET, &a.sin_addr, ipbuf, (socklen_t)sizeof(ipbuf));
     freeaddrinfo(res);
 #endif
+    // success -> clear backoff
+    g_seed_backoff.erase(host);
+
     // Build PeerState
     PeerState ps;
     ps.sock = s;
@@ -797,7 +912,7 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
 // Trickle enqueue for tx announcements (per-peer)
 static inline void trickle_enqueue(int sock, const std::vector<uint8_t>& txid){
     if (txid.size()!=32) return;
-    auto& q = g_trickle_q[sock];   // <-- fixed (was using 's')
+    auto& q = g_trickle_q[sock];
     if (q.size() < 4096) q.push_back(txid); // simple bound; drop if queue grows too big
 }
 
@@ -1468,6 +1583,15 @@ void P2P::loop(){
 #endif
                         maybe_send_getaddr(ps);
 
+                        // --- announce our feefilter to peer ---
+                        {
+                            uint64_t mrf = local_min_relay_kb();
+                            std::vector<uint8_t> pl(8);
+                            for(int i=0;i<8;i++) pl[i] = (uint8_t)((mrf >> (8*i)) & 0xFF);
+                            auto ff = encode_msg("feefilter", pl);
+                            send(s, (const char*)ff.data(), (int)ff.size(), 0);
+                        }
+
                     } else if (cmd == "ping") {
                         auto pong = encode_msg("pong", m.payload);
                         send(s, (const char*)pong.data(), (int)pong.size(), 0);
@@ -1565,8 +1689,31 @@ void P2P::loop(){
                                 }
                             }
                             if (accepted) {
-                                // announce via trickle queue
-                                broadcast_inv_tx(tx.txid());
+                                // --- feefilter-aware announce (per-peer trickle) ---
+                                uint64_t in_sum = 0, out_sum = 0;
+                                for (const auto& o : tx.vout) out_sum += o.value;
+                                bool inputs_ok = true;
+                                for (const auto& in : tx.vin) {
+                                    UTXOEntry e;
+                                    if (!chain_.utxo().get(in.prev.txid, in.prev.vout, e)) { inputs_ok = false; break; }
+                                    in_sum += e.value;
+                                }
+                                if (inputs_ok && in_sum >= out_sum) {
+                                    uint64_t fee = in_sum - out_sum;
+                                    size_t sz = m.payload.size(); if (sz == 0) sz = 1;
+                                    uint64_t feerate_kb = (fee * 1000ULL + (sz - 1)) / sz;
+
+                                    const std::vector<uint8_t> txidv = tx.txid();
+                                    for (auto& kvp : peers_) {
+                                        int psock = kvp.first;
+                                        uint64_t peer_min = peer_feefilter_kb(psock);
+                                        if (peer_min && feerate_kb < peer_min) continue;
+                                        trickle_enqueue(psock, txidv);
+                                    }
+                                } else {
+                                    // fallback: legacy broadcast (shouldn't happen if mempool accepted)
+                                    broadcast_inv_tx(tx.txid());
+                                }
                             } else if (!err.empty()) {
                                 if (++ps.mis > 25) banned_.insert(ps.ip);
                             }
@@ -1577,6 +1724,15 @@ void P2P::loop(){
 
                     } else if (cmd == "addr") {
                         handle_addr_msg(ps, m.payload);
+
+                    } else if (cmd == "feefilter") {
+                        if (m.payload.size() == 8) {
+                            uint64_t kb = 0;
+                            for(int i=0;i<8;i++) kb |= (uint64_t)m.payload[i] << (8*i);
+                            set_peer_feefilter(s, kb);
+                        } else {
+                            if (++ps.mis > 10) { dead.push_back(s); }
+                        }
 
 #if MIQ_ENABLE_HEADERS_FIRST
                     } else if (cmd == "getheaders") {
@@ -1665,7 +1821,7 @@ void P2P::loop(){
         for (int s : dead) { gate_on_close(s); CLOSESOCK(s); peers_.erase(s); }
 
         // Tx INV trickle flush (time-based)
-        trickle_flush();  // <-- now free function; no private access
+        trickle_flush();
 
         // Autosave legacy addrs periodically if we’ve learned new ones
         if (now_ms() - last_addr_save_ms > MIQ_ADDR_SAVE_INTERVAL_MS) {
