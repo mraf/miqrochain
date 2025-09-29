@@ -32,15 +32,12 @@ public:
     KVDB() = default;
     ~KVDB();
 
-    // Create/open a database directory. Creates it if missing.
     bool open(const std::string& path, std::string* err = nullptr);
 
-    // Get/Put/Delete single keys (immediate, not batched)
     bool get(const std::string& k, std::string& v, std::string* err = nullptr) const;
     bool put(const std::string& k, const std::string& v, bool sync=true, std::string* err = nullptr);
     bool del(const std::string& k, bool sync=true, std::string* err = nullptr);
 
-    // Batched writer (atomic).
     class Batch {
     public:
         explicit Batch(KVDB& db);
@@ -56,10 +53,7 @@ public:
     #endif
     };
 
-    // Manual fsync of manifest/WAL (if supported)
     bool flush_wal(std::string* err = nullptr);
-
-    // Close DB
     void close();
 
 private:
