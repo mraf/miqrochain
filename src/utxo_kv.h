@@ -1,6 +1,7 @@
 #pragma once
 #include "kvdb.h"
 #include "tx.h"
+#include "utxo.h"   // <-- use the canonical UTXOEntry here
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -12,13 +13,6 @@ namespace miq {
 // Meta keys (examples):
 //  "M:state" -> serialized tip state (optional, chain.cpp already persists state to block storage)
 // You can add more meta as needed.
-
-struct UTXOEntry {
-    uint64_t value{0};
-    std::vector<uint8_t> pkh; // 20 bytes
-    uint32_t height{0};
-    bool coinbase{false};
-};
 
 class UTXOKV {
 public:
