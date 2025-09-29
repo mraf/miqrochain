@@ -34,6 +34,8 @@ if(MSVC)
   add_link_options(/LTCG)
   add_compile_options(/W4 /permissive- /Zc:__cplusplus)
   add_definitions(/D_CRT_SECURE_NO_WARNINGS)
+  # Ensure modern Winsock API (inet_ntop etc.) declarations are available
+  add_compile_definitions(_WIN32_WINNT=0x0600)
 else()
   add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 endif()
@@ -122,8 +124,8 @@ endif()
 # ------------------------------------------------------------------
 # TLS / Threads (for RPC TLS proxy & background threads)
 # ------------------------------------------------------------------
-find_package(OpenSSL REQUIRED)         # << NEW (needed for tls_proxy)
-find_package(Threads REQUIRED)         # << NEW (std::thread on POSIX)
+find_package(OpenSSL REQUIRED)         # TLS proxy
+find_package(Threads REQUIRED)         # std::thread on POSIX
 
 # ------------------------------------------------------------------
 # Main daemon
@@ -182,7 +184,7 @@ add_executable(miqrod
     ${MICRO_ECC_DIR}/uECC.c
     src/crypto/uECC_shim.c
 
-    # --- NEW: TLS proxy & IBD monitor ---
+    # --- TLS proxy & IBD monitor ---
     src/tls_proxy.h src/tls_proxy.cpp
     src/ibd_monitor.h src/ibd_monitor.cpp
 )
@@ -211,14 +213,13 @@ if(WIN32)
   target_link_libraries(miqrod PRIVATE Ws2_32)
 endif()
 
-# --- NEW: link TLS + Threads (needed regardless of wallet enc) ---
+# Link TLS + Threads
 target_link_libraries(miqrod PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 
 # ------------------------------------------------------------------
 # Optional Wallet Encryption (OpenSSL AES-256-GCM + PBKDF2)
 # ------------------------------------------------------------------
 if(MIQ_ENABLE_WALLET_ENC)
-  # OpenSSL already found above; this just adds the compile def and ensures libcrypto is linked (it already is).
   target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_WALLET_ENC=1)
   message(STATUS "Wallet encryption: ENABLED (OpenSSL)")
 else()
