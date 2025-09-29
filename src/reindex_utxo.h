@@ -6,10 +6,10 @@
 namespace miq {
 
 // Rebuilds the UTXO set into <datadir>/chainstate using UTXOKV.
-// - Reads blocks from the active chain (from index 0..tip).
-// - Ignores double-spend noise on old forks (spend() best-effort).
-// - Uses batched writes for speed; fsync at end.
-// - If compact_after is true, calls db_.compact() if your KVDB supports it (noop otherwise).
+// - Reads blocks from the active chain (index 0..tip).
+// - Best-effort spend: ignores missing coins from old forks.
+// - Batched writes for throughput; fsync at commit.
+// - `compact_after` is kept for future use (no-op unless you expose KV compaction).
 //
 // Returns true on success; false and sets `err` on failure.
 bool ReindexUTXO(Chain& chain, UTXOKV& kv, bool compact_after, std::string& err);
