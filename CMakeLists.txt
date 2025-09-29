@@ -138,6 +138,8 @@ add_executable(miqrod
     src/kv_log.cpp
     src/reindex.h
     src/reindex.cpp
+    src/reindex_utxo.h
+    src/reindex_utxo.cpp
     src/main.cpp
     src/constants.h
     src/config.h src/config.cpp
