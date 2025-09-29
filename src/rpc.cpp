@@ -1,7 +1,6 @@
 #include "rpc.h"
 #include "sha256.h"
 #include "ibd_monitor.h"
-#include "ibd_monitor.h"
 #include "constants.h"
 #include "util.h"
 #include "hex.h"
@@ -48,7 +47,7 @@ static constexpr size_t RPC_MAX_BODY_BYTES = 512 * 1024; // 512 KiB
 
 namespace miq {
 
-// ======== Simple global cookie-auth gate (payload-level for current HTTP shim) ========
+// ======== Cookie auth (token file) — used by HTTP layer via env header token ========
 
 static std::string& rpc_cookie_token() {
     static std::string tok;
@@ -57,10 +56,6 @@ static std::string& rpc_cookie_token() {
 static std::string& rpc_cookie_path() {
     static std::string p;
     return p;
-}
-static bool& rpc_auth_enabled() {
-    static bool b = false;
-    return b;
 }
 
 static std::string join_path(const std::string& a, const std::string& b){
@@ -97,15 +92,13 @@ static bool read_first_line_trim(const std::string& p, std::string& out) {
     return true;
 }
 
-// Constant-time compare to avoid token timing leaks
+// Constant-time compare to avoid token timing leaks (kept for future use)
 static bool timing_safe_eq(const std::string& a, const std::string& b){
     if (a.size() != b.size()) return false;
     unsigned char acc = 0;
     for (size_t i=0;i<a.size();++i) acc |= (unsigned char)(a[i] ^ b[i]);
     return acc == 0;
 }
-
-// ==============================================================================
 
 static bool write_cookie_file_secure(const std::string& p, const std::string& tok) {
 #ifndef _WIN32
@@ -122,10 +115,17 @@ static bool write_cookie_file_secure(const std::string& p, const std::string& to
     return f.good();
 }
 
-void rpc_enable_auth_cookie(const std::string& datadir) {
-    auto& enabled = rpc_auth_enabled();
-    enabled = true;
+// Helper: export token to the HTTP layer so it can validate headers.
+// http.cpp checks MIQ_RPC_TOKEN against Authorization/X-Auth-Token.
+static void export_token_to_env(const std::string& tok){
+#ifdef _WIN32
+    _putenv_s("MIQ_RPC_TOKEN", tok.c_str());
+#else
+    setenv("MIQ_RPC_TOKEN", tok.c_str(), 1);
+#endif
+}
 
+void rpc_enable_auth_cookie(const std::string& datadir) {
     std::string path = join_path(datadir, ".cookie");
     rpc_cookie_path() = path;
 
@@ -133,6 +133,7 @@ void rpc_enable_auth_cookie(const std::string& datadir) {
     if (file_exists(path)) {
         if (read_first_line_trim(path, tok) && !tok.empty()) {
             rpc_cookie_token() = tok;
+            export_token_to_env(tok);  // hand to HTTP layer (header-based auth)
             log_info("RPC auth cookie loaded from " + path);
             return;
         } else {
@@ -143,11 +144,13 @@ void rpc_enable_auth_cookie(const std::string& datadir) {
     tok = hex32_random();
     if (!write_cookie_file_secure(path, tok)) {
         log_error("Failed to write RPC cookie file at " + path + " (errno=" + std::to_string(errno) + ")");
-        // As a fallback, still enable with in-memory token (not persisted).
+        // Fallback: still enable with in-memory token (not persisted).
         rpc_cookie_token() = tok;
+        export_token_to_env(tok);
         return;
     }
     rpc_cookie_token() = tok;
+    export_token_to_env(tok);
     log_info("RPC auth cookie created at " + path + " (600 perms).");
 }
 
@@ -180,7 +183,6 @@ static double difficulty_from_bits(uint32_t bits){
     return (double)difficulty; // cast to double for JNode
 }
 
-
 static bool is_hex(const std::string& s){
     if(s.empty()) return false;
     return std::all_of(s.begin(), s.end(), [](unsigned char c){ return std::isxdigit(c)!=0; });
@@ -212,6 +214,8 @@ static uint64_t min_fee_for_size(size_t sz_bytes){
 }
 
 void RpcService::start(uint16_t port){
+    // NOTE: http.cpp already authenticates using Authorization/X-Auth-Token
+    // against MIQ_RPC_TOKEN. We no longer require "auth" in JSON.
     http_.start(port, [this](const std::string& b){
         try { return this->handle(b); }
         catch(const std::exception& ex){ log_error(std::string("rpc exception: ")+ex.what()); return err("internal error"); }
@@ -238,28 +242,12 @@ std::string RpcService::handle(const std::string& body){
     }
 
     try {
-        JNode req; 
+        JNode req;
         if(!json_parse(body, req)) return err("bad json");
         if(!std::holds_alternative<std::map<std::string,JNode>>(req.v)) return err("bad json obj");
         auto& obj = std::get<std::map<std::string,JNode>>(req.v);
 
-        // ---- Cookie/token auth (payload-level for now; HTTP headers not available here) ----
-        if (rpc_auth_enabled()) {
-            // Accept either "auth" or "token" fields (strings)
-            std::string provided;
-            auto ia = obj.find("auth");
-            if (ia != obj.end() && std::holds_alternative<std::string>(ia->second.v)) {
-                provided = std::get<std::string>(ia->second.v);
-            } else {
-                auto itok = obj.find("token");
-                if (itok != obj.end() && std::holds_alternative<std::string>(itok->second.v)) {
-                    provided = std::get<std::string>(itok->second.v);
-                }
-            }
-            if (provided.empty() || !timing_safe_eq(provided, rpc_cookie_token())) {
-                return err("unauthorized");
-            }
-        }
+        // ---- Header-based auth happens in http.cpp. No JSON "auth" required anymore. ----
 
         auto it = obj.find("method");
         if(it==obj.end() || !std::holds_alternative<std::string>(it->second.v)) return err("missing method");
@@ -320,7 +308,7 @@ std::string RpcService::handle(const std::string& body){
             JNode r; r.v = o; return json_dump(r);
         }
 
-        // --- NEW: IBD snapshot (machine-readable) ---
+        // --- IBD snapshot ---
         if(method=="getibdinfo"){
             auto s = miq::get_ibd_info_snapshot();
             std::map<std::string,JNode> o;
@@ -399,7 +387,7 @@ std::string RpcService::handle(const std::string& body){
             Block b;
             bool ok = false;
 
-            if(std::holds_alternative<double>(params[0].v)){
+            if(std::holds_alternative<double>(params[0].v])){
                 size_t idx = (size_t)std::get<double>(params[0].v);
                 ok = chain_.get_block_by_index(idx, b);
             } else if(std::holds_alternative<std::string>(params[0].v)){
