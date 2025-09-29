@@ -387,7 +387,7 @@ std::string RpcService::handle(const std::string& body){
             Block b;
             bool ok = false;
 
-            if(std::holds_alternative<double>(params[0].v])){
+            if(std::holds_alternative<double>(params[0].v)){
                 size_t idx = (size_t)std::get<double>(params[0].v);
                 ok = chain_.get_block_by_index(idx, b);
             } else if(std::holds_alternative<std::string>(params[0].v)){
