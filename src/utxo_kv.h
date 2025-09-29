@@ -37,6 +37,9 @@ public:
         KVDB::Batch b_;
     };
 
+    // === NEW: convenience factory to start a batch without exposing KVDB ===
+    Batch make_batch();
+
 private:
     friend class Batch;
     KVDB db_;
