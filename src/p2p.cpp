@@ -146,6 +146,29 @@
 #define MIQ_TX_STORE_MAX 10000
 #endif
 
+// ===== new defensive/gossip fallbacks (safe defaults) =======================
+#ifndef MIQ_P2P_GETADDR_INTERVAL_MS
+#define MIQ_P2P_GETADDR_INTERVAL_MS 120000  // ask each peer for addrs at most every 2 min
+#endif
+#ifndef MIQ_P2P_NEW_INBOUND_CAP_PER_MIN
+#define MIQ_P2P_NEW_INBOUND_CAP_PER_MIN 60  // soft cap on new inbound per minute
+#endif
+#ifndef MIQ_P2P_INV_WINDOW_MS
+#define MIQ_P2P_INV_WINDOW_MS 10000         // 10s INV window
+#endif
+#ifndef MIQ_P2P_INV_WINDOW_CAP
+#define MIQ_P2P_INV_WINDOW_CAP 500          // max INVs we accept in a 10s window
+#endif
+#ifndef MIQ_P2P_TRICKLE_MS
+#define MIQ_P2P_TRICKLE_MS 200              // trickle INV/tx every 200ms per peer
+#endif
+#ifndef MIQ_P2P_TRICKLE_BATCH
+#define MIQ_P2P_TRICKLE_BATCH 64            // up to 64 tx announcements per flush per peer
+#endif
+#ifndef MIQ_P2P_STALL_RETRY_MS
+#define MIQ_P2P_STALL_RETRY_MS 60000        // probe headers if no progress for 60s
+#endif
+
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
   #define WIN32_LEAN_AND_MEAN
@@ -190,14 +213,30 @@ static const int    HANDSHAKE_MS  = 5000;            // must complete within 5s
 static bool g_logged_headers_started = false;
 static bool g_logged_headers_done    = false;
 
+// Global listen port for outbound dials (set in start())
+static uint16_t g_listen_port = 0;
+
+// Stall/progress trackers
+static int64_t g_last_progress_ms = 0;
+static size_t  g_last_progress_height = 0;
+static int64_t g_next_stall_probe_ms = 0;
+
+// Simple trickle queues per-peer (sock -> txid queue and last flush ms)
+static std::unordered_map<int, std::vector<std::vector<uint8_t>>> g_trickle_q;
+static std::unordered_map<int, int64_t> g_trickle_last_ms;
+
 static inline void gate_on_connect(int fd){
     PeerGate pg;
     pg.t_conn = Clock::now();
     pg.t_last = pg.t_conn;
     g_gate[fd] = pg;
+    // init trickle timer
+    g_trickle_last_ms[fd] = 0;
 }
 static inline void gate_on_close(int fd){
     g_gate.erase(fd);
+    g_trickle_q.erase(fd);
+    g_trickle_last_ms.erase(fd);
 }
 static inline bool gate_on_bytes(int fd, size_t add){
     auto it = g_gate.find(fd);
@@ -317,9 +356,6 @@ static inline uint16_t v4_group16(uint32_t be_ip){
     uint8_t A = uint8_t(be_ip>>24), B = uint8_t(be_ip>>16);
     return (uint16_t(A) << 8) | uint16_t(B);
 }
-
-// Global listen port for outbound dials (set in start())
-static uint16_t g_listen_port = 0;
 
 // Dial a single IPv4 (be order) at supplied port; returns socket or -1
 static int dial_be_ipv4(uint32_t be_ip, uint16_t port){
@@ -549,6 +585,11 @@ bool P2P::start(uint16_t port){
     if (srv_ < 0) { log_error("P2P: failed to create server"); return false; }
     g_listen_port = port;
 
+    // Init progress trackers
+    g_last_progress_ms = now_ms();
+    g_last_progress_height = chain_.height();
+    g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
+
     // Try UPnP/NAT-PMP (no-op unless built with -DMIQ_ENABLE_UPNP=ON)
     {
         std::string ext_ip;
@@ -652,6 +693,9 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     ps.last_refill_ms = ps.last_ms;
     peers_[s] = ps;
 
+    // init trickle queue entry
+    g_trickle_last_ms[s] = 0;
+
     // addr learn & persist
     uint32_t be_ip;
     if (ipbuf[0] && parse_ipv4(ipbuf, be_ip) && ipv4_is_public(be_ip)) {
@@ -719,6 +763,9 @@ void P2P::handle_new_peer(int c, const std::string& ip){
     ps.last_refill_ms = ps.last_ms;
     peers_[c] = ps;
 
+    // init trickle queue entry
+    g_trickle_last_ms[c] = 0;
+
     // learn addr
     uint32_t be_ip;
     if (parse_ipv4(ip, be_ip) && ipv4_is_public(be_ip)) {
@@ -747,11 +794,59 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
 
 // =================== helpers for sync / serving ===================
 
+// Trickle enqueue for tx announcements (per-peer)
+static inline void trickle_enqueue(int sock, const std::vector<uint8_t>& txid){
+    if (txid.size()!=32) return;
+    auto& q = g_trickle_q[s];
+    if (q.size() < 4096) q.push_back(txid); // simple bound; drop if queue grows too big
+}
+
 void P2P::broadcast_inv_tx(const std::vector<uint8_t>& txid){
     if (txid.size()!=32) return;
-    auto m = encode_msg("invtx", txid);
+    // Time-based trickle instead of immediate flood (privacy-friendly & DoS-friendly)
     for (auto& kv : peers_) {
-        send(kv.first, (const char*)m.data(), (int)m.size(), 0);
+        trickle_enqueue(kv.first, txid);
+    }
+}
+
+// Flush pending INV/tx trickle queues respecting per-peer INV windows
+static void trickle_flush(P2P& self){
+    int64_t tnow = now_ms();
+    for (auto& kv : self.peers_) {
+        int s = kv.first;
+        auto& ps = kv.second;
+
+        auto it_last = g_trickle_last_ms.find(s);
+        int64_t last = (it_last==g_trickle_last_ms.end()?0:it_last->second);
+        if (tnow - last < MIQ_P2P_TRICKLE_MS) continue;
+
+        auto itq = g_trickle_q.find(s);
+        if (itq == g_trickle_q.end() || itq->second.empty()) {
+            g_trickle_last_ms[s] = tnow;
+            continue;
+        }
+
+        size_t n_send = 0;
+        auto& q = itq->second;
+        // send up to batch, respecting inv window accounting
+        while (!q.empty() && n_send < MIQ_P2P_TRICKLE_BATCH) {
+            const auto& txid = q.back();
+
+            // INV window accounting (shared with main loop helper)
+            int64_t tnow2 = now_ms();
+            if (tnow2 - ps.inv_win_start_ms > (int64_t)MIQ_P2P_INV_WINDOW_MS) {
+                ps.inv_win_start_ms = tnow2;
+                ps.inv_in_window = 0;
+            }
+            if (ps.inv_in_window + 1 > MIQ_P2P_INV_WINDOW_CAP) break;
+            ps.inv_in_window += 1;
+
+            auto m = encode_msg("invtx", txid);
+            send(s, (const char*)m.data(), (int)m.size(), 0);
+            q.pop_back();
+            ++n_send;
+        }
+        g_trickle_last_ms[s] = tnow;
     }
 }
 
@@ -993,6 +1088,9 @@ void P2P::handle_incoming_block(int sock, const std::vector<uint8_t>& raw){
         log_info("P2P: accepted block (child of known parent)");
         broadcast_inv_block(bh);
         try_connect_orphans(hexkey(bh));
+        // progress tracker
+        g_last_progress_ms = now_ms();
+        g_last_progress_height = chain_.height();
     } else {
         log_warn("P2P: reject block (" + err + ")");
     }
@@ -1035,6 +1133,9 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
                 for (const auto& g : cit->second) q.push_back(g);
                 orphan_children_.erase(cit);
             }
+            // progress tracker
+            g_last_progress_ms = now_ms();
+            g_last_progress_height = chain_.height();
         } else {
             log_warn("P2P: orphan child rejected (" + err + "), dropping orphan " + child_hex);
             remove_orphan_by_hex(child_hex);
@@ -1093,6 +1194,7 @@ void P2P::loop(){
                         PeerState ps; ps.sock = s; ps.ip = dotted; ps.mis=0; ps.last_ms=now_ms();
                         ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
                         peers_[s] = ps;
+                        g_trickle_last_ms[s] = 0;
                         log_info("P2P: outbound (addrman) " + ps.ip);
                         gate_on_connect(s);
                         auto msg = encode_msg("version", {});
@@ -1134,6 +1236,7 @@ void P2P::loop(){
                             ps.tx_tokens  = MIQ_RATE_TX_BURST;
                             ps.last_refill_ms = ps.last_ms;
                             peers_[s] = ps;
+                            g_trickle_last_ms[s] = 0;
 
                             log_info("P2P: outbound to known " + ps.ip);
                             gate_on_connect(s);
@@ -1168,6 +1271,7 @@ void P2P::loop(){
                                     PeerState ps; ps.sock=s; ps.ip=dotted; ps.mis=0; ps.last_ms=now_ms();
                                     ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
                                     peers_[s]=ps;
+                                    g_trickle_last_ms[s] = 0;
                                     log_info("P2P: feeler " + dotted);
                                     gate_on_connect(s);
                                     auto msg = encode_msg("version", {});
@@ -1180,6 +1284,34 @@ void P2P::loop(){
             }
         }
 #endif
+
+        // === Stall detection / probing headers-first if no progress ==========
+        {
+            int64_t tnow = now_ms();
+            size_t h = chain_.height();
+            if (h > g_last_progress_height) {
+                g_last_progress_height = h;
+                g_last_progress_ms = tnow;
+                g_next_stall_probe_ms = tnow + MIQ_P2P_STALL_RETRY_MS;
+            } else if (tnow >= g_next_stall_probe_ms && !peers_.empty()) {
+#if MIQ_ENABLE_HEADERS_FIRST
+                // Re-probe best peers for headers; harmless if already synced
+                std::vector<std::vector<uint8_t>> locator;
+                chain_.build_locator(locator);
+                std::vector<uint8_t> stop(32, 0);
+                auto pl = build_getheaders_payload(locator, stop);
+                auto m  = encode_msg("getheaders", pl);
+                int probes = 0;
+                for (auto& kv : peers_) {
+                    if (kv.second.verack_ok) {
+                        send(kv.first, (const char*)m.data(), (int)m.size(), 0);
+                        if (++probes >= 2) break; // a couple of peers are enough
+                    }
+                }
+#endif
+                g_next_stall_probe_ms = tnow + MIQ_P2P_STALL_RETRY_MS;
+            }
+        }
 
         std::vector<PollFD> fds;
         size_t base = 0;
@@ -1449,6 +1581,7 @@ void P2P::loop(){
                                 }
                             }
                             if (accepted) {
+                                // announce via trickle queue
                                 broadcast_inv_tx(tx.txid());
                             } else if (!err.empty()) {
                                 if (++ps.mis > 25) banned_.insert(ps.ip);
@@ -1488,6 +1621,11 @@ void P2P::loop(){
                         std::string herr;
                         for (const auto& h : hs) {
                             if (chain_.accept_header(h, herr)) accepted++;
+                        }
+
+                        // Track progress on header acceptance
+                        if (accepted > 0) {
+                            g_last_progress_ms = now_ms();
                         }
 
                         // Ask for missing blocks on best-header path
@@ -1542,6 +1680,9 @@ void P2P::loop(){
 
         for (int s : dead) { gate_on_close(s); CLOSESOCK(s); peers_.erase(s); }
 
+        // Tx INV trickle flush (time-based)
+        trickle_flush(*this);
+
         // Autosave legacy addrs periodically if we’ve learned new ones
         if (now_ms() - last_addr_save_ms > MIQ_ADDR_SAVE_INTERVAL_MS) {
             last_addr_save_ms = now_ms();
@@ -1589,3 +1730,4 @@ std::vector<PeerSnapshot> P2P::snapshot_peers() const {
     return out;
 }
 }
+
