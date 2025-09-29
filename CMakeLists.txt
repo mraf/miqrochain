@@ -129,6 +129,8 @@ find_package(Threads REQUIRED)         # << NEW (std::thread on POSIX)
 # Main daemon
 # ------------------------------------------------------------------
 add_executable(miqrod
+    src/addrman.h
+    src/addrman.cpp
     src/address.h src/address.cpp
     src/wallet_store.h src/wallet_store.cpp
     src/main.cpp
