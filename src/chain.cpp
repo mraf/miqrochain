@@ -163,40 +163,6 @@ static bool write_undo_file(const std::string& base_dir,
     return true;
 }
 
-auto utxo_batch = utxo_.make_batch();
-
-for (size_t ti = 1; ti < b.txs.size(); ++ti){
-    const auto& tx = b.txs[ti];
-
-    // spends
-    for (const auto& in : tx.vin){
-        utxo_batch.spend(in.prev.txid, in.prev.vout);
-    }
-    // adds
-    for (size_t i = 0; i < tx.vout.size(); ++i){
-        UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, new_height, false};
-        utxo_batch.add(tx.txid(), (uint32_t)i, e);
-    }
-}
-
-// coinbase adds + sum
-const auto& cb = b.txs[0];
-uint64_t cb_sum = 0;
-for (size_t i = 0; i < cb.vout.size(); ++i){
-    UTXOEntry e{cb.vout[i].value, cb.vout[i].pkh, new_height, true};
-    utxo_batch.add(cb.txid(), (uint32_t)i, e);
-    cb_sum += cb.vout[i].value;
-}
-
-// single durable commit of all UTXO changes
-{
-    std::string kv_err;
-    if (!utxo_batch.commit(/*sync=*/true, &kv_err)){
-        err = kv_err.empty() ? "utxo batch commit failed" : kv_err;
-        return false;
-    }
-}
-
 static bool read_exact(FILE* f, void* buf, size_t n){
     return std::fread(buf, 1, n, f) == n;
 }
@@ -982,28 +948,40 @@ bool Chain::disconnect_tip_once(std::string& err){
     }
     const std::vector<UndoIn>& undo = undo_tmp;
 
+    // --- Apply disconnect atomically via batch ---
+    auto utxo_batch = utxo_.make_batch();
+
     // Spend non-coinbase created outs
     for (size_t ti = cur.txs.size(); ti-- > 1; ){
         const auto& tx = cur.txs[ti];
         for (size_t i = 0; i < tx.vout.size(); ++i) {
-            (void)utxo_.spend(tx.txid(), (uint32_t)i);
+            utxo_batch.spend(tx.txid(), (uint32_t)i);
         }
     }
 
     // Restore previous inputs from undo (reverse order)
     for (size_t i = undo.size(); i-- > 0; ){
         const auto& u = undo[i];
-        utxo_.add(u.prev_txid, u.prev_vout, u.prev_entry);
+        utxo_batch.add(u.prev_txid, u.prev_vout, u.prev_entry);
     }
 
     // Remove coinbase outs and compute sum
     const auto& cb = cur.txs[0];
     uint64_t cb_sum = 0;
     for (size_t i = 0; i < cb.vout.size(); ++i) {
-        (void)utxo_.spend(cb.txid(), (uint32_t)i);
+        utxo_batch.spend(cb.txid(), (uint32_t)i);
         cb_sum += cb.vout[i].value;
     }
     if (tip_.issued < cb_sum) { err = "issued underflow"; return false; }
+
+    // Commit all UTXO reversals atomically
+    {
+        std::string kv_err;
+        if (!utxo_batch.commit(/*sync=*/true, &kv_err)) {
+            err = kv_err.empty() ? "utxo batch commit failed (disconnect)" : kv_err;
+            return false;
+        }
+    }
 
     Block prev;
     if (!get_block_by_hash(cur.header.prev_hash, prev)) {
@@ -1059,25 +1037,39 @@ bool Chain::submit_block(const Block& b, std::string& err){
         return false;
     }
 
-    // --- Apply UTXO changes (same logic, just happens AFTER durable undo) ---
+    // --- Apply UTXO changes atomically via batch ---
+    auto utxo_batch = utxo_.make_batch();
+
     for (size_t ti = 1; ti < b.txs.size(); ++ti){
         const auto& tx = b.txs[ti];
 
+        // spends
         for (const auto& in : tx.vin){
-            (void)utxo_.spend(in.prev.txid, in.prev.vout);
+            utxo_batch.spend(in.prev.txid, in.prev.vout);
         }
+        // adds
         for (size_t i = 0; i < tx.vout.size(); ++i){
             UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, new_height, false};
-            utxo_.add(tx.txid(), (uint32_t)i, e);
+            utxo_batch.add(tx.txid(), (uint32_t)i, e);
         }
     }
 
+    // coinbase adds + sum
     const auto& cb = b.txs[0];
     uint64_t cb_sum = 0;
     for (size_t i = 0; i < cb.vout.size(); ++i){
         UTXOEntry e{cb.vout[i].value, cb.vout[i].pkh, new_height, true};
-        utxo_.add(cb.txid(), (uint32_t)i, e);
+        utxo_batch.add(cb.txid(), (uint32_t)i, e);
         cb_sum += cb.vout[i].value;
+    }
+
+    // single durable commit of all UTXO changes
+    {
+        std::string kv_err;
+        if (!utxo_batch.commit(/*sync=*/true, &kv_err)){
+            err = kv_err.empty() ? "utxo batch commit failed" : kv_err;
+            return false;
+        }
     }
 
     // Advance tip
