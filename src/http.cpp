@@ -18,6 +18,7 @@
 #include <chrono>
 #include <atomic>
 #include <memory>
+#include <array>     // <-- needed for std::array
 
 // --- platform sockets + sleep -----------------------------------------------
 #ifdef _WIN32
@@ -87,7 +88,8 @@ static inline bool is_loopback_sockaddr(const sockaddr* sa){
     }
 #ifdef AF_INET6
     if(sa->sa_family == AF_INET6){
-        const sockaddr_in6* s6 = reinterpret_cast<const sockaddr_in6*>(&sa);
+        // FIX: cast the pointer itself (not &sa)
+        const sockaddr_in6* s6 = reinterpret_cast<const sockaddr_in6*>(sa);
         static const uint8_t loop6[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
         return std::memcmp(s6->sin6_addr.s6_addr, loop6, 16) == 0;
     }
@@ -867,3 +869,4 @@ void HttpServer::stop(){
 }
 
 }
+
