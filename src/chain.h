@@ -72,6 +72,9 @@ public:
     bool get_block_by_hash(const std::vector<uint8_t>& h, Block& out) const;
     bool have_block(const std::vector<uint8_t>& h) const;
 
+    // NEW: expose datadir path (needed by reindex tool)
+    const std::string& datadir() const { return datadir_; }
+
 private:
     Storage  storage_;
     std::string datadir_;
