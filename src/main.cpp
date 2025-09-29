@@ -35,7 +35,7 @@
 #include <vector>
 #include <chrono>
 #include <cstring> // memcpy
-#include <cstdlib> // getenv
+#include <cstdlib> // getenv,setenv
 #include <csignal> // signal handling
 #include <atomic>
 #include <memory>  // NEW: std::unique_ptr
@@ -344,8 +344,15 @@ int main(int argc, char** argv){
         start_ibd_monitor(&chain, &p2p);
 
         if(!cfg.no_rpc){
-            // Enable RPC cookie auth (.cookie in datadir) before starting RPC
+            // Enable RPC cookie auth (.cookie in datadir) and export token to HTTP layer
             miq::rpc_enable_auth_cookie(cfg.datadir);
+
+            // **Security hardening**: require token on ALL RPC requests, even loopback.
+#ifdef _WIN32
+            _putenv_s("MIQ_RPC_REQUIRE_TOKEN", "1");
+#else
+            setenv("MIQ_RPC_REQUIRE_TOKEN", "1", 1);
+#endif
 
             rpc.start(RPC_PORT);
             log_info("RPC listening on " + std::to_string(RPC_PORT));
