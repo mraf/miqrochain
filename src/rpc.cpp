@@ -214,15 +214,24 @@ static uint64_t min_fee_for_size(size_t sz_bytes){
 }
 
 void RpcService::start(uint16_t port){
-    // NOTE: http.cpp already authenticates using Authorization/X-Auth-Token
-    // against MIQ_RPC_TOKEN. We no longer require "auth" in JSON.
-    http_.start(port, [this](const std::string& b){
-        try { return this->handle(b); }
-        catch(const std::exception& ex){ log_error(std::string("rpc exception: ")+ex.what()); return err("internal error"); }
-        catch(...){ log_error("rpc exception: unknown"); return err("internal error"); }
-    });
+    // http.cpp authenticates via Authorization / X-Auth-Token (MIQ_RPC_TOKEN).
+    // Use the headers-aware start() so we can access headers later if needed.
+    http_.start(
+        port,
+        [this](const std::string& b,
+               const std::vector<std::pair<std::string,std::string>>& /*headers*/) {
+            try {
+                return this->handle(b); // current handler ignores headers (by design)
+            } catch (const std::exception& ex) {
+                log_error(std::string("rpc exception: ") + ex.what());
+                return err("internal error");
+            } catch (...) {
+                log_error("rpc exception: unknown");
+                return err("internal error");
+            }
+        }
+    );
 }
-
 void RpcService::stop(){ http_.stop(); }
 
 // simple uptime base
