@@ -134,5 +134,5 @@ UTXOSet::list_for_pkh(const std::vector<uint8_t>& pkh) const {
     return out;
 }
 
-} // namespace miq
+}
 
