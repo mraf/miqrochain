@@ -78,4 +78,9 @@ void UTXOKV::Batch::spend(const std::vector<uint8_t>& txid, uint32_t vout){
     b_.del(UTXOKV::k_utxo(txid, vout));
 }
 
+// === NEW: tiny factory to create a batch (non-breaking convenience) ===
+UTXOKV::Batch UTXOKV::make_batch(){
+    return UTXOKV::Batch(*this);
+}
+
 }
