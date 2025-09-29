@@ -133,6 +133,11 @@ add_executable(miqrod
     src/addrman.cpp
     src/address.h src/address.cpp
     src/wallet_store.h src/wallet_store.cpp
+    src/kv.h
+    src/kv_log.h
+    src/kv_log.cpp
+    src/reindex.h
+    src/reindex.cpp
     src/main.cpp
     src/constants.h
     src/config.h src/config.cpp
