@@ -679,18 +679,30 @@ static std::mt19937& rng(){
 }
 
 // === group-diversity helper =================================================
-static bool violates_group_diversity(const std::unordered_map<int, P2P::PeerState>& peers,
+static bool violates_group_diversity(const std::unordered_map<int, PeerState>& peers,
                                      uint32_t candidate_be_ip){
-    // Count per /16 among current OUTBOUND peers (in this code, all peers_ are in one map;
-    // we apply diversity anyway to lower eclipse risk)
+    // Count per /16 among current peers; cap outbounds per group to reduce eclipse risk.
     std::unordered_map<uint16_t,int> group_counts;
+
+    auto parse_be_ipv4 = [](const std::string& dotted, uint32_t& be_ip)->bool{
+        sockaddr_in tmp{};
+    #ifdef _WIN32
+        if (InetPtonA(AF_INET, dotted.c_str(), &tmp.sin_addr) != 1) return false;
+    #else
+        if (inet_pton(AF_INET, dotted.c_str(), &tmp.sin_addr) != 1) return false;
+    #endif
+        be_ip = tmp.sin_addr.s_addr;
+        return true;
+    };
+
     for (const auto& kv : peers){
         const auto& ps = kv.second;
-        uint32_t be_ip;
-        if (!P2P::parse_ipv4(ps.ip, be_ip)) continue;
-        uint16_t g = v4_group16(be_ip);
+        uint32_t be_ip2 = 0;
+        if (!parse_be_ipv4(ps.ip, be_ip2)) continue;
+        uint16_t g = v4_group16(be_ip2);
         group_counts[g]++;
     }
+
     uint16_t cg = v4_group16(candidate_be_ip);
     auto it = group_counts.find(cg);
     return (it != group_counts.end() && it->second >= MIQ_GROUP_OUTBOUND_MAX);
@@ -712,10 +724,25 @@ void P2P::handle_new_peer(int c, const std::string& ip){
     if (parse_ipv4(ip, be_ip) && ipv4_is_public(be_ip)) {
         addrv4_.insert(be_ip);
 #if MIQ_ENABLE_ADDRMAN
-        miq::NetAddr na; na.host=ip; na.port=g_listen_port; na.is_ipv6=false; na.tried=false;
-        g_addrman.add(na, /*from_dns=*/false);
-#endif
+    {
+        // Try to pull up to MIQ_ADDR_RESPONSE_MAX unique public IPv4 addrs
+        // by repeatedly sampling addrman’s selection (tried→new).
+        std::unordered_set<uint32_t> emitted;
+        for (int tries = 0; tries < (int)(MIQ_ADDR_RESPONSE_MAX * 3) && cnt < MIQ_ADDR_RESPONSE_MAX; ++tries) {
+            auto cand = g_addrman.select_for_outbound(g_am_rng, /*prefer_tried=*/true);
+            if (!cand) break;
+            uint32_t be_ip;
+            if (!P2P::parse_ipv4(cand->host, be_ip) || !P2P::ipv4_is_public(be_ip)) continue;
+            if (!emitted.insert(be_ip).second) continue;
+
+            payload.push_back((uint8_t)(be_ip >> 24));
+            payload.push_back((uint8_t)(be_ip >> 16));
+            payload.push_back((uint8_t)(be_ip >> 8));
+            payload.push_back((uint8_t)(be_ip >> 0));
+            ++cnt;
+        }
     }
+#endif
 
     log_info("P2P: inbound peer " + ip);
 
