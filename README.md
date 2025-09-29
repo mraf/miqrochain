@@ -16,7 +16,7 @@ A minimal, Bitcoin-inspired PoW blockchain in C++ with:
 - INITIAL_SUBSIDY: **50**
 - HALVING_INTERVAL: **262800**
 - COINBASE_MATURITY: **100**
-- MAX_SUPPLY: **26.280.000**
+- MAX_SUPPLY: **26280000**
 - GENESIS_BITS: **0x1d00ffff**
 - GENESIS_NONCE: **0xd3dda73c**
 - GENESIS_TIME: **1758890000**
