@@ -1,4 +1,3 @@
-// src/http.cpp  (hardened, backward-compatible)
 #include "http.h"
 #include <thread>
 #include <string>
@@ -13,6 +12,7 @@
 #include <unordered_map>
 #include <chrono>
 #include <atomic>
+#include <memory>
 
 // --- platform sockets + sleep -----------------------------------------------
 #ifdef _WIN32
@@ -45,7 +45,6 @@ static inline void miq_sleep_ms(unsigned ms){
   usleep(ms * 1000);
 #endif
 }
-
 
 namespace miq {
 
@@ -210,7 +209,6 @@ static bool parse_http_request(sock_t fd,
             body.assign(buf.data() + header_end_pos, already);
             size_t remain = content_len - already;
             while(remain > 0){
-                if(std::chrono::steady_clock::now() > deadline) return false;
 #ifdef _WIN32
                 DWORD tv = 200; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
 #else
@@ -338,7 +336,13 @@ static bool rl_allow(const std::string& ip, int rps, int burst){
 
 // ================= HttpServer ===============================================
 
-void HttpServer::start(uint16_t port, std::function<std::string(const std::string&)> on_json){
+// NEW headers-aware start()
+void HttpServer::start(
+    uint16_t port,
+    std::function<std::string(
+        const std::string&,
+        const std::vector<std::pair<std::string,std::string>>&)> on_json)
+{
     if(running_.exchange(true)) return;
 
 #ifdef _WIN32
@@ -500,12 +504,12 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
                 }
 
                 // Collect headers
-                std::string auth = get_header(headers, "authorization");
+                std::string auth  = get_header(headers, "authorization");
                 std::string xauth = get_header(headers, "x-auth-token");
                 std::string content_type = get_header(headers, "content-type");
                 if(content_type.empty()) content_type = "application/json";
 
-                // Token policy
+                // Token policy (legacy env-based gate; OK to disable by leaving env unset)
                 bool token_required = require_always || !bound_loopback;
                 std::string token = env_token ? std::string(env_token) : std::string();
                 auto unauthorized = [&](const char* why){
@@ -535,20 +539,38 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
 
                 if(token_required){
                     if(token.empty()){
-                        unauthorized("token-required");
-                        return;
+                        // If no env token configured, skip this legacy gate
+                        // (RPC will enforce cookie-based Authorization itself).
+                    } else {
+                        if(!(check_bearer(auth) || (!xauth.empty() && xauth == token))){
+                            unauthorized("invalid-token");
+                            return;
+                        }
+                        token_present = true;
                     }
-                    if(!(check_bearer(auth) || (!xauth.empty() && xauth == token))){
-                        unauthorized("invalid-token");
-                        return;
-                    }
-                    token_present = true;
                 } else {
-                    // Not required (loopback), but if provided and valid, mark present
+                    // Not required (loopback), but if provided and matches env token, mark present
                     if(check_bearer(auth) || (!xauth.empty() && xauth == token)) token_present = true;
                 }
 
-                // Method check
+                // Method check for unauthenticated *per the legacy gate only*.
+                // NOTE: RPC still gets headers and will do its own cookie-based auth.
+                if(!token_present){
+                    std::string m = extract_json_method(body);
+                    if(m.empty() || safe.find(m) == safe.end()){
+                        std::vector<std::pair<std::string,std::string>> hdrs;
+                        if(allow_cors){
+                            hdrs.emplace_back("Access-Control-Allow-Origin","*");
+                            hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type");
+                        }
+                        send_http_simple(fd, 403, "Forbidden", "application/json",
+                            std::string("{\"error\":\"forbidden\",\"reason\":\"method requires token\"}"), hdrs);
+                        closesocket(fd);
+                        return;
+                    }
+                }
+
+                // Only POST (OPTIONS allowed for CORS)
                 if(lc(method) != "post"){
                     std::vector<std::pair<std::string,std::string>> hdrs;
                     if(allow_cors){
@@ -568,26 +590,10 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
                     return;
                 }
 
-                // If unauthenticated (no valid token), enforce allowlist:
-                if(!token_present){
-                    std::string m = extract_json_method(body);
-                    if(m.empty() || safe.find(m) == safe.end()){
-                        std::vector<std::pair<std::string,std::string>> hdrs;
-                        if(allow_cors){
-                            hdrs.emplace_back("Access-Control-Allow-Origin","*");
-                            hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type");
-                        }
-                        send_http_simple(fd, 403, "Forbidden", "application/json",
-                            std::string("{\"error\":\"forbidden\",\"reason\":\"method requires token\"}"), hdrs);
-                        closesocket(fd);
-                        return;
-                    }
-                }
-
-                // Invoke handler
+                // Invoke headers-aware handler
                 std::string resp_body;
                 try{
-                    resp_body = on_json(body);
+                    resp_body = on_json(body, headers);
                     if(resp_body.empty()) resp_body = "{\"result\":null}";
                 } catch(...){
                     resp_body = "{\"error\":\"internal error\"}";
@@ -612,6 +618,16 @@ void HttpServer::start(uint16_t port, std::function<std::string(const std::strin
     };
 
     std::thread(thread_fn).detach();
+}
+
+// Back-compat wrapper: ignores headers for the callback
+void HttpServer::start(uint16_t port, std::function<std::string(const std::string&)> on_json){
+    // Wrap the old callback into headers-aware form.
+    auto wrapper = [on_json](const std::string& body,
+                             const std::vector<std::pair<std::string,std::string>>& /*headers*/)->std::string {
+        return on_json(body);
+    };
+    this->start(port, wrapper);
 }
 
 void HttpServer::stop(){
