@@ -576,122 +576,144 @@ std::string RpcService::handle(const std::string& body){
             JNode out; out.v = o; return json_dump(out);
         }
 
-      // --- HD wallet RPCs ---
+        // --- HD wallet RPCs ---
 
-if (method == "createhdwallet") {
-    // params: [mnemonic(optional), mnemonic_pass(optional), wallet_pass(optional)]
-    std::string mnemonic = (params.size()>0 && params[0].is_string()) ? params[0].get_string() : std::string();
-    std::string mpass    = (params.size()>1 && params[1].is_string()) ? params[1].get_string() : std::string();
-    std::string wpass    = (params.size()>2 && params[2].is_string()) ? params[2].get_string() : std::string();
+        if (method == "createhdwallet") {
+            // params: [mnemonic(optional), mnemonic_pass(optional), wallet_pass(optional)]
+            std::string mnemonic;
+            std::string mpass;
+            std::string wpass;
 
-    std::string wdir = default_wallet_file();
-    if(!wdir.empty()){
-        size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
-    } else {
-        wdir = "wallets/default";
-    }
+            if (params.size() > 0 && std::holds_alternative<std::string>(params[0].v))
+                mnemonic = std::get<std::string>(params[0].v);
+            if (params.size() > 1 && std::holds_alternative<std::string>(params[1].v))
+                mpass = std::get<std::string>(params[1].v);
+            if (params.size() > 2 && std::holds_alternative<std::string>(params[2].v))
+                wpass = std::get<std::string>(params[2].v);
 
-    std::vector<uint8_t> seed(64);
-    if(mnemonic.empty()){
-        std::string outmn;
-        if(!miq::HdWallet::GenerateMnemonic(128, outmn)) return Json::err("mnemonic generation failed");
-        mnemonic = outmn;
-    }
-    if(!miq::HdWallet::MnemonicToSeed(mnemonic, mpass, seed)) return Json::err("mnemonic->seed failed");
+            std::string wdir = default_wallet_file();
+            if (!wdir.empty()) {
+                size_t pos = wdir.find_last_of("/\\");
+                if (pos != std::string::npos) wdir = wdir.substr(0, pos);
+            } else {
+                wdir = "wallets/default";
+            }
 
-    miq::HdAccountMeta meta; meta.account=0; meta.next_recv=0; meta.next_change=0;
-    std::string err;
-    if(!SaveHdWallet(wdir, seed, meta, wpass, err)) return Json::err(err);
+            if (mnemonic.empty()) {
+                std::string outmn;
+                if (!miq::HdWallet::GenerateMnemonic(128, outmn)) return err("mnemonic generation failed");
+                mnemonic = outmn;
+            }
 
-    Json r = Json::object();
-    r.set("mnemonic", mnemonic);
-    r.set("wallet_dir", wdir);
-    return r;
-}
+            std::vector<uint8_t> seed;
+            if (!miq::HdWallet::MnemonicToSeed(mnemonic, mpass, seed)) return err("mnemonic->seed failed");
 
-if (method == "restorehdwallet") {
-    // params: [mnemonic, mnemonic_pass(optional), wallet_pass(optional)]
-    if(params.size()<1 || !params[0].is_string()) return Json::err("mnemonic required");
-    std::string mnemonic = params[0].get_string();
-    std::string mpass    = (params.size()>1 && params[1].is_string()) ? params[1].get_string() : std::string();
-    std::string wpass    = (params.size()>2 && params[2].is_string()) ? params[2].get_string() : std::string();
+            miq::HdAccountMeta meta; meta.account = 0; meta.next_recv = 0; meta.next_change = 0;
+            std::string emsg;
+            if (!SaveHdWallet(wdir, seed, meta, wpass, emsg)) return err(emsg);
 
-    std::string wdir = default_wallet_file();
-    if(!wdir.empty()){
-        size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
-    } else {
-        wdir = "wallets/default";
-    }
+            std::map<std::string,JNode> o;
+            o["mnemonic"]   = jstr(mnemonic);
+            o["wallet_dir"] = jstr(wdir);
+            JNode r; r.v = o; return json_dump(r);
+        }
 
-    std::vector<uint8_t> seed;
-    if(!miq::HdWallet::MnemonicToSeed(mnemonic, mpass, seed)) return Json::err("mnemonic->seed failed");
+        if (method == "restorehdwallet") {
+            // params: [mnemonic, mnemonic_pass(optional), wallet_pass(optional)]
+            if (params.size() < 1 || !std::holds_alternative<std::string>(params[0].v))
+                return err("mnemonic required");
 
-    miq::HdAccountMeta meta; meta.account=0; meta.next_recv=0; meta.next_change=0;
-    std::string err;
-    if(!SaveHdWallet(wdir, seed, meta, wpass, err)) return Json::err(err);
-    return Json::ok();
-}
+            std::string mnemonic = std::get<std::string>(params[0].v);
+            std::string mpass, wpass;
+            if (params.size() > 1 && std::holds_alternative<std::string>(params[1].v))
+                mpass = std::get<std::string>(params[1].v);
+            if (params.size() > 2 && std::holds_alternative<std::string>(params[2].v))
+                wpass = std::get<std::string>(params[2].v);
 
-if (method == "walletinfo") {
-    std::string wdir = default_wallet_file();
-    if(!wdir.empty()){
-        size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
-    } else {
-        wdir = "wallets/default";
-    }
+            std::string wdir = default_wallet_file();
+            if (!wdir.empty()) {
+                size_t pos = wdir.find_last_of("/\\");
+                if (pos != std::string::npos) wdir = wdir.substr(0, pos);
+            } else {
+                wdir = "wallets/default";
+            }
 
-    std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string err;
-    std::string pass = getenv("MIQ_WALLET_PASSPHRASE") ? getenv("MIQ_WALLET_PASSPHRASE") : "";
-    if(!LoadHdWallet(wdir, seed, meta, pass, err)) return Json::err(err);
+            std::vector<uint8_t> seed;
+            if (!miq::HdWallet::MnemonicToSeed(mnemonic, mpass, seed)) return err("mnemonic->seed failed");
 
-    Json r = Json::object();
-    r.set("account", (int)meta.account);
-    r.set("next_recv", (int)meta.next_recv);
-    r.set("next_change", (int)meta.next_change);
-    return r;
-}
+            miq::HdAccountMeta meta; meta.account = 0; meta.next_recv = 0; meta.next_change = 0;
+            std::string emsg;
+            if (!SaveHdWallet(wdir, seed, meta, wpass, emsg)) return err(emsg);
 
-if (method == "getnewaddress") {
-    std::string wdir = default_wallet_file();
-    if(!wdir.empty()){
-        size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
-    } else {
-        wdir = "wallets/default";
-    }
+            return json_dump(jbool(true));
+        }
 
-    std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string err;
-    std::string pass = getenv("MIQ_WALLET_PASSPHRASE") ? getenv("MIQ_WALLET_PASSPHRASE") : "";
-    if(!LoadHdWallet(wdir, seed, meta, pass, err)) return Json::err(err);
+        if (method == "walletinfo") {
+            std::string wdir = default_wallet_file();
+            if (!wdir.empty()) {
+                size_t pos = wdir.find_last_of("/\\");
+                if (pos != std::string::npos) wdir = wdir.substr(0, pos);
+            } else {
+                wdir = "wallets/default";
+            }
 
-    miq::HdWallet w(seed, meta);
-    std::string addr;
-    if(!w.GetNewAddress(addr)) return Json::err("derive failed");
+            std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string emsg;
+            std::string pass = getenv("MIQ_WALLET_PASSPHRASE") ? getenv("MIQ_WALLET_PASSPHRASE") : "";
+            if (!LoadHdWallet(wdir, seed, meta, pass, emsg)) return err(emsg);
 
-    if(!SaveHdWallet(wdir, seed, w.meta(), pass, err)) return Json::err(err);
-    return Json::from_string(addr);
-}
+            std::map<std::string,JNode> o;
+            o["account"]     = jnum((double)meta.account);
+            o["next_recv"]   = jnum((double)meta.next_recv);
+            o["next_change"] = jnum((double)meta.next_change);
+            JNode r; r.v = o; return json_dump(r);
+        }
 
-if (method == "deriveaddressat") {
-    // params: [index]
-    if(params.size()<1 || !params[0].is_number()) return Json::err("index required");
-    uint32_t idx = (uint32_t)params[0].get_int64();
+        if (method == "getnewaddress") {
+            std::string wdir = default_wallet_file();
+            if (!wdir.empty()) {
+                size_t pos = wdir.find_last_of("/\\");
+                if (pos != std::string::npos) wdir = wdir.substr(0, pos);
+            } else {
+                wdir = "wallets/default";
+            }
 
-    std::string wdir = default_wallet_file();
-    if(!wdir.empty()){
-        size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
-    } else {
-        wdir = "wallets/default";
-    }
+            std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string emsg;
+            std::string pass = getenv("MIQ_WALLET_PASSPHRASE") ? getenv("MIQ_WALLET_PASSPHRASE") : "";
+            if (!LoadHdWallet(wdir, seed, meta, pass, emsg)) return err(emsg);
 
-    std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string err;
-    std::string pass = getenv("MIQ_WALLET_PASSPHRASE") ? getenv("MIQ_WALLET_PASSPHRASE") : "";
-    if(!LoadHdWallet(wdir, seed, meta, pass, err)) return Json::err(err);
+            miq::HdWallet w(seed, meta);
+            std::string addr;
+            if (!w.GetNewAddress(addr)) return err("derive failed");
 
-    miq::HdWallet w(seed, meta);
-    std::string addr;
-    if(!w.GetAddressAt(idx, addr)) return Json::err("derive failed");
-    return Json::from_string(addr);
-}
+            if (!SaveHdWallet(wdir, seed, w.meta(), pass, emsg)) return err(emsg);
+
+            JNode n; n.v = addr; return json_dump(n);
+        }
+
+        if (method == "deriveaddressat") {
+            // params: [index]
+            if (params.size() < 1 || !std::holds_alternative<double>(params[0].v))
+                return err("index required");
+            uint32_t idx = (uint32_t)std::get<double>(params[0].v);
+
+            std::string wdir = default_wallet_file();
+            if (!wdir.empty()) {
+                size_t pos = wdir.find_last_of("/\\");
+                if (pos != std::string::npos) wdir = wdir.substr(0, pos);
+            } else {
+                wdir = "wallets/default";
+            }
+
+            std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string emsg;
+            std::string pass = getenv("MIQ_WALLET_PASSPHRASE") ? getenv("MIQ_WALLET_PASSPHRASE") : "";
+            if (!LoadHdWallet(wdir, seed, meta, pass, emsg)) return err(emsg);
+
+            miq::HdWallet w(seed, meta);
+            std::string addr;
+            if (!w.GetAddressAt(idx, addr)) return err("derive failed");
+
+            JNode n; n.v = addr; return json_dump(n);
+        }
 
         // sendtoaddress(priv_hex, to_address, amount) with auto-fee + change
         if(method=="sendtoaddress"){
