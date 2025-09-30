@@ -1,4 +1,6 @@
 // src/crypto/ecdsa_uECC.cpp
+#ifndef MIQ_USE_SECP256K1  // ---- build this file only when not selecting libsecp256k1
+
 #include "crypto/ecdsa_uECC.h"
 #include "crypto/ecdsa_iface.h"
 
@@ -9,15 +11,6 @@ extern "C" {
 #include <vector>
 #include <cstdint>
 #include <cstring>
-
-#ifdef MIQ_USE_SECP256K1
-// libsecp build selected -> do not compile micro-ecc backend
-#  ifdef _MSC_VER
-#    pragma message("Skipping micro-ecc backend because MIQ_USE_SECP256K1=1")
-#  endif
-#else
-// (no guard -> compile uECC backend)
-#endif
 
 // ---- OS randomness (portable) ----
 #if defined(_WIN32)
@@ -94,7 +87,7 @@ static void ensure_rng() {
 }
 
 // ---- pubkey normalization (compressed/uncompressed -> XY) ----
-bool normalize_pubkey_xy(const std::vector<uint8_t>& pub, uint8_t out_xy[64]) {
+static bool normalize_pubkey_xy(const std::vector<uint8_t>& pub, uint8_t out_xy[64]) {
     if (pub.size() == 33 && (pub[0] == 0x02 || pub[0] == 0x03)) {
         uECC_decompress(pub.data(), out_xy, curve());
         return true;
@@ -146,15 +139,15 @@ bool ECDSA::sign(const std::vector<uint8_t>& priv32,
         return false;
     }
 
-    // ---- Low-S normalization (consensus-neutral here; only affects our signatures) ----
+    // ---- Low-S normalization ----
     uint8_t* r = sig64.data();
     uint8_t* s = sig64.data() + 32;
+    (void)r;
     if (cmp_be(s, SECP256K1_N_HALF, 32) > 0) {
         uint8_t s_norm[32];
         sub_be(s_norm, SECP256K1_N, s, 32);   // s = n - s
         std::memcpy(s, s_norm, 32);
     }
-    (void)r; // r untouched, present for clarity
     return true;
 }
 
@@ -165,7 +158,7 @@ bool ECDSA::verify(const std::vector<uint8_t>& pubkey,
     uint8_t pub_xy[64];
     if (!normalize_pubkey_xy(pubkey, pub_xy)) return false;
 
-    // uECC_verify returns 1 on success. It will fail if pubkey is invalid.
+    // uECC_verify returns 1 on success.
     return uECC_verify(pub_xy, msg32.data(), (unsigned)msg32.size(), sig64.data(), curve()) == 1;
 }
 
@@ -173,4 +166,6 @@ std::string ECDSA::backend() {
     return "micro-ecc";
 }
 
-}
+}}
+
+#endif // !MIQ_USE_SECP256K1
