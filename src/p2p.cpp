@@ -1678,6 +1678,19 @@ void P2P::loop(){
                             if (mempool_) {
                                 accepted = mempool_->accept(tx, chain_.utxo(), chain_.height(), err);
                             }
+                            bool in_mempool = mempool_ && mempool_->exists(tx.txid());
+                            if (accepted && !in_mempool) {
+                               for (const auto& in : tx.vin) {
+                                 UTXOEntry e;
+                                 if (!chain_.utxo().get(in.prev.txid, in.prev.vout, e)) {
+                                 send_gettx(s, in.prev.txid);   // request the missing parent from this peer
+                              }
+                          }
+                          // Skip announce/broadcast paths for orphans.
+                          continue;
+                     }
+                               
+                                  
                             // cache raw for serving (bounded by count)
                             if (tx_store_.find(key) == tx_store_.end()) {
                                 tx_store_[key] = m.payload;
