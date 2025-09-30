@@ -1,20 +1,40 @@
-
-#pragma once
+#include "ecdsa_iface.h"
 #include <vector>
-#include <cstdint>
 #include <string>
-namespace miq { namespace crypto {
-// Interface for ECDSA-like backends. Provide a drop-in implementation using micro-ecc (BSD-2) or ed25519-donna (public domain).
-struct ECDSA {
-    // Generate a private key (32 bytes). Returns true on success.
-    static bool generate_priv(std::vector<uint8_t>& out);
-    // Derive public key (compressed) from private key. Returns pubkey (33 bytes) into out.
-    static bool derive_pub(const std::vector<uint8_t>& priv, std::vector<uint8_t>& out33);
-    // Sign msg (32-byte hash) with priv, returning signature (64 bytes r||s or Ed25519 signature length 64).
-    static bool sign(const std::vector<uint8_t>& priv, const std::vector<uint8_t>& msg32, std::vector<uint8_t>& sig64);
-    // Verify msg with pubkey and signature.
-    static bool verify(const std::vector<uint8_t>& pub33, const std::vector<uint8_t>& msg32, const std::vector<uint8_t>& sig64);
-    // Name of backend
-    static std::string backend();
-};
-}} // namespace
+
+namespace crypto {
+namespace ECDSA {
+
+// Forward decls implemented in the backend .cpps
+bool secp_derive_pub(const std::vector<uint8_t>& priv, std::vector<uint8_t>& pub);
+bool secp_sign(const std::vector<uint8_t>& priv, const std::vector<uint8_t>& msg32, std::vector<uint8_t>& sig64);
+
+bool uecc_derive_pub(const std::vector<uint8_t>& priv, std::vector<uint8_t>& pub);
+bool uecc_sign(const std::vector<uint8_t>& priv, const std::vector<uint8_t>& msg32, std::vector<uint8_t>& sig64);
+
+bool derive_pub(const std::vector<uint8_t>& priv, std::vector<uint8_t>& pub) {
+#ifdef MIQ_USE_SECP256K1
+    return secp_derive_pub(priv, pub);
+#else
+    return uecc_derive_pub(priv, pub);
+#endif
+}
+
+bool sign(const std::vector<uint8_t>& priv, const std::vector<uint8_t>& msg32, std::vector<uint8_t>& sig64) {
+#ifdef MIQ_USE_SECP256K1
+    return secp_sign(priv, msg32, sig64);
+#else
+    return uecc_sign(priv, msg32, sig64);
+#endif
+}
+
+std::string backend() {
+#ifdef MIQ_USE_SECP256K1
+    return "libsecp256k1";
+#else
+    return "micro-ecc";
+#endif
+}
+
+}
+}
