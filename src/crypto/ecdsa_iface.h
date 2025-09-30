@@ -4,9 +4,10 @@
 #include <string>
 #include <vector>
 
+namespace miq {
 namespace crypto {
 
-// Unified ECDSA interface. Backends provide these static methods.
+// Unified ECDSA interface. Backends implement these static methods.
 class ECDSA {
 public:
     // Generate a valid 32-byte private key (secp256k1 order range).
@@ -30,4 +31,5 @@ public:
     static std::string backend();
 };
 
+}
 }
