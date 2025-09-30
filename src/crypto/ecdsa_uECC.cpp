@@ -10,6 +10,15 @@ extern "C" {
 #include <cstdint>
 #include <cstring>
 
+#ifdef MIQ_USE_SECP256K1
+// libsecp build selected -> do not compile micro-ecc backend
+#  ifdef _MSC_VER
+#    pragma message("Skipping micro-ecc backend because MIQ_USE_SECP256K1=1")
+#  endif
+#else
+// (no guard -> compile uECC backend)
+#endif
+
 // ---- OS randomness (portable) ----
 #if defined(_WIN32)
   #include <windows.h>
