@@ -64,7 +64,7 @@ endif()
 set_source_files_properties(
   ${MICRO_ECC_DIR}/uECC.c
   PROPERTIES
-    COMPILE_OPTIONS "$<$<C_COMPILER_ID:GNU,Clang>:-Wno-sign-compare;-Wno-type-limits;-Wno-unused-function;-Wno-unused-parameter>"
+    COMPILE_OPTIONS "$<$<C_COMPILER_ID:GNU,Clang>:-Wno-sign-compare;-Wno-type-limits;-Wno-unused-function;-Wno-unused-parameter;-Wno-maybe-uninitialized>"
 )
 if(MSVC)
   set_source_files_properties(
@@ -181,7 +181,7 @@ add_executable(miqrod
     src/crypto/ecdsa_iface.h
     src/crypto/ecdsa_uECC.h src/crypto/ecdsa_uECC.cpp
     src/crypto/ecdsa_secp256k1.h
-    $<$<NOT:$<BOOL:${WIN32}>>:src/crypto/ecdsa_secp256k1.cpp>
+    src/crypto/ecdsa_secp256k1.cpp   # <— build libsecp backend on all platforms
 
     # micro-ecc + shim (C sources)
     ${MICRO_ECC_DIR}/uECC.c
@@ -207,6 +207,9 @@ target_include_directories(miqrod PRIVATE
 
 # micro-ecc config: enable compressed points (safe, no consensus change)
 target_compile_definitions(miqrod PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
+
+# --- Default to libsecp256k1 backend for ECDSA ---
+target_compile_definitions(miqrod PRIVATE MIQ_USE_SECP256K1=1)
 
 # Link DB backend
 target_link_libraries(miqrod PRIVATE ${MIQ_DB_TARGET})
