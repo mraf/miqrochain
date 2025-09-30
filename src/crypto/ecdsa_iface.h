@@ -1,35 +1,27 @@
-// src/crypto/ecdsa_iface.h
 #pragma once
-#include <cstdint>
-#include <string>
 #include <vector>
+#include <string>
+#include <cstdint>
 
-namespace miq {
-namespace crypto {
+namespace miq { namespace crypto { namespace ECDSA {
 
-// Unified ECDSA interface. Backends implement these static methods.
-class ECDSA {
-public:
-    // Generate a valid 32-byte private key (secp256k1 order range).
-    static bool generate_priv(std::vector<uint8_t>& out32);
+// 32-byte private key
+bool generate_priv(std::vector<uint8_t>& out32);
 
-    // Derive compressed 33-byte public key from 32-byte private key.
-    static bool derive_pub(const std::vector<uint8_t>& priv32,
-                           std::vector<uint8_t>& out_pub33);
+// Derive 33-byte compressed public key from 32-byte priv
+bool derive_pub(const std::vector<uint8_t>& priv32, std::vector<uint8_t>& out33);
 
-    // Sign a 32-byte message hash. Writes 64-byte (r||s) signature.
-    static bool sign(const std::vector<uint8_t>& priv32,
-                     const std::vector<uint8_t>& msg32,
-                     std::vector<uint8_t>& out_sig64);
+// Sign 32-byte message hash, return 64-byte (r||s) (low-S normalized)
+bool sign(const std::vector<uint8_t>& priv32,
+          const std::vector<uint8_t>& msg32,
+          std::vector<uint8_t>& sig64);
 
-    // Verify 64-byte (r||s) signature against compressed 33-byte pubkey.
-    static bool verify(const std::vector<uint8_t>& pubkey33,
-                       const std::vector<uint8_t>& msg32,
-                       const std::vector<uint8_t>& sig64);
+// Verify (accepts 33-byte compressed or 64-byte uncompressed pubkey)
+bool verify(const std::vector<uint8_t>& pubkey,
+            const std::vector<uint8_t>& msg32,
+            const std::vector<uint8_t>& sig64);
 
-    // Human-readable backend name ("libsecp256k1" or "micro-ecc").
-    static std::string backend();
-};
+// Human-readable backend name
+std::string backend();
 
-}
-}
+}}}
