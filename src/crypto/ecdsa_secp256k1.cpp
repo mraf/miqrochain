@@ -1,22 +1,19 @@
-#include "ecdsa_secp256k1.h"
-#include "../sha256.h"
+// src/crypto/ecdsa_secp256k1.cpp
+#ifdef MIQ_USE_SECP256K1  // ---- build this file only when selecting libsecp256k1 backend
+
+#include "crypto/ecdsa_secp256k1.h"
+#include "crypto/ecdsa_iface.h"
+#include "sha256.h"
+
 #include <array>
 #include <random>
 #include <cstring>
 #include <cassert>
 #include <vector>
+#include <algorithm>
 
 #ifndef MIQ_SECP256K1_C_BRIDGE
 #define MIQ_SECP256K1_C_BRIDGE 0
-#endif
-
-#ifndef MIQ_USE_SECP256K1
-// micro-ecc build selected -> do not compile libsecp backend
-#  ifdef _MSC_VER
-#    pragma message("Skipping libsecp256k1 backend because MIQ_USE_SECP256K1=0")
-#  endif
-#else
-// (no guard -> compile libsecp backend)
 #endif
 
 #if defined(_MSC_VER)
@@ -34,7 +31,6 @@ static inline uint64_t addc_u64(uint64_t a, uint64_t b, uint64_t carry_in, uint6
 static inline uint64_t subb_u64(uint64_t a, uint64_t b, uint64_t borrow_in, uint64_t* borrow_out){ unsigned __int128 t=(unsigned __int128)a - b - borrow_in; *borrow_out=(uint64_t)((t>>127)&1); return (uint64_t)t; }
 #endif
 
-
 namespace miq { namespace crypto {
 
 // ----- Simple 256-bit integer and field arithmetic over secp256k1 -----
@@ -44,7 +40,6 @@ static inline void U256_to_be(const U256& x, uint8_t b[32]){ for(int i=0;i<4;i++
 static inline bool U256_is_zero(const U256& a){ return !(a.v[0]|a.v[1]|a.v[2]|a.v[3]); }
 static inline int U256_cmp(const U256& a,const U256& b){ for(int i=3;i>=0;--i){ if(a.v[i]<b.v[i]) return -1; if(a.v[i]>b.v[i]) return 1; } return 0; }
 
-// --- fixed bracing (from previous step) ---
 static inline U256 U256_add(const U256& a,const U256& b,uint64_t*carry){
     U256 r{}; uint64_t c=0;
     for(int i=0;i<4;i++){ r.v[i]=addc_u64(a.v[i], b.v[i], c, &c); }
@@ -73,7 +68,6 @@ static inline U512 U256_mul(const U256& a,const U256& b){
     }
     return r;
 }
-// -----------------------------------------
 
 static inline U256 U512_mod(const U512& x,const U256& m){ U512 r=x; auto ge=[&](const U512&A,const U256&B,int s){ for(int i=7;i>=0;--i){ uint64_t a=A.w[i]; uint64_t b=(i-s>=0 && i-s<4)?B.v[i-s]:0; if(a<b) return false; if(a>b) return true; } return true; }; auto sub=[&](U512&A,const U256&B,int s){ __int128 c=0; for(int i=0;i<8;i++){ int bi=i-s; unsigned __int128 b=(bi>=0&&bi<4)?B.v[bi]:0; __int128 t=(__int128)A.w[i]-b-c; A.w[i]=(uint64_t)t; c=t<0; } }; for(int s=7;s>=0;--s){ while(ge(r,m,s)) sub(r,m,s); } U256 o; for(int i=0;i<4;i++) o.v[i]=r.w[i]; return o; }
 static inline U256 U256_mod_add(const U256&a,const U256&b,const U256&m){ uint64_t c; U256 s=U256_add(a,b,&c); if(c||U256_cmp(s,m)>=0) s=U256_sub(s,m,nullptr); return s; }
@@ -148,17 +142,16 @@ static Point add(const Point& P, const Point& Q){
     Fp S1=Fp_mul(Fp_mul(P.Y,Q.Z), Z2Z2);
     Fp S2=Fp_mul(Fp_mul(Q.Y,P.Z), Z1Z1);
 
-    // disambiguate the curve prime P from the parameter P
-    U256 H_=U256_mod_sub(U2.n, U1.n, ::miq::crypto::P); Fp H=Fp_fromU(H_);
-    U256 r_=U256_mod_sub(S2.n, S1.n, ::miq::crypto::P); r_=U256_mod_add(r_, r_, ::miq::crypto::P); Fp r=Fp_fromU(r_);
+    U256 H_=U256_mod_sub(U2.n, U1.n, P); Fp H=Fp_fromU(H_);
+    U256 r_=U256_mod_sub(S2.n, S1.n, P); r_=U256_mod_add(r_, r_, P); Fp r=Fp_fromU(r_);
 
     if(U256_is_zero(H.n)){ if(U256_is_zero(r.n)) return dbl(P); return Inf(); }
-    Fp I = Fp_sqr(Fp_fromU(U256_mod_add(H.n, H.n, ::miq::crypto::P)));
+    Fp I = Fp_sqr(Fp_fromU(U256_mod_add(H.n, H.n, P)));
     Fp J = Fp_mul(H, I);
     Fp V = Fp_mul(U1, I);
     Fp X3 = Fp_sub(Fp_sub(Fp_sqr(r), J), Fp_add(V,V));
-    Fp Y3 = Fp_sub(Fp_mul(r, Fp_sub(V, X3)), Fp_mul(Fp_fromU(U256_mod_add(S1.n,S1.n, ::miq::crypto::P)), J));
-    Fp Z3 = Fp_mul(Fp_mul(Fp_sub(Fp_add(P.Z,Q.Z), Fp_add(Z1Z1,Z2Z2)), Fp_fromU(U256{{1,0,0,0}})), H); // (Z1+Z2)^2 - Z1Z1 - Z2Z2 = 2*Z1*Z2 ; then * H
+    Fp Y3 = Fp_sub(Fp_mul(r, Fp_sub(V, X3)), Fp_mul(Fp_fromU(U256_mod_add(S1.n,S1.n, P)), J));
+    Fp Z3 = Fp_mul(Fp_mul(Fp_sub(Fp_add(P.Z,Q.Z), Fp_add(Z1Z1,Z2Z2)), Fp_fromU(U256{{1,0,0,0}})), H);
     Point R{X3,Y3,Z3,false}; return R;
 }
 
@@ -201,6 +194,7 @@ static U256 rfc6979(const U256& x, const U256& z, const U256& n){
         U512 prod{}; prod.w[0]=k.v[0]; prod.w[1]=k.v[1]; prod.w[2]=k.v[2]; prod.w[3]=k.v[3]; U256 kk=U512_mod(prod,n); if(U256_is_zero(kk)||U256_cmp(kk,n)>=0) continue; return kk; }
 }
 
+// ===== built-in Secp256k1 (deterministic signatures) =====
 bool Secp256k1::generate_priv(std::vector<uint8_t>& out32){
     std::random_device rd; out32.resize(32); for(auto&i:out32) i=(uint8_t)rd(); if(out32[0]==0) out32[0]=1; return true;
 }
@@ -232,13 +226,10 @@ bool Secp256k1::decompress_pub(const std::vector<uint8_t>& in33, std::vector<uin
     Fp x = Fp_fromU(X); Fp rhs = Fp_add(Fp_mul(Fp_sqr(x), x), Fp_fromU(U256_from_be((const uint8_t*)"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x07")));
     // (p+1)/4
     U256 e = U256_from_be((const uint8_t*)"\x3f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfb");
-    // pow via square-and-multiply
     auto pow = [&](Fp a, U256 ee){ Fp r=Fp_fromU(U256{{1,0,0,0}}); for(int i=0;i<256;i++){ if( (ee.v[i/64]>>(i%64)) & 1 ) r=Fp_mul(r,a); a=Fp_sqr(a); } return r; };
     Fp y = pow(rhs, e);
     uint8_t yb[32]; U256_to_be(y.n, yb);
-    if( (yb[31]&1) != (prefix&1) ){ // y = p - y
-        U256 yy = U256_mod_sub(U256_from_be(yb), P, P); y.n = yy;
-    }
+    if( (yb[31]&1) != (prefix&1) ){ U256 yy = U256_mod_sub(U256_from_be(yb), P, P); y.n = yy; }
     uint8_t xb[32]; U256_to_be(x.n, xb);
     out64.assign(xb, xb+32); out64.insert(out64.end(), yb, yb+32); return true;
 }
@@ -280,9 +271,45 @@ bool Secp256k1::verify(const std::vector<uint8_t>& pub64, const std::vector<uint
 
 std::string Secp256k1::name(){ return "secp256k1 (built-in, RFC6979)"; }
 
-}} // ns
+// ---------- ECDSA iface wrappers (so callers use miq::crypto::ECDSA) ----------
+bool ECDSA::generate_priv(std::vector<uint8_t>& out32){
+    return Secp256k1::generate_priv(out32);
+}
 
-// -------- C bridge for vendor/microecc/uECC.c ---------
+bool ECDSA::derive_pub(const std::vector<uint8_t>& priv32, std::vector<uint8_t>& out_pub33){
+    std::vector<uint8_t> un64;
+    if(!Secp256k1::derive_pub_uncompressed(priv32, un64)) return false;
+    return Secp256k1::compress_pub(un64, out_pub33);
+}
+
+bool ECDSA::sign(const std::vector<uint8_t>& priv32,
+                 const std::vector<uint8_t>& msg32,
+                 std::vector<uint8_t>& out_sig64){
+    return Secp256k1::sign_rfc6979(priv32, msg32, out_sig64);
+}
+
+bool ECDSA::verify(const std::vector<uint8_t>& pubkey33,
+                   const std::vector<uint8_t>& msg32,
+                   const std::vector<uint8_t>& sig64){
+    // Accept 33-byte compressed or 64-byte uncompressed
+    std::vector<uint8_t> un64;
+    if (pubkey33.size() == 33) {
+        if(!Secp256k1::decompress_pub(pubkey33, un64)) return false;
+    } else if (pubkey33.size() == 64) {
+        un64 = pubkey33;
+    } else {
+        return false;
+    }
+    return Secp256k1::verify(un64, msg32, sig64);
+}
+
+std::string ECDSA::backend(){
+    return "libsecp256k1";
+}
+
+}} // namespace miq::crypto
+
+// -------- C bridge for vendor/microecc/uECC.c (optional) ---------
 #if MIQ_SECP256K1_C_BRIDGE
 extern "C" {
 int miq_secp_make_key(uint8_t *pub64, uint8_t *priv32){
@@ -311,4 +338,6 @@ int miq_secp_valid_pub(const uint8_t *pub64){
     uint8_t c[33]; if(!miq_secp_compress(pub64,c)) return 0; uint8_t u[64]; if(!miq_secp_decompress(c,u)) return 0; return std::memcmp(u,pub64,64)==0;
 }
 }
+#endif
+
 #endif
