@@ -227,7 +227,13 @@ static int64_t g_next_stall_probe_ms = 0;
 static std::unordered_map<int, std::vector<std::vector<uint8_t>>> g_trickle_q;
 static std::unordered_map<int, int64_t> g_trickle_last_ms;
 
-// ---- env helper (u64) ------------------------------------------------------
+// --- NEW: helper to send gettx using existing encode_msg/send path ----------
+static inline void send_gettx(int sock, const std::vector<uint8_t>& txid) {
+    if (txid.size() != 32) return;
+    auto m = encode_msg("gettx", txid);
+    send(sock, (const char*)m.data(), (int)m.size(), 0);
+}
+
 static inline uint64_t env_u64(const char* name, uint64_t defv){
     const char* v = std::getenv(name);
     if(!v || !*v) return defv;
@@ -1679,18 +1685,19 @@ void P2P::loop(){
                                 accepted = mempool_->accept(tx, chain_.utxo(), chain_.height(), err);
                             }
                             bool in_mempool = mempool_ && mempool_->exists(tx.txid());
+
+                            // If it was accepted but not inserted (i.e., treated as orphan), request parents and skip gossip.
                             if (accepted && !in_mempool) {
-                               for (const auto& in : tx.vin) {
-                                 UTXOEntry e;
-                                 if (!chain_.utxo().get(in.prev.txid, in.prev.vout, e)) {
-                                 send_gettx(s, in.prev.txid);   // request the missing parent from this peer
-                              }
-                          }
-                          // Skip announce/broadcast paths for orphans.
-                          continue;
-                     }
-                               
-                                  
+                                for (const auto& in : tx.vin) {
+                                    UTXOEntry e;
+                                    if (!chain_.utxo().get(in.prev.txid, in.prev.vout, e)) {
+                                        send_gettx(s, in.prev.txid); // ask this peer for the missing parent tx
+                                    }
+                                }
+                                // Skip announce/broadcast/cache for orphans.
+                                continue;
+                            }
+
                             // cache raw for serving (bounded by count)
                             if (tx_store_.find(key) == tx_store_.end()) {
                                 tx_store_[key] = m.payload;
