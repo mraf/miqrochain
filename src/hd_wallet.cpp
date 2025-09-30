@@ -5,8 +5,8 @@
 #include "hash160.h"
 #include "base58check.h"
 #include "hex.h"
-#include "wallet_encryptor.h"   // your AES-GCM helpers (if MIQ_ENABLE_WALLET_ENC)
-#include "crypto/ecdsa_iface.h" // your secp256k1 bridge
+#include "wallet_encryptor.h"   // AES-GCM helpers (if MIQ_ENABLE_WALLET_ENC)
+#include "crypto/ecdsa_iface.h" // crypto::ECDSA::{derive_pub,sign,backend}
 #include "constants.h"
 
 #include <openssl/evp.h>
@@ -18,8 +18,14 @@
 #include <fstream>
 #include <random>
 #include <algorithm>
+#include <cstring> // std::strlen
 
 namespace miq {
+
+// ---- config ----
+// Domain-separation label for BIP32 master key derivation (HMAC key).
+// Changing this means mnemonics produce different keys than standard wallets.
+static constexpr const char* BIP32_MASTER_KEY_LABEL = "miqrochain seed";
 
 // ---- small utils ----
 static inline void put32(uint8_t* p, uint32_t v){ p[0]=v>>24; p[1]=(v>>16)&0xff; p[2]=(v>>8)&0xff; p[3]=v&0xff; }
@@ -50,9 +56,6 @@ static bool pbkdf2_hmac_sha512(const std::string& pass, const std::string& salt,
                              (const unsigned char*)salt.data(), (int)salt.size(),
                              iters, EVP_sha512(), 64, out)==1;
 }
-
-// Provided by your secp256k1 wrapper (compressed 33B)
-extern bool ecdsa_derive_pub_from_priv(const std::vector<uint8_t>& priv, std::vector<uint8_t>& pub33);
 
 // ---------- BIP39 ----------
 
@@ -98,7 +101,7 @@ bool HdWallet::GenerateMnemonic(int entropy_bits, std::string& out_mnemonic){
 bool HdWallet::MnemonicToSeed(const std::string& mnemonic,
                               const std::string& passphrase,
                               std::vector<uint8_t>& out_seed){
-    // For brevity we assume normalized/trimmed input (can add NFKD later if needed).
+    // (Note: input normalization to NFKD can be added later if desired.)
     std::string salt = std::string("mnemonic") + passphrase;
     out_seed.assign(64,0);
     if(!pbkdf2_hmac_sha512(mnemonic, salt, out_seed.data(), 2048)) return false;
@@ -107,12 +110,14 @@ bool HdWallet::MnemonicToSeed(const std::string& mnemonic,
 
 // ---------- BIP32 ----------
 
-// Master: I = HMAC-SHA512(key="Bitcoin seed", data=seed) => IL, IR
+// Master: I = HMAC-SHA512(key=BIP32_MASTER_KEY_LABEL, data=seed) => IL, IR
 static bool bip32_master_from_seed(const std::vector<uint8_t>& seed,
                                    std::vector<uint8_t>& k_master,
                                    std::vector<uint8_t>& c_master){
     uint8_t I[64];
-    if(!hmac_sha512((const uint8_t*)"Bitcoin seed", 12, seed.data(), seed.size(), I)) return false;
+    const uint8_t* key  = reinterpret_cast<const uint8_t*>(BIP32_MASTER_KEY_LABEL);
+    const size_t   klen = std::strlen(BIP32_MASTER_KEY_LABEL);
+    if(!hmac_sha512(key, klen, seed.data(), seed.size(), I)) return false;
     k_master.assign(I, I+32);
     c_master.assign(I+32, I+64);
     return true;
@@ -127,7 +132,7 @@ static bool bip32_ckd_priv(std::vector<uint8_t>& k, std::vector<uint8_t>& c, uin
         std::copy(k.begin(), k.end(), data+off); off+=32;
     }else{
         std::vector<uint8_t> pub33;
-        if(!ecdsa_derive_pub_from_priv(k, pub33)) return false;
+        if(!crypto::ECDSA::derive_pub(k, pub33)) return false;
         std::copy(pub33.begin(), pub33.end(), data); off=33;
     }
     put32(data+off, i);
@@ -168,14 +173,12 @@ bool HdWallet::DerivePrivPub(uint32_t account, uint32_t chain, uint32_t index,
     if(!bip32_ckd_priv(k,c,index, false)) return false;
 
     out_priv = k;
-    if(!ecdsa_derive_pub_from_priv(out_priv, out_pub)) return false;
+    if(!crypto::ECDSA::derive_pub(out_priv, out_pub)) return false;
     return true;
 }
 
 std::string PubkeyToAddress(const std::vector<uint8_t>& pub33){
-    // Your hash160() returns a vector, so use it as a value:
     std::vector<uint8_t> h160 = hash160(pub33);
-    // VERSION_P2PKH should be defined in constants.h (uint8_t)
     return base58check_encode(VERSION_P2PKH, h160);
 }
 
