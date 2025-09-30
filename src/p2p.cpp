@@ -227,10 +227,10 @@ static int64_t g_next_stall_probe_ms = 0;
 static std::unordered_map<int, std::vector<std::vector<uint8_t>>> g_trickle_q;
 static std::unordered_map<int, int64_t> g_trickle_last_ms;
 
-// --- NEW: helper to send gettx using existing encode_msg/send path ----------
+// --- helper to send gettx using existing encode_msg/send path ----------
 static inline void send_gettx(int sock, const std::vector<uint8_t>& txid) {
     if (txid.size() != 32) return;
-    auto m = encode_msg("gettx", txid);
+    auto m = miq::encode_msg("gettx", txid);
     send(sock, (const char*)m.data(), (int)m.size(), 0);
 }
 
@@ -433,7 +433,7 @@ static int dial_be_ipv4(uint32_t be_ip, uint16_t port){
     return s;
 }
 
-} // anon
+}
 
 namespace miq {
 
@@ -531,7 +531,7 @@ namespace {
         }
         return true;
     }
-} // anon
+}
 #endif // MIQ_ENABLE_HEADERS_FIRST
 
 // === AddrMan state (TU-local) ===============================================
