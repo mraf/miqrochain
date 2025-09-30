@@ -1,4 +1,4 @@
-// src/rpc.cpp  — full file (adds sendfromhd)
+// src/rpc.cpp  — full file (adds sendfromhd + walletunlock/lock + getwalletinfo + listaddresses + listutxos)
 #include "hd_wallet.h"
 #include "wallet_store.h"
 #include "rpc.h"
@@ -27,6 +27,7 @@
 #include <cctype>   // std::isxdigit
 #include <string>
 #include <vector>
+#include <cstring>  // std::memset
 
 #include <fstream>
 #include <random>
@@ -216,6 +217,26 @@ static uint64_t min_fee_for_size(size_t sz_bytes){
     return kb * rate;
 }
 
+// ---- Wallet unlock cache (RAM only) ----------------------------------------
+namespace {
+    static std::vector<uint8_t> g_cached_seed;
+    static miq::HdAccountMeta   g_cached_meta{};
+    static int64_t              g_wallet_unlocked_until_ms = 0;
+
+    static inline int64_t now_ms_rpc() {
+        using namespace std::chrono;
+        return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    }
+    static inline bool wallet_is_unlocked() {
+        return !g_cached_seed.empty() && now_ms_rpc() < g_wallet_unlocked_until_ms;
+    }
+    static inline void wallet_lock() {
+        std::vector<uint8_t>().swap(g_cached_seed);
+        g_wallet_unlocked_until_ms = 0;
+        std::memset(&g_cached_meta, 0, sizeof(g_cached_meta));
+    }
+} // anon
+
 void RpcService::start(uint16_t port){
     // http.cpp authenticates via Authorization / X-Auth-Token (MIQ_RPC_TOKEN).
     // Use the headers-aware start() so we can access headers later if needed.
@@ -283,6 +304,7 @@ std::string RpcService::handle(const std::string& body){
                 "estimatemediantime","getdifficulty","getchaintips",
                 "getpeerinfo","getconnectioncount",
                 "createhdwallet","restorehdwallet","walletinfo","getnewaddress","deriveaddressat",
+                "walletunlock","walletlock","getwalletinfo","listaddresses","listutxos",
                 "sendfromhd"
                 // (getibdinfo exists but not listed here to keep help stable)
             };
@@ -715,6 +737,161 @@ if (method == "deriveaddressat") {
     return json_dump(jstr(addr));
 }
 
+// --- walletunlock (RAM cache, timeout) ---
+if (method == "walletunlock") {
+    if (params.size() < 2
+        || !std::holds_alternative<std::string>(params[0].v)
+        || !std::holds_alternative<double>(params[1].v)) {
+        return err("usage: walletunlock pass timeout_sec");
+    }
+    std::string pass = std::get<std::string>(params[0].v);
+    int64_t timeout_s = (int64_t)std::get<double>(params[1].v);
+    if (pass.empty()) return err("empty passphrase refused");
+    if (timeout_s <= 0) return err("timeout must be >0");
+
+    std::string wdir = default_wallet_file();
+    if(!wdir.empty()){
+        size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
+    } else {
+        wdir = "wallets/default";
+    }
+
+    std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
+    if (!LoadHdWallet(wdir, seed, meta, pass, e)) return err(e);
+
+    g_cached_seed = std::move(seed);
+    g_cached_meta = meta;
+    g_wallet_unlocked_until_ms = now_ms_rpc() + timeout_s * 1000;
+
+    std::map<std::string,JNode> o;
+    o["ok"]                = jbool(true);
+    o["unlocked_until_ms"] = jnum((double)g_wallet_unlocked_until_ms);
+    o["next_recv"]         = jnum((double)g_cached_meta.next_recv);
+    o["next_change"]       = jnum((double)g_cached_meta.next_change);
+    JNode out; out.v = o; return json_dump(out);
+}
+
+// --- walletlock ---
+if (method == "walletlock") {
+    wallet_lock();
+    return "\"ok\"";
+}
+
+// --- getwalletinfo (unlocked status + meta if readable) ---
+if (method == "getwalletinfo") {
+    std::map<std::string,JNode> o;
+    o["unlocked"]          = jbool(wallet_is_unlocked());
+    o["unlocked_until_ms"] = jnum((double)g_wallet_unlocked_until_ms);
+
+    // try to surface meta either from cache or from disk (env pass if present)
+    if (wallet_is_unlocked()) {
+        o["next_recv"]   = jnum((double)g_cached_meta.next_recv);
+        o["next_change"] = jnum((double)g_cached_meta.next_change);
+    } else {
+        std::string wdir = default_wallet_file();
+        if(!wdir.empty()){
+            size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
+        } else {
+            wdir = "wallets/default";
+        }
+        std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
+        std::string pass = getenv("MIQ_WALLET_PASSPHRASE") ? getenv("MIQ_WALLET_PASSPHRASE") : "";
+        if (LoadHdWallet(wdir, seed, meta, pass, e)) {
+            o["next_recv"]   = jnum((double)meta.next_recv);
+            o["next_change"] = jnum((double)meta.next_change);
+        }
+    }
+    JNode out; out.v = o; return json_dump(out);
+}
+
+// --- listaddresses [count?] ---
+if (method == "listaddresses") {
+    int want = -1;
+    if (params.size()>0) {
+        if (std::holds_alternative<double>(params[0].v)) want = (int)std::get<double>(params[0].v);
+        else if (std::holds_alternative<std::string>(params[0].v)) {
+            try { want = (int)std::stoul(std::get<std::string>(params[0].v)); } catch(...) { return err("bad count"); }
+        }
+    }
+
+    std::string wdir = default_wallet_file();
+    if(!wdir.empty()){
+        size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
+    } else {
+        wdir = "wallets/default";
+    }
+
+    std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
+    bool from_cache = wallet_is_unlocked();
+    if (from_cache) { seed = g_cached_seed; meta = g_cached_meta; }
+    else {
+        std::string pass = getenv("MIQ_WALLET_PASSPHRASE") ? getenv("MIQ_WALLET_PASSPHRASE") : "";
+        if(!LoadHdWallet(wdir, seed, meta, pass, e)) return err("wallet locked");
+    }
+
+    miq::HdWallet w(seed, meta);
+    int n = (want>0) ? std::min<int>(want, (int)meta.next_recv) : (int)meta.next_recv;
+
+    std::vector<JNode> arr;
+    for (int i=0;i<n;i++){
+        std::string addr;
+        if (w.GetAddressAt((uint32_t)i, addr)) arr.push_back(jstr(addr));
+    }
+    JNode out; out.v = arr; return json_dump(out);
+}
+
+// --- listutxos ---
+if (method == "listutxos") {
+    std::string wdir = default_wallet_file();
+    if(!wdir.empty()){
+        size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
+    } else {
+        wdir = "wallets/default";
+    }
+
+    std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
+    bool from_cache = wallet_is_unlocked();
+    if (from_cache) { seed = g_cached_seed; meta = g_cached_meta; }
+    else {
+        std::string pass = getenv("MIQ_WALLET_PASSPHRASE") ? getenv("MIQ_WALLET_PASSPHRASE") : "";
+        if(!LoadHdWallet(wdir, seed, meta, pass, e)) return err("wallet locked");
+    }
+
+    miq::HdWallet w(seed, meta);
+
+    // Build PKHs for known receive & change ranges
+    auto collect_pkh_for_range = [&](bool change, uint32_t n, std::vector<std::array<uint8_t,20>>& out){
+        for (uint32_t i=0;i<n;i++){
+            std::vector<uint8_t> priv, pub;
+            if (!w.DerivePrivPub(meta.account, change?1u:0u, i, priv, pub)) continue;
+            auto h = hash160(pub);
+            if (h.size()!=20) continue;
+            std::array<uint8_t,20> p{}; std::copy(h.begin(), h.end(), p.begin());
+            out.push_back(p);
+        }
+    };
+    std::vector<std::array<uint8_t,20>> pkhs;
+    collect_pkh_for_range(false, meta.next_recv, pkhs);
+    collect_pkh_for_range(true,  meta.next_change, pkhs);
+
+    std::vector<JNode> outarr;
+    for (const auto& pkh : pkhs){
+        auto lst = chain_.utxo().list_for_pkh(std::vector<uint8_t>(pkh.begin(), pkh.end()));
+        for (const auto& t : lst){
+            const auto& txid = std::get<0>(t);
+            uint32_t vout    = std::get<1>(t);
+            const auto& e2   = std::get<2>(t);
+
+            std::map<std::string,JNode> o;
+            o["txid"]  = jstr(to_hex(txid));
+            o["vout"]  = jnum((double)vout);
+            o["value"] = jnum((double)e2.value);
+            JNode n; n.v = o; outarr.push_back(n);
+        }
+    }
+    JNode out; out.v = outarr; return json_dump(out);
+}
+
         // -------- NEW: spend from HD wallet (account 0) --------
         if (method == "sendfromhd") {
             // params: [to_address, amount, feerate(optional miqron per kB)]
@@ -821,9 +998,11 @@ if (method == "deriveaddressat") {
             uint64_t fee_final = 0, change = 0;
             {
                 size_t est_size = estimate_size_bytes(tx.vin.size(), 2);
+                (void)est_size;
                 fee_final = fee_for(tx.vin.size(), 2);
                 if(in_sum < amount + fee_final){
-                    est_size = estimate_size_bytes(tx.vin.size(), 1);
+                    size_t est_size1 = estimate_size_bytes(tx.vin.size(), 1);
+                    (void)est_size1;
                     fee_final = fee_for(tx.vin.size(), 1);
                     if(in_sum < amount + fee_final) return err("insufficient funds (need amount+fee)");
                     change = 0;
@@ -831,7 +1010,8 @@ if (method == "deriveaddressat") {
                     change = in_sum - amount - fee_final;
                     if(change < DUST_THRESHOLD){
                         change = 0;
-                        size_t est2 = estimate_size_bytes(tx.vin.size(), 1);
+                        size_t est_size2 = estimate_size_bytes(tx.vin.size(), 1);
+                        (void)est_size2;
                         fee_final = fee_for(tx.vin.size(), 1);
                         if(in_sum < amount + fee_final) return err("insufficient after dust fold");
                     }
