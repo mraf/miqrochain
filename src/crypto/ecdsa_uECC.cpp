@@ -164,4 +164,4 @@ std::string ECDSA::backend() {
     return "micro-ecc";
 }
 
-}} // namespace miq::crypto
+}
