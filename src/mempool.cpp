@@ -3,6 +3,9 @@
 #include "constants.h"
 #include "block.h"   // Block type for connect/disconnect
 #include "utxo.h"    // UTXOSet + UTXOEntry definition
+#include "sha256.h"  // dsha256 for sighash
+#include "hash160.h" // hash160(pubkey) to compare with PKH
+#include "crypto/ecdsa_iface.h" // crypto::ECDSA::verify
 
 #include <algorithm>
 #include <queue>
@@ -45,8 +48,21 @@ int64_t Mempool::now_ms(){
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+// Helper: compute a minimal relay fee if a global policy macro is defined.
+// If MIN_RELAY_FEE_RATE is not defined globally, this returns 0 (no floor change).
+static inline uint64_t min_fee_for_size_bytes(size_t sz){
+#ifdef MIN_RELAY_FEE_RATE
+    uint64_t kb = (uint64_t)((sz + 999) / 1000);
+    if (kb == 0) kb = 1;
+    return kb * (uint64_t)MIN_RELAY_FEE_RATE;
+#else
+    (void)sz;
+    return 0;
+#endif
+}
+
 bool Mempool::validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView& utxo, uint64_t& fee, std::string& err) const {
-    // coinbase cannot be in mempool
+    // coinbase cannot be in mempool (loose check)
     if (tx.vin.size()==1 &&
         tx.vin[0].prev.vout==0 &&
         tx.vin[0].prev.txid.size()==32 &&
@@ -55,28 +71,51 @@ bool Mempool::validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView
         return false;
     }
 
-    // Sum inputs using UTXO or mempool-provided outputs
+    // Prepare sighash: blank sig/pubkey for all inputs, serialize, double-SHA256
+    Transaction sighash_tx = tx;
+    for (auto& i : sighash_tx.vin) { i.sig.clear(); i.pubkey.clear(); }
+    const std::vector<uint8_t> sighash = dsha256(ser_tx(sighash_tx));
+
+    // Sum inputs using UTXO or mempool-provided outputs, while verifying each input's signature & PKH
     uint64_t in_sum = 0;
     for (const auto& in : tx.vin) {
-        // Try mempool parent first
+        // Determine previous output (value + PKH), first try mempool parent
+        std::vector<uint8_t> expect_pkh;
+        uint64_t prev_value = 0;
+
         auto pit = map_.find(k(in.prev.txid));
         if (pit != map_.end()) {
             const auto& ptx = pit->second.tx;
             if (in.prev.vout >= ptx.vout.size()) { err="bad prev vout"; return false; }
-            uint64_t val = ptx.vout[in.prev.vout].value;
-            uint64_t tmp = in_sum + val;
-            if (tmp < in_sum) { err="input overflow"; return false; }
-            in_sum = tmp;
-            continue;
+            const auto& prev_out = ptx.vout[in.prev.vout];
+            prev_value = prev_out.value;
+            expect_pkh = prev_out.pkh;
+        } else {
+            // Then UTXO set via interface
+            UTXOEntry e;
+            if (!utxo.get(in.prev.txid, in.prev.vout, e)) {
+                // Not found in UTXO or mempool -> orphan candidate
+                err.clear();
+                return false; // caller treats empty err as orphan
+            }
+            prev_value = e.value;
+            expect_pkh = e.pkh;
         }
-        // Then UTXO set via interface
-        UTXOEntry e;
-        if (!utxo.get(in.prev.txid, in.prev.vout, e)) {
-            // Not found in UTXO or mempool -> orphan candidate
-            err.clear();
-            return false; // caller treats empty err as orphan
+
+        // Basic input fields
+        if (in.sig.size() != 64) { err = "bad sig size"; return false; }
+        if (in.pubkey.size() != 33 && in.pubkey.size() != 65) { err = "bad pubkey size"; return false; }
+
+        // PKH must match referenced output's PKH
+        if (hash160(in.pubkey) != expect_pkh) { err = "pkh mismatch"; return false; }
+
+        // Verify ECDSA over the tx-wide sighash
+        if (!crypto::ECDSA::verify(in.pubkey, sighash, in.sig)) {
+            err = "bad signature"; return false;
         }
-        uint64_t tmp = in_sum + e.value;
+
+        // input sum + overflow guard
+        uint64_t tmp = in_sum + prev_value;
         if (tmp < in_sum) { err="input overflow"; return false; }
         in_sum = tmp;
     }
@@ -241,8 +280,13 @@ bool Mempool::accept(const Transaction& tx, const UTXOView& utxo, uint32_t heigh
         return false;
     }
 
-    // Reasonable fee
+    // Fee sanity
     if (fee > (uint64_t)MAX_MONEY) { err="fee>MAX_MONEY"; return false; }
+
+    // Min relay fee policy (no behavior change if MIN_RELAY_FEE_RATE isn't defined)
+    const size_t sz = est_tx_size(tx);
+    const uint64_t minfee = min_fee_for_size_bytes(sz);
+    if (fee < minfee) { err = "insufficient fee"; return false; }
 
     if (!enforce_limits_and_insert(tx, fee, err)) return false;
 
