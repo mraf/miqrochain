@@ -1,40 +1,22 @@
-#include "ecdsa_iface.h"
-#include <vector>
+// src/crypto/ecdsa_iface.h
+#pragma once
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace crypto {
 namespace ECDSA {
 
-// Forward decls implemented in the backend .cpps
-bool secp_derive_pub(const std::vector<uint8_t>& priv, std::vector<uint8_t>& pub);
-bool secp_sign(const std::vector<uint8_t>& priv, const std::vector<uint8_t>& msg32, std::vector<uint8_t>& sig64);
+// Derive compressed 33-byte pubkey from 32-byte privkey.
+bool derive_pub(const std::vector<uint8_t>& priv, std::vector<uint8_t>& out_pub33);
 
-bool uecc_derive_pub(const std::vector<uint8_t>& priv, std::vector<uint8_t>& pub);
-bool uecc_sign(const std::vector<uint8_t>& priv, const std::vector<uint8_t>& msg32, std::vector<uint8_t>& sig64);
+// Sign 32-byte message hash. Returns 64-byte (r||s) signature.
+bool sign(const std::vector<uint8_t>& priv,
+          const std::vector<uint8_t>& msg32,
+          std::vector<uint8_t>& out_sig64);
 
-bool derive_pub(const std::vector<uint8_t>& priv, std::vector<uint8_t>& pub) {
-#ifdef MIQ_USE_SECP256K1
-    return secp_derive_pub(priv, pub);
-#else
-    return uecc_derive_pub(priv, pub);
-#endif
-}
-
-bool sign(const std::vector<uint8_t>& priv, const std::vector<uint8_t>& msg32, std::vector<uint8_t>& sig64) {
-#ifdef MIQ_USE_SECP256K1
-    return secp_sign(priv, msg32, sig64);
-#else
-    return uecc_sign(priv, msg32, sig64);
-#endif
-}
-
-std::string backend() {
-#ifdef MIQ_USE_SECP256K1
-    return "libsecp256k1";
-#else
-    return "micro-ecc";
-#endif
-}
+// Human-readable backend name.
+std::string backend();
 
 }
 }
