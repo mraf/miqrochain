@@ -10,6 +10,15 @@
 #define MIQ_SECP256K1_C_BRIDGE 0
 #endif
 
+#ifndef MIQ_USE_SECP256K1
+// micro-ecc build selected -> do not compile libsecp backend
+#  ifdef _MSC_VER
+#    pragma message("Skipping libsecp256k1 backend because MIQ_USE_SECP256K1=0")
+#  endif
+#else
+// (no guard -> compile libsecp backend)
+#endif
+
 #if defined(_MSC_VER)
 #include <intrin.h>
 static inline void mul128_u64(uint64_t a, uint64_t b, uint64_t* lo, uint64_t* hi){ *lo = _umul128(a,b,hi); }
