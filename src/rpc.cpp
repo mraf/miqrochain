@@ -1,3 +1,4 @@
+// src/rpc.cpp  — full file (adds sendfromhd)
 #include "hd_wallet.h"
 #include "wallet_store.h"
 #include "rpc.h"
@@ -280,7 +281,9 @@ std::string RpcService::handle(const std::string& body){
                 "validateaddress","decodeaddress","decoderawtx",
                 "getminerstats","sendrawtransaction","sendtoaddress",
                 "estimatemediantime","getdifficulty","getchaintips",
-                "getpeerinfo","getconnectioncount"
+                "getpeerinfo","getconnectioncount",
+                "createhdwallet","restorehdwallet","walletinfo","getnewaddress","deriveaddressat",
+                "sendfromhd"
                 // (getibdinfo exists but not listed here to keep help stable)
             };
             std::vector<JNode> v;
@@ -580,212 +583,229 @@ std::string RpcService::handle(const std::string& body){
 
         if (method == "createhdwallet") {
             // params: [mnemonic(optional), mnemonic_pass(optional), wallet_pass(optional)]
-            std::string mnemonic;
-            std::string mpass;
-            std::string wpass;
-
-            if (params.size() > 0 && std::holds_alternative<std::string>(params[0].v))
-                mnemonic = std::get<std::string>(params[0].v);
-            if (params.size() > 1 && std::holds_alternative<std::string>(params[1].v))
-                mpass = std::get<std::string>(params[1].v);
-            if (params.size() > 2 && std::holds_alternative<std::string>(params[2].v))
-                wpass = std::get<std::string>(params[2].v);
+            std::string mnemonic = (params.size()>0 && params[0].is_string()) ? params[0].get_string() : std::string();
+            std::string mpass    = (params.size()>1 && params[1].is_string()) ? params[1].get_string() : std::string();
+            std::string wpass    = (params.size()>2 && params[2].is_string()) ? params[2].get_string() : std::string();
 
             std::string wdir = default_wallet_file();
-            if (!wdir.empty()) {
-                size_t pos = wdir.find_last_of("/\\");
-                if (pos != std::string::npos) wdir = wdir.substr(0, pos);
+            if(!wdir.empty()){
+                size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
             } else {
                 wdir = "wallets/default";
             }
 
-            if (mnemonic.empty()) {
+            std::vector<uint8_t> seed(64);
+            if(mnemonic.empty()){
                 std::string outmn;
-                if (!miq::HdWallet::GenerateMnemonic(128, outmn)) return err("mnemonic generation failed");
+                if(!miq::HdWallet::GenerateMnemonic(128, outmn)) return Json::err("mnemonic generation failed");
                 mnemonic = outmn;
             }
+            if(!miq::HdWallet::MnemonicToSeed(mnemonic, mpass, seed)) return Json::err("mnemonic->seed failed");
 
-            std::vector<uint8_t> seed;
-            if (!miq::HdWallet::MnemonicToSeed(mnemonic, mpass, seed)) return err("mnemonic->seed failed");
+            miq::HdAccountMeta meta; meta.account=0; meta.next_recv=0; meta.next_change=0;
+            std::string err;
+            if(!SaveHdWallet(wdir, seed, meta, wpass, err)) return Json::err(err);
 
-            miq::HdAccountMeta meta; meta.account = 0; meta.next_recv = 0; meta.next_change = 0;
-            std::string emsg;
-            if (!SaveHdWallet(wdir, seed, meta, wpass, emsg)) return err(emsg);
-
-            std::map<std::string,JNode> o;
-            o["mnemonic"]   = jstr(mnemonic);
-            o["wallet_dir"] = jstr(wdir);
-            JNode r; r.v = o; return json_dump(r);
+            Json r = Json::object();
+            r.set("mnemonic", mnemonic);
+            r.set("wallet_dir", wdir);
+            return r;
         }
 
         if (method == "restorehdwallet") {
             // params: [mnemonic, mnemonic_pass(optional), wallet_pass(optional)]
-            if (params.size() < 1 || !std::holds_alternative<std::string>(params[0].v))
-                return err("mnemonic required");
-
-            std::string mnemonic = std::get<std::string>(params[0].v);
-            std::string mpass, wpass;
-            if (params.size() > 1 && std::holds_alternative<std::string>(params[1].v))
-                mpass = std::get<std::string>(params[1].v);
-            if (params.size() > 2 && std::holds_alternative<std::string>(params[2].v))
-                wpass = std::get<std::string>(params[2].v);
+            if(params.size()<1 || !params[0].is_string()) return Json::err("mnemonic required");
+            std::string mnemonic = params[0].get_string();
+            std::string mpass    = (params.size()>1 && params[1].is_string()) ? params[1].get_string() : std::string();
+            std::string wpass    = (params.size()>2 && params[2].is_string()) ? params[2].get_string() : std::string();
 
             std::string wdir = default_wallet_file();
-            if (!wdir.empty()) {
-                size_t pos = wdir.find_last_of("/\\");
-                if (pos != std::string::npos) wdir = wdir.substr(0, pos);
+            if(!wdir.empty()){
+                size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
             } else {
                 wdir = "wallets/default";
             }
 
             std::vector<uint8_t> seed;
-            if (!miq::HdWallet::MnemonicToSeed(mnemonic, mpass, seed)) return err("mnemonic->seed failed");
+            if(!miq::HdWallet::MnemonicToSeed(mnemonic, mpass, seed)) return Json::err("mnemonic->seed failed");
 
-            miq::HdAccountMeta meta; meta.account = 0; meta.next_recv = 0; meta.next_change = 0;
-            std::string emsg;
-            if (!SaveHdWallet(wdir, seed, meta, wpass, emsg)) return err(emsg);
-
-            return json_dump(jbool(true));
+            miq::HdAccountMeta meta; meta.account=0; meta.next_recv=0; meta.next_change=0;
+            std::string err;
+            if(!SaveHdWallet(wdir, seed, meta, wpass, err)) return Json::err(err);
+            return Json::ok();
         }
 
         if (method == "walletinfo") {
             std::string wdir = default_wallet_file();
-            if (!wdir.empty()) {
-                size_t pos = wdir.find_last_of("/\\");
-                if (pos != std::string::npos) wdir = wdir.substr(0, pos);
+            if(!wdir.empty()){
+                size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
             } else {
                 wdir = "wallets/default";
             }
 
-            std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string emsg;
+            std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string err;
             std::string pass = getenv("MIQ_WALLET_PASSPHRASE") ? getenv("MIQ_WALLET_PASSPHRASE") : "";
-            if (!LoadHdWallet(wdir, seed, meta, pass, emsg)) return err(emsg);
+            if(!LoadHdWallet(wdir, seed, meta, pass, err)) return Json::err(err);
 
-            std::map<std::string,JNode> o;
-            o["account"]     = jnum((double)meta.account);
-            o["next_recv"]   = jnum((double)meta.next_recv);
-            o["next_change"] = jnum((double)meta.next_change);
-            JNode r; r.v = o; return json_dump(r);
+            Json r = Json::object();
+            r.set("account", (int)meta.account);
+            r.set("next_recv", (int)meta.next_recv);
+            r.set("next_change", (int)meta.next_change);
+            return r;
         }
 
         if (method == "getnewaddress") {
             std::string wdir = default_wallet_file();
-            if (!wdir.empty()) {
-                size_t pos = wdir.find_last_of("/\\");
-                if (pos != std::string::npos) wdir = wdir.substr(0, pos);
+            if(!wdir.empty()){
+                size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
             } else {
                 wdir = "wallets/default";
             }
 
-            std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string emsg;
+            std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string err;
             std::string pass = getenv("MIQ_WALLET_PASSPHRASE") ? getenv("MIQ_WALLET_PASSPHRASE") : "";
-            if (!LoadHdWallet(wdir, seed, meta, pass, emsg)) return err(emsg);
+            if(!LoadHdWallet(wdir, seed, meta, pass, err)) return Json::err(err);
 
             miq::HdWallet w(seed, meta);
             std::string addr;
-            if (!w.GetNewAddress(addr)) return err("derive failed");
+            if(!w.GetNewAddress(addr)) return Json::err("derive failed");
 
-            if (!SaveHdWallet(wdir, seed, w.meta(), pass, emsg)) return err(emsg);
-
-            JNode n; n.v = addr; return json_dump(n);
+            if(!SaveHdWallet(wdir, seed, w.meta(), pass, err)) return Json::err(err);
+            return Json::from_string(addr);
         }
 
         if (method == "deriveaddressat") {
             // params: [index]
-            if (params.size() < 1 || !std::holds_alternative<double>(params[0].v))
-                return err("index required");
-            uint32_t idx = (uint32_t)std::get<double>(params[0].v);
+            if(params.size()<1 || !params[0].is_number()) return Json::err("index required");
+            uint32_t idx = (uint32_t)params[0].get_int64();
 
             std::string wdir = default_wallet_file();
-            if (!wdir.empty()) {
-                size_t pos = wdir.find_last_of("/\\");
-                if (pos != std::string::npos) wdir = wdir.substr(0, pos);
+            if(!wdir.empty()){
+                size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
             } else {
                 wdir = "wallets/default";
             }
 
-            std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string emsg;
+            std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string err;
             std::string pass = getenv("MIQ_WALLET_PASSPHRASE") ? getenv("MIQ_WALLET_PASSPHRASE") : "";
-            if (!LoadHdWallet(wdir, seed, meta, pass, emsg)) return err(emsg);
+            if(!LoadHdWallet(wdir, seed, meta, pass, err)) return Json::err(err);
 
             miq::HdWallet w(seed, meta);
             std::string addr;
-            if (!w.GetAddressAt(idx, addr)) return err("derive failed");
-
-            JNode n; n.v = addr; return json_dump(n);
+            if(!w.GetAddressAt(idx, addr)) return Json::err("derive failed");
+            return Json::from_string(addr);
         }
 
-        // sendtoaddress(priv_hex, to_address, amount) with auto-fee + change
-        if(method=="sendtoaddress"){
-            if(params.size()<3
-               || !std::holds_alternative<std::string>(params[0].v)
-               || !std::holds_alternative<std::string>(params[1].v)
-               || !std::holds_alternative<std::string>(params[2].v)) {
-                return err("need priv_hex, to_address, amount");
+        // -------- NEW: spend from HD wallet (account 0) --------
+        if (method == "sendfromhd") {
+            // params: [to_address, amount, feerate(optional miqron per kB)]
+            if (params.size() < 2
+                || !std::holds_alternative<std::string>(params[0].v)
+                || !std::holds_alternative<std::string>(params[1].v)) {
+                return err("need to_address, amount");
+            }
+            const std::string toaddr = std::get<std::string>(params[0].v);
+            const std::string amtstr = std::get<std::string>(params[1].v);
+
+            uint64_t feerate = MIN_RELAY_FEE_RATE;
+            if (params.size() >= 3) {
+                if (std::holds_alternative<double>(params[2].v)) {
+                    feerate = (uint64_t)std::get<double>(params[2].v);
+                } else if (std::holds_alternative<std::string>(params[2].v)) {
+                    try { feerate = (uint64_t)std::stoull(std::get<std::string>(params[2].v)); }
+                    catch(...) { return err("bad feerate"); }
+                }
+                if (feerate == 0) feerate = MIN_RELAY_FEE_RATE;
             }
 
-            const std::string privh  = std::get<std::string>(params[0].v);
-            const std::string toaddr = std::get<std::string>(params[1].v);
-            const std::string amtstr = std::get<std::string>(params[2].v);
-
-            std::vector<uint8_t> priv;
-            try { priv = from_hex(privh); } catch(...) { return err("bad priv_hex"); }
-            std::vector<uint8_t> pub33;
-            if(!crypto::ECDSA::derive_pub(priv, pub33) || pub33.size()!=33) return err("derive_pub failed");
-            const auto my_pkh = hash160(pub33);
-
+            // decode destination
             uint8_t ver=0; std::vector<uint8_t> to_payload;
             if(!base58check_decode(toaddr, ver, to_payload) || to_payload.size()!=20 || ver!=VERSION_P2PKH)
                 return err("bad to_address");
 
+            // amount
             uint64_t amount = 0;
             try { amount = parse_amount_str(amtstr); }
             catch(...) { return err("bad amount"); }
+            if (amount == 0) return err("amount must be >0");
 
-            // Gather UTXOs
-            auto utxos = chain_.utxo().list_for_pkh(my_pkh);
-            if(utxos.empty()) return err("no funds");
+            // Load wallet data
+            std::string wdir = default_wallet_file();
+            if(!wdir.empty()){
+                size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
+            } else {
+                wdir = "wallets/default";
+            }
+            std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string werr;
+            std::string pass = getenv("MIQ_WALLET_PASSPHRASE") ? getenv("MIQ_WALLET_PASSPHRASE") : "";
+            if(!LoadHdWallet(wdir, seed, meta, pass, werr)) return err(werr);
 
-            // Smallest-first to reduce change
-            std::sort(utxos.begin(), utxos.end(),
-                      [](const auto& A, const auto& B){
-                          return std::get<2>(A).value < std::get<2>(B).value;
-                      });
+            miq::HdWallet w(seed, meta);
+
+            struct OwnedUtxo {
+                std::vector<uint8_t> txid; uint32_t vout; UTXOEntry e;
+                std::vector<uint8_t> priv; std::vector<uint8_t> pub; std::vector<uint8_t> pkh;
+            };
+            std::vector<OwnedUtxo> owned;
+
+            auto gather_chain = [&](uint32_t chain, uint32_t limit){
+                for (uint32_t i = 0; i < limit + 1; ++i) { // include current "next" (fresh)
+                    std::vector<uint8_t> priv, pub;
+                    if (!w.DerivePrivPub(meta.account, chain, i, priv, pub)) continue;
+                    auto pkh = hash160(pub);
+                    auto lst = chain_.utxo().list_for_pkh(pkh);
+                    for (auto& t : lst){
+                        OwnedUtxo ou;
+                        ou.txid = std::get<0>(t);
+                        ou.vout = std::get<1>(t);
+                        ou.e    = std::get<2>(t);
+                        ou.priv = priv;
+                        ou.pub  = pub;
+                        ou.pkh  = pkh;
+                        owned.push_back(std::move(ou));
+                    }
+                }
+            };
+            gather_chain(0, meta.next_recv);
+            gather_chain(1, meta.next_change);
+
+            if (owned.empty()) return err("no funds");
+
+            std::sort(owned.begin(), owned.end(), [](const OwnedUtxo& A, const OwnedUtxo& B){
+                return A.e.value < B.e.value;
+            });
 
             Transaction tx;
             uint64_t in_sum = 0;
 
-            for(const auto& itU : utxos){
-                const auto& txid = std::get<0>(itU);
-                uint32_t vout = std::get<1>(itU);
-                const auto& e  = std::get<2>(itU);
+            auto fee_for = [&](size_t nin, size_t nout)->uint64_t{
+                size_t sz = estimate_size_bytes(nin, nout);
+                uint64_t kb = (uint64_t)((sz + 999) / 1000);
+                if (kb==0) kb=1;
+                return kb * feerate;
+            };
 
-                TxIn in; in.prev.txid = txid; in.prev.vout = vout;
+            for (size_t k = 0; k < owned.size(); ++k){
+                const auto& u = owned[k];
+                TxIn in; in.prev.txid = u.txid; in.prev.vout = u.vout;
                 tx.vin.push_back(in);
-                in_sum += e.value;
+                in_sum += u.e.value;
 
-                uint64_t change_if_two = (in_sum > amount) ? (in_sum - amount) : 0;
-                size_t nout_guess = (change_if_two > 0) ? 2 : 1;
-                size_t est_size = estimate_size_bytes(tx.vin.size(), nout_guess);
-                uint64_t fee = min_fee_for_size(est_size);
-
-                if(in_sum >= amount + fee){
-                    break;
-                }
+                uint64_t fee_guess = fee_for(tx.vin.size(), 2);
+                if (in_sum >= amount + fee_guess) break;
             }
+            if (tx.vin.empty()) return err("insufficient funds");
 
-            if(tx.vin.empty()) return err("insufficient funds");
-
-            // Build outputs + fee
+            // Outputs & fee
             TxOut out; out.pkh = to_payload;
 
             uint64_t fee_final = 0, change = 0;
             {
                 size_t est_size = estimate_size_bytes(tx.vin.size(), 2);
-                fee_final = min_fee_for_size(est_size);
+                fee_final = fee_for(tx.vin.size(), 2);
                 if(in_sum < amount + fee_final){
                     est_size = estimate_size_bytes(tx.vin.size(), 1);
-                    fee_final = min_fee_for_size(est_size);
+                    fee_final = fee_for(tx.vin.size(), 1);
                     if(in_sum < amount + fee_final) return err("insufficient funds (need amount+fee)");
                     change = 0;
                 } else {
@@ -793,7 +813,7 @@ std::string RpcService::handle(const std::string& body){
                     if(change < DUST_THRESHOLD){
                         change = 0;
                         size_t est2 = estimate_size_bytes(tx.vin.size(), 1);
-                        fee_final = min_fee_for_size(est2);
+                        fee_final = fee_for(tx.vin.size(), 1);
                         if(in_sum < amount + fee_final) return err("insufficient after dust fold");
                     }
                 }
@@ -802,26 +822,44 @@ std::string RpcService::handle(const std::string& body){
             out.value = amount;
             tx.vout.push_back(out);
 
-            if(change > 0){
-                TxOut ch; ch.value = change; ch.pkh = my_pkh;
+            // Change -> new change address (m/44'/coin'/account'/1/index)
+            std::vector<uint8_t> change_priv, change_pub; std::vector<uint8_t> change_pkh;
+            bool used_change = false;
+            if (change > 0) {
+                if (!w.DerivePrivPub(meta.account, 1, meta.next_change, change_priv, change_pub))
+                    return err("derive change failed");
+                change_pkh = hash160(change_pub);
+                TxOut ch; ch.value = change; ch.pkh = change_pkh;
                 tx.vout.push_back(ch);
+                used_change = true;
             }
 
-            // Sign all inputs (single-key case)
+            // Sighash and sign each input with its matching key
             auto sighash = [&](){
                 Transaction t=tx; for(auto& i: t.vin){ i.sig.clear(); i.pubkey.clear(); }
                 return dsha256(ser_tx(t));
             }();
-            for(auto& in : tx.vin){
+            for (auto& in : tx.vin){
+                const OwnedUtxo* key = nullptr;
+                for (const auto& u : owned){
+                    if (u.txid == in.prev.txid && u.vout == in.prev.vout) { key = &u; break; }
+                }
+                if (!key) return err("internal: key lookup failed");
                 std::vector<uint8_t> sig64;
-                if(!crypto::ECDSA::sign(priv, sighash, sig64)) return err("sign failed");
+                if(!crypto::ECDSA::sign(key->priv, sighash, sig64)) return err("sign failed");
                 in.sig = sig64;
-                in.pubkey = pub33;
+                in.pubkey = key->pub;
             }
 
-            // Mempool accept
             auto tip = chain_.tip(); std::string e;
             if(mempool_.accept(tx, chain_.utxo(), (size_t)tip.height, e)){
+                if (used_change) {
+                    HdAccountMeta newm = w.meta();
+                    newm.next_change = meta.next_change + 1;
+                    if(!SaveHdWallet(wdir, seed, newm, pass, e)) {
+                        log_warn(std::string("sendfromhd: SaveHdWallet failed: ") + e);
+                    }
+                }
                 JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
             } else {
                 return err(e);
