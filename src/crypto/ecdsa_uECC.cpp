@@ -1,5 +1,5 @@
 // src/crypto/ecdsa_uECC.cpp
-#ifndef MIQ_USE_SECP256K1  // ---- build this file only when not selecting libsecp256k1
+#ifndef MIQ_USE_SECP256K1  // Build this file only when NOT selecting the secp backend
 
 #include "crypto/ecdsa_uECC.h"
 #include "crypto/ecdsa_iface.h"
@@ -100,9 +100,9 @@ static bool normalize_pubkey_xy(const std::vector<uint8_t>& pub, uint8_t out_xy[
     return false;
 }
 
-// ========================= ECDSA (micro-ecc backend) =========================
+namespace ECDSA { // <<<<<<<<<<<<<< IMPLEMENT IN THE CORRECT NAMESPACE
 
-bool ECDSA::generate_priv(std::vector<uint8_t>& out) {
+bool generate_priv(std::vector<uint8_t>& out) {
     ensure_rng();
     out.resize(32);
 
@@ -119,7 +119,7 @@ bool ECDSA::generate_priv(std::vector<uint8_t>& out) {
     return false;
 }
 
-bool ECDSA::derive_pub(const std::vector<uint8_t>& priv, std::vector<uint8_t>& out33) {
+bool derive_pub(const std::vector<uint8_t>& priv, std::vector<uint8_t>& out33) {
     if (priv.size() != 32) return false;
     uint8_t pub_xy[64];
     if (!uECC_compute_public_key(priv.data(), pub_xy, curve())) return false;
@@ -129,9 +129,9 @@ bool ECDSA::derive_pub(const std::vector<uint8_t>& priv, std::vector<uint8_t>& o
     return true;
 }
 
-bool ECDSA::sign(const std::vector<uint8_t>& priv32,
-                 const std::vector<uint8_t>& msg32,
-                 std::vector<uint8_t>& sig64) {
+bool sign(const std::vector<uint8_t>& priv32,
+          const std::vector<uint8_t>& msg32,
+          std::vector<uint8_t>& sig64) {
     if (priv32.size() != 32 || msg32.size() != 32) return false;
     ensure_rng();
     sig64.resize(64);
@@ -140,9 +140,7 @@ bool ECDSA::sign(const std::vector<uint8_t>& priv32,
     }
 
     // ---- Low-S normalization ----
-    uint8_t* r = sig64.data();
     uint8_t* s = sig64.data() + 32;
-    (void)r;
     if (cmp_be(s, SECP256K1_N_HALF, 32) > 0) {
         uint8_t s_norm[32];
         sub_be(s_norm, SECP256K1_N, s, 32);   // s = n - s
@@ -151,9 +149,9 @@ bool ECDSA::sign(const std::vector<uint8_t>& priv32,
     return true;
 }
 
-bool ECDSA::verify(const std::vector<uint8_t>& pubkey,
-                   const std::vector<uint8_t>& msg32,
-                   const std::vector<uint8_t>& sig64) {
+bool verify(const std::vector<uint8_t>& pubkey,
+            const std::vector<uint8_t>& msg32,
+            const std::vector<uint8_t>& sig64) {
     if (msg32.size() != 32 || sig64.size() != 64) return false;
     uint8_t pub_xy[64];
     if (!normalize_pubkey_xy(pubkey, pub_xy)) return false;
@@ -162,10 +160,11 @@ bool ECDSA::verify(const std::vector<uint8_t>& pubkey,
     return uECC_verify(pub_xy, msg32.data(), (unsigned)msg32.size(), sig64.data(), curve()) == 1;
 }
 
-std::string ECDSA::backend() {
+std::string backend() {
     return "micro-ecc";
 }
 
-}}
+}
+}} 
 
 #endif // !MIQ_USE_SECP256K1
