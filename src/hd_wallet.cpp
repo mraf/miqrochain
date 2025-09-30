@@ -135,7 +135,7 @@ static bool bip32_ckd_priv(std::vector<uint8_t>& k, std::vector<uint8_t>& c, uin
     if(!hmac_sha512(c.data(), c.size(), data, off+4, I)) return false;
 
     // k' = (IL + k) mod n
-    BIGNUM* n = BN_new(); BN_hex2bn(n, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+    BIGNUM* n = nullptr; BN_hex2bn(&n, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
     BIGNUM* IL= BN_bin2bn(I,32,nullptr);
     BIGNUM* kk= BN_bin2bn(k.data(),32,nullptr);
     BN_CTX*  ctx= BN_CTX_new();
@@ -173,9 +173,9 @@ bool HdWallet::DerivePrivPub(uint32_t account, uint32_t chain, uint32_t index,
 }
 
 std::string PubkeyToAddress(const std::vector<uint8_t>& pub33){
-    std::vector<uint8_t> h160;
-    hash160(pub33, h160);
-    // VERSION_P2PKH should be defined in your constants.h (uint8_t)
+    // Your hash160() returns a vector, so use it as a value:
+    std::vector<uint8_t> h160 = hash160(pub33);
+    // VERSION_P2PKH should be defined in constants.h (uint8_t)
     return base58check_encode(VERSION_P2PKH, h160);
 }
 
