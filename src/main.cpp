@@ -436,8 +436,20 @@ int main(int argc, char** argv){
         }
 
         // --- Miner (off if no_mine or no address). Keep coinbase prev.vout=0.
-        unsigned threads = cfg.miner_threads ? cfg.miner_threads : std::thread::hardware_concurrency();
-        if (threads == 0) threads = 1;
+        unsigned threads = cfg.miner_threads;
+
+        if (threads == 0) {
+            if (const char* s = std::getenv("MIQ_MINER_THREADS")) {
+                char* end = nullptr;
+                long v = std::strtol(s, &end, 10);
+        if (end != s && v > 0 && v <= 256) {
+                threads = static_cast<unsigned>(v);
+                }
+            }
+        }
+        if (threads == 0) threads = 6;
+
+        log_info("miner: using " + std::to_string(threads) + " thread(s)");
 
         if(!cfg.no_mine){
             const auto mine_pkh = g_mine_pkh; // require user/address (no fallback)
