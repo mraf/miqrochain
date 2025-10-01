@@ -227,6 +227,16 @@ static int64_t g_next_stall_probe_ms = 0;
 static std::unordered_map<int, std::vector<std::vector<uint8_t>>> g_trickle_q;
 static std::unordered_map<int, int64_t> g_trickle_last_ms;
 
+// Per-socket parse deadlines for partial frames
+static std::unordered_map<int, int64_t> g_rx_started_ms;
+static inline void rx_track_start(int fd){
+    if (g_rx_started_ms.find(fd)==g_rx_started_ms.end())
+        g_rx_started_ms[fd] = [](){ using namespace std::chrono; return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count(); }();
+}
+static inline void rx_clear_start(int fd){
+    g_rx_started_ms.erase(fd);
+}
+
 // --- helper to send gettx using existing encode_msg/send path ----------
 static inline void send_gettx(int sock, const std::vector<uint8_t>& txid) {
     if (txid.size() != 32) return;
@@ -297,6 +307,7 @@ static inline void gate_on_close(int fd){
     // clear feefilter state
     g_peer_minrelay_kb.erase(fd);
     g_peer_last_ff_ms.erase(fd);
+    rx_clear_start(fd);
 }
 static inline bool gate_on_bytes(int fd, size_t add){
     auto it = g_gate.find(fd);
@@ -458,6 +469,7 @@ namespace {
     static inline uint64_t get_u64le(const uint8_t* p){ uint64_t z=0; for(int i=0;i<8;i++) z|=((uint64_t)p[i])<<(8*i); return z; }
     static inline int64_t  get_i64le(const uint8_t* p){ return (int64_t)get_u64le(p); }
 
+    // serialize header (no tx count)
     static std::vector<uint8_t> ser_header(const BlockHeader& h){
         std::vector<uint8_t> v; v.reserve(HEADER_WIRE_BYTES);
         put_u32le(v, h.version);
@@ -601,6 +613,7 @@ P2P::P2P(Chain& c) : chain_(c) {
 }
 P2P::~P2P(){ stop(); }
 
+// Legacy bans.txt kept for backward-compat; json banlist is wired in p2p.h
 void P2P::load_bans(){
     std::ifstream f(datadir_ + "/bans.txt");
     std::string ip;
@@ -618,7 +631,6 @@ bool P2P::start(uint16_t port){
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
     load_bans();
-    // load legacy persisted addrs (best-effort)
     load_addrs_from_disk(datadir_, addrv4_);
 
 #if MIQ_ENABLE_ADDRMAN
@@ -812,6 +824,13 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     ps.blk_tokens = MIQ_RATE_BLOCK_BURST;
     ps.tx_tokens  = MIQ_RATE_TX_BURST;
     ps.last_refill_ms = ps.last_ms;
+    // new pacing/version fields
+    ps.inflight_hdr_batches = 0;
+    ps.rate.last_ms = ps.last_ms;
+    ps.banscore = 0;
+    ps.version = 0;
+    ps.features = 0;
+    ps.whitelisted = false;
     peers_[s] = ps;
 
     // init trickle queue entry
@@ -882,6 +901,13 @@ void P2P::handle_new_peer(int c, const std::string& ip){
     ps.blk_tokens = MIQ_RATE_BLOCK_BURST;
     ps.tx_tokens  = MIQ_RATE_TX_BURST;
     ps.last_refill_ms = ps.last_ms;
+    // new pacing/version fields
+    ps.inflight_hdr_batches = 0;
+    ps.rate.last_ms = ps.last_ms;
+    ps.banscore = 0;
+    ps.version = 0;
+    ps.features = 0;
+    ps.whitelisted = false;
     peers_[c] = ps;
 
     // init trickle queue entry
@@ -957,8 +983,11 @@ static void trickle_flush(){
 
 void P2P::request_tx(PeerState& ps, const std::vector<uint8_t>& txid){
     if (txid.size()!=32) return;
+    if (!check_rate(ps, "get", 1.0, now_ms())) return;
+    if (ps.inflight_tx.size() >= caps_.max_txs) return;
     auto m = encode_msg("gettx", txid);
     send(ps.sock, (const char*)m.data(), (int)m.size(), 0);
+    ps.inflight_tx.insert(hexkey(txid));
 }
 
 void P2P::send_tx(int sock, const std::vector<uint8_t>& raw){
@@ -982,8 +1011,11 @@ void P2P::request_block_index(PeerState& ps, uint64_t index){
 
 void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     if (h.size()!=32) return;
+    if (!check_rate(ps, "get", 1.0, now_ms())) return;
+    if (ps.inflight_blocks.size() >= caps_.max_blocks) return;
     auto msg = encode_msg("getb", h);
     send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
+    ps.inflight_blocks.insert(hexkey(h));
 }
 
 void P2P::send_block(int s, const std::vector<uint8_t>& raw){
@@ -1027,10 +1059,13 @@ void P2P::maybe_send_getaddr(PeerState& ps){
     if (t - ps.last_getaddr_ms < (int64_t)MIQ_P2P_GETADDR_INTERVAL_MS) return;
     ps.last_getaddr_ms = t;
     auto msg = encode_msg("getaddr", {});
-    send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
+    if (check_rate(ps, "get", 1.0, t)) { // light pacing for get*
+        send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
+    }
 }
 
 void P2P::send_addr_snapshot(PeerState& ps){
+    if (!check_rate(ps, "addr", 1.0, now_ms())) return; // avoid amplification
     std::vector<uint8_t> payload;
     payload.reserve(MIQ_ADDR_RESPONSE_MAX * 4);
     size_t cnt = 0;
@@ -1071,10 +1106,15 @@ void P2P::send_addr_snapshot(PeerState& ps){
 void P2P::handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload){
     int64_t t = now_ms();
     if (t - ps.last_addr_ms < MIQ_ADDR_MIN_INTERVAL_MS) {
-        if (++ps.mis > 20) { banned_.insert(ps.ip); }
+        if (++ps.mis > 20) { bump_ban(ps, ps.ip, "addr-interval", t); }
         return;
     }
     ps.last_addr_ms = t;
+
+    if (!check_rate(ps, "addr", std::max(1.0, (double)(payload.size()/64u)), t)) {
+        bump_ban(ps, ps.ip, "addr-flood", t);
+        return;
+    }
 
     if (payload.size() % 4 != 0) return;
     size_t n = payload.size() / 4;
@@ -1103,7 +1143,7 @@ void P2P::handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload){
         ++accepted;
     }
     if (accepted == 0) {
-        if (++ps.mis > 30) banned_.insert(ps.ip);
+        if (++ps.mis > 30) bump_ban(ps, ps.ip, "addr-empty", now_ms());
     }
 }
 
@@ -1298,6 +1338,7 @@ void P2P::loop(){
                     if (s >= 0) {
                         PeerState ps; ps.sock = s; ps.ip = dotted; ps.mis=0; ps.last_ms=now_ms();
                         ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
+                        ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
                         peers_[s] = ps;
                         g_trickle_last_ms[s] = 0;
                         log_info("P2P: outbound (addrman) " + ps.ip);
@@ -1340,6 +1381,7 @@ void P2P::loop(){
                             ps.blk_tokens = MIQ_RATE_BLOCK_BURST;
                             ps.tx_tokens  = MIQ_RATE_TX_BURST;
                             ps.last_refill_ms = ps.last_ms;
+                            ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
                             peers_[s] = ps;
                             g_trickle_last_ms[s] = 0;
 
@@ -1375,6 +1417,7 @@ void P2P::loop(){
                                     // We treat it like an outbound; on verack we will mark_good (see below)
                                     PeerState ps; ps.sock=s; ps.ip=dotted; ps.mis=0; ps.last_ms=now_ms();
                                     ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
+                                    ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
                                     peers_[s]=ps;
                                     g_trickle_last_ms[s] = 0;
                                     log_info("P2P: feeler " + dotted);
@@ -1408,8 +1451,11 @@ void P2P::loop(){
                 auto m  = encode_msg("getheaders", pl);
                 int probes = 0;
                 for (auto& kv : peers_) {
-                    if (kv.second.verack_ok) {
+                    if (kv.second.verack_ok &&
+                        can_accept_hdr_batch(kv.second, now_ms()) &&
+                        check_rate(kv.second, "get", 1.0, now_ms())) {
                         send(kv.first, (const char*)m.data(), (int)m.size(), 0);
+                        kv.second.inflight_hdr_batches++;
                         if (++probes >= 2) break; // a couple of peers are enough
                     }
                 }
@@ -1469,7 +1515,7 @@ void P2P::loop(){
 #else
                     inet_ntop(AF_INET, &ca.sin_addr, ipbuf, (socklen_t)sizeof(ipbuf));
 #endif
-                    if (banned_.count(ipbuf)) { CLOSESOCK(c); }
+                    if (banned_.count(ipbuf) || is_ip_banned(ipbuf, now_ms())) { CLOSESOCK(c); }
                     else handle_new_peer(c, ipbuf);
                 }
             }
@@ -1502,9 +1548,10 @@ void P2P::loop(){
                 ps.last_ms = now_ms();
 
                 ps.rx.insert(ps.rx.end(), buf, buf + n);
+                if (!ps.rx.empty()) rx_track_start(s);
                 if (ps.rx.size() > MIQ_P2P_MAX_BUFSZ) {
                     log_warn("P2P: oversize buffer from " + ps.ip + " -> banning & dropping");
-                    banned_.insert(ps.ip);
+                    bump_ban(ps, ps.ip, "oversize-buffer", now_ms());
                     dead.push_back(s);
                     continue;
                 }
@@ -1528,7 +1575,7 @@ void P2P::loop(){
                         send(s, (const char*)verack.data(), (int)verack.size(), 0);
                     }
 
-                    // --- INV storm damping helpers ---
+                    // --- INV storm + per-family rate limiting ---
                     auto inv_tick = [&](unsigned add)->bool{
                         int64_t tnow = now_ms();
                         if (tnow - ps.inv_win_start_ms > (int64_t)MIQ_P2P_INV_WINDOW_MS) {
@@ -1537,7 +1584,7 @@ void P2P::loop(){
                         }
                         ps.inv_in_window += add;
                         if (ps.inv_in_window > MIQ_P2P_INV_WINDOW_CAP) {
-                            if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
+                            if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "inv-window-overflow", tnow);
                             return false; // drop excess INV
                         }
                         return true;
@@ -1547,14 +1594,37 @@ void P2P::loop(){
                         if (!ps.recent_inv_keys.insert(key).second) return false;
                         // bound memory
                         if (ps.recent_inv_keys.size() > 4096) {
-                            // crude clean: clear all to keep structure simple
                             ps.recent_inv_keys.clear();
                         }
                         return true;
                     };
 
                     if (cmd == "version") {
-                        // also send our verack (done above via gate)
+                        // Parse peer version/services for gating
+                        int32_t peer_ver = 0; uint64_t peer_services = 0;
+                        if (m.payload.size() >= 4) {
+                            peer_ver = (int32_t)((uint32_t)m.payload[0] | ((uint32_t)m.payload[1]<<8) | ((uint32_t)m.payload[2]<<16) | ((uint32_t)m.payload[3]<<24));
+                        }
+                        if (m.payload.size() >= 12) {
+                            for(int i=0;i<8;i++) peer_services |= ((uint64_t)m.payload[4+i]) << (8*i);
+                        }
+                        ps.version = peer_ver;
+                        ps.features = 0;
+#if MIQ_ENABLE_HEADERS_FIRST
+                        ps.features |= (1ull<<0);
+#endif
+                        ps.features |= (1ull<<1); // feefilter
+
+                        if (ps.version > 0 && ps.version < min_peer_version_) {
+                            log_warn("P2P: dropping old peer " + ps.ip);
+                            dead.push_back(s);
+                            break;
+                        }
+                        if ((ps.features & required_features_mask_) != required_features_mask_) {
+                            log_warn("P2P: dropping peer missing required features " + ps.ip);
+                            dead.push_back(s);
+                            break;
+                        }
 
                     } else if (cmd == "verack") {
                         ps.verack_ok = true;
@@ -1567,14 +1637,22 @@ void P2P::loop(){
                             g_addrman.add_anchor(na); // keep a few last-good peers
                         }
 #endif
+                        // whitelist loopback/CIDRs
+                        ps.whitelisted = is_loopback(ps.ip) || is_whitelisted_ip(ps.ip);
+
 #if MIQ_ENABLE_HEADERS_FIRST
-                        // headers-first: send getheaders(locator, stop=0)
-                        std::vector<std::vector<uint8_t>> locator;
-                        chain_.build_locator(locator);
-                        std::vector<uint8_t> stop(32, 0);
-                        auto pl = build_getheaders_payload(locator, stop);
-                        auto msg = encode_msg("getheaders", pl);
-                        send(s, (const char*)msg.data(), (int)msg.size(), 0);
+                        // headers-first: send getheaders(locator, stop=0) with pacing
+                        {
+                            std::vector<std::vector<uint8_t>> locator;
+                            chain_.build_locator(locator);
+                            std::vector<uint8_t> stop(32, 0);
+                            auto pl = build_getheaders_payload(locator, stop);
+                            auto msg = encode_msg("getheaders", pl);
+                            if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "get", 1.0, now_ms())) {
+                                send(s, (const char*)msg.data(), (int)msg.size(), 0);
+                                ps.inflight_hdr_batches++;
+                            }
+                        }
 
                         // --- IBD log: started (once) ---
                         if (!g_logged_headers_started) {
@@ -1606,6 +1684,10 @@ void P2P::loop(){
                         ps.awaiting_pong = false;
 
                     } else if (cmd == "invb") {
+                        if (!check_rate(ps, "inv", 0.5, now_ms())) {
+                            bump_ban(ps, ps.ip, "inv-flood", now_ms());
+                            continue;
+                        }
                         if (m.payload.size() == 32) {
                             if (!inv_tick(1)) { /* drop excess INV */ continue; }
                             auto k = hexkey(m.payload);
@@ -1637,14 +1719,27 @@ void P2P::loop(){
 
                     } else if (cmd == "block") {
                         if (!rate_consume_block(ps, m.payload.size())) {
-                            if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
+                            if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "block-rate", now_ms());
                             continue;
                         }
                         if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
+                            // parse once to get hash and enforce unsolicited discipline
+                            Block hb;
+                            if (!deser_block(m.payload, hb)) { if (++ps.mis > 10) { dead.push_back(s); } continue; }
+                            const std::string bh = hexkey(hb.block_hash());
+                            if (unsolicited_drop(ps, "block", bh)) {
+                                bump_ban(ps, ps.ip, "unsolicited-block", now_ms());
+                                continue;
+                            }
+                            ps.inflight_blocks.erase(bh);
                             handle_incoming_block(s, m.payload);
                         }
 
                     } else if (cmd == "invtx") {
+                        if (!check_rate(ps, "inv", 0.25, now_ms())) {
+                            bump_ban(ps, ps.ip, "inv-flood", now_ms());
+                            continue;
+                        }
                         if (m.payload.size() == 32) {
                             if (!inv_tick(1)) { continue; }
                             auto key = hexkey(m.payload);
@@ -1668,7 +1763,7 @@ void P2P::loop(){
 
                     } else if (cmd == "tx") {
                         if (!rate_consume_tx(ps, m.payload.size())) {
-                            if ((ps.banscore += 3) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
+                            if ((ps.banscore += 3) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "tx-rate", now_ms());
                             continue;
                         }
                         Transaction tx;
@@ -1677,6 +1772,10 @@ void P2P::loop(){
 
                         // clear inflight if any
                         ps.inflight_tx.erase(key);
+                        if (unsolicited_drop(ps, "tx", key)) {
+                            bump_ban(ps, ps.ip, "unsolicited-tx", now_ms());
+                            continue;
+                        }
 
                         if (seen_txids_.insert(key).second) {
                             std::string err;
@@ -1694,7 +1793,6 @@ void P2P::loop(){
                                         send_gettx(s, in.prev.txid); // ask this peer for the missing parent tx
                                     }
                                 }
-                                // Skip announce/broadcast/cache for orphans.
                                 continue;
                             }
 
@@ -1731,11 +1829,11 @@ void P2P::loop(){
                                         trickle_enqueue(psock, txidv);
                                     }
                                 } else {
-                                    // fallback: legacy broadcast (shouldn't happen if mempool accepted)
+                                    // fallback: legacy broadcast
                                     broadcast_inv_tx(tx.txid());
                                 }
                             } else if (!err.empty()) {
-                                if (++ps.mis > 25) banned_.insert(ps.ip);
+                                if (++ps.mis > 25) bump_ban(ps, ps.ip, "tx-invalid", now_ms());
                             }
                         }
 
@@ -1771,6 +1869,10 @@ void P2P::loop(){
                         send(s, (const char*)msg.data(), (int)msg.size(), 0);
 
                     } else if (cmd == "headers") {
+                        if (unsolicited_drop(ps, "headers", "")) {
+                            bump_ban(ps, ps.ip, "unsolicited-headers", now_ms());
+                            continue;
+                        }
                         // Accept headers into header tree, then request missing blocks
                         std::vector<BlockHeader> hs;
                         if (!parse_headers_payload(m.payload, hs)) {
@@ -1799,14 +1901,21 @@ void P2P::loop(){
                             log_info("[IBD] headers phase complete; switching to blocks");
                         }
 
-                        // If batch full, peer likely has more — request next batch
+                        // done with a batch
+                        if (ps.inflight_hdr_batches > 0) ps.inflight_hdr_batches--;
+                        ps.last_hdr_batch_done_ms = now_ms();
+
+                        // If batch full, peer likely has more — request next batch (paced)
                         if (hs.size() >= 2000) {
                             std::vector<std::vector<uint8_t>> locator;
                             chain_.build_locator(locator);
                             std::vector<uint8_t> stop(32, 0);
                             auto pl = build_getheaders_payload(locator, stop);
                             auto msg = encode_msg("getheaders", pl);
-                            send(s, (const char*)msg.data(), (int)msg.size(), 0);
+                            if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "get", 1.0, now_ms())) {
+                                send(s, (const char*)msg.data(), (int)msg.size(), 0);
+                                ps.inflight_hdr_batches++;
+                            }
                         }
 #endif
 
@@ -1818,6 +1927,19 @@ void P2P::loop(){
                 // drop consumed prefix
                 if (off > 0 && off <= ps.rx.size()) {
                     ps.rx.erase(ps.rx.begin(), ps.rx.begin() + (ptrdiff_t)off);
+                    if (ps.rx.empty()) rx_clear_start(s);
+                }
+
+                // Drop partials that linger too long (slowloris)
+                if (!ps.rx.empty()) {
+                    auto it0 = g_rx_started_ms.find(s);
+                    if (it0 != g_rx_started_ms.end()) {
+                        if (now_ms() - it0->second > msg_deadline_ms_) {
+                            bump_ban(ps, ps.ip, "slowloris/parse-timeout", now_ms());
+                            dead.push_back(s);
+                            continue;
+                        }
+                    }
                 }
             }
 
@@ -1833,7 +1955,7 @@ void P2P::loop(){
                 ps.last_ping_ms = tnow;
                 ps.awaiting_pong = true;
             } else if (ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PONG_TIMEOUT_MS) {
-                if ((ps.banscore += 20) >= MIQ_P2P_MAX_BANSCORE) banned_.insert(ps.ip);
+                bump_ban(ps, ps.ip, "pong-timeout", now_ms());
                 dead.push_back(s);
             }
         }
