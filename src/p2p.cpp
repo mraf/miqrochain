@@ -177,6 +177,10 @@
   #ifndef WIN32_LEAN_AND_MEAN
   #define WIN32_LEAN_AND_MEAN
   #endif
+  // Prevent <windows.h> family from defining min/max macros that break std::min/std::max
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #pragma comment(lib, "Ws2_32.lib")
@@ -237,7 +241,7 @@ static std::unordered_map<int,
 static std::unordered_map<int, int64_t> g_rx_started_ms;
 static inline void rx_track_start(int fd){
     if (g_rx_started_ms.find(fd)==g_rx_started_ms.end())
-        g_rx_started_ms[fd] = [](){ using namespace std::chrono; return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }();
+        g_rx_started_ms[fd] = [](){ using namespace std::chrono; return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count(); }();
 }
 static inline void rx_clear_start(int fd){
     g_rx_started_ms.erase(fd);
