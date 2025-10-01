@@ -15,6 +15,38 @@
 #define MIQ_SECP256K1_C_BRIDGE 0
 #endif
 
+#if defined(_MSC_VER) && defined(_M_X64)
+  #include <intrin.h>
+  #pragma intrinsic(_umul128)
+  #pragma intrinsic(_addcarry_u64)
+  #pragma intrinsic(_subborrow_u64)
+  static inline void mul_u64_128(uint64_t a, uint64_t b, uint64_t& lo, uint64_t& hi){
+      lo = _umul128(a, b, &hi);
+  }
+  static inline uint64_t addc_u64(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t& out){
+      unsigned char c = _addcarry_u64((unsigned char)carry_in, a, b, &out);
+      return (uint64_t)c;
+  }
+  static inline uint64_t subb_u64(uint64_t a, uint64_t b, uint64_t borrow_in, uint64_t& out){
+      unsigned char c = _subborrow_u64((unsigned char)borrow_in, a, b, &out);
+      return (uint64_t)c;
+  }
+#else
+  static inline void mul_u64_128(uint64_t a, uint64_t b, uint64_t& lo, uint64_t& hi){
+      unsigned __int128 p = (unsigned __int128)a * (unsigned __int128)b;
+      lo = (uint64_t)p; hi = (uint64_t)(p>>64);
+  }
+  static inline uint64_t addc_u64(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t& out){
+      unsigned __int128 s = (unsigned __int128)a + b + carry_in;
+      out = (uint64_t)s; return (uint64_t)(s>>64);
+  }
+  static inline uint64_t subb_u64(uint64_t a, uint64_t b, uint64_t borrow_in, uint64_t& out){
+      unsigned __int128 d = (unsigned __int128)a - b - borrow_in;
+      out = (uint64_t)d; return (d >> 127) & 1; // 1 if borrow
+  }
+#endif
+
+
 #if defined(_MSC_VER)
   #include <intrin.h>
   static inline void mul128_u64(uint64_t a, uint64_t b, uint64_t* lo, uint64_t* hi){ *lo = _umul128(a,b,hi); }
