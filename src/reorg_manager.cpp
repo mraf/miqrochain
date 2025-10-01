@@ -113,4 +113,4 @@ bool ReorgManager::plan_reorg(const HashBytes& current_active_tip,
     return !out_disconnect.empty() || !out_connect.empty();
 }
 
-} // namespace miq
+}
