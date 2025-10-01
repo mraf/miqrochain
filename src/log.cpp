@@ -37,5 +37,5 @@ void log_info(const std::string& m)  { write_line("INFO",  m); }
 void log_warn(const std::string& m)  { write_line("WARN",  m); }
 void log_error(const std::string& m) { write_line("ERROR", m); }
 
-} // namespace miq
+}
 
