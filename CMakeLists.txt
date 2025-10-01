@@ -18,13 +18,14 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 option(MIQ_ENABLE_WALLET_ENC "Enable wallet at-rest encryption" OFF)
 option(MIQ_ENABLE_UPNP       "Enable UPnP/NAT-PMP port mapping" OFF)
 option(MIQ_BUILD_TESTS       "Build tests"                                 OFF)
-option(MIQ_FETCH_MICROECC    "Fetch micro-ecc from GitHub if not vendored" ON)
 
 # DB backend options
 option(MIQ_USE_ROCKSDB       "Use RocksDB instead of LevelDB"              OFF)
 option(MIQ_FETCH_LEVELDB     "Automatically fetch/build LevelDB if missing" ON)
-set(MIQ_VENDOR_MICROECC_DIR  "${CMAKE_SOURCE_DIR}/third_party/micro-ecc"
-    CACHE PATH "Path to vendored micro-ecc")
+
+# libsecp256k1 options
+option(MIQ_USE_LIBSECP       "Use bitcoin-core/libsecp256k1 backend"        ON)
+set(MIQ_LIBSECP_TAG "master" CACHE STRING "bitcoin-core/secp256k1 git tag or commit to fetch")
 
 # ------------------------------------------------------------------
 # Warnings / Optimization
@@ -41,46 +42,6 @@ else()
 endif()
 
 include(FetchContent)
-
-# ------------------------------------------------------------------
-# micro-ecc source setup
-# ------------------------------------------------------------------
-set(MICRO_ECC_DIR "")
-if(EXISTS "${MIQ_VENDOR_MICROECC_DIR}/uECC.c")
-  set(MICRO_ECC_DIR "${MIQ_VENDOR_MICROECC_DIR}")
-elseif(MIQ_FETCH_MICROECC)
-  FetchContent_Declare(
-    microecc
-    GIT_REPOSITORY https://github.com/kmackay/micro-ecc.git
-    GIT_TAG        master
-  )
-  FetchContent_MakeAvailable(microecc)
-  set(MICRO_ECC_DIR "${microecc_SOURCE_DIR}")
-else()
-  message(FATAL_ERROR "micro-ecc not found. Set MIQ_VENDOR_MICROECC_DIR or enable MIQ_FETCH_MICROECC.")
-endif()
-
-# Give the 3rd-party C files gentle, localized warning silencing
-set_source_files_properties(
-  ${MICRO_ECC_DIR}/uECC.c
-  PROPERTIES
-    COMPILE_OPTIONS "$<$<C_COMPILER_ID:GNU,Clang>:-Wno-sign-compare;-Wno-type-limits;-Wno-unused-function;-Wno-unused-parameter;-Wno-maybe-uninitialized>"
-)
-if(MSVC)
-  set_source_files_properties(
-    ${MICRO_ECC_DIR}/uECC.c
-    PROPERTIES
-      COMPILE_OPTIONS "/wd4244;/wd4267;/wd4334"
-  )
-endif()
-
-# Also mark our shim as C and keep it quiet if needed
-set_source_files_properties(
-  src/crypto/uECC_shim.c
-  PROPERTIES
-    LANGUAGE C
-    COMPILE_OPTIONS "$<$<C_COMPILER_ID:GNU,Clang>:-Wno-unused-parameter>"
-)
 
 # ------------------------------------------------------------------
 # Key-Value DB backend (LevelDB default, or RocksDB if opted)
@@ -126,6 +87,49 @@ endif()
 # ------------------------------------------------------------------
 find_package(OpenSSL REQUIRED)         # TLS proxy
 find_package(Threads REQUIRED)         # std::thread on POSIX
+
+# ------------------------------------------------------------------
+# libsecp256k1: try system package first, otherwise auto-fetch & build
+# Creates a target: ${MIQ_LIBSECP_TARGET}
+# ------------------------------------------------------------------
+set(MIQ_LIBSECP_TARGET "")
+if(MIQ_USE_LIBSECP)
+  # Try vcpkg/Conan/etc. first
+  find_package(secp256k1 CONFIG QUIET)
+  if(secp256k1_FOUND)
+    set(MIQ_LIBSECP_TARGET secp256k1::secp256k1)
+    message(STATUS "Using system-provided secp256k1 (package)")
+  else()
+    message(STATUS "secp256k1 not found in system; fetching bitcoin-core/secp256k1 @ ${MIQ_LIBSECP_TAG}")
+    FetchContent_Declare(
+      secp256k1_src
+      GIT_REPOSITORY https://github.com/bitcoin-core/secp256k1.git
+      GIT_TAG        ${MIQ_LIBSECP_TAG}
+      GIT_PROGRESS   TRUE
+    )
+    FetchContent_MakeAvailable(secp256k1_src)
+
+    # Build static lib directly from upstream source using basic-config.h
+    add_library(secp256k1 STATIC
+      ${secp256k1_src_SOURCE_DIR}/src/secp256k1.c
+    )
+
+    target_include_directories(secp256k1 PUBLIC
+      ${secp256k1_src_SOURCE_DIR}/include  # public API
+      ${secp256k1_src_SOURCE_DIR}/src      # internal headers & src/basic-config.h
+    )
+    target_compile_definitions(secp256k1 PRIVATE SECP256K1_BUILD)
+    if(MSVC)
+      target_compile_options(secp256k1 PRIVATE /WX- /W4)
+    else()
+      target_compile_options(secp256k1 PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
+
+    set(MIQ_LIBSECP_TARGET secp256k1)
+  endif()
+
+  add_compile_definitions(MIQ_USE_LIBSECP256K1=1)
+endif()
 
 # ------------------------------------------------------------------
 # Main daemon
@@ -177,15 +181,9 @@ add_executable(miqrod
     src/http.h src/http.cpp
     src/rpc.h src/rpc.cpp
 
-    # Crypto interface and backends
+    # Crypto interface + libsecp backend wrapper
     src/crypto/ecdsa_iface.h
-    src/crypto/ecdsa_uECC.h src/crypto/ecdsa_uECC.cpp
-    src/crypto/ecdsa_secp256k1.h
-    src/crypto/ecdsa_secp256k1.cpp   # <— build libsecp backend on all platforms
-
-    # micro-ecc + shim (C sources)
-    ${MICRO_ECC_DIR}/uECC.c
-    src/crypto/uECC_shim.c
+    src/crypto/ecdsa_libsecp256k1.cpp
 
     # --- TLS proxy & IBD monitor ---
     src/tls_proxy.h src/tls_proxy.cpp
@@ -202,14 +200,7 @@ target_sources(miqrod PRIVATE
 
 target_include_directories(miqrod PRIVATE
     src
-    ${MICRO_ECC_DIR}
 )
-
-# micro-ecc config: enable compressed points (safe, no consensus change)
-target_compile_definitions(miqrod PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
-
-# --- Default to libsecp256k1 backend for ECDSA ---
-target_compile_definitions(miqrod PRIVATE MIQ_USE_SECP256K1=1)
 
 # Link DB backend
 target_link_libraries(miqrod PRIVATE ${MIQ_DB_TARGET})
@@ -222,6 +213,11 @@ endif()
 # Link TLS + Threads
 target_link_libraries(miqrod PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 
+# Link libsecp256k1
+if(MIQ_USE_LIBSECP)
+  target_link_libraries(miqrod PRIVATE ${MIQ_LIBSECP_TARGET})
+endif()
+
 # ------------------------------------------------------------------
 # Optional Wallet Encryption (OpenSSL AES-256-GCM + PBKDF2)
 # ------------------------------------------------------------------
@@ -232,7 +228,7 @@ else()
   message(STATUS "Wallet encryption: DISABLED (default)")
 endif()
 
-# Add sources unconditionally; implementation switches via the define above.
+# Add sources unconditionally; RNG is used by ECDSA backend too.
 target_sources(miqrod PRIVATE
     src/wallet_encryptor.cpp
     src/crypto/secure_random.cpp
@@ -258,7 +254,7 @@ else()
 endif()
 
 # ------------------------------------------------------------------
-# Tests (optional)
+# Tests (optional) — now use libsecp backend via iface
 # ------------------------------------------------------------------
 if(MIQ_BUILD_TESTS)
   enable_testing()
@@ -269,11 +265,14 @@ if(MIQ_BUILD_TESTS)
       src/hash160.h src/hash160.cpp
       src/base58check.h src/base58check.cpp
       src/hex.h src/hex.cpp
-      ${MICRO_ECC_DIR}/uECC.c
-      src/crypto/uECC_shim.c
+      src/crypto/secure_random.cpp
+      src/crypto/ecdsa_iface.h
+      src/crypto/ecdsa_libsecp256k1.cpp
   )
-  target_include_directories(test_crypto PRIVATE src ${MICRO_ECC_DIR})
-  target_compile_definitions(test_crypto PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
+  target_include_directories(test_crypto PRIVATE src)
+  if(MIQ_USE_LIBSECP)
+    target_link_libraries(test_crypto PRIVATE ${MIQ_LIBSECP_TARGET})
+  endif()
   if(WIN32)
     target_link_libraries(test_crypto PRIVATE Ws2_32)
   endif()
@@ -303,13 +302,14 @@ add_executable(miq-keygen
     src/hash160.h src/hash160.cpp
     src/base58.h src/base58.cpp
     src/hex.h src/hex.cpp
-    src/crypto/ecdsa_secp256k1.cpp
-    src/crypto/ecdsa_secp256k1.h
-    src/crypto/ecdsa_iface.h
     src/crypto/secure_random.cpp
-    src/crypto/secure_random.h
+    src/crypto/ecdsa_iface.h
+    src/crypto/ecdsa_libsecp256k1.cpp
 )
-target_compile_definitions(miq-keygen PRIVATE MIQ_USE_SECP256K1=1)
+target_include_directories(miq-keygen PRIVATE src)
+if(MIQ_USE_LIBSECP)
+  target_link_libraries(miq-keygen PRIVATE ${MIQ_LIBSECP_TARGET})
+endif()
 if(WIN32)
   target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
