@@ -11,65 +11,67 @@
 #include <algorithm>
 #include <cstdint>
 
+// Keep the optional C bridge off by default.
 #ifndef MIQ_SECP256K1_C_BRIDGE
 #define MIQ_SECP256K1_C_BRIDGE 0
 #endif
+
+// =====================================================================================
+// Cross-platform 64-bit helpers (single, consistent API used everywhere in this file)
+//   - mul128_u64(a,b,&lo,&hi) -> 128-bit product split into lo/hi 64-bit
+//   - addc_u64(a,b,carry_in,&carry_out) -> returns sum (64-bit), carry_out is 0/1
+//   - subb_u64(a,b,borrow_in,&borrow_out) -> returns diff (64-bit), borrow_out is 0/1
+// =====================================================================================
 
 #if defined(_MSC_VER) && defined(_M_X64)
   #include <intrin.h>
   #pragma intrinsic(_umul128)
   #pragma intrinsic(_addcarry_u64)
   #pragma intrinsic(_subborrow_u64)
-  static inline void mul_u64_128(uint64_t a, uint64_t b, uint64_t& lo, uint64_t& hi){
-      lo = _umul128(a, b, &hi);
+  static inline void mul128_u64(uint64_t a, uint64_t b, uint64_t* lo, uint64_t* hi){
+      *lo = _umul128(a, b, hi);
   }
-  static inline uint64_t addc_u64(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t& out){
-      unsigned char c = _addcarry_u64((unsigned char)carry_in, a, b, &out);
-      return (uint64_t)c;
-  }
-  static inline uint64_t subb_u64(uint64_t a, uint64_t b, uint64_t borrow_in, uint64_t& out){
-      unsigned char c = _subborrow_u64((unsigned char)borrow_in, a, b, &out);
-      return (uint64_t)c;
-  }
-#else
-  static inline void mul_u64_128(uint64_t a, uint64_t b, uint64_t& lo, uint64_t& hi){
-      unsigned __int128 p = (unsigned __int128)a * (unsigned __int128)b;
-      lo = (uint64_t)p; hi = (uint64_t)(p>>64);
-  }
-  static inline uint64_t addc_u64(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t& out){
-      unsigned __int128 s = (unsigned __int128)a + b + carry_in;
-      out = (uint64_t)s; return (uint64_t)(s>>64);
-  }
-  static inline uint64_t subb_u64(uint64_t a, uint64_t b, uint64_t borrow_in, uint64_t& out){
-      unsigned __int128 d = (unsigned __int128)a - b - borrow_in;
-      out = (uint64_t)d; return (d >> 127) & 1; // 1 if borrow
-  }
-#endif
-
-
-#if defined(_MSC_VER)
-  #include <intrin.h>
-  static inline void mul128_u64(uint64_t a, uint64_t b, uint64_t* lo, uint64_t* hi){ *lo = _umul128(a,b,hi); }
   static inline uint64_t addc_u64(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t* carry_out){
-      unsigned __int64 out; unsigned char c = _addcarry_u64((unsigned char)carry_in, a, b, &out); *carry_out = (uint64_t)c; return (uint64_t)out;
+      unsigned __int64 out64;
+      unsigned char c = _addcarry_u64((unsigned char)carry_in, a, b, &out64);
+      if (carry_out) *carry_out = (uint64_t)c;
+      return (uint64_t)out64;
   }
   static inline uint64_t subb_u64(uint64_t a, uint64_t b, uint64_t borrow_in, uint64_t* borrow_out){
-      unsigned __int64 out; unsigned char c = _subborrow_u64((unsigned char)borrow_in, a, b, &out); *borrow_out = (uint64_t)c; return (uint64_t)out;
+      unsigned __int64 out64;
+      unsigned char c = _subborrow_u64((unsigned char)borrow_in, a, b, &out64);
+      if (borrow_out) *borrow_out = (uint64_t)c;
+      return (uint64_t)out64;
   }
 #else
-  static inline void mul128_u64(uint64_t a, uint64_t b, uint64_t* lo, uint64_t* hi){ unsigned __int128 t=(unsigned __int128)a*b; *lo=(uint64_t)t; *hi=(uint64_t)(t>>64); }
-  static inline uint64_t addc_u64(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t* carry_out){ unsigned __int128 t=(unsigned __int128)a+b+carry_in; *carry_out=(uint64_t)(t>>64); return (uint64_t)t; }
-  static inline uint64_t subb_u64(uint64_t a, uint64_t b, uint64_t borrow_in, uint64_t* borrow_out){ unsigned __int128 t=(unsigned __int128)a - b - borrow_in; *borrow_out=(uint64_t)((t>>127)&1); return (uint64_t)t; }
+  static inline void mul128_u64(uint64_t a, uint64_t b, uint64_t* lo, uint64_t* hi){
+      unsigned __int128 t = (unsigned __int128)a * (unsigned __int128)b;
+      *lo = (uint64_t)t;
+      *hi = (uint64_t)(t >> 64);
+  }
+  static inline uint64_t addc_u64(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t* carry_out){
+      unsigned __int128 t = (unsigned __int128)a + b + carry_in;
+      if (carry_out) *carry_out = (uint64_t)(t >> 64);
+      return (uint64_t)t;
+  }
+  static inline uint64_t subb_u64(uint64_t a, uint64_t b, uint64_t borrow_in, uint64_t* borrow_out){
+      // Compute a - b - borrow_in
+      unsigned __int128 A = (unsigned __int128)a;
+      unsigned __int128 B = (unsigned __int128)b + borrow_in;
+      unsigned __int128 D = A - B;
+      if (borrow_out) *borrow_out = (uint64_t)(A < B); // 1 if borrow
+      return (uint64_t)D;
+  }
 #endif
 
 namespace miq { namespace crypto {
 
 // ===== basic 256-bit helpers =====
-struct U256{ uint64_t v[4]{}; };
-struct U512{ uint64_t w[8]{}; };
+struct U256{ uint64_t v[4]{}; }; // v[0] = least significant limb
+struct U512{ uint64_t w[8]{}; }; // w[0] = least significant limb
 
 static inline U256 U256_from_be(const uint8_t b[32]){
-    U256 x;
+    U256 x{};
     for(int i=0;i<4;i++){
         x.v[3-i]= ((uint64_t)b[i*8+0]<<56)|((uint64_t)b[i*8+1]<<48)|((uint64_t)b[i*8+2]<<40)|((uint64_t)b[i*8+3]<<32)
                 |((uint64_t)b[i*8+4]<<24)|((uint64_t)b[i*8+5]<<16)|((uint64_t)b[i*8+6]<<8)|((uint64_t)b[i*8+7]);
@@ -92,12 +94,51 @@ static inline int  U256_cmp(const U256& a,const U256& b){
 static inline U256 U256_add(const U256& a,const U256& b,uint64_t*carry){
     U256 r{}; uint64_t c=0;
     for(int i=0;i<4;i++){ r.v[i]=addc_u64(a.v[i], b.v[i], c, &c); }
-    if(carry) *carry=c; return r;
+    if (carry) *carry = c;
+    return r;
 }
 static inline U256 U256_sub(const U256& a,const U256& b,uint64_t*borrow){
     U256 r{}; uint64_t br=0;
     for(int i=0;i<4;i++){ r.v[i]=subb_u64(a.v[i], b.v[i], br, &br); }
-    if(borrow) *borrow=br; return r;
+    if (borrow) *borrow = br;
+    return r;
+}
+static inline U256 U256_shl_bits(const U256& x, int bits){
+    // Shift left by 0..63 bits
+    if (bits <= 0) return x;
+    if (bits >= 64) { U256 z{}; return z; }
+    U256 r{}; uint64_t carry = 0;
+    for (int i=0;i<4;i++){
+        uint64_t w = x.v[i];
+        r.v[i] = (w << bits) | carry;
+        carry = (bits == 0 ? 0 : (w >> (64 - bits)));
+    }
+    return r;
+}
+static inline U256 U256_shl(const U256& x, int shift){
+    // Shift left by 0..255 bits
+    if (shift <= 0) return x;
+    if (shift >= 256) { U256 z{}; return z; }
+    int limb = shift / 64;
+    int bits = shift % 64;
+    U256 r{};
+    for (int i=3;i>=0;--i){
+        uint64_t lo = 0, hi = 0;
+        int src = i - limb;
+        if (src >= 0){
+            uint64_t cur = x.v[src];
+            uint64_t nxt = (src-1 >= 0) ? x.v[src-1] : 0;
+            if (bits == 0){
+                r.v[i] = cur;
+            } else {
+                r.v[i] = (cur << bits) | (nxt >> (64 - bits));
+            }
+        } else {
+            r.v[i] = 0;
+        }
+        (void)lo; (void)hi;
+    }
+    return r;
 }
 static inline U512 U256_mul(const U256& a,const U256& b){
     U512 r{};
@@ -105,65 +146,86 @@ static inline U512 U256_mul(const U256& a,const U256& b){
         uint64_t c=0;
         for(int j=0;j<4;j++){
             uint64_t lo, hi; mul128_u64(a.v[i], b.v[j], &lo, &hi);
-            uint64_t sum = r.w[i+j];
-            uint64_t carry1; sum = addc_u64(sum, lo, 0, &carry1);
-            uint64_t carry2; r.w[i+j] = addc_u64(sum, c, 0, &carry2);
+            uint64_t carry1=0, carry2=0;
+            uint64_t sum = addc_u64(r.w[i+j], lo, 0, &carry1);
+            r.w[i+j] = addc_u64(sum, c, 0, &carry2);
             c = hi + carry1 + carry2;
         }
-        r.w[i+4] += c;
+        r.w[i+4] = addc_u64(r.w[i+4], c, 0, nullptr);
     }
     return r;
 }
 
 static inline U256 U512_mod(const U512& x,const U256& m){
-    U512 r=x;
-    auto ge=[&](const U512&A,const U256&B,int s){
-        for(int i=7;i>=0;--i){
-            uint64_t a=A.w[i];
-            uint64_t b=(i-s>=0 && i-s<4)?B.v[i-s]:0;
-            if(a<b) return false; if(a>b) return true;
+    U512 r = x;
+
+    auto ge = [&](const U512& A, const U256& B, int s)->bool{
+        // Compare A >= (B << (64*s)) where 's' is limb shift (0..7)
+        for (int i=7;i>=0;--i){
+            uint64_t a = A.w[i];
+            uint64_t b = 0;
+            int bi = i - s;
+            if (bi >= 0 && bi < 4) b = B.v[bi];
+            if (a < b) return false;
+            if (a > b) return true;
         }
-        return true;
+        return true; // equal
     };
-    auto sub=[&](U512&A,const U256&B,int s){
-        __int128 c=0;
-        for(int i=0;i<8;i++){
-            int bi=i-s; unsigned __int128 b=(bi>=0&&bi<4)?B.v[bi]:0;
-            __int128 t=(__int128)A.w[i]-b-c;
-            A.w[i]=(uint64_t)t; c=t<0;
+
+    auto sub_shifted = [&](U512& A, const U256& B, int s){
+        uint64_t borrow = 0;
+        for (int i=0;i<8;i++){
+            uint64_t b = 0;
+            int bi = i - s;
+            if (bi >= 0 && bi < 4) b = B.v[bi];
+            A.w[i] = subb_u64(A.w[i], b, borrow, &borrow);
         }
     };
-    for(int s=7;s>=0;--s){ while(ge(r,m,s)) sub(r,m,s); }
-    U256 o; for(int i=0;i<4;i++) o.v[i]=r.w[i]; return o;
+
+    // Long reduction: subtract (m << s) where possible
+    for (int s=7; s>=0; --s){
+        while (ge(r, m, s)) sub_shifted(r, m, s);
+    }
+    U256 o{};
+    for (int i=0;i<4;i++) o.v[i]=r.w[i];
+    return o;
 }
+
 static inline U256 U256_mod_add(const U256&a,const U256&b,const U256&m){
-    uint64_t c; U256 s=U256_add(a,b,&c); if(c||U256_cmp(s,m)>=0) s=U256_sub(s,m,nullptr); return s;
+    uint64_t c=0; U256 s=U256_add(a,b,&c);
+    if (c || U256_cmp(s,m)>=0) s=U256_sub(s,m,nullptr);
+    return s;
 }
 static inline U256 U256_mod_sub(const U256&a,const U256&b,const U256&m){
-    uint64_t br; U256 s=U256_sub(a,b,&br); if(br) s=U256_add(s,m,nullptr); return s;
+    uint64_t br=0; U256 s=U256_sub(a,b,&br);
+    if (br) s=U256_add(s,m,nullptr);
+    return s;
 }
 static inline U256 U256_mod_mul(const U256&a,const U256&b,const U256&m){ return U512_mod(U256_mul(a,b),m); }
 
 static U256 U256_mod_inv(U256 a, U256 m){
+    // Extended Euclid over 256-bit ints (schoolbook, but portable)
     U256 lm{{1,0,0,0}}, hm{{0,0,0,0}};
     U256 low=a, high=m;
+
     auto isz=[&](const U256&x){return U256_is_zero(x);};
+
     auto divmod=[&](const U256&num,const U256&den,U256&q,U256&r){
-        q={{0,0,0,0}}; r=num;
+        // Binary restoring division, bit by bit: r = num, q = 0
+        q = U256{{0,0,0,0}};
+        r = num;
         for(int i=255;i>=0;--i){
-            // den<<i
-            U256 d{{0,0,0,0}}; int limb=i/64,b=i%64; unsigned __int128 carry=0;
-            for(int j=3;j>=0;--j){
-                unsigned __int128 val=(j-limb>=0)?(unsigned __int128)den.v[j-limb]:0; val=(val<<b)|carry; d.v[j]=(uint64_t)val; carry=val>>64;
-            }
-            if(U256_cmp(r,d)>=0){
-                r=U256_sub(r,d,nullptr);
-                q.v[i/64]|=(uint64_t)1<<(i%64);
+            U256 d = U256_shl(den, i);
+            if (U256_cmp(r, d) >= 0){
+                r = U256_sub(r, d, nullptr);
+                q.v[i/64] |= (uint64_t)1ULL << (i%64);
             }
         }
     };
+
     while(!isz(low)){
-        U256 q,nr; divmod(high,low,q,nr);
+        U256 q,nr;
+        divmod(high,low,q,nr);
         U256 tmp=U256_mod_mul(q,lm,m);
         U256 nm=U256_mod_sub(hm,tmp,m);
         hm=lm; high=low; lm=nm; low=nr;
@@ -230,23 +292,22 @@ static Point add(const Point& Pp, const Point& Qp){
     Fp S1=Fp_mul(Fp_mul(Pp.Y,Qp.Z), Z2Z2);
     Fp S2=Fp_mul(Fp_mul(Qp.Y,Pp.Z), Z1Z1);
 
-    // disambiguate the curve prime P (constant) from the parameter names
-    U256 H_=U256_mod_sub(U2.n, S1.n /* placeholder to keep order */, ::miq::crypto::P); // will fix below
-    // Correct H = U2 - U1
-    H_ = U256_mod_sub(U2.n, U1.n, ::miq::crypto::P);
+    // H = U2 - U1
+    U256 H_ = U256_mod_sub(U2.n, U1.n, P);
     Fp H=Fp_fromU(H_);
 
-    U256 r_=U256_mod_sub(S2.n, S1.n, ::miq::crypto::P);
-    r_=U256_mod_add(r_, r_, ::miq::crypto::P); // r = 2*(S2-S1)
+    // r = 2*(S2 - S1)
+    U256 r_ = U256_mod_sub(S2.n, S1.n, P);
+    r_ = U256_mod_add(r_, r_, P);
     Fp r=Fp_fromU(r_);
 
     if(U256_is_zero(H.n)){ if(U256_is_zero(r.n)) return dbl(Pp); return Inf(); }
-    Fp I = Fp_sqr(Fp_fromU(U256_mod_add(H.n, H.n, ::miq::crypto::P)));
+    Fp I = Fp_sqr(Fp_fromU(U256_mod_add(H.n, H.n, P)));
     Fp J = Fp_mul(H, I);
     Fp V = Fp_mul(U1, I);
     Fp X3 = Fp_sub(Fp_sub(Fp_sqr(r), J), Fp_add(V,V));
-    Fp Y3 = Fp_sub(Fp_mul(r, Fp_sub(V, X3)), Fp_mul(Fp_fromU(U256_mod_add(S1.n,S1.n, ::miq::crypto::P)), J));
-    Fp Z3 = Fp_mul(Fp_mul(Fp_sub(Fp_add(Pp.Z,Qp.Z), Fp_add(Z1Z1,Z2Z2)), Fp_fromU(U256{{1,0,0,0}})), H);
+    Fp Y3 = Fp_sub(Fp_mul(r, Fp_sub(V, X3)), Fp_mul(Fp_fromU(U256_mod_add(S1.n,S1.n, P)), J));
+    Fp Z3 = Fp_mul(Fp_sub(Fp_add(Pp.Z,Qp.Z), Fp_add(Z1Z1,Z2Z2)), H);
     Point R{X3,Y3,Z3,false}; return R;
 }
 
@@ -254,7 +315,7 @@ static Point mul(const U256& k,const Point&Pt){
     Point R=Inf();
     for(int i=255;i>=0;--i){
         R=dbl(R);
-        if( (k.v[i/64]>>(i%64)) & 1 ) R=add(R,Pt);
+        if( (k.v[i/64]>>(i%64)) & 1ULL ) R=add(R,Pt);
     }
     return R;
 }
@@ -353,7 +414,7 @@ bool Secp256k1::decompress_pub(const std::vector<uint8_t>& in33, std::vector<uin
 
     auto pow = [&](Fp a, U256 ee){
         Fp r=Fp_fromU(U256{{1,0,0,0}});
-        for(int i=0;i<256;i++){ if( (ee.v[i/64]>>(i%64)) & 1 ) r=Fp_mul(r,a); a=Fp_sqr(a); }
+        for(int i=0;i<256;i++){ if( (ee.v[i/64]>>(i%64)) & 1ULL ) r=Fp_mul(r,a); a=Fp_sqr(a); }
         return r;
     };
     Fp y = pow(rhs, e);
