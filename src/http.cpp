@@ -18,7 +18,7 @@
 #include <chrono>
 #include <atomic>
 #include <memory>
-#include <array>     // <-- needed for std::array
+#include <array>     // for std::array
 
 // --- platform sockets + sleep -----------------------------------------------
 #ifdef _WIN32
@@ -31,7 +31,7 @@
   #pragma comment(lib, "Ws2_32.lib")
   using socklen_t = int;
   using sock_t = SOCKET;
-  // no macro remap; native closesocket() exists on Windows
+  // Windows has closesocket()
 #else
   #include <sys/types.h>
   #include <sys/socket.h>
@@ -88,7 +88,6 @@ static inline bool is_loopback_sockaddr(const sockaddr* sa){
     }
 #ifdef AF_INET6
     if(sa->sa_family == AF_INET6){
-        // FIX: cast the pointer itself (not &sa)
         const sockaddr_in6* s6 = reinterpret_cast<const sockaddr_in6*>(sa);
         static const uint8_t loop6[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
         return std::memcmp(s6->sin6_addr.s6_addr, loop6, 16) == 0;
@@ -194,17 +193,16 @@ static std::atomic<int> g_live_conns{0};
 static bool rl_allow(const std::string& ip, int rps, int burst){
     auto now = std::chrono::steady_clock::now();
 
-    // First time seeing this IP? Create a prefilled bucket and allow immediately.
+    // First time: prefill and allow the first request (consume 1 token).
     auto it = g_buckets.find(ip);
     if (it == g_buckets.end()) {
         TokenBucket nb;
         nb.rate_per_sec = (double)rps;
         nb.burst        = (double)burst;
-        nb.tokens       = std::max(0.0, nb.burst - 1.0);  // consume 1 for this request
+        nb.tokens       = std::max(0.0, nb.burst - 1.0);
         nb.last         = now;
         g_buckets.emplace(ip, nb);
 
-        // periodic cleanup
         if(now - g_last_cleanup > std::chrono::minutes(5)){
             for(auto it2 = g_buckets.begin(); it2 != g_buckets.end();){
                 if(now - it2->second.last > std::chrono::minutes(10)) it2 = g_buckets.erase(it2);
@@ -215,7 +213,7 @@ static bool rl_allow(const std::string& ip, int rps, int burst){
         return true;
     }
 
-    // Existing bucket: refill and check
+    // Existing bucket
     TokenBucket& b = it->second;
     double dt = std::chrono::duration<double>(now - b.last).count();
     b.last = now;
@@ -402,6 +400,19 @@ static bool parse_http_request(sock_t fd,
         }
     }
 
+    // Handle Expect: 100-continue (PowerShell/.NET commonly send this)
+    {
+        std::string expect = lc(get_header(headers, "expect"));
+        if (!expect.empty() && expect.find("100-continue") != std::string::npos) {
+            static const char k100[] = "HTTP/1.1 100 Continue\r\n\r\n";
+#ifdef _WIN32
+            send(fd, k100, (int)sizeof(k100)-1, 0);
+#else
+            ::send(fd, k100, sizeof(k100)-1, 0);
+#endif
+        }
+    }
+
     // Determine body length
     size_t content_len = 0;
     for(auto& kv : headers){
@@ -485,12 +496,12 @@ void HttpServer::start(
 #endif
 
     // Tunables (with sane defaults)
-    const int max_conn          = env_int("MIQ_RPC_MAX_CONN", 64);      // global simultaneous connections
-    const int ip_rps            = env_int("MIQ_RPC_RPS", 10);           // requests/sec per IP
-    const int ip_burst          = env_int("MIQ_RPC_BURST", 30);         // burst size
-    const size_t max_hdr_bytes  = env_szt("MIQ_RPC_MAX_HEADER", 16*1024); // 16 KiB (safer default)
+    const int max_conn          = env_int("MIQ_RPC_MAX_CONN", 64);         // global simultaneous connections
+    const int ip_rps            = env_int("MIQ_RPC_RPS", 10);              // requests/sec per IP
+    const int ip_burst          = env_int("MIQ_RPC_BURST", 30);            // burst size
+    const size_t max_hdr_bytes  = env_szt("MIQ_RPC_MAX_HEADER", 16*1024);  // 16 KiB
     const size_t max_body_bytes = env_szt("MIQ_RPC_MAX_BODY",   2*1024*1024); // 2 MiB
-    const int recv_timeout_ms   = env_int("MIQ_RPC_RECV_TIMEOUT_MS", 5000); // header+body total window
+    const int recv_timeout_ms   = env_int("MIQ_RPC_RECV_TIMEOUT_MS", 5000);   // header+body total window
     const bool allow_cors       = env_truthy(std::getenv("MIQ_RPC_CORS"));
 
     // Observability toggles
@@ -891,4 +902,3 @@ void HttpServer::stop(){
 }
 
 }
-
