@@ -128,10 +128,10 @@ datadir=/var/lib/miq
 
 # Networking
 no_p2p=0
-p2p_port=9833
+p2p_port=55001
 # Bootstrap peers (example):
-addnode=seed1.yourdomain.example:9833
-addnode=seed2.yourdomain.example:9833
+addnode=miqseed1.duckdns.org:55001
+addnode=miqroseed1.freeddns.org:55001
 
 # RPC
 no_rpc=0
