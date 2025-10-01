@@ -229,11 +229,15 @@ static int64_t g_next_stall_probe_ms = 0;
 static std::unordered_map<int, std::vector<std::vector<uint8_t>>> g_trickle_q;
 static std::unordered_map<int, int64_t> g_trickle_last_ms;
 
+// Per-peer sliding-window message counters: sock -> ("family:name" -> {win_start_ms, count})
+static std::unordered_map<int,
+    std::unordered_map<std::string, std::pair<int64_t,uint32_t>>> g_cmd_rl;
+
 // Per-socket parse deadlines for partial frames
 static std::unordered_map<int, int64_t> g_rx_started_ms;
 static inline void rx_track_start(int fd){
     if (g_rx_started_ms.find(fd)==g_rx_started_ms.end())
-        g_rx_started_ms[fd] = [](){ using namespace std::chrono; return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count(); }();
+        g_rx_started_ms[fd] = [](){ using namespace std::chrono; return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }();
 }
 static inline void rx_clear_start(int fd){
     g_rx_started_ms.erase(fd);
@@ -752,6 +756,45 @@ bool P2P::check_rate(PeerState& ps, const char* key) {
     }
     // Conservative default
     return check_rate(ps, "misc", key, 32, 1000);
+}
+
+// 5-arg overload used by the key-based helper above
+bool P2P::check_rate(PeerState& ps,
+                     const char* family,
+                     const char* name,
+                     uint32_t burst,
+                     uint32_t window_ms)
+{
+    const char* fam = family ? family : "misc";
+    const char* nam = name   ? name   : "";
+
+    // Compose key "family:name"
+    std::string k;
+    k.reserve(std::strlen(fam) + 1 + std::strlen(nam));
+    k.append(fam);
+    k.push_back(':');
+    k.append(nam);
+
+    const int64_t t = now_ms();
+
+    auto& perPeer = g_cmd_rl[ps.sock];          // creates on first use
+    auto& slot    = perPeer[k];                 // default-initializes to {0,0}
+    int64_t&  win_start = slot.first;
+    uint32_t& count     = slot.second;
+
+    if (win_start == 0 || (t - win_start) >= (int64_t)window_ms) {
+        win_start = t;
+        count = 0;
+    }
+
+    if (count >= burst) {
+        // Light penalty; hard disconnects are triggered elsewhere on score
+        if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
+        return false;
+    }
+
+    ++count;
+    return true;
 }
 
 bool P2P::connect_seed(const std::string& host, uint16_t port){
