@@ -41,6 +41,7 @@
 #include <atomic>
 #include <memory>  // std::unique_ptr
 
+// ---------- small helpers (file + optional genesis key loader) --------------
 static bool read_file_all(const std::string& path, std::vector<uint8_t>& out){
     std::ifstream f(path, std::ios::binary);
     if(!f) return false;
@@ -74,6 +75,7 @@ static bool load_existing_genesis_priv(const std::string& datadir, std::vector<u
     }
     return false; // not found
 }
+
 using namespace miq;
 
 static std::vector<uint8_t> g_mine_pkh;
@@ -166,6 +168,11 @@ static void handle_signal(int sig){
 
 int main(int argc, char** argv){
     try {
+        // Make stdio unbuffered so single-shot commands print immediately.
+        std::ios::sync_with_stdio(false);
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+        std::setvbuf(stderr, nullptr, _IONBF, 0);
+
         // Fatal terminate hook (helps catch background thread aborts)
         std::set_terminate([](){
             std::fputs("[FATAL] std::terminate() called (likely from a background thread)\n", stderr);
@@ -176,8 +183,7 @@ int main(int argc, char** argv){
         std::signal(SIGINT,  handle_signal);
         std::signal(SIGTERM, handle_signal);
 
-        std::fprintf(stderr, "[BOOT] enter main()\n");
-
+        // ----- Parse CLI FIRST (no heavy work yet) -----------------------
         Config cfg;
         std::string conf;
         bool genaddr=false, buildtx=false;
@@ -222,14 +228,7 @@ int main(int argc, char** argv){
             }
         }
 
-        if(!conf.empty()){
-            load_config(conf, cfg);
-        }
-
-        if(cfg.datadir.empty()) cfg.datadir = "./miqdata";
-        std::error_code ec;
-        std::filesystem::create_directories(cfg.datadir, ec); // best-effort
-
+        // ===== FAST PATHS: return before heavy init ======================
         if(genaddr){
             std::vector<uint8_t> priv;
             if(!crypto::ECDSA::generate_priv(priv)){
@@ -237,7 +236,10 @@ int main(int argc, char** argv){
                 return 1;
             }
             std::vector<uint8_t> pub33;
-            crypto::ECDSA::derive_pub(priv, pub33);
+            if(!crypto::ECDSA::derive_pub(priv, pub33)){
+                std::fprintf(stderr, "derive_pub failed\n");
+                return 1;
+            }
             auto pkh  = hash160(pub33);
             auto addr = base58check_encode(VERSION_P2PKH, pkh);
             std::cout
@@ -248,7 +250,7 @@ int main(int argc, char** argv){
         }
 
         if(buildtx){
-            std::vector<uint8_t> priv = from_hex(privh);
+            std::vector<uint8_t> priv = miq::from_hex(privh);
             std::vector<uint8_t> pub33;
             if(!crypto::ECDSA::derive_pub(priv, pub33)){
                 std::fprintf(stderr, "derive_pub failed\n");
@@ -263,7 +265,7 @@ int main(int argc, char** argv){
 
             Transaction tx;
             TxIn in;
-            in.prev.txid = from_hex(prevtxid_hex);
+            in.prev.txid = miq::from_hex(prevtxid_hex);
             in.prev.vout = vout;
             tx.vin.push_back(in);
 
@@ -285,6 +287,17 @@ int main(int argc, char** argv){
             std::cout << "txhex=" << to_hex(raw) << "\n";
             return 0;
         }
+        // =================================================================
+
+        std::fprintf(stderr, "[BOOT] enter main()\n");
+
+        if(!conf.empty()){
+            load_config(conf, cfg);
+        }
+
+        if(cfg.datadir.empty()) cfg.datadir = "./miqdata";
+        std::error_code ec;
+        std::filesystem::create_directories(cfg.datadir, ec); // best-effort
 
         std::fprintf(stderr, "[BOOT] datadir=%s no_rpc=%d no_p2p=%d no_mine=%d\n",
                      cfg.datadir.c_str(), cfg.no_rpc?1:0, cfg.no_p2p?1:0, cfg.no_mine?1:0);
@@ -301,51 +314,53 @@ int main(int argc, char** argv){
         }
         std::fprintf(stderr, "[BOOT] chain.open OK\n");
 
-        // --- Genesis key (robust) ---
-std::fprintf(stderr, "[BOOT] load genesis from constants raw hex\n");
-{
-    // Parse raw block bytes from constants
-    std::vector<uint8_t> raw;
-    try {
-        raw = miq::from_hex(GENESIS_RAW_BLOCK_HEX);
-    } catch (...) {
-        log_error("GENESIS_RAW_BLOCK_HEX is not valid hex");
-        return 1;
-    }
-    if (raw.empty()) {
-        log_error("GENESIS_RAW_BLOCK_HEX is empty");
-        return 1;
-    }
+        // --- Genesis from pinned raw block --------------------------------
+        std::fprintf(stderr, "[BOOT] load genesis from constants raw hex\n");
+        {
+            // Parse raw block bytes from constants
+            std::vector<uint8_t> raw;
+            try {
+                raw = miq::from_hex(GENESIS_RAW_BLOCK_HEX);
+            } catch (...) {
+                log_error("GENESIS_RAW_BLOCK_HEX is not valid hex");
+                return 1;
+            }
+            if (raw.empty()) {
+                log_error("GENESIS_RAW_BLOCK_HEX is empty");
+                return 1;
+            }
 
-    // Deserialize and verify against pinned hash/merkle
-    Block g;
-    if (!deser_block(raw, g)) {
-        log_error("Failed to deserialize GENESIS_RAW_BLOCK_HEX");
-        return 1;
-    }
+            // Deserialize and verify against pinned hash/merkle
+            Block g;
+            if (!deser_block(raw, g)) {
+                log_error("Failed to deserialize GENESIS_RAW_BLOCK_HEX");
+                return 1;
+            }
 
-    const std::string got_hash   = to_hex(g.block_hash());
-    const std::string want_hash  = std::string(GENESIS_HASH_HEX);
-    if (got_hash != want_hash) {
-        log_error(std::string("Genesis hash mismatch. got=") + got_hash + " want=" + want_hash);
-        return 1;
-    }
+            const std::string got_hash   = to_hex(g.block_hash());
+            const std::string want_hash  = std::string(GENESIS_HASH_HEX);
+            if (got_hash != want_hash) {
+                log_error(std::string("Genesis hash mismatch. got=") + got_hash + " want=" + want_hash);
+                return 1;
+            }
 
-    const std::string got_merkle = to_hex(g.header.merkle_root);
-    const std::string want_merkle= std::string(GENESIS_MERKLE_HEX);
-    if (got_merkle != want_merkle) {
-        log_error(std::string("Genesis merkle mismatch. got=") + got_merkle + " want=" + want_merkle);
-        return 1;
-    }
+            const std::string got_merkle = to_hex(g.header.merkle_root);
+            const std::string want_merkle= std::string(GENESIS_MERKLE_HEX);
+            if (got_merkle != want_merkle) {
+                log_error(std::string("Genesis merkle mismatch. got=") + got_merkle + " want=" + want_merkle);
+                return 1;
+            }
 
-    std::fprintf(stderr, "[BOOT] init_genesis begin\n");
-    if (!chain.init_genesis(g)) {
-        log_error("genesis init failed");
-        return 1;
-    }
-    std::fprintf(stderr, "[BOOT] init_genesis OK\n");
-}
-        // === NEW: Optional UTXO reindex BEFORE starting services ===============
+            std::fprintf(stderr, "[BOOT] init_genesis begin\n");
+            if (!chain.init_genesis(g)) {
+                log_error("genesis init failed");
+                return 1;
+            }
+            std::fprintf(stderr, "[BOOT] init_genesis OK\n");
+        }
+        // ------------------------------------------------------------------
+
+        // === NEW: Optional UTXO reindex BEFORE starting services ===========
         if (flag_reindex_utxo) {
             log_info("ReindexUTXO: rebuilding chainstate from active chain...");
             UTXOKV utxo_kv;
@@ -356,7 +371,7 @@ std::fprintf(stderr, "[BOOT] load genesis from constants raw hex\n");
             }
             log_info("ReindexUTXO: done");
         }
-        // =========================================================================
+        // ===================================================================
 
         // Resolve mining address (prompt if needed — ALWAYS prompts first)
         bool have_addr = resolve_mining_address(g_mine_pkh, !cfg.no_mine, conf);
@@ -383,7 +398,7 @@ std::fprintf(stderr, "[BOOT] load genesis from constants raw hex\n");
             }
         }
 
-        // NEW: start IBD monitor (exposes getibdinfo via RPC handler you'll add next)
+        // start IBD monitor
         start_ibd_monitor(&chain, &p2p);
 
         if(!cfg.no_rpc){
@@ -584,15 +599,7 @@ std::fprintf(stderr, "[BOOT] load genesis from constants raw hex\n");
         try { p2p.stop(); } catch(...) {}
         // stop TLS proxy by destroying it (safe even if null)
         try { /* if running */ } catch(...) {}
-        // ensure destruction
-        // (unique_ptr will be destroyed on scope exit; explicit reset for clarity)
-        // Note: don't call tls->stop() if unsure about API; destruction is enough.
-        // (No-op if not enabled)
-        // The variable is in outer scope:
-        // std::unique_ptr<TlsProxy> tls;
-        // so just reset here:
-        // (wrapped in a block so this compiles even if not used)
-        { /* explicit reset */ }
+        { /* explicit reset via unique_ptr destruction on scope exit */ }
 
         log_info("Shutdown complete.");
         return 0;
