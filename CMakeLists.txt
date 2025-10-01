@@ -89,18 +89,37 @@ find_package(OpenSSL REQUIRED)         # TLS proxy
 find_package(Threads REQUIRED)         # std::thread on POSIX
 
 # ------------------------------------------------------------------
-# libsecp256k1: try system package first, otherwise auto-fetch & build
-# Creates a target: ${MIQ_LIBSECP_TARGET}
+# libsecp256k1: try system package first, otherwise auto-fetch & use its target
+# Exposes: MIQ_LIBSECP_TARGET = <imported target to link>
 # ------------------------------------------------------------------
 set(MIQ_LIBSECP_TARGET "")
 if(MIQ_USE_LIBSECP)
-  # Try vcpkg/Conan/etc. first
+  # Prefer system-provided config packages (vcpkg/Conan/etc.)
   find_package(secp256k1 CONFIG QUIET)
+
   if(secp256k1_FOUND)
-    set(MIQ_LIBSECP_TARGET secp256k1::secp256k1)
-    message(STATUS "Using system-provided secp256k1 (package)")
+    # Package exports an imported target; common name is secp256k1::secp256k1
+    if(TARGET secp256k1::secp256k1)
+      set(MIQ_LIBSECP_TARGET secp256k1::secp256k1)
+      message(STATUS "Using system-provided secp256k1 (secp256k1::secp256k1)")
+    else()
+      # Some packages expose a plain 'secp256k1' target
+      if(TARGET secp256k1)
+        set(MIQ_LIBSECP_TARGET secp256k1)
+        message(STATUS "Using system-provided secp256k1 (secp256k1)")
+      else()
+        message(FATAL_ERROR "secp256k1 package found but no usable CMake target exported.")
+      endif()
+    endif()
   else()
     message(STATUS "secp256k1 not found in system; fetching bitcoin-core/secp256k1 @ ${MIQ_LIBSECP_TAG}")
+
+    include(FetchContent)
+    # Optionally slim the upstream build; if a var is unknown, CMake just ignores it.
+    set(SECP256K1_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(SECP256K1_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
+    set(SECP256K1_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+
     FetchContent_Declare(
       secp256k1_src
       GIT_REPOSITORY https://github.com/bitcoin-core/secp256k1.git
@@ -109,23 +128,14 @@ if(MIQ_USE_LIBSECP)
     )
     FetchContent_MakeAvailable(secp256k1_src)
 
-    # Build static lib directly from upstream source using basic-config.h
-    add_library(secp256k1 STATIC
-      ${secp256k1_src_SOURCE_DIR}/src/secp256k1.c
-    )
-
-    target_include_directories(secp256k1 PUBLIC
-      ${secp256k1_src_SOURCE_DIR}/include  # public API
-      ${secp256k1_src_SOURCE_DIR}/src      # internal headers & src/basic-config.h
-    )
-    target_compile_definitions(secp256k1 PRIVATE SECP256K1_BUILD)
-    if(MSVC)
-      target_compile_options(secp256k1 PRIVATE /WX- /W4)
+    # The fetched project already defines a target named 'secp256k1'.
+    if(TARGET secp256k1::secp256k1)
+      set(MIQ_LIBSECP_TARGET secp256k1::secp256k1)
+    elseif(TARGET secp256k1)
+      set(MIQ_LIBSECP_TARGET secp256k1)
     else()
-      target_compile_options(secp256k1 PRIVATE -Wall -Wextra -Wno-unused-parameter)
+      message(FATAL_ERROR "Fetched secp256k1 but no target named 'secp256k1' was created.")
     endif()
-
-    set(MIQ_LIBSECP_TARGET secp256k1)
   endif()
 
   add_compile_definitions(MIQ_USE_LIBSECP256K1=1)
