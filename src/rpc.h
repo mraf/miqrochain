@@ -29,15 +29,4 @@ private:
     P2P*       p2p_{nullptr};   // <-- add this
 };
 
-class HttpServer {
-public:
-    void start(
-        uint16_t port,
-        std::function<std::string(
-            const std::string& body,
-            const std::vector<std::pair<std::string,std::string>>& headers
-        )> handler);
-    void stop();
-};
-
 }
