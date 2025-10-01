@@ -7,14 +7,11 @@
 #include <iostream>
 
 #include "constants.h"
+#include "crypto/ecdsa_iface.h"
 #include "sha256.h"
 #include "ripemd160.h"
 #include "hash160.h"
 #include "base58.h"
-
-extern "C" {
-#include "uECC.h"
-}
 
 #if defined(_WIN32)
   #define NOMINMAX
@@ -73,7 +70,18 @@ int main() {
 
     const struct uECC_Curve_t* curve = uECC_secp256k1();
     uint8_t pub[64];
-    uint8_t priv[32];
+
+    std::vector<uint8_t> priv(32), pub33;
+    if (!miq::crypto::ECDSA::generate_priv(priv)) { std::cerr << "rng failed\n"; return 1; }
+    if (!miq::crypto::ECDSA::derive_pub(priv, pub33)) { std::cerr << "derive_pub failed\n"; return 1; }
+
+    // Build PKH/address from compressed pubkey (33 bytes) – you already have helpers:
+    auto pkh = hash160(pub33);
+    std::string addr = b58check_p2pkh(miq::VERSION_P2PKH, pkh);
+
+    // print hex priv (same helper you already have):
+    std::cout << "Address (P2PKH): " << addr << "\n";
+    std::cout << "PrivateKey (hex, keep secret!): " << hex2(priv.data(), 32) << "\n";
 
     if (!uECC_make_key(pub, priv, curve)) {
         std::cerr << "ERROR: key generation failed (rng not available?)\n";
