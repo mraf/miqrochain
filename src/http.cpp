@@ -193,19 +193,41 @@ static std::atomic<int> g_live_conns{0};
 // Refill & check token bucket
 static bool rl_allow(const std::string& ip, int rps, int burst){
     auto now = std::chrono::steady_clock::now();
-    TokenBucket& b = g_buckets[ip];
-    double dt = std::chrono::duration<double>(now - b.last).count();
-    b.last = now;
-    if(b.rate_per_sec <= 0.0){ b.rate_per_sec = (double)rps; }
-    if(b.burst <= 0.0){ b.burst = (double)burst; }
-    b.tokens = std::min(b.burst, b.tokens + dt * b.rate_per_sec);
-    if(b.tokens >= 1.0){
-        b.tokens -= 1.0;
+
+    // First time seeing this IP? Create a prefilled bucket and allow immediately.
+    auto it = g_buckets.find(ip);
+    if (it == g_buckets.end()) {
+        TokenBucket nb;
+        nb.rate_per_sec = (double)rps;
+        nb.burst        = (double)burst;
+        nb.tokens       = std::max(0.0, nb.burst - 1.0);  // consume 1 for this request
+        nb.last         = now;
+        g_buckets.emplace(ip, nb);
+
         // periodic cleanup
         if(now - g_last_cleanup > std::chrono::minutes(5)){
-            for(auto it = g_buckets.begin(); it != g_buckets.end();){
-                if(now - it->second.last > std::chrono::minutes(10)) it = g_buckets.erase(it);
-                else ++it;
+            for(auto it2 = g_buckets.begin(); it2 != g_buckets.end();){
+                if(now - it2->second.last > std::chrono::minutes(10)) it2 = g_buckets.erase(it2);
+                else ++it2;
+            }
+            g_last_cleanup = now;
+        }
+        return true;
+    }
+
+    // Existing bucket: refill and check
+    TokenBucket& b = it->second;
+    double dt = std::chrono::duration<double>(now - b.last).count();
+    b.last = now;
+    if (b.rate_per_sec <= 0.0) b.rate_per_sec = (double)rps;
+    if (b.burst       <= 0.0) b.burst        = (double)burst;
+    b.tokens = std::min(b.burst, b.tokens + dt * b.rate_per_sec);
+    if (b.tokens >= 1.0){
+        b.tokens -= 1.0;
+        if(now - g_last_cleanup > std::chrono::minutes(5)){
+            for(auto it2 = g_buckets.begin(); it2 != g_buckets.end();){
+                if(now - it2->second.last > std::chrono::minutes(10)) it2 = g_buckets.erase(it2);
+                else ++it2;
             }
             g_last_cleanup = now;
         }
