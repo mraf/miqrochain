@@ -154,6 +154,7 @@ public:
     inline Mempool*       mempool()       { return mempool_; }
     inline const Mempool* mempool() const { return mempool_; }
 
+    bool check_rate(PeerState& ps, const char* key);
     bool start(uint16_t port);
     void stop();
 
