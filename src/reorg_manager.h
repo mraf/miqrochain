@@ -61,4 +61,4 @@ private:
     static long double work_from_bits(uint32_t bits);
 };
 
-} // namespace miq
+}
