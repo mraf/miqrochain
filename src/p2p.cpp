@@ -724,6 +724,36 @@ void P2P::stop(){
 
 // === outbound connect helpers ===============================================
 
+bool P2P::check_rate(PeerState& ps, const char* key) {
+    if (!key) return true;
+
+    using Rule = std::tuple<const char*, const char*, uint32_t, uint32_t>; // family, name, burst, window_ms
+    struct Map { const char* key; Rule r; };
+
+    static const Map kTable[] = {
+        {"invb",    {"inv",  "block",    64,  1000}},
+        {"invtx",   {"inv",  "tx",       256, 1000}},
+        {"getb",    {"get",  "block",    8,   1000}},
+        {"getbi",   {"get",  "blockidx", 2,   2000}},
+        {"gettx",   {"get",  "tx",       128, 1000}},
+        {"gethdr",  {"get",  "headers",  2,   2000}},
+        {"addr",    {"addr", "push",     64,  60000}},
+        {"getaddr", {"addr", "pull",     8,   60000}},
+    };
+
+    for (const auto& e : kTable) {
+        if (std::strcmp(e.key, key) == 0) {
+            return check_rate(ps,
+                              std::get<0>(e.r),
+                              std::get<1>(e.r),
+                              std::get<2>(e.r),
+                              std::get<3>(e.r));
+        }
+    }
+    // Conservative default
+    return check_rate(ps, "misc", key, 32, 1000);
+}
+
 bool P2P::connect_seed(const std::string& host, uint16_t port){
     // respect per-host cooldown
     {
