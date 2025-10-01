@@ -302,64 +302,49 @@ int main(int argc, char** argv){
         std::fprintf(stderr, "[BOOT] chain.open OK\n");
 
         // --- Genesis key (robust) ---
-        std::fprintf(stderr, "[BOOT] genesis key begin\n");
-
-// IMPORTANT: never generate a new key here — must match the network you started.
-std::vector<uint8_t> gpriv;
-if (!load_existing_genesis_priv(cfg.datadir, gpriv)) {
-    log_error(
-        "Missing/invalid genesis private key.\n"
-        "Provide it via MIQ_GENESIS_PRIV_HEX=<64-hex> or place it at "
-        + cfg.datadir + "/genesis.key (32 raw bytes or 64-hex)."
-    );
-    return 1;
-}
-
-std::vector<uint8_t> gpub33;
-if(!crypto::ECDSA::derive_pub(gpriv, gpub33) || gpub33.size()!=33){
-    log_error("genesis derive_pub failed (key corrupt?)");
-    return 1;
-}
-auto gpkh = hash160(gpub33);
-std::fprintf(stderr, "[BOOT] genesis key ok\n");
-
-        // --- Genesis coinbase (prev.vout=0 to avoid serializer overflow bug) ---
-Transaction cb0;
+std::fprintf(stderr, "[BOOT] load genesis from constants raw hex\n");
 {
-    TxIn coin; coin.prev.txid = std::vector<uint8_t>(32,0); coin.prev.vout = 0;
-    cb0.vin.push_back(coin);
-    TxOut cbout; cbout.value = INITIAL_SUBSIDY; cbout.pkh = gpkh; // uses loaded genesis key
-    cb0.vout.push_back(cbout);
-}
-
-Block g;
-g.header.time  = GENESIS_TIME;
-g.header.bits  = GENESIS_BITS;
-g.header.nonce = (uint64_t)GENESIS_NONCE;   // set your constant nonce
-g.txs.push_back(cb0);
-
-// Compute and *verify* Merkle matches constants
-{
-    std::vector<std::vector<uint8_t>> txids;
-    txids.push_back(cb0.txid());
-    auto mr = merkle_root(txids);
-    const auto mr_hex = to_hex(mr);
-    if (mr_hex != std::string(GENESIS_MERKLE_HEX)) {
-        log_error("GENESIS_MERKLE_HEX mismatch.\nComputed: " + mr_hex +
-                  "\nExpected: " + std::string(GENESIS_MERKLE_HEX) +
-                  "\nYour genesis private key is not the original one used for this network.");
+    // Parse raw block bytes from constants
+    std::vector<uint8_t> raw;
+    try {
+        raw = miq::from_hex(GENESIS_RAW_BLOCK_HEX);
+    } catch (...) {
+        log_error("GENESIS_RAW_BLOCK_HEX is not valid hex");
         return 1;
     }
-    g.header.merkle_root = mr;
+    if (raw.empty()) {
+        log_error("GENESIS_RAW_BLOCK_HEX is empty");
+        return 1;
+    }
+
+    // Deserialize and verify against pinned hash/merkle
+    Block g;
+    if (!deser_block(raw, g)) {
+        log_error("Failed to deserialize GENESIS_RAW_BLOCK_HEX");
+        return 1;
+    }
+
+    const std::string got_hash   = to_hex(g.block_hash());
+    const std::string want_hash  = std::string(GENESIS_HASH_HEX);
+    if (got_hash != want_hash) {
+        log_error(std::string("Genesis hash mismatch. got=") + got_hash + " want=" + want_hash);
+        return 1;
+    }
+
+    const std::string got_merkle = to_hex(g.header.merkle_root);
+    const std::string want_merkle= std::string(GENESIS_MERKLE_HEX);
+    if (got_merkle != want_merkle) {
+        log_error(std::string("Genesis merkle mismatch. got=") + got_merkle + " want=" + want_merkle);
+        return 1;
+    }
+
+    std::fprintf(stderr, "[BOOT] init_genesis begin\n");
+    if (!chain.init_genesis(g)) {
+        log_error("genesis init failed");
+        return 1;
+    }
+    std::fprintf(stderr, "[BOOT] init_genesis OK\n");
 }
-
-        std::fprintf(stderr, "[BOOT] init_genesis begin\n");
-        if(!chain.init_genesis(g)){
-            log_error("genesis init failed");
-            return 1;
-        }
-        std::fprintf(stderr, "[BOOT] init_genesis OK\n");
-
         // === NEW: Optional UTXO reindex BEFORE starting services ===============
         if (flag_reindex_utxo) {
             log_info("ReindexUTXO: rebuilding chainstate from active chain...");
