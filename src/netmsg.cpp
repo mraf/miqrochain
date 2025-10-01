@@ -1,4 +1,5 @@
-// src/netmsg.cpp
+// netmsg.cpp (drop-in replacement)
+
 #include "netmsg.h"
 
 #include <vector>
@@ -35,6 +36,17 @@
 #define MIQ_ADDR_MAX_BATCH 1000
 #endif
 
+// Headers-first wire constants (must match p2p.cpp)
+#ifndef MIQ_HDR_WIRE_BYTES
+#define MIQ_HDR_WIRE_BYTES 88            // serialized BlockHeader size on the wire
+#endif
+#ifndef MIQ_MAX_HEADERS_PER_MSG
+#define MIQ_MAX_HEADERS_PER_MSG 2000
+#endif
+#ifndef MIQ_MAX_LOCATOR_HASHES
+#define MIQ_MAX_LOCATOR_HASHES 32        // locator cap used by p2p.cpp
+#endif
+
 namespace miq {
 
 // ---- local helpers ---------------------------------------------------------
@@ -58,7 +70,9 @@ static bool cmd_is_allowed(const std::string& c){
         "version","verack","ping","pong",
         "invb","getb","getbi","block",
         "invtx","gettx","tx",
-        "getaddr","addr"
+        "getaddr","addr",
+        // headers-first & relay extras
+        "getheaders","headers","feefilter"
     };
     for (auto* s : k) if (c == s) return true;
     return false;
@@ -92,8 +106,33 @@ static bool length_ok_for_command(const std::string& cmd, size_t n){
     }
 
     if (cmd == "tx"){
-        // allow up to configured tx size (or 1 MiB fallback)
+        // allow up to configured tx size (or fallback)
         return n > 0 && n <= (size_t)MIQ_FALLBACK_MAX_TX_SIZE;
+    }
+
+    if (cmd == "feefilter"){
+        return n == 8; // uint64 min-relay (per kB)
+    }
+
+    if (cmd == "getheaders"){
+        // 1 byte count (0..32), count*32 locator hashes, 32 bytes stop-hash
+        // Accept any n that matches this shape & <= cap
+        if (n < 33) return false;              // at least 1 + 0*32 + 32
+        if ((n - 33) % 32 != 0) return false;  // (n - (1+32)) must be multiple of 32
+        size_t count = (n - 33) / 32;
+        if (count > MIQ_MAX_LOCATOR_HASHES) return false;
+        // absolute upper bound to guard
+        if (n > (size_t)(1 + MIQ_MAX_LOCATOR_HASHES*32 + 32)) return false;
+        return true;
+    }
+
+    if (cmd == "headers"){
+        // 2-byte count (LE), then count * 88-byte headers
+        if (n < 2) return false;
+        if ((n - 2) % MIQ_HDR_WIRE_BYTES != 0) return false;
+        size_t count = (n - 2) / MIQ_HDR_WIRE_BYTES;
+        if (count == 0 || count > MIQ_MAX_HEADERS_PER_MSG) return false;
+        return true;
     }
 
     // Unknown command: reject
@@ -102,7 +141,7 @@ static bool length_ok_for_command(const std::string& cmd, size_t n){
 
 // ---- public API ------------------------------------------------------------
 
-// Wire format (unchanged): command[12] (ASCII, NUL-padded) | len[4-le] | payload[len]
+// Wire format: command[12] (ASCII, NUL-padded) | len[4-le] | payload[len]
 std::vector<uint8_t> encode_msg(const std::string& cmd_in, const std::vector<uint8_t>& payload){
     // Normalize command: lower-case, max 12 chars, ASCII
     std::string cmd = cmd_in;
