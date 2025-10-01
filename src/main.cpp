@@ -40,6 +40,41 @@
 #include <atomic>
 #include <memory>  // std::unique_ptr
 
+// --- small file helpers ------------------------------------------------------
+static bool read_file_all(const std::string& path, std::vector<uint8_t>& out){
+    std::ifstream f(path, std::ios::binary);
+    if(!f) return false;
+    f.seekg(0, std::ios::end);
+    std::streamsize n = f.tellg();
+    if(n < 0) return false;
+    f.seekg(0, std::ios::beg);
+    out.resize((size_t)n);
+    if(n > 0 && !f.read(reinterpret_cast<char*>(out.data()), n)) return false;
+    return true;
+}
+
+// Load the *existing* genesis private key.
+// Accepts: env MIQ_GENESIS_PRIV_HEX (64 hex) or <datadir>/genesis.key (32 raw bytes or 64 hex).
+static bool load_existing_genesis_priv(const std::string& datadir, std::vector<uint8_t>& out32){
+    // 1) Environment override
+    if (const char* h = std::getenv("MIQ_GENESIS_PRIV_HEX")) {
+        auto v = from_hex(std::string(h));
+        if (v.size() == 32) { out32 = std::move(v); return true; }
+        return false;
+    }
+    // 2) datadir/genesis.key
+    std::vector<uint8_t> buf;
+    if (read_file_all(datadir + "/genesis.key", buf)) {
+        if (buf.size() == 32) { out32 = std::move(buf); return true; }
+        // allow text hex file
+        std::string s(reinterpret_cast<const char*>(buf.data()), buf.size());
+        auto v = from_hex(s);
+        if (v.size() == 32) { out32 = std::move(v); return true; }
+        return false;
+    }
+    return false; // not found
+}
+
 using namespace miq;
 
 static std::vector<uint8_t> g_mine_pkh;
@@ -269,36 +304,55 @@ int main(int argc, char** argv){
 
         // --- Genesis key (robust) ---
         std::fprintf(stderr, "[BOOT] genesis key begin\n");
-        std::vector<uint8_t> gpriv;
-        try { gpriv = from_hex(GENESIS_ECDSA_PRIV_HEX); } catch(...) {}
-        if(gpriv.size()!=32) crypto::ECDSA::generate_priv(gpriv);
 
-        std::vector<uint8_t> gpub33;
-        if(!crypto::ECDSA::derive_pub(gpriv, gpub33) || gpub33.size()!=33){
-            crypto::ECDSA::generate_priv(gpriv);
-            crypto::ECDSA::derive_pub(gpriv, gpub33);
-        }
-        auto gpkh = hash160(gpub33);
-        std::fprintf(stderr, "[BOOT] genesis key ok\n");
+// IMPORTANT: never generate a new key here — must match the network you started.
+std::vector<uint8_t> gpriv;
+if (!load_existing_genesis_priv(cfg.datadir, gpriv)) {
+    log_error(
+        "Missing/invalid genesis private key.\n"
+        "Provide it via MIQ_GENESIS_PRIV_HEX=<64-hex> or place it at "
+        + cfg.datadir + "/genesis.key (32 raw bytes or 64-hex)."
+    );
+    return 1;
+}
+
+std::vector<uint8_t> gpub33;
+if(!crypto::ECDSA::derive_pub(gpriv, gpub33) || gpub33.size()!=33){
+    log_error("genesis derive_pub failed (key corrupt?)");
+    return 1;
+}
+auto gpkh = hash160(gpub33);
+std::fprintf(stderr, "[BOOT] genesis key ok\n");
 
         // --- Genesis coinbase (prev.vout=0 to avoid serializer overflow bug) ---
-        Transaction cb0;
-        {
-            TxIn coin; coin.prev.txid = std::vector<uint8_t>(32,0); coin.prev.vout = 0;
-            cb0.vin.push_back(coin);
-            TxOut cbout; cbout.value = INITIAL_SUBSIDY; cbout.pkh = gpkh;
-            cb0.vout.push_back(cbout);
-        }
+Transaction cb0;
+{
+    TxIn coin; coin.prev.txid = std::vector<uint8_t>(32,0); coin.prev.vout = 0;
+    cb0.vin.push_back(coin);
+    TxOut cbout; cbout.value = INITIAL_SUBSIDY; cbout.pkh = gpkh; // uses loaded genesis key
+    cb0.vout.push_back(cbout);
+}
 
-        Block g;
-        g.header.time = GENESIS_TIME;
-        g.header.bits = GENESIS_BITS;
-        g.txs.push_back(cb0);
-        {
-            std::vector<std::vector<uint8_t>> txids;
-            txids.push_back(cb0.txid());
-            g.header.merkle_root = merkle_root(txids);
-        }
+Block g;
+g.header.time  = GENESIS_TIME;
+g.header.bits  = GENESIS_BITS;
+g.header.nonce = (uint64_t)GENESIS_NONCE;   // set your constant nonce
+g.txs.push_back(cb0);
+
+// Compute and *verify* Merkle matches constants
+{
+    std::vector<std::vector<uint8_t>> txids;
+    txids.push_back(cb0.txid());
+    auto mr = merkle_root(txids);
+    const auto mr_hex = to_hex(mr);
+    if (mr_hex != std::string(GENESIS_MERKLE_HEX)) {
+        log_error("GENESIS_MERKLE_HEX mismatch.\nComputed: " + mr_hex +
+                  "\nExpected: " + std::string(GENESIS_MERKLE_HEX) +
+                  "\nYour genesis private key is not the original one used for this network.");
+        return 1;
+    }
+    g.header.merkle_root = mr;
+}
 
         std::fprintf(stderr, "[BOOT] init_genesis begin\n");
         if(!chain.init_genesis(g)){
