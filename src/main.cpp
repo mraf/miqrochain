@@ -17,12 +17,12 @@
 #include "merkle.h"
 #include "crypto/ecdsa_iface.h"
 #include "hex.h"
-#include "difficulty.h"   // + use LWMA to compute next_bits
+#include "difficulty.h"   // LWMA next_bits
 
-#include "tls_proxy.h"    // NEW: TLS terminator for RPC
-#include "ibd_monitor.h"  // NEW: IBD sampling for getibdinfo
+#include "tls_proxy.h"    // TLS terminator for RPC
+#include "ibd_monitor.h"  // IBD sampling for getibdinfo
 
-// === NEW: UTXO KV + Reindex =================================================
+// === UTXO KV + Reindex =======================================================
 #include "utxo_kv.h"
 #include "reindex_utxo.h"
 // ============================================================================
@@ -35,11 +35,36 @@
 #include <string>
 #include <vector>
 #include <chrono>
-#include <cstring> // memcpy
-#include <cstdlib> // getenv,setenv
-#include <csignal> // signal handling
+#include <cstring>   // memcpy
+#include <cstdlib>   // getenv, setenv, _putenv_s
+#include <csignal>   // signal handling
 #include <atomic>
-#include <memory>  // std::unique_ptr
+#include <memory>    // std::unique_ptr
+#include <algorithm> // find_if
+
+// ---------- default per-user datadir (stable across launch locations) --------
+static std::string default_datadir() {
+#ifdef _WIN32
+    // %APPDATA%\miqrochain  (Roaming, works on all supported Windows)
+    size_t len = 0; char* v = nullptr;
+    if (_dupenv_s(&v, &len, "APPDATA") == 0 && v && len) {
+        std::string base(v); free(v);
+        return base + "\\miqrochain";
+    }
+    return "C:\\miqrochain-data";
+#elif defined(__APPLE__)
+    const char* home = std::getenv("HOME");
+    if (home && *home) return std::string(home) + "/Library/Application Support/miqrochain";
+    return "./miqdata";
+#else
+    if (const char* xdg = std::getenv("XDG_DATA_HOME")) {
+        if (*xdg) return std::string(xdg) + "/miqrochain";
+    }
+    const char* home = std::getenv("HOME");
+    if (home && *home) return std::string(home) + "/.miqrochain";
+    return "./miqdata";
+#endif
+}
 
 // ---------- small helpers (file + optional genesis key loader) --------------
 static bool read_file_all(const std::string& path, std::vector<uint8_t>& out){
@@ -85,16 +110,19 @@ static void print_usage(){
     std::cout
       << "miqrod options:\n"
       << "  --conf=<path>                                config file (key=value)\n"
+      << "  --datadir=<path>                             data directory (overrides config)\n"
       << "  --genaddress                                generate ECDSA-P2PKH address (priv/pk/address)\n"
       << "  --buildtx <priv_hex> <prev_txid_hex> <vout> <value> <to_address>  (prints txhex)\n"
       << "  --reindex_utxo                              rebuild chainstate/UTXO from current chain\n"
       << "  --utxo_kv                                   (reserved) enable KV-backed UTXO at runtime if supported\n"
       << "Env:\n"
-      << "  MIQ_MINING_ADDR     If set, node will mine to this address (Base58 P2PKH)\n";
+      << "  MIQ_MINING_ADDR     If set, node will mine to this address (Base58 P2PKH)\n"
+      << "  MIQ_MINER_THREADS   If set, overrides miner thread count\n";
 }
 
 static bool is_recognized_arg(const std::string& s){
     if(s.rfind("--conf=",0)==0) return true;
+    if(s.rfind("--datadir=",0)==0) return true;   // NEW
     if(s=="--genaddress") return true;
     if(s=="--buildtx") return true; // expects more args after
     if(s=="--reindex_utxo") return true;   // NEW
@@ -209,6 +237,8 @@ int main(int argc, char** argv){
             std::string a(argv[i]);
             if(a.rfind("--conf=",0)==0){
                 conf = a.substr(7);
+            } else if(a.rfind("--datadir=",0)==0){
+                cfg.datadir = a.substr(10);            // NEW
             } else if(a=="--genaddress"){
                 genaddr = true;
             } else if(a=="--buildtx" && i+5<argc){
@@ -295,7 +325,9 @@ int main(int argc, char** argv){
             load_config(conf, cfg);
         }
 
-        if(cfg.datadir.empty()) cfg.datadir = "./miqdata";
+        // Use stable per-user default datadir if not provided
+        if(cfg.datadir.empty()) cfg.datadir = default_datadir();
+
         std::error_code ec;
         std::filesystem::create_directories(cfg.datadir, ec); // best-effort
 
@@ -360,7 +392,7 @@ int main(int argc, char** argv){
         }
         // ------------------------------------------------------------------
 
-        // === NEW: Optional UTXO reindex BEFORE starting services ===========
+        // === Optional UTXO reindex BEFORE starting services ================
         if (flag_reindex_utxo) {
             log_info("ReindexUTXO: rebuilding chainstate from active chain...");
             UTXOKV utxo_kv;
@@ -412,6 +444,22 @@ int main(int argc, char** argv){
             setenv("MIQ_RPC_REQUIRE_TOKEN", "1", 1);
 #endif
 
+            // NEW: synchronize HTTP gate token to the RPC cookie so clients only need Authorization: Bearer <cookie>
+            try {
+                std::ifstream f(cfg.datadir + "/.cookie", std::ios::binary);
+                std::string tok((std::istreambuf_iterator<char>(f)), {});
+                // trim trailing whitespace
+                while(!tok.empty() && (tok.back()=='\r'||tok.back()=='\n'||tok.back()==' '||tok.back()=='\t')) tok.pop_back();
+#ifdef _WIN32
+                _putenv_s("MIQ_RPC_TOKEN", tok.c_str());
+#else
+                setenv("MIQ_RPC_TOKEN", tok.c_str(), 1);
+#endif
+                log_info("HTTP gate token synchronized with RPC cookie");
+            } catch (...) {
+                log_warn("Could not sync MIQ_RPC_TOKEN to cookie; clients may need X-Auth-Token");
+            }
+
             rpc.start(RPC_PORT);
             log_info("RPC listening on " + std::to_string(RPC_PORT));
         }
@@ -436,19 +484,21 @@ int main(int argc, char** argv){
         }
 
         // --- Miner (off if no_mine or no address). Keep coinbase prev.vout=0.
+        // Default behavior:
+        // 1) If config provided miner_threads, use it.
+        // 2) Else if env MIQ_MINER_THREADS is set, use it.
+        // 3) Else DEFAULT to 6 (so double-click uses 6 threads with no shell/env).
         unsigned threads = cfg.miner_threads;
-
         if (threads == 0) {
             if (const char* s = std::getenv("MIQ_MINER_THREADS")) {
                 char* end = nullptr;
                 long v = std::strtol(s, &end, 10);
-        if (end != s && v > 0 && v <= 256) {
-                threads = static_cast<unsigned>(v);
+                if (end != s && v > 0 && v <= 256) {
+                    threads = static_cast<unsigned>(v);
                 }
             }
         }
         if (threads == 0) threads = 6;
-
         log_info("miner: using " + std::to_string(threads) + " thread(s)");
 
         if(!cfg.no_mine){
