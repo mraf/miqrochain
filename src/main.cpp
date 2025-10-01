@@ -28,6 +28,7 @@
 // ============================================================================
 
 #include <thread>
+#include <fstream>
 #include <iostream>
 #include <filesystem>
 #include <cstdio>
@@ -40,7 +41,6 @@
 #include <atomic>
 #include <memory>  // std::unique_ptr
 
-// --- small file helpers ------------------------------------------------------
 static bool read_file_all(const std::string& path, std::vector<uint8_t>& out){
     std::ifstream f(path, std::ios::binary);
     if(!f) return false;
@@ -58,7 +58,7 @@ static bool read_file_all(const std::string& path, std::vector<uint8_t>& out){
 static bool load_existing_genesis_priv(const std::string& datadir, std::vector<uint8_t>& out32){
     // 1) Environment override
     if (const char* h = std::getenv("MIQ_GENESIS_PRIV_HEX")) {
-        auto v = from_hex(std::string(h));
+        auto v = miq::from_hex(std::string(h));
         if (v.size() == 32) { out32 = std::move(v); return true; }
         return false;
     }
@@ -68,13 +68,12 @@ static bool load_existing_genesis_priv(const std::string& datadir, std::vector<u
         if (buf.size() == 32) { out32 = std::move(buf); return true; }
         // allow text hex file
         std::string s(reinterpret_cast<const char*>(buf.data()), buf.size());
-        auto v = from_hex(s);
+        auto v = miq::from_hex(s);
         if (v.size() == 32) { out32 = std::move(v); return true; }
         return false;
     }
     return false; // not found
 }
-
 using namespace miq;
 
 static std::vector<uint8_t> g_mine_pkh;
