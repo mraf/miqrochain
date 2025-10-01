@@ -309,8 +309,7 @@ add_executable(miq-keygen
     src/crypto/secure_random.cpp
     src/crypto/secure_random.h
 )
-target_include_directories(miq-keygen PRIVATE src ${MICRO_ECC_DIR})
-target_compile_definitions(miq-keygen PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
+target_compile_definitions(miq-keygen PRIVATE MIQ_USE_SECP256K1=1)
 if(WIN32)
   target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
