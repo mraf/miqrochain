@@ -181,6 +181,12 @@
   #ifndef NOMINMAX
   #define NOMINMAX
   #endif
+  #ifdef min
+  #undef min
+  #endif
+  #ifdef max
+  #undef max
+  #endif
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #pragma comment(lib, "Ws2_32.lib")
@@ -735,31 +741,25 @@ void P2P::stop(){
 bool P2P::check_rate(PeerState& ps, const char* key) {
     if (!key) return true;
 
-    using Rule = std::tuple<const char*, const char*, uint32_t, uint32_t>; // family, name, burst, window_ms
-    struct Map { const char* key; Rule r; };
-
+    struct Map { const char* key; const char* family; };
     static const Map kTable[] = {
-        {"invb",    {"inv",  "block",    64,  1000}},
-        {"invtx",   {"inv",  "tx",       256, 1000}},
-        {"getb",    {"get",  "block",    8,   1000}},
-        {"getbi",   {"get",  "blockidx", 2,   2000}},
-        {"gettx",   {"get",  "tx",       128, 1000}},
-        {"gethdr",  {"get",  "headers",  2,   2000}},
-        {"addr",    {"addr", "push",     64,  60000}},
-        {"getaddr", {"addr", "pull",     8,   60000}},
+        {"invb",   "inv"},
+        {"invtx",  "inv"},
+        {"getb",   "get"},
+        {"getbi",  "get"},
+        {"gettx",  "get"},
+        {"gethdr", "get"},
+        {"addr",   "addr"},
+        {"getaddr","addr"},
     };
 
     for (const auto& e : kTable) {
         if (std::strcmp(e.key, key) == 0) {
-            return check_rate(ps,
-                              std::get<0>(e.r),
-                              std::get<1>(e.r),
-                              std::get<2>(e.r),
-                              std::get<3>(e.r));
+            return check_rate(ps, e.family, 1.0, now_ms());
         }
     }
     // Conservative default
-    return check_rate(ps, "misc", key, 32, 1000);
+    return check_rate(ps, "misc", 1.0, now_ms());
 }
 
 // 5-arg overload used by the key-based helper above
