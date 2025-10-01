@@ -186,12 +186,14 @@ struct TokenBucket {
 };
 
 static std::unordered_map<std::string, TokenBucket> g_buckets;
+static std::mutex g_buckets_mtx; // FIX: protect map + cleanup against data races
 static std::chrono::steady_clock::time_point g_last_cleanup = std::chrono::steady_clock::now();
 static std::atomic<int> g_live_conns{0};
 
 // Refill & check token bucket
 static bool rl_allow(const std::string& ip, int rps, int burst){
     auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lk(g_buckets_mtx);
 
     // First time: prefill and allow the first request (consume 1 token).
     auto it = g_buckets.find(ip);
@@ -699,7 +701,25 @@ void HttpServer::start(
                 std::string content_type = get_header(headers, "content-type");
                 if(content_type.empty()) content_type = "application/json";
 
-                // Early: /healthz
+                // =================== EARLY HANDLERS (no auth gate) ===================
+                // CORS preflight
+                if(lc(method) == "options"){
+                    std::vector<std::pair<std::string,std::string>> hdrs = {
+                        {"X-Request-Id", reqid}
+                    };
+                    if(allow_cors){
+                        hdrs.emplace_back("Access-Control-Allow-Origin","*");
+                        hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type, X-Request-Id");
+                        hdrs.emplace_back("Access-Control-Allow-Methods","POST, OPTIONS");
+                        hdrs.emplace_back("Access-Control-Max-Age","600");
+                    }
+                    send_http_simple(fd, 204, "No Content", "text/plain", "", hdrs);
+                    access_logf(204, ip, method, path, "", 0, 0, reqid);
+                    closesocket(fd);
+                    return;
+                }
+
+                // /healthz
                 if(lc(method) == "get" && enable_healthz && path == "/healthz"){
                     std::string resp = std::string("{\"ok\":true,\"live_conns\":") +
                                        std::to_string(g_live_conns.load()) + "}";
@@ -714,7 +734,7 @@ void HttpServer::start(
                     return;
                 }
 
-                // Early: /metrics
+                // /metrics
                 if(lc(method) == "get" && enable_metrics && path == "/metrics"){
                     bool ok = true;
                     if(!bound_loopback && !metrics_public){
@@ -750,6 +770,7 @@ void HttpServer::start(
                     closesocket(fd);
                     return;
                 }
+                // =====================================================================
 
                 // Token policy (legacy env-based gate; OK to disable by leaving env unset)
                 bool token_required = require_always || !bound_loopback;
@@ -818,8 +839,9 @@ void HttpServer::start(
                     }
                 }
 
-                // Only POST (OPTIONS allowed for CORS)
+                // Only POST (we already handled OPTIONS above)
                 if(lc(method) != "post"){
+                    g_metrics.http_method_not_allowed_total += 1;
                     std::vector<std::pair<std::string,std::string>> hdrs;
                     if(allow_cors){
                         hdrs.emplace_back("Access-Control-Allow-Origin","*");
@@ -827,14 +849,6 @@ void HttpServer::start(
                         hdrs.emplace_back("Access-Control-Allow-Methods","POST, OPTIONS");
                     }
                     hdrs.emplace_back("X-Request-Id", reqid);
-                    if(lc(method) == "options"){
-                        // CORS preflight (no body)
-                        send_http_simple(fd, 204, "No Content", "text/plain", "", hdrs);
-                        access_logf(204, ip, method, path, "", 0, 0, reqid);
-                        closesocket(fd);
-                        return;
-                    }
-                    g_metrics.http_method_not_allowed_total += 1;
                     const std::string body_405 = "{\"error\":\"only POST\"}";
                     send_http_simple(fd, 405, "Method Not Allowed", "application/json", body_405, hdrs);
                     access_logf(405, ip, method, path, "", body.size(), body_405.size(), reqid);
