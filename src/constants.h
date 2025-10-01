@@ -77,7 +77,7 @@ static constexpr uint32_t GENESIS_NONCE = 0xd3dda73c;    // low 32 bits
 
 // Explicit hash & merkle of block 0 (display/big-endian hex as you had)
 static constexpr const char* GENESIS_HASH_HEX   = "00000000a5e8a7eb02a83fb9693bc2dccbf14ee69d67315c1f151a25cb43fce8";
-static constexpr const char* GENESIS_MERKLE_HEX = "97a08487d57f8e55c4368308978703ad51e733df73950d4bcded07b8cdf3d2c5";
+static constexpr const char* GENESIS_MERKLE_HEX = "c5d2f3cdb807edcd4b0d9573df33e751ad038797088336c4558e7fd58784a097";
 
 // Bundled genesis private key (leave empty if you don’t embed it)
 static constexpr const char* GENESIS_ECDSA_PRIV_HEX = "";
