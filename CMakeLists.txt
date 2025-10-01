@@ -303,8 +303,11 @@ add_executable(miq-keygen
     src/hash160.h src/hash160.cpp
     src/base58.h src/base58.cpp
     src/hex.h src/hex.cpp
-    ${MICRO_ECC_DIR}/uECC.c
-    src/crypto/uECC_shim.c
+    src/crypto/ecdsa_secp256k1.cpp
+    src/crypto/ecdsa_secp256k1.h
+    src/crypto/ecdsa_iface.h
+    src/crypto/secure_random.cpp
+    src/crypto/secure_random.h
 )
 target_include_directories(miq-keygen PRIVATE src ${MICRO_ECC_DIR})
 target_compile_definitions(miq-keygen PRIVATE uECC_SUPPORT_COMPRESSED_POINT=1)
