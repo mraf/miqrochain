@@ -9,6 +9,8 @@
 #include "utxo.h"   // fee calc (UTXOEntry)
 
 #include <chrono>
+#include <tuple>
+#include <cstring> 
 #include <fstream>
 #include <cstring>
 #include <algorithm>
