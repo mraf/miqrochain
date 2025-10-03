@@ -39,7 +39,7 @@ Miqrochain Core is open source under the **MIT** license. See `LICENSE`.
 
 ```bash
 # Linux/macOS (Release build)
-git clone <your-repo-url> miqrochain
+git clone https://github.com/takumichronen/miqrochain.git
 cd miqrochain
 mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
