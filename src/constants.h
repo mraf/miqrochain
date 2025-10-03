@@ -3,9 +3,11 @@
 #include <cstddef>
 #include <string>
 
+//
 // ==== P2P/addrman tuning (macros picked up by p2p.cpp) =====================
 // These are optional overrides; p2p.cpp only defines its own defaults if these
 // are *not* defined here. Adjust as you like without touching code.
+//
 
 // Enable the new persistent addrman path
 #ifndef MIQ_ENABLE_ADDRMAN
@@ -58,8 +60,19 @@ static constexpr uint64_t COIN = 100000000ULL;
 static constexpr uint64_t BLOCK_TIME_SECS = 480; // 8 minutes
 static constexpr uint16_t P2P_PORT = 55001;      // (kept as-is per your current config)
 static constexpr uint16_t RPC_PORT = 9834;
-static constexpr uint32_t MAGIC    = 0xA3FB9E21;
 
+// Historical 32-bit network tag you already had; we continue to honor it.
+static constexpr uint32_t MAGIC = 0xA3FB9E21;
+
+// Canonical **wire** magic bytes (big-endian rendering of MAGIC). Keep stable forever.
+static constexpr uint8_t MAGIC_BE[4] = {
+    static_cast<uint8_t>((MAGIC >> 24) & 0xFF),
+    static_cast<uint8_t>((MAGIC >> 16) & 0xFF),
+    static_cast<uint8_t>((MAGIC >>  8) & 0xFF),
+    static_cast<uint8_t>((MAGIC >>  0) & 0xFF),
+};
+
+// Money / subsidy
 static constexpr uint64_t MAX_MONEY        = 26280000ULL * COIN;
 static constexpr uint64_t INITIAL_SUBSIDY  = 50ULL * COIN;
 static constexpr uint64_t HALVING_INTERVAL = 262800ULL;
@@ -130,4 +143,4 @@ static constexpr size_t MAX_MSG_SIZE   = 2 * 1024 * 1024; // 2 MiB
 // Optional: default RPC token (empty = no token unless MIQ_RPC_TOKEN env set)
 static constexpr const char* RPC_TOKEN_DEFAULT = "";
 
-}
+} 
