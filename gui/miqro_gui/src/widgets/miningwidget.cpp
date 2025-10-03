@@ -1,28 +1,46 @@
-#include "miningwidget.h"
+#include "overviewwidget.h"
 #include "../rpcclient.h"
 #include <QVBoxLayout>
+#include <QHBoxLayout>
 #include <QLabel>
 #include <QTimer>
 #include <QJsonObject>
 
+class KV : public QWidget {
+public:
+    KV(const QString &k, const QString &v, QWidget *p=nullptr) : QWidget(p){
+        auto *l = new QHBoxLayout(this);
+        l->addWidget(new QLabel(QString("<b>%1</b>").arg(k)));
+        m_v = new QLabel(v);
+        l->addWidget(m_v, 1);
+    }
+    void setV(const QString &v){ m_v->setText(v); }
+private:
+    QLabel *m_v{nullptr};
+};
 
-MiningWidget::MiningWidget(RpcClient &rpc, QWidget *p) : QWidget(p), m_rpc(rpc){
-auto *lay = new QVBoxLayout(this);
-lay->addWidget(new QLabel("<h2>Mining</h2>"));
-m_height = new QLabel("Height: -"); lay->addWidget(m_height);
-m_hash = new QLabel("Hashrate: 0 H/s"); lay->addWidget(m_hash);
-lay->addStretch(1);
+OverviewWidget::OverviewWidget(RpcClient &rpc, QWidget *p) : QWidget(p), m_rpc(rpc){
+    auto *lay = new QVBoxLayout(this);
+    lay->addWidget(new QLabel("<h2>Overview</h2>"));
 
+    auto *hHeight = new KV("Height", "-");
+    auto *hHash   = new KV("Best Hash", "-");
+    auto *hBits   = new KV("Bits", "-");
 
-m_timer = new QTimer(this); m_timer->setInterval(1000);
-connect(m_timer, &QTimer::timeout, this, [this]{
-try {
-const auto v = m_rpc.getMinerStats().toObject();
-const auto h = v.value("height").toInt();
-const auto hr= v.value("hashrate").toDouble();
-m_height->setText(QString("Height: %1").arg(h));
-m_hash->setText(QString("Hashrate: %1 H/s").arg(hr,0,'f',0));
-} catch (...) {}
-});
-m_timer->start();
+    lay->addWidget(hHeight);
+    lay->addWidget(hHash);
+    lay->addWidget(hBits);
+    lay->addStretch(1);
+
+    m_timer = new QTimer(this);
+    m_timer->setInterval(2000);
+    connect(m_timer, &QTimer::timeout, this, [this, hHeight, hHash, hBits]{
+        try {
+            const auto v = m_rpc.getTipInfo().toObject();
+            hHeight->setV(QString::number(v.value("height").toInt()));
+            hHash->setV(v.value("best_hash").toString());
+            hBits->setV(QString::number(v.value("bits").toInt()));
+        } catch (...) {}
+    });
+    m_timer->start();
 }
