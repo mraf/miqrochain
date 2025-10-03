@@ -1,15 +1,12 @@
 #pragma once
 #include <QWidget>
-class RpcClient; class QTimer; class QLabel;
+class RpcClient; class QTimer;
 
-
-class MiningWidget : public QWidget {
-Q_OBJECT
+class OverviewWidget : public QWidget {
+    Q_OBJECT
 public:
-explicit MiningWidget(RpcClient &rpc, QWidget *parent=nullptr);
+    explicit OverviewWidget(RpcClient &rpc, QWidget *parent=nullptr);
 private:
-RpcClient &m_rpc;
-QTimer *m_timer{nullptr};
-QLabel *m_hash{nullptr};
-QLabel *m_height{nullptr};
+    RpcClient &m_rpc;
+    QTimer *m_timer{nullptr};
 };
