@@ -11,7 +11,8 @@ public:
     KV(const QString &k, const QString &v, QWidget *p=nullptr) : QWidget(p){
         auto *l = new QHBoxLayout(this);
         l->addWidget(new QLabel(QString("<b>%1</b>").arg(k)));
-        m_v = new QLabel(v); l->addWidget(m_v, 1);
+        m_v = new QLabel(v);
+        l->addWidget(m_v, 1);
     }
     void setV(const QString &v){ m_v->setText(v); }
 private:
