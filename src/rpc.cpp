@@ -219,6 +219,27 @@ static uint64_t min_fee_for_size(size_t sz_bytes){
     return kb * rate;
 }
 
+namespace {
+std::string json_err(std::string_view m) {
+    miq::JNode root;
+    std::map<std::string, miq::JNode> o;
+    miq::JNode e; e.v = std::string(m);
+    o["error"] = e;
+    root.v = o;
+    return json_dump(root);
+}
+std::string json_ok(const miq::JNode& res) {
+    miq::JNode root;
+    std::map<std::string, miq::JNode> o;
+    miq::JNode rn; rn.v = res.v;
+    miq::JNode en; en.v = miq::JNull{};
+    o["result"] = rn;
+    o["error"]  = en;
+    root.v = o;
+    return json_dump(root);
+}
+}
+
 // ---- Wallet passphrase cache (RAM only) ------------------------------------
 namespace {
     static std::string g_cached_pass;
