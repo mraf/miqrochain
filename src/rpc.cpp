@@ -18,6 +18,7 @@
 
 #include <sstream>
 #include <array>
+#include <string_view>
 #include <map>
 #include <exception>
 #include <chrono>
@@ -301,6 +302,61 @@ std::string RpcService::handle(const std::string& body){
             params = std::get<std::vector<JNode>>(ip->second.v);
 
         // ---------------- basic/info ----------------
+      auto err = [&](std::string_view m) -> std::string {
+    miq::JNode root;
+    std::map<std::string, miq::JNode> o;
+    miq::JNode e; e.v = std::string(m);
+    o["error"] = e;
+    root.v = o;
+    return json_dump(root);
+};
+
+auto ok = [&](const miq::JNode& res) -> std::string {
+    miq::JNode root;
+    std::map<std::string, miq::JNode> o;
+    miq::JNode rn; rn.v = res.v;
+    miq::JNode en; en.v = miq::JNull{};
+    o["result"] = rn;
+    o["error"]  = en;
+    root.v = o;
+    return json_dump(root);
+};auto err = [&](std::string_view m) -> std::string {
+    miq::JNode root;
+    std::map<std::string, miq::JNode> o;
+    miq::JNode e; e.v = std::string(m);
+    o["error"] = e;
+    root.v = o;
+    return json_dump(root);
+};
+
+auto ok = [&](const miq::JNode& res) -> std::string {
+    miq::JNode root;
+    std::map<std::string, miq::JNode> o;
+    miq::JNode rn; rn.v = res.v;
+    miq::JNode en; en.v = miq::JNull{};
+    o["result"] = rn;
+    o["error"]  = en;
+    root.v = o;
+    return json_dump(root);
+};auto err = [&](std::string_view m) -> std::string {
+    miq::JNode root;
+    std::map<std::string, miq::JNode> o;
+    miq::JNode e; e.v = std::string(m);
+    o["error"] = e;
+    root.v = o;
+    return json_dump(root);
+};
+
+auto ok = [&](const miq::JNode& res) -> std::string {
+    miq::JNode root;
+    std::map<std::string, miq::JNode> o;
+    miq::JNode rn; rn.v = res.v;
+    miq::JNode en; en.v = miq::JNull{};
+    o["result"] = rn;
+    o["error"]  = en;
+    root.v = o;
+    return json_dump(root);
+};
 
 auto err = [&](const char* m) -> std::string {
     miq::JNode root;
