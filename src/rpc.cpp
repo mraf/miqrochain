@@ -744,7 +744,7 @@ if (method == "getaddressutxos")
             if(mempool_.accept(tx, chain_.utxo(), (size_t)tip.height, e)){
                 JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
             } else {
-                return err(e);
+                return json_err(e);
             }
         }
 
@@ -800,7 +800,7 @@ if (method == "createhdwallet") {
 
     miq::HdAccountMeta meta; meta.account=0; meta.next_recv=0; meta.next_change=0;
     std::string e;
-    if(!SaveHdWallet(wdir, seed, meta, wpass, e)) return err(e);
+    if(!SaveHdWallet(wdir, seed, meta, wpass, e)) return json_err(e);
 
     std::map<std::string,JNode> o;
     o["mnemonic"]  = jstr(mnemonic);
@@ -831,7 +831,7 @@ if (method == "restorehdwallet") {
 
     miq::HdAccountMeta meta; meta.account=0; meta.next_recv=0; meta.next_change=0;
     std::string e;
-    if(!SaveHdWallet(wdir, seed, meta, wpass, e)) return err(e);
+    if(!SaveHdWallet(wdir, seed, meta, wpass, e)) return json_err(e);
 
     return "\"ok\"";
 }
@@ -847,7 +847,7 @@ if (method == "walletinfo") {
 
     std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
     std::string pass = get_wallet_pass_or_cached();
-    if(!LoadHdWallet(wdir, seed, meta, pass, e)) return err(e);
+    if(!LoadHdWallet(wdir, seed, meta, pass, e)) return json_err(e);
 
     std::map<std::string,JNode> o;
     o["account"]     = jnum((double)meta.account);
@@ -867,13 +867,13 @@ if (method == "getnewaddress") {
 
     std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
     std::string pass = get_wallet_pass_or_cached();
-    if(!LoadHdWallet(wdir, seed, meta, pass, e)) return err(e);
+    if(!LoadHdWallet(wdir, seed, meta, pass, e)) return json_err(e);
 
     miq::HdWallet w(seed, meta);
     std::string addr;
     if(!w.GetNewAddress(addr)) return err("derive failed");
 
-    if(!SaveHdWallet(wdir, seed, w.meta(), pass, e)) return err(e);
+    if(!SaveHdWallet(wdir, seed, w.meta(), pass, e)) return json_err(e);
     return json_dump(jstr(addr));
 }
 
@@ -899,7 +899,7 @@ if (method == "deriveaddressat") {
 
     std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
     std::string pass = get_wallet_pass_or_cached();
-    if(!LoadHdWallet(wdir, seed, meta, pass, e)) return err(e);
+    if(!LoadHdWallet(wdir, seed, meta, pass, e)) return json_err(e);
 
     miq::HdWallet w(seed, meta);
     std::string addr;
@@ -934,7 +934,7 @@ if (method == "walletunlock") {
         wdir = "wallets/default";
     }
     std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
-    if (!LoadHdWallet(wdir, seed, meta, pass, e)) return err(e);
+    if (!LoadHdWallet(wdir, seed, meta, pass, e)) return json_err(e);
 
     wallet_unlock_cache_for(pass, timeout_s);
 
@@ -991,7 +991,7 @@ if (method == "listaddresses") {
 
     std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
     std::string pass = get_wallet_pass_or_cached();
-    if(!LoadHdWallet(wdir, seed, meta, pass, e)) return err(e);
+    if(!LoadHdWallet(wdir, seed, meta, pass, e)) return json_err(e);
 
     miq::HdWallet w(seed, meta);
     int n = (want>0) ? std::min<int>(want, (int)meta.next_recv) : (int)meta.next_recv;
@@ -1015,7 +1015,7 @@ if (method == "listutxos") {
 
     std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
     std::string pass = get_wallet_pass_or_cached();
-    if(!LoadHdWallet(wdir, seed, meta, pass, e)) return err(e);
+    if(!LoadHdWallet(wdir, seed, meta, pass, e)) return json_err(e);
 
     miq::HdWallet w(seed, meta);
 
@@ -1221,7 +1221,7 @@ if (method == "listutxos") {
                 }
                 JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
             } else {
-                return err(e);
+                return json_err(e);
             }
         }
 
