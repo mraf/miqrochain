@@ -6,7 +6,7 @@
 #include <QTimer>
 #include <QJsonObject>
 
-class KV : public QWidget {            // ❌ no Q_OBJECT needed
+class KV : public QWidget {
 public:
     KV(const QString &k, const QString &v, QWidget *p=nullptr) : QWidget(p){
         auto *l = new QHBoxLayout(this);
@@ -24,21 +24,21 @@ OverviewWidget::OverviewWidget(RpcClient &rpc, QWidget *p) : QWidget(p), m_rpc(r
 
     auto *hHeight = new KV("Height", "-");
     auto *hHash   = new KV("Best Hash", "-");
-    auto *hDiff   = new KV("Bits", "-");
+    auto *hBits   = new KV("Bits", "-");
 
     lay->addWidget(hHeight);
     lay->addWidget(hHash);
-    lay->addWidget(hDiff);
+    lay->addWidget(hBits);
     lay->addStretch(1);
 
     m_timer = new QTimer(this);
     m_timer->setInterval(2000);
-    connect(m_timer, &QTimer::timeout, this, [this, hHeight, hHash, hDiff]{
+    connect(m_timer, &QTimer::timeout, this, [this, hHeight, hHash, hBits]{
         try {
             const auto v = m_rpc.getTipInfo().toObject();
             hHeight->setV(QString::number(v.value("height").toInt()));
             hHash->setV(v.value("best_hash").toString());
-            hDiff->setV(QString::number(v.value("bits").toInt()));
+            hBits->setV(QString::number(v.value("bits").toInt()));
         } catch (...) {}
     });
     m_timer->start();
