@@ -890,6 +890,26 @@ if (method == "listutxos") {
     }
     JNode out; out.v = outarr; return json_dump(out);
 }
+      if (method == "getaddressutxos") {
+    if (params.size() != 1 || !params[0].is_string()) return err("usage: getaddressutxos <address>");
+    const std::string addr = params[0].as_string();
+    std::vector<uint8_t> pkh;
+    if (!decode_p2pkh_address(addr, pkh)) return err("bad address");
+    auto vec = chain_.utxo().list_for_pkh(pkh);
+    JNode arr; arr.a = std::make_unique<JArray>();
+    for (auto &t : vec) {
+        const auto &txid = std::get<0>(t);
+        uint32_t vout = std::get<1>(t);
+        const auto &e = std::get<2>(t);
+        JNode o; o.o = std::make_unique<JObject>();
+        o["txid"] = to_hex(txid);
+        o["vout"] = (int64_t)vout;
+        o["value"] = (int64_t)e.value;
+        o["pkh"] = to_hex(e.pkh);
+        arr.push_back(std::move(o));
+    }
+    return json_dump(arr);
+}
 
         // -------- NEW: spend from HD wallet (account 0) --------
         if (method == "sendfromhd") {
