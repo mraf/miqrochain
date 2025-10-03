@@ -302,25 +302,88 @@ std::string RpcService::handle(const std::string& body){
 
         // ---------------- basic/info ----------------
 
-            if (method == "getaddressutxos") {
-    if (params.size() != 1 || !params[0].is_string()) return err("usage: getaddressutxos <address>");
-    const std::string addr = params[0].as_string();
-    std::vector<uint8_t> pkh;
-    if (!decode_p2pkh_address(addr, pkh)) return err("bad address");
-    auto vec = chain_.utxo().list_for_pkh(pkh);
-    JNode arr; arr.a = std::make_unique<JArray>();
-    for (auto &t : vec) {
-        const auto &txid = std::get<0>(t);
+auto err = [&](const char* m) -> std::string {
+    miq::JNode root;
+    std::map<std::string, miq::JNode> o;
+    miq::JNode e; e.v = std::string(m);
+    o["error"] = e;
+    root.v = o;
+    return json_dump(root);
+};
+
+auto ok = [&](const miq::JNode& res) -> std::string {
+    miq::JNode root;
+    std::map<std::string, miq::JNode> o;
+    miq::JNode rn; rn.v = res.v;
+    miq::JNode en; en.v = miq::JNull{};
+    o["result"] = rn;
+    o["error"]  = en;
+    root.v = o;
+    return json_dump(root);
+};
+
+auto get_str = [](const miq::JNode& n, std::string& out) -> bool {
+    if (!std::holds_alternative<std::string>(n.v)) return false;
+    out = std::get<std::string>(n.v);
+    return true;
+};
+
+// --- the actual handler ---
+if (method == "getaddressutxos")
+{
+    // Expect: params = ["<base58 address>"]
+    auto itParams = obj.find("params");
+    if (itParams == obj.end())
+        return err("usage: getaddressutxos <address>");
+    if (!std::holds_alternative<std::vector<miq::JNode>>(itParams->second.v))
+        return err("usage: getaddressutxos <address>");
+
+    auto& params = std::get<std::vector<miq::JNode>>(itParams->second.v);
+    if (params.size() != 1)
+        return err("usage: getaddressutxos <address>");
+
+    std::string addr;
+    if (!get_str(params[0], addr))
+        return err("address must be string");
+
+    // Decode Base58Check and validate P2PKH
+    uint8_t ver = 0;
+    std::vector<uint8_t> payload;
+    if (!miq::base58check_decode(addr, ver, payload))
+        return err("bad address");
+    if (ver != miq::VERSION_P2PKH || payload.size() != 20)
+        return err("bad address");
+
+    const std::vector<uint8_t> pkh = payload;
+
+    // Lookup UTXOs
+    auto entries = chain_.utxo().list_for_pkh(pkh);
+
+    // Build JSON array result
+    std::vector<miq::JNode> out;
+    out.reserve(entries.size());
+    for (const auto& t : entries) {
+        const std::vector<uint8_t>& txid = std::get<0>(t);
         uint32_t vout = std::get<1>(t);
-        const auto &e = std::get<2>(t);
-        JNode o; o.o = std::make_unique<JObject>();
-        o["txid"] = to_hex(txid);
-        o["vout"] = (int64_t)vout;
-        o["value"] = (int64_t)e.value;
-        o["pkh"] = to_hex(e.pkh);
-        arr.push_back(std::move(o));
+        const miq::UTXOEntry& e = std::get<2>(t);
+
+        std::map<std::string, miq::JNode> o;
+        miq::JNode jtxid; jtxid.v = miq::to_hex(txid);
+        miq::JNode jvout; jvout.v = static_cast<double>(vout);       // numbers are doubles in JSON
+        miq::JNode jval;  jval.v  = static_cast<double>(e.value);
+        miq::JNode jpkh;  jpkh.v  = miq::to_hex(e.pkh);
+
+        o["txid"]  = jtxid;
+        o["vout"]  = jvout;
+        o["value"] = jval;
+        o["pkh"]   = jpkh;
+
+        miq::JNode on; on.v = o;
+        out.emplace_back(std::move(on));
     }
-    return json_dump(arr);
+
+    miq::JNode arr; arr.v = out;
+    return ok(arr);
 }
 
         if(method=="help"){
