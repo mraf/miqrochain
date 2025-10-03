@@ -8,9 +8,6 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
 
-# Find Qt6 (Widgets + Network + Core + Gui)
-find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets Network Core Gui)
-
 
 set(SRC
 src/main.cpp
@@ -29,17 +26,15 @@ resources/icons.qrc
 )
 
 
+find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets Network Core Gui)
 qt_add_executable(miqro-gui ${SRC})
+target_link_libraries(miqro-gui PRIVATE Qt6::Widgets Qt6::Network Qt6::Core Qt6::Gui)
 
 
 # Windows nice icon / app details
 if (WIN32)
 set_property(TARGET miqro-gui PROPERTY WIN32_EXECUTABLE TRUE)
 endif()
-
-
-# Link Qt
-target_link_libraries(miqro-gui PRIVATE Qt6::Widgets Qt6::Network Qt6::Core Qt6::Gui)
 
 
 # Safer warnings
