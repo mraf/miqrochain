@@ -25,6 +25,8 @@ struct NetMsg {
 };
 
 // Implemented in netmsg.cpp
+// Encodes using NEW framed wire format:
+//   [ magic(4) | cmd(12) | len(4-le) | checksum(4) | payload ]
 std::vector<uint8_t> encode_msg(const std::string& cmd,
                                 const std::vector<uint8_t>& payload);
 
@@ -36,9 +38,11 @@ inline std::vector<uint8_t> encode_msg(const char* cmd,
 }
 
 // Decode one full message starting at/after 'off' inside 'buf'.
+// Accepts BOTH new framed messages (with magic+checksum) and the legacy format
+// (no magic/checksum) for backward compatibility.
 // On success: fills 'out', advances 'off' to first byte after the message, and returns true.
 // On need-more-bytes: returns false without changing 'off'.
-// On corruption: scans forward past bad bytes to next magic and continues on next call.
+// On corruption: scans forward past bad bytes to next candidate and continues on next call.
 bool decode_msg(const std::vector<uint8_t>& buf, std::size_t& off, NetMsg& out);
 
 }
