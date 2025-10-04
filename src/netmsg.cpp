@@ -8,7 +8,7 @@
 
 #ifdef __has_include
 #  if __has_include("constants.h")
-#    include "constants.h"
+#    include "constants.h"   // may define miq::MAGIC and miq::MAGIC_BE
 #  endif
 #  if __has_include("sha256.h")
 #    include "sha256.h"
@@ -50,7 +50,25 @@
 
 namespace miq {
 
-// ---- local helpers ---------------------------------------------------------
+// ---------- FALLBACKS for MAGIC / MAGIC_BE ----------------------------------
+// If constants.h didn't define MAGIC and MAGIC_BE, provide safe defaults here.
+// This guarantees the file compiles in all trees and NEW framing works steadily.
+#ifndef MAGIC
+static constexpr uint32_t MAGIC = 0xA3FB9E21; // default network tag
+#endif
+
+#ifndef MAGIC_BE
+static constexpr uint8_t MAGIC_BE[4] = {
+    static_cast<uint8_t>((MAGIC >> 24) & 0xFF),
+    static_cast<uint8_t>((MAGIC >> 16) & 0xFF),
+    static_cast<uint8_t>((MAGIC >>  8) & 0xFF),
+    static_cast<uint8_t>((MAGIC >>  0) & 0xFF),
+};
+#endif
+// -----------------------------------------------------------------------------
+
+
+// ---- local helpers ----------------------------------------------------------
 
 static inline uint32_t rd32le(const uint8_t* p){
     return (uint32_t)p[0]
