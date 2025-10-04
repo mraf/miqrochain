@@ -243,7 +243,7 @@ If built **without** wallet encryption (default), these RPCs are no‑ops.
 
 ## Networking
 
-- **P2P port**: 9833/tcp. Open or port‑forward this on your router for a public node.  
+- **P2P port**: 55001/tcp. Open or port‑forward this on your router for a public node.  
 - **RPC port**: 9834/tcp (binds to loopback by default).  
 - Seeds / bootstrapping are defined in `src/seeds.cpp`. You can add bootstrap DNS names or IPs.
 
