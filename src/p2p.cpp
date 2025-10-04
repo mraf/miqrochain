@@ -173,6 +173,14 @@
 #define MIQ_P2P_STALL_RETRY_MS 60000        // probe headers if no progress for 60s
 #endif
 
+// ===== Handshake strictness knobs (keep strict; just a tiny safe window) ====
+#ifndef MIQ_STRICT_HANDSHAKE
+#define MIQ_STRICT_HANDSHAKE 1
+#endif
+#ifndef MIQ_PREVERACK_QUEUE_MAX
+#define MIQ_PREVERACK_QUEUE_MAX 8   // tolerate a handful of early safe msgs
+#endif
+
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
   #define WIN32_LEAN_AND_MEAN
@@ -295,6 +303,17 @@ static std::unordered_map<std::string, std::pair<int64_t,int64_t>> g_seed_backof
 // ---- Header zero-progress tracker (socket -> consecutive empty batches) ----
 static std::unordered_map<int,int> g_zero_hdr_batches;
 
+// ---- NEW: pre-verack safe allow-list & counters ----------------------------
+static std::unordered_map<int,int> g_preverack_counts;  // socket -> early safe msg count
+static inline bool miq_safe_preverack_cmd(const std::string& cmd) {
+    static const char* k[] = {
+        "verack","ping","pong","getheaders","headers",
+        "addr","getaddr","invb","getb","getbi","invtx","gettx","tx","feefilter"
+    };
+    for (auto* s : k) if (cmd == s) return true;
+    return false;
+}
+
 static inline int64_t now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
@@ -328,6 +347,7 @@ static inline void gate_on_close(int fd){
     g_peer_last_ff_ms.erase(fd);
     rx_clear_start(fd);
     g_zero_hdr_batches.erase(fd);
+    g_preverack_counts.erase(fd); // NEW: cleanup early-msg counter
 }
 static inline bool gate_on_bytes(int fd, size_t add){
     auto it = g_gate.find(fd);
@@ -372,16 +392,28 @@ static inline bool gate_on_command(int fd, const std::string& cmd,
                 g.banscore += 10; // unexpected verack
             }
         } else {
-            // NEW: any command before 'version' is a violation → drop fast
+            // STRICT: any command before 'version' => drop fast
             if (!g.got_version) {
                 g.banscore += 50;
                 close_code = 400;
                 return true;
             }
+            // STRICT, but allow tiny window after version before verack
             if (!g.got_verack){
-                g.banscore += 50;
-                close_code = 400; // bad sequence
-                return true;
+                if (!miq_safe_preverack_cmd(cmd)) {
+                    g.banscore += 25;                 // harder nudge for out-of-order chatter
+                    if (g.banscore >= MAX_BANSCORE) { close_code = 401; return true; }
+                    return false;                      // ignore silently
+                }
+                int &cnt = g_preverack_counts[fd];
+                cnt++;
+                g.banscore += 1;                       // light pressure on early messages
+                if (cnt > MIQ_PREVERACK_QUEUE_MAX) {
+                    g.banscore += 10;
+                    close_code = 402;                  // spamming safe msgs before verack
+                    return true;
+                }
+                // else: safe pre-verack command will be processed below by caller
             }
         }
     }
@@ -1773,6 +1805,7 @@ void P2P::loop(){
                     if (send_verack) {
                         auto verack = encode_msg("verack", {});
                         send(s, (const char*)verack.data(), (int)verack.size(), 0);
+                        // (no need to touch counters here; we clean on verack cmd below)
                     }
 
                     // --- INV storm + per-family rate limiting ---
@@ -1828,6 +1861,8 @@ void P2P::loop(){
 
                     } else if (cmd == "verack") {
                         ps.verack_ok = true;
+                        // Clean pre-verack pressure counter on successful handshake
+                        g_preverack_counts.erase(s);
 #if MIQ_ENABLE_ADDRMAN
                         // Mark successful connection good
                         uint32_t be_ip;
@@ -2090,15 +2125,17 @@ void P2P::loop(){
                             g_last_progress_ms = now_ms();
                         }
 
-                        // --- NEW: foreign/zero-progress detection -----------------
+                        // --- MODIFIED: foreign/zero-progress → fallback by-index ---
                         if (!hs.empty() && accepted == 0) {
                             int &z = g_zero_hdr_batches[s];
                             z++;
-                            if (z >= 3) { // three consecutive empty batches → likely wrong genesis/fork
-                                log_warn("P2P: dropping " + ps.ip + " (headers make no progress; foreign network?)");
-                                bump_ban(ps, ps.ip, "foreign-headers", now_ms());
-                                dead.push_back(s);
-                                // don't 'continue'; let outer loop close the socket cleanly
+                            if (z >= 3) { // three consecutive empty batches
+                                log_warn("P2P: headers made no progress after 3 batches; falling back to by-index sync");
+                                ps.banscore += 1; // keep tiny pressure
+                                ps.syncing = true;
+                                ps.next_index = chain_.height() + 1;
+                                request_block_index(ps, ps.next_index);
+                                z = 0; // reset and continue
                             }
                         } else if (accepted > 0) {
                             g_zero_hdr_batches[s] = 0;
@@ -2119,7 +2156,7 @@ void P2P::loop(){
                         if (ps.inflight_hdr_batches > 0) ps.inflight_hdr_batches--;
                         ps.last_hdr_batch_done_ms = now_ms();
 
-                        // --- NEW: refill header pipeline if empty -----------------
+                        // --- Refill header pipeline if empty ---
                         if (ps.inflight_hdr_batches == 0) {
                             std::vector<std::vector<uint8_t>> locator2;
                             chain_.build_locator(locator2);
