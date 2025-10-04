@@ -103,10 +103,14 @@ static bool cmd_is_allowed(const std::string& c){
 static bool length_ok_for_command(const std::string& cmd, size_t n){
     if (n > MIQ_FALLBACK_MAX_MSG_SIZE) return false;
 
-    if (cmd == "version" || cmd == "verack" || cmd == "getaddr" ||
-        cmd == "ping"    || cmd == "pong")
-    {
+    // verack/getaddr/ping/pong must be empty
+    if (cmd == "verack" || cmd == "getaddr" || cmd == "ping" || cmd == "pong") {
         return n == 0;
+    }
+
+    // version: accept legacy zero-payload and small payloads (interop)
+    if (cmd == "version") {
+        return n <= 24; // allow 0..24 bytes
     }
 
     if (cmd == "invb" || cmd == "getb" || cmd == "invtx" || cmd == "gettx"){
@@ -137,7 +141,6 @@ static bool length_ok_for_command(const std::string& cmd, size_t n){
 
     if (cmd == "getheaders"){
         // 1 byte count (0..32), count*32 locator hashes, 32 bytes stop-hash
-        // Accept any n that matches this shape & <= cap
         if (n < 33) return false;              // at least 1 + 0*32 + 32
         if ((n - 33) % 32 != 0) return false;  // (n - (1+32)) must be multiple of 32
         size_t count = (n - 33) / 32;
@@ -173,6 +176,25 @@ std::vector<uint8_t> encode_msg(const std::string& cmd_in, const std::vector<uin
     if (!cmd_is_allowed(cmd)) return {};
     if (!length_ok_for_command(cmd, payload.size())) return {};
 
+#if MIQ_WIRE_LEGACY_SEND
+    // ---- LEGACY ENCODING: cmd[12] | len[4] | payload ----
+    std::vector<uint8_t> out;
+    out.resize(12 + 4 + payload.size());
+
+    // cmd (12, NUL-padded)
+    std::memset(out.data(), 0, 12);
+    std::memcpy(out.data(), cmd.data(), std::min<size_t>(12, cmd.size()));
+
+    // length
+    wr32le(out.data() + 12, (uint32_t)payload.size());
+
+    // payload
+    if (!payload.empty()){
+        std::memcpy(out.data() + 16, payload.data(), payload.size());
+    }
+    return out;
+#else
+    // ---- NEW ENCODING: magic(4) | cmd(12) | len(4) | csum(4) | payload ----
     std::vector<uint8_t> out;
     out.resize(4 + 12 + 4 + 4 + payload.size()); // magic + cmd + len + csum + payload
 
@@ -195,6 +217,7 @@ std::vector<uint8_t> encode_msg(const std::string& cmd_in, const std::vector<uin
         std::memcpy(out.data() + 24, payload.data(), payload.size());
     }
     return out;
+#endif
 }
 
 // Streaming decoder:
