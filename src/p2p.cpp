@@ -1968,6 +1968,19 @@ void P2P::loop(){
                         if (accepted > 0) {
                             g_last_progress_ms = now_ms();
                         }
+                        if (hs.size() > 0 && accepted == 0) {
+                        // If we repeatedly get zero-utility header batches from this peer, drop it.
+                            ps.zero_hdr_batches++;
+                        if (ps.zero_hdr_batches >= 3) {  // 3 strikes: they're likely on a different network
+                              log_warn("P2P: dropping " + ps.ip + " (headers do not connect to our chain)");
+                              bump_ban(ps, ps.ip, "foreign-headers", now_ms());
+                              dead.push_back(s);
+                            // note: do not 'continue' here; let the outer loop close the socket
+                              }
+                    }  else if (accepted > 0) {
+                             
+                              ps.zero_hdr_batches = 0; // reset on progress
+                          }
 
                         // Ask for missing blocks on best-header path
                         std::vector<std::vector<uint8_t>> want;
