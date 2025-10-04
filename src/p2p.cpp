@@ -448,6 +448,94 @@ static std::string be_ip_to_string(uint32_t be_ip){
     return std::string(buf[0]?buf:"0.0.0.0");
 }
 
+// ---- NEVER DIAL LOOPBACK/SELF: guard state & helpers -----------------------
+static std::unordered_set<uint32_t> g_self_v4; // network byte order (BE)
+
+// ipv4 dotted parser (local helper)
+static bool parse_ipv4_dotted(const std::string& dotted, uint32_t& be_ip){
+    sockaddr_in tmp{};
+#ifdef _WIN32
+    if (InetPtonA(AF_INET, dotted.c_str(), &tmp.sin_addr) != 1) return false;
+#else
+    if (inet_pton(AF_INET, dotted.c_str(), &tmp.sin_addr) != 1) return false;
+#endif
+    be_ip = tmp.sin_addr.s_addr; // network byte order
+    return true;
+}
+
+static inline bool is_loopback_be(uint32_t be_ip){
+    return (uint8_t)(be_ip >> 24) == 127;
+}
+static inline bool is_self_be(uint32_t be_ip){
+    return g_self_v4.find(be_ip) != g_self_v4.end();
+}
+static void self_add_be(uint32_t be_ip){
+    g_self_v4.insert(be_ip);
+}
+static void self_add_dotted(const std::string& ip){
+    uint32_t be_ip=0;
+    if (parse_ipv4_dotted(ip, be_ip)) g_self_v4.insert(be_ip);
+}
+static void gather_self_ipv4_basic(){
+    // Collect local interface addresses via gethostname + getaddrinfo (IPv4)
+    char host[256] = {0};
+#ifdef _WIN32
+    if (gethostname(host, (int)sizeof(host)) != 0) return;
+    ADDRINFOA hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    PADDRINFOA res = nullptr;
+    if (getaddrinfo(host, nullptr, &hints, &res) != 0 || !res) return;
+    for (auto p = res; p; p = p->ai_next) {
+        if (p->ai_family != AF_INET) continue;
+        auto sa = reinterpret_cast<sockaddr_in*>(p->ai_addr);
+        if (!sa) continue;
+        uint32_t be_ip = sa->sin_addr.s_addr;
+        if (be_ip) g_self_v4.insert(be_ip);
+    }
+    freeaddrinfo(res);
+#else
+    if (gethostname(host, sizeof(host)) != 0) return;
+    addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    if (getaddrinfo(host, nullptr, &hints, &res) != 0 || !res) return;
+    for (auto p = res; p; p = p->ai_next) {
+        if (p->ai_family != AF_INET) continue;
+        auto sa = reinterpret_cast<sockaddr_in*>(p->ai_addr);
+        if (!sa) continue;
+        uint32_t be_ip = sa->sin_addr.s_addr;
+        if (be_ip) g_self_v4.insert(be_ip);
+    }
+    freeaddrinfo(res);
+#endif
+}
+static void gather_self_from_env(){
+    const char* a = std::getenv("MIQ_SELF_IP");
+    const char* b = std::getenv("MIQ_SELF_IPV4");
+    auto take = [&](const char* s){
+        if (!s || !*s) return;
+        std::string v(s);
+        size_t i=0;
+        while (i < v.size()) {
+            while (i < v.size() && (v[i]==' '||v[i]==','||v[i]==';'||v[i]=='\t')) ++i;
+            size_t j=i;
+            while (j < v.size() && v[j]!=',' && v[j]!=';' && v[j]!=' ' && v[j]!='\t') ++j;
+            if (j>i) self_add_dotted(v.substr(i,j-i));
+            i=j;
+        }
+    };
+    take(a); take(b);
+}
+static std::string self_list_for_log(){
+    std::string out;
+    bool first = true;
+    for (uint32_t be_ip : g_self_v4){
+        if (!first) out += ",";
+        out += be_ip_to_string(be_ip);
+        first = false;
+    }
+    if (out.empty()) out = "(none)";
+    return out;
+}
+
 // Compute IPv4 /16 group key from BE ip
 static inline uint16_t v4_group16(uint32_t be_ip){
     uint8_t A = uint8_t(be_ip>>24), B = uint8_t(be_ip>>16);
@@ -456,6 +544,10 @@ static inline uint16_t v4_group16(uint32_t be_ip){
 
 // Dial a single IPv4 (be order) at supplied port; returns socket or -1
 static int dial_be_ipv4(uint32_t be_ip, uint16_t port){
+    // Hard guard: never dial loopback or self.
+    if (is_loopback_be(be_ip) || is_self_be(be_ip)) {
+        return -1;
+    }
 #ifdef _WIN32
     int s = (int)socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 #else
@@ -684,10 +776,18 @@ bool P2P::start(uint16_t port){
     g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
 
     // Try UPnP/NAT-PMP (no-op unless built with -DMIQ_ENABLE_UPNP=ON)
+    std::string ext_ip;
     {
-        std::string ext_ip;
         miq::TryOpenP2PPort(port, &ext_ip);
         if (!ext_ip.empty()) log_info("P2P: external IP (UPnP): " + ext_ip);
+    }
+
+    // Build self-IP set (loopback + local + optional external + env) to never dial
+    gather_self_ipv4_basic();
+    if (!ext_ip.empty()) self_add_dotted(ext_ip);
+    gather_self_from_env();
+    if (!g_self_v4.empty()) {
+        log_info("P2P: self-ip guard active: " + self_list_for_log());
     }
 
     // Resolve bootstrap seeds from constants.h and stash into stores
@@ -697,7 +797,7 @@ bool P2P::start(uint16_t port){
             size_t added = 0;
             for (const auto& s : seeds) {
                 uint32_t be_ip;
-                if (parse_ipv4(s.ip, be_ip) && ipv4_is_public(be_ip)) {
+                if (parse_ipv4(s.ip, be_ip) && ipv4_is_public(be_ip) && !is_self_be(be_ip)) {
                     added += addrv4_.insert(be_ip).second ? 1 : 0;
 #if MIQ_ENABLE_ADDRMAN
                     miq::NetAddr na;
@@ -836,7 +936,20 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
         log_warn("P2P: DNS resolve failed: " + host + " (backoff " + std::to_string(cur) + "ms)");
         return false;
     }
-    int s = (int)socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+
+    int s = -1;
+    PADDRINFOA choice = nullptr;
+    for (auto p = res; p; p = p->ai_next) {
+        if (p->ai_family != AF_INET) continue;
+        auto sa = reinterpret_cast<sockaddr_in*>(p->ai_addr);
+        if (!sa) continue;
+        uint32_t be_ip = sa->sin_addr.s_addr;
+        if (is_loopback_be(be_ip) || is_self_be(be_ip)) continue; // skip loopback/self
+        int ts = (int)socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (ts < 0) continue;
+        if (connect(ts, p->ai_addr, (int)p->ai_addrlen) != 0) { CLOSESOCK(ts); continue; }
+        s = ts; choice = p; break;
+    }
     if (s < 0) {
         freeaddrinfo(res);
         int64_t now = now_ms();
@@ -847,16 +960,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
         st = { now + cur, cur };
         return false;
     }
-    if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
-        CLOSESOCK(s); freeaddrinfo(res);
-        int64_t now = now_ms();
-        auto &st = g_seed_backoff[host];
-        int64_t cur = st.second > 0 ? st.second : seed_backoff_base_ms();
-        cur = std::min<int64_t>(cur * 2, seed_backoff_max_ms());
-        cur += jitter_ms(5000);
-        st = { now + cur, cur };
-        return false;
-    }
+
     sockaddr_in a{}; int alen = (int)sizeof(a);
     char ipbuf[64] = {0};
     if (getpeername(s, (sockaddr*)&a, &alen) == 0) InetNtopA(AF_INET, &a.sin_addr, ipbuf, (int)sizeof(ipbuf));
@@ -875,8 +979,20 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
         log_warn(std::string("P2P: DNS resolve failed: ") + host + " (backoff " + std::to_string(cur) + "ms)");
         return false;
     }
-    int s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s < 0) { 
+
+    int s = -1;
+    for (auto p = res; p; p = p->ai_next) {
+        if (p->ai_family != AF_INET) continue;
+        auto sa = reinterpret_cast<sockaddr_in*>(p->ai_addr);
+        if (!sa) continue;
+        uint32_t be_ip = sa->sin_addr.s_addr;
+        if (is_loopback_be(be_ip) || is_self_be(be_ip)) continue; // skip loopback/self
+        int ts = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (ts < 0) continue;
+        if (connect(ts, p->ai_addr, p->ai_addrlen) != 0) { CLOSESOCK(ts); continue; }
+        s = ts; break;
+    }
+    if (s < 0) {
         freeaddrinfo(res);
         int64_t now = now_ms();
         auto &st = g_seed_backoff[host];
@@ -886,16 +1002,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
         st = { now + cur, cur };
         return false; 
     }
-    if (connect(s, res->ai_addr, res->ai_addrlen) != 0) { 
-        CLOSESOCK(s); freeaddrinfo(res);
-        int64_t now = now_ms();
-        auto &st = g_seed_backoff[host];
-        int64_t cur = st.second > 0 ? st.second : seed_backoff_base_ms();
-        cur = std::min<int64_t>(cur * 2, seed_backoff_max_ms());
-        cur += jitter_ms(5000);
-        st = { now + cur, cur };
-        return false; 
-    }
+
     sockaddr_in a{}; socklen_t alen = static_cast<socklen_t>(sizeof(a));
     char ipbuf[64] = {0};
     if (getpeername(s, (sockaddr*)&a, &alen) == 0) inet_ntop(AF_INET, &a.sin_addr, ipbuf, (socklen_t)sizeof(ipbuf));
@@ -927,7 +1034,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 
     // addr learn & persist
     uint32_t be_ip;
-    if (ipbuf[0] && parse_ipv4(ipbuf, be_ip) && ipv4_is_public(be_ip)) {
+    if (ipbuf[0] && parse_ipv4(ipbuf, be_ip) && ipv4_is_public(be_ip) && !is_self_be(be_ip)) {
         addrv4_.insert(be_ip);
 #if MIQ_ENABLE_ADDRMAN
         miq::NetAddr na; na.host = ps.ip; na.port = port; na.tried = true; na.is_ipv6=false;
@@ -1411,6 +1518,10 @@ void P2P::loop(){
                         g_addrman.mark_attempt(*cand);
                         continue;
                     }
+                    if (is_self_be(be_ip)) { // hard-skip self/hairpin
+                        g_addrman.mark_attempt(*cand);
+                        continue;
+                    }
                     if (violates_group_diversity(peers_, be_ip)) {
                         g_addrman.mark_attempt(*cand);
                         continue;
@@ -1445,6 +1556,7 @@ void P2P::loop(){
                     std::vector<uint32_t> candidates;
                     candidates.reserve(addrv4_.size());
                     for (uint32_t ip : addrv4_) {
+                        if (is_self_be(ip)) continue; // never dial ourselves
                         std::string dotted = be_ip_to_string(ip);
                         if (banned_.count(dotted)) continue;
                         bool connected = false;
@@ -1495,7 +1607,7 @@ void P2P::loop(){
                 auto cand = g_addrman.select_feeler(g_am_rng);
                 if (cand) {
                     uint32_t be_ip;
-                    if (parse_ipv4(cand->host, be_ip) && ipv4_is_public(be_ip) && !violates_group_diversity(peers_, be_ip)) {
+                    if (parse_ipv4(cand->host, be_ip) && ipv4_is_public(be_ip) && !is_self_be(be_ip) && !violates_group_diversity(peers_, be_ip)) {
                         std::string dotted = be_ip_to_string(be_ip);
                         if (!banned_.count(dotted)) {
                             bool connected=false; for (auto& kv:peers_) if (kv.second.ip==dotted) { connected=true; break; }
