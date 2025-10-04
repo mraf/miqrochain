@@ -9,7 +9,7 @@ Miqrochain Core is the reference implementation of the **MIQ** peer‑to‑peer 
 
 **Default ports**
 
-- P2P: `9833/tcp`
+- P2P: `55001/tcp`
 - JSON‑RPC: `9834/tcp`
 
 Miqrochain Core uses **libsecp256k1** (the Bitcoin Core secp256k1 library) for ECDSA. The build system will automatically fetch it at configure time if a system package is not available. LevelDB is used by default for the chainstate (RocksDB optional).
