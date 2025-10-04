@@ -11,7 +11,7 @@
 #endif
 
 // TEMP: while the network upgrades, send legacy frames by default.
-// Set to 0 later to enforce the new header (magic+checksum) on the wire.
+// Flip to 0 later to enforce the new header (magic+checksum) on the wire.
 #ifndef MIQ_WIRE_LEGACY_SEND
 #define MIQ_WIRE_LEGACY_SEND 1
 #endif
@@ -31,9 +31,9 @@ struct NetMsg {
 };
 
 // Implemented in netmsg.cpp
-// If MIQ_WIRE_LEGACY_SEND==0, encodes using NEW framed wire format:
+// If MIQ_WIRE_LEGACY_SEND==0, encodes NEW:
 //   [ magic(4) | cmd(12) | len(4-le) | checksum(4) | payload ]
-// If MIQ_WIRE_LEGACY_SEND==1, encodes legacy:
+// If MIQ_WIRE_LEGACY_SEND==1, encodes LEGACY:
 //   [ cmd(12) | len(4-le) | payload ]
 std::vector<uint8_t> encode_msg(const std::string& cmd,
                                 const std::vector<uint8_t>& payload);
