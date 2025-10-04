@@ -292,6 +292,9 @@ static inline uint64_t peer_feefilter_kb(int fd){
 static std::unordered_map<std::string, std::pair<int64_t,int64_t>> g_seed_backoff;
 // map host -> {next_allowed_ms, current_backoff_ms}
 
+// ---- Header zero-progress tracker (socket -> consecutive empty batches) ----
+static std::unordered_map<int,int> g_zero_hdr_batches;
+
 static inline int64_t now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
@@ -324,6 +327,7 @@ static inline void gate_on_close(int fd){
     g_peer_minrelay_kb.erase(fd);
     g_peer_last_ff_ms.erase(fd);
     rx_clear_start(fd);
+    g_zero_hdr_batches.erase(fd);
 }
 static inline bool gate_on_bytes(int fd, size_t add){
     auto it = g_gate.find(fd);
@@ -368,7 +372,13 @@ static inline bool gate_on_command(int fd, const std::string& cmd,
                 g.banscore += 10; // unexpected verack
             }
         } else {
-            if (!g.got_version || !g.got_verack){
+            // NEW: any command before 'version' is a violation → drop fast
+            if (!g.got_version) {
+                g.banscore += 50;
+                close_code = 400;
+                return true;
+            }
+            if (!g.got_verack){
                 g.banscore += 50;
                 close_code = 400; // bad sequence
                 return true;
@@ -1149,7 +1159,6 @@ void P2P::send_addr_snapshot(PeerState& ps){
     payload.reserve(MIQ_ADDR_RESPONSE_MAX * 4);
     size_t cnt = 0;
 
-    // Prefer returning samples known to addrman (if enabled), fallback to legacy set
 #if MIQ_ENABLE_ADDRMAN
     {
         // Pull up to MIQ_ADDR_RESPONSE_MAX unique public IPv4 addrs
@@ -1968,19 +1977,20 @@ void P2P::loop(){
                         if (accepted > 0) {
                             g_last_progress_ms = now_ms();
                         }
-                        if (hs.size() > 0 && accepted == 0) {
-                        // If we repeatedly get zero-utility header batches from this peer, drop it.
-                            ps.zero_hdr_batches++;
-                        if (ps.zero_hdr_batches >= 3) {  // 3 strikes: they're likely on a different network
-                              log_warn("P2P: dropping " + ps.ip + " (headers do not connect to our chain)");
-                              bump_ban(ps, ps.ip, "foreign-headers", now_ms());
-                              dead.push_back(s);
-                            // note: do not 'continue' here; let the outer loop close the socket
-                              }
-                    }  else if (accepted > 0) {
-                             
-                              ps.zero_hdr_batches = 0; // reset on progress
-                          }
+
+                        // --- NEW: foreign/zero-progress detection -----------------
+                        if (!hs.empty() && accepted == 0) {
+                            int &z = g_zero_hdr_batches[s];
+                            z++;
+                            if (z >= 3) { // three consecutive empty batches → likely wrong genesis/fork
+                                log_warn("P2P: dropping " + ps.ip + " (headers make no progress; foreign network?)");
+                                bump_ban(ps, ps.ip, "foreign-headers", now_ms());
+                                dead.push_back(s);
+                                // don't 'continue'; let outer loop close the socket cleanly
+                            }
+                        } else if (accepted > 0) {
+                            g_zero_hdr_batches[s] = 0;
+                        }
 
                         // Ask for missing blocks on best-header path
                         std::vector<std::vector<uint8_t>> want;
@@ -1997,15 +2007,15 @@ void P2P::loop(){
                         if (ps.inflight_hdr_batches > 0) ps.inflight_hdr_batches--;
                         ps.last_hdr_batch_done_ms = now_ms();
 
-                        // If batch full, peer likely has more — request next batch (paced)
-                        if (hs.size() >= 2000) {
-                            std::vector<std::vector<uint8_t>> locator;
-                            chain_.build_locator(locator);
-                            std::vector<uint8_t> stop(32, 0);
-                            auto pl = build_getheaders_payload(locator, stop);
-                            auto msg = encode_msg("getheaders", pl);
+                        // --- NEW: refill header pipeline if empty -----------------
+                        if (ps.inflight_hdr_batches == 0) {
+                            std::vector<std::vector<uint8_t>> locator2;
+                            chain_.build_locator(locator2);
+                            std::vector<uint8_t> stop2(32, 0);
+                            auto pl2 = build_getheaders_payload(locator2, stop2);
+                            auto m2  = encode_msg("getheaders", pl2);
                             if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "get", 1.0, now_ms())) {
-                                send(s, (const char*)msg.data(), (int)msg.size(), 0);
+                                send(s, (const char*)m2.data(), (int)m2.size(), 0);
                                 ps.inflight_hdr_batches++;
                             }
                         }
