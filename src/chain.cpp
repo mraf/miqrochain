@@ -14,7 +14,7 @@
 #include "hash160.h"
 #include "crypto/ecdsa_iface.h"
 #include "constants.h"     // BLOCK_TIME_SECS, GENESIS_BITS, etc.
-#include "difficulty.h"    // lwma_next_bits
+#include "difficulty.h"    // epoch_next_bits / lwma_next_bits
 #include "supply.h"        // MAX_SUPPLY helpers (GetBlockSubsidy, WouldExceedMaxSupply, CoinbaseWithinLimits)
 #include <sstream>
 #include <unordered_set>
@@ -69,7 +69,7 @@ static inline std::string hk(const std::vector<uint8_t>& h){
 }
 
 static inline std::vector<uint8_t> header_hash_of(const BlockHeader& h) {
-    Block tmp; 
+    Block tmp;
     tmp.header = h;
     return tmp.block_hash();
 }
@@ -399,17 +399,16 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         std::chrono::system_clock::now().time_since_epoch()).count();
     if (h.time > now + (int64_t)MAX_TIME_SKEW) { err="header time too far in future"; return false; }
 
-    // Bits: LWMA
-{
-    // retarget every MIQ_RETARGET_INTERVAL, freeze otherwise
-    auto last = last_headers(MIQ_RETARGET_INTERVAL);
-    uint32_t expected = miq::epoch_next_bits(
-        last, BLOCK_TIME_SECS, GENESIS_BITS,
-        /*next_height=*/ tip_.height + 1,
-        /*interval=*/ MIQ_RETARGET_INTERVAL
-    );
-    if (h.bits != expected) { err = "bad header bits"; return false; }
-}
+    // Difficulty bits (epoch retarget; freeze inside the interval)
+    {
+        auto last = last_headers(MIQ_RETARGET_INTERVAL);
+        uint32_t expected = miq::epoch_next_bits(
+            last, BLOCK_TIME_SECS, GENESIS_BITS,
+            /*next_height=*/ tip_.height + 1,
+            /*interval=*/ MIQ_RETARGET_INTERVAL
+        );
+        if (h.bits != expected) { err = "bad header bits"; return false; }
+    }
 
     // POW
     if (!meets_target_be(header_hash_of(h), h.bits)) { err = "bad header pow"; return false; }
@@ -818,7 +817,6 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     if (cb.vin[0].prev.vout != 0) { err="bad coinbase vout"; return false; }
 
     // === BIP30: reject if any txid in this block already has ANY unspent outputs ===
-    // (i.e., if utxo_.get(txid, v, ...) succeeds for any v in [0..tx.vout.size()-1])
     {
         UTXOEntry dummy;
         for (const auto& tx : b.txs) {
@@ -845,17 +843,16 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         if (raw.size() > MIQ_FALLBACK_MAX_TX_SIZE) { err="tx too large"; return false; }
     }
 
-    // Difficulty bits must match LWMA
+    // Difficulty bits (epoch retarget; freeze inside the interval)
     {
-{
-    auto last = last_headers(MIQ_RETARGET_INTERVAL);
-    uint32_t expected = miq::epoch_next_bits(
-        last, BLOCK_TIME_SECS, GENESIS_BITS,
-        /*next_height=*/ tip_.height + 1,
-        /*interval=*/ MIQ_RETARGET_INTERVAL
-    );
-    if (b.header.bits != expected) { err = "bad bits"; return false; }
-}
+        auto last = last_headers(MIQ_RETARGET_INTERVAL);
+        uint32_t expected = miq::epoch_next_bits(
+            last, BLOCK_TIME_SECS, GENESIS_BITS,
+            /*next_height=*/ tip_.height + 1,
+            /*interval=*/ MIQ_RETARGET_INTERVAL
+        );
+        if (b.header.bits != expected) { err = "bad bits"; return false; }
+    }
 
     // POW
     if (!meets_target_be(b.block_hash(), b.header.bits)) { err = "bad pow"; return false; }
