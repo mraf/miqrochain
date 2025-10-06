@@ -53,6 +53,9 @@ namespace miq {
 #ifndef MIQ_P2P_HDR_BATCH_SPACING_MS
 #define MIQ_P2P_HDR_BATCH_SPACING_MS 200   // min spacing between header batches from a peer
 #endif
+#ifndef MIQ_P2P_MAX_BANSCORE
+#define MIQ_P2P_MAX_BANSCORE 100           // keep in sync with p2p.cpp
+#endif
 
 class Chain; // fwd
 
@@ -154,12 +157,16 @@ public:
     inline Mempool*       mempool()       { return mempool_; }
     inline const Mempool* mempool() const { return mempool_; }
 
+    // key-based helper ("invb","getb", etc.)
     bool check_rate(PeerState& ps, const char* key);
+
+    // explicit family:name burst/window helper (used internally in .cpp)
     bool check_rate(PeerState& ps,
-                const char* family,
-                const char* name,
-                uint32_t burst,
-                uint32_t window_ms);
+                    const char* family,
+                    const char* name,
+                    uint32_t burst,
+                    uint32_t window_ms);
+
     bool start(uint16_t port);
     void stop();
 
@@ -254,7 +261,7 @@ private:
     size_t orphan_count_limit_{0};
 
     // Inbound rate gating (soft Sybil friction)
-    int64_t inbound_win_start_ms_{0};
+    int64_t inbound_win_start_ms{0};
     uint32_t inbound_accepts_in_window_{0};
 
     // --- New: timed bans + whitelist + feature gates -------------------------
@@ -342,8 +349,7 @@ private:
     inline void bump_ban(PeerState& ps, const std::string& ip, const char* /*reason*/, int64_t now_ms) {
         // increment local score and, on exceed, create/refresh timed ban
         if (ps.banscore < 0) ps.banscore = 0;
-        // caller already adjusted ps.banscore when appropriate; ensure timed ban if exceeded:
-        if (ps.banscore >= 100) {
+        if (ps.banscore >= MIQ_P2P_MAX_BANSCORE) {
             timed_bans_[ip] = now_ms + default_ban_ms_;
         }
     }
@@ -365,7 +371,6 @@ private:
     inline bool is_whitelisted_ip(const std::string& ip) const {
         if (whitelist_ips_.count(ip)) return true;
         // CIDR check (IPv4 only)
-        // parse "ip" dotted
         sockaddr_in tmp{};
     #ifdef _WIN32
         if (InetPtonA(AF_INET, ip.c_str(), &tmp.sin_addr) != 1) return false;
