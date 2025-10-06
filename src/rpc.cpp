@@ -455,25 +455,14 @@ std::string RpcService::handle(const std::string& body){
 
             if(!ok) return err("not found");
             if(b.txs.empty()) return err("no transactions in block");
-            const auto& cb = b.txs[0];
+            const Transaction& cb = b.txs[0];
             if(cb.vout.empty()) return err("coinbase has no outputs");
-            const auto& o0 = cb.vout[0];
+            const TxOut& o0 = cb.vout[0];
 
             std::map<std::string,JNode> o;
             JNode val; val.v = (double)o0.value;            o["value"] = val;   // in miqron
             JNode pk ; pk.v  = std::string(to_hex(o0.pkh)); o["pkh"]   = pk;
-
-            JNode out; out.v = o; return json_dump(out);
-          if(!ok) return err("not found");
-          if(b.txs.empty()) return err("no transactions in block");
-            const auto& cb = b.txs[0];
-          if(cb.vout.empty()) return err("coinbase has no outputs");
-            const auto& o0 = cb.vout[0];
-
-            std::map<std::string,JNode> o;
-            JNode val; val.v = (double)o0.value;            o["value"] = val;   // in miqron
-            JNode pk ; pk.v  = std::string(to_hex(o0.pkh)); o["pkh"]   = pk;
-            // NEW: return full txid of the coinbase
+            // Include full coinbase txid for downstream scripts
             JNode tx ; tx.v  = std::string(to_hex(cb.txid())); o["txid"] = tx;
 
             JNode out; out.v = o; return json_dump(out);
@@ -505,11 +494,11 @@ std::string RpcService::handle(const std::string& body){
             if(params.size()<1 || !std::holds_alternative<std::string>(params[0].v))
                 return err("need address");
             uint8_t ver=0; std::vector<uint8_t> payload;
-            bool ok = base58check_decode(std::get<std::string>(params[0].v), ver, payload);
+            bool ok2 = base58check_decode(std::get<std::string>(params[0].v), ver, payload);
             std::map<std::string,JNode> o;
-            o["isvalid"] = jbool(ok && ver==VERSION_P2PKH && payload.size()==20);
+            o["isvalid"] = jbool(ok2 && ver==VERSION_P2PKH && payload.size()==20);
             o["version"] = jnum((double)ver);
-            if(ok && payload.size()==20){ o["pkh"] = jstr(to_hex(payload)); }
+            if(ok2 && payload.size()==20){ o["pkh"] = jstr(to_hex(payload)); }
             JNode out; out.v = o; return json_dump(out);
         }
 
@@ -658,7 +647,7 @@ std::string RpcService::handle(const std::string& body){
 
                 std::map<std::string,JNode> o;
                 o["coinbase"] = jbool(e.coinbase);
-                o["height"]   = jnum((double)e.height); 
+                o["height"]   = jnum((double)e.height);
                 o["txid"]  = jstr(to_hex(txid));
                 o["vout"]  = jnum((double)vout);
                 o["value"] = jnum((double)e.value);
