@@ -42,6 +42,7 @@
 #include <memory>    // std::unique_ptr
 #include <algorithm> // find_if
 #include <ctime>     // time()
+#include <random>    // extraNonce for unique coinbase txid
 
 // ---------- default per-user datadir (stable across launch locations) --------
 static std::string default_datadir() {
@@ -465,25 +466,6 @@ int main(int argc, char** argv){
             log_info("RPC listening on " + std::to_string(RPC_PORT));
         }
 
-        // NEW: Optional TLS proxy in front of RPC (terminates HTTPS → forwards to localhost RPC)
-        std::unique_ptr<TlsProxy> tls;
-        if(!cfg.no_rpc && cfg.rpc_tls_enable){
-            std::string err;
-            tls = std::make_unique<TlsProxy>(
-                cfg.rpc_tls_bind,
-                cfg.rpc_tls_cert,
-                cfg.rpc_tls_key,
-                cfg.rpc_tls_client_ca,
-                "127.0.0.1",
-                (int)RPC_PORT
-            );
-            if(!tls->start(err)){
-                log_error(std::string("TLS proxy failed: ")+err);
-                return 1;
-            }
-            log_info(std::string("RPC TLS enabled on ")+cfg.rpc_tls_bind+" → 127.0.0.1:"+std::to_string((int)RPC_PORT));
-        }
-
         // --- Miner (off if no_mine or no address). Keep coinbase prev.vout=0.
         // Default behavior:
         // 1) If config provided miner_threads, use it.
@@ -506,6 +488,10 @@ int main(int argc, char** argv){
             const auto mine_pkh = g_mine_pkh; // require user/address (no fallback)
 
             std::thread miner([&, mine_pkh, threads](){
+                // thread-local RNG for extraNonce
+                std::random_device rd;
+                std::mt19937_64 gen( (uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count()) ^ (uint64_t)rd() ^ (uint64_t)(uintptr_t)&gen) );
+
                 while (!g_shutdown_requested.load()) {
                     try {
                         // ---- A) get tip
@@ -594,20 +580,26 @@ int main(int argc, char** argv){
                                 // lock_time participates in txid; set to (height+1)
                                 cbt.lock_time = static_cast<uint32_t>(t.height + 1);
 
-                                // Add a BIP34-style tag in "sig" (scriptSig-equivalent) with height+now
+                                // Add a BIP34-style tag in "sig" (scriptSig-equivalent) with height + now + extraNonce
                                 const uint32_t h   = static_cast<uint32_t>(t.height + 1);
                                 const uint32_t now = static_cast<uint32_t>(time(nullptr));
-                                cbt.vin[0].sig = {
-                                    0x01,
-                                    static_cast<uint8_t>(h      ),
-                                    static_cast<uint8_t>(h >> 8 ),
-                                    static_cast<uint8_t>(h >>16 ),
-                                    static_cast<uint8_t>(h >>24 ),
-                                    static_cast<uint8_t>(now      ),
-                                    static_cast<uint8_t>(now >> 8 ),
-                                    static_cast<uint8_t>(now >>16 ),
-                                    static_cast<uint8_t>(now >>24 )
-                                };
+                                const uint64_t extraNonce = gen(); // 64-bit per-attempt entropy
+
+                                std::vector<uint8_t> tag;
+                                tag.reserve(1 + 4 + 4 + 8);
+                                tag.push_back(0x01);
+                                tag.push_back(uint8_t(h      & 0xff));
+                                tag.push_back(uint8_t((h>>8) & 0xff));
+                                tag.push_back(uint8_t((h>>16)& 0xff));
+                                tag.push_back(uint8_t((h>>24)& 0xff));
+                                tag.push_back(uint8_t(now      & 0xff));
+                                tag.push_back(uint8_t((now>>8) & 0xff));
+                                tag.push_back(uint8_t((now>>16)& 0xff));
+                                tag.push_back(uint8_t((now>>24)& 0xff));
+                                // extraNonce little-endian
+                                for (int i=0;i<8;i++) tag.push_back(uint8_t((extraNonce >> (8*i)) & 0xff));
+
+                                cbt.vin[0].sig = std::move(tag);
                                 // NOTE: pubkey must remain empty (validation enforces this).
                             } catch (const std::exception& ex) {
                                 log_error(std::string("miner C4(uniqueness tag) fatal: ") + ex.what());
@@ -654,11 +646,16 @@ int main(int argc, char** argv){
                             std::string err;
                             if (chain.submit_block(b, err)) {
                                 std::string miner_addr = "(unknown)";
-                                if (!b.txs.empty() && !b.txs[0].vout.empty() && b.txs[0].vout[0].pkh.size()==20) {
-                                    miner_addr = base58check_encode(VERSION_P2PKH, b.txs[0].vout[0].pkh);
+                                std::string cb_txid_hex = "(n/a)";
+                                if (!b.txs.empty()) {
+                                    cb_txid_hex = to_hex(b.txs[0].txid());
+                                    if (!b.txs[0].vout.empty() && b.txs[0].vout[0].pkh.size()==20) {
+                                        miner_addr = base58check_encode(VERSION_P2PKH, b.txs[0].vout[0].pkh);
+                                    }
                                 }
                                 log_info("mined block accepted, height=" + std::to_string(t.height + 1)
-                                         + ", miner=" + miner_addr);
+                                         + ", miner=" + miner_addr
+                                         + ", coinbase_txid=" + cb_txid_hex);
 
                                 // broadcast if P2P is up
                                 try {
