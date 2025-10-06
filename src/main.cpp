@@ -41,6 +41,7 @@
 #include <atomic>
 #include <memory>    // std::unique_ptr
 #include <algorithm> // find_if
+#include <ctime>     // time()
 
 // ---------- default per-user datadir (stable across launch locations) --------
 static std::string default_datadir() {
@@ -587,6 +588,36 @@ int main(int argc, char** argv){
                                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                                 continue;
                             }
+
+                            // C4: ensure coinbase txid is UNIQUE per block
+                            try {
+                                // lock_time participates in txid; set to (height+1)
+                                cbt.lock_time = static_cast<uint32_t>(t.height + 1);
+
+                                // Add a BIP34-style tag in "sig" (scriptSig-equivalent) with height+now
+                                const uint32_t h   = static_cast<uint32_t>(t.height + 1);
+                                const uint32_t now = static_cast<uint32_t>(time(nullptr));
+                                cbt.vin[0].sig = {
+                                    0x01,
+                                    static_cast<uint8_t>(h      ),
+                                    static_cast<uint8_t>(h >> 8 ),
+                                    static_cast<uint8_t>(h >>16 ),
+                                    static_cast<uint8_t>(h >>24 ),
+                                    static_cast<uint8_t>(now      ),
+                                    static_cast<uint8_t>(now >> 8 ),
+                                    static_cast<uint8_t>(now >>16 ),
+                                    static_cast<uint8_t>(now >>24 )
+                                };
+                                // NOTE: pubkey must remain empty (validation enforces this).
+                            } catch (const std::exception& ex) {
+                                log_error(std::string("miner C4(uniqueness tag) fatal: ") + ex.what());
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                                continue;
+                            } catch (...) {
+                                log_error("miner C4(uniqueness tag) fatal: unknown");
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                                continue;
+                            }
                         } catch (const std::exception& ex) {
                             log_error(std::string("miner C(coinbase vout) fatal: ") + ex.what());
                             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -623,18 +654,21 @@ int main(int argc, char** argv){
                             std::string err;
                             if (chain.submit_block(b, err)) {
                                 std::string miner_addr = "(unknown)";
-                            if (!b.txs.empty() && !b.txs[0].vout.empty() && b.txs[0].vout[0].pkh.size()==20) {
-                                miner_addr = base58check_encode(VERSION_P2PKH, b.txs[0].vout[0].pkh);
-                        }
+                                if (!b.txs.empty() && !b.txs[0].vout.empty() && b.txs[0].vout[0].pkh.size()==20) {
+                                    miner_addr = base58check_encode(VERSION_P2PKH, b.txs[0].vout[0].pkh);
+                                }
                                 log_info("mined block accepted, height=" + std::to_string(t.height + 1)
-                                 + ", miner=" + miner_addr);
+                                         + ", miner=" + miner_addr);
 
                                 // broadcast if P2P is up
-                                    try { if (!g_shutdown_requested.load()) p2p.broadcast_inv_block(b.block_hash()); }
-                                catch(...) { /* ignore */ }
+                                try {
+                                    if (!g_shutdown_requested.load()) {
+                                        p2p.broadcast_inv_block(b.block_hash());
+                                    }
+                                } catch(...) { /* ignore */ }
                             } else {
                                 log_warn(std::string("mined block rejected: ") + err);
-                        }
+                            }
                         } catch (const std::exception& ex) {
                             log_error(std::string("miner E(submit_block) fatal: ") + ex.what());
                         } catch (...) {
