@@ -1,6 +1,9 @@
 #include "difficulty.h"
+#include "constants.h"   // for BLOCK_TIME_SECS / GENESIS_BITS if callers pass those
 #include <cstdint>
 #include <cstddef>
+#include <vector>
+#include <utility>
 
 namespace miq {
 
@@ -43,6 +46,7 @@ static inline void target_from_compact(uint32_t bits, unsigned char* out) {
     }
 }
 
+// --- LWMA (kept; window implied by size of `last`) ---
 uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
                         int64_t target_spacing, uint32_t min_bits) {
     if (last.size() < 2) return min_bits;
@@ -72,6 +76,32 @@ uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
         t[i] = (unsigned char)v;
     }
     return compact_from_target(t);
+}
+
+// --- Epoch retarget: freeze inside epoch; adjust only at boundary ---
+uint32_t epoch_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
+                         int64_t target_spacing,
+                         uint32_t min_bits,
+                         uint64_t next_height,
+                         size_t interval) {
+    // If not at a boundary, keep current bits (freeze difficulty).
+    if (!last.empty() && (next_height % interval) != 0) {
+        return last.back().second;
+    }
+
+    // At boundary: compute new bits using the last `interval` headers
+    if (last.size() < 2) {
+        // No history? stick with min_bits / genesis
+        return last.empty() ? min_bits : last.back().second;
+    }
+
+    if (last.size() > interval) {
+        // Use only the last `interval` headers to determine the new target
+        std::vector<std::pair<int64_t, uint32_t>> tail(last.end() - interval, last.end());
+        return lwma_next_bits(tail, target_spacing, min_bits);
+    } else {
+        return lwma_next_bits(last, target_spacing, min_bits);
+    }
 }
 
 }
