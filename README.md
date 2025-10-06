@@ -9,7 +9,7 @@ Miqrochain Core is the reference implementation of the **MIQ** peer‑to‑peer 
 
 **Default ports**
 
-- P2P: `55001/tcp`
+- P2P: `9833/tcp`
 - JSON‑RPC: `9834/tcp`
 
 Miqrochain Core uses **libsecp256k1** (the Bitcoin Core secp256k1 library) for ECDSA. The build system will automatically fetch it at configure time if a system package is not available. LevelDB is used by default for the chainstate (RocksDB optional).
@@ -101,15 +101,14 @@ cmake --build . --parallel
 ```powershell
 # 0) Prereqs: Visual Studio 2022 (Desktop C++), CMake, OpenSSL (vcpkg recommended)
 
-# 1) Configure + build
-mkdir build; cd build
-cmake -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release ..
-cmake --build . --config Release --parallel
+cmake -G "Visual Studio 17 2022" -A x64 `
+  -DSECP256K1_EXHAUSTIVE_TESTS=OFF `
+  -DLEVELDB_BUILD_TESTS=OFF `
+  -DLEVELDB_BUILD_BENCHMARKS=OFF `
+  ..
 
-# 2) Binaries:
-#   build\Release\miqrod.exe
-#   build\Release\miq-keygen.exe
-```
+# 3) Build *Release* and in parallel
+cmake --build . --config Release --parallel
 
 **Notes**
 - The build will try to use a system `secp256k1` if present (vcpkg/Conan, etc.). Otherwise, it fetches the official bitcoin‑core repo at the configured tag and builds it as part of your tree.
@@ -128,10 +127,10 @@ datadir=/var/lib/miq
 
 # Networking
 no_p2p=0
-p2p_port=55001
+p2p_port=9833
 # Bootstrap peers (example):
-addnode=miqseed1.duckdns.org:55001
-addnode=miqroseed1.freeddns.org:55001
+addnode=miqseed1.duckdns.org:9833
+addnode=miqroseed1.freeddns.org:9833
 
 # RPC
 no_rpc=0
