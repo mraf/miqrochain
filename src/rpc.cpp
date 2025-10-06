@@ -644,6 +644,8 @@ std::string RpcService::handle(const std::string& body){
                 const auto& e    = std::get<2>(t);
 
                 std::map<std::string,JNode> o;
+                o["coinbase"] = jbool(e.coinbase);
+                o["height"]   = jnum((double)e.height); 
                 o["txid"]  = jstr(to_hex(txid));
                 o["vout"]  = jnum((double)vout);
                 o["value"] = jnum((double)e.value);
