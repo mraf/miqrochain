@@ -742,9 +742,7 @@ bool Chain::load_state(){
 }
 
 uint64_t Chain::subsidy_for_height(uint64_t h) const {
-    uint64_t halv = h / HALVING_INTERVAL;
-    if(halv >= 64) return 0;
-    return INITIAL_SUBSIDY >> halv;
+    return GetBlockSubsidy(static_cast<uint32_t>(h));
 }
 
 bool Chain::init_genesis(const Block& g){
