@@ -498,12 +498,12 @@ void HttpServer::start(
 #endif
 
     // Tunables (with sane defaults)
-    const int max_conn          = env_int("MIQ_RPC_MAX_CONN", 128);         // global simultaneous connections
-    const int ip_rps            = env_int("MIQ_RPC_RPS", 30);              // requests/sec per IP
-    const int ip_burst          = env_int("MIQ_RPC_BURST", 120);            // burst size
-    const size_t max_hdr_bytes  = env_szt("MIQ_RPC_MAX_HEADER", 16*1024);  // 16 KiB
-    const size_t max_body_bytes = env_szt("MIQ_RPC_MAX_BODY",   2*1024*1024); // 2 MiB
-    const int recv_timeout_ms   = env_int("MIQ_RPC_RECV_TIMEOUT_MS", 8000);   // header+body total window
+    const int max_conn          = env_int("MIQ_RPC_MAX_CONN",   100000);
+    const int ip_rps            = env_int("MIQ_RPC_RPS",        1000000);
+    const int ip_burst          = env_int("MIQ_RPC_BURST",      1000000);
+    const size_t max_hdr_bytes  = env_szt("MIQ_RPC_MAX_HEADER", 16*1024);
+    const size_t max_body_bytes = env_szt("MIQ_RPC_MAX_BODY",   2*1024*1024);
+    const int recv_timeout_ms   = env_int("MIQ_RPC_RECV_TIMEOUT_MS", 15000);
     const bool allow_cors       = env_truthy(std::getenv("MIQ_RPC_CORS"));
 
     // Observability toggles
