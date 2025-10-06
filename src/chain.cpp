@@ -400,13 +400,16 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
     if (h.time > now + (int64_t)MAX_TIME_SKEW) { err="header time too far in future"; return false; }
 
     // Bits: LWMA
-    {
-        auto last = last_headers(90);
-        uint32_t expected;
-        if (last.size() < 2) expected = last.empty() ? GENESIS_BITS : last.back().second;
-        else expected = lwma_next_bits(last, BLOCK_TIME_SECS, GENESIS_BITS);
-        if (h.bits != expected) { err = "bad header bits"; return false; }
-    }
+{
+    // retarget every MIQ_RETARGET_INTERVAL, freeze otherwise
+    auto last = last_headers(MIQ_RETARGET_INTERVAL);
+    uint32_t expected = miq::epoch_next_bits(
+        last, BLOCK_TIME_SECS, GENESIS_BITS,
+        /*next_height=*/ tip_.height + 1,
+        /*interval=*/ MIQ_RETARGET_INTERVAL
+    );
+    if (h.bits != expected) { err = "bad header bits"; return false; }
+}
 
     // POW
     if (!meets_target_be(header_hash_of(h), h.bits)) { err = "bad header pow"; return false; }
@@ -844,12 +847,15 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
 
     // Difficulty bits must match LWMA
     {
-        auto last = last_headers(90);
-        uint32_t expected;
-        if (last.size() < 2) expected = last.empty() ? GENESIS_BITS : last.back().second;
-        else expected = lwma_next_bits(last, BLOCK_TIME_SECS, GENESIS_BITS);
-        if (b.header.bits != expected) { err = "bad bits"; return false; }
-    }
+{
+    auto last = last_headers(MIQ_RETARGET_INTERVAL);
+    uint32_t expected = miq::epoch_next_bits(
+        last, BLOCK_TIME_SECS, GENESIS_BITS,
+        /*next_height=*/ tip_.height + 1,
+        /*interval=*/ MIQ_RETARGET_INTERVAL
+    );
+    if (b.header.bits != expected) { err = "bad bits"; return false; }
+}
 
     // POW
     if (!meets_target_be(b.block_hash(), b.header.bits)) { err = "bad pow"; return false; }
