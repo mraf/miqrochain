@@ -177,10 +177,16 @@ static Transaction make_coinbase_for(Chain& chain,
     cb.vin.resize(1);
     cb.vin[0].prev.txid.assign(32, 0);
     cb.vin[0].prev.vout = 0;
+
     TxOut out0;
-    out0.value = chain.subsidy_for_height(chain.height() + 1);
+    out0.value = chain.subsidy_for_height(chain.height() + 1);           // 50 * COIN at start
     out0.pkh   = (pkh20.size()==20) ? pkh20 : std::vector<uint8_t>(20,0);
     cb.vout.push_back(std::move(out0));
+
+    // Make coinbase txid unique per height while staying consensus-safe:
+    // lock_time is part of txid and unconstrained by your rules.
+    cb.lock_time = static_cast<uint32_t>(chain.height() + 1);
+
     return cb;
 }
 
