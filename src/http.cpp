@@ -498,18 +498,13 @@ void HttpServer::start(
 #endif
 
     // Tunables (with sane defaults)
-int max_conn          = env_int("MIQ_RPC_MAX_CONN", 128);          // was 64
-int ip_rps            = env_int("MIQ_RPC_RPS", 30);                // was 10
-int ip_burst          = env_int("MIQ_RPC_BURST", 120);             // was 30
-const size_t max_hdr_bytes  = env_szt("MIQ_RPC_MAX_HEADER", 16*1024);
-const size_t max_body_bytes = env_szt("MIQ_RPC_MAX_BODY",   2*1024*1024);
-int recv_timeout_ms   = env_int("MIQ_RPC_RECV_TIMEOUT_MS", 8000);  // was 5000
-
-// Make sure env cannot accidentally shrink below our relaxed defaults:
-max_conn = std::max(max_conn, 128);
-ip_rps   = std::max(ip_rps, 30);
-ip_burst = std::max(ip_burst, 120);
-recv_timeout_ms = std::max(recv_timeout_ms, 8000);
+    const int max_conn          = env_int("MIQ_RPC_MAX_CONN", 128);         // global simultaneous connections
+    const int ip_rps            = env_int("MIQ_RPC_RPS", 30);              // requests/sec per IP
+    const int ip_burst          = env_int("MIQ_RPC_BURST", 120);            // burst size
+    const size_t max_hdr_bytes  = env_szt("MIQ_RPC_MAX_HEADER", 16*1024);  // 16 KiB
+    const size_t max_body_bytes = env_szt("MIQ_RPC_MAX_BODY",   2*1024*1024); // 2 MiB
+    const int recv_timeout_ms   = env_int("MIQ_RPC_RECV_TIMEOUT_MS", 8000);   // header+body total window
+    const bool allow_cors       = env_truthy(std::getenv("MIQ_RPC_CORS"));
 
     // Observability toggles
     const bool enable_metrics   = env_truthy(std::getenv("MIQ_RPC_METRICS"));
