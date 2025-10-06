@@ -7,6 +7,7 @@
 #include "chain.h"
 #include "constants.h"
 #include "utxo.h"   // fee calc (UTXOEntry)
+#include "base58check.h"  // ← NEW: for Base58Check address display
 
 #include <chrono>
 #include <tuple>
@@ -594,6 +595,19 @@ static int dial_be_ipv4(uint32_t be_ip, uint16_t port){
     return s;
 }
 
+// ---- NEW (helper): convert coinbase PKH → Base58 P2PKH and extract from block
+static std::string miq_addr_from_pkh(const std::vector<uint8_t>& pkh) {
+    if (pkh.size() != 20) return "(unknown)";
+    return base58check_encode(VERSION_P2PKH, pkh);
+}
+static std::string miq_miner_from_block(const Block& b) {
+    // coinbase is tx[0], payout is vout[0].pkh (as constructed in miner in main.cpp)
+    if (b.txs.empty()) return "(unknown)";
+    const Transaction& cb = b.txs[0];
+    if (cb.vout.empty()) return "(unknown)";
+    return miq_addr_from_pkh(cb.vout[0].pkh);
+}
+
 }
 
 namespace miq {
@@ -1080,7 +1094,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     // Gate + handshake
     gate_on_connect(s);
     auto msg = encode_msg("version", {});
-    send(s, (const char*)msg.data(), (int)msg.size(), 0);
+    send(s, (const char*)msg.data(), (int)m.size(), 0);
 
     return true;
 }
@@ -1457,7 +1471,16 @@ void P2P::handle_incoming_block(int sock, const std::vector<uint8_t>& raw){
 
     std::string err;
     if (chain_.submit_block(b, err)) {
-        log_info("P2P: accepted block (child of known parent)");
+        // --- NEW: log miner address for accepted blocks from peers
+        const std::string miner = miq_miner_from_block(b);
+        std::string src_ip = "?";
+        auto pit = peers_.find(sock);
+        if (pit != peers_.end()) src_ip = pit->second.ip;
+
+        log_info("P2P: accepted block height=" + std::to_string(chain_.height())
+                 + " miner=" + miner
+                 + " from=" + src_ip);
+
         broadcast_inv_block(bh);
         try_connect_orphans(hexkey(bh));
         // progress tracker
@@ -1496,6 +1519,11 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
 
         std::string err;
         if (chain_.submit_block(ob, err)) {
+            // --- NEW: log miner address for accepted orphans
+            const std::string miner = miq_miner_from_block(ob);
+            log_info("P2P: accepted orphan as block height=" + std::to_string(chain_.height())
+                     + " miner=" + miner);
+
             broadcast_inv_block(oit->second.hash);
             const std::string new_parent_hex = child_hex;
             remove_orphan_by_hex(child_hex);
