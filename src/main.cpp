@@ -17,7 +17,7 @@
 #include "merkle.h"
 #include "crypto/ecdsa_iface.h"
 #include "hex.h"
-#include "difficulty.h"   // LWMA next_bits
+#include "difficulty.h"   // epoch_next_bits
 
 #include "tls_proxy.h"    // TLS terminator for RPC
 #include "ibd_monitor.h"  // IBD sampling for getibdinfo
@@ -490,7 +490,9 @@ int main(int argc, char** argv){
             std::thread miner([&, mine_pkh, threads](){
                 // thread-local RNG for extraNonce
                 std::random_device rd;
-                std::mt19937_64 gen( (uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count()) ^ (uint64_t)rd() ^ (uint64_t)(uintptr_t)&gen) );
+                std::mt19937_64 gen(
+                    (uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count())
+                    ^ (uint64_t)rd() ^ (uint64_t)(uintptr_t)&gen));
 
                 while (!g_shutdown_requested.load()) {
                     try {
@@ -620,18 +622,18 @@ int main(int argc, char** argv){
                             continue;
                         }
 
-                        // ---- D) mine_block with LWMA next_bits (safe early fallback)
+                        // ---- D) mine_block using EPOCH retarget (matches consensus)
                         Block b;
                         try {
-                            std::vector<Transaction> txs; // empty set
-                            auto headers = chain.last_headers(90);
-                            uint32_t nb;
-                            if (headers.size() < 2) {
-                                // Not enough history yet → reuse tip bits (or GENESIS_BITS at height 0)
-                                nb = headers.empty() ? GENESIS_BITS : headers.back().second;
-                            } else {
-                                nb = lwma_next_bits(headers, BLOCK_TIME_SECS, GENESIS_BITS);
-                            }
+                            std::vector<Transaction> txs; // empty set (mempool integration later)
+                            auto last = chain.last_headers(MIQ_RETARGET_INTERVAL);
+                            uint32_t nb = miq::epoch_next_bits(
+                                last,
+                                BLOCK_TIME_SECS,
+                                GENESIS_BITS,
+                                /*next_height=*/ t.height + 1,
+                                /*interval=*/ MIQ_RETARGET_INTERVAL
+                            );
                             b = miq::mine_block(t.hash, nb, cbt, txs, threads);
                         } catch (const std::exception& ex) {
                             log_error(std::string("miner D(mine_block) fatal: ") + ex.what());
