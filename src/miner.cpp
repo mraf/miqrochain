@@ -176,15 +176,30 @@ static Transaction make_coinbase_for(Chain& chain,
     Transaction cb;
     cb.vin.resize(1);
     cb.vin[0].prev.txid.assign(32, 0);
-    cb.vin[0].prev.vout = 0;
+    cb.vin[0].prev.vout = 0;          // keep your existing convention
+    cb.vin[0].pubkey.clear();
+
+    // --- Make coinbase tx UNIQUE per block (BIP34-style tag) ---
+    // Put (height,time) into the coinbase input's "sig" (scriptSig-equivalent),
+    // which is part of the serialized transaction and therefore of the txid.
+    {
+        std::vector<uint8_t> tag;
+        tag.reserve(1 + 4 + 4);
+        tag.push_back(0x01); // version/tag byte (future-proof)
+        const uint32_t height = static_cast<uint32_t>(chain.height() + 1);
+        const uint32_t now    = static_cast<uint32_t>(time(nullptr));
+        put_u32_le(tag, height);
+        put_u32_le(tag, now);
+        cb.vin[0].sig = std::move(tag);
+    }
+    // ------------------------------------------------------------
 
     TxOut out0;
-    out0.value = chain.subsidy_for_height(chain.height() + 1);           // 50 * COIN at start
+    out0.value = chain.subsidy_for_height(chain.height() + 1); // 50 * COIN at start
     out0.pkh   = (pkh20.size()==20) ? pkh20 : std::vector<uint8_t>(20,0);
     cb.vout.push_back(std::move(out0));
 
-    // Make coinbase txid unique per height while staying consensus-safe:
-    // lock_time is part of txid and unconstrained by your rules.
+    // (Optional) also vary lock_time with height; harmless, but not relied on.
     cb.lock_time = static_cast<uint32_t>(chain.height() + 1);
 
     return cb;
