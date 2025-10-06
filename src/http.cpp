@@ -19,6 +19,7 @@
 #include <atomic>
 #include <memory>
 #include <array>     // for std::array
+#include <cstdint>
 
 // --- platform sockets + sleep -----------------------------------------------
 #ifdef _WIN32
@@ -186,7 +187,7 @@ struct TokenBucket {
 };
 
 static std::unordered_map<std::string, TokenBucket> g_buckets;
-static std::mutex g_buckets_mtx; // FIX: protect map + cleanup against data races
+static std::mutex g_buckets_mtx; // protect map + cleanup
 static std::chrono::steady_clock::time_point g_last_cleanup = std::chrono::steady_clock::now();
 static std::atomic<int> g_live_conns{0};
 
@@ -466,7 +467,12 @@ static void send_http_simple(sock_t fd, int code, const char* status,
     for(const auto& h : extra_headers){
         resp += h.first; resp += ": "; resp += h.second; resp += "\r\n";
     }
-    resp += "Connection: close\r\n\r\n";
+    bool has_conn = false;
+    for (const auto& h : extra_headers) {
+        if (lc(h.first) == "connection") { has_conn = true; break; }
+    }
+    if (!has_conn) resp += "Connection: close\r\n";
+    resp += "\r\n";
     resp += body;
     g_metrics.http_bytes_out_total += body.size();
 #ifdef _WIN32
@@ -497,7 +503,7 @@ void HttpServer::start(
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
 
-    // Tunables (with sane defaults)
+    // Tunables (very high defaults for local tools)
     const int max_conn          = env_int("MIQ_RPC_MAX_CONN",   100000);
     const int ip_rps            = env_int("MIQ_RPC_RPS",        1000000);
     const int ip_burst          = env_int("MIQ_RPC_BURST",      1000000);
@@ -567,7 +573,7 @@ void HttpServer::start(
 #endif
 
         if(bind(s, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0){
-            if(listen(s, 64) == 0){
+            if(listen(s, 4096) == 0){ // bigger backlog
                 if(ai->ai_addrlen <= sizeof(bound_sa)){
                     std::memcpy(&bound_sa, ai->ai_addr, ai->ai_addrlen);
                     bound_len = (socklen_t)ai->ai_addrlen;
@@ -667,18 +673,20 @@ void HttpServer::start(
                     g_metrics.observe_duration_ms((uint64_t)ms);
                 };
 
-                // Per-IP token bucket
+                // Per-IP token bucket (EXEMPT loopback)
                 std::string ip = sock_ntop(cli);
-                if(!rl_allow(ip, ip_rps, ip_burst)){
-                    g_metrics.http_rate_limited_total += 1;
-                    std::string reqid = gen_reqid();
-                    const std::string body_rl = "{\"error\":\"rate limit\"}";
-                    send_http_simple(fd, 429, "Too Many Requests", "application/json",
-                                     body_rl,
-                                     {{"Retry-After","1"},{"X-Request-Id", reqid}});
-                    access_logf(429, ip, "?", "?", "", 0, body_rl.size(), reqid);
-                    closesocket(fd);
-                    return;
+                bool is_local = is_loopback_sockaddr(reinterpret_cast<const sockaddr*>(&cli));
+                if (!is_local) {
+                    if (!rl_allow(ip, ip_rps, ip_burst)) {
+                        g_metrics.http_rate_limited_total += 1;
+                        std::string reqid = gen_reqid();
+                        const std::string body_rl = "{\"error\":\"rate limit\"}";
+                        send_http_simple(fd, 429, "Too Many Requests", "application/json",
+                                         body_rl, {{"Retry-After","0"},{"X-Request-Id", reqid}});
+                        access_logf(429, ip, "?", "?", "", 0, body_rl.size(), reqid);
+                        closesocket(fd);
+                        return;
+                    }
                 }
 
                 // Parse one request (with time/size caps)
