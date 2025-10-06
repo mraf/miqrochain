@@ -33,7 +33,7 @@ namespace miq {
 #define MIQ_P2P_INV_WINDOW_MS 10000   // window for INV rate checks (must match .cpp)
 #endif
 #ifndef MIQ_P2P_INV_WINDOW_CAP
-#define MIQ_P2P_INV_WINDOW_CAP 500    // max invs we accept per window per peer (match .cpp)
+#define MIQ_P2P_INV_WINDOW_CAP 500    // max INVs accepted per window per peer (match .cpp)
 #endif
 #ifndef MIQ_P2P_GETADDR_INTERVAL_MS
 #define MIQ_P2P_GETADDR_INTERVAL_MS 120000  // throttle our getaddr requests per peer
@@ -160,7 +160,7 @@ public:
     // key-based helper ("invb","getb", etc.)
     bool check_rate(PeerState& ps, const char* key);
 
-    // explicit family:name burst/window helper (used internally in .cpp)
+    // explicit family:name burst/window helper (implemented in .cpp)
     bool check_rate(PeerState& ps,
                     const char* family,
                     const char* name,
@@ -261,15 +261,15 @@ private:
     size_t orphan_count_limit_{0};
 
     // Inbound rate gating (soft Sybil friction)
-    int64_t inbound_win_start_ms{0};
+    int64_t  inbound_win_start_ms_{0};     // NOTE: underscore to match p2p.cpp
     uint32_t inbound_accepts_in_window_{0};
 
     // --- New: timed bans + whitelist + feature gates -------------------------
     std::unordered_map<std::string,int64_t> timed_bans_; // ip -> expiry_ms
-    int64_t default_ban_ms_{MIQ_P2P_BAN_MS};
+    int64_t  default_ban_ms_{MIQ_P2P_BAN_MS};
     uint32_t min_peer_version_{0};
     uint64_t required_features_mask_{0};
-    int64_t msg_deadline_ms_{MIQ_P2P_MSG_DEADLINE_MS};
+    int64_t  msg_deadline_ms_{MIQ_P2P_MSG_DEADLINE_MS};
 
     struct Cidr { uint32_t net; uint8_t bits; };
     std::unordered_set<std::string> whitelist_ips_;
@@ -381,7 +381,7 @@ private:
         for (const auto& c : whitelist_cidrs_) {
             if (c.bits == 0) return true; // 0.0.0.0/0
             uint32_t mask = (c.bits==0) ? 0u : (~uint32_t(0) << (32 - c.bits));
-            if ( (host_ip & mask) == (c.net & mask) ) return true;
+            if ((host_ip & mask) == (c.net & mask)) return true;
         }
         return false;
     }
