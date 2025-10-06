@@ -622,13 +622,19 @@ int main(int argc, char** argv){
                         try {
                             std::string err;
                             if (chain.submit_block(b, err)) {
-                                log_info("mined block accepted, height=" + std::to_string(t.height + 1));
+                                std::string miner_addr = "(unknown)";
+                            if (!b.txs.empty() && !b.txs[0].vout.empty() && b.txs[0].vout[0].pkh.size()==20) {
+                                miner_addr = base58check_encode(VERSION_P2PKH, b.txs[0].vout[0].pkh);
+                        }
+                                log_info("mined block accepted, height=" + std::to_string(t.height + 1)
+                                 + ", miner=" + miner_addr);
+
                                 // broadcast if P2P is up
-                                try { if (!g_shutdown_requested.load()) p2p.broadcast_inv_block(b.block_hash()); }
+                                    try { if (!g_shutdown_requested.load()) p2p.broadcast_inv_block(b.block_hash()); }
                                 catch(...) { /* ignore */ }
                             } else {
                                 log_warn(std::string("mined block rejected: ") + err);
-                            }
+                        }
                         } catch (const std::exception& ex) {
                             log_error(std::string("miner E(submit_block) fatal: ") + ex.what());
                         } catch (...) {
