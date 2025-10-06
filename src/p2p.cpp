@@ -256,7 +256,7 @@ static std::unordered_map<int,
 static std::unordered_map<int, int64_t> g_rx_started_ms;
 static inline void rx_track_start(int fd){
     if (g_rx_started_ms.find(fd)==g_rx_started_ms.end())
-        g_rx_started_ms[fd] = [](){ using namespace std::chrono; return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count(); }();
+        g_rx_started_ms[fd] = [](){ using namespace std::chrono; return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }();
 }
 static inline void rx_clear_start(int fd){
     g_rx_started_ms.erase(fd);
@@ -598,12 +598,12 @@ static int dial_be_ipv4(uint32_t be_ip, uint16_t port){
 // ---- NEW (helper): convert coinbase PKH → Base58 P2PKH and extract from block
 static std::string miq_addr_from_pkh(const std::vector<uint8_t>& pkh) {
     if (pkh.size() != 20) return "(unknown)";
-    return base58check_encode(VERSION_P2PKH, pkh);
+    return miq::base58check_encode(miq::VERSION_P2PKH, pkh);
 }
-static std::string miq_miner_from_block(const Block& b) {
+static std::string miq_miner_from_block(const miq::Block& b) {
     // coinbase is tx[0], payout is vout[0].pkh (as constructed in miner in main.cpp)
     if (b.txs.empty()) return "(unknown)";
-    const Transaction& cb = b.txs[0];
+    const miq::Transaction& cb = b.txs[0];
     if (cb.vout.empty()) return "(unknown)";
     return miq_addr_from_pkh(cb.vout[0].pkh);
 }
@@ -1094,7 +1094,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     // Gate + handshake
     gate_on_connect(s);
     auto msg = encode_msg("version", {});
-    send(s, (const char*)msg.data(), (int)m.size(), 0);
+    send(s, (const char*)msg.data(), (int)msg.size(), 0);
 
     return true;
 }
