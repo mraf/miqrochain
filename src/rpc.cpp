@@ -464,6 +464,19 @@ std::string RpcService::handle(const std::string& body){
             JNode pk ; pk.v  = std::string(to_hex(o0.pkh)); o["pkh"]   = pk;
 
             JNode out; out.v = o; return json_dump(out);
+          if(!ok) return err("not found");
+          if(b.txs.empty()) return err("no transactions in block");
+            const auto& cb = b.txs[0];
+          if(cb.vout.empty()) return err("coinbase has no outputs");
+            const auto& o0 = cb.vout[0];
+
+            std::map<std::string,JNode> o;
+            JNode val; val.v = (double)o0.value;            o["value"] = val;   // in miqron
+            JNode pk ; pk.v  = std::string(to_hex(o0.pkh)); o["pkh"]   = pk;
+            // NEW: return full txid of the coinbase
+            JNode tx ; tx.v  = std::string(to_hex(cb.txid())); o["txid"] = tx;
+
+            JNode out; out.v = o; return json_dump(out);
         }
 
         if(method=="gettipinfo"){
