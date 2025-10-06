@@ -1686,6 +1686,7 @@ void P2P::loop(){
                     if (kv.second.verack_ok &&
                         can_accept_hdr_batch(kv.second, now_ms()) &&
                         check_rate(kv.second, "get", 1.0, now_ms())) {
+                        kv.second.sent_getheaders = true; // NEW: track request
                         send(kv.first, (const char*)m.data(), (int)m.size(), 0);
                         kv.second.inflight_hdr_batches++;
                         if (++probes >= 2) break; // a couple of peers are enough
@@ -1884,6 +1885,7 @@ void P2P::loop(){
                             auto pl = build_getheaders_payload(locator, stop);
                             auto msg = encode_msg("getheaders", pl);
                             if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "get", 1.0, now_ms())) {
+                                ps.sent_getheaders = true; // NEW: track request
                                 send(s, (const char*)msg.data(), (int)msg.size(), 0);
                                 ps.inflight_hdr_batches++;
                             }
@@ -2125,20 +2127,23 @@ void P2P::loop(){
                             g_last_progress_ms = now_ms();
                         }
 
-                        // --- MODIFIED: foreign/zero-progress → fallback by-index ---
-                        if (!hs.empty() && accepted == 0) {
-                            int &z = g_zero_hdr_batches[s];
-                            z++;
-                            if (z >= 3) { // three consecutive empty batches
-                                log_warn("P2P: headers made no progress after 3 batches; falling back to by-index sync");
-                                ps.banscore += 1; // keep tiny pressure
-                                ps.syncing = true;
-                                ps.next_index = chain_.height() + 1;
-                                request_block_index(ps, ps.next_index);
-                                z = 0; // reset and continue
+                        // --- Foreign/zero-progress detection (empty or rejected batches) ---
+                        {
+                            bool zero_progress = hs.empty() || (accepted == 0);
+                            if (zero_progress) {
+                                int &z = g_zero_hdr_batches[s];
+                                z++;
+                                if (z >= 3) {
+                                    log_warn("P2P: headers made no progress after 3 batches; falling back to by-index sync");
+                                    ps.banscore = std::min(ps.banscore + 1, MIQ_P2P_MAX_BANSCORE);
+                                    ps.syncing = true;
+                                    ps.next_index = chain_.height() + 1;
+                                    request_block_index(ps, ps.next_index);
+                                    z = 0; // reset after fallback
+                                }
+                            } else {
+                                g_zero_hdr_batches[s] = 0;
                             }
-                        } else if (accepted > 0) {
-                            g_zero_hdr_batches[s] = 0;
                         }
 
                         // Ask for missing blocks on best-header path
@@ -2155,6 +2160,7 @@ void P2P::loop(){
                         // done with a batch
                         if (ps.inflight_hdr_batches > 0) ps.inflight_hdr_batches--;
                         ps.last_hdr_batch_done_ms = now_ms();
+                        if (ps.inflight_hdr_batches == 0) ps.sent_getheaders = false; // NEW: clear flag when drained
 
                         // --- Refill header pipeline if empty ---
                         if (ps.inflight_hdr_batches == 0) {
@@ -2164,6 +2170,7 @@ void P2P::loop(){
                             auto pl2 = build_getheaders_payload(locator2, stop2);
                             auto m2  = encode_msg("getheaders", pl2);
                             if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "get", 1.0, now_ms())) {
+                                ps.sent_getheaders = true; // NEW: track request
                                 send(s, (const char*)m2.data(), (int)m2.size(), 0);
                                 ps.inflight_hdr_batches++;
                             }
