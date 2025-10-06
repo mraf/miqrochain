@@ -807,12 +807,27 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         if(mr != b.header.merkle_root){ err="bad merkle"; return false; }
     }
 
-    // Coinbase shape
+    // Coinbase shape (allow tagged sig; pubkey must be empty)
     const auto& cb = b.txs[0];
     if (cb.vin.size()!=1 || !cb.vin[0].pubkey.empty()) { err="bad coinbase"; return false; }
     if (cb.vin[0].prev.txid.size()!=32) { err="bad coinbase prev size"; return false; }
     if (std::any_of(cb.vin[0].prev.txid.begin(), cb.vin[0].prev.txid.end(), [](uint8_t v){ return v!=0; })) { err="bad coinbase prev"; return false; }
     if (cb.vin[0].prev.vout != 0) { err="bad coinbase vout"; return false; }
+
+    // === BIP30: reject if any txid in this block already has ANY unspent outputs ===
+    // (i.e., if utxo_.get(txid, v, ...) succeeds for any v in [0..tx.vout.size()-1])
+    {
+        UTXOEntry dummy;
+        for (const auto& tx : b.txs) {
+            const auto id = tx.txid();
+            for (uint32_t v = 0; v < (uint32_t)tx.vout.size(); ++v) {
+                if (utxo_.get(id, v, dummy)) {
+                    err = "BIP30 duplicate txid";
+                    return false;
+                }
+            }
+        }
+    }
 
     // Non-coinbase tx checks
     for (size_t ti=1; ti<b.txs.size(); ++ti) {
