@@ -202,37 +202,32 @@ static void handle_signal(int sig){
 // ======== SFINAE helpers to pull txs from Mempool ============================
 namespace {
     template<typename MP>
-    using has_collect_for_block_expr = decltype(
-        std::declval<MP&>().collect_for_block(
-            std::declval<std::vector<Transaction>&>(),
-            std::declval<std::size_t>()
-        )
-    );
+    using has_collect_for_block_sig =
+        decltype(std::declval<MP&>().collect_for_block(
+            std::declval<std::vector<Transaction>&>(), std::size_t{}));
 
     template<typename MP>
-    using has_snapshot_expr = decltype(
-        std::declval<MP&>().snapshot(
-            std::declval<std::vector<Transaction>&>()
-        )
-    );
+    using has_snapshot_sig =
+        decltype(std::declval<MP&>().snapshot(
+            std::declval<std::vector<Transaction>&>()));
 
     template<typename T, typename = void>
     struct has_collect_for_block : std::false_type {};
     template<typename T>
-    struct has_collect_for_block<T, std::void_t<has_collect_for_block_expr<T>>> : std::true_type {};
+    struct has_collect_for_block<T, std::void_t<has_collect_for_block_sig<T>>> : std::true_type {};
 
     template<typename T, typename = void>
     struct has_snapshot : std::false_type {};
     template<typename T>
-    struct has_snapshot<T, std::void_t<has_snapshot_expr<T>>> : std::true_type {};
+    struct has_snapshot<T, std::void_t<has_snapshot_sig<T>>> : std::true_type {};
 
     // Cap txs to fit within max_bytes (roughly), accounting for coinbase size
-    static void cap_by_size(std::vector<Transaction>& txs, std::size_t max_bytes, std::size_t already_used_bytes) {
+    static void cap_by_size(std::vector<Transaction>& txs, size_t max_bytes, size_t already_used_bytes) {
         std::vector<Transaction> kept;
         kept.reserve(txs.size());
-        std::size_t used = already_used_bytes;
+        size_t used = already_used_bytes;
         for (const auto& tx : txs) {
-            std::size_t sz = ser_tx(tx).size();
+            size_t sz = ser_tx(tx).size();
             if (used + sz > max_bytes) continue;
             kept.push_back(tx);
             used += sz;
@@ -241,9 +236,9 @@ namespace {
     }
 
     template<typename MP>
-    static std::vector<Transaction> collect_mempool_for_block(MP& mp, const Transaction& coinbase, std::size_t max_bytes) {
+    static std::vector<Transaction> collect_mempool_for_block(MP& mp, const Transaction& coinbase, size_t max_bytes) {
         std::vector<Transaction> txs;
-        std::size_t used = ser_tx(coinbase).size();
+        size_t used = ser_tx(coinbase).size();
 
         if constexpr (has_collect_for_block<MP>::value) {
             // Preferred: mempool handles its own packing
@@ -260,7 +255,7 @@ namespace {
             return txs;
         }
     }
-}
+} // namespace
 // ============================================================================
 
 // ======== Miner thread as a plain function (avoids MSVC lambda hiccups) =====
@@ -280,7 +275,7 @@ static void miner_loop(MinerCtx ctx) {
         ^ (uint64_t)rd() ^ (uint64_t)(uintptr_t)&gen));
 
     // Soft cap on block size (bytes)
-    const std::size_t kBlockMaxBytes = 900 * 1024; // leave headroom under 1 MiB
+    const size_t kBlockMaxBytes = 900 * 1024; // leave headroom under 1 MiB
 
     while (!g_shutdown_requested.load()) {
         try {
