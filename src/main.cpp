@@ -43,6 +43,9 @@
 #include <algorithm> // find_if
 #include <ctime>     // time()
 #include <random>    // extraNonce for unique coinbase txid
+#include <type_traits> // SFINAE detection
+
+using namespace miq;
 
 // ---------- default per-user datadir (stable across launch locations) --------
 static std::string default_datadir() {
@@ -102,8 +105,6 @@ static bool load_existing_genesis_priv(const std::string& datadir, std::vector<u
     }
     return false; // not found
 }
-
-using namespace miq;
 
 static std::vector<uint8_t> g_mine_pkh;
 static std::atomic<bool> g_shutdown_requested{false};
@@ -195,6 +196,63 @@ static void handle_signal(int sig){
     (void)sig;
     g_shutdown_requested.store(true);
 }
+
+// ======== SFINAE helpers to pull txs from Mempool ============================
+namespace {
+    template<typename MP>
+    using has_collect_for_block_sig =
+        decltype(std::declval<MP&>().collect_for_block(std::declval<std::vector<Transaction>&>(), size_t{}));
+
+    template<typename MP>
+    using has_snapshot_sig =
+        decltype(std::declval<MP&>().snapshot(std::declval<std::vector<Transaction>&>()));
+
+    template<typename T, typename = void>
+    struct has_collect_for_block : std::false_type {};
+    template<typename T>
+    struct has_collect_for_block<T, std::void_t<has_collect_for_block_sig<T>>> : std::true_type {};
+
+    template<typename T, typename = void>
+    struct has_snapshot : std::false_type {};
+    template<typename T>
+    struct has_snapshot<T, std::void_t<has_snapshot_sig<T>>> : std::true_type {};
+
+    // Cap txs to fit within max_bytes (roughly), accounting for coinbase size
+    static void cap_by_size(std::vector<Transaction>& txs, size_t max_bytes, size_t already_used_bytes) {
+        std::vector<Transaction> kept;
+        kept.reserve(txs.size());
+        size_t used = already_used_bytes;
+        for (const auto& tx : txs) {
+            size_t sz = ser_tx(tx).size();
+            if (used + sz > max_bytes) continue;
+            kept.push_back(tx);
+            used += sz;
+        }
+        txs.swap(kept);
+    }
+
+    template<typename MP>
+    static std::vector<Transaction> collect_mempool_for_block(MP& mp, const Transaction& coinbase, size_t max_bytes) {
+        std::vector<Transaction> txs;
+        size_t used = ser_tx(coinbase).size();
+
+        if constexpr (has_collect_for_block<MP>::value) {
+            // Preferred: mempool handles its own packing
+            mp.collect_for_block(txs, (max_bytes > used) ? (max_bytes - used) : 0);
+            return txs;
+        } else if constexpr (has_snapshot<MP>::value) {
+            // Fallback: take a snapshot and cap locally
+            mp.snapshot(txs);
+            cap_by_size(txs, max_bytes, used);
+            return txs;
+        } else {
+            // No known API -> mine coinbase-only (safe fallback)
+            (void)max_bytes;
+            return txs;
+        }
+    }
+} // namespace
+// ============================================================================
 
 int main(int argc, char** argv){
     try {
@@ -494,6 +552,9 @@ int main(int argc, char** argv){
                     (uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count())
                     ^ (uint64_t)rd() ^ (uint64_t)(uintptr_t)&gen));
 
+                // Soft cap on block size (bytes)
+                const size_t kBlockMaxBytes = 900 * 1024; // leave headroom under 1 MiB
+
                 while (!g_shutdown_requested.load()) {
                     try {
                         // ---- A) get tip
@@ -622,10 +683,13 @@ int main(int argc, char** argv){
                             continue;
                         }
 
-                        // ---- D) mine_block using EPOCH retarget (matches consensus)
+                        // ---- D) pull mempool txs and mine with EPOCH retarget (consensus)
                         Block b;
                         try {
-                            std::vector<Transaction> txs; // empty set (mempool integration later)
+                            // Collect transactions from mempool with a size cap
+                            std::vector<Transaction> txs = collect_mempool_for_block(mempool, cbt, kBlockMaxBytes);
+
+                            // Difficulty for next block (epoch-based)
                             auto last = chain.last_headers(MIQ_RETARGET_INTERVAL);
                             uint32_t nb = miq::epoch_next_bits(
                                 last,
@@ -634,6 +698,7 @@ int main(int argc, char** argv){
                                 /*next_height=*/ t.height + 1,
                                 /*interval=*/ MIQ_RETARGET_INTERVAL
                             );
+
                             b = miq::mine_block(t.hash, nb, cbt, txs, threads);
                         } catch (const std::exception& ex) {
                             log_error(std::string("miner D(mine_block) fatal: ") + ex.what());
@@ -649,6 +714,7 @@ int main(int argc, char** argv){
                             if (chain.submit_block(b, err)) {
                                 std::string miner_addr = "(unknown)";
                                 std::string cb_txid_hex = "(n/a)";
+                                int noncb = (int)b.txs.size() - 1;
                                 if (!b.txs.empty()) {
                                     cb_txid_hex = to_hex(b.txs[0].txid());
                                     if (!b.txs[0].vout.empty() && b.txs[0].vout[0].pkh.size()==20) {
@@ -657,7 +723,8 @@ int main(int argc, char** argv){
                                 }
                                 log_info("mined block accepted, height=" + std::to_string(t.height + 1)
                                          + ", miner=" + miner_addr
-                                         + ", coinbase_txid=" + cb_txid_hex);
+                                         + ", coinbase_txid=" + cb_txid_hex
+                                         + ", txs=" + std::to_string(std::max(0, noncb)));
 
                                 // broadcast if P2P is up
                                 try {
