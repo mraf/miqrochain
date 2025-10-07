@@ -91,8 +91,12 @@ public:
     size_t bytes_used()  const { return total_bytes_; }
     bool   exists(const std::vector<uint8_t>& txid) const;
 
-    // For miner: collect up to `max` txs (parents-first, highest feerate)
+    // For miner: simple parents-first, highest-feerate up to `max` transactions
     std::vector<Transaction> collect(size_t max) const;
+
+    // For miner (SFINAE target): take a size-capped parents-first snapshot
+    void snapshot(std::vector<Transaction>& out) const;                       // <-- added
+    void collect_for_block(std::vector<Transaction>& out, size_t max_bytes) const; // <-- added
 
     // For P2P serving (ids only)
     std::vector<std::vector<uint8_t>> txids() const;
