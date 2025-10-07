@@ -38,7 +38,7 @@
 #include <vector>
 #include <chrono>
 #include <cstring>   // memcpy
-#include <cstdlib>   // getenv, setenv, _putenv_s
+#include <cstdlib>   // getenv, setenv, _putenv_s, _dupenv_s
 #include <csignal>   // signal handling
 #include <atomic>
 #include <memory>    // std::unique_ptr
@@ -47,7 +47,6 @@
 #include <random>    // extraNonce for unique coinbase txid
 #include <type_traits>
 #include <utility>
-#include <iterator>  // istreambuf_iterator
 #include <cstdint>   // uint64_t
 
 using namespace miq;
@@ -605,14 +604,17 @@ int main(int argc, char** argv){
 
             // NEW: synchronize HTTP gate token to the RPC cookie so clients only need Authorization: Bearer <cookie>
             try {
+                std::string cookie_path =
 #ifdef _WIN32
-                std::ifstream f(cfg.datadir + "\\.cookie", std::ios::binary);
+                    cfg.datadir + "\\.cookie";
 #else
-                std::ifstream f(cfg.datadir + "/.cookie", std::ios::binary);
+                    cfg.datadir + "/.cookie";
 #endif
-                std::string tok(
-                    (std::istreambuf_iterator<char>(f)),
-                    std::istreambuf_iterator<char>()); // explicit end iterator
+                std::vector<uint8_t> buf;
+                if (!read_file_all(cookie_path, buf)) {
+                    throw std::runtime_error("failed to read cookie");
+                }
+                std::string tok(buf.begin(), buf.end());
                 // trim trailing whitespace
                 while(!tok.empty() && (tok.back()=='\r'||tok.back()=='\n'||tok.back()==' '||tok.back()=='\t')) tok.pop_back();
 #ifdef _WIN32
