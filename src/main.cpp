@@ -40,11 +40,11 @@
 #include <csignal>   // signal handling
 #include <atomic>
 #include <memory>    // std::unique_ptr
-#include <algorithm> // find_if
+#include <algorithm> // std::max
 #include <ctime>     // time()
 #include <random>    // extraNonce for unique coinbase txid
-#include <type_traits> // SFINAE helpers
-#include <utility>     // std::declval
+#include <type_traits>
+#include <utility>
 
 using namespace miq;
 
@@ -198,29 +198,53 @@ static void handle_signal(int sig){
     g_shutdown_requested.store(true);
 }
 
-// ======== SFINAE helpers to pull txs from Mempool (MSVC-safe) ================
+// ======== Robust MSVC-safe detection + packing helpers =======================
+// Pointer-to-member based detection (no declval/decltype parsing headaches)
 namespace {
-    template<typename MP>
-    using has_collect_for_block_sig =
-        decltype(std::declval<MP&>().collect_for_block(
-            std::declval<std::vector<Transaction>&>(), std::declval<size_t>()));
-
-    template<typename MP>
-    using has_snapshot_sig =
-        decltype(std::declval<MP&>().snapshot(
-            std::declval<std::vector<Transaction>&>()));
-
-    template<typename T, typename = void>
-    struct has_collect_for_block : std::false_type {};
+    // collect_for_block(txs, size_t)  [non-const]
     template<typename T>
-    struct has_collect_for_block<T, std::void_t<has_collect_for_block_sig<T>>> : std::true_type {};
-
-    template<typename T, typename = void>
-    struct has_snapshot : std::false_type {};
+    struct has_cfb {
+        template<typename U, void (U::*)(std::vector<Transaction>&, size_t)> struct S;
+        template<typename U> static std::true_type  test(S<U, &U::collect_for_block>*);
+        template<typename U> static std::false_type test(...);
+        static constexpr bool value = decltype(test<T>(nullptr))::value;
+    };
+    // collect_for_block(txs, size_t)  [const]
     template<typename T>
-    struct has_snapshot<T, std::void_t<has_snapshot_sig<T>>> : std::true_type {};
+    struct has_cfb_const {
+        template<typename U, void (U::*)(std::vector<Transaction>&, size_t) const> struct S;
+        template<typename U> static std::true_type  test(S<U, &U::collect_for_block>*);
+        template<typename U> static std::false_type test(...);
+        static constexpr bool value = decltype(test<T>(nullptr))::value;
+    };
 
-    // Cap txs to fit within max_bytes (roughly), accounting for coinbase size
+    // snapshot(txs) [non-const]
+    template<typename T>
+    struct has_snapshot {
+        template<typename U, void (U::*)(std::vector<Transaction>&)> struct S;
+        template<typename U> static std::true_type  test(S<U, &U::snapshot>*);
+        template<typename U> static std::false_type test(...);
+        static constexpr bool value = decltype(test<T>(nullptr))::value;
+    };
+    // snapshot(txs) [const]
+    template<typename T>
+    struct has_snapshot_const {
+        template<typename U, void (U::*)(std::vector<Transaction>&) const> struct S;
+        template<typename U> static std::true_type  test(S<U, &U::snapshot>*);
+        template<typename U> static std::false_type test(...);
+        static constexpr bool value = decltype(test<T>(nullptr))::value;
+    };
+
+    // collect(size_t) -> std::vector<Transaction> [const]
+    template<typename T>
+    struct has_collect_const {
+        template<typename U, std::vector<Transaction> (U::*)(size_t) const> struct S;
+        template<typename U> static std::true_type  test(S<U, &U::collect>*);
+        template<typename U> static std::false_type test(...);
+        static constexpr bool value = decltype(test<T>(nullptr))::value;
+    };
+
+    // Cap by block-size budget (accounting for coinbase size)
     static void cap_by_size(std::vector<Transaction>& txs, size_t max_bytes, size_t already_used_bytes) {
         std::vector<Transaction> kept;
         kept.reserve(txs.size());
@@ -237,23 +261,44 @@ namespace {
     template<typename MP>
     static std::vector<Transaction> collect_mempool_for_block(MP& mp, const Transaction& coinbase, size_t max_bytes) {
         std::vector<Transaction> txs;
-        size_t used = ser_tx(coinbase).size();
+        const size_t used = ser_tx(coinbase).size();
 
-        if constexpr (has_collect_for_block<MP>::value) {
-            // Preferred: mempool handles its own packing (pass remaining bytes)
+        if constexpr (has_cfb<MP>::value) {
             mp.collect_for_block(txs, (max_bytes > used) ? (max_bytes - used) : 0);
-            // Safety: still trim if oversized
+            cap_by_size(txs, max_bytes, used);
+            return txs;
+        } else if constexpr (has_cfb_const<MP>::value) {
+            const MP& cmp = mp;
+            cmp.collect_for_block(txs, (max_bytes > used) ? (max_bytes - used) : 0);
             cap_by_size(txs, max_bytes, used);
             return txs;
         } else if constexpr (has_snapshot<MP>::value) {
-            // Fallback: take a snapshot and cap locally
             mp.snapshot(txs);
             cap_by_size(txs, max_bytes, used);
             return txs;
-        } else {
-            // No known API -> mine coinbase-only (safe fallback)
-            (void)max_bytes; (void)used;
+        } else if constexpr (has_snapshot_const<MP>::value) {
+            const MP& cmp = mp;
+            cmp.snapshot(txs);
+            cap_by_size(txs, max_bytes, used);
             return txs;
+        } else if constexpr (has_collect_const<MP>::value) {
+            // Fallback to "collect(max_count)" then trim by bytes.
+            const MP& cmp = mp;
+            // Generous count; final size is trimmed by bytes.
+            auto cands = cmp.collect(100000);
+            std::vector<Transaction> kept;
+            kept.reserve(cands.size());
+            size_t used2 = used;
+            for (auto& tx : cands) {
+                size_t sz = ser_tx(tx).size();
+                if (used2 + sz > max_bytes) continue;
+                kept.push_back(std::move(tx));
+                used2 += sz;
+            }
+            return kept;
+        } else {
+            // No known API -> coinbase-only
+            return {};
         }
     }
 } // namespace
@@ -563,18 +608,7 @@ int main(int argc, char** argv){
                 while (!g_shutdown_requested.load()) {
                     try {
                         // ---- A) get tip
-                        decltype(chain.tip()) t;
-                        try {
-                            t = chain.tip();
-                        } catch (const std::exception& ex) {
-                            log_error(std::string("miner A(tip) fatal: ") + ex.what());
-                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                            continue;
-                        } catch (...) {
-                            log_error("miner A(tip) fatal: unknown");
-                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                            continue;
-                        }
+                        auto t = chain.tip(); // avoid decltype(const) issue
 
                         // ---- B) build coinbase (vin)
                         Transaction cbt;
@@ -583,12 +617,8 @@ int main(int argc, char** argv){
                             cin.prev.txid = std::vector<uint8_t>(32, 0);
                             cin.prev.vout = 0;
                             cbt.vin.push_back(cin);
-                        } catch (const std::exception& ex) {
-                            log_error(std::string("miner B(coinbase vin) fatal: ") + ex.what());
-                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                            continue;
                         } catch (...) {
-                            log_error("miner B(coinbase vin) fatal: unknown");
+                            log_error("miner B(coinbase vin) fatal");
                             std::this_thread::sleep_for(std::chrono::milliseconds(50));
                             continue;
                         }
@@ -598,92 +628,48 @@ int main(int argc, char** argv){
                             TxOut cbout;
 
                             // C1: set value
-                            try {
-                                cbout.value = chain.subsidy_for_height(t.height + 1);
-                            } catch (const std::exception& ex) {
-                                log_error(std::string("miner C1(set value) fatal: ") + ex.what());
-                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                                continue;
-                            } catch (...) {
-                                log_error("miner C1(set value) fatal: unknown");
-                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                                continue;
-                            }
+                            cbout.value = chain.subsidy_for_height(t.height + 1);
 
                             // C2: assign pkh
-                            try {
-                                if (mine_pkh.size() != 20) {
-                                    log_error(std::string("miner C2(assign pkh) fatal: pkh size != 20 (got ")
-                                              + std::to_string(mine_pkh.size()) + ")");
-                                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                                    continue;
-                                }
-                                cbout.pkh.resize(20);
-                                std::memcpy(cbout.pkh.data(), mine_pkh.data(), 20);
-                            } catch (const std::exception& ex) {
-                                log_error(std::string("miner C2(assign pkh) fatal: ") + ex.what());
-                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                                continue;
-                            } catch (...) {
-                                log_error("miner C2(assign pkh) fatal: unknown");
+                            if (mine_pkh.size() != 20) {
+                                log_error(std::string("miner C2(assign pkh) fatal: pkh size != 20 (got ")
+                                          + std::to_string(mine_pkh.size()) + ")");
                                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                                 continue;
                             }
+                            cbout.pkh.resize(20);
+                            std::memcpy(cbout.pkh.data(), mine_pkh.data(), 20);
 
                             // C3: push_back into vout
-                            try {
-                                cbt.vout.push_back(cbout);
-                            } catch (const std::exception& ex) {
-                                log_error(std::string("miner C3(push vout) fatal: ") + ex.what());
-                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                                continue;
-                            } catch (...) {
-                                log_error("miner C3(push vout) fatal: unknown");
-                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                                continue;
-                            }
+                            cbt.vout.push_back(cbout);
 
                             // C4: ensure coinbase txid is UNIQUE per block
-                            try {
-                                // lock_time participates in txid; set to (height+1)
-                                cbt.lock_time = static_cast<uint32_t>(t.height + 1);
+                            // lock_time participates in txid; set to (height+1)
+                            cbt.lock_time = static_cast<uint32_t>(t.height + 1);
 
-                                // Add a BIP34-style tag in "sig" with height + now + extraNonce
-                                const uint32_t h   = static_cast<uint32_t>(t.height + 1);
-                                const uint32_t now = static_cast<uint32_t>(time(nullptr));
-                                const uint64_t extraNonce = gen(); // 64-bit per-attempt entropy
+                            // Add a BIP34-style tag in "sig" with height + now + extraNonce
+                            const uint32_t ch   = static_cast<uint32_t>(t.height + 1);
+                            const uint32_t now  = static_cast<uint32_t>(time(nullptr));
+                            const uint64_t extraNonce = gen(); // 64-bit per-attempt entropy
 
-                                std::vector<uint8_t> tag;
-                                tag.reserve(1 + 4 + 4 + 8);
-                                tag.push_back(0x01);
-                                tag.push_back(uint8_t(h      & 0xff));
-                                tag.push_back(uint8_t((h>>8) & 0xff));
-                                tag.push_back(uint8_t((h>>16)& 0xff));
-                                tag.push_back(uint8_t((h>>24)& 0xff));
-                                tag.push_back(uint8_t(now      & 0xff));
-                                tag.push_back(uint8_t((now>>8) & 0xff));
-                                tag.push_back(uint8_t((now>>16)& 0xff));
-                                tag.push_back(uint8_t((now>>24)& 0xff));
-                                // extraNonce little-endian
-                                for (int i=0;i<8;i++) tag.push_back(uint8_t((extraNonce >> (8*i)) & 0xff));
+                            std::vector<uint8_t> tag;
+                            tag.reserve(1 + 4 + 4 + 8);
+                            tag.push_back(0x01);
+                            tag.push_back(uint8_t(ch      & 0xff));
+                            tag.push_back(uint8_t((ch>>8) & 0xff));
+                            tag.push_back(uint8_t((ch>>16)& 0xff));
+                            tag.push_back(uint8_t((ch>>24)& 0xff));
+                            tag.push_back(uint8_t(now      & 0xff));
+                            tag.push_back(uint8_t((now>>8) & 0xff));
+                            tag.push_back(uint8_t((now>>16)& 0xff));
+                            tag.push_back(uint8_t((now>>24)& 0xff));
+                            // extraNonce little-endian
+                            for (int i=0;i<8;i++) tag.push_back(uint8_t((extraNonce >> (8*i)) & 0xff));
 
-                                cbt.vin[0].sig = std::move(tag);
-                                // NOTE: pubkey must remain empty (validation enforces this).
-                            } catch (const std::exception& ex) {
-                                log_error(std::string("miner C4(uniqueness tag) fatal: ") + ex.what());
-                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                                continue;
-                            } catch (...) {
-                                log_error("miner C4(uniqueness tag) fatal: unknown");
-                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                                continue;
-                            }
-                        } catch (const std::exception& ex) {
-                            log_error(std::string("miner C(coinbase vout) fatal: ") + ex.what());
-                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                            continue;
+                            cbt.vin[0].sig = std::move(tag);
+                            // NOTE: pubkey must remain empty (validation enforces this).
                         } catch (...) {
-                            log_error("miner C(coinbase vout) fatal: unknown");
+                            log_error("miner C(coinbase vout) fatal");
                             std::this_thread::sleep_for(std::chrono::milliseconds(50));
                             continue;
                         }
@@ -709,12 +695,9 @@ int main(int argc, char** argv){
                                 /*interval=*/ MIQ_RETARGET_INTERVAL
                             );
                             b = miq::mine_block(t.hash, nb, cbt, txs, threads);
-                        } catch (const std::exception& ex) {
-                            log_error(std::string("miner D(mine_block) fatal: ") + ex.what());
-                            continue; // loop again
                         } catch (...) {
-                            log_error("miner D(mine_block) fatal: unknown");
-                            continue;
+                            log_error("miner D(mine_block) fatal");
+                            continue; // loop again
                         }
 
                         // ---- F) submit_block
@@ -744,17 +727,12 @@ int main(int argc, char** argv){
                             } else {
                                 log_warn(std::string("mined block rejected: ") + err);
                             }
-                        } catch (const std::exception& ex) {
-                            log_error(std::string("miner F(submit_block) fatal: ") + ex.what());
                         } catch (...) {
-                            log_error("miner F(submit_block) fatal: unknown");
+                            log_error("miner F(submit_block) fatal");
                         }
 
-                    } catch (const std::exception& ex) {
-                        log_error(std::string("miner outer fatal: ") + ex.what());
-                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     } catch (...) {
-                        log_error("miner outer fatal: unknown");
+                        log_error("miner outer fatal");
                         std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     }
                 }
