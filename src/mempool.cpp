@@ -11,6 +11,7 @@
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
+#include <deque>
 
 namespace miq {
 
@@ -500,6 +501,68 @@ std::vector<Transaction> Mempool::collect(size_t max) const{
     }
     return out;
 }
+
+// === SFINAE targets ==========================================================
+// 1) snapshot(out): return parents-first, feerate-desc full list (no size cap)
+void Mempool::snapshot(std::vector<Transaction>& out) const {
+    out.clear();
+    // Reuse collect(max) to preserve ordering guarantees; pass full size.
+    const size_t n = map_.size();
+    std::vector<Transaction> v = collect(n == 0 ? 0 : n);
+    out.swap(v);
+}
+
+// 2) collect_for_block(out, max_bytes): parents-first, feerate-desc with size cap
+void Mempool::collect_for_block(std::vector<Transaction>& out, size_t max_bytes) const {
+    out.clear();
+
+    // Build sorted node view by feerate desc (tie-break: smaller size first)
+    struct NodeRef { const MempoolEntry* e; };
+    std::vector<NodeRef> nodes;
+    nodes.reserve(map_.size());
+    for (const auto& kv : map_) nodes.push_back(NodeRef{ &kv.second });
+
+    std::sort(nodes.begin(), nodes.end(), [](const NodeRef& a, const NodeRef& b){
+        if (a.e->fee_rate == b.e->fee_rate) return a.e->size_bytes < b.e->size_bytes;
+        return a.e->fee_rate > b.e->fee_rate;
+    });
+
+    std::unordered_set<std::string> selected_keys;
+    size_t used = 0;
+    bool progress = true;
+
+    while (progress) {
+        progress = false;
+        for (const auto& n : nodes) {
+            const auto& e = *n.e;
+            const std::string myk = key_from_vec(e.tx.txid());
+            if (selected_keys.count(myk)) continue;
+
+            // parents must be either not in mempool or already selected
+            bool parents_ok = true;
+            for (const auto& pk : e.parents) {
+                if (map_.find(pk) != map_.end() && !selected_keys.count(pk)) {
+                    parents_ok = false; break;
+                }
+            }
+            if (!parents_ok) continue;
+
+            const size_t sz = e.size_bytes;
+            if (sz > max_bytes) continue; // single tx larger than cap remainder; skip
+            if (used > max_bytes - sz) continue; // avoid overflow and respect cap
+
+            out.push_back(e.tx);
+            selected_keys.insert(myk);
+            used += sz;
+            progress = true;
+
+            if (used >= max_bytes) return; // filled
+        }
+        // If no progress and still have space, we're done.
+    }
+}
+
+// ============================================================================
 
 std::vector<std::vector<uint8_t>> Mempool::txids() const{
     std::vector<std::vector<uint8_t>> v;
