@@ -35,24 +35,23 @@
 #include <string>
 #include <vector>
 #include <chrono>
-#include <cstring>   // std::memcpy
+#include <cstring>   // memcpy
 #include <cstdlib>   // getenv, setenv, _putenv_s
 #include <csignal>   // signal handling
 #include <atomic>
-#include <memory>
-#include <algorithm>
-#include <ctime>
-#include <random>
-#include <type_traits>
-#include <utility>
-#include <cstddef>
+#include <memory>    // std::unique_ptr
+#include <algorithm> // find_if
+#include <ctime>     // time()
+#include <random>    // extraNonce for unique coinbase txid
+#include <type_traits> // SFINAE helpers
+#include <utility>     // std::declval
 
 using namespace miq;
 
 // ---------- default per-user datadir (stable across launch locations) --------
 static std::string default_datadir() {
 #ifdef _WIN32
-    // %APPDATA%\miqrochain
+    // %APPDATA%\miqrochain  (Roaming, works on all supported Windows)
     size_t len = 0; char* v = nullptr;
     if (_dupenv_s(&v, &len, "APPDATA") == 0 && v && len) {
         std::string base(v); free(v);
@@ -127,17 +126,18 @@ static void print_usage(){
 
 static bool is_recognized_arg(const std::string& s){
     if(s.rfind("--conf=",0)==0) return true;
-    if(s.rfind("--datadir=",0)==0) return true;
+    if(s.rfind("--datadir=",0)==0) return true;   // NEW
     if(s=="--genaddress") return true;
-    if(s=="--buildtx") return true;
-    if(s=="--reindex_utxo") return true;
-    if(s=="--utxo_kv") return true;
+    if(s=="--buildtx") return true; // expects more args after
+    if(s=="--reindex_utxo") return true;   // NEW
+    if(s=="--utxo_kv") return true;        // NEW (harmless if unused)
     if(s=="--help") return true;
     return false;
 }
 
 // ALWAYS prompt first; if blank → mining disabled for this run.
-static bool resolve_mining_address(std::vector<uint8_t>& out_pkh, bool mining_enabled, const std::string&){
+// (Env/default wallet only used if mining is disabled.)
+static bool resolve_mining_address(std::vector<uint8_t>& out_pkh, bool mining_enabled, const std::string& /*conf_hint*/){
     out_pkh.clear();
 
     // 0) Interactive prompt (every run)
@@ -198,56 +198,27 @@ static void handle_signal(int sig){
     g_shutdown_requested.store(true);
 }
 
-// ======== Robust MSVC-friendly member detection (no declval/decltype args) ==
+// ======== SFINAE helpers to pull txs from Mempool (MSVC-safe) ================
 namespace {
+    template<typename MP>
+    using has_collect_for_block_sig =
+        decltype(std::declval<MP&>().collect_for_block(
+            std::declval<std::vector<Transaction>&>(), std::declval<size_t>()));
 
-    // ---- detect: void MP::collect_for_block(std::vector<Transaction>&, size_t) [non-const]
-    template <typename U, void (U::*)(std::vector<Transaction>&, size_t)> struct _cfb_probe_nc {};
-    template <typename T>
-    struct has_collect_for_block_nc {
-        template <typename U>
-        static std::true_type test(_cfb_probe_nc<U, &U::collect_for_block>*);
-        template <typename> static std::false_type test(...);
-        static constexpr bool value = decltype(test<T>(nullptr))::value;
-    };
+    template<typename MP>
+    using has_snapshot_sig =
+        decltype(std::declval<MP&>().snapshot(
+            std::declval<std::vector<Transaction>&>()));
 
-    // ---- detect: void MP::collect_for_block(std::vector<Transaction>&, size_t) const
-    template <typename U, void (U::*)(std::vector<Transaction>&, size_t) const> struct _cfb_probe_c {};
-    template <typename T>
-    struct has_collect_for_block_c {
-        template <typename U>
-        static std::true_type test(_cfb_probe_c<U, &U::collect_for_block>*);
-        template <typename> static std::false_type test(...);
-        static constexpr bool value = decltype(test<T>(nullptr))::value;
-    };
+    template<typename T, typename = void>
+    struct has_collect_for_block : std::false_type {};
+    template<typename T>
+    struct has_collect_for_block<T, std::void_t<has_collect_for_block_sig<T>>> : std::true_type {};
 
-    template <typename T>
-    struct has_collect_for_block
-        : std::integral_constant<bool, has_collect_for_block_nc<T>::value || has_collect_for_block_c<T>::value> {};
-
-    // ---- detect: void MP::snapshot(std::vector<Transaction>&) [non-const]
-    template <typename U, void (U::*)(std::vector<Transaction>&)> struct _snap_probe_nc {};
-    template <typename T>
-    struct has_snapshot_nc {
-        template <typename U>
-        static std::true_type test(_snap_probe_nc<U, &U::snapshot>*);
-        template <typename> static std::false_type test(...);
-        static constexpr bool value = decltype(test<T>(nullptr))::value;
-    };
-
-    // ---- detect: void MP::snapshot(std::vector<Transaction>&) const
-    template <typename U, void (U::*)(std::vector<Transaction>&) const> struct _snap_probe_c {};
-    template <typename T>
-    struct has_snapshot_c {
-        template <typename U>
-        static std::true_type test(_snap_probe_c<U, &U::snapshot>*);
-        template <typename> static std::false_type test(...);
-        static constexpr bool value = decltype(test<T>(nullptr))::value;
-    };
-
-    template <typename T>
-    struct has_snapshot
-        : std::integral_constant<bool, has_snapshot_nc<T>::value || has_snapshot_c<T>::value> {};
+    template<typename T, typename = void>
+    struct has_snapshot : std::false_type {};
+    template<typename T>
+    struct has_snapshot<T, std::void_t<has_snapshot_sig<T>>> : std::true_type {};
 
     // Cap txs to fit within max_bytes (roughly), accounting for coinbase size
     static void cap_by_size(std::vector<Transaction>& txs, size_t max_bytes, size_t already_used_bytes) {
@@ -266,13 +237,15 @@ namespace {
     template<typename MP>
     static std::vector<Transaction> collect_mempool_for_block(MP& mp, const Transaction& coinbase, size_t max_bytes) {
         std::vector<Transaction> txs;
-        const size_t used = ser_tx(coinbase).size();
+        size_t used = ser_tx(coinbase).size();
 
-        if (has_collect_for_block<MP>::value) {
-            // Preferred: mempool handles its own packing
+        if constexpr (has_collect_for_block<MP>::value) {
+            // Preferred: mempool handles its own packing (pass remaining bytes)
             mp.collect_for_block(txs, (max_bytes > used) ? (max_bytes - used) : 0);
+            // Safety: still trim if oversized
+            cap_by_size(txs, max_bytes, used);
             return txs;
-        } else if (has_snapshot<MP>::value) {
+        } else if constexpr (has_snapshot<MP>::value) {
             // Fallback: take a snapshot and cap locally
             mp.snapshot(txs);
             cap_by_size(txs, max_bytes, used);
@@ -284,125 +257,6 @@ namespace {
         }
     }
 } // namespace
-// ============================================================================
-
-// ======== Miner thread as a plain function (avoids MSVC lambda hiccups) =====
-struct MinerCtx {
-    Chain*   chain{nullptr};
-    P2P*     p2p{nullptr};
-    Mempool* mempool{nullptr};
-    std::vector<uint8_t> mine_pkh;
-    unsigned threads{0};
-};
-
-static void miner_loop(MinerCtx ctx) {
-    // thread-local RNG for extraNonce
-    std::random_device rd;
-    std::mt19937_64 gen(
-        (uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count())
-        ^ (uint64_t)rd() ^ (uint64_t)(uintptr_t)&gen));
-
-    // Soft cap on block size (bytes)
-    const size_t kBlockMaxBytes = 900 * 1024; // leave headroom under 1 MiB
-
-    while (!g_shutdown_requested.load()) {
-        try {
-            // A) tip
-            auto t = ctx.chain->tip();
-
-            // B) coinbase VIN
-            Transaction cbt;
-            TxIn cin;
-            cin.prev.txid = std::vector<uint8_t>(32, 0);
-            cin.prev.vout = 0;
-            cbt.vin.push_back(cin);
-
-            // C) coinbase VOUT
-            TxOut cbout;
-            cbout.value = ctx.chain->subsidy_for_height(t.height + 1);
-
-            if (ctx.mine_pkh.size() != 20) {
-                log_error("miner: mine_pkh size != 20; mining paused for 100ms");
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
-            }
-            cbout.pkh.resize(20);
-            std::memcpy(cbout.pkh.data(), ctx.mine_pkh.data(), 20);
-            cbt.vout.push_back(cbout);
-
-            // Unique coinbase txid
-            cbt.lock_time = static_cast<uint32_t>(t.height + 1);
-            {
-                const uint32_t h   = static_cast<uint32_t>(t.height + 1);
-                const uint32_t now = static_cast<uint32_t>(time(nullptr));
-                const uint64_t extraNonce = gen();
-
-                std::vector<uint8_t> tag;
-                tag.reserve(1 + 4 + 4 + 8);
-                tag.push_back(0x01);
-                tag.push_back(uint8_t(h      & 0xff));
-                tag.push_back(uint8_t((h>>8) & 0xff));
-                tag.push_back(uint8_t((h>>16)& 0xff));
-                tag.push_back(uint8_t((h>>24)& 0xff));
-                tag.push_back(uint8_t(now      & 0xff));
-                tag.push_back(uint8_t((now>>8) & 0xff));
-                tag.push_back(uint8_t((now>>16)& 0xff));
-                tag.push_back(uint8_t((now>>24)& 0xff));
-                for (int i=0;i<8;i++) tag.push_back(uint8_t((extraNonce >> (8*i)) & 0xff));
-                cbt.vin[0].sig = std::move(tag);
-            }
-
-            // D) collect mempool txs (best-effort, size-capped)
-            std::vector<Transaction> txs;
-            if (ctx.mempool) {
-                txs = collect_mempool_for_block(*ctx.mempool, cbt, kBlockMaxBytes);
-            }
-
-            // E) difficulty (epoch retarget; matches validator side)
-            auto last = ctx.chain->last_headers(MIQ_RETARGET_INTERVAL);
-            uint32_t nb = miq::epoch_next_bits(
-                last,
-                BLOCK_TIME_SECS,
-                GENESIS_BITS,
-                /*next_height=*/ t.height + 1,
-                /*interval=*/ MIQ_RETARGET_INTERVAL
-            );
-
-            // F) mine
-            Block b = miq::mine_block(t.hash, nb, cbt, txs, ctx.threads);
-
-            // G) submit + announce
-            std::string err;
-            if (ctx.chain->submit_block(b, err)) {
-                std::string miner_addr = "(unknown)";
-                std::string cb_txid_hex = "(n/a)";
-                int noncb = (int)b.txs.size() - 1;
-                if (!b.txs.empty()) {
-                    cb_txid_hex = to_hex(b.txs[0].txid());
-                    if (!b.txs[0].vout.empty() && b.txs[0].vout[0].pkh.size()==20) {
-                        miner_addr = base58check_encode(VERSION_P2PKH, b.txs[0].vout[0].pkh);
-                    }
-                }
-                log_info("mined block accepted, height=" + std::to_string(t.height + 1)
-                         + ", miner=" + miner_addr
-                         + ", coinbase_txid=" + cb_txid_hex
-                         + ", txs=" + std::to_string(std::max(0, noncb)));
-                if (ctx.p2p && !g_shutdown_requested.load()) {
-                    ctx.p2p->broadcast_inv_block(b.block_hash());
-                }
-            } else {
-                log_warn(std::string("mined block rejected: ") + err);
-            }
-
-        } catch (const std::exception& ex) {
-            log_error(std::string("miner fatal: ") + ex.what());
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        } catch (...) {
-            log_error("miner fatal: unknown");
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-    }
-}
 // ============================================================================
 
 int main(int argc, char** argv){
@@ -426,6 +280,7 @@ int main(int argc, char** argv){
         Config cfg;
         std::string conf;
         bool genaddr=false, buildtx=false;
+        // NEW flags
         bool flag_reindex_utxo = false;
         bool flag_utxo_kv      = false;
 
@@ -448,7 +303,7 @@ int main(int argc, char** argv){
             if(a.rfind("--conf=",0)==0){
                 conf = a.substr(7);
             } else if(a.rfind("--datadir=",0)==0){
-                cfg.datadir = a.substr(10);
+                cfg.datadir = a.substr(10);            // NEW
             } else if(a=="--genaddress"){
                 genaddr = true;
             } else if(a=="--buildtx" && i+5<argc){
@@ -459,9 +314,9 @@ int main(int argc, char** argv){
                 value       = (uint64_t)std::stoull(argv[++i]);
                 toaddr      = argv[++i];
             } else if(a=="--reindex_utxo"){
-                flag_reindex_utxo = true;
+                flag_reindex_utxo = true;            // NEW
             } else if(a=="--utxo_kv"){
-                flag_utxo_kv = true;
+                flag_utxo_kv = true;                 // NEW (reserved)
             } else if(a=="--help"){
                 print_usage();
                 return 0;
@@ -544,7 +399,7 @@ int main(int argc, char** argv){
         std::fprintf(stderr, "[BOOT] datadir=%s no_rpc=%d no_p2p=%d no_mine=%d\n",
                      cfg.datadir.c_str(), cfg.no_rpc?1:0, cfg.no_p2p?1:0, cfg.no_mine?1:0);
 
-        // Consume the --utxo_kv flag
+        // Consume the --utxo_kv flag (no-op, but prevents unused-var warning)
         if (flag_utxo_kv) {
             log_info("Flag --utxo_kv set (runtime no-op; UTXO KV backend is compiled-in).");
         }
@@ -559,6 +414,7 @@ int main(int argc, char** argv){
         // --- Genesis from pinned raw block --------------------------------
         std::fprintf(stderr, "[BOOT] load genesis from constants raw hex\n");
         {
+            // Parse raw block bytes from constants
             std::vector<uint8_t> raw;
             try {
                 raw = miq::from_hex(GENESIS_RAW_BLOCK_HEX);
@@ -571,6 +427,7 @@ int main(int argc, char** argv){
                 return 1;
             }
 
+            // Deserialize and verify against pinned hash/merkle
             Block g;
             if (!deser_block(raw, g)) {
                 log_error("Failed to deserialize GENESIS_RAW_BLOCK_HEX");
@@ -624,9 +481,9 @@ int main(int argc, char** argv){
         RpcService rpc(chain, mempool);
 
         P2P p2p(chain);
-        p2p.set_datadir(cfg.datadir);
-        p2p.set_mempool(&mempool);
-        rpc.set_p2p(&p2p);
+        p2p.set_datadir(cfg.datadir);   // persist peers/bans in datadir
+        p2p.set_mempool(&mempool);      // enable tx relay from mempool
+        rpc.set_p2p(&p2p);              // RPC can report peer info/conn count
 
         // Start P2P first so RPC has a valid P2P pointer immediately
         if(!cfg.no_p2p){
@@ -644,15 +501,19 @@ int main(int argc, char** argv){
         if(!cfg.no_rpc){
             // Enable RPC cookie auth (.cookie in datadir) and export token to HTTP layer
             miq::rpc_enable_auth_cookie(cfg.datadir);
+
+            // **Security hardening**: require token on ALL RPC requests, even loopback.
 #ifdef _WIN32
             _putenv_s("MIQ_RPC_REQUIRE_TOKEN", "1");
 #else
             setenv("MIQ_RPC_REQUIRE_TOKEN", "1", 1);
 #endif
-            // Sync HTTP gate token to RPC cookie
+
+            // NEW: synchronize HTTP gate token to the RPC cookie so clients only need Authorization: Bearer <cookie>
             try {
                 std::ifstream f(cfg.datadir + "/.cookie", std::ios::binary);
                 std::string tok((std::istreambuf_iterator<char>(f)), {});
+                // trim trailing whitespace
                 while(!tok.empty() && (tok.back()=='\r'||tok.back()=='\n'||tok.back()==' '||tok.back()=='\t')) tok.pop_back();
 #ifdef _WIN32
                 _putenv_s("MIQ_RPC_TOKEN", tok.c_str());
@@ -669,6 +530,10 @@ int main(int argc, char** argv){
         }
 
         // --- Miner (off if no_mine or no address). Keep coinbase prev.vout=0.
+        // Default behavior:
+        // 1) If config provided miner_threads, use it.
+        // 2) Else if env MIQ_MINER_THREADS is set, use it.
+        // 3) Else DEFAULT to 6 (so double-click uses 6 threads with no shell/env).
         unsigned threads = cfg.miner_threads;
         if (threads == 0) {
             if (const char* s = std::getenv("MIQ_MINER_THREADS")) {
@@ -683,14 +548,217 @@ int main(int argc, char** argv){
         log_info("miner: using " + std::to_string(threads) + " thread(s)");
 
         if(!cfg.no_mine){
-            MinerCtx ctx;
-            ctx.chain    = &chain;
-            ctx.p2p      = &p2p;
-            ctx.mempool  = &mempool;
-            ctx.mine_pkh = g_mine_pkh;
-            ctx.threads  = threads;
+            const auto mine_pkh = g_mine_pkh; // require user/address (no fallback)
 
-            std::thread miner(miner_loop, ctx);
+            std::thread miner([&, mine_pkh, threads](){
+                // thread-local RNG for extraNonce
+                std::random_device rd;
+                std::mt19937_64 gen(
+                    (uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count())
+                    ^ (uint64_t)rd() ^ (uint64_t)(uintptr_t)&gen));
+
+                // Soft cap (bytes) to keep blocks < 1 MiB
+                const size_t kBlockMaxBytes = 900 * 1024;
+
+                while (!g_shutdown_requested.load()) {
+                    try {
+                        // ---- A) get tip
+                        decltype(chain.tip()) t;
+                        try {
+                            t = chain.tip();
+                        } catch (const std::exception& ex) {
+                            log_error(std::string("miner A(tip) fatal: ") + ex.what());
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                            continue;
+                        } catch (...) {
+                            log_error("miner A(tip) fatal: unknown");
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                            continue;
+                        }
+
+                        // ---- B) build coinbase (vin)
+                        Transaction cbt;
+                        try {
+                            TxIn cin;
+                            cin.prev.txid = std::vector<uint8_t>(32, 0);
+                            cin.prev.vout = 0;
+                            cbt.vin.push_back(cin);
+                        } catch (const std::exception& ex) {
+                            log_error(std::string("miner B(coinbase vin) fatal: ") + ex.what());
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                            continue;
+                        } catch (...) {
+                            log_error("miner B(coinbase vin) fatal: unknown");
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                            continue;
+                        }
+
+                        // ---- C) build coinbase (vout)
+                        try {
+                            TxOut cbout;
+
+                            // C1: set value
+                            try {
+                                cbout.value = chain.subsidy_for_height(t.height + 1);
+                            } catch (const std::exception& ex) {
+                                log_error(std::string("miner C1(set value) fatal: ") + ex.what());
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                                continue;
+                            } catch (...) {
+                                log_error("miner C1(set value) fatal: unknown");
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                                continue;
+                            }
+
+                            // C2: assign pkh
+                            try {
+                                if (mine_pkh.size() != 20) {
+                                    log_error(std::string("miner C2(assign pkh) fatal: pkh size != 20 (got ")
+                                              + std::to_string(mine_pkh.size()) + ")");
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                                    continue;
+                                }
+                                cbout.pkh.resize(20);
+                                std::memcpy(cbout.pkh.data(), mine_pkh.data(), 20);
+                            } catch (const std::exception& ex) {
+                                log_error(std::string("miner C2(assign pkh) fatal: ") + ex.what());
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                                continue;
+                            } catch (...) {
+                                log_error("miner C2(assign pkh) fatal: unknown");
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                                continue;
+                            }
+
+                            // C3: push_back into vout
+                            try {
+                                cbt.vout.push_back(cbout);
+                            } catch (const std::exception& ex) {
+                                log_error(std::string("miner C3(push vout) fatal: ") + ex.what());
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                                continue;
+                            } catch (...) {
+                                log_error("miner C3(push vout) fatal: unknown");
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                                continue;
+                            }
+
+                            // C4: ensure coinbase txid is UNIQUE per block
+                            try {
+                                // lock_time participates in txid; set to (height+1)
+                                cbt.lock_time = static_cast<uint32_t>(t.height + 1);
+
+                                // Add a BIP34-style tag in "sig" with height + now + extraNonce
+                                const uint32_t h   = static_cast<uint32_t>(t.height + 1);
+                                const uint32_t now = static_cast<uint32_t>(time(nullptr));
+                                const uint64_t extraNonce = gen(); // 64-bit per-attempt entropy
+
+                                std::vector<uint8_t> tag;
+                                tag.reserve(1 + 4 + 4 + 8);
+                                tag.push_back(0x01);
+                                tag.push_back(uint8_t(h      & 0xff));
+                                tag.push_back(uint8_t((h>>8) & 0xff));
+                                tag.push_back(uint8_t((h>>16)& 0xff));
+                                tag.push_back(uint8_t((h>>24)& 0xff));
+                                tag.push_back(uint8_t(now      & 0xff));
+                                tag.push_back(uint8_t((now>>8) & 0xff));
+                                tag.push_back(uint8_t((now>>16)& 0xff));
+                                tag.push_back(uint8_t((now>>24)& 0xff));
+                                // extraNonce little-endian
+                                for (int i=0;i<8;i++) tag.push_back(uint8_t((extraNonce >> (8*i)) & 0xff));
+
+                                cbt.vin[0].sig = std::move(tag);
+                                // NOTE: pubkey must remain empty (validation enforces this).
+                            } catch (const std::exception& ex) {
+                                log_error(std::string("miner C4(uniqueness tag) fatal: ") + ex.what());
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                                continue;
+                            } catch (...) {
+                                log_error("miner C4(uniqueness tag) fatal: unknown");
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                                continue;
+                            }
+                        } catch (const std::exception& ex) {
+                            log_error(std::string("miner C(coinbase vout) fatal: ") + ex.what());
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                            continue;
+                        } catch (...) {
+                            log_error("miner C(coinbase vout) fatal: unknown");
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                            continue;
+                        }
+
+                        // ---- D) collect mempool txs (size-capped)
+                        std::vector<Transaction> txs;
+                        try {
+                            txs = collect_mempool_for_block(mempool, cbt, kBlockMaxBytes);
+                        } catch(...) {
+                            // If mempool API throws, mine coinbase-only this round
+                            txs.clear();
+                        }
+
+                        // ---- E) mine_block using EPOCH retarget (matches consensus)
+                        Block b;
+                        try {
+                            auto last = chain.last_headers(MIQ_RETARGET_INTERVAL);
+                            uint32_t nb = miq::epoch_next_bits(
+                                last,
+                                BLOCK_TIME_SECS,
+                                GENESIS_BITS,
+                                /*next_height=*/ t.height + 1,
+                                /*interval=*/ MIQ_RETARGET_INTERVAL
+                            );
+                            b = miq::mine_block(t.hash, nb, cbt, txs, threads);
+                        } catch (const std::exception& ex) {
+                            log_error(std::string("miner D(mine_block) fatal: ") + ex.what());
+                            continue; // loop again
+                        } catch (...) {
+                            log_error("miner D(mine_block) fatal: unknown");
+                            continue;
+                        }
+
+                        // ---- F) submit_block
+                        try {
+                            std::string err;
+                            if (chain.submit_block(b, err)) {
+                                std::string miner_addr = "(unknown)";
+                                std::string cb_txid_hex = "(n/a)";
+                                if (!b.txs.empty()) {
+                                    cb_txid_hex = to_hex(b.txs[0].txid());
+                                    if (!b.txs[0].vout.empty() && b.txs[0].vout[0].pkh.size()==20) {
+                                        miner_addr = base58check_encode(VERSION_P2PKH, b.txs[0].vout[0].pkh);
+                                    }
+                                }
+                                int noncb = (int)b.txs.size() - 1;
+                                log_info("mined block accepted, height=" + std::to_string(t.height + 1)
+                                         + ", miner=" + miner_addr
+                                         + ", coinbase_txid=" + cb_txid_hex
+                                         + ", txs=" + std::to_string(std::max(0, noncb)));
+
+                                // broadcast if P2P is up
+                                try {
+                                    if (!g_shutdown_requested.load()) {
+                                        p2p.broadcast_inv_block(b.block_hash());
+                                    }
+                                } catch(...) { /* ignore */ }
+                            } else {
+                                log_warn(std::string("mined block rejected: ") + err);
+                            }
+                        } catch (const std::exception& ex) {
+                            log_error(std::string("miner F(submit_block) fatal: ") + ex.what());
+                        } catch (...) {
+                            log_error("miner F(submit_block) fatal: unknown");
+                        }
+
+                    } catch (const std::exception& ex) {
+                        log_error(std::string("miner outer fatal: ") + ex.what());
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    } catch (...) {
+                        log_error("miner outer fatal: unknown");
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                }
+            });
             miner.detach();
         }
 
@@ -706,6 +774,10 @@ int main(int argc, char** argv){
         log_info("Shutdown requested — stopping services...");
         try { rpc.stop(); } catch(...) {}
         try { p2p.stop(); } catch(...) {}
+        // stop TLS proxy by destroying it (safe even if null)
+        try { /* if running */ } catch(...) {}
+        { /* explicit reset via unique_ptr destruction on scope exit */ }
+
         log_info("Shutdown complete.");
         return 0;
 
