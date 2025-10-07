@@ -47,6 +47,8 @@
 #include <random>    // extraNonce for unique coinbase txid
 #include <type_traits>
 #include <utility>
+#include <iterator>  // istreambuf_iterator
+#include <cstdint>   // uint64_t
 
 using namespace miq;
 
@@ -608,7 +610,9 @@ int main(int argc, char** argv){
 #else
                 std::ifstream f(cfg.datadir + "/.cookie", std::ios::binary);
 #endif
-                std::string tok((std::istreambuf_iterator<char>(f)), {});
+                std::string tok(
+                    (std::istreambuf_iterator<char>(f)),
+                    std::istreambuf_iterator<char>()); // explicit end iterator
                 // trim trailing whitespace
                 while(!tok.empty() && (tok.back()=='\r'||tok.back()=='\n'||tok.back()==' '||tok.back()=='\t')) tok.pop_back();
 #ifdef _WIN32
