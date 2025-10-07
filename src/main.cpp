@@ -43,16 +43,16 @@
 #include <algorithm>
 #include <ctime>
 #include <random>
-#include <type_traits> // SFINAE detection
-#include <utility>     // std::declval
-#include <cstddef>     // std::size_t
+#include <type_traits>
+#include <utility>
+#include <cstddef>
 
 using namespace miq;
 
 // ---------- default per-user datadir (stable across launch locations) --------
 static std::string default_datadir() {
 #ifdef _WIN32
-    // %APPDATA%\miqrochain  (Roaming, works on all supported Windows)
+    // %APPDATA%\miqrochain
     size_t len = 0; char* v = nullptr;
     if (_dupenv_s(&v, &len, "APPDATA") == 0 && v && len) {
         std::string base(v); free(v);
@@ -127,18 +127,17 @@ static void print_usage(){
 
 static bool is_recognized_arg(const std::string& s){
     if(s.rfind("--conf=",0)==0) return true;
-    if(s.rfind("--datadir=",0)==0) return true;   // NEW
+    if(s.rfind("--datadir=",0)==0) return true;
     if(s=="--genaddress") return true;
-    if(s=="--buildtx") return true; // expects more args after
-    if(s=="--reindex_utxo") return true;   // NEW
-    if(s=="--utxo_kv") return true;        // NEW (harmless if unused)
+    if(s=="--buildtx") return true;
+    if(s=="--reindex_utxo") return true;
+    if(s=="--utxo_kv") return true;
     if(s=="--help") return true;
     return false;
 }
 
 // ALWAYS prompt first; if blank → mining disabled for this run.
-// (Env/default wallet only used if mining is disabled.)
-static bool resolve_mining_address(std::vector<uint8_t>& out_pkh, bool mining_enabled, const std::string& /*conf_hint*/){
+static bool resolve_mining_address(std::vector<uint8_t>& out_pkh, bool mining_enabled, const std::string&){
     out_pkh.clear();
 
     // 0) Interactive prompt (every run)
@@ -199,27 +198,56 @@ static void handle_signal(int sig){
     g_shutdown_requested.store(true);
 }
 
-// ======== SFINAE helpers to pull txs from Mempool ============================
+// ======== Robust MSVC-friendly member detection (no declval/decltype args) ==
 namespace {
-    template<typename MP>
-    using has_collect_for_block_sig =
-        decltype(std::declval<MP&>().collect_for_block(
-            std::declval<std::vector<Transaction>&>(), std::declval<std::size_t>()));
 
-    template<typename MP>
-    using has_snapshot_sig =
-        decltype(std::declval<MP&>().snapshot(
-            std::declval<std::vector<Transaction>&>()));
+    // ---- detect: void MP::collect_for_block(std::vector<Transaction>&, size_t) [non-const]
+    template <typename U, void (U::*)(std::vector<Transaction>&, size_t)> struct _cfb_probe_nc {};
+    template <typename T>
+    struct has_collect_for_block_nc {
+        template <typename U>
+        static std::true_type test(_cfb_probe_nc<U, &U::collect_for_block>*);
+        template <typename> static std::false_type test(...);
+        static constexpr bool value = decltype(test<T>(nullptr))::value;
+    };
 
-    template<typename T, typename = void>
-    struct has_collect_for_block : std::false_type {};
-    template<typename T>
-    struct has_collect_for_block<T, std::void_t<has_collect_for_block_sig<T>>> : std::true_type {};
+    // ---- detect: void MP::collect_for_block(std::vector<Transaction>&, size_t) const
+    template <typename U, void (U::*)(std::vector<Transaction>&, size_t) const> struct _cfb_probe_c {};
+    template <typename T>
+    struct has_collect_for_block_c {
+        template <typename U>
+        static std::true_type test(_cfb_probe_c<U, &U::collect_for_block>*);
+        template <typename> static std::false_type test(...);
+        static constexpr bool value = decltype(test<T>(nullptr))::value;
+    };
 
-    template<typename T, typename = void>
-    struct has_snapshot : std::false_type {};
-    template<typename T>
-    struct has_snapshot<T, std::void_t<has_snapshot_sig<T>>> : std::true_type {};
+    template <typename T>
+    struct has_collect_for_block
+        : std::integral_constant<bool, has_collect_for_block_nc<T>::value || has_collect_for_block_c<T>::value> {};
+
+    // ---- detect: void MP::snapshot(std::vector<Transaction>&) [non-const]
+    template <typename U, void (U::*)(std::vector<Transaction>&)> struct _snap_probe_nc {};
+    template <typename T>
+    struct has_snapshot_nc {
+        template <typename U>
+        static std::true_type test(_snap_probe_nc<U, &U::snapshot>*);
+        template <typename> static std::false_type test(...);
+        static constexpr bool value = decltype(test<T>(nullptr))::value;
+    };
+
+    // ---- detect: void MP::snapshot(std::vector<Transaction>&) const
+    template <typename U, void (U::*)(std::vector<Transaction>&) const> struct _snap_probe_c {};
+    template <typename T>
+    struct has_snapshot_c {
+        template <typename U>
+        static std::true_type test(_snap_probe_c<U, &U::snapshot>*);
+        template <typename> static std::false_type test(...);
+        static constexpr bool value = decltype(test<T>(nullptr))::value;
+    };
+
+    template <typename T>
+    struct has_snapshot
+        : std::integral_constant<bool, has_snapshot_nc<T>::value || has_snapshot_c<T>::value> {};
 
     // Cap txs to fit within max_bytes (roughly), accounting for coinbase size
     static void cap_by_size(std::vector<Transaction>& txs, size_t max_bytes, size_t already_used_bytes) {
@@ -238,13 +266,13 @@ namespace {
     template<typename MP>
     static std::vector<Transaction> collect_mempool_for_block(MP& mp, const Transaction& coinbase, size_t max_bytes) {
         std::vector<Transaction> txs;
-        size_t used = ser_tx(coinbase).size();
+        const size_t used = ser_tx(coinbase).size();
 
-        if constexpr (has_collect_for_block<MP>::value) {
+        if (has_collect_for_block<MP>::value) {
             // Preferred: mempool handles its own packing
             mp.collect_for_block(txs, (max_bytes > used) ? (max_bytes - used) : 0);
             return txs;
-        } else if constexpr (has_snapshot<MP>::value) {
+        } else if (has_snapshot<MP>::value) {
             // Fallback: take a snapshot and cap locally
             mp.snapshot(txs);
             cap_by_size(txs, max_bytes, used);
@@ -398,7 +426,6 @@ int main(int argc, char** argv){
         Config cfg;
         std::string conf;
         bool genaddr=false, buildtx=false;
-        // NEW flags
         bool flag_reindex_utxo = false;
         bool flag_utxo_kv      = false;
 
@@ -421,7 +448,7 @@ int main(int argc, char** argv){
             if(a.rfind("--conf=",0)==0){
                 conf = a.substr(7);
             } else if(a.rfind("--datadir=",0)==0){
-                cfg.datadir = a.substr(10);            // NEW
+                cfg.datadir = a.substr(10);
             } else if(a=="--genaddress"){
                 genaddr = true;
             } else if(a=="--buildtx" && i+5<argc){
@@ -432,9 +459,9 @@ int main(int argc, char** argv){
                 value       = (uint64_t)std::stoull(argv[++i]);
                 toaddr      = argv[++i];
             } else if(a=="--reindex_utxo"){
-                flag_reindex_utxo = true;            // NEW
+                flag_reindex_utxo = true;
             } else if(a=="--utxo_kv"){
-                flag_utxo_kv = true;                 // NEW (reserved)
+                flag_utxo_kv = true;
             } else if(a=="--help"){
                 print_usage();
                 return 0;
@@ -517,7 +544,7 @@ int main(int argc, char** argv){
         std::fprintf(stderr, "[BOOT] datadir=%s no_rpc=%d no_p2p=%d no_mine=%d\n",
                      cfg.datadir.c_str(), cfg.no_rpc?1:0, cfg.no_p2p?1:0, cfg.no_mine?1:0);
 
-        // Consume the --utxo_kv flag (no-op, but prevents unused-var warning)
+        // Consume the --utxo_kv flag
         if (flag_utxo_kv) {
             log_info("Flag --utxo_kv set (runtime no-op; UTXO KV backend is compiled-in).");
         }
@@ -532,7 +559,6 @@ int main(int argc, char** argv){
         // --- Genesis from pinned raw block --------------------------------
         std::fprintf(stderr, "[BOOT] load genesis from constants raw hex\n");
         {
-            // Parse raw block bytes from constants
             std::vector<uint8_t> raw;
             try {
                 raw = miq::from_hex(GENESIS_RAW_BLOCK_HEX);
@@ -545,7 +571,6 @@ int main(int argc, char** argv){
                 return 1;
             }
 
-            // Deserialize and verify against pinned hash/merkle
             Block g;
             if (!deser_block(raw, g)) {
                 log_error("Failed to deserialize GENESIS_RAW_BLOCK_HEX");
@@ -599,9 +624,9 @@ int main(int argc, char** argv){
         RpcService rpc(chain, mempool);
 
         P2P p2p(chain);
-        p2p.set_datadir(cfg.datadir);   // persist peers/bans in datadir
-        p2p.set_mempool(&mempool);      // enable tx relay from mempool
-        rpc.set_p2p(&p2p);              // RPC can report peer info/conn count
+        p2p.set_datadir(cfg.datadir);
+        p2p.set_mempool(&mempool);
+        rpc.set_p2p(&p2p);
 
         // Start P2P first so RPC has a valid P2P pointer immediately
         if(!cfg.no_p2p){
@@ -619,19 +644,15 @@ int main(int argc, char** argv){
         if(!cfg.no_rpc){
             // Enable RPC cookie auth (.cookie in datadir) and export token to HTTP layer
             miq::rpc_enable_auth_cookie(cfg.datadir);
-
-            // **Security hardening**: require token on ALL RPC requests, even loopback.
 #ifdef _WIN32
             _putenv_s("MIQ_RPC_REQUIRE_TOKEN", "1");
 #else
             setenv("MIQ_RPC_REQUIRE_TOKEN", "1", 1);
 #endif
-
-            // NEW: synchronize HTTP gate token to the RPC cookie so clients only need Authorization: Bearer <cookie>
+            // Sync HTTP gate token to RPC cookie
             try {
                 std::ifstream f(cfg.datadir + "/.cookie", std::ios::binary);
                 std::string tok((std::istreambuf_iterator<char>(f)), {});
-                // trim trailing whitespace
                 while(!tok.empty() && (tok.back()=='\r'||tok.back()=='\n'||tok.back()==' '||tok.back()=='\t')) tok.pop_back();
 #ifdef _WIN32
                 _putenv_s("MIQ_RPC_TOKEN", tok.c_str());
@@ -648,10 +669,6 @@ int main(int argc, char** argv){
         }
 
         // --- Miner (off if no_mine or no address). Keep coinbase prev.vout=0.
-        // Default behavior:
-        // 1) If config provided miner_threads, use it.
-        // 2) Else if env MIQ_MINER_THREADS is set, use it.
-        // 3) Else DEFAULT to 6 (so double-click uses 6 threads with no shell/env).
         unsigned threads = cfg.miner_threads;
         if (threads == 0) {
             if (const char* s = std::getenv("MIQ_MINER_THREADS")) {
@@ -689,10 +706,6 @@ int main(int argc, char** argv){
         log_info("Shutdown requested — stopping services...");
         try { rpc.stop(); } catch(...) {}
         try { p2p.stop(); } catch(...) {}
-        // stop TLS proxy by destroying it (safe even if null)
-        try { /* if running */ } catch(...) {}
-        { /* explicit reset via unique_ptr destruction on scope exit */ }
-
         log_info("Shutdown complete.");
         return 0;
 
