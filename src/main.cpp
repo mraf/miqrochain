@@ -198,110 +198,28 @@ static void handle_signal(int sig){
     g_shutdown_requested.store(true);
 }
 
-// ======== Robust MSVC-safe detection + packing helpers =======================
-// Pointer-to-member based detection (no declval/decltype parsing headaches)
-namespace {
-    // collect_for_block(txs, size_t)  [non-const]
-    template<typename T>
-    struct has_cfb {
-        template<typename U, void (U::*)(std::vector<Transaction>&, size_t)> struct S;
-        template<typename U> static std::true_type  test(S<U, &U::collect_for_block>*);
-        template<typename U> static std::false_type test(...);
-        static constexpr bool value = decltype(test<T>(nullptr))::value;
-    };
-    // collect_for_block(txs, size_t)  [const]
-    template<typename T>
-    struct has_cfb_const {
-        template<typename U, void (U::*)(std::vector<Transaction>&, size_t) const> struct S;
-        template<typename U> static std::true_type  test(S<U, &U::collect_for_block>*);
-        template<typename U> static std::false_type test(...);
-        static constexpr bool value = decltype(test<T>(nullptr))::value;
-    };
+// ======== Simple mempool packer (MSVC-safe; no SFINAE needed) ===============
+static std::vector<Transaction> collect_mempool_for_block(Mempool& mp,
+                                                          const Transaction& coinbase,
+                                                          size_t max_bytes) {
+    const size_t coinbase_sz = ser_tx(coinbase).size();
+    const size_t budget = (max_bytes > coinbase_sz) ? (max_bytes - coinbase_sz) : 0;
 
-    // snapshot(txs) [non-const]
-    template<typename T>
-    struct has_snapshot {
-        template<typename U, void (U::*)(std::vector<Transaction>&)> struct S;
-        template<typename U> static std::true_type  test(S<U, &U::snapshot>*);
-        template<typename U> static std::false_type test(...);
-        static constexpr bool value = decltype(test<T>(nullptr))::value;
-    };
-    // snapshot(txs) [const]
-    template<typename T>
-    struct has_snapshot_const {
-        template<typename U, void (U::*)(std::vector<Transaction>&) const> struct S;
-        template<typename U> static std::true_type  test(S<U, &U::snapshot>*);
-        template<typename U> static std::false_type test(...);
-        static constexpr bool value = decltype(test<T>(nullptr))::value;
-    };
+    // Grab a generous number in feerate order, then trim by bytes.
+    auto cands = mp.collect(100000);
+    std::vector<Transaction> kept;
+    kept.reserve(cands.size());
 
-    // collect(size_t) -> std::vector<Transaction> [const]
-    template<typename T>
-    struct has_collect_const {
-        template<typename U, std::vector<Transaction> (U::*)(size_t) const> struct S;
-        template<typename U> static std::true_type  test(S<U, &U::collect>*);
-        template<typename U> static std::false_type test(...);
-        static constexpr bool value = decltype(test<T>(nullptr))::value;
-    };
-
-    // Cap by block-size budget (accounting for coinbase size)
-    static void cap_by_size(std::vector<Transaction>& txs, size_t max_bytes, size_t already_used_bytes) {
-        std::vector<Transaction> kept;
-        kept.reserve(txs.size());
-        size_t used = already_used_bytes;
-        for (const auto& tx : txs) {
-            size_t sz = ser_tx(tx).size();
-            if (used + sz > max_bytes) continue;
-            kept.push_back(tx);
-            used += sz;
-        }
-        txs.swap(kept);
+    size_t used = 0;
+    for (auto& tx : cands) {
+        size_t sz = ser_tx(tx).size();
+        if (used + sz > budget) continue;
+        kept.push_back(std::move(tx));
+        used += sz;
+        if (used >= budget) break;
     }
-
-    template<typename MP>
-    static std::vector<Transaction> collect_mempool_for_block(MP& mp, const Transaction& coinbase, size_t max_bytes) {
-        std::vector<Transaction> txs;
-        const size_t used = ser_tx(coinbase).size();
-
-        if constexpr (has_cfb<MP>::value) {
-            mp.collect_for_block(txs, (max_bytes > used) ? (max_bytes - used) : 0);
-            cap_by_size(txs, max_bytes, used);
-            return txs;
-        } else if constexpr (has_cfb_const<MP>::value) {
-            const MP& cmp = mp;
-            cmp.collect_for_block(txs, (max_bytes > used) ? (max_bytes - used) : 0);
-            cap_by_size(txs, max_bytes, used);
-            return txs;
-        } else if constexpr (has_snapshot<MP>::value) {
-            mp.snapshot(txs);
-            cap_by_size(txs, max_bytes, used);
-            return txs;
-        } else if constexpr (has_snapshot_const<MP>::value) {
-            const MP& cmp = mp;
-            cmp.snapshot(txs);
-            cap_by_size(txs, max_bytes, used);
-            return txs;
-        } else if constexpr (has_collect_const<MP>::value) {
-            // Fallback to "collect(max_count)" then trim by bytes.
-            const MP& cmp = mp;
-            // Generous count; final size is trimmed by bytes.
-            auto cands = cmp.collect(100000);
-            std::vector<Transaction> kept;
-            kept.reserve(cands.size());
-            size_t used2 = used;
-            for (auto& tx : cands) {
-                size_t sz = ser_tx(tx).size();
-                if (used2 + sz > max_bytes) continue;
-                kept.push_back(std::move(tx));
-                used2 += sz;
-            }
-            return kept;
-        } else {
-            // No known API -> coinbase-only
-            return {};
-        }
-    }
-} // namespace
+    return kept;
+}
 // ============================================================================
 
 int main(int argc, char** argv){
@@ -608,78 +526,59 @@ int main(int argc, char** argv){
                 while (!g_shutdown_requested.load()) {
                     try {
                         // ---- A) get tip
-                        auto t = chain.tip(); // avoid decltype(const) issue
+                        auto t = chain.tip();
 
                         // ---- B) build coinbase (vin)
                         Transaction cbt;
-                        try {
-                            TxIn cin;
-                            cin.prev.txid = std::vector<uint8_t>(32, 0);
-                            cin.prev.vout = 0;
-                            cbt.vin.push_back(cin);
-                        } catch (...) {
-                            log_error("miner B(coinbase vin) fatal");
-                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                            continue;
-                        }
+                        TxIn cin;
+                        cin.prev.txid = std::vector<uint8_t>(32, 0);
+                        cin.prev.vout = 0;
+                        cbt.vin.push_back(cin);
 
                         // ---- C) build coinbase (vout)
-                        try {
-                            TxOut cbout;
+                        TxOut cbout;
 
-                            // C1: set value
-                            cbout.value = chain.subsidy_for_height(t.height + 1);
+                        // C1: set value
+                        cbout.value = chain.subsidy_for_height(t.height + 1);
 
-                            // C2: assign pkh
-                            if (mine_pkh.size() != 20) {
-                                log_error(std::string("miner C2(assign pkh) fatal: pkh size != 20 (got ")
-                                          + std::to_string(mine_pkh.size()) + ")");
-                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                                continue;
-                            }
-                            cbout.pkh.resize(20);
-                            std::memcpy(cbout.pkh.data(), mine_pkh.data(), 20);
-
-                            // C3: push_back into vout
-                            cbt.vout.push_back(cbout);
-
-                            // C4: ensure coinbase txid is UNIQUE per block
-                            // lock_time participates in txid; set to (height+1)
-                            cbt.lock_time = static_cast<uint32_t>(t.height + 1);
-
-                            // Add a BIP34-style tag in "sig" with height + now + extraNonce
-                            const uint32_t ch   = static_cast<uint32_t>(t.height + 1);
-                            const uint32_t now  = static_cast<uint32_t>(time(nullptr));
-                            const uint64_t extraNonce = gen(); // 64-bit per-attempt entropy
-
-                            std::vector<uint8_t> tag;
-                            tag.reserve(1 + 4 + 4 + 8);
-                            tag.push_back(0x01);
-                            tag.push_back(uint8_t(ch      & 0xff));
-                            tag.push_back(uint8_t((ch>>8) & 0xff));
-                            tag.push_back(uint8_t((ch>>16)& 0xff));
-                            tag.push_back(uint8_t((ch>>24)& 0xff));
-                            tag.push_back(uint8_t(now      & 0xff));
-                            tag.push_back(uint8_t((now>>8) & 0xff));
-                            tag.push_back(uint8_t((now>>16)& 0xff));
-                            tag.push_back(uint8_t((now>>24)& 0xff));
-                            // extraNonce little-endian
-                            for (int i=0;i<8;i++) tag.push_back(uint8_t((extraNonce >> (8*i)) & 0xff));
-
-                            cbt.vin[0].sig = std::move(tag);
-                            // NOTE: pubkey must remain empty (validation enforces this).
-                        } catch (...) {
-                            log_error("miner C(coinbase vout) fatal");
+                        // C2: assign pkh
+                        if (mine_pkh.size() != 20) {
+                            log_error(std::string("miner C2(assign pkh) fatal: pkh size != 20 (got ")
+                                      + std::to_string(mine_pkh.size()) + ")");
                             std::this_thread::sleep_for(std::chrono::milliseconds(50));
                             continue;
                         }
+                        cbout.pkh.resize(20);
+                        std::memcpy(cbout.pkh.data(), mine_pkh.data(), 20);
+
+                        // C3: push_back into vout
+                        cbt.vout.push_back(cbout);
+
+                        // C4: ensure coinbase txid is UNIQUE per block
+                        cbt.lock_time = static_cast<uint32_t>(t.height + 1);
+                        const uint32_t ch   = static_cast<uint32_t>(t.height + 1);
+                        const uint32_t now  = static_cast<uint32_t>(time(nullptr));
+                        const uint64_t extraNonce = gen();
+
+                        std::vector<uint8_t> tag;
+                        tag.reserve(1 + 4 + 4 + 8);
+                        tag.push_back(0x01);
+                        tag.push_back(uint8_t(ch      & 0xff));
+                        tag.push_back(uint8_t((ch>>8) & 0xff));
+                        tag.push_back(uint8_t((ch>>16)& 0xff));
+                        tag.push_back(uint8_t((ch>>24)& 0xff));
+                        tag.push_back(uint8_t(now      & 0xff));
+                        tag.push_back(uint8_t((now>>8) & 0xff));
+                        tag.push_back(uint8_t((now>>16)& 0xff));
+                        tag.push_back(uint8_t((now>>24)& 0xff));
+                        for (int i=0;i<8;i++) tag.push_back(uint8_t((extraNonce >> (8*i)) & 0xff));
+                        cbt.vin[0].sig = std::move(tag);
 
                         // ---- D) collect mempool txs (size-capped)
                         std::vector<Transaction> txs;
                         try {
                             txs = collect_mempool_for_block(mempool, cbt, kBlockMaxBytes);
                         } catch(...) {
-                            // If mempool API throws, mine coinbase-only this round
                             txs.clear();
                         }
 
@@ -697,7 +596,7 @@ int main(int argc, char** argv){
                             b = miq::mine_block(t.hash, nb, cbt, txs, threads);
                         } catch (...) {
                             log_error("miner D(mine_block) fatal");
-                            continue; // loop again
+                            continue;
                         }
 
                         // ---- F) submit_block
@@ -718,12 +617,9 @@ int main(int argc, char** argv){
                                          + ", coinbase_txid=" + cb_txid_hex
                                          + ", txs=" + std::to_string(std::max(0, noncb)));
 
-                                // broadcast if P2P is up
-                                try {
-                                    if (!g_shutdown_requested.load()) {
-                                        p2p.broadcast_inv_block(b.block_hash());
-                                    }
-                                } catch(...) { /* ignore */ }
+                                if (!g_shutdown_requested.load()) {
+                                    p2p.broadcast_inv_block(b.block_hash());
+                                }
                             } else {
                                 log_warn(std::string("mined block rejected: ") + err);
                             }
