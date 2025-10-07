@@ -260,7 +260,7 @@ namespace {
             return txs;
         }
     }
-} // namespace
+}
 // ============================================================================
 
 // ======== Miner thread as a plain function (avoids MSVC lambda hiccups) =====
