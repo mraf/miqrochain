@@ -1,5 +1,12 @@
 // src/main.cpp  — MIQ core entrypoint (MSVC-safe; no lambda-capture pitfalls)
 
+// Prevent Windows headers from defining min/max macros that break std::min/std::max
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX 1
+#endif
+#endif
+
 #include "constants.h"
 #include "address.h"
 #include "wallet_store.h"
@@ -48,6 +55,16 @@
 #include <type_traits>
 #include <utility>
 #include <cstdint>   // uint64_t
+
+// Belt-and-suspenders: if min/max slipped in, kill them.
+#ifdef _WIN32
+#  ifdef min
+#    undef min
+#  endif
+#  ifdef max
+#    undef max
+#  endif
+#endif
 
 using namespace miq;
 
