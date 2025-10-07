@@ -204,7 +204,7 @@ namespace {
     template<typename MP>
     using has_collect_for_block_sig =
         decltype(std::declval<MP&>().collect_for_block(
-            std::declval<std::vector<Transaction>&>(), std::size_t{}));
+            std::declval<std::vector<Transaction>&>(), std::declval<std::size_t>()));
 
     template<typename MP>
     using has_snapshot_sig =
