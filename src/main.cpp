@@ -44,6 +44,7 @@
 #include <ctime>
 #include <random>
 #include <type_traits> // SFINAE detection
+#include <utility>     // std::declval   <-- IMPORTANT for MSVC
 
 using namespace miq;
 
@@ -201,11 +202,13 @@ static void handle_signal(int sig){
 namespace {
     template<typename MP>
     using has_collect_for_block_sig =
-        decltype(std::declval<MP&>().collect_for_block(std::declval<std::vector<Transaction>&>(), size_t{}));
+        decltype(std::declval<MP&>().collect_for_block(
+            std::declval<std::vector<Transaction>&>(), std::declval<size_t>()));
 
     template<typename MP>
     using has_snapshot_sig =
-        decltype(std::declval<MP&>().snapshot(std::declval<std::vector<Transaction>&>()));
+        decltype(std::declval<MP&>().snapshot(
+            std::declval<std::vector<Transaction>&>()));
 
     template<typename T, typename = void>
     struct has_collect_for_block : std::false_type {};
