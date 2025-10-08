@@ -1,6 +1,9 @@
 // src/cli/miqwallet.cpp
 // Menu-driven MIQ wallet CLI (create/recover/send + live confirmations).
-// Auto-discovers RPC token and can work remotely (no local node required).
+// Works with a remote miqrod via static token or cookie. Portable defaults:
+//   - CLI flags: --host --port --token --cookiepath
+//   - Env: MIQ_RPC_HOST / MIQ_RPC_PORT / MIQ_RPC_TOKEN
+//   - Built-ins: MIQ_DEFAULT_RPC_HOST / MIQ_DEFAULT_RPC_PORT / MIQ_DEFAULT_RPC_TOKEN
 
 #include <iostream>
 #include <iomanip>
@@ -27,9 +30,9 @@
   #include <unistd.h>
 #endif
 
-#include "constants.h"  // RPC_PORT, CHAIN_NAME, COIN
+#include "constants.h"  // miq::RPC_PORT, miq::CHAIN_NAME, miq::COIN
 
-// ---------- trim ----------
+// ---------- tiny helpers ----------
 static std::string trim(const std::string& s) {
     size_t a = 0, b = s.size();
     while (a < b && std::isspace((unsigned char)s[a])) ++a;
@@ -37,136 +40,27 @@ static std::string trim(const std::string& s) {
     return s.substr(a, b-a);
 }
 
-// ---------- default datadir ----------
-static std::string default_datadir(){
+static bool read_cookie_token_file(const std::string& fullpath, std::string& out_tok) {
+    std::ifstream f(fullpath, std::ios::in | std::ios::binary);
+    if (!f.good()) return false;
+    std::string line; std::getline(f, line);
+    // trim
+    while (!line.empty() && (line.back()=='\r'||line.back()=='\n'||line.back()==' '||line.back()=='\t')) line.pop_back();
+    out_tok = line;
+    return !out_tok.empty();
+}
+
+static bool read_cookie_token_default_dir(std::string& out_tok) {
 #ifdef _WIN32
-    // %APPDATA%\miqrochain
-    char* appdata = nullptr;
-    size_t sz=0;
-    _dupenv_s(&appdata, &sz, "APPDATA");
-    std::string r = appdata ? std::string(appdata) : std::string(".");
-    if (appdata) free(appdata);
-    if (!r.empty() && r.back()!='\\') r.push_back('\\');
-    r += "miqrochain";
-    return r;
-#elif __APPLE__
-    const char* home = std::getenv("HOME");
-    std::string r = home ? std::string(home) : std::string(".");
-    if (!r.empty() && r.back()!='/') r.push_back('/');
-    r += "Library/Application Support/miqrochain";
-    return r;
+    const char* app = std::getenv("APPDATA");
+    std::string dd = app && *app ? std::string(app) + "\\miqrochain\\.cookie" : std::string(".\\.cookie");
 #else
     const char* home = std::getenv("HOME");
-    std::string r = home ? std::string(home) : std::string(".");
-    if (!r.empty() && r.back()!='/') r.push_back('/');
-    r += ".miqrochain";
-    return r;
+    std::string dd = home && *home ? std::string(home) + "/.miqrochain/.cookie" : std::string("./.cookie");
 #endif
+    return read_cookie_token_file(dd, out_tok);
 }
 
-static bool read_first_line_trim(const std::string& path, std::string& out){
-    std::ifstream f(path, std::ios::in | std::ios::binary);
-    if(!f.good()) return false;
-    std::string s; std::getline(f, s);
-    while(!s.empty() && (s.back()=='\r'||s.back()=='\n'||s.back()==' '||s.back()=='\t')) s.pop_back();
-    out = s;
-    return !out.empty();
-}
-
-// ---------- token discovery ----------
-struct AuthInfo{
-    std::string token;
-    std::string source;
-};
-
-static bool read_token_from_conf(const std::string& conf_path, std::string& out){
-    std::ifstream f(conf_path, std::ios::in | std::ios::binary);
-    if(!f.good()) return false;
-    std::string line;
-    while (std::getline(f, line)) {
-        if(!line.empty() && line.back()=='\r') line.pop_back();
-        size_t i=0; while(i<line.size() && (line[i]==' '||line[i]=='\t')) ++i;
-        if(i>=line.size() || line[i]=='#' || line[i]==';') continue;
-        size_t eq = line.find('=', i);
-        if (eq==std::string::npos) continue;
-        std::string key = line.substr(i, eq-i);
-        while(!key.empty() && (key.back()==' '||key.back()=='\t')) key.pop_back();
-        if (key != "rpc_static_token") continue;
-        std::string val = line.substr(eq+1);
-        size_t a=0,b=val.size();
-        while(a<b && (val[a]==' '||val[a]=='\t')) ++a;
-        while(b>a && (val[b-1]==' '||val[b-1]=='\t')) --b;
-        out = val.substr(a,b-a);
-        return !out.empty();
-    }
-    return false;
-}
-
-static AuthInfo auto_load_token(std::string datadir, const std::string& token_file_hint){
-    AuthInfo ai;
-
-    // 1) explicit token file hint
-    if(!token_file_hint.empty()){
-        if (read_first_line_trim(token_file_hint, ai.token)) {
-            ai.source = token_file_hint;
-            return ai;
-        }
-    }
-
-    // 2) env MIQ_RPC_TOKEN or MIQ_RPC_STATIC_TOKEN
-    if(const char* t = std::getenv("MIQ_RPC_TOKEN"); t && *t){
-        ai.token = t; ai.source = "env:MIQ_RPC_TOKEN"; return ai;
-    }
-    if(const char* t2 = std::getenv("MIQ_RPC_STATIC_TOKEN"); t2 && *t2){
-        ai.token = t2; ai.source = "env:MIQ_RPC_STATIC_TOKEN"; return ai;
-    }
-
-    // 3) env MIQ_RPC_TOKEN_FILE
-    if(const char* tf = std::getenv("MIQ_RPC_TOKEN_FILE"); tf && *tf){
-        if (read_first_line_trim(tf, ai.token)) { ai.source = tf; return ai; }
-    }
-
-    // 4) datadir files (if present on this machine)
-    if(datadir.empty()){
-        const char* d = std::getenv("MIQ_DATADIR");
-        if(d && *d) datadir = d;
-        else datadir = default_datadir();
-    }
-
-#ifdef _WIN32
-    const char sep='\\';
-#else
-    const char sep='/';
-#endif
-    auto join=[&](const std::string& a, const std::string& b)->std::string{
-        if(a.empty()) return b;
-        if(a.back()==sep) return a+b;
-        return a + sep + b;
-    };
-
-    // .cookie
-    {
-        std::string p = join(datadir, ".cookie");
-        if (read_first_line_trim(p, ai.token)) { ai.source = p; return ai; }
-    }
-    // .rpctoken
-    {
-        std::string p = join(datadir, ".rpctoken");
-        if (read_first_line_trim(p, ai.token)) { ai.source = p; return ai; }
-    }
-    // miq.conf -> rpc_static_token
-    {
-        std::string p = join(datadir, "miq.conf");
-        if (read_token_from_conf(p, ai.token)) { ai.source = p; return ai; }
-    }
-
-    // 5) none found
-    ai.token.clear();
-    ai.source.clear();
-    return ai;
-}
-
-// ---------- tiny JSON helpers ----------
 static std::string json_escape(const std::string& s) {
     std::ostringstream o;
     o << '"';
@@ -187,6 +81,8 @@ static std::string json_escape(const std::string& s) {
     o << '"';
     return o.str();
 }
+
+// extremely small JSON field pickers (good enough for the shapes we use)
 static bool json_get_string_field(const std::string& json, const std::string& key, std::string& out) {
     std::string pattern = "\"" + key + "\"";
     auto p = json.find(pattern);
@@ -333,7 +229,8 @@ static bool http_post(const std::string& host, const std::string& port,
 
 static std::string rpc_call(const std::string& method, const std::vector<std::string>& params_json,
                             const std::string& token,
-                            const std::string& host, const std::string& port)
+                            const std::string& host="127.0.0.1",
+                            const std::string& port=std::to_string(miq::RPC_PORT))
 {
     std::ostringstream b;
     b << "{\"method\":" << json_escape(method);
@@ -353,6 +250,51 @@ static std::string rpc_call(const std::string& method, const std::vector<std::st
 
 static std::string jstrp(const std::string& s) { return json_escape(s); }
 
+// ---------- option parsing ----------
+struct Opts {
+    std::string host;
+    std::string port;
+    std::string token;
+    std::string cookiepath; // explicit cookie path on local machine
+};
+
+static Opts parse_opts(int argc, char** argv){
+    Opts o;
+
+    // defaults (compile-time)
+#ifdef MIQ_DEFAULT_RPC_HOST
+    o.host = MIQ_DEFAULT_RPC_HOST;
+#endif
+#ifdef MIQ_DEFAULT_RPC_PORT
+    o.port = MIQ_DEFAULT_RPC_PORT;
+#endif
+#ifdef MIQ_DEFAULT_RPC_TOKEN
+    o.token = MIQ_DEFAULT_RPC_TOKEN;
+#endif
+
+    // env overrides
+    if (const char* e=getenv("MIQ_RPC_HOST"))  o.host = e;
+    if (const char* e=getenv("MIQ_RPC_PORT"))  o.port = e;
+    if (const char* e=getenv("MIQ_RPC_TOKEN")) o.token = e;
+
+    // CLI overrides
+    for (int i=1;i<argc;i++){
+        std::string a = argv[i];
+        auto getv=[&](std::string& dst){
+            if (i+1<argc) { dst = argv[++i]; return true; }
+            return false;
+        };
+        if (a=="--host") getv(o.host);
+        else if (a=="--port") getv(o.port);
+        else if (a=="--token") getv(o.token);
+        else if (a=="--cookiepath") getv(o.cookiepath);
+    }
+
+    if (o.host.empty()) o.host = "127.0.0.1";
+    if (o.port.empty()) o.port = std::to_string(miq::RPC_PORT);
+    return o;
+}
+
 // ---------- wallet ops ----------
 static bool unlock_if_needed(const std::string& token, const std::string& host, const std::string& port) {
     std::cout << "\nWallet passphrase (leave blank if not encrypted): ";
@@ -363,21 +305,6 @@ static bool unlock_if_needed(const std::string& token, const std::string& host, 
         std::cout << "Unlock failed: " << r << "\n";
         return false;
     }
-    return true;
-}
-
-static bool op_show_balance(const std::string& token, const std::string& host, const std::string& port){
-    std::string bal = rpc_call("getbalance", {}, token, host, port);
-    if (bal.empty()) { std::cout << "RPC error.\n"; return false; }
-    long long miqron=0; std::string miqPretty;
-    json_get_number_field_ll(bal, "miqron", miqron);
-    json_get_string_field(bal, "miq", miqPretty);
-    if (miqPretty.empty()) {
-        // fallback formatting
-        std::ostringstream s; s << (miqron / (long long)COIN) << "." << std::setw(8) << std::setfill('0') << (miqron % (long long)COIN);
-        miqPretty = s.str();
-    }
-    std::cout << "Balance: " << miqPretty << " MIQ (" << miqron << " miqron)\n";
     return true;
 }
 
@@ -397,10 +324,9 @@ static bool op_create_wallet(const std::string& token, const std::string& host, 
         return false;
     }
 
-    std::cout << "\nYour mnemonic (WRITE IT DOWN, offline!):\n\n";
+    std::cout << "\nYour mnemonic (WRITE IT DOWN, keep offline!):\n\n";
     std::cout << "  " << mnemonic << "\n\n";
 
-    // unlock if pass set
     if (!wpass.empty()) {
         std::string ur = rpc_call("walletunlock", { jstrp(wpass), "600" }, token, host, port);
         if (ur.find("\"error\"") != std::string::npos) {
@@ -417,7 +343,12 @@ static bool op_create_wallet(const std::string& token, const std::string& host, 
     std::cout << "First receive address:\n";
     std::cout << "  " << addr << "\n";
 
-    (void)op_show_balance(token, host, port);
+    // Show balance (should be 0 for a new wallet)
+    std::string bal = rpc_call("getbalance", {}, token, host, port);
+    long long miqron=0; std::string miqPretty;
+    json_get_number_field_ll(bal, "miqron", miqron);
+    json_get_string_field(bal, "miq", miqPretty);
+    std::cout << "Balance: " << miqPretty << " MIQ (" << miqron << " miqron)\n";
     return true;
 }
 
@@ -447,7 +378,39 @@ static bool op_recover_wallet(const std::string& token, const std::string& host,
         }
     }
 
-    return op_show_balance(token, host, port);
+    // Address-scan for balance
+    const int SCAN_RECEIVE = 50;
+    const int SCAN_CHANGE  = 10;
+    unsigned long long total_miqron = 0;
+
+    auto scan_range = [&](int count){
+        for (int i=0;i<count;i++){
+            std::string addrJson = rpc_call("deriveaddressat", { std::to_string(i) }, token, host, port);
+            std::string addr;
+            if (!json_is_string_value(addrJson, addr)) continue;
+
+            std::string utx = rpc_call("getaddressutxos", { jstrp(addr) }, token, host, port);
+            size_t p = 0;
+            while ((p = utx.find("\"value\"", p)) != std::string::npos) {
+                p = utx.find(':', p);
+                if (p == std::string::npos) break;
+                ++p;
+                while (p < utx.size() && std::isspace((unsigned char)utx[p])) ++p;
+                unsigned long long v = 0; bool any=false;
+                while (p < utx.size() && std::isdigit((unsigned char)utx[p])) { any=true; v = v*10 + (utx[p]-'0'); ++p; }
+                if (any) total_miqron += v;
+            }
+        }
+    };
+    scan_range(SCAN_RECEIVE);
+    scan_range(SCAN_CHANGE);
+
+    std::cout << "Discovered balance (first " << SCAN_RECEIVE << " receive + " << SCAN_CHANGE << " change): ";
+    std::cout << (total_miqron / (unsigned long long)miq::COIN) << "."
+              << std::setw(8) << std::setfill('0') << (total_miqron % (unsigned long long)miq::COIN)
+              << " MIQ\n";
+
+    return true;
 }
 
 static bool tx_in_mempool(const std::string& token, const std::string& host, const std::string& port, const std::string& txid) {
@@ -546,79 +509,43 @@ static bool op_send_flow(const std::string& token, const std::string& host, cons
     return true;
 }
 
-// ---------- arg/env parsing ----------
-struct Conn {
-    std::string host = "127.0.0.1";
-    std::string port = std::to_string(RPC_PORT);
-    std::string datadir;          // optional
-    std::string token_file_hint;  // optional
-    std::string token;            // resolved
-    std::string token_source;     // for display
-};
-
-static void apply_env(Conn& c){
-    if(const char* h = std::getenv("MIQ_RPC_HOST"); h && *h) c.host = h;
-    if(const char* p = std::getenv("MIQ_RPC_PORT"); p && *p) c.port = p;
-    if(const char* d = std::getenv("MIQ_DATADIR");  d && *d) c.datadir = d;
-    if(const char* tf= std::getenv("MIQ_RPC_TOKEN_FILE"); tf && *tf) c.token_file_hint = tf;
-    if(const char* t = std::getenv("MIQ_RPC_TOKEN"); t && *t){ c.token = t; c.token_source = "env:MIQ_RPC_TOKEN"; }
-    if(c.token.empty()){
-        if(const char* t2 = std::getenv("MIQ_RPC_STATIC_TOKEN"); t2 && *t2){ c.token = t2; c.token_source = "env:MIQ_RPC_STATIC_TOKEN"; }
+static bool op_show_balance(const std::string& token, const std::string& host, const std::string& port) {
+    std::string bal = rpc_call("getbalance", {}, token, host, port);
+    long long miqron=0; std::string miqPretty;
+    json_get_number_field_ll(bal, "miqron", miqron);
+    if (!json_get_string_field(bal, "miq", miqPretty)) {
+        std::ostringstream s; s << (miqron / (long long)miq::COIN) << "." << std::setw(8) << std::setfill('0') << (miqron % (long long)miq::COIN);
+        miqPretty = s.str();
     }
+    std::cout << "Balance: " << miqPretty << " MIQ (" << miqron << " miqron)\n";
+    return true;
 }
 
-static void apply_args(Conn& c, int argc, char** argv){
-    for (int i=1;i<argc;i++){
-        std::string a = argv[i];
-        auto next = [&](std::string& dst){
-            if (i+1 < argc) { dst = argv[++i]; return true; }
-            return false;
-        };
-        if (a=="--host") { next(c.host); }
-        else if (a=="--port") { next(c.port); }
-        else if (a=="--datadir") { next(c.datadir); }
-        else if (a=="--token-file") { next(c.token_file_hint); }
-        else if (a=="--token") { next(c.token); c.token_source="--token"; }
-        else if (a=="-h" || a=="--help") {
-            std::cout <<
-              "Usage: miqwallet [--host HOST] [--port PORT] [--datadir PATH]\n"
-              "                 [--token TOKEN] [--token-file FILE]\n";
-        }
-    }
-}
-
-// ---------- main menu ----------
+// ---------- main ----------
 int main(int argc, char** argv){
     std::ios::sync_with_stdio(false);
 
-    Conn C;
-    apply_env(C);
-    apply_args(C, argc, argv);
+    Opts o = parse_opts(argc, argv);
 
-    if (C.datadir.empty()) C.datadir = default_datadir();
-
-    // If no inline/env token, auto-load from file/env/datadir
-    if (C.token.empty()) {
-        auto ai = auto_load_token(C.datadir, C.token_file_hint);
-        C.token = ai.token; C.token_source = ai.source;
-    }
-
-    // If still none, we'll continue and let RPC fail (prints helpful error),
-    // but try to show where we looked:
-    std::cout << "Target: miqrochain RPC at " << C.host << ":" << C.port << "\n";
-    if (!C.token.empty()) {
-        std::cout << "Auth source: " << (C.token_source.empty()? "(unknown)" : C.token_source) << "\n";
-    } else {
-        std::cout << "Auth source: (none auto-discovered)\n";
-        std::cout << "Tip: set MIQ_RPC_TOKEN env var, or pass --token, or use --token-file, or place a .cookie/.rpctoken/miq.conf in " << C.datadir << "\n";
-    }
-
-    // Light ping to detect auth issues early
-    if (!C.token.empty()){
-        std::string ping = rpc_call("ping", {}, C.token, C.host, C.port);
-        if (trim(ping) != "\"pong\"") {
-            std::cout << "Warning: RPC not reachable or token invalid. Server replied: " << ping << "\n";
+    // token resolution order:
+    // 1) --token
+    // 2) MIQ_RPC_TOKEN env
+    // 3) --cookiepath (read .cookie locally at that path)
+    // 4) default cookie location (~/.miqrochain/.cookie or %APPDATA%\miqrochain\.cookie)
+    if (o.token.empty()) {
+        if (!o.cookiepath.empty()) {
+            std::string t; if (read_cookie_token_file(o.cookiepath, t)) o.token = t;
         }
+    }
+    if (o.token.empty()) {
+        std::string t; if (read_cookie_token_default_dir(t)) o.token = t;
+    }
+
+    std::cout << "Target: miqrochain RPC at " << o.host << ":" << o.port << "\n";
+    if (!o.token.empty()) {
+        std::cout << "Auth: using provided token (length " << o.token.size() << ")\n";
+    } else {
+        std::cout << "Auth: no token found; unauthenticated RPC will fail unless node allows it.\n";
     }
 
     for (;;) {
@@ -631,11 +558,10 @@ int main(int argc, char** argv){
         std::cout << "> ";
         std::string choice; std::getline(std::cin, choice);
         choice = trim(choice);
-
-        if (choice=="1") { (void)op_create_wallet(C.token, C.host, C.port); }
-        else if (choice=="2") { (void)op_recover_wallet(C.token, C.host, C.port); }
-        else if (choice=="3") { (void)op_send_flow(C.token, C.host, C.port); }
-        else if (choice=="4") { (void)op_show_balance(C.token, C.host, C.port); }
+        if (choice=="1") { (void)op_create_wallet(o.token, o.host, o.port); }
+        else if (choice=="2") { (void)op_recover_wallet(o.token, o.host, o.port); }
+        else if (choice=="3") { (void)op_send_flow(o.token, o.host, o.port); }
+        else if (choice=="4") { (void)op_show_balance(o.token, o.host, o.port); }
         else if (choice=="q" || choice=="Q" || choice=="exit") break;
     }
 
