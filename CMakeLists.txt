@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-# Silence FetchContent_Populate deprecation for now
+# Silence FetchContent_Populate deprecation for now (keeps current behavior)
 if(POLICY CMP0169)
   cmake_policy(SET CMP0169 OLD)
 endif()
@@ -17,7 +17,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # ------------------------------------------------------------------
 option(MIQ_ENABLE_WALLET_ENC "Enable wallet at-rest encryption" OFF)
 option(MIQ_ENABLE_UPNP       "Enable UPnP/NAT-PMP port mapping" OFF)
-option(MIQ_BUILD_TESTS       "Build tests"                      OFF)
+option(MIQ_BUILD_TESTS       "Build tests"                                 OFF)
 
 # DB backend options
 option(MIQ_USE_ROCKSDB       "Use RocksDB instead of LevelDB"              OFF)
@@ -35,7 +35,8 @@ if(MSVC)
   add_link_options(/LTCG)
   add_compile_options(/W4 /permissive- /Zc:__cplusplus)
   add_definitions(/D_CRT_SECURE_NO_WARNINGS)
-  add_compile_definitions(_WIN32_WINNT=0x0600) # enable inet_ntop, etc.
+  # Ensure modern Winsock API (inet_ntop etc.) declarations are available
+  add_compile_definitions(_WIN32_WINNT=0x0600)
 else()
   add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 endif()
@@ -48,21 +49,25 @@ include(FetchContent)
 #   LevelDB::LevelDB  (or) RocksDB::rocksdb
 # ------------------------------------------------------------------
 set(MIQ_DB_TARGET "")
+set(MIQ_DB_DEFINE "")     # <--- NEW: track which macro to define
+
 if(MIQ_USE_ROCKSDB)
   find_package(rocksdb QUIET)
   if(NOT rocksdb_FOUND)
-    message(FATAL_ERROR "MIQ_USE_ROCKSDB=ON but RocksDB package not found. Install it or set MIQ_USE_ROCKSDB=OFF.")
+    message(FATAL_ERROR "MIQ_USE_ROCKSDB=ON but RocksDB package not found. Install it or turn MIQ_USE_ROCKSDB OFF to use LevelDB.")
   endif()
   set(MIQ_DB_TARGET RocksDB::rocksdb)
-  add_compile_definitions(MIQ_USE_ROCKSDB=1)
+  set(MIQ_DB_DEFINE MIQ_USE_ROCKSDB=1)   # <--- define RocksDB flavor when used
 else()
+  # Try system LevelDB first
   find_package(LevelDB QUIET)
   if(LevelDB_FOUND)
     set(MIQ_DB_TARGET LevelDB::LevelDB)
   else()
     if(NOT MIQ_FETCH_LEVELDB)
-      message(FATAL_ERROR "LevelDB not found. Install LevelDB, set LevelDB_DIR, or enable MIQ_FETCH_LEVELDB.")
+      message(FATAL_ERROR "LevelDB not found. Install a LevelDB dev package, set LevelDB_DIR, or enable MIQ_FETCH_LEVELDB.")
     endif()
+    # Fetch LevelDB from upstream
     FetchContent_Declare(
       leveldb_src
       GIT_REPOSITORY https://github.com/google/leveldb.git
@@ -77,34 +82,41 @@ else()
     endif()
     set(MIQ_DB_TARGET LevelDB::LevelDB)
   endif()
+  set(MIQ_DB_DEFINE MIQ_USE_LEVELDB=1)   # <--- NEW: define LevelDB flavor
 endif()
 
 # ------------------------------------------------------------------
-# TLS / Threads (for TLS proxy & background threads)
+# TLS / Threads (for RPC TLS proxy & background threads)
 # ------------------------------------------------------------------
-find_package(OpenSSL REQUIRED)
-find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)         # TLS proxy
+find_package(Threads REQUIRED)         # std::thread on POSIX
 
 # ------------------------------------------------------------------
-# libsecp256k1 (system or auto-fetch)
-# Exposes MIQ_LIBSECP_TARGET
+# libsecp256k1: try system package first, otherwise auto-fetch & use its target
+# Exposes: MIQ_LIBSECP_TARGET = <imported target to link>
 # ------------------------------------------------------------------
 set(MIQ_LIBSECP_TARGET "")
 if(MIQ_USE_LIBSECP)
   find_package(secp256k1 CONFIG QUIET)
+
   if(secp256k1_FOUND)
     if(TARGET secp256k1::secp256k1)
       set(MIQ_LIBSECP_TARGET secp256k1::secp256k1)
+      message(STATUS "Using system-provided secp256k1 (secp256k1::secp256k1)")
     elseif(TARGET secp256k1)
       set(MIQ_LIBSECP_TARGET secp256k1)
+      message(STATUS "Using system-provided secp256k1 (secp256k1)")
     else()
-      message(FATAL_ERROR "secp256k1 was found but exposes no usable CMake target.")
+      message(FATAL_ERROR "secp256k1 package found but no usable CMake target exported.")
     endif()
   else()
-    message(STATUS "secp256k1 not found; fetching bitcoin-core/secp256k1 @ ${MIQ_LIBSECP_TAG}")
+    message(STATUS "secp256k1 not found in system; fetching bitcoin-core/secp256k1 @ ${MIQ_LIBSECP_TAG}")
+
+    include(FetchContent)
     set(SECP256K1_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(SECP256K1_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
     set(SECP256K1_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+
     FetchContent_Declare(
       secp256k1_src
       GIT_REPOSITORY https://github.com/bitcoin-core/secp256k1.git
@@ -112,14 +124,16 @@ if(MIQ_USE_LIBSECP)
       GIT_PROGRESS   TRUE
     )
     FetchContent_MakeAvailable(secp256k1_src)
+
     if(TARGET secp256k1::secp256k1)
       set(MIQ_LIBSECP_TARGET secp256k1::secp256k1)
     elseif(TARGET secp256k1)
       set(MIQ_LIBSECP_TARGET secp256k1)
     else()
-      message(FATAL_ERROR "Fetched secp256k1 but no 'secp256k1' target exists.")
+      message(FATAL_ERROR "Fetched secp256k1 but no target named 'secp256k1' was created.")
     endif()
   endif()
+
   add_compile_definitions(MIQ_USE_LIBSECP256K1=1)
 endif()
 
@@ -155,8 +169,12 @@ add_executable(miqrod
     src/difficulty.h src/difficulty.cpp
     src/storage.h src/storage.cpp
 
-    # UTXO backend used by the tree
+    # Legacy/simple UTXO backend (keep if you still use it)
     src/utxo.h src/utxo.cpp
+
+    # New durable KV-backed chainstate
+    src/kvdb.h src/kvdb.cpp
+    src/utxo_kv.h src/utxo_kv.cpp
 
     src/mempool.h src/mempool.cpp
     src/hasher.h src/hasher.cpp
@@ -173,21 +191,21 @@ add_executable(miqrod
     src/crypto/ecdsa_iface.h
     src/crypto/ecdsa_libsecp256k1.cpp
 
-    # TLS proxy & IBD monitor
+    # --- TLS proxy & IBD monitor ---
     src/tls_proxy.h src/tls_proxy.cpp
     src/ibd_monitor.h src/ibd_monitor.cpp
-
-    # Extras
-    src/reorg_manager.cpp
-    src/nat.cpp
-    src/seeds.cpp
-    src/mtp.cpp
 )
 
-target_include_directories(miqrod PRIVATE src)
+target_include_directories(miqrod PRIVATE
+    src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
-# Link DB backend
+# Link DB backend & define which flavor we're compiling for
 target_link_libraries(miqrod PRIVATE ${MIQ_DB_TARGET})
+if(MIQ_DB_DEFINE)
+  target_compile_definitions(miqrod PRIVATE ${MIQ_DB_DEFINE})
+endif()
 
 # Platform libs
 if(WIN32)
@@ -202,20 +220,21 @@ if(MIQ_USE_LIBSECP)
   target_link_libraries(miqrod PRIVATE ${MIQ_LIBSECP_TARGET})
 endif()
 
-# Optional wallet encryption (compile-time define)
+# ------------------------------------------------------------------
+# Optional Wallet Encryption (OpenSSL AES-256-GCM + PBKDF2)
+# ------------------------------------------------------------------
 if(MIQ_ENABLE_WALLET_ENC)
   target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_WALLET_ENC=1)
-  message(STATUS "Wallet encryption: ENABLED")
+  message(STATUS "Wallet encryption: ENABLED (OpenSSL)")
 else()
-  message(STATUS "Wallet encryption: DISABLED")
+  message(STATUS "Wallet encryption: DISABLED (default)")
 endif()
 
-# Always build these crypto helpers (used by ecdsa backend too)
+# Add sources unconditionally; RNG is used by ECDSA backend too.
 target_sources(miqrod PRIVATE
     src/wallet_encryptor.cpp
     src/crypto/secure_random.cpp
 )
-target_include_directories(miqrod PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # ------------------------------------------------------------------
 # Optional UPnP/NAT-PMP (miniupnpc)
@@ -229,48 +248,11 @@ if(MIQ_ENABLE_UPNP)
     target_link_libraries(miqrod PRIVATE ${MINIUPNP_LIBRARY})
     message(STATUS "UPnP enabled (miniupnpc)")
   else()
-    message(FATAL_ERROR "MIQ_ENABLE_UPNP=ON but miniupnpc not found.")
+    message(FATAL_ERROR "MIQ_ENABLE_UPNP=ON but miniupnpc not found (e.g., libminiupnpc-dev / brew install miniupnpc / vcpkg).")
   endif()
 else()
-  message(STATUS "UPnP disabled")
+  message(STATUS "UPnP disabled (default)")
 endif()
-
-# ------------------------------------------------------------------
-# Tools
-# ------------------------------------------------------------------
-# Key generator
-add_executable(miq-keygen
-    src/tools/miq_keygen.cpp
-    src/sha256.h src/sha256.cpp
-    src/ripemd160.h src/ripemd160.cpp
-    src/hash160.h src/hash160.cpp
-    src/base58.h src/base58.cpp
-    src/hex.h src/hex.cpp
-    src/crypto/secure_random.cpp
-    src/crypto/ecdsa_iface.h
-    src/crypto/ecdsa_libsecp256k1.cpp
-)
-target_include_directories(miq-keygen PRIVATE src)
-if(MIQ_USE_LIBSECP)
-  target_link_libraries(miq-keygen PRIVATE ${MIQ_LIBSECP_TARGET})
-endif()
-if(WIN32)
-  target_link_libraries(miq-keygen PRIVATE bcrypt)
-endif()
-
-# Menu-driven wallet CLI (the interactive one you asked for)
-# Adjust path if you saved the file elsewhere.
-add_executable(miqwallet
-    src/cli/miqwallet.cpp
-)
-target_include_directories(miqwallet PRIVATE src)
-if(WIN32)
-  target_link_libraries(miqwallet PRIVATE Ws2_32)
-endif()
-set_target_properties(miqwallet PROPERTIES
-  CXX_STANDARD 17
-  CXX_STANDARD_REQUIRED YES
-)
 
 # ------------------------------------------------------------------
 # Tests (optional)
@@ -305,8 +287,36 @@ if(MIQ_BUILD_TESTS)
   )
   target_include_directories(test_ser PRIVATE src)
   add_test(NAME test_ser COMMAND test_ser)
+endif()
 
-  add_executable(fuzz_json tests/fuzz_json.cpp src/json.h src/json.cpp)
-  target_include_directories(fuzz_json PRIVATE src)
-  add_test(NAME fuzz_json COMMAND fuzz_json)
+# ------------------------------------------------------------------
+# CLI wallet tool
+# ------------------------------------------------------------------
+add_executable(miqwallet src/cli/miqwallet.cpp)
+target_include_directories(miqwallet PRIVATE src)
+if(WIN32)
+  target_link_libraries(miqwallet PRIVATE ws2_32)
+endif()
+set_target_properties(miqwallet PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
+
+# ------------------------------------------------------------------
+# Simple key tool
+# ------------------------------------------------------------------
+add_executable(miq-keygen
+    src/tools/miq_keygen.cpp
+    src/sha256.h src/sha256.cpp
+    src/ripemd160.h src/ripemd160.cpp
+    src/hash160.h src/hash160.cpp
+    src/base58.h src/base58.cpp
+    src/hex.h src/hex.cpp
+    src/crypto/secure_random.cpp
+    src/crypto/ecdsa_iface.h
+    src/crypto/ecdsa_libsecp256k1.cpp
+)
+target_include_directories(miq-keygen PRIVATE src)
+if(MIQ_USE_LIBSECP)
+  target_link_libraries(miq-keygen PRIVATE ${MIQ_LIBSECP_TARGET})
+endif()
+if(WIN32)
+  target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
