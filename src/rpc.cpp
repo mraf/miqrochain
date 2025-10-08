@@ -30,6 +30,7 @@
 #include <vector>
 #include <cstring>  // std::memset
 #include <cstdlib>  // std::getenv
+#include <iomanip>  // std::setw, std::setfill
 
 #include <fstream>
 #include <random>
@@ -38,8 +39,9 @@
 #ifndef _WIN32
   #include <sys/stat.h>
   #include <unistd.h>
+#else
+  #include <windows.h>
 #endif
-#include <iomanip>  // std::setw, std::setfill
 
 #ifndef MIN_RELAY_FEE_RATE
 // sat/KB (miqron per kilobyte)
@@ -54,7 +56,7 @@ static constexpr size_t RPC_MAX_BODY_BYTES = 512 * 1024; // 512 KiB
 
 namespace miq {
 
-// ======== Cookie auth (token file) — used by HTTP layer via env header token ========
+// ======== Cookie/static-token auth helpers (HTTP layer checks MIQ_RPC_TOKEN) ========
 
 static std::string& rpc_cookie_token() {
     static std::string tok;
@@ -99,14 +101,6 @@ static bool read_first_line_trim(const std::string& p, std::string& out) {
     return true;
 }
 
-// Constant-time compare to avoid token timing leaks (kept for future use)
-[[maybe_unused]] static bool timing_safe_eq(const std::string& a, const std::string& b){
-    if (a.size() != b.size()) return false;
-    unsigned char acc = 0;
-    for (size_t i=0;i<a.size();++i) acc |= (unsigned char)(a[i] ^ b[i]);
-    return acc == 0;
-}
-
 static bool write_cookie_file_secure(const std::string& p, const std::string& tok) {
 #ifndef _WIN32
     // best-effort: 0600
@@ -122,8 +116,7 @@ static bool write_cookie_file_secure(const std::string& p, const std::string& to
     return f.good();
 }
 
-// Helper: export token to the HTTP layer so it can validate headers.
-// http.cpp checks MIQ_RPC_TOKEN against Authorization/X-Auth-Token.
+// Export token to HTTP layer (checked against Authorization/X-Auth-Token)
 static void export_token_to_env(const std::string& tok){
 #ifdef _WIN32
     _putenv_s("MIQ_RPC_TOKEN", tok.c_str());
@@ -132,33 +125,96 @@ static void export_token_to_env(const std::string& tok){
 #endif
 }
 
-void rpc_enable_auth_cookie(const std::string& datadir) {
-    std::string path = join_path(datadir, ".cookie");
-    rpc_cookie_path() = path;
-
-    std::string tok;
-    if (file_exists(path)) {
-        if (read_first_line_trim(path, tok) && !tok.empty()) {
-            rpc_cookie_token() = tok;
-            export_token_to_env(tok);  // hand to HTTP layer (header-based auth)
-            log_info("RPC auth cookie loaded from " + path);
-            return;
-        } else {
-            log_warn("RPC cookie file exists but unreadable/empty; recreating: " + path);
+// Try to read a "static" token from (in order):
+//  1) env MIQ_RPC_STATIC_TOKEN
+//  2) <datadir>/.rpctoken (first line)
+//  3) <datadir>/miq.conf with line: rpc_static_token=YOURTOKEN
+static bool try_load_static_token(const std::string& datadir, std::string& out_tok){
+    // 1) env
+    if (const char* s = std::getenv("MIQ_RPC_STATIC_TOKEN"); s && *s) {
+        out_tok.assign(s);
+        return true;
+    }
+    // 2) .rpctoken (first line)
+    {
+        std::string rpct = join_path(datadir, ".rpctoken");
+        std::string t;
+        if (file_exists(rpct) && read_first_line_trim(rpct, t) && !t.empty()) {
+            out_tok = t;
+            return true;
         }
     }
+    // 3) miq.conf key=value
+    {
+        std::string conf = join_path(datadir, "miq.conf");
+        if (file_exists(conf)) {
+            std::ifstream f(conf, std::ios::in | std::ios::binary);
+            std::string line;
+            while (std::getline(f, line)) {
+                if(!line.empty() && line.back()=='\r') line.pop_back();
+                // trim leading
+                size_t i = 0; while (i<line.size() && (line[i]==' ' || line[i]=='\t')) ++i;
+                if (i>=line.size() || line[i]=='#' || line[i]==';') continue;
+                size_t eq = line.find('=', i);
+                if (eq==std::string::npos) continue;
+                std::string key = line.substr(i, eq-i);
+                // rtrim key
+                while(!key.empty() && (key.back()==' ' || key.back()=='\t')) key.pop_back();
+                if (key != "rpc_static_token") continue;
+                std::string val = line.substr(eq+1);
+                // trim val
+                size_t a=0,b=val.size();
+                while (a<b && (val[a]==' '||val[a]=='\t')) ++a;
+                while (b>a && (val[b-1]==' '||val[b-1]=='\t')) --b;
+                val = val.substr(a,b-a);
+                if (!val.empty()) { out_tok = val; return true; }
+            }
+        }
+    }
+    return false;
+}
 
-    tok = hex32_random();
-    if (!write_cookie_file_secure(path, tok)) {
-        log_error("Failed to write RPC cookie file at " + path + " (errno=" + std::to_string(errno) + ")");
-        // Fallback: still enable with in-memory token (not persisted).
+void rpc_enable_auth_cookie(const std::string& datadir) {
+    // Prefer a static token (env/.rpctoken/miq.conf). Otherwise use cookie.
+    std::string tok;
+    bool have_static = try_load_static_token(datadir, tok);
+
+    std::string cookiep = join_path(datadir, ".cookie");
+    rpc_cookie_path() = cookiep;
+
+    if (!have_static) {
+        // No static token — load cookie or create a random one
+        if (file_exists(cookiep)) {
+            if (read_first_line_trim(cookiep, tok) && !tok.empty()) {
+                rpc_cookie_token() = tok;
+                export_token_to_env(tok);
+                log_info("RPC auth cookie loaded from " + cookiep);
+                return;
+            } else {
+                log_warn("RPC cookie file exists but unreadable/empty; recreating: " + cookiep);
+            }
+        }
+        tok = hex32_random();
+        if (!write_cookie_file_secure(cookiep, tok)) {
+            log_error("Failed to write RPC cookie file at " + cookiep + " (errno=" + std::to_string(errno) + ")");
+            // Fallback: still enable with in-memory token (not persisted).
+            rpc_cookie_token() = tok;
+            export_token_to_env(tok);
+            return;
+        }
         rpc_cookie_token() = tok;
         export_token_to_env(tok);
+        log_info("RPC auth cookie created at " + cookiep + " (600 perms).");
         return;
     }
+
+    // Static token chosen. Export + also mirror into .cookie for compatibility.
     rpc_cookie_token() = tok;
     export_token_to_env(tok);
-    log_info("RPC auth cookie created at " + path + " (600 perms).");
+    if (!write_cookie_file_secure(cookiep, tok)) {
+        log_warn("Static token active, but failed to mirror to " + cookiep);
+    }
+    log_info("RPC static token enabled (env/.rpctoken/miq.conf).");
 }
 
 // ==============================================================================
@@ -251,13 +307,12 @@ namespace {
 
 void RpcService::start(uint16_t port){
     // http.cpp authenticates via Authorization / X-Auth-Token (MIQ_RPC_TOKEN).
-    // Use the headers-aware start() so we can access headers later if needed.
     http_.start(
         port,
         [this](const std::string& b,
                const std::vector<std::pair<std::string,std::string>>& /*headers*/) {
             try {
-                return this->handle(b); // current handler ignores headers (by design)
+                return this->handle(b);
             } catch (const std::exception& ex) {
                 log_error(std::string("rpc exception: ") + ex.what());
                 return err("internal error");
@@ -281,7 +336,7 @@ static JNode jnum(double v){ JNode n; n.v = v; return n; }
 static JNode jstr(const std::string& s){ JNode n; n.v = s; return n; }
 
 std::string RpcService::handle(const std::string& body){
-    // Request-size guard (defense-in-depth)
+    // Request-size guard
     if (body.size() > RPC_MAX_BODY_BYTES) {
         return err("request too large");
     }
@@ -292,7 +347,7 @@ std::string RpcService::handle(const std::string& body){
         if(!std::holds_alternative<std::map<std::string,JNode>>(req.v)) return err("bad json obj");
         auto& obj = std::get<std::map<std::string,JNode>>(req.v);
 
-        // ---- Header-based auth happens in http.cpp. No JSON "auth" required anymore. ----
+        // ---- Header-based auth happens in http.cpp. No JSON "auth" required. ----
 
         auto it = obj.find("method");
         if(it==obj.end() || !std::holds_alternative<std::string>(it->second.v)) return err("missing method");
@@ -1004,7 +1059,7 @@ std::string RpcService::handle(const std::string& body){
             JNode out; out.v = outarr; return json_dump(out);
         }
 
-        // -------- Bulletproof: spend from HD wallet (filters immature coinbase) --------
+        // -------- Spend from HD wallet (filters immature coinbase) --------
         if (method == "sendfromhd") {
             // params: [to_address, amount, feerate(optional miqron per kB)]
             if (params.size() < 2
@@ -1239,7 +1294,7 @@ std::string RpcService::handle(const std::string& body){
         }
 
         if(method=="getchaintips"){
-            // Minimal: only the active tip (we don't expose side branches here)
+            // Minimal: only the active tip
             auto tip = chain_.tip();
             std::map<std::string,JNode> t;
             t["height"]    = jnum((double)tip.height);
@@ -1251,15 +1306,13 @@ std::string RpcService::handle(const std::string& body){
             JNode out; out.v = arr; return json_dump(out);
         }
 
-        // ---------------- p2p stubs (no P2P reference here) ----------------
+        // ---------------- p2p stubs ----------------
 
         if(method=="getpeerinfo"){
-            // Return empty list if P2P service isn't injected here
             std::vector<JNode> v; JNode out; out.v = v; return json_dump(out);
         }
 
         if(method=="getconnectioncount"){
-            // Return 0 if not wired to P2P
             return json_dump(jnum(0.0));
         }
 
