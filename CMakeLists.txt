@@ -287,6 +287,12 @@ if(MIQ_BUILD_TESTS)
     target_link_libraries(test_crypto PRIVATE Ws2_32)
   endif()
   add_test(NAME test_crypto COMMAND test_crypto)
+  
+  add_executable(miqwallet tools/miqwallet.cpp)
+if (WIN32)
+  target_link_libraries(miqwallet ws2_32)
+endif()
+set_target_properties(miqwallet PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
 
   add_executable(test_ser tests/test_ser.cpp
       src/serialize.h src/serialize.cpp
