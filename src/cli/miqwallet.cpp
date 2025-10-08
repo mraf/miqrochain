@@ -1,6 +1,14 @@
 // src/cli/miqwallet.cpp
-// Menu-driven MIQ wallet CLI (create/recover/send + live confirmations).
-// Requires a running miqrod with RPC enabled (default). Auth via datadir/.cookie.
+// Portable MIQ wallet CLI (create/recover/send + live confirmations) with
+// robust remote RPC support and multi-source token discovery.
+//
+// It can run on any PC without a local node. It talks to a remote node via RPC.
+// Token discovery order:
+//   1) --token / MIQW_TOKEN
+//   2) --cookie / MIQW_COOKIE_PATH (any path, including UNC)
+//   3) CWD: .cookie / miqwallet.token / miqrpc.token
+//   4) EXE dir: .cookie / miqwallet.token / miqrpc.token
+//   5) OS default datadirs (Roaming on Windows etc.)
 
 #include <iostream>
 #include <iomanip>
@@ -19,35 +27,48 @@
 #ifdef _WIN32
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #include <windows.h>
   #pragma comment(lib, "ws2_32.lib")
+#elif __APPLE__
+  #include <sys/types.h>
+  #include <sys/socket.h>
+  #include <netdb.h>
+  #include <unistd.h>
+  #include <mach-o/dyld.h>
 #else
   #include <sys/types.h>
   #include <sys/socket.h>
   #include <netdb.h>
   #include <unistd.h>
+  #include <limits.h>
 #endif
 
-// Pull the RPC port from your project constants
 #include "constants.h"  // miq::RPC_PORT, miq::CHAIN_NAME, miq::COIN
 
-// ---------- tiny helpers ----------
+// -------------------- runtime RPC target --------------------
+static std::string g_rpc_host = "127.0.0.1";
+static std::string g_rpc_port = std::to_string(miq::RPC_PORT);
+
+// -------------------- tiny helpers --------------------
 static std::string trim(const std::string& s) {
     size_t a = 0, b = s.size();
     while (a < b && std::isspace((unsigned char)s[a])) ++a;
     while (b > a && std::isspace((unsigned char)s[b-1])) --b;
     return s.substr(a, b-a);
 }
-
-static bool read_cookie_token(const std::string& datadir, std::string& out_tok) {
-    std::string path = datadir;
+static std::string join_path(const std::string& a, const std::string& b){
 #ifdef _WIN32
     const char sep='\\';
 #else
     const char sep='/';
 #endif
-    if (!path.empty() && path.back()!=sep) path.push_back(sep);
-    path += ".cookie";
-    std::ifstream f(path, std::ios::in | std::ios::binary);
+    if(a.empty()) return b;
+    if(a.back()==sep) return a+b;
+    return a + sep + b;
+}
+
+static bool read_first_line(const std::string& full_path, std::string& out_tok) {
+    std::ifstream f(full_path, std::ios::in | std::ios::binary);
     if (!f.good()) return false;
     std::string line;
     std::getline(f, line);
@@ -76,20 +97,15 @@ static std::string json_escape(const std::string& s) {
     return o.str();
 }
 
-// extremely small JSON field pickers (good enough for the shapes we use)
+// very small JSON field helpers (good enough for known responses)
 static bool json_get_string_field(const std::string& json, const std::string& key, std::string& out) {
-    // looks for "key":"...value..."
     std::string pattern = "\"" + key + "\"";
     auto p = json.find(pattern);
     if (p == std::string::npos) return false;
     p = json.find(':', p);
     if (p == std::string::npos) return false;
-    // skip spaces
     while (p < json.size() && (json[p]==':' || std::isspace((unsigned char)json[p]))) ++p;
-    if (p >= json.size() || json[p] != '"') {
-        // sometimes RPC returns a raw string (whole body is "abc"), caller can handle separately
-        return false;
-    }
+    if (p >= json.size() || json[p] != '"') return false;
     ++p;
     std::ostringstream v;
     while (p < json.size()) {
@@ -135,7 +151,7 @@ static bool json_is_string_value(const std::string& body, std::string& out) {
     return false;
 }
 
-// ---------- very small HTTP POST ----------
+// -------------------- HTTP POST --------------------
 static bool http_post(const std::string& host, const std::string& port,
                       const std::string& path, const std::string& token,
                       const std::string& body, std::string& out_body, std::string* out_status=nullptr)
@@ -209,7 +225,6 @@ static bool http_post(const std::string& host, const std::string& port,
     close(fd);
 #endif
 
-    // split headers/body
     auto p = resp.find("\r\n\r\n");
     if (p == std::string::npos) return false;
     std::string headers = resp.substr(0, p);
@@ -227,8 +242,7 @@ static bool http_post(const std::string& host, const std::string& port,
 }
 
 static std::string rpc_call(const std::string& method, const std::vector<std::string>& params_json,
-                            const std::string& token,
-                            const std::string& host="127.0.0.1", const std::string& port=std::to_string(miq::RPC_PORT))
+                            const std::string& token)
 {
     std::ostringstream b;
     b << "{\"method\":" << json_escape(method);
@@ -236,20 +250,105 @@ static std::string rpc_call(const std::string& method, const std::vector<std::st
         b << ",\"params\":[";
         for (size_t i=0;i<params_json.size();++i) {
             if (i) b << ',';
-            b << params_json[i]; // already JSON-escaped by caller if string
+            b << params_json[i];
         }
         b << "]";
     }
     b << "}";
     std::string resp, status;
-    if (!http_post(host, port, "/", token, b.str(), resp, &status)) return "";
+    if (!http_post(g_rpc_host, g_rpc_port, "/", token, b.str(), resp, &status)) return "";
     return trim(resp);
 }
 
-// convenience overload for string params
 static std::string jstrp(const std::string& s) { return json_escape(s); }
 
-// ---------- wallet ops ----------
+// -------------------- EXE directory --------------------
+static std::string g_exe_dir = ".";
+static void init_exe_dir(const char* argv0) {
+#ifdef _WIN32
+    char path[MAX_PATH+4] = {0};
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    std::string p = (n>0) ? std::string(path, path+n) : std::string(argv0?argv0:"");
+#elif __APPLE__
+    uint32_t size = 0; _NSGetExecutablePath(NULL, &size);
+    std::string p;
+    if (size > 0) {
+        std::vector<char> buf(size+2, 0);
+        if (_NSGetExecutablePath(buf.data(), &size) == 0) p.assign(buf.data());
+        else p = argv0 ? argv0 : "";
+    } else p = argv0 ? argv0 : "";
+#else
+    char path[4096]; ssize_t n = readlink("/proc/self/exe", path, sizeof(path)-1);
+    std::string p = (n>0) ? std::string(path, path+n) : std::string(argv0?argv0:"");
+#endif
+    size_t pos = p.find_last_of("/\\");
+    g_exe_dir = (pos!=std::string::npos) ? p.substr(0,pos) : std::string(".");
+}
+
+// -------------------- cookie discovery --------------------
+static std::string detect_default_datadir() {
+    const char* dd = std::getenv("MIQ_DATADIR");
+    if (dd && *dd) return std::string(dd);
+    const char* wdd = std::getenv("MIQW_DATADIR");
+    if (wdd && *wdd) return std::string(wdd);
+
+#ifdef _WIN32
+    const char* appdata = std::getenv("APPDATA"); // C:\Users\<user>\AppData\Roaming
+    if (appdata && *appdata) return join_path(appdata, "miqrochain");
+    return "C:\\miqrochain";
+#elif __APPLE__
+    const char* home = std::getenv("HOME");
+    if (home && *home) return join_path(join_path(home, "Library/Application Support"), "miqrochain");
+    return "miqrochain";
+#else
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg) return join_path(xdg, "miqrochain");
+    const char* home = std::getenv("HOME");
+    if (home && *home) return join_path(home, ".miqrochain");
+    return ".";
+#endif
+}
+
+static bool find_token_multi(std::string& out_token, std::string& used_path,
+                             const std::string& cli_token,
+                             const std::string& cli_cookie_path)
+{
+    // 1) Direct token (CLI/env)
+    if (!cli_token.empty()) { out_token = cli_token; used_path = "<direct token>"; return true; }
+    if (const char* et = std::getenv("MIQW_TOKEN"); et && *et) { out_token = et; used_path = "<env:MIQW_TOKEN>"; return true; }
+
+    // 2) Explicit cookie path (CLI/env) — can be local or UNC
+    std::string cp = cli_cookie_path;
+    if (cp.empty()) { if (const char* ec = std::getenv("MIQW_COOKIE_PATH"); ec && *ec) cp = ec; }
+    if (!cp.empty()) {
+        if (read_first_line(cp, out_token)) { used_path = cp; return true; }
+    }
+
+    // 3) Current working directory candidates
+    const char* cwd_candidates[] = { ".cookie", "miqwallet.token", "miqrpc.token" };
+    for (const char* c : cwd_candidates) {
+        if (read_first_line(c, out_token)) { used_path = c; return true; }
+    }
+
+    // 4) EXE directory candidates
+    if (!g_exe_dir.empty()) {
+        for (const char* nm : cwd_candidates) {
+            std::string p = join_path(g_exe_dir, nm);
+            if (read_first_line(p, out_token)) { used_path = p; return true; }
+        }
+    }
+
+    // 5) OS default datadir
+    {
+        std::string dd = detect_default_datadir();
+        std::string ck = join_path(dd, ".cookie");
+        if (read_first_line(ck, out_token)) { used_path = ck; return true; }
+    }
+
+    return false;
+}
+
+// -------------------- wallet ops --------------------
 static bool unlock_if_needed(const std::string& token) {
     std::cout << "\nWallet passphrase (leave blank if not encrypted): ";
     std::string pass; std::getline(std::cin, pass);
@@ -259,6 +358,22 @@ static bool unlock_if_needed(const std::string& token) {
         std::cout << "Unlock failed: " << r << "\n";
         return false;
     }
+    return true;
+}
+
+static bool show_balance(const std::string& token) {
+    std::string bal = rpc_call("getbalance", {}, token);
+    if (bal.empty()) { std::cout << "RPC failed (getbalance)\n"; return false; }
+    long long miqron=0; std::string pretty;
+    json_get_number_field_ll(bal, "miqron", miqron);
+    json_get_string_field(bal, "miq", pretty);
+    if (pretty.empty()) {
+        std::ostringstream s;
+        s << (miqron / (long long)miq::COIN) << "."
+          << std::setw(8) << std::setfill('0') << (miqron % (long long)miq::COIN);
+        pretty = s.str();
+    }
+    std::cout << "Balance: " << pretty << " MIQ (" << miqron << " miqron)\n";
     return true;
 }
 
@@ -278,10 +393,8 @@ static bool op_create_wallet(const std::string& token) {
         return false;
     }
 
-    std::cout << "\nYour 12-word mnemonic (WRITE IT DOWN, keep offline!):\n\n";
-    std::cout << "  " << mnemonic << "\n\n";
+    std::cout << "\nYour mnemonic (WRITE IT DOWN, keep offline!):\n\n  " << mnemonic << "\n\n";
 
-    // unlock if pass set
     if (!wpass.empty()) {
         std::string ur = rpc_call("walletunlock", { jstrp(wpass), "600" }, token);
         if (ur.find("\"error\"") != std::string::npos) {
@@ -295,15 +408,9 @@ static bool op_create_wallet(const std::string& token) {
         std::cout << "Could not get receive address: " << addr << "\n";
         return false;
     }
-    std::cout << "First receive address:\n";
-    std::cout << "  " << addr << "\n";
+    std::cout << "First receive address:\n  " << addr << "\n";
 
-    // Show balance (should be 0 for a new wallet)
-    std::string bal = rpc_call("getbalance", {}, token);
-    long long miqron=0; std::string miqPretty;
-    json_get_number_field_ll(bal, "miqron", miqron);
-    json_get_string_field(bal, "miq", miqPretty);
-    std::cout << "Balance: " << miqPretty << " MIQ (" << miqron << " miqron)\n";
+    show_balance(token);
     return true;
 }
 
@@ -326,111 +433,21 @@ static bool op_recover_wallet(const std::string& token) {
     }
     std::cout << "Restored.\n";
 
-    // Unlock for reading/spending
     if (!wpass.empty()) {
         std::string ur = rpc_call("walletunlock", { jstrp(wpass), "600" }, token);
         if (ur.find("\"error\"") != std::string::npos) {
             std::cout << "Unlock failed: " << ur << "\n";
-            // Not fatal for balance discovery if wallet reading requires pass in your build; try anyway.
         }
     }
 
-    // --- Balance discovery (address-scan) ---
-    // We’ll scan first N receive + change addresses without changing wallet state,
-    // using deriveaddressat + getaddressutxos to show *real* balance even right after restore.
-    const int SCAN_RECEIVE = 50;
-    const int SCAN_CHANGE  = 10;
-    unsigned long long total_miqron = 0;
-
-    auto scan_range = [&](int count, bool /*change*/){
-        for (int i=0;i<count;i++){
-            std::string addrJson = rpc_call("deriveaddressat", { std::to_string(i) }, token);
-            std::string addr;
-            if (!json_is_string_value(addrJson, addr)) continue;
-
-            std::string utx = rpc_call("getaddressutxos", { jstrp(addr) }, token);
-            // crude sum: look for "value": numbers
-            size_t p = 0;
-            while ((p = utx.find("\"value\"", p)) != std::string::npos) {
-                p = utx.find(':', p);
-                if (p == std::string::npos) break;
-                ++p;
-                while (p < utx.size() && std::isspace((unsigned char)utx[p])) ++p;
-                unsigned long long v = 0; bool any=false;
-                while (p < utx.size() && std::isdigit((unsigned char)utx[p])) { any=true; v = v*10 + (utx[p]-'0'); ++p; }
-                if (any) total_miqron += v;
-            }
-        }
-    };
-    scan_range(SCAN_RECEIVE, false);
-    scan_range(SCAN_CHANGE, true);
-
-    std::cout << "Discovered balance (first " << SCAN_RECEIVE << " receive + " << SCAN_CHANGE << " change): ";
-    std::cout << (total_miqron / (unsigned long long)miq::COIN) << "."
-              << std::setw(8) << std::setfill('0') << (total_miqron % (unsigned long long)miq::COIN)
-              << " MIQ\n";
-
+    show_balance(token);
     return true;
 }
 
 static bool tx_in_mempool(const std::string& token, const std::string& txid) {
     std::string mp = rpc_call("getrawmempool", {}, token);
-    // Look for "txid" as a JSON string in the array
     std::string needle = "\"" + txid + "\"";
     return mp.find(needle) != std::string::npos;
-}
-
-static int tx_confirmations_via_recipient(const std::string& token,
-                                          const std::string& txid,
-                                          const std::string& recipient_addr)
-{
-    // If still in mempool -> 0 conf
-    if (tx_in_mempool(token, txid)) return 0;
-
-    // Find mined height via address UTXOs
-    std::string utx = rpc_call("getaddressutxos", { jstrp(recipient_addr) }, token);
-    // locate object with matching txid
-    size_t pos = 0;
-    int txHeight = -1;
-    while (true) {
-        auto p = utx.find("\"txid\"", pos);
-        if (p == std::string::npos) break;
-        auto pcol = utx.find(':', p);
-        if (pcol == std::string::npos) break;
-        auto pquo = utx.find('"', pcol+1);
-        if (pquo == std::string::npos) break;
-        auto pquo2 = utx.find('"', pquo+1);
-        if (pquo2 == std::string::npos) break;
-        std::string tid = utx.substr(pquo+1, pquo2-pquo-1);
-        pos = pquo2+1;
-        if (tid == txid) {
-            // find height in the same object (search forward)
-            auto ph = utx.find("\"height\"", pquo2);
-            if (ph != std::string::npos) {
-                long long h=0;
-                if (json_get_number_field_ll(utx.substr(ph-20, 80), "height", h)) txHeight = (int)h;
-                else {
-                    // fallback quick parse
-                    auto col = utx.find(':', ph);
-                    if (col != std::string::npos) {
-                        ++col; while (col<utx.size() && std::isspace((unsigned char)utx[col])) ++col;
-                        int v=0; while (col<utx.size() && std::isdigit((unsigned char)utx[col])) { v = v*10 + (utx[col]-'0'); ++col; }
-                        txHeight = v;
-                    }
-                }
-            }
-            break;
-        }
-    }
-    if (txHeight < 0) return 0; // not seen yet as UTXO (maybe sent to non-P2PKH? or not mined yet)
-
-    // current height
-    std::string hjson = rpc_call("getblockcount", {}, token);
-    std::string hs; if (!json_is_string_value(hjson, hs)) hs = hjson;
-    int curH = std::stoi(hs);
-    int confs = (curH - txHeight + 1);
-    if (confs < 0) confs = 0;
-    return confs;
 }
 
 static bool op_send_flow(const std::string& token) {
@@ -458,53 +475,124 @@ static bool op_send_flow(const std::string& token) {
     }
     std::cout << "Broadcasted. Txid: " << txid << "\n";
 
-    // Live confirmations up to 3
+    // Live confirmations up to 3 (recipient-UTXO method)
     std::cout << "Waiting for confirmations (target: 3). Press Ctrl+C to stop watching.\n";
-    int last = -1;
+    int lastPrinted = -99;
     for (;;) {
-        int c = tx_confirmations_via_recipient(token, txid, addr);
-        if (c != last) {
-            if (c == 0) std::cout << "  0-conf (in mempool or not yet seen)\n";
-            else std::cout << "  confirmations: " << c << "\n";
-            last = c;
+        // query address utxos to get height
+        std::string utx = rpc_call("getaddressutxos", { jstrp(addr) }, token);
+        int txHeight = -1;
+        size_t pos = 0;
+        while (true) {
+            auto p = utx.find("\"txid\"", pos);
+            if (p == std::string::npos) break;
+            auto pcol = utx.find(':', p);
+            if (pcol == std::string::npos) break;
+            auto pquo = utx.find('"', pcol+1);
+            if (pquo == std::string::npos) break;
+            auto pquo2 = utx.find('"', pquo+1);
+            if (pquo2 == std::string::npos) break;
+            std::string tid = utx.substr(pquo+1, pquo2-pquo-1);
+            pos = pquo2+1;
+            if (tid == txid) {
+                auto ph = utx.find("\"height\"", pquo2);
+                if (ph != std::string::npos) {
+                    long long h=0;
+                    if (json_get_number_field_ll(utx.substr(ph-20, 80), "height", h)) txHeight = (int)h;
+                }
+                break;
+            }
         }
-        if (c >= 3) break;
+
+        int confs = 0;
+        if (txHeight < 0) {
+            confs = tx_in_mempool(token, txid) ? 0 : 0;
+        } else {
+            std::string hjson = rpc_call("getblockcount", {}, token);
+            std::string hs; if (!json_is_string_value(hjson, hs)) hs = hjson;
+            int curH = (hs.empty() ? 0 : std::stoi(hs));
+            confs = (curH - txHeight + 1);
+            if (confs < 0) confs = 0;
+        }
+
+        if (confs != lastPrinted) {
+            if (confs == 0) std::cout << "  0-conf (in mempool or not yet seen)\n";
+            else std::cout << "  confirmations: " << confs << "\n";
+            lastPrinted = confs;
+        }
+        if (confs >= 3) break;
         std::this_thread::sleep_for(std::chrono::seconds(5));
     }
     std::cout << "Reached 3 confirmations.\n";
     return true;
 }
 
-// ---------- main menu ----------
+// -------------------- CLI args --------------------
+static void parse_args(int argc, char** argv, std::string& host, std::string& port, std::string& token, std::string& cookie_path) {
+    if (const char* h = std::getenv("MIQW_RPC_HOST")) host = h;
+    if (const char* p = std::getenv("MIQW_RPC_PORT")) port = p;
+    if (const char* t = std::getenv("MIQW_TOKEN")) token = t;
+    if (const char* c = std::getenv("MIQW_COOKIE_PATH")) cookie_path = c;
+
+    for (int i=1;i<argc;i++){
+        std::string a = argv[i];
+        auto need = [&](const char* what)->const char*{
+            if (i+1>=argc) { std::cerr << "Missing value for " << what << "\n"; std::exit(2); }
+            return argv[++i];
+        };
+        if (a=="--host" || a=="-H") host = need("--host");
+        else if (a=="--port" || a=="-P") port = need("--port");
+        else if (a=="--token" || a=="-t") token = need("--token");
+        else if (a=="--cookie" || a=="-c") cookie_path = need("--cookie");
+        else if (a=="--help" || a=="-h") {
+            std::cout <<
+                "miqwallet options:\n"
+                "  -H, --host   <host>    RPC host (default 127.0.0.1)\n"
+                "  -P, --port   <port>    RPC port (default from constants)\n"
+                "  -c, --cookie <path>    Path to .cookie (local or UNC)\n"
+                "  -t, --token  <tok>     Authorization token string\n"
+                "Env vars: MIQW_RPC_HOST, MIQW_RPC_PORT, MIQW_COOKIE_PATH, MIQW_TOKEN\n";
+            std::exit(0);
+        }
+    }
+}
+
+// -------------------- main --------------------
 int main(int argc, char** argv){
     std::ios::sync_with_stdio(false);
+    init_exe_dir(argc>0 ? argv[0] : nullptr);
 
-    // datadir to read RPC cookie
-    std::string datadir;
-    const char* envd = std::getenv("MIQ_DATADIR");
-    if (envd && *envd) datadir = envd;
-    else datadir = "."; // current dir by default
-
+    std::string host = g_rpc_host;
+    std::string port = g_rpc_port;
     std::string token;
-    if (!read_cookie_token(datadir, token)) {
-        std::cout << "Could not read auth cookie from '" << datadir << "/.cookie'.\n";
-        std::cout << "Enter RPC token manually (or start miqrod in this datadir): ";
+    std::string cookie_path;
+
+    parse_args(argc, argv, host, port, token, cookie_path);
+    g_rpc_host = host;
+    g_rpc_port = port;
+
+    std::string used_source;
+    if (!find_token_multi(token, used_source, token, cookie_path)) {
+        std::cout << "Could not locate RPC token automatically.\n";
+        std::cout << "Enter RPC token manually (or run with --cookie / --token): ";
         std::getline(std::cin, token);
         token = trim(token);
         if (token.empty()) {
             std::cerr << "No RPC token. Exiting.\n";
             return 1;
         }
+        used_source = "<entered>";
     }
 
-    std::cout << "Connected to " << miq::CHAIN_NAME << " RPC at 127.0.0.1:" << miq::RPC_PORT << "\n";
-    std::cout << "(Using cookie from " << datadir << "/.cookie)\n";
+    std::cout << "Target: " << miq::CHAIN_NAME << " RPC at " << g_rpc_host << ":" << g_rpc_port << "\n";
+    std::cout << "Auth source: " << used_source << "\n";
 
     for (;;) {
         std::cout << "\n==== MIQ Wallet ====\n";
         std::cout << "1) Create wallet (mnemonic + address)\n";
         std::cout << "2) Recover wallet (from 12/24 words) and show balance\n";
         std::cout << "3) Send MIQ (auto-fee) + live confirmations to 3\n";
+        std::cout << "4) Show balance\n";
         std::cout << "q) Quit\n";
         std::cout << "> ";
         std::string choice; std::getline(std::cin, choice);
@@ -512,6 +600,7 @@ int main(int argc, char** argv){
         if (choice=="1") { (void)op_create_wallet(token); }
         else if (choice=="2") { (void)op_recover_wallet(token); }
         else if (choice=="3") { (void)op_send_flow(token); }
+        else if (choice=="4") { (void)show_balance(token); }
         else if (choice=="q" || choice=="Q" || choice=="exit") break;
     }
 
