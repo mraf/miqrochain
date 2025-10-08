@@ -28,7 +28,7 @@
 #endif
 
 // Pull the RPC port from your project constants
-#include "constants.h"  // RPC_PORT, CHAIN_NAME, COIN
+#include "constants.h"  // miq::RPC_PORT, miq::CHAIN_NAME, miq::COIN
 
 // ---------- tiny helpers ----------
 static std::string trim(const std::string& s) {
@@ -228,7 +228,7 @@ static bool http_post(const std::string& host, const std::string& port,
 
 static std::string rpc_call(const std::string& method, const std::vector<std::string>& params_json,
                             const std::string& token,
-                            const std::string& host="127.0.0.1", const std::string& port=std::to_string(RPC_PORT))
+                            const std::string& host="127.0.0.1", const std::string& port=std::to_string(miq::RPC_PORT))
 {
     std::ostringstream b;
     b << "{\"method\":" << json_escape(method);
@@ -342,11 +342,9 @@ static bool op_recover_wallet(const std::string& token) {
     const int SCAN_CHANGE  = 10;
     unsigned long long total_miqron = 0;
 
-    auto scan_range = [&](int count, bool change){
+    auto scan_range = [&](int count, bool /*change*/){
         for (int i=0;i<count;i++){
-            std::string addrJson = change
-                ? rpc_call("deriveaddressat", { std::to_string(i) }, token) // same index space; you only issued receive before usually
-                : rpc_call("deriveaddressat", { std::to_string(i) }, token);
+            std::string addrJson = rpc_call("deriveaddressat", { std::to_string(i) }, token);
             std::string addr;
             if (!json_is_string_value(addrJson, addr)) continue;
 
@@ -368,8 +366,8 @@ static bool op_recover_wallet(const std::string& token) {
     scan_range(SCAN_CHANGE, true);
 
     std::cout << "Discovered balance (first " << SCAN_RECEIVE << " receive + " << SCAN_CHANGE << " change): ";
-    std::cout << (total_miqron / (unsigned long long)COIN) << "."
-              << std::setw(8) << std::setfill('0') << (total_miqron % (unsigned long long)COIN)
+    std::cout << (total_miqron / (unsigned long long)miq::COIN) << "."
+              << std::setw(8) << std::setfill('0') << (total_miqron % (unsigned long long)miq::COIN)
               << " MIQ\n";
 
     return true;
@@ -499,7 +497,7 @@ int main(int argc, char** argv){
         }
     }
 
-    std::cout << "Connected to " << CHAIN_NAME << " RPC at 127.0.0.1:" << RPC_PORT << "\n";
+    std::cout << "Connected to " << miq::CHAIN_NAME << " RPC at 127.0.0.1:" << miq::RPC_PORT << "\n";
     std::cout << "(Using cookie from " << datadir << "/.cookie)\n";
 
     for (;;) {
