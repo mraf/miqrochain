@@ -323,6 +323,53 @@ std::string RpcService::handle(const std::string& body){
             JNode out; out.v = v; return json_dump(out);
         }
 
+        if (method == "getbalance") {
+    // Load wallet
+    std::string wdir = default_wallet_file();
+    if(!wdir.empty()){
+        size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
+    } else {
+        wdir = "wallets/default";
+    }
+    std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
+    std::string pass = get_wallet_pass_or_cached();
+    if(!LoadHdWallet(wdir, seed, meta, pass, e)) return err(e);
+
+    miq::HdWallet w(seed, meta);
+
+    // Collect PKHs (same ranges as listutxos)
+    auto collect_pkh_for_range = [&](bool change, uint32_t n, std::vector<std::array<uint8_t,20>>& out){
+        for (uint32_t i=0;i<n;i++){
+            std::vector<uint8_t> priv, pub;
+            if (!w.DerivePrivPub(meta.account, change?1u:0u, i, priv, pub)) continue;
+            auto h = hash160(pub);
+            if (h.size()!=20) continue;
+            std::array<uint8_t,20> p{}; std::copy(h.begin(), h.end(), p.begin());
+            out.push_back(p);
+        }
+    };
+    std::vector<std::array<uint8_t,20>> pkhs;
+    collect_pkh_for_range(false, meta.next_recv, pkhs);
+    collect_pkh_for_range(true,  meta.next_change, pkhs);
+
+    uint64_t sum = 0;
+    for (const auto& pkh : pkhs){
+        auto lst = chain_.utxo().list_for_pkh(std::vector<uint8_t>(pkh.begin(), pkh.end()));
+        for (const auto& t : lst){
+            const auto& e2 = std::get<2>(t);
+            sum += e2.value;
+        }
+    }
+
+    std::map<std::string,JNode> o;
+    o["miqron"] = jnum((double)sum);
+    // string MIQ for pretty print
+    std::ostringstream s; s << (sum/COIN) << "." << std::setw(8) << std::setfill('0') << (sum%COIN);
+    o["miq"] = jstr(s.str());
+
+    JNode out; out.v = o; return json_dump(out);
+}
+
         if(method=="version"){
             JNode n; n.v = std::string("miqrochain-rpc/1");
             return json_dump(n);
