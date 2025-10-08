@@ -351,6 +351,15 @@ static inline bool meets_target_be(const std::vector<uint8_t>& hash32, uint32_t 
     return std::memcmp(hash32.data(), target, 32) <= 0; // hash <= target
 }
 
+// Small helper for median time
+static inline int64_t median_time_of(const std::vector<std::pair<int64_t,uint32_t>>& xs){
+    if (xs.empty()) return 0;
+    std::vector<int64_t> t; t.reserve(xs.size());
+    for (auto& p: xs) t.push_back(p.first);
+    std::sort(t.begin(), t.end());
+    return t[t.size()/2];
+}
+
 // ===========================================================================
 
 long double Chain::work_from_bits(uint32_t bits) {
@@ -381,17 +390,61 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         }
     }
 
-    // MTP
-    int64_t mtp = tip_.time;
-    {
-        auto hdrs = last_headers(11);
-        if (!hdrs.empty()) {
-            std::vector<int64_t> ts; ts.reserve(hdrs.size());
-            for (auto& p : hdrs) ts.push_back(p.first);
-            std::sort(ts.begin(), ts.end());
-            mtp = ts[ts.size()/2];
+    // === MTP and expected bits computed on the header's own branch (fixes IBD stalls) ===
+    uint64_t parent_height = 0;
+    std::vector<std::pair<int64_t,uint32_t>> recent;   // for MTP (<=11)
+    std::vector<std::pair<int64_t,uint32_t>> window;   // for difficulty (<=interval)
+
+    auto itp = header_index_.find(hk(h.prev_hash));
+    if (itp != header_index_.end()) {
+        // Walk ancestors from parent header in header_index_
+        const auto* cur = &itp->second;
+        parent_height = cur->height;
+
+        // Collect up to 11 for MTP
+        {
+            recent.clear();
+            recent.reserve(11);
+            const auto* c = cur;
+            while (c && recent.size() < 11) {
+                recent.emplace_back(c->time, c->bits);
+                auto ip = header_index_.find(hk(c->prev));
+                if (ip == header_index_.end()) {
+                    if (c->prev == tip_.hash) recent.emplace_back(tip_.time, tip_.bits);
+                    break;
+                }
+                c = &ip->second;
+            }
+        }
+        // Collect up to interval for difficulty window
+        {
+            window.clear();
+            window.reserve(MIQ_RETARGET_INTERVAL);
+            const auto* c = cur;
+            while (c && window.size() < MIQ_RETARGET_INTERVAL) {
+                window.emplace_back(c->time, c->bits);
+                auto ip = header_index_.find(hk(c->prev));
+                if (ip == header_index_.end()) {
+                    if (c->prev == tip_.hash) window.emplace_back(tip_.time, tip_.bits);
+                    break;
+                }
+                c = &ip->second;
+            }
+        }
+    } else {
+        // Parent is the connected tip (or at least we only know the connected chain)
+        parent_height = tip_.height;
+        recent = last_headers(11);
+        window = last_headers(MIQ_RETARGET_INTERVAL);
+        if (h.prev_hash != tip_.hash && !have_block(h.prev_hash)) {
+            err = "unknown parent header";
+            return false;
         }
     }
+
+    // MTP (median over branch recent)
+    int64_t mtp = median_time_of(recent);
+    if (mtp == 0) mtp = tip_.time; // conservative fallback
     if (h.time <= mtp) { err = "header time <= MTP"; return false; }
 
     // Future bound
@@ -399,12 +452,11 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         std::chrono::system_clock::now().time_since_epoch()).count();
     if (h.time > now + (int64_t)MAX_TIME_SKEW) { err="header time too far in future"; return false; }
 
-    // Difficulty bits (epoch retarget; freeze inside the interval)
+    // Difficulty bits (epoch retarget; freeze inside the interval) on the same branch
     {
-        auto last = last_headers(MIQ_RETARGET_INTERVAL);
         uint32_t expected = miq::epoch_next_bits(
-            last, BLOCK_TIME_SECS, GENESIS_BITS,
-            /*next_height=*/ tip_.height + 1,
+            window, BLOCK_TIME_SECS, GENESIS_BITS,
+            /*next_height=*/ parent_height + 1,
             /*interval=*/ MIQ_RETARGET_INTERVAL
         );
         if (h.bits != expected) { err = "bad header bits"; return false; }
