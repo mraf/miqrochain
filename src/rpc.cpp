@@ -39,6 +39,7 @@
   #include <sys/stat.h>
   #include <unistd.h>
 #endif
+#include <iomanip>  // std::setw, std::setfill
 
 #ifndef MIN_RELAY_FEE_RATE
 // sat/KB (miqron per kilobyte)
@@ -99,7 +100,7 @@ static bool read_first_line_trim(const std::string& p, std::string& out) {
 }
 
 // Constant-time compare to avoid token timing leaks (kept for future use)
-static bool timing_safe_eq(const std::string& a, const std::string& b){
+[[maybe_unused]] static bool timing_safe_eq(const std::string& a, const std::string& b){
     if (a.size() != b.size()) return false;
     unsigned char acc = 0;
     for (size_t i=0;i<a.size();++i) acc |= (unsigned char)(a[i] ^ b[i]);
@@ -173,7 +174,7 @@ static std::string err(const std::string& m){
 }
 
 // Local difficulty helper (same formula as Chain::work_from_bits, but public here)
-static double difficulty_from_bits(uint32_t bits){
+[[maybe_unused]] static double difficulty_from_bits(uint32_t bits){
     uint32_t exp  = bits >> 24;
     uint32_t mant = bits & 0x007fffff;
     if (mant == 0) return 0.0;
@@ -213,7 +214,7 @@ static size_t estimate_size_bytes(size_t nin, size_t nout){
     return nin*148 + nout*34 + 10;
 }
 
-static uint64_t min_fee_for_size(size_t sz_bytes){
+[[maybe_unused]] static uint64_t min_fee_for_size(size_t sz_bytes){
     const uint64_t rate = MIN_RELAY_FEE_RATE; // sat/kB
     uint64_t kb = (uint64_t)((sz_bytes + 999) / 1000);
     if(kb==0) kb=1;
@@ -315,7 +316,7 @@ std::string RpcService::handle(const std::string& body){
                 "getpeerinfo","getconnectioncount",
                 "createhdwallet","restorehdwallet","walletinfo","getnewaddress","deriveaddressat",
                 "walletunlock","walletlock","getwalletinfo","listaddresses","listutxos",
-                "sendfromhd","getaddressutxos"
+                "sendfromhd","getaddressutxos","getbalance"
                 // (getibdinfo exists but not listed here to keep help stable)
             };
             std::vector<JNode> v;
@@ -323,52 +324,53 @@ std::string RpcService::handle(const std::string& body){
             JNode out; out.v = v; return json_dump(out);
         }
 
+        // --- getbalance ---
         if (method == "getbalance") {
-    // Load wallet
-    std::string wdir = default_wallet_file();
-    if(!wdir.empty()){
-        size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
-    } else {
-        wdir = "wallets/default";
-    }
-    std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
-    std::string pass = get_wallet_pass_or_cached();
-    if(!LoadHdWallet(wdir, seed, meta, pass, e)) return err(e);
+            // Load wallet
+            std::string wdir = default_wallet_file();
+            if(!wdir.empty()){
+                size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
+            } else {
+                wdir = "wallets/default";
+            }
+            std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
+            std::string pass = get_wallet_pass_or_cached();
+            if(!LoadHdWallet(wdir, seed, meta, pass, e)) return err(e);
 
-    miq::HdWallet w(seed, meta);
+            miq::HdWallet w(seed, meta);
 
-    // Collect PKHs (same ranges as listutxos)
-    auto collect_pkh_for_range = [&](bool change, uint32_t n, std::vector<std::array<uint8_t,20>>& out){
-        for (uint32_t i=0;i<n;i++){
-            std::vector<uint8_t> priv, pub;
-            if (!w.DerivePrivPub(meta.account, change?1u:0u, i, priv, pub)) continue;
-            auto h = hash160(pub);
-            if (h.size()!=20) continue;
-            std::array<uint8_t,20> p{}; std::copy(h.begin(), h.end(), p.begin());
-            out.push_back(p);
+            // Collect PKHs (same ranges as listutxos)
+            auto collect_pkh_for_range = [&](bool change, uint32_t n, std::vector<std::array<uint8_t,20>>& out){
+                for (uint32_t i=0;i<n;i++){
+                    std::vector<uint8_t> priv, pub;
+                    if (!w.DerivePrivPub(meta.account, change?1u:0u, i, priv, pub)) continue;
+                    auto h = hash160(pub);
+                    if (h.size()!=20) continue;
+                    std::array<uint8_t,20> p{}; std::copy(h.begin(), h.end(), p.begin());
+                    out.push_back(p);
+                }
+            };
+            std::vector<std::array<uint8_t,20>> pkhs;
+            collect_pkh_for_range(false, meta.next_recv, pkhs);
+            collect_pkh_for_range(true,  meta.next_change, pkhs);
+
+            uint64_t sum = 0;
+            for (const auto& pkh : pkhs){
+                auto lst = chain_.utxo().list_for_pkh(std::vector<uint8_t>(pkh.begin(), pkh.end()));
+                for (const auto& t : lst){
+                    const auto& e2 = std::get<2>(t);
+                    sum += e2.value;
+                }
+            }
+
+            std::map<std::string,JNode> o;
+            o["miqron"] = jnum((double)sum);
+            // string MIQ for pretty print
+            std::ostringstream s; s << (sum/COIN) << "." << std::setw(8) << std::setfill('0') << (sum%COIN);
+            o["miq"] = jstr(s.str());
+
+            JNode out; out.v = o; return json_dump(out);
         }
-    };
-    std::vector<std::array<uint8_t,20>> pkhs;
-    collect_pkh_for_range(false, meta.next_recv, pkhs);
-    collect_pkh_for_range(true,  meta.next_change, pkhs);
-
-    uint64_t sum = 0;
-    for (const auto& pkh : pkhs){
-        auto lst = chain_.utxo().list_for_pkh(std::vector<uint8_t>(pkh.begin(), pkh.end()));
-        for (const auto& t : lst){
-            const auto& e2 = std::get<2>(t);
-            sum += e2.value;
-        }
-    }
-
-    std::map<std::string,JNode> o;
-    o["miqron"] = jnum((double)sum);
-    // string MIQ for pretty print
-    std::ostringstream s; s << (sum/COIN) << "." << std::setw(8) << std::setfill('0') << (sum%COIN);
-    o["miq"] = jstr(s.str());
-
-    JNode out; out.v = o; return json_dump(out);
-}
 
         if(method=="version"){
             JNode n; n.v = std::string("miqrochain-rpc/1");
