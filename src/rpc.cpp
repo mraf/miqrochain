@@ -890,7 +890,7 @@ std::string RpcService::handle(const std::string& body){
             JNode out; out.v = arr; return json_dump(out);
         }
 
-        // --- listutxos ---
+        // --- listutxos (now includes spendability/maturity) ---
         if (method == "listutxos") {
             std::string wdir = default_wallet_file();
             if(!wdir.empty()){
@@ -905,7 +905,8 @@ std::string RpcService::handle(const std::string& body){
 
             miq::HdWallet w(seed, meta);
 
-            // Build PKHs for known receive & change ranges
+            const uint64_t curH = chain_.tip().height;
+
             auto collect_pkh_for_range = [&](bool change, uint32_t n, std::vector<std::array<uint8_t,20>>& out){
                 for (uint32_t i=0;i<n;i++){
                     std::vector<uint8_t> priv, pub;
@@ -928,17 +929,33 @@ std::string RpcService::handle(const std::string& body){
                     uint32_t vout    = std::get<1>(t);
                     const auto& e2   = std::get<2>(t);
 
+                    bool spendable = true;
+                    uint64_t mat_in = 0, at_h = 0;
+                    if (e2.coinbase) {
+                        uint64_t mature_h = e2.height + COINBASE_MATURITY;
+                        at_h = mature_h;
+                        if (curH + 1 < mature_h) { // next block height still < mature
+                            spendable = false;
+                            mat_in = mature_h - (curH + 1);
+                        }
+                    }
+
                     std::map<std::string,JNode> o;
-                    o["txid"]  = jstr(to_hex(txid));
-                    o["vout"]  = jnum((double)vout);
-                    o["value"] = jnum((double)e2.value);
+                    o["txid"]      = jstr(to_hex(txid));
+                    o["vout"]      = jnum((double)vout);
+                    o["value"]     = jnum((double)e2.value);
+                    o["pkh"]       = jstr(to_hex(e2.pkh));
+                    o["coinbase"]  = jbool(e2.coinbase);
+                    o["spendable"] = jbool(spendable);
+                    o["matures_in"]= jnum((double)mat_in);
+                    if (e2.coinbase) o["at_height"] = jnum((double)at_h);
                     JNode n; n.v = o; outarr.push_back(n);
                 }
             }
             JNode out; out.v = outarr; return json_dump(out);
         }
 
-        // -------- NEW: spend from HD wallet (account 0) --------
+        // -------- Bulletproof: spend from HD wallet (filters immature coinbase) --------
         if (method == "sendfromhd") {
             // params: [to_address, amount, feerate(optional miqron per kB)]
             if (params.size() < 2
@@ -983,14 +1000,19 @@ std::string RpcService::handle(const std::string& body){
             if(!LoadHdWallet(wdir, seed, meta, pass, werr)) return err(werr);
 
             miq::HdWallet w(seed, meta);
+            const uint64_t curH = chain_.tip().height;
 
             struct OwnedUtxo {
                 std::vector<uint8_t> txid; uint32_t vout; UTXOEntry e;
                 std::vector<uint8_t> priv; std::vector<uint8_t> pub; std::vector<uint8_t> pkh;
             };
-            std::vector<OwnedUtxo> owned;
+            std::vector<OwnedUtxo> owned_all;   // all funds we control
+            std::vector<OwnedUtxo> spendables;  // filtered mature funds
 
-            auto gather_chain = [&](uint32_t chain, uint32_t limit){
+            uint64_t total_balance = 0, spendable_balance = 0, locked_balance = 0;
+            uint64_t soonest_mature_h = UINT64_MAX;
+
+            auto maybe_push = [&](uint32_t chain, uint32_t limit){
                 for (uint32_t i = 0; i < limit + 1; ++i) { // include current "next" (fresh)
                     std::vector<uint8_t> priv, pub;
                     if (!w.DerivePrivPub(meta.account, chain, i, priv, pub)) continue;
@@ -1004,18 +1026,54 @@ std::string RpcService::handle(const std::string& body){
                         ou.priv = priv;
                         ou.pub  = pub;
                         ou.pkh  = pkh;
-                        owned.push_back(std::move(ou));
+                        owned_all.push_back(ou);
+
+                        total_balance += ou.e.value;
+
+                        bool is_spendable = true;
+                        if (ou.e.coinbase) {
+                            uint64_t m_h = ou.e.height + COINBASE_MATURITY;
+                            if (curH + 1 < m_h) {
+                                is_spendable = false;
+                                locked_balance += ou.e.value;
+                                soonest_mature_h = std::min<uint64_t>(soonest_mature_h, m_h);
+                            }
+                        }
+                        if (is_spendable) {
+                            spendables.push_back(owned_all.back());
+                            spendable_balance += ou.e.value;
+                        }
                     }
                 }
             };
-            gather_chain(0, meta.next_recv);
-            gather_chain(1, meta.next_change);
+            maybe_push(0, meta.next_recv);
+            maybe_push(1, meta.next_change);
 
-            if (owned.empty()) return err("no funds");
+            if (owned_all.empty()) return err("no funds");
 
-            std::sort(owned.begin(), owned.end(), [](const OwnedUtxo& A, const OwnedUtxo& B){
-                return A.e.value < B.e.value;
-            });
+            if (spendables.empty()) {
+                if (locked_balance > 0 && soonest_mature_h != UINT64_MAX) {
+                    char buf[160];
+                    std::snprintf(buf, sizeof(buf),
+                                  "no spendable utxos: %llu locked until height %llu",
+                                  (unsigned long long)locked_balance,
+                                  (unsigned long long)soonest_mature_h);
+                    return err(buf);
+                } else {
+                    return err("no spendable utxos (balance=0)");
+                }
+            }
+
+            // Oldest-first coin selection: (height asc, txid lex, vout asc)
+            auto lex_less = [](const std::vector<uint8_t>& A, const std::vector<uint8_t>& B){
+                return std::lexicographical_compare(A.begin(), A.end(), B.begin(), B.end());
+            };
+            std::sort(spendables.begin(), spendables.end(),
+                      [&](const OwnedUtxo& A, const OwnedUtxo& B){
+                          if (A.e.height != B.e.height) return A.e.height < B.e.height;
+                          if (A.txid != B.txid) return lex_less(A.txid, B.txid);
+                          return A.vout < B.vout;
+                      });
 
             Transaction tx;
             uint64_t in_sum = 0;
@@ -1027,8 +1085,8 @@ std::string RpcService::handle(const std::string& body){
                 return kb * feerate;
             };
 
-            for (size_t k = 0; k < owned.size(); ++k){
-                const auto& u = owned[k];
+            for (size_t k = 0; k < spendables.size(); ++k){
+                const auto& u = spendables[k];
                 TxIn in; in.prev.txid = u.txid; in.prev.vout = u.vout;
                 tx.vin.push_back(in);
                 in_sum += u.e.value;
@@ -1086,7 +1144,7 @@ std::string RpcService::handle(const std::string& body){
             }();
             for (auto& in : tx.vin){
                 const OwnedUtxo* key = nullptr;
-                for (const auto& u : owned){
+                for (const auto& u : spendables){
                     if (u.txid == in.prev.txid && u.vout == in.prev.vout) { key = &u; break; }
                 }
                 if (!key) return err("internal: key lookup failed");
