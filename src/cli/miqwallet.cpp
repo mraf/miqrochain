@@ -1,7 +1,7 @@
 // MIQ wallet CLI (hybrid): local HD + (RPC optional) + P2P tx broadcast.
 // Default P2P seed: 62.38.73.147:9833
 //
-// Build dependencies: hd_wallet, wallet_store, sha256, ripemd160, hash160,
+// Build deps: hd_wallet, wallet_store, sha256, ripemd160, hash160,
 // base58*, hex, serialize, tx, secp256k1, and wallet/p2p_light.*
 
 #include <iostream>
@@ -9,6 +9,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <tuple>
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -18,12 +19,19 @@
 #include <thread>
 #include <fstream>
 #include <random>
+#include <cmath>
+#include <stdexcept>
 
 #ifdef _WIN32
   #include <windows.h>
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #pragma comment(lib, "ws2_32.lib")
+#else
+  #include <sys/types.h>
+  #include <sys/socket.h>
+  #include <netdb.h>
+  #include <unistd.h>
 #endif
 
 #include "constants.h"
@@ -124,11 +132,12 @@ static bool http_post(const std::string& host, const std::string& port,
     for (; rp; rp=rp->ai_next) {
         fd = (int)socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd < 0) continue;
-        if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) break;
 #ifdef _WIN32
+        if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) break;
         closesocket(fd);
 #else
-        close(fd);
+        if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) break;
+        ::close(fd);
 #endif
         fd = -1;
     }
@@ -155,7 +164,7 @@ static bool http_post(const std::string& host, const std::string& port,
 #ifdef _WIN32
         int n = send(fd, data.data() + sent, (int)(data.size() - sent), 0);
 #else
-        ssize_t n = send(fd, data.data() + sent, data.size() - sent, 0);
+        ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, 0);
 #endif
         if (n <= 0) break;
         sent += (size_t)n;
@@ -167,7 +176,7 @@ static bool http_post(const std::string& host, const std::string& port,
 #ifdef _WIN32
         int n = recv(fd, buf, sizeof(buf), 0);
 #else
-        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
 #endif
         if (n <= 0) break;
         resp.append(buf, buf+n);
@@ -175,7 +184,7 @@ static bool http_post(const std::string& host, const std::string& port,
 #ifdef _WIN32
     closesocket(fd); WSACleanup();
 #else
-    close(fd);
+    ::close(fd);
 #endif
 
     auto p = resp.find("\r\n\r\n");
@@ -235,8 +244,6 @@ static bool find_cookie_auto(std::string& out_userpass, std::string& source_hint
             if(read_first_line(p, out_userpass)) { source_hint = p; return true; }
         }
     }
-#else
-    // keep it simple on Windows (pass cookiefile/env)
 #endif
     return false;
 }
@@ -286,7 +293,7 @@ static bool p2p_broadcast_tx(const std::string& seed_host, const std::string& se
 // Wallet ops
 // -----------------------------------------------------------------------------
 static bool make_or_restore_wallet(bool restore){
-    std::string wdir = default_wallet_file();
+    std::string wdir = miq::default_wallet_file();
     if(!wdir.empty()){
         size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
     } else {
@@ -359,7 +366,9 @@ static bool rpc_getbalance(const Rpc& rpc, uint64_t& miqron){
     while(p<r.size() && std::isspace((unsigned char)r[p])) ++p;
     uint64_t v=0; bool any=false;
     while(p<r.size() && std::isdigit((unsigned char)r[p])){ any=true; v = v*10 + (r[p]-'0'); ++p; }
-    if(!any) return false; miqron=v; return true;
+    if(!any) return false;
+    miqron=v;
+    return true;
 }
 
 static bool rpc_listutxos(const Rpc& rpc, std::vector<std::tuple<std::vector<uint8_t>,uint32_t,uint64_t,std::vector<uint8_t>>>& out){
@@ -399,7 +408,7 @@ static bool flow_send(const Rpc& rpc, const std::string& p2p_host, const std::st
     } else wdir = "wallets/default";
 
     std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
-    std::string pass; // we use env/cached in future; for now prompt
+    std::string pass; // we use env/cached later; for now prompt
     std::cout << "Wallet passphrase (ENTER if none): ";
     std::getline(std::cin, pass);
     if(!miq::LoadHdWallet(wdir, seed, meta, pass, e)){ std::cout << "Load wallet failed: " << e << "\n"; return false; }
@@ -438,10 +447,13 @@ static bool flow_send(const Rpc& rpc, const std::string& p2p_host, const std::st
     add_range(1, meta.next_change);
 
     auto find_key_for_pkh = [&](const std::vector<uint8_t>& pkh)->const Key*{
-        for(auto& k: keys) if(k.pkh==pkh) return &k; return nullptr;
+        for(auto& k: keys){
+            if(k.pkh==pkh) return &k;
+        }
+        return nullptr;
     };
 
-    // coin selection (oldest-first is fine if RPC returns in order; otherwise simple accumulate)
+    // coin selection (simple accumulate)
     miq::Transaction tx;
     uint64_t in_sum=0;
     for(auto& t: utx){
