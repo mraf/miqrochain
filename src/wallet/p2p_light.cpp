@@ -1,4 +1,4 @@
-// wallet/p2p_light.cpp
+// src/wallet/p2p_light.cpp
 #include "wallet/p2p_light.h"
 #include "sha256.h"
 #include "constants.h"
@@ -6,7 +6,6 @@
 #include <cstring>
 #include <chrono>
 #include <random>
-#include <sstream>
 #include <vector>
 #include <algorithm>
 
@@ -32,7 +31,6 @@
   #include <sys/socket.h>
   #include <netdb.h>
   #include <unistd.h>
-  #include <fcntl.h>
   #include <sys/time.h>
   static inline void closesock(int s){ if(s>=0) ::close(s); }
   static inline void set_timeouts(int s, int ms){
@@ -47,9 +45,7 @@
 
 namespace miq {
 
-// ---- network magic (match daemon wire bytes exactly) ------------------------
-// We want the header to carry MAGIC_BE in order. We build a 32-bit integer that,
-// when written out byte-by-byte in [0..3], yields MAGIC_BE[0..3].
+// ---- network magic from chain constants --------------------------------------
 #ifndef MIQ_P2P_MAGIC
 static constexpr uint32_t MIQ_P2P_MAGIC =
     (uint32_t(MAGIC_BE[0])      ) |
@@ -58,7 +54,7 @@ static constexpr uint32_t MIQ_P2P_MAGIC =
     (uint32_t(MAGIC_BE[3]) << 24);
 #endif
 
-// ---- varint / varstr ---------------------------------------------------------
+// ---- helpers -----------------------------------------------------------------
 static void put_u32_le(std::vector<uint8_t>& b, uint32_t v){
     b.push_back(uint8_t(v)); b.push_back(uint8_t(v>>8));
     b.push_back(uint8_t(v>>16)); b.push_back(uint8_t(v>>24));
@@ -78,10 +74,6 @@ static void put_varint(std::vector<uint8_t>& b, uint64_t v){
     else if (v <= 0xFFFFFFFFULL) { b.push_back(0xFE); put_u32_le(b, (uint32_t)v); }
     else { b.push_back(0xFF); put_u64_le(b, v); }
 }
-static void put_varstr(std::vector<uint8_t>& b, const std::string& s){
-    put_varint(b, s.size());
-    b.insert(b.end(), s.begin(), s.end());
-}
 static bool get_varint(const uint8_t* p, size_t n, uint64_t& v, size_t& used){
     if(n==0) return false;
     uint8_t x = p[0]; used = 1;
@@ -91,14 +83,6 @@ static bool get_varint(const uint8_t* p, size_t n, uint64_t& v, size_t& used){
     if(x == 0xFF){ if(n<9) return false; uint64_t r=0; for(int i=0;i<8;i++) r |= ((uint64_t)p[1+i]<<(8*i)); v=r; used=9; return true; }
     return false;
 }
-
-// ---- checksum ----------------------------------------------------------------
-static uint32_t checksum4(const std::vector<uint8_t>& payload){
-    auto d = dsha256(payload);
-    return (uint32_t)d[0] | ((uint32_t)d[1]<<8) | ((uint32_t)d[2]<<16) | ((uint32_t)d[3]<<24);
-}
-
-// ---- hash utils --------------------------------------------------------------
 static std::vector<uint8_t> dsha256_bytes(const uint8_t* data, size_t len){
     std::vector<uint8_t> v(data, data+len);
     return dsha256(v);
@@ -106,8 +90,12 @@ static std::vector<uint8_t> dsha256_bytes(const uint8_t* data, size_t len){
 static std::vector<uint8_t> to_le32(const std::vector<uint8_t>& h){
     std::vector<uint8_t> r = h; std::reverse(r.begin(), r.end()); return r;
 }
+static uint32_t checksum4(const std::vector<uint8_t>& payload){
+    auto d = dsha256(payload);
+    return (uint32_t)d[0] | ((uint32_t)d[1]<<8) | ((uint32_t)d[2]<<16) | ((uint32_t)d[3]<<24);
+}
 
-// ---- P2PLight ----------------------------------------------------------------
+// ---- class -------------------------------------------------------------------
 P2PLight::P2PLight(){}
 P2PLight::~P2PLight(){ close(); }
 
@@ -124,8 +112,8 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
         err = "getaddrinfo failed";
         return false;
     }
-    int fd = -1; addrinfo* rp=res;
-    for (; rp; rp = rp->ai_next) {
+    int fd = -1;
+    for (auto rp = res; rp; rp = rp->ai_next) {
         fd = (int)socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd < 0) continue;
         set_timeouts(fd, o_.io_timeout_ms);
@@ -176,7 +164,7 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
         return true;
     }
 
-    // Start from "null" locator to get headers from genesis.
+    // Start from "null" locator to get headers from genesis (daemon expects u8 count + hashes + stop).
     std::vector<std::vector<uint8_t>> locator;
     locator.emplace_back(32, 0x00);
     std::vector<uint8_t> stop(32, 0x00);
@@ -210,56 +198,88 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
     return true;
 }
 
+// Your daemon's getheaders: [u8 count][count*32 hashes][32 stop]
 bool P2PLight::request_headers_from_locator(const std::vector<std::vector<uint8_t>>& locator_hashes_le,
                                             std::vector<uint8_t>& stop_le,
                                             std::string& err)
 {
     std::vector<uint8_t> p;
-    const uint32_t version = 70015;
-    put_u32_le(p, version);
-    put_varint(p, locator_hashes_le.size());
-    for(const auto& h : locator_hashes_le){
-        if(h.size()!=32){ err = "bad locator hash size"; return false; }
-        p.insert(p.end(), h.begin(), h.end());
+    const uint8_t n = (uint8_t)std::min<size_t>(locator_hashes_le.size(), 32);
+    p.push_back(n);
+    for (size_t i=0;i<n;i++){
+        if(locator_hashes_le[i].size()!=32){ err="bad locator hash size"; return false; }
+        p.insert(p.end(), locator_hashes_le[i].begin(), locator_hashes_le[i].end());
     }
     if(stop_le.size()!=32) stop_le.assign(32, 0x00);
     p.insert(p.end(), stop_le.begin(), stop_le.end());
     return send_msg("getheaders", p, err);
 }
 
+// Accepts both daemon-style headers (u16 + count*88 bytes) and Bitcoin-style (varint + 80 + varint txcount).
 bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_le, std::string& err){
     out_hashes_le.clear();
     for(;;){
-        std::string cmd; uint32_t len=0, csum=0;
-        if(!read_msg_header(cmd, len, csum, err)) return false;
+        std::string cmd; uint32_t len=0, csum=0; bool legacy=false;
+        if(!read_msg_header(cmd, len, csum, legacy, err)) return false;
 
         std::vector<uint8_t> payload(len);
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
 
-        if(cmd == "headers"){
-            size_t pos = 0;
-            uint64_t count=0, used=0;
-            if(!get_varint(payload.data(), payload.size(), count, used)){ err="bad headers varint"; return false; }
-            pos += used;
-
-            for(uint64_t i=0;i<count;i++){
-                if(pos + 80 > payload.size()){ err="truncated header"; return false; }
-                const uint8_t* hdr = payload.data()+pos;
-
-                auto h  = dsha256_bytes(hdr, 80);
-                auto hl = to_le32(h);
-                out_hashes_le.push_back(std::move(hl));
-                pos += 80;
-
-                // skip txn_count varint
-                uint64_t tcnt=0, u2=0;
-                if(!get_varint(payload.data()+pos, payload.size()-pos, tcnt, u2)){ err="bad txcount varint"; return false; }
-                pos += u2;
-            }
-            return true;
+        if(cmd == "ping"){
+            std::string e; send_msg("pong", payload, e);
+            continue;
         }
 
-        // swallow unrelated messages (ping, inv, addr, sendcmpct, ...)
+        if(cmd != "headers"){
+            // swallow unrelated messages (inv, addr, sendcmpct, etc.)
+            continue;
+        }
+
+        // Try daemon format first: [u16 count][count * 88 bytes]
+        if(payload.size() >= 2){
+            uint16_t count = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+            size_t pos = 2;
+            const size_t HBYTES = 88;
+            if (payload.size() == pos + (size_t)count * HBYTES){
+                out_hashes_le.reserve(count);
+                for (uint16_t i=0;i<count;i++){
+                    const uint8_t* hdr = payload.data()+pos;
+                    auto h  = dsha256_bytes(hdr, HBYTES);
+                    auto hl = to_le32(h);
+                    out_hashes_le.push_back(std::move(hl));
+                    pos += HBYTES;
+                }
+                return true;
+            }
+        }
+
+        // Fallback: Bitcoin-style [varint count][count*(80-byte header + varint txcount)]
+        if(!payload.empty()){
+            size_t pos = 0; uint64_t count=0, used=0;
+            if(get_varint(payload.data(), payload.size(), count, used)){
+                pos += used;
+                std::vector<std::vector<uint8_t>> tmp;
+                tmp.reserve((size_t)count);
+                bool ok = true;
+                for(uint64_t i=0;i<count;i++){
+                    if(pos + 80 > payload.size()){ ok=false; break; }
+                    const uint8_t* hdr = payload.data()+pos;
+                    auto h  = dsha256_bytes(hdr, 80);
+                    auto hl = to_le32(h);
+                    tmp.push_back(std::move(hl));
+                    pos += 80;
+                    // txcount varint may be present; if parse fails, treat as absent (0)
+                    if(pos < payload.size()){
+                        uint64_t tcnt=0, u2=0;
+                        if(get_varint(payload.data()+pos, payload.size()-pos, tcnt, u2)) pos += u2;
+                    }
+                }
+                if(ok){ out_hashes_le.swap(tmp); return true; }
+            }
+        }
+
+        err = "unrecognized headers payload shape";
+        return false;
     }
 }
 
@@ -286,7 +306,7 @@ bool P2PLight::match_recent_blocks(const std::vector<std::vector<uint8_t>>& /*pk
     return true;
 }
 
-// ---- block fetch -------------------------------------------------------------
+// ---- block fetch (your daemon uses `getb`) -----------------------------------
 bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
                                  std::vector<uint8_t>& raw_block,
                                  std::string& err)
@@ -295,32 +315,31 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
     if (sock_ < 0){ err = "not connected"; return false; }
     if (hash_le.size()!=32){ err = "hash_le must be 32 bytes"; return false; }
 
-    // getdata: varint count (1), then (type=2 MSG_BLOCK little-endian) + hash (LE)
-    std::vector<uint8_t> p;
-    put_varint(p, 1);
-    put_u32_le(p, 2); // MSG_BLOCK
-    p.insert(p.end(), hash_le.begin(), hash_le.end());
-    if(!send_msg("getdata", p, err)) return false;
+    if(!send_msg("getb", hash_le, err)) return false;
 
     // read messages until we get "block"
     for(;;){
-        std::string cmd; uint32_t len=0, csum=0;
-        if(!read_msg_header(cmd, len, csum, err)) return false;
+        std::string cmd; uint32_t len=0, csum=0; bool legacy=false;
+        if(!read_msg_header(cmd, len, csum, legacy, err)) return false;
 
         std::vector<uint8_t> payload(len);
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
 
+        if(cmd=="ping"){
+            std::string e; send_msg("pong", payload, e);
+            continue;
+        }
         if(cmd=="block"){
             raw_block = std::move(payload);
             return true;
         }
-        // ignore other messages (inv, ping, etc.)
+        // ignore others
     }
 }
 
 // ---- internals: version/verack and IO ----------------------------------------
 bool P2PLight::send_version(std::string& err){
-    // Build "version" payload (Bitcoin-like)
+    // Build Bitcoin-like "version" payload; daemon is permissive and ignores extras.
     std::vector<uint8_t> p;
 
     const int32_t  version   = 70015;
@@ -354,7 +373,16 @@ bool P2PLight::send_version(std::string& err){
     put_u16_be(p, port_from);
 
     put_u64_le(p, nonce);
-    put_varstr(p, o_.user_agent);
+    // user agent
+    {
+        // If daemon expects a short UA, this still works (varstr).
+        std::string ua = o_.user_agent;
+        if(ua.empty()) ua = "/miqwallet:0.1/";
+        // varstr
+        if (ua.size() < 0xFD) { p.push_back((uint8_t)ua.size()); }
+        else { put_varint(p, ua.size()); }
+        p.insert(p.end(), ua.begin(), ua.end());
+    }
     put_u32_le(p, o_.start_height);
     p.push_back(1); // relay = true
 
@@ -370,56 +398,83 @@ bool P2PLight::send_version(std::string& err){
 bool P2PLight::read_until_verack(std::string& err){
     // Read a few messages, stop when we see verack.
     for (int i=0;i<50;i++){
-        std::string cmd; uint32_t len=0, csum=0;
-        if(!read_msg_header(cmd, len, csum, err)) return false;
+        std::string cmd; uint32_t len=0, csum=0; bool legacy=false;
+        if(!read_msg_header(cmd, len, csum, legacy, err)) return false;
 
         std::vector<uint8_t> payload(len);
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
 
         if(cmd=="verack") return true;
+        if(cmd=="ping"){ std::string e; send_msg("pong", payload, e); }
         // ignore other msgs in handshake window
     }
     err = "no verack from peer";
     return false;
 }
 
+// Encode and send one message (Bitcoin-style or legacy, per opt)
 bool P2PLight::send_msg(const char cmd12[12], const std::vector<uint8_t>& payload, std::string& err){
     if (sock_ < 0) { err = "not connected"; return false; }
 
-    uint8_t header[24]{};
-    // magic (we write the 4 canonical bytes directly)
-    uint32_t m = MIQ_P2P_MAGIC;
-    header[0]=uint8_t(m); header[1]=uint8_t(m>>8); header[2]=uint8_t(m>>16); header[3]=uint8_t(m>>24);
-
-    // command (null-padded to 12)
-    for (int i=0;i<12 && cmd12[i]; ++i) header[4+i] = (uint8_t)cmd12[i];
-
-    // length
-    uint32_t L = (uint32_t)payload.size();
-    header[16]=uint8_t(L); header[17]=uint8_t(L>>8); header[18]=uint8_t(L>>16); header[19]=uint8_t(L>>24);
-
-    // checksum
-    uint32_t c = checksum4(payload);
-    header[20]=uint8_t(c); header[21]=uint8_t(c>>8); header[22]=uint8_t(c>>16); header[23]=uint8_t(c>>24);
-
-    if(!write_all(header, sizeof(header), err)) return false;
-    if(L>0 && !write_all(payload.data(), payload.size(), err)) return false;
-    return true;
+    if (o_.prefer_new_frame){
+        // Bitcoin-style: [magic(4)|cmd(12)|len(4)|chk(4)] + payload
+        uint8_t header[24]{};
+        uint32_t m = MIQ_P2P_MAGIC;
+        header[0]=uint8_t(m); header[1]=uint8_t(m>>8); header[2]=uint8_t(m>>16); header[3]=uint8_t(m>>24);
+        for (int i=0;i<12 && cmd12[i]; ++i) header[4+i] = (uint8_t)cmd12[i];
+        uint32_t L = (uint32_t)payload.size();
+        header[16]=uint8_t(L); header[17]=uint8_t(L>>8); header[18]=uint8_t(L>>16); header[19]=uint8_t(L>>24);
+        uint32_t c = checksum4(payload);
+        header[20]=uint8_t(c); header[21]=uint8_t(c>>8); header[22]=uint8_t(c>>16); header[23]=uint8_t(c>>24);
+        if(!write_all(header, sizeof(header), err)) return false;
+        if(L>0 && !write_all(payload.data(), payload.size(), err)) return false;
+        return true;
+    } else {
+        // Legacy: [cmd(12)|len(4)] + payload
+        uint8_t header[16]{};
+        for (int i=0;i<12 && cmd12[i]; ++i) header[0+i] = (uint8_t)cmd12[i];
+        uint32_t L = (uint32_t)payload.size();
+        header[12]=uint8_t(L); header[13]=uint8_t(L>>8); header[14]=uint8_t(L>>16); header[15]=uint8_t(L>>24);
+        if(!write_all(header, sizeof(header), err)) return false;
+        if(L>0 && !write_all(payload.data(), payload.size(), err)) return false;
+        return true;
+    }
 }
 
-bool P2PLight::read_msg_header(std::string& cmd_out, uint32_t& len_out, uint32_t& csum_out, std::string& err){
-    uint8_t h[24];
-    if(!read_exact(h, 24, err)) return false;
+// Read message header; auto-detect framing. Returns len and sets legacy_out.
+bool P2PLight::read_msg_header(std::string& cmd_out, uint32_t& len_out, uint32_t& csum_out, bool& legacy_out, std::string& err){
+    cmd_out.clear(); len_out=0; csum_out=0; legacy_out=false;
 
-    uint32_t m = (uint32_t)h[0] | ((uint32_t)h[1]<<8) | ((uint32_t)h[2]<<16) | ((uint32_t)h[3]<<24);
-    if(m != MIQ_P2P_MAGIC){ err = "bad magic"; return false; }
+    // Peek first 4 bytes to check magic
+    uint8_t first4[4];
+    if(!read_exact(first4, 4, err)) return false;
 
-    char cmd[13]; std::memset(cmd, 0, sizeof(cmd));
-    std::memcpy(cmd, h+4, 12);
+    uint32_t m = (uint32_t)first4[0] | ((uint32_t)first4[1]<<8) | ((uint32_t)first4[2]<<16) | ((uint32_t)first4[3]<<24);
+    if(m == MIQ_P2P_MAGIC){
+        // Bitcoin-style header: read remaining 20 bytes
+        uint8_t rest[20];
+        if(!read_exact(rest, 20, err)) return false;
+        char cmd[13]{}; std::memcpy(cmd, rest+0, 12);
+        cmd_out = std::string(cmd);
+        len_out  = (uint32_t)rest[12] | ((uint32_t)rest[13]<<8) | ((uint32_t)rest[14]<<16) | ((uint32_t)rest[15]<<24);
+        csum_out = (uint32_t)rest[16] | ((uint32_t)rest[17]<<8) | ((uint32_t)rest[18]<<16) | ((uint32_t)rest[19]<<24);
+        legacy_out = false;
+        return true;
+    }
+
+    // Legacy header (we already consumed 4 bytes of cmd)
+    uint8_t rest_legacy[12]; // remaining cmd bytes (8) + len (4) → but we need total 12 to complete 16
+    if(!read_exact(rest_legacy, 12, err)) return false;
+
+    char cmd[13]{};
+    // First 4 bytes are part of cmd (they are not guaranteed printable, but your daemon uses printable cmds)
+    std::memcpy(cmd+0, first4, 4);
+    std::memcpy(cmd+4, rest_legacy+0, 8);
     cmd_out = std::string(cmd);
 
-    len_out  = (uint32_t)h[16] | ((uint32_t)h[17]<<8) | ((uint32_t)h[18]<<16) | ((uint32_t)h[19]<<24);
-    csum_out = (uint32_t)h[20] | ((uint32_t)h[21]<<8) | ((uint32_t)h[22]<<16) | ((uint32_t)h[23]<<24);
+    len_out  = (uint32_t)rest_legacy[8] | ((uint32_t)rest_legacy[9]<<8) | ((uint32_t)rest_legacy[10]<<16) | ((uint32_t)rest_legacy[11]<<24);
+    csum_out = 0;
+    legacy_out = true;
     return true;
 }
 
