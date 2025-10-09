@@ -32,13 +32,6 @@
 
 namespace miq {
 
-// ---- choose network magic ----------------------------------------------------
-#ifndef MIQ_P2P_MAGIC
-// If your repo already defines one, add it in constants.h, e.g.:
-//   static constexpr uint32_t MIQ_P2P_MAGIC = 0x4d495121; // "MIQ!" little-endian
-static constexpr uint32_t MIQ_P2P_MAGIC = 0xD9B4BEF9; // Bitcoin mainnet style fallback
-#endif
-
 // ---- varint / varstr ---------------------------------------------------------
 static void put_u32_le(std::vector<uint8_t>& b, uint32_t v){
     b.push_back(uint8_t(v)); b.push_back(uint8_t(v>>8));
@@ -149,7 +142,6 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
     tip_height = 0; tip_hash_le.clear();
     if (sock_ < 0){ err = "not connected"; return false; }
 
-    // If we already synced in this session, just return the last.
     if(!header_hashes_le_.empty()){
         tip_height = (uint32_t)(header_hashes_le_.size() - 1);
         tip_hash_le = header_hashes_le_.back();
@@ -168,15 +160,11 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
         if(!read_headers_batch(batch, err)) return false;
 
         if(batch.empty()){
-            // No more headers to send; we’re at tip.
-            break;
+            break; // at tip
         }
 
-        // Append
         for(auto& h : batch) header_hashes_le_.push_back(std::move(h));
 
-        // Build new locator from the tail (like Bitcoin does; keeping it simple)
-        // Here we just use the last hash we saw.
         locator.clear();
         locator.push_back(header_hashes_le_.back());
     }
@@ -195,11 +183,6 @@ bool P2PLight::request_headers_from_locator(const std::vector<std::vector<uint8_
                                             std::vector<uint8_t>& stop_le,
                                             std::string& err)
 {
-    // getheaders payload:
-    //   uint32 version
-    //   varint hash_count
-    //   hash[hash_count] (each 32 bytes, little-endian on the wire)
-    //   stop_hash (32 bytes)
     std::vector<uint8_t> p;
     const uint32_t version = 70015;
     put_u32_le(p, version);
@@ -223,7 +206,6 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
 
         if(cmd == "headers"){
-            // parse: varint count, then count * (80 bytes header + varint txcount)
             size_t pos = 0;
             uint64_t count=0, used=0;
             if(!get_varint(payload.data(), payload.size(), count, used)){ err="bad headers varint"; return false; }
@@ -232,22 +214,18 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
             for(uint64_t i=0;i<count;i++){
                 if(pos + 80 > payload.size()){ err="truncated header"; return false; }
                 const uint8_t* hdr = payload.data()+pos;
-                // header hash = dsha256(80 bytes), reversed for LE on the wire
                 auto h  = dsha256_bytes(hdr, 80);
                 auto hl = to_le32(h);
                 out_hashes_le.push_back(std::move(hl));
                 pos += 80;
 
-                // skip txn_count varint
                 uint64_t tcnt=0, u2=0;
                 if(!get_varint(payload.data()+pos, payload.size()-pos, tcnt, u2)){ err="bad txcount varint"; return false; }
                 pos += u2;
             }
             return true;
         }
-
-        // swallow unrelated messages during header sync
-        // (e.g., ping, addr, inv, sendcmpct, etc.)
+        // swallow unrelated messages
     }
 }
 
@@ -261,16 +239,14 @@ bool P2PLight::match_recent_blocks(const std::vector<std::vector<uint8_t>>& /*pk
     matched.clear();
     if (sock_ < 0){ err = "not connected"; return false; }
 
-    // Ensure we have headers
     uint32_t tip=0; std::vector<uint8_t> tip_hash;
     if(!get_best_header(tip, tip_hash, err)) return false;
 
     if(to_height > tip) to_height = tip;
-    if(from_height > to_height) return true; // empty window
+    if(from_height > to_height) return true;
 
     for(uint32_t h = from_height; h <= to_height; ++h){
         matched.emplace_back(header_hashes_le_[h], h);
-        // keep it light; the wallet will fetch blocks one-by-one and scan
     }
     return true;
 }
@@ -284,14 +260,12 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
     if (sock_ < 0){ err = "not connected"; return false; }
     if (hash_le.size()!=32){ err = "hash_le must be 32 bytes"; return false; }
 
-    // getdata: varint count (1), then (type=2 MSG_BLOCK little-endian) + hash (LE)
     std::vector<uint8_t> p;
     put_varint(p, 1);
     put_u32_le(p, 2); // MSG_BLOCK
     p.insert(p.end(), hash_le.begin(), hash_le.end());
     if(!send_msg("getdata", p, err)) return false;
 
-    // read messages until we get "block"
     for(;;){
         std::string cmd; uint32_t len=0, csum=0;
         if(!read_msg_header(cmd, len, csum, err)) return false;
@@ -303,33 +277,27 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
             raw_block = std::move(payload);
             return true;
         }
-        // ignore other messages (inv, ping, etc.)
     }
 }
 
 // ---- internals: version/verack and IO ----------------------------------------
 bool P2PLight::send_version(std::string& err){
-    // Build "version" payload (Bitcoin-like)
     std::vector<uint8_t> p;
 
     const int32_t  version   = 70015;
     const uint64_t services  = 0;
     const int64_t  timestamp = (int64_t) (std::chrono::system_clock::now().time_since_epoch() / std::chrono::seconds(1));
 
-    // remote addr (ignored by most)
     const uint64_t srv_recv = 0;
     uint8_t ip_zero[16]{}; // ::0
-    const uint16_t port_recv = 9833;
+    const uint16_t port_recv = miq::P2P_PORT; // <<< use constants.h
 
-    // local addr
     const uint64_t srv_from = 0;
     const uint16_t port_from = 0;
 
-    // random nonce
     std::mt19937_64 rng{std::random_device{}()};
     uint64_t nonce = rng();
 
-    // version
     put_u32_le(p, (uint32_t)version);
     put_u64_le(p, services);
     put_i64_le(p, timestamp);
@@ -357,7 +325,6 @@ bool P2PLight::send_version(std::string& err){
 }
 
 bool P2PLight::read_until_verack(std::string& err){
-    // Read a few messages, stop when we see verack.
     for (int i=0;i<50;i++){
         std::string cmd; uint32_t len=0, csum=0;
         if(!read_msg_header(cmd, len, csum, err)) return false;
@@ -366,7 +333,6 @@ bool P2PLight::read_until_verack(std::string& err){
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
 
         if(cmd=="verack") return true;
-        // ignore other msgs in handshake window
     }
     err = "no verack from peer";
     return false;
@@ -376,18 +342,17 @@ bool P2PLight::send_msg(const char cmd12[12], const std::vector<uint8_t>& payloa
     if (sock_ < 0) { err = "not connected"; return false; }
 
     uint8_t header[24]{};
-    // magic
-    uint32_t m = MIQ_P2P_MAGIC;
-    header[0]=uint8_t(m); header[1]=uint8_t(m>>8); header[2]=uint8_t(m>>16); header[3]=uint8_t(m>>24);
+    // magic: canonical wire bytes from constants.h
+    header[0]=miq::MAGIC_BE[0];
+    header[1]=miq::MAGIC_BE[1];
+    header[2]=miq::MAGIC_BE[2];
+    header[3]=miq::MAGIC_BE[3];
 
-    // command (null-padded to 12)
     for (int i=0;i<12 && cmd12[i]; ++i) header[4+i] = (uint8_t)cmd12[i];
 
-    // length
     uint32_t L = (uint32_t)payload.size();
     header[16]=uint8_t(L); header[17]=uint8_t(L>>8); header[18]=uint8_t(L>>16); header[19]=uint8_t(L>>24);
 
-    // checksum
     uint32_t c = checksum4(payload);
     header[20]=uint8_t(c); header[21]=uint8_t(c>>8); header[22]=uint8_t(c>>16); header[23]=uint8_t(c>>24);
 
@@ -400,8 +365,10 @@ bool P2PLight::read_msg_header(std::string& cmd_out, uint32_t& len_out, uint32_t
     uint8_t h[24];
     if(!read_exact(h, 24, err)) return false;
 
-    uint32_t m = (uint32_t)h[0] | ((uint32_t)h[1]<<8) | ((uint32_t)h[2]<<16) | ((uint32_t)h[3]<<24);
-    if(m != MIQ_P2P_MAGIC){ err = "bad magic"; return false; }
+    if(h[0]!=miq::MAGIC_BE[0] || h[1]!=miq::MAGIC_BE[1] || h[2]!=miq::MAGIC_BE[2] || h[3]!=miq::MAGIC_BE[3]){
+        err = "bad magic";
+        return false;
+    }
 
     char cmd[13]; std::memset(cmd, 0, sizeof(cmd));
     std::memcpy(cmd, h+4, 12);
@@ -432,7 +399,7 @@ bool P2PLight::write_all(const void* buf, size_t len, std::string& err){
     size_t sent = 0;
     while (sent < len){
 #ifdef _WIN32
-        int n = send(sock_, (const char*)p + (int)sent, (int)(len - sent), 0);
+        int n = send(sock_, (const char*)p + (int)sent, (int)(len - (int)sent), 0);
 #else
         ssize_t n = send(sock_, p + sent, len - sent, 0);
 #endif
