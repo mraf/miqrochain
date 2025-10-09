@@ -14,6 +14,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 find_package(PkgConfig QUIET)
+find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED)
 
 # ---------------- Options ----------------
 option(MIQ_ENABLE_WALLET_ENC "Enable wallet at-rest encryption" OFF)
@@ -38,11 +40,7 @@ else()
   add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 endif()
 
-# ---------------- Deps ----------------
-find_package(OpenSSL REQUIRED)
-find_package(Threads REQUIRED)
-
-# ---- DB (LevelDB default) ----
+# ---------------- DB (LevelDB default) ----------------
 set(MIQ_DB_TARGET "")
 set(MIQ_DB_DEFINE "")
 
@@ -78,7 +76,7 @@ else()
   set(MIQ_DB_DEFINE MIQ_USE_LEVELDB=1)
 endif()
 
-# ---- libsecp256k1 ----
+# ---------------- libsecp256k1 ----------------
 set(MIQ_LIBSECP_TARGET "")
 if(MIQ_USE_LIBSECP)
   find_package(secp256k1 CONFIG QUIET)
@@ -112,9 +110,9 @@ if(MIQ_USE_LIBSECP)
   add_compile_definitions(MIQ_USE_LIBSECP256K1=1)
 endif()
 
-# ---------------- Core sources (shared) ----------------
-# IMPORTANT: nat.cpp is NOT in the shared list so each target can compile it
-# with different defines (UPnP only for the daemon).
+# ---------------- Core sources (shared, NO nat/tls here) ----------------
+# nat.cpp is per-target (daemon UPnP vs wallet stub)
+# tls_proxy.* is daemon-only (kept out of the core to avoid SSL deps in the wallet)
 set(MIQ_CORE_SOURCES_NO_NAT
     src/hd_wallet.cpp
     src/hd_wallet.h
@@ -162,13 +160,11 @@ set(MIQ_CORE_SOURCES_NO_NAT
     src/seeds.cpp
     src/mtp.h
     src/mtp.cpp
-    src/tls_proxy.h src/tls_proxy.cpp
     src/ibd_monitor.h src/ibd_monitor.cpp
     src/wallet_encryptor.cpp
     src/crypto/secure_random.cpp
 )
 
-# Build a static library for the core so every exe gets all symbols resolved.
 add_library(miqcore STATIC ${MIQ_CORE_SOURCES_NO_NAT})
 target_include_directories(miqcore PUBLIC src ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(miqcore PUBLIC ${MIQ_DB_TARGET} OpenSSL::Crypto Threads::Threads)
@@ -236,8 +232,12 @@ else()
 endif()
 
 # ---------------- Daemon ----------------
-add_executable(miqrod src/main.cpp src/nat.cpp)  # nat.cpp compiled per-target
-target_link_libraries(miqrod PRIVATE miqcore OpenSSL::SSL)  # SSL used by tls_proxy in core
+add_executable(miqrod
+  src/main.cpp
+  src/nat.cpp
+  src/tls_proxy.h src/tls_proxy.cpp   # TLS is daemon-only
+)
+target_link_libraries(miqrod PRIVATE miqcore OpenSSL::SSL)
 if(_HAVE_MINIUPNPC)
   target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_UPNP=1)
   if(_MINIUPNPC_INC)
@@ -246,9 +246,10 @@ if(_HAVE_MINIUPNPC)
   if(_MINIUPNPC_LIBS)
     target_link_libraries(miqrod PRIVATE ${_MINIUPNPC_LIBS})
   endif()
-  if(WIN32)
-    target_link_libraries(miqrod PRIVATE iphlpapi ws2_32)
-  endif()
+endif()
+if(WIN32)
+  target_link_libraries(miqrod PRIVATE ws2_32 iphlpapi bcrypt)
+  target_compile_definitions(miqrod PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
 
 # ---------------- Wallet CLI ----------------
@@ -269,10 +270,10 @@ add_executable(miqwallet
   ${MIQ_P2P_LIGHT_SRC}
 )
 target_include_directories(miqwallet PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
-# Link against the full core so all HdWallet/Chain/AddrMan/etc resolve
-target_link_libraries(miqwallet PRIVATE miqcore OpenSSL::SSL)  # SSL needed because tls_proxy.cpp is in core
+target_link_libraries(miqwallet PRIVATE miqcore)   # no OpenSSL::SSL here
 if(WIN32)
-  target_link_libraries(miqwallet PRIVATE ws2_32)
+  target_link_libraries(miqwallet PRIVATE ws2_32 bcrypt)
+  target_compile_definitions(miqwallet PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
 set_target_properties(miqwallet PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
 
@@ -289,7 +290,7 @@ add_executable(miq-keygen
     src/crypto/ecdsa_libsecp256k1.cpp
 )
 target_include_directories(miq-keygen PRIVATE src)
-target_link_libraries(miq-keygen PRIVATE miqcore) # reuse core crypto/glue
+target_link_libraries(miq-keygen PRIVATE miqcore)
 if(WIN32)
   target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
