@@ -608,10 +608,13 @@ static bool is_self_endpoint(int fd, uint16_t listen_port){
     if (peer.ss_family == AF_INET && local.ss_family == AF_INET) {
         auto* p = (sockaddr_in*)&peer;
         auto* l = (sockaddr_in*)&local;
-        // If the peer IP is one of ours (incl. loopback) and local listens on listen_port,
-        // treat as self-connection. This will NOT block a local wallet (peer port != listen_port).
-        bool peer_is_self = is_self_be(p->sin_addr.s_addr) || ((ntohl(p->sin_addr.s_addr) >> 24) == 127);
-        if (peer_is_self && ntohs(l->sin_port) == listen_port) return true;
+
+        // --- ALLOW localhost wallet connections ---
+        uint32_t peer_be = p->sin_addr.s_addr;
+        if ((ntohl(peer_be) >> 24) == 127) return false;
+
+        // --- Block only true hairpin to our own non-loopback IPs ---
+        if (is_self_be(peer_be) && ntohs(l->sin_port) == listen_port) return true;
     }
     return false;
 }
