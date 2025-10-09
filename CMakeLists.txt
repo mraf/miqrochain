@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
+# Keep FetchContent current behavior
 if(POLICY CMP0169)
   cmake_policy(SET CMP0169 OLD)
 endif()
@@ -16,14 +17,14 @@ find_package(PkgConfig QUIET)
 
 # ---------------- Options ----------------
 option(MIQ_ENABLE_WALLET_ENC "Enable wallet at-rest encryption" OFF)
-option(MIQ_ENABLE_UPNP       "Enable UPnP/NAT-PMP port mapping (daemon only; auto-detect)" ON)
+option(MIQ_ENABLE_UPNP       "Enable UPnP/NAT-PMP (daemon only; auto-detect)" ON)
 option(MIQ_FETCH_MINIUPNPC   "Auto-fetch miniupnpc if not found (needs network)" OFF)
 option(MIQ_BUILD_TESTS       "Build tests" OFF)
 
 option(MIQ_USE_ROCKSDB       "Use RocksDB instead of LevelDB"               OFF)
 option(MIQ_FETCH_LEVELDB     "Auto-fetch LevelDB if missing"                ON)
 
-option(MIQ_USE_LIBSECP       "Use bitcoin-core/libsecp256k1 backend"        ON)
+option(MIQ_USE_LIBSECP "Use bitcoin-core/libsecp256k1 backend" ON)
 set(MIQ_LIBSECP_TAG "master" CACHE STRING "bitcoin-core/secp256k1 tag/commit")
 
 # ---------------- Warnings / Opt ----------------
@@ -48,7 +49,7 @@ set(MIQ_DB_DEFINE "")
 if(MIQ_USE_ROCKSDB)
   find_package(rocksdb QUIET)
   if(NOT rocksdb_FOUND)
-    message(FATAL_ERROR "MIQ_USE_ROCKSDB=ON but RocksDB not found")
+    message(FATAL_ERROR "MIQ_USE_ROCKSDB=ON but RocksDB not found.")
   endif()
   set(MIQ_DB_TARGET RocksDB::rocksdb)
   set(MIQ_DB_DEFINE MIQ_USE_ROCKSDB=1)
@@ -105,14 +106,16 @@ if(MIQ_USE_LIBSECP)
     elseif(TARGET secp256k1)
       set(MIQ_LIBSECP_TARGET secp256k1)
     else()
-      message(FATAL_ERROR "Fetched secp256k1 but no target named secp256k1")
+      message(FATAL_ERROR "Fetched secp256k1 but no target named 'secp256k1'")
     endif()
   endif()
   add_compile_definitions(MIQ_USE_LIBSECP256K1=1)
 endif()
 
 # ---------------- Core sources (shared) ----------------
-set(MIQ_CORE_SOURCES
+# IMPORTANT: nat.cpp is NOT in the shared list so each target can compile it
+# with different defines (UPnP only for the daemon).
+set(MIQ_CORE_SOURCES_NO_NAT
     src/hd_wallet.cpp
     src/hd_wallet.h
     src/bip39_words_en.h
@@ -156,7 +159,6 @@ set(MIQ_CORE_SOURCES
     src/crypto/ecdsa_libsecp256k1.cpp
     src/reorg_manager.h
     src/reorg_manager.cpp
-    src/nat.cpp
     src/seeds.cpp
     src/mtp.h
     src/mtp.cpp
@@ -165,6 +167,20 @@ set(MIQ_CORE_SOURCES
     src/wallet_encryptor.cpp
     src/crypto/secure_random.cpp
 )
+
+# Build a static library for the core so every exe gets all symbols resolved.
+add_library(miqcore STATIC ${MIQ_CORE_SOURCES_NO_NAT})
+target_include_directories(miqcore PUBLIC src ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(miqcore PUBLIC ${MIQ_DB_TARGET} OpenSSL::Crypto Threads::Threads)
+if(MIQ_DB_DEFINE)
+  target_compile_definitions(miqcore PUBLIC ${MIQ_DB_DEFINE})
+endif()
+if(MIQ_USE_LIBSECP)
+  target_link_libraries(miqcore PUBLIC ${MIQ_LIBSECP_TARGET})
+endif()
+if(WIN32)
+  target_link_libraries(miqcore PUBLIC Ws2_32)
+endif()
 
 # ---------------- miniupnpc (daemon only) ----------------
 set(_HAVE_MINIUPNPC OFF)
@@ -211,65 +227,50 @@ if(MIQ_ENABLE_UPNP)
     endif()
   endif()
   if(_HAVE_MINIUPNPC)
-    message(STATUS "UPnP enabled (daemon): miniupnpc detected")
+    message(STATUS "UPnP enabled for daemon (miniupnpc detected)")
   else()
     message(WARNING "UPnP requested but miniupnpc not available; daemon will build WITHOUT UPnP.")
   endif()
 else()
-  message(STATUS "UPnP disabled (daemon).")
+  message(STATUS "UPnP disabled for daemon.")
 endif()
 
 # ---------------- Daemon ----------------
-add_executable(miqrod src/main.cpp ${MIQ_CORE_SOURCES})
-target_include_directories(miqrod PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(miqrod PRIVATE ${MIQ_DB_TARGET})
-if(MIQ_DB_DEFINE)
-  target_compile_definitions(miqrod PRIVATE ${MIQ_DB_DEFINE})
-endif()
-
+add_executable(miqrod src/main.cpp src/nat.cpp)  # nat.cpp compiled per-target
+target_link_libraries(miqrod PRIVATE miqcore OpenSSL::SSL)  # SSL used by tls_proxy in core
 if(_HAVE_MINIUPNPC)
   target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_UPNP=1)
   if(_MINIUPNPC_INC)
     target_include_directories(miqrod PRIVATE ${_MINIUPNPC_INC})
   endif()
   if(_MINIUPNPC_LIBS)
-    target_link_libraries(miqrod PRIVATE ${(_MINIUPNPC_LIBS)})
+    target_link_libraries(miqrod PRIVATE ${_MINIUPNPC_LIBS})
   endif()
   if(WIN32)
     target_link_libraries(miqrod PRIVATE iphlpapi ws2_32)
   endif()
 endif()
 
-if(WIN32)
-  target_link_libraries(miqrod PRIVATE Ws2_32)
-endif()
-
-target_link_libraries(miqrod PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
-if(MIQ_USE_LIBSECP)
-  target_link_libraries(miqrod PRIVATE ${MIQ_LIBSECP_TARGET})
-endif()
-
-if(MIQ_ENABLE_WALLET_ENC)
-  target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_WALLET_ENC=1)
-  message(STATUS "Wallet encryption: ENABLED (OpenSSL)")
-else()
-  message(STATUS "Wallet encryption: DISABLED (default)")
-endif()
-
 # ---------------- Wallet CLI ----------------
-# Build wallet against core sources so P2PLight & friends resolve cleanly.
+# Pull in P2P-light implementation if present (any of the common locations).
+set(MIQ_P2P_LIGHT_SRC "")
+foreach(cand IN ITEMS
+        src/p2p_light.cpp
+        src/wallet/p2p_light.cpp
+        src/light/p2p_light.cpp)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${cand}")
+    list(APPEND MIQ_P2P_LIGHT_SRC "${cand}")
+  endif()
+endforeach()
+
 add_executable(miqwallet
   src/cli/miqwallet.cpp
-  ${MIQ_CORE_SOURCES}           # reuse core (no main.cpp)
+  src/nat.cpp              # compile without MIQ_ENABLE_UPNP for wallet (stub path)
+  ${MIQ_P2P_LIGHT_SRC}
 )
 target_include_directories(miqwallet PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(miqwallet PRIVATE OpenSSL::Crypto Threads::Threads ${MIQ_DB_TARGET})
-if(MIQ_DB_DEFINE)
-  target_compile_definitions(miqwallet PRIVATE ${MIQ_DB_DEFINE})
-endif()
-if(MIQ_USE_LIBSECP)
-  target_link_libraries(miqwallet PRIVATE ${MIQ_LIBSECP_TARGET})
-endif()
+# Link against the full core so all HdWallet/Chain/AddrMan/etc resolve
+target_link_libraries(miqwallet PRIVATE miqcore OpenSSL::SSL)  # SSL needed because tls_proxy.cpp is in core
 if(WIN32)
   target_link_libraries(miqwallet PRIVATE ws2_32)
 endif()
@@ -288,9 +289,7 @@ add_executable(miq-keygen
     src/crypto/ecdsa_libsecp256k1.cpp
 )
 target_include_directories(miq-keygen PRIVATE src)
-if(MIQ_USE_LIBSECP)
-  target_link_libraries(miq-keygen PRIVATE ${MIQ_LIBSECP_TARGET})
-endif()
+target_link_libraries(miq-keygen PRIVATE miqcore) # reuse core crypto/glue
 if(WIN32)
   target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
@@ -310,9 +309,7 @@ if(MIQ_BUILD_TESTS)
       src/crypto/ecdsa_libsecp256k1.cpp
   )
   target_include_directories(test_crypto PRIVATE src)
-  if(MIQ_USE_LIBSECP)
-    target_link_libraries(test_crypto PRIVATE ${MIQ_LIBSECP_TARGET})
-  endif()
+  target_link_libraries(test_crypto PRIVATE miqcore)
   if(WIN32)
     target_link_libraries(test_crypto PRIVATE Ws2_32)
   endif()
@@ -325,5 +322,14 @@ if(MIQ_BUILD_TESTS)
       src/sha256.h src/sha256.cpp
   )
   target_include_directories(test_ser PRIVATE src)
+  target_link_libraries(test_ser PRIVATE miqcore)
   add_test(NAME test_ser COMMAND test_ser)
+endif()
+
+# ---------------- Wallet encryption flag note ----------------
+if(MIQ_ENABLE_WALLET_ENC)
+  target_compile_definitions(miqcore PUBLIC MIQ_ENABLE_WALLET_ENC=1)
+  message(STATUS "Wallet encryption: ENABLED (OpenSSL)")
+else()
+  message(STATUS "Wallet encryption: DISABLED (default)")
 endif()
