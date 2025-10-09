@@ -21,6 +21,8 @@
 #include <random>
 #include <cmath>
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "constants.h"
 #include "hd_wallet.h"
@@ -31,6 +33,7 @@
 #include "hex.h"
 #include "serialize.h"
 #include "tx.h"
+#include "block.h"
 #include "crypto/ecdsa_iface.h"
 #include "wallet/p2p_light.h"
 
@@ -93,8 +96,8 @@ struct UtxoLite {
 };
 
 // SPV: collect UTXOs for a set of PKHs using only P2P.
-// Requires these P2PLight methods: get_best_header, has_compact_filters,
-// scan_blocks_with_filters, match_recent_blocks, get_block_by_hash.
+// Requires P2PLight: get_best_header, has_compact_filters (stubbed false),
+// scan_blocks_with_filters (stubbed false), match_recent_blocks, get_block_by_hash.
 static bool spv_collect_utxos(
     const std::string& host, const std::string& port,
     const std::vector<std::vector<uint8_t>>& pkhs,
@@ -122,7 +125,6 @@ static bool spv_collect_utxos(
     }
 
     // 3) walk matched blocks: add our outputs / remove spent ones
-    // View indexed by outpoint
     auto key_of = [](const std::vector<uint8_t>& txid, uint32_t vout){
         std::string k; k.reserve(36);
         k.assign((const char*)txid.data(), txid.size());
@@ -133,11 +135,9 @@ static bool spv_collect_utxos(
     std::vector<UtxoLite> view;
     std::unordered_map<std::string,size_t> idx;
 
-    // fast lookup for PKHs
     struct VecHash {
         size_t operator()(const std::vector<uint8_t>& v) const noexcept {
-            // simple FNV-1a
-            size_t h = 1469598103934665603ull;
+            size_t h = 1469598103934665603ull; // FNV-1a
             for(uint8_t b: v){ h ^= b; h *= 1099511628211ull; }
             return h;
         }
@@ -166,12 +166,16 @@ static bool spv_collect_utxos(
                 }
             }
         }
-        // add our outputs
+        // add our outputs (respect coinbase maturity)
         for(const auto& tx : b.vtx){
             bool is_cb = tx.is_coinbase();
             for(uint32_t i=0;i<(uint32_t)tx.vout.size();++i){
                 const auto& o = tx.vout[i];
                 if(pkhset.find(o.pkh)!=pkhset.end()){
+                    if(is_cb){
+                        uint32_t conf = (tip_height >= h) ? (tip_height - h + 1) : 0;
+                        if(conf < miq::COINBASE_MATURITY) continue; // skip immature coinbase
+                    }
                     UtxoLite u; u.txid = tx.txid(); u.vout=i; u.value=o.value; u.pkh=o.pkh; u.height=h; u.coinbase=is_cb;
                     idx[key_of(u.txid, u.vout)] = (uint32_t)view.size();
                     view.push_back(std::move(u));
@@ -286,7 +290,7 @@ static bool flow_send_p2p_only(const std::string& p2p_host, const std::string& p
         return false;
     }
 
-    // Build transaction: prefer coinbase (common for mined payouts)
+    // Build transaction: prefer coinbase (common for mined payouts, but only mature ones were kept)
     miq::Transaction tx;
     uint64_t in_sum=0;
     std::stable_sort(utxos.begin(), utxos.end(), [](const UtxoLite& a, const UtxoLite& b){
@@ -326,7 +330,11 @@ static bool flow_send_p2p_only(const std::string& p2p_host, const std::string& p
     }
 
     // sign each input
-    auto sighash = [&](){ miq::Transaction t=tx; for(auto& i: t.vin){ i.sig.clear(); i.pubkey.clear(); } return miq::dsha256(miq::ser_tx(t)); }();
+    auto sighash = [&](){
+        miq::Transaction t=tx;
+        for(auto& i: t.vin){ i.sig.clear(); i.pubkey.clear(); }
+        return miq::dsha256(miq::ser_tx(t));
+    }();
     auto find_key_for_pkh = [&](const std::vector<uint8_t>& pkh)->const Key*{
         for(const auto& k: keys) if(k.pkh==pkh) return &k;
         return nullptr;
