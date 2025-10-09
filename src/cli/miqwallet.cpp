@@ -1,9 +1,7 @@
 // src/cli/miqwallet.cpp
 // Menu-driven MIQ wallet CLI (create/recover/send + live confirmations).
-// Works with a remote miqrod via static token or cookie. Portable defaults:
-//   - CLI flags: --host --port --token --cookiepath
-//   - Env: MIQ_RPC_HOST / MIQ_RPC_PORT / MIQ_RPC_TOKEN
-//   - Built-ins: MIQ_DEFAULT_RPC_HOST / MIQ_DEFAULT_RPC_PORT / MIQ_DEFAULT_RPC_TOKEN
+// Portable remote mode: --host/--port/--token/--cookiepath OR env overrides.
+// Falls back to a compiled-in static token so it "just works" remotely.
 
 #include <iostream>
 #include <iomanip>
@@ -32,7 +30,21 @@
 
 #include "constants.h"  // miq::RPC_PORT, miq::CHAIN_NAME, miq::COIN
 
-// ---------- tiny helpers ----------
+// ---- default host/port/token (compile-time) ----
+#ifndef MIQ_DEFAULT_RPC_HOST
+#define MIQ_DEFAULT_RPC_HOST "127.0.0.1"
+#endif
+#ifndef MIQ_DEFAULT_RPC_PORT
+#define MIQ_DEFAULT_RPC_PORT "9834"
+#endif
+#ifndef MIQ_STATIC_RPC_TOKEN_STR
+#define MIQ_STATIC_RPC_TOKEN_STR "miq_static_token_change_me" // MUST match server default
+#endif
+#ifndef MIQ_DEFAULT_RPC_TOKEN
+#define MIQ_DEFAULT_RPC_TOKEN MIQ_STATIC_RPC_TOKEN_STR
+#endif
+
+// ---------- helpers ----------
 static std::string trim(const std::string& s) {
     size_t a = 0, b = s.size();
     while (a < b && std::isspace((unsigned char)s[a])) ++a;
@@ -44,7 +56,6 @@ static bool read_cookie_token_file(const std::string& fullpath, std::string& out
     std::ifstream f(fullpath, std::ios::in | std::ios::binary);
     if (!f.good()) return false;
     std::string line; std::getline(f, line);
-    // trim
     while (!line.empty() && (line.back()=='\r'||line.back()=='\n'||line.back()==' '||line.back()=='\t')) line.pop_back();
     out_tok = line;
     return !out_tok.empty();
@@ -82,7 +93,6 @@ static std::string json_escape(const std::string& s) {
     return o.str();
 }
 
-// extremely small JSON field pickers (good enough for the shapes we use)
 static bool json_get_string_field(const std::string& json, const std::string& key, std::string& out) {
     std::string pattern = "\"" + key + "\"";
     auto p = json.find(pattern);
@@ -136,7 +146,7 @@ static bool json_is_string_value(const std::string& body, std::string& out) {
     return false;
 }
 
-// ---------- very small HTTP POST ----------
+// ---------- raw HTTP ----------
 static bool http_post(const std::string& host, const std::string& port,
                       const std::string& path, const std::string& token,
                       const std::string& body, std::string& out_body, std::string* out_status=nullptr)
@@ -210,7 +220,6 @@ static bool http_post(const std::string& host, const std::string& port,
     close(fd);
 #endif
 
-    // split headers/body
     auto p = resp.find("\r\n\r\n");
     if (p == std::string::npos) return false;
     std::string headers = resp.substr(0, p);
@@ -238,7 +247,7 @@ static std::string rpc_call(const std::string& method, const std::vector<std::st
         b << ",\"params\":[";
         for (size_t i=0;i<params_json.size();++i) {
             if (i) b << ',';
-            b << params_json[i]; // already JSON-escaped by caller if string
+            b << params_json[i];
         }
         b << "]";
     }
@@ -255,22 +264,16 @@ struct Opts {
     std::string host;
     std::string port;
     std::string token;
-    std::string cookiepath; // explicit cookie path on local machine
+    std::string cookiepath;
 };
 
 static Opts parse_opts(int argc, char** argv){
     Opts o;
 
-    // defaults (compile-time)
-#ifdef MIQ_DEFAULT_RPC_HOST
+    // compile-time defaults
     o.host = MIQ_DEFAULT_RPC_HOST;
-#endif
-#ifdef MIQ_DEFAULT_RPC_PORT
     o.port = MIQ_DEFAULT_RPC_PORT;
-#endif
-#ifdef MIQ_DEFAULT_RPC_TOKEN
-    o.token = MIQ_DEFAULT_RPC_TOKEN;
-#endif
+    // token left empty here; we'll fill later
 
     // env overrides
     if (const char* e=getenv("MIQ_RPC_HOST"))  o.host = e;
@@ -290,12 +293,23 @@ static Opts parse_opts(int argc, char** argv){
         else if (a=="--cookiepath") getv(o.cookiepath);
     }
 
-    if (o.host.empty()) o.host = "127.0.0.1";
-    if (o.port.empty()) o.port = std::to_string(miq::RPC_PORT);
+    // resolve token
+    if (o.token.empty()) {
+        if (!o.cookiepath.empty()) {
+            std::string t; if (read_cookie_token_file(o.cookiepath, t)) o.token = t;
+        }
+    }
+    if (o.token.empty()) {
+        std::string t; if (read_cookie_token_default_dir(t)) o.token = t;
+    }
+    if (o.token.empty()) {
+        // final fallback: compiled-in static token
+        o.token = MIQ_DEFAULT_RPC_TOKEN;
+    }
     return o;
 }
 
-// ---------- wallet ops ----------
+// ---------- wallet ops (fully qualifies miq::COIN) ----------
 static bool unlock_if_needed(const std::string& token, const std::string& host, const std::string& port) {
     std::cout << "\nWallet passphrase (leave blank if not encrypted): ";
     std::string pass; std::getline(std::cin, pass);
@@ -343,7 +357,6 @@ static bool op_create_wallet(const std::string& token, const std::string& host, 
     std::cout << "First receive address:\n";
     std::cout << "  " << addr << "\n";
 
-    // Show balance (should be 0 for a new wallet)
     std::string bal = rpc_call("getbalance", {}, token, host, port);
     long long miqron=0; std::string miqPretty;
     json_get_number_field_ll(bal, "miqron", miqron);
@@ -378,7 +391,6 @@ static bool op_recover_wallet(const std::string& token, const std::string& host,
         }
     }
 
-    // Address-scan for balance
     const int SCAN_RECEIVE = 50;
     const int SCAN_CHANGE  = 10;
     unsigned long long total_miqron = 0;
@@ -527,25 +539,11 @@ int main(int argc, char** argv){
 
     Opts o = parse_opts(argc, argv);
 
-    // token resolution order:
-    // 1) --token
-    // 2) MIQ_RPC_TOKEN env
-    // 3) --cookiepath (read .cookie locally at that path)
-    // 4) default cookie location (~/.miqrochain/.cookie or %APPDATA%\miqrochain\.cookie)
-    if (o.token.empty()) {
-        if (!o.cookiepath.empty()) {
-            std::string t; if (read_cookie_token_file(o.cookiepath, t)) o.token = t;
-        }
-    }
-    if (o.token.empty()) {
-        std::string t; if (read_cookie_token_default_dir(t)) o.token = t;
-    }
-
     std::cout << "Target: miqrochain RPC at " << o.host << ":" << o.port << "\n";
     if (!o.token.empty()) {
-        std::cout << "Auth: using provided token (length " << o.token.size() << ")\n";
+        std::cout << "Auth: using token (length " << o.token.size() << ")\n";
     } else {
-        std::cout << "Auth: no token found; unauthenticated RPC will fail unless node allows it.\n";
+        std::cout << "Auth: <empty> (server must be unauthenticated)\n";
     }
 
     for (;;) {
