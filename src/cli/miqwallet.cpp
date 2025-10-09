@@ -33,7 +33,6 @@
 #include "hex.h"
 #include "serialize.h"
 #include "tx.h"
-#include "block.h"
 #include "crypto/ecdsa_iface.h"
 #include "wallet/p2p_light.h"
 
@@ -68,6 +67,26 @@ static uint64_t fee_for(size_t nin, size_t nout, uint64_t feerate){
     return kb * feerate;
 }
 
+// ---- byte helpers ------------------------------------------------------------
+static inline uint32_t rd_u32_le(const uint8_t* p){
+    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+}
+static inline uint64_t rd_u64_le(const uint8_t* p){
+    uint64_t v=0; for(int i=0;i<8;i++) v |= (uint64_t)p[i] << (8*i); return v;
+}
+static std::vector<uint8_t> to_le32(const std::vector<uint8_t>& h){
+    std::vector<uint8_t> r = h; std::reverse(r.begin(), r.end()); return r;
+}
+static bool get_varint(const uint8_t* p, size_t n, uint64_t& v, size_t& used){
+    if(n==0) return false;
+    uint8_t x = p[0]; used = 1;
+    if(x < 0xFD){ v = x; return true; }
+    if(x == 0xFD){ if(n<3) return false; v = (uint64_t)p[1] | ((uint64_t)p[2]<<8); used = 3; return true; }
+    if(x == 0xFE){ if(n<5) return false; v = (uint64_t)p[1] | ((uint64_t)p[2]<<8) | ((uint64_t)p[3]<<16) | ((uint64_t)p[4]<<24); used = 5; return true; }
+    if(x == 0xFF){ if(n<9) return false; uint64_t r=0; for(int i=0;i<8;i++) r |= ((uint64_t)p[1+i]<<(8*i)); v=r; used=9; return true; }
+    return false;
+}
+
 // -----------------------------------------------------------------------------
 // P2P helpers (broadcast + simple SPV UTXO discovery)
 // -----------------------------------------------------------------------------
@@ -75,19 +94,19 @@ static bool p2p_broadcast_tx(const std::string& seed_host, const std::string& se
                              const std::vector<uint8_t>& raw_tx,
                              std::string& err)
 {
-    miq::P2POpts o;
-    o.host = seed_host;
-    o.port = seed_port;
-    o.user_agent = "/miqwallet-p2p:0.1/";
+    miq::P2POpts popts;
+    popts.host = seed_host;
+    popts.port = seed_port;
+    popts.user_agent = "/miqwallet-p2p:0.1/";
     miq::P2PLight p2p;
-    if(!p2p.connect_and_handshake(o, err)) return false;
+    if(!p2p.connect_and_handshake(popts, err)) return false;
     bool ok = p2p.send_tx(raw_tx, err);
     p2p.close();
     return ok;
 }
 
 struct UtxoLite {
-    std::vector<uint8_t> txid;   // 32
+    std::vector<uint8_t> txid;   // 32 (LE)
     uint32_t vout;               // index
     uint64_t value;              // in miqron
     std::vector<uint8_t> pkh;    // 20
@@ -95,9 +114,206 @@ struct UtxoLite {
     bool coinbase{false};
 };
 
+// ---- minimal MIQ tx decode (matches your genesis format) ---------------------
+struct InLite { std::vector<uint8_t> prev_txid; uint32_t vout; };
+struct OutLite { uint64_t value; std::vector<uint8_t> pkh; };
+
+static bool parse_miq_tx(const uint8_t* tx, size_t txlen,
+                         bool& is_coinbase,
+                         std::vector<InLite>& vin,
+                         std::vector<OutLite>& vout)
+{
+    vin.clear(); vout.clear(); is_coinbase=false;
+    if(txlen < 4+4+4) return false;
+    size_t p = 0;
+
+    // version
+    (void)rd_u32_le(tx+p); p += 4;
+
+    // inputs
+    if(p+4 > txlen) return false;
+    uint32_t nin = rd_u32_le(tx+p); p+=4;
+    vin.reserve(nin);
+
+    for(uint32_t i=0;i<nin;i++){
+        if(p+4 > txlen) return false;
+        uint32_t len_txid = rd_u32_le(tx+p); p+=4;
+        if(p + len_txid > txlen) return false;
+        std::vector<uint8_t> prev(tx+ p, tx+ p + len_txid); p += len_txid;
+
+        if(p+4 > txlen) return false;
+        uint32_t vout_idx = rd_u32_le(tx+p); p+=4;
+
+        if(p+4 > txlen) return false;
+        uint32_t sig_len = rd_u32_le(tx+p); p+=4;
+        if(p + sig_len > txlen) return false;
+        p += sig_len;
+
+        if(p+4 > txlen) return false;
+        uint32_t pub_len = rd_u32_le(tx+p); p+=4;
+        if(p + pub_len > txlen) return false;
+        p += pub_len;
+
+        vin.push_back({std::move(prev), vout_idx});
+    }
+
+    // outputs
+    if(p+4 > txlen) return false;
+    uint32_t nout = rd_u32_le(tx+p); p+=4;
+    vout.reserve(nout);
+
+    for(uint32_t i=0;i<nout;i++){
+        if(p+8 > txlen) return false;
+        uint64_t value = rd_u64_le(tx+p); p+=8;
+
+        if(p+4 > txlen) return false;
+        uint32_t pkh_len = rd_u32_le(tx+p); p+=4;
+        if(p + pkh_len > txlen) return false;
+        std::vector<uint8_t> pkh(tx+p, tx+p+pkh_len); p += pkh_len;
+
+        vout.push_back({value, std::move(pkh)});
+    }
+
+    // lock_time
+    if(p+4 > txlen) return false;
+    (void)rd_u32_le(tx+p); p+=4;
+
+    // coinbase heuristic: single input, 32 zero prev and vout=0
+    if(!vin.empty()){
+        const auto& in0 = vin[0];
+        bool allz = in0.prev_txid.size()==32 &&
+                    std::all_of(in0.prev_txid.begin(), in0.prev_txid.end(), [](uint8_t b){return b==0;});
+        if(allz && in0.vout==0) is_coinbase = true;
+    }
+
+    return (p == txlen);
+}
+
+// ---- block scan: supports MIQ (u32 count + u32 size) and BTC style -----------
+static bool scan_block_for_wallet(
+    const std::vector<uint8_t>& raw_block,
+    const std::unordered_set<std::vector<uint8_t>, struct HashVec>& pkhset,
+    uint32_t block_height,
+    std::vector<UtxoLite>& view,
+    std::unordered_map<std::string,size_t>& idx,
+    uint32_t tip_height)
+{
+    if(raw_block.size() < 80) return false;
+    size_t pos = 0;
+
+    // skip 80-byte header
+    pos += 80;
+
+    auto key_of = [](const std::vector<uint8_t>& txid, uint32_t vout){
+        std::string k; k.reserve(36);
+        k.assign((const char*)txid.data(), txid.size());
+        k.push_back(char((vout>>0)&0xFF)); k.push_back(char((vout>>8)&0xFF));
+        k.push_back(char((vout>>16)&0xFF)); k.push_back(char((vout>>24)&0xFF));
+        return k;
+    };
+
+    auto handle_tx = [&](const uint8_t* tptr, size_t tlen){
+        // txid = little-endian dsha256(tx_bytes)
+        std::vector<uint8_t> tx_bytes(tptr, tptr+tlen);
+        auto h  = dsha256(tx_bytes);
+        auto hl = to_le32(h);
+
+        bool is_cb=false;
+        std::vector<InLite>  in;
+        std::vector<OutLite> out;
+        if(!parse_miq_tx(tptr, tlen, is_cb, in, out)) return false;
+
+        // remove spends
+        for(const auto& i : in){
+            auto k = key_of(i.prev_txid, i.vout);
+            auto it = idx.find(k);
+            if(it!=idx.end()){
+                size_t p = it->second;
+                size_t last = view.size()-1;
+                if(p!=last){
+                    idx[key_of(view[last].txid, view[last].vout)] = p;
+                    std::swap(view[p], view[last]);
+                }
+                view.pop_back();
+                idx.erase(it);
+            }
+        }
+
+        // add our outputs (respect coinbase maturity)
+        for(uint32_t j=0;j<(uint32_t)out.size();++j){
+            const auto& o = out[j];
+            if(pkhset.find(o.pkh) != pkhset.end()){
+                if(is_cb){
+                    uint32_t conf = (tip_height >= block_height) ? (tip_height - block_height + 1) : 0;
+                    if(conf < miq::COINBASE_MATURITY) continue;
+                }
+                UtxoLite u; u.txid = hl; u.vout=j; u.value=o.value; u.pkh=o.pkh; u.height=block_height; u.coinbase=is_cb;
+                idx[key_of(u.txid, u.vout)] = (uint32_t)view.size();
+                view.push_back(std::move(u));
+            }
+        }
+        return true;
+    };
+
+    // Try MIQ-style: u32 tx_count; for each: u32 tx_size + tx
+    if(pos + 4 <= raw_block.size()){
+        uint32_t tx_count = rd_u32_le(&raw_block[pos]); pos += 4;
+
+        // Heuristic: if the next u32 looks like a sane tx size, assume MIQ-style.
+        if(pos + 4 <= raw_block.size()){
+            uint32_t first_size = rd_u32_le(&raw_block[pos]);
+            if(first_size >= 4 && first_size <= miq::MAX_TX_SIZE){
+                for(uint32_t i=0;i<tx_count;i++){
+                    if(pos + 4 > raw_block.size()) return false;
+                    uint32_t tlen = rd_u32_le(&raw_block[pos]); pos += 4;
+                    if(tlen == 0 || tlen > miq::MAX_TX_SIZE) return false;
+                    if(pos + tlen > raw_block.size()) return false;
+                    if(!handle_tx(&raw_block[pos], tlen)) return false;
+                    pos += tlen;
+                }
+                return true;
+            }
+        }
+        // If that check failed, fall through to varint path below (Bitcoin style).
+        pos -= 4; // rewind count read
+    }
+
+    // Bitcoin-style: varint tx_count; then txs back-to-back (we can parse MIQ txs)
+    uint64_t vcnt=0, used=0;
+    if(!get_varint(&raw_block[pos], raw_block.size()-pos, vcnt, used)) return false;
+    pos += used;
+    for(uint64_t i=0;i<vcnt;i++){
+        // We don't know the tx size up-front; parse_miq_tx will verify and we can
+        // detect the consumed length by binary searching, but we actually know the
+        // exact boundary because our MIQ tx format uses fixed-length fields + sizes.
+        // So we parse once, then walk forward until the end returned by a sentinel.
+        // Easiest: incrementally grow a window until parse succeeds on exactly that size.
+        size_t start = pos;
+        // upper bound clamp
+        size_t max_win = std::min(raw_block.size()-start, (size_t)miq::MAX_TX_SIZE);
+        bool ok=false;
+        for(size_t win=16; win<=max_win; win+=16){
+            bool is_cb=false; std::vector<InLite> in; std::vector<OutLite> out;
+            if(parse_miq_tx(&raw_block[start], win, is_cb, in, out)){
+                ok = handle_tx(&raw_block[start], win);
+                pos = start + win;
+                break;
+            }
+        }
+        if(!ok) return false;
+    }
+    return true;
+}
+
 // SPV: collect UTXOs for a set of PKHs using only P2P.
-// Requires P2PLight: get_best_header, has_compact_filters (stubbed false),
-// scan_blocks_with_filters (stubbed false), match_recent_blocks, get_block_by_hash.
+struct HashVec {
+    size_t operator()(const std::vector<uint8_t>& v) const noexcept {
+        size_t h = 1469598103934665603ull; // FNV-1a
+        for(uint8_t b: v){ h ^= b; h *= 1099511628211ull; }
+        return h;
+    }
+};
+
 static bool spv_collect_utxos(
     const std::string& host, const std::string& port,
     const std::vector<std::vector<uint8_t>>& pkhs,
@@ -108,23 +324,20 @@ static bool spv_collect_utxos(
     out.clear();
 
     // 1) connect + get tip
-    miq::P2POpts o; o.host=host; o.port=port; o.user_agent="/miqwallet-spv:0.1/";
+    miq::P2POpts popts; popts.host=host; popts.port=port; popts.user_agent="/miqwallet-spv:0.1/";
     miq::P2PLight p2p;
-    if(!p2p.connect_and_handshake(o, err)) return false;
+    if(!p2p.connect_and_handshake(popts, err)) return false;
 
     uint32_t tip_height=0; std::vector<uint8_t> tip_hash;
     if(!p2p.get_best_header(tip_height, tip_hash, err)){ p2p.close(); return false; }
 
-    // 2) find blocks that might contain our PKHs
+    // 2) window of recent blocks
+    uint32_t from_h = (tip_height > recent_block_window) ? (tip_height - recent_block_window) : 0;
     std::vector<std::pair<std::vector<uint8_t>, uint32_t>> matched; // (blockhash,height)
-    if(p2p.has_compact_filters()){
-        if(!p2p.scan_blocks_with_filters(pkhs, tip_height, matched, err)){ p2p.close(); return false; }
-    } else {
-        uint32_t from_h = (tip_height > recent_block_window) ? (tip_height - recent_block_window) : 0;
-        if(!p2p.match_recent_blocks(pkhs, from_h, tip_height, matched, err)){ p2p.close(); return false; }
-    }
+    if(!p2p.match_recent_blocks(pkhs, from_h, tip_height, matched, err)){ p2p.close(); return false; }
 
     // 3) walk matched blocks: add our outputs / remove spent ones
+    out.clear();
     auto key_of = [](const std::vector<uint8_t>& txid, uint32_t vout){
         std::string k; k.reserve(36);
         k.assign((const char*)txid.data(), txid.size());
@@ -132,60 +345,24 @@ static bool spv_collect_utxos(
         k.push_back(char((vout>>16)&0xFF)); k.push_back(char((vout>>24)&0xFF));
         return k;
     };
-    std::vector<UtxoLite> view;
     std::unordered_map<std::string,size_t> idx;
+    std::unordered_set<std::vector<uint8_t>, HashVec> pkhset(pkhs.begin(), pkhs.end());
 
-    struct VecHash {
-        size_t operator()(const std::vector<uint8_t>& v) const noexcept {
-            size_t h = 1469598103934665603ull; // FNV-1a
-            for(uint8_t b: v){ h ^= b; h *= 1099511628211ull; }
-            return h;
-        }
-    };
-    std::unordered_set<std::vector<uint8_t>, VecHash> pkhset(pkhs.begin(), pkhs.end());
+    for(const auto& bh_h : matched){
+        const auto& bh = bh_h.first;
+        uint32_t h = bh_h.second;
 
-    for(const auto& [bh, h] : matched){
         std::vector<uint8_t> raw;
         if(!p2p.get_block_by_hash(bh, raw, err)){ p2p.close(); return false; }
-        miq::Block b; if(!miq::Block::deserialize(raw, b)) continue;
 
-        // remove spends
-        for(const auto& tx : b.vtx){
-            for(const auto& in : tx.vin){
-                auto k = key_of(in.prev.txid, in.prev.vout);
-                auto it = idx.find(k);
-                if(it!=idx.end()){
-                    size_t pos = it->second;
-                    size_t last = view.size()-1;
-                    if(pos!=last){
-                        idx[key_of(view[last].txid, view[last].vout)] = pos;
-                        std::swap(view[pos], view[last]);
-                    }
-                    view.pop_back();
-                    idx.erase(it);
-                }
-            }
-        }
-        // add our outputs (respect coinbase maturity)
-        for(const auto& tx : b.vtx){
-            bool is_cb = tx.is_coinbase();
-            for(uint32_t i=0;i<(uint32_t)tx.vout.size();++i){
-                const auto& o = tx.vout[i];
-                if(pkhset.find(o.pkh)!=pkhset.end()){
-                    if(is_cb){
-                        uint32_t conf = (tip_height >= h) ? (tip_height - h + 1) : 0;
-                        if(conf < miq::COINBASE_MATURITY) continue; // skip immature coinbase
-                    }
-                    UtxoLite u; u.txid = tx.txid(); u.vout=i; u.value=o.value; u.pkh=o.pkh; u.height=h; u.coinbase=is_cb;
-                    idx[key_of(u.txid, u.vout)] = (uint32_t)view.size();
-                    view.push_back(std::move(u));
-                }
-            }
+        if(!scan_block_for_wallet(raw, pkhset, h, out, idx, tip_height)){
+            p2p.close();
+            err = "block parse failed";
+            return false;
         }
     }
 
     p2p.close();
-    out = std::move(view);
     return true;
 }
 
@@ -320,7 +497,7 @@ static bool flow_send_p2p_only(const std::string& p2p_host, const std::string& p
             if(change < 1000){ change = 0; fee_final = fee_for(tx.vin.size(), 1, 1000); }
         }
     }
-    miq::TxOut o; o.pkh = payload; o.value = amount; tx.vout.push_back(o);
+    miq::TxOut txout; txout.pkh = payload; txout.value = amount; tx.vout.push_back(txout);
 
     bool used_change=false; std::vector<uint8_t> cpub, cpriv, cpkh;
     if(change>0){
