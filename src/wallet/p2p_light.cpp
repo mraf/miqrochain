@@ -99,6 +99,70 @@ static uint32_t checksum4(const std::vector<uint8_t>& payload){
 P2PLight::P2PLight(){}
 P2PLight::~P2PLight(){ close(); }
 
+// Helper: send either full (Bitcoin-like) or minimal 12-byte version payload.
+static bool send_version_mode(P2PLight* self, bool minimal, std::string& err, const P2POpts& o){
+    if (minimal){
+        std::vector<uint8_t> p;
+        // Minimal 12 bytes: [u32 version | u64 services]
+        put_u32_le(p, 70015);
+        put_u64_le(p, 0);
+        if(!self->send_msg("version", p, err)) return false;
+        if(o.send_verack){
+            std::vector<uint8_t> empty;
+            if(!self->send_msg("verack", empty, err)) return false;
+        }
+        return true;
+    }
+    // Full, Bitcoin-like "version"
+    std::vector<uint8_t> p;
+
+    const int32_t  version   = 70015;
+    const uint64_t services  = 0;
+    const int64_t  timestamp = (int64_t) (std::chrono::system_clock::now().time_since_epoch() / std::chrono::seconds(1));
+
+    const uint64_t srv_recv = 0;
+    uint8_t ip_zero[16]{}; // ::0
+    const uint16_t port_recv = P2P_PORT;
+
+    const uint64_t srv_from = 0;
+    const uint16_t port_from = 0;
+
+    std::mt19937_64 rng{std::random_device{}()};
+    uint64_t nonce = rng();
+
+    put_u32_le(p, (uint32_t)version);
+    put_u64_le(p, services);
+    put_i64_le(p, timestamp);
+
+    put_u64_le(p, srv_recv);
+    p.insert(p.end(), ip_zero, ip_zero+16);
+    put_u16_be(p, port_recv);
+
+    put_u64_le(p, srv_from);
+    p.insert(p.end(), ip_zero, ip_zero+16);
+    put_u16_be(p, port_from);
+
+    put_u64_le(p, nonce);
+
+    // user agent (varstr)
+    {
+        std::string ua = o.user_agent.empty() ? "/miqwallet:0.1/" : o.user_agent;
+        if (ua.size() < 0xFD) { p.push_back((uint8_t)ua.size()); }
+        else { put_varint(p, ua.size()); }
+        p.insert(p.end(), ua.begin(), ua.end());
+    }
+    put_u32_le(p, o.start_height);
+    p.push_back(1); // relay = true
+
+    if(!self->send_msg("version", p, err)) return false;
+
+    if(o.send_verack){
+        std::vector<uint8_t> empty;
+        if(!self->send_msg("verack", empty, err)) return false;
+    }
+    return true;
+}
+
 bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     o_ = opts;
 
@@ -106,32 +170,64 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
 
-    addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
-    addrinfo* res=nullptr;
-    if (getaddrinfo(o_.host.c_str(), o_.port.c_str(), &hints, &res) != 0) {
-        err = "getaddrinfo failed";
-        return false;
+    auto dial = [&](std::string& e)->bool{
+        addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
+        addrinfo* res=nullptr;
+        if (getaddrinfo(o_.host.c_str(), o_.port.c_str(), &hints, &res) != 0) { e = "getaddrinfo failed"; return false; }
+        int fd = -1;
+        for (auto rp = res; rp; rp = rp->ai_next) {
+            fd = (int)socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+            if (fd < 0) continue;
+            set_timeouts(fd, o_.io_timeout_ms);
+            if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) break;
+            closesock(fd); fd = -1;
+        }
+        freeaddrinfo(res);
+        if (fd < 0) { e = "connect failed"; return false; }
+        sock_ = fd;
+        return true;
+    };
+
+    auto close_if_open = [&]{ if (sock_>=0) { closesock(sock_); sock_ = -1; } };
+
+    // Attempt matrix to survive strict daemons:
+    // 1) new framing + full version
+    // 2) legacy framing + full version
+    // 3) legacy framing + minimal version (12 bytes)
+    // 4) new framing + minimal version
+    struct Attempt { bool prefer_new; bool minimal_ver; };
+    Attempt plan[4] = {
+        { true,  false },
+        { false, false },
+        { false, true  },
+        { true,  true  }
+    };
+
+    std::string last_err;
+    for (auto a : plan) {
+        o_.prefer_new_frame = a.prefer_new;
+
+        std::string e1;
+        if (!dial(e1)) { last_err = e1; continue; }
+
+        std::string e2;
+        if (!send_version_mode(this, a.minimal_ver, e2, o_)) { last_err = e2; close_if_open(); continue; }
+
+        std::string e3;
+        if (!read_until_verack(e3)) { last_err = e3; close_if_open(); continue; }
+
+        // optional: best-effort getaddr
+        std::string e4; (void)send_getaddr(e4);
+
+        header_hashes_le_.clear();
+        return true; // success
     }
-    int fd = -1;
-    for (auto rp = res; rp; rp = rp->ai_next) {
-        fd = (int)socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd < 0) continue;
-        set_timeouts(fd, o_.io_timeout_ms);
-        if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) break;
-        closesock(fd); fd = -1;
-    }
-    freeaddrinfo(res);
-    if (fd < 0) { err = "connect failed"; return false; }
-    sock_ = fd;
 
-    if(!send_version(err)) { close(); return false; }
-    if(!read_until_verack(err)) { close(); return false; }
-
-    std::string e2;
-    (void)send_getaddr(e2); // best-effort
-
-    header_hashes_le_.clear();
-    return true;
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    err = last_err.empty() ? "handshake failed (all modes)" : last_err;
+    return false;
 }
 
 bool P2PLight::send_tx(const std::vector<uint8_t>& tx_bytes, std::string& err){
@@ -339,60 +435,8 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
 
 // ---- internals: version/verack and IO ----------------------------------------
 bool P2PLight::send_version(std::string& err){
-    // Build Bitcoin-like "version" payload; daemon is permissive and ignores extras.
-    std::vector<uint8_t> p;
-
-    const int32_t  version   = 70015;
-    const uint64_t services  = 0;
-    const int64_t  timestamp = (int64_t) (std::chrono::system_clock::now().time_since_epoch() / std::chrono::seconds(1));
-
-    // remote addr (ignored by most)
-    const uint64_t srv_recv = 0;
-    uint8_t ip_zero[16]{}; // ::0
-    const uint16_t port_recv = P2P_PORT;
-
-    // local addr
-    const uint64_t srv_from = 0;
-    const uint16_t port_from = 0;
-
-    // random nonce
-    std::mt19937_64 rng{std::random_device{}()};
-    uint64_t nonce = rng();
-
-    // version
-    put_u32_le(p, (uint32_t)version);
-    put_u64_le(p, services);
-    put_i64_le(p, timestamp);
-
-    put_u64_le(p, srv_recv);
-    p.insert(p.end(), ip_zero, ip_zero+16);
-    put_u16_be(p, port_recv);
-
-    put_u64_le(p, srv_from);
-    p.insert(p.end(), ip_zero, ip_zero+16);
-    put_u16_be(p, port_from);
-
-    put_u64_le(p, nonce);
-    // user agent
-    {
-        // If daemon expects a short UA, this still works (varstr).
-        std::string ua = o_.user_agent;
-        if(ua.empty()) ua = "/miqwallet:0.1/";
-        // varstr
-        if (ua.size() < 0xFD) { p.push_back((uint8_t)ua.size()); }
-        else { put_varint(p, ua.size()); }
-        p.insert(p.end(), ua.begin(), ua.end());
-    }
-    put_u32_le(p, o_.start_height);
-    p.push_back(1); // relay = true
-
-    if(!send_msg("version", p, err)) return false;
-
-    if(o_.send_verack){
-        std::vector<uint8_t> empty;
-        if(!send_msg("verack", empty, err)) return false;
-    }
-    return true;
+    // (Unused directly now; kept for completeness. Handshake uses send_version_mode.)
+    return send_version_mode(this, /*minimal=*/false, err, o_);
 }
 
 bool P2PLight::read_until_verack(std::string& err){
@@ -463,11 +507,10 @@ bool P2PLight::read_msg_header(std::string& cmd_out, uint32_t& len_out, uint32_t
     }
 
     // Legacy header (we already consumed 4 bytes of cmd)
-    uint8_t rest_legacy[12]; // remaining cmd bytes (8) + len (4) → but we need total 12 to complete 16
+    uint8_t rest_legacy[12]; // remaining cmd bytes (8) + len (4)
     if(!read_exact(rest_legacy, 12, err)) return false;
 
     char cmd[13]{};
-    // First 4 bytes are part of cmd (they are not guaranteed printable, but your daemon uses printable cmds)
     std::memcpy(cmd+0, first4, 4);
     std::memcpy(cmd+4, rest_legacy+0, 8);
     cmd_out = std::string(cmd);
