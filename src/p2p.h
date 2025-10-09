@@ -346,20 +346,27 @@ private:
         return true;
     }
 
+    // ---- CHANGED: never time-ban loopback or whitelisted peers --------------
     inline void bump_ban(PeerState& ps, const std::string& ip, const char* /*reason*/, int64_t now_ms) {
-        // increment local score and, on exceed, create/refresh timed ban
+        if (is_loopback(ip) || is_whitelisted_ip(ip)) {
+            if (ps.banscore < 0) ps.banscore = 0;
+            return; // no timed ban for loopback/whitelisted
+        }
         if (ps.banscore < 0) ps.banscore = 0;
         if (ps.banscore >= MIQ_P2P_MAX_BANSCORE) {
             timed_bans_[ip] = now_ms + default_ban_ms_;
         }
     }
 
+    // ---- CHANGED: loopback/whitelisted are never considered banned ----------
     inline bool is_ip_banned(const std::string& ip, int64_t now_ms) const {
+        if (is_loopback(ip) || is_whitelisted_ip(ip)) return false;
+
         auto it = timed_bans_.find(ip);
         if (it != timed_bans_.end()) {
             if (it->second > now_ms) return true;
         }
-        // legacy flat list
+        // legacy flat list (ignore loopback handled above)
         return banned_.count(ip) != 0;
     }
 
