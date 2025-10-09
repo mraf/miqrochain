@@ -32,6 +32,17 @@
 
 namespace miq {
 
+// ---- network magic (match daemon) -------------------------------------------
+#ifndef MIQ_P2P_MAGIC
+// constants.h exposes MAGIC_BE (big-endian canonical bytes).
+// Our header writes the magic as 4 bytes [0..3], so we build the same byte-sequence.
+static constexpr uint32_t MIQ_P2P_MAGIC =
+    (uint32_t(MAGIC_BE[0])      ) |
+    (uint32_t(MAGIC_BE[1]) <<  8) |
+    (uint32_t(MAGIC_BE[2]) << 16) |
+    (uint32_t(MAGIC_BE[3]) << 24);
+#endif
+
 // ---- varint / varstr ---------------------------------------------------------
 static void put_u32_le(std::vector<uint8_t>& b, uint32_t v){
     b.push_back(uint8_t(v)); b.push_back(uint8_t(v>>8));
@@ -43,7 +54,7 @@ static void put_u64_le(std::vector<uint8_t>& b, uint64_t v){
 static void put_i64_le(std::vector<uint8_t>& b, int64_t v){
     put_u64_le(b, (uint64_t)v);
 }
-static void put_u16_be(std::vector<uint8_t>& b, uint16_t v){ // network byte-order port
+static void put_u16_be(std::vector<uint8_t>& b, uint16_t v){ // network order port
     b.push_back(uint8_t(v>>8)); b.push_back(uint8_t(v));
 }
 static void put_varint(std::vector<uint8_t>& b, uint64_t v){
@@ -142,13 +153,14 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
     tip_height = 0; tip_hash_le.clear();
     if (sock_ < 0){ err = "not connected"; return false; }
 
+    // Cached?
     if(!header_hashes_le_.empty()){
         tip_height = (uint32_t)(header_hashes_le_.size() - 1);
         tip_hash_le = header_hashes_le_.back();
         return true;
     }
 
-    // Start with a "null" locator (00..00) to get headers from genesis.
+    // Start from "null" locator to get headers from genesis.
     std::vector<std::vector<uint8_t>> locator;
     locator.emplace_back(32, 0x00);
     std::vector<uint8_t> stop(32, 0x00);
@@ -160,11 +172,14 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
         if(!read_headers_batch(batch, err)) return false;
 
         if(batch.empty()){
-            break; // at tip
+            // No more headers; at tip.
+            break;
         }
 
+        // Append
         for(auto& h : batch) header_hashes_le_.push_back(std::move(h));
 
+        // New locator = last hash (simple)
         locator.clear();
         locator.push_back(header_hashes_le_.back());
     }
@@ -214,18 +229,21 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
             for(uint64_t i=0;i<count;i++){
                 if(pos + 80 > payload.size()){ err="truncated header"; return false; }
                 const uint8_t* hdr = payload.data()+pos;
+
                 auto h  = dsha256_bytes(hdr, 80);
                 auto hl = to_le32(h);
                 out_hashes_le.push_back(std::move(hl));
                 pos += 80;
 
+                // skip txn_count varint
                 uint64_t tcnt=0, u2=0;
                 if(!get_varint(payload.data()+pos, payload.size()-pos, tcnt, u2)){ err="bad txcount varint"; return false; }
                 pos += u2;
             }
             return true;
         }
-        // swallow unrelated messages
+
+        // swallow unrelated messages (ping, inv, addr, sendcmpct, ...)
     }
 }
 
@@ -239,11 +257,12 @@ bool P2PLight::match_recent_blocks(const std::vector<std::vector<uint8_t>>& /*pk
     matched.clear();
     if (sock_ < 0){ err = "not connected"; return false; }
 
+    // Ensure we have headers
     uint32_t tip=0; std::vector<uint8_t> tip_hash;
     if(!get_best_header(tip, tip_hash, err)) return false;
 
     if(to_height > tip) to_height = tip;
-    if(from_height > to_height) return true;
+    if(from_height > to_height) return true; // empty window
 
     for(uint32_t h = from_height; h <= to_height; ++h){
         matched.emplace_back(header_hashes_le_[h], h);
@@ -260,12 +279,14 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
     if (sock_ < 0){ err = "not connected"; return false; }
     if (hash_le.size()!=32){ err = "hash_le must be 32 bytes"; return false; }
 
+    // getdata: varint count (1), then (type=2 MSG_BLOCK little-endian) + hash (LE)
     std::vector<uint8_t> p;
     put_varint(p, 1);
     put_u32_le(p, 2); // MSG_BLOCK
     p.insert(p.end(), hash_le.begin(), hash_le.end());
     if(!send_msg("getdata", p, err)) return false;
 
+    // read messages until we get "block"
     for(;;){
         std::string cmd; uint32_t len=0, csum=0;
         if(!read_msg_header(cmd, len, csum, err)) return false;
@@ -277,27 +298,33 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
             raw_block = std::move(payload);
             return true;
         }
+        // ignore other messages (inv, ping, etc.)
     }
 }
 
 // ---- internals: version/verack and IO ----------------------------------------
 bool P2PLight::send_version(std::string& err){
+    // Build "version" payload (Bitcoin-like)
     std::vector<uint8_t> p;
 
     const int32_t  version   = 70015;
     const uint64_t services  = 0;
     const int64_t  timestamp = (int64_t) (std::chrono::system_clock::now().time_since_epoch() / std::chrono::seconds(1));
 
+    // remote addr (ignored by most)
     const uint64_t srv_recv = 0;
     uint8_t ip_zero[16]{}; // ::0
-    const uint16_t port_recv = miq::P2P_PORT; // <<< use constants.h
+    const uint16_t port_recv = 9833;
 
+    // local addr
     const uint64_t srv_from = 0;
     const uint16_t port_from = 0;
 
+    // random nonce
     std::mt19937_64 rng{std::random_device{}()};
     uint64_t nonce = rng();
 
+    // version
     put_u32_le(p, (uint32_t)version);
     put_u64_le(p, services);
     put_i64_le(p, timestamp);
@@ -325,6 +352,7 @@ bool P2PLight::send_version(std::string& err){
 }
 
 bool P2PLight::read_until_verack(std::string& err){
+    // Read a few messages, stop when we see verack.
     for (int i=0;i<50;i++){
         std::string cmd; uint32_t len=0, csum=0;
         if(!read_msg_header(cmd, len, csum, err)) return false;
@@ -333,6 +361,7 @@ bool P2PLight::read_until_verack(std::string& err){
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
 
         if(cmd=="verack") return true;
+        // ignore other msgs in handshake window
     }
     err = "no verack from peer";
     return false;
@@ -342,17 +371,18 @@ bool P2PLight::send_msg(const char cmd12[12], const std::vector<uint8_t>& payloa
     if (sock_ < 0) { err = "not connected"; return false; }
 
     uint8_t header[24]{};
-    // magic: canonical wire bytes from constants.h
-    header[0]=miq::MAGIC_BE[0];
-    header[1]=miq::MAGIC_BE[1];
-    header[2]=miq::MAGIC_BE[2];
-    header[3]=miq::MAGIC_BE[3];
+    // magic (we write the 4 canonical bytes directly)
+    uint32_t m = MIQ_P2P_MAGIC;
+    header[0]=uint8_t(m); header[1]=uint8_t(m>>8); header[2]=uint8_t(m>>16); header[3]=uint8_t(m>>24);
 
+    // command (null-padded to 12)
     for (int i=0;i<12 && cmd12[i]; ++i) header[4+i] = (uint8_t)cmd12[i];
 
+    // length
     uint32_t L = (uint32_t)payload.size();
     header[16]=uint8_t(L); header[17]=uint8_t(L>>8); header[18]=uint8_t(L>>16); header[19]=uint8_t(L>>24);
 
+    // checksum
     uint32_t c = checksum4(payload);
     header[20]=uint8_t(c); header[21]=uint8_t(c>>8); header[22]=uint8_t(c>>16); header[23]=uint8_t(c>>24);
 
@@ -365,10 +395,8 @@ bool P2PLight::read_msg_header(std::string& cmd_out, uint32_t& len_out, uint32_t
     uint8_t h[24];
     if(!read_exact(h, 24, err)) return false;
 
-    if(h[0]!=miq::MAGIC_BE[0] || h[1]!=miq::MAGIC_BE[1] || h[2]!=miq::MAGIC_BE[2] || h[3]!=miq::MAGIC_BE[3]){
-        err = "bad magic";
-        return false;
-    }
+    uint32_t m = (uint32_t)h[0] | ((uint32_t)h[1]<<8) | ((uint32_t)h[2]<<16) | ((uint32_t)h[3]<<24);
+    if(m != MIQ_P2P_MAGIC){ err = "bad magic"; return false; }
 
     char cmd[13]; std::memset(cmd, 0, sizeof(cmd));
     std::memcpy(cmd, h+4, 12);
@@ -384,7 +412,7 @@ bool P2PLight::read_exact(void* buf, size_t len, std::string& err){
     size_t got = 0;
     while (got < len){
 #ifdef _WIN32
-        int n = recv(sock_, (char*)p + (int)got, (int)(len - got), 0);
+        int n = recv(sock_, (char*)p + (int)got, (int)(len - (int)got), 0);
 #else
         ssize_t n = recv(sock_, p + got, len - got, 0);
 #endif
