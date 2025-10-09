@@ -7,6 +7,8 @@
 #include <random>
 #include <vector>
 #include <algorithm>
+#include <string>
+#include <cerrno>
 
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
@@ -25,6 +27,18 @@
       setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&t, sizeof(t));
       setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&t, sizeof(t));
   }
+  static inline std::string last_sock_err(){
+      int e = WSAGetLastError();
+      return "WSA " + std::to_string(e);
+  }
+  // Ensure Winsock is initialized exactly once
+  static void ensure_winsock() {
+      static bool s_init = false;
+      if (!s_init) {
+          WSADATA wsa;
+          if (WSAStartup(MAKEWORD(2,2), &wsa) == 0) s_init = true;
+      }
+  }
 #else
   #include <sys/types.h>
   #include <sys/socket.h>
@@ -40,6 +54,10 @@
       setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
       setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
   }
+  static inline std::string last_sock_err(){
+      return std::string(strerror(errno));
+  }
+  static inline void ensure_winsock() {}
 #endif
 
 namespace miq {
@@ -101,26 +119,37 @@ P2PLight::~P2PLight(){ close(); }
 bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     o_ = opts;
 
-#ifdef _WIN32
-    WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
-#endif
+    // REQUIRED on Windows; harmless elsewhere
+    ensure_winsock();
 
-    addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
+    // Prefer IPv4 because the daemon binds AF_INET only
+    addrinfo hints{};
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family   = AF_INET; // force IPv4 to avoid ::1 when server is v4-only
+
     addrinfo* res=nullptr;
     if (getaddrinfo(o_.host.c_str(), o_.port.c_str(), &hints, &res) != 0) {
-        err = "getaddrinfo failed";
+        err = "resolve failed";
         return false;
     }
     int fd = -1;
+    std::string last_err;
     for (auto rp = res; rp; rp = rp->ai_next) {
         fd = (int)socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd < 0) continue;
+        if (fd < 0) { last_err = "socket() failed: " + last_sock_err(); continue; }
         set_timeouts(fd, o_.io_timeout_ms);
-        if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) break;
+        if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) {
+            last_err.clear();
+            break;
+        }
+        last_err = "connect() failed: " + last_sock_err();
         closesock(fd); fd = -1;
     }
     freeaddrinfo(res);
-    if (fd < 0) { err = "connect failed"; return false; }
+    if (fd < 0) {
+        err = last_err.empty() ? "connect failed" : last_err;
+        return false;
+    }
     sock_ = fd;
 
     if(!send_version(err)) { close(); return false; }
@@ -147,6 +176,7 @@ bool P2PLight::send_getaddr(std::string& err){
 void P2PLight::close(){
     if (sock_ >= 0){ closesock(sock_); sock_ = -1; }
 #ifdef _WIN32
+    // It's fine to call; ensure_winsock() increments once at process start
     WSACleanup();
 #endif
 }
@@ -457,7 +487,7 @@ bool P2PLight::read_exact(void* buf, size_t len, std::string& err){
 #else
         ssize_t n = recv(sock_, p + got, len - got, 0);
 #endif
-        if (n <= 0) { err = "recv failed"; return false; }
+        if (n <= 0) { err = "recv failed: " + last_sock_err(); return false; }
         got += (size_t)n;
     }
     return true;
@@ -472,7 +502,7 @@ bool P2PLight::write_all(const void* buf, size_t len, std::string& err){
 #else
         ssize_t n = send(sock_, p + sent, len - sent, 0);
 #endif
-        if (n <= 0) { err = "send failed"; return false; }
+        if (n <= 0) { err = "send failed: " + last_sock_err(); return false; }
         sent += (size_t)n;
     }
     return true;
