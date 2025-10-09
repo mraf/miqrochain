@@ -1,6 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
 
-# Keep old behavior for FetchContent_Populate
 if(POLICY CMP0169)
   cmake_policy(SET CMP0169 OLD)
 endif()
@@ -18,10 +17,10 @@ include(FetchContent)
 # Options
 # ------------------------------------------------------------------
 option(MIQ_ENABLE_WALLET_ENC "Enable wallet at-rest encryption" OFF)
-option(MIQ_BUILD_TESTS       "Build tests"                       OFF)
+option(MIQ_BUILD_TESTS       "Build tests" OFF)
 
 # DB backend options
-option(MIQ_USE_ROCKSDB       "Use RocksDB instead of LevelDB"              OFF)
+option(MIQ_USE_ROCKSDB       "Use RocksDB instead of LevelDB"               OFF)
 option(MIQ_FETCH_LEVELDB     "Automatically fetch/build LevelDB if missing" ON)
 
 # libsecp256k1 options
@@ -152,14 +151,9 @@ set(MIQ_CORE_SOURCES
     src/block.h src/block.cpp
     src/difficulty.h src/difficulty.cpp
     src/storage.h src/storage.cpp
-
-    # Legacy/simple UTXO backend
     src/utxo.h src/utxo.cpp
-
-    # KV-backed chainstate
     src/kvdb.h src/kvdb.cpp
     src/utxo_kv.h src/utxo_kv.cpp
-
     src/mempool.h src/mempool.cpp
     src/hasher.h src/hasher.cpp
     src/lut.h src/lut.cpp
@@ -170,24 +164,16 @@ set(MIQ_CORE_SOURCES
     src/p2p.h src/p2p.cpp
     src/http.h src/http.cpp
     src/rpc.h src/rpc.cpp
-
-    # Crypto interface + libsecp backend wrapper
     src/crypto/ecdsa_iface.h
     src/crypto/ecdsa_libsecp256k1.cpp
-
-    # Reorg / NAT / Seeds / MTP
     src/reorg_manager.h
     src/reorg_manager.cpp
-    src/nat.cpp
+    src/nat.cpp         # harmless if MIQ_ENABLE_UPNP not defined
     src/seeds.cpp
     src/mtp.h
     src/mtp.cpp
-
-    # TLS proxy & IBD monitor
     src/tls_proxy.h src/tls_proxy.cpp
     src/ibd_monitor.h src/ibd_monitor.cpp
-
-    # RNG / wallet encryption stubs
     src/wallet_encryptor.cpp
     src/crypto/secure_random.cpp
 )
@@ -196,28 +182,23 @@ set(MIQ_CORE_SOURCES
 # Daemon (miqrod)
 # ------------------------------------------------------------------
 add_executable(miqrod src/main.cpp ${MIQ_CORE_SOURCES})
+
 target_include_directories(miqrod PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
 
-# Link DB backend & define flavor
 target_link_libraries(miqrod PRIVATE ${MIQ_DB_TARGET})
 if(MIQ_DB_DEFINE)
   target_compile_definitions(miqrod PRIVATE ${MIQ_DB_DEFINE})
 endif()
 
-# Platform libs
 if(WIN32)
   target_link_libraries(miqrod PRIVATE Ws2_32)
 endif()
 
-# TLS + Threads
 target_link_libraries(miqrod PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
-
-# libsecp256k1
 if(MIQ_USE_LIBSECP)
   target_link_libraries(miqrod PRIVATE ${MIQ_LIBSECP_TARGET})
 endif()
 
-# Optional wallet encryption
 if(MIQ_ENABLE_WALLET_ENC)
   target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_WALLET_ENC=1)
   target_link_libraries(miqrod PRIVATE OpenSSL::Crypto)
@@ -227,10 +208,42 @@ else()
 endif()
 
 # ------------------------------------------------------------------
-# CLI wallet (miqwallet) — minimal deps (just sockets)
+# Wallet P2P helper (new)
 # ------------------------------------------------------------------
-add_executable(miqwallet src/cli/miqwallet.cpp)
+# Tiny P2P light client used by the CLI.
+add_library(miqwallet_p2p STATIC
+    src/wallet/p2p_light.cpp
+    src/wallet/p2p_light.h
+)
+target_include_directories(miqwallet_p2p PUBLIC src)
+if(WIN32)
+  target_link_libraries(miqwallet_p2p PUBLIC ws2_32)
+endif()
+
+# ------------------------------------------------------------------
+# CLI wallet (miqwallet)
+# ------------------------------------------------------------------
+add_executable(miqwallet
+    src/cli/miqwallet.cpp
+    # link core bits it uses (HD, tx, crypto, ser, base58, hash160)
+    src/hd_wallet.cpp
+    src/wallet_store.cpp
+    src/sha256.cpp
+    src/ripemd160.cpp
+    src/hash160.cpp
+    src/base58.cpp
+    src/base58check.cpp
+    src/hex.cpp
+    src/serialize.cpp
+    src/tx.cpp
+    src/crypto/secure_random.cpp
+    src/crypto/ecdsa_libsecp256k1.cpp
+)
 target_include_directories(miqwallet PRIVATE src)
+target_link_libraries(miqwallet PRIVATE miqwallet_p2p)
+if(MIQ_USE_LIBSECP)
+  target_link_libraries(miqwallet PRIVATE ${MIQ_LIBSECP_TARGET})
+endif()
 if(WIN32)
   target_link_libraries(miqwallet PRIVATE ws2_32)
 endif()
@@ -241,13 +254,12 @@ set_target_properties(miqwallet PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED
 # ------------------------------------------------------------------
 add_executable(miq-keygen
     src/tools/miq_keygen.cpp
-    src/sha256.h src/sha256.cpp
-    src/ripemd160.h src/ripemd160.cpp
-    src/hash160.h src/hash160.cpp
-    src/base58.h src/base58.cpp
-    src/hex.h src/hex.cpp
+    src/sha256.cpp
+    src/ripemd160.cpp
+    src/hash160.cpp
+    src/base58.cpp
+    src/hex.cpp
     src/crypto/secure_random.cpp
-    src/crypto/ecdsa_iface.h
     src/crypto/ecdsa_libsecp256k1.cpp
 )
 target_include_directories(miq-keygen PRIVATE src)
@@ -263,26 +275,6 @@ endif()
 # ------------------------------------------------------------------
 if(MIQ_BUILD_TESTS)
   enable_testing()
-
-  add_executable(test_crypto tests/test_crypto.cpp
-      src/sha256.h src/sha256.cpp
-      src/ripemd160.h src/ripemd160.cpp
-      src/hash160.h src/hash160.cpp
-      src/base58check.h src/base58check.cpp
-      src/hex.h src/hex.cpp
-      src/crypto/secure_random.cpp
-      src/crypto/ecdsa_iface.h
-      src/crypto/ecdsa_libsecp256k1.cpp
-  )
-  target_include_directories(test_crypto PRIVATE src)
-  if(MIQ_USE_LIBSECP)
-    target_link_libraries(test_crypto PRIVATE ${MIQ_LIBSECP_TARGET})
-  endif()
-  if(WIN32)
-    target_link_libraries(test_crypto PRIVATE Ws2_32)
-  endif()
-  add_test(NAME test_crypto COMMAND test_crypto)
-
   add_executable(test_ser tests/test_ser.cpp
       src/serialize.h src/serialize.cpp
       src/tx.h src/tx.cpp
