@@ -1,3 +1,4 @@
+// wallet/p2p_light.h
 #pragma once
 #include <string>
 #include <vector>
@@ -6,7 +7,7 @@
 namespace miq {
 
 // Minimal, blocking P2P client: version/verack + headers sync + block fetch + tx broadcast.
-// Wire framing is Bitcoin-like. Magic MUST match your daemon.
+// Magic MUST match your daemon.
 struct P2POpts {
     std::string host = "62.38.73.147";
     std::string port = "9833";
