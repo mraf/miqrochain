@@ -22,6 +22,7 @@
 #include <random>
 #include <cmath>
 #include <stdexcept>
+#include <unordered_set>   // <-- needed
 
 #include "constants.h"
 #include "hd_wallet.h"
@@ -105,7 +106,7 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
     // 2) local daemon first (works best if wallet & node on same box)
     seeds.emplace_back("127.0.0.1", std::to_string(miq::P2P_PORT));
 
-    // 3) your primary static seed/IP from constants.h (e.g. 62.38.73.147)
+    // 3) your primary static seed/IP from constants.h
     seeds.emplace_back(miq::DNS_SEED, std::to_string(miq::P2P_PORT));
 
     // 4) extra DNS seeds
@@ -151,15 +152,15 @@ static bool try_spv_collect_any_seed(const std::vector<std::pair<std::string,std
     used_host.clear(); used_tip_height = 0; last_err.clear();
     out.clear();
 
-    miq::SpvOptions opts{};           // keep defaults from spv_simple.h/cpp
-    opts.recent_block_window = recent_window;   // safe default; file handles maturity & confs
+    miq::SpvOptions opts{};                 // use defaults from spv_simple
+    opts.recent_block_window = recent_window;
 
     for(const auto& [h,p] : seeds){
         std::vector<miq::UtxoLite> v; std::string e;
         if(miq::spv_collect_utxos(h, p, pkhs, opts, v, e)){
             out.swap(v);
             used_host = h + ":" + p;
-            used_tip_height = opts.tip_height;  // spv_simple.cpp can set this in opts by reference
+            used_tip_height = 0;            // SpvOptions in your tree has no tip_height field
             return true;
         }
         last_err = e.empty() ? "tip query failed" : e;
@@ -297,7 +298,7 @@ static bool flow_send_p2p_only(const std::string& cli_host, const std::string& c
             if(change < 1000){ change = 0; fee_final = fee_for(tx.vin.size(), 1, 1000); }
         }
     }
-    (void)fee_final; // currently fixed feerate; tx serialization doesn’t embed fee explicitly
+    (void)fee_final; // fee implied by inputs-outputs
 
     miq::TxOut o; o.pkh = payload; o.value = amount; tx.vout.push_back(o);
 
