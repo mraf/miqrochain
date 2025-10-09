@@ -1,8 +1,8 @@
 // MIQ wallet CLI (P2P-only): local HD + SPV UTXO discovery + P2P tx broadcast.
 // Default P2P seed: 62.38.73.147:9833
 //
-// Build deps: hd_wallet, wallet_store, sha256, ripemd160, hash160,
-// base58*, hex, serialize, tx, secp256k1, wallet/p2p_light.*, wallet/spv_simple.h
+// Build deps already in your tree: hd_wallet, wallet_store, sha256, ripemd160,
+// hash160, base58*, hex, serialize, tx, secp256k1, wallet/p2p_light.*, wallet/spv_simple.*.
 
 #include <iostream>
 #include <iomanip>
@@ -33,13 +33,12 @@
 #include "tx.h"
 #include "crypto/ecdsa_iface.h"
 #include "wallet/p2p_light.h"
-#include "wallet/spv_simple.h"   // <- use the SPV helpers present in your tree
+#include "wallet/spv_simple.h"
 
 using miq::CHAIN_NAME;
 using miq::COIN;
-using miq::COINBASE_MATURITY;
 
-// ----------------- tiny helpers -----------------
+// ----------------- helpers -----------------
 static std::string trim(const std::string& s) {
     size_t a = 0, b = s.size();
     while (a < b && std::isspace((unsigned char)s[a])) ++a;
@@ -60,16 +59,28 @@ static uint64_t parse_amount_miqron(const std::string& s){
 }
 
 static size_t est_size_bytes(size_t nin, size_t nout){ return nin*148 + nout*34 + 10; }
-static uint64_t fee_for(size_t nin, size_t nout, uint64_t feerate){
+static uint64_t fee_for(size_t nin, size_t nout, uint64_t feerate_miqron_per_kb){
     size_t sz = est_size_bytes(nin, nout);
     uint64_t kb = (uint64_t)((sz + 999) / 1000);
     if(kb==0) kb=1;
-    return kb * feerate;
+    return kb * feerate_miqron_per_kb;
 }
 
-// -----------------------------------------------------------------------------
-// P2P helpers
-// -----------------------------------------------------------------------------
+// -------- P2P helpers: tip + broadcast + seeds ----------
+static bool get_tip_from_peer(const std::string& host, const std::string& port,
+                              uint32_t& tip_height, std::vector<uint8_t>& tip_hash_le,
+                              std::string& err)
+{
+    tip_height = 0; tip_hash_le.clear();
+    miq::P2POpts o;
+    o.host = host; o.port = port; o.user_agent = "/miqwallet-tip:0.1/";
+    miq::P2PLight p2p;
+    if(!p2p.connect_and_handshake(o, err)) return false;
+    bool ok = p2p.get_best_header(tip_height, tip_hash_le, err);
+    p2p.close();
+    return ok;
+}
+
 static bool p2p_broadcast_tx(const std::string& seed_host, const std::string& seed_port,
                              const std::vector<uint8_t>& raw_tx,
                              std::string& err)
@@ -77,7 +88,7 @@ static bool p2p_broadcast_tx(const std::string& seed_host, const std::string& se
     miq::P2POpts o;
     o.host = seed_host;
     o.port = seed_port;
-    o.user_agent = "/miqwallet-p2p:0.2/";
+    o.user_agent = "/miqwallet-p2p:0.1/";
     miq::P2PLight p2p;
     if(!p2p.connect_and_handshake(o, err)) return false;
     bool ok = p2p.send_tx(raw_tx, err);
@@ -85,63 +96,63 @@ static bool p2p_broadcast_tx(const std::string& seed_host, const std::string& se
     return ok;
 }
 
-static bool get_tip_height_from(const std::string& host, const std::string& port,
-                                uint32_t& tip, std::string& err){
-    miq::P2POpts o; o.host=host; o.port=port; o.user_agent="/miqwallet-tip:0.2/";
-    miq::P2PLight p;
-    if(!p.connect_and_handshake(o, err)) return false;
-    std::vector<uint8_t> tip_hash;
-    bool ok = p.get_best_header(tip, tip_hash, err);
-    p.close();
-    return ok;
+static void build_seed_list(const std::string& cli_host, const std::string& cli_port,
+                            std::vector<std::pair<std::string,std::string>>& out)
+{
+    out.clear();
+    // CLI-provided first
+    if(!cli_host.empty())
+        out.emplace_back(cli_host, cli_port);
+
+    // constants.h fallback seeds
+    // DNS_SEEDS is a list of hostnames/IPs, P2P_PORT is default port.
+    for(size_t i=0;i<miq::DNS_SEEDS_COUNT;i++){
+        out.emplace_back(std::string(miq::DNS_SEEDS[i]), std::to_string(miq::P2P_PORT));
+    }
+    // Legacy single seed string
+    out.emplace_back(std::string(miq::DNS_SEED), std::to_string(miq::P2P_PORT));
 }
 
-// Try a list of seeds until SPV succeeds; also return which seed worked and tip height.
-static bool try_spv_collect_any_seed(
-    const std::vector<std::pair<std::string,std::string>>& seeds,
-    const std::vector<std::vector<uint8_t>>& pkhs,
-    uint32_t recent_window,
-    std::vector<miq::UtxoLite>& out,
-    std::string& seed_used,
-    uint32_t& tip_height,
-    std::string& err_out)
+static bool try_spv_collect_any_seed(const std::vector<std::pair<std::string,std::string>>& seeds,
+                                     const std::vector<std::vector<uint8_t>>& pkhs,
+                                     uint32_t recent_block_window,
+                                     std::vector<miq::UtxoLite>& out,
+                                     std::string& used_host,
+                                     std::string& used_port,
+                                     uint32_t& tip_height_out,
+                                     std::string& err)
 {
-    out.clear(); seed_used.clear(); tip_height=0; err_out.clear();
+    out.clear(); used_host.clear(); used_port.clear(); tip_height_out = 0;
+    std::string last_err;
 
     for(const auto& [h,p] : seeds){
-        miq::SpvOptions opts{};
-        // If SpvOptions exposes this knob, set it; otherwise harmless if optimized away by the compiler.
-        opts.recent_block_window = recent_window;
-
-        std::string e2;
-        std::vector<miq::UtxoLite> tmp;
-
-        // 1) fetch tip from same peer (used for coinbase maturity checks)
+        // quick tip probe (also verifies magic & basic handshake)
+        std::vector<uint8_t> tip_hash;
+        std::string e1;
         uint32_t tip=0;
-        if(!get_tip_height_from(h, p, tip, e2)){
-            err_out = "tip query failed at " + h + ":" + p + " (" + e2 + ")";
+        if(!get_tip_from_peer(h, p, tip, tip_hash, e1)){
+            last_err = "connect/tip failed: " + e1;
             continue;
         }
 
-        // 2) collect UTXOs via the header-defined API
-        if(!miq::spv_collect_utxos(h, p, pkhs, opts, tmp, e2)){
-            err_out = "SPV failed at " + h + ":" + p + " (" + e2 + ")";
+        miq::SpvOptions o;
+        o.p2p_host = h;
+        o.p2p_port = p;
+        o.recent_block_window = recent_block_window;
+        o.require_compact_filters = false; // fall back to raw block scan if filters not supported
+
+        std::vector<miq::UtxoLite> v;
+        std::string e2;
+        if(!miq::spv_collect_utxos(o, pkhs, v, e2)){
+            last_err = "spv scan failed: " + e2;
             continue;
         }
-
-        // success
-        out.swap(tmp);
-        seed_used = h + ":" + p;
-        tip_height = tip;
-        err_out.clear();
+        out = std::move(v);
+        used_host = h; used_port = p; tip_height_out = tip;
         return true;
     }
-    if(err_out.empty()) err_out = "no seeds reachable";
+    err = last_err.empty()? "no seeds worked" : last_err;
     return false;
-}
-
-static uint64_t utxo_sum(const std::vector<miq::UtxoLite>& v){
-    uint64_t s=0; for(const auto& u: v) s+=u.value; return s;
 }
 
 // -----------------------------------------------------------------------------
@@ -179,15 +190,15 @@ static bool make_or_restore_wallet(bool restore){
     std::string e;
     if(!miq::SaveHdWallet(wdir, seed, meta, wpass, e)) { std::cout << "save failed: " << e << "\n"; return false; }
 
-    miq::HdWallet wseed(seed, meta);
+    miq::HdWallet w(seed, meta);
     std::string addr;
-    if(!wseed.GetNewAddress(addr)) { std::cout << "derive address failed\n"; return false; }
-    if(!miq::SaveHdWallet(wdir, seed, wseed.meta(), wpass, e)) { std::cout << "save meta failed: " << e << "\n"; }
+    if(!w.GetNewAddress(addr)) { std::cout << "derive address failed\n"; return false; }
+    if(!miq::SaveHdWallet(wdir, seed, w.meta(), wpass, e)) { std::cout << "save meta failed: " << e << "\n"; }
     std::cout << "First receive address: " << addr << "\n";
     return true;
 }
 
-static bool flow_send_p2p_only(const std::string& p2p_host, const std::string& p2p_port){
+static bool flow_send_p2p_only(const std::string& cli_host, const std::string& cli_port){
     // load wallet
     std::string wdir = miq::default_wallet_file();
     if(!wdir.empty()){
@@ -216,7 +227,9 @@ static bool flow_send_p2p_only(const std::string& p2p_host, const std::string& p
     struct Key { std::vector<uint8_t> priv, pub, pkh; uint32_t chain, index; };
     std::vector<Key> keys;
     auto add_range = [&](uint32_t chain, uint32_t upto){
-        for(uint32_t i=0;i<=upto + 20; ++i){
+        // derive up to known next index + small gap
+        uint32_t limit = upto + 20;
+        for(uint32_t i=0;i<=limit; ++i){
             Key k; k.chain=chain; k.index=i;
             if(!w.DerivePrivPub(meta.account, chain, i, k.priv, k.pub)) continue;
             k.pkh = miq::hash160(k.pub);
@@ -226,41 +239,45 @@ static bool flow_send_p2p_only(const std::string& p2p_host, const std::string& p
     add_range(0, meta.next_recv);
     add_range(1, meta.next_change);
 
-    // Prepare seeds to try (default + configured DNS seeds)
-    std::vector<std::pair<std::string,std::string>> seeds;
-    seeds.emplace_back(p2p_host, p2p_port);
-    for(size_t i=0;i<miq::DNS_SEEDS_COUNT;i++){
-        seeds.emplace_back(miq::DNS_SEEDS[i], std::to_string(miq::P2P_PORT));
-    }
-
-    // SPV UTXO discovery over P2P
+    // SPV UTXO discovery over P2P (multi-seed)
     std::vector<std::vector<uint8_t>> pkhs; pkhs.reserve(keys.size());
     for(auto& k: keys) pkhs.push_back(k.pkh);
 
-    std::vector<miq::UtxoLite> utxos; std::string seed_used; uint32_t tip_height=0; std::string perr;
+    std::vector<std::pair<std::string,std::string>> seeds;
+    build_seed_list(cli_host, cli_port, seeds);
+
+    std::vector<miq::UtxoLite> utxos;
+    uint32_t tip_height = 0;
+    std::string used_host, used_port, perr;
     std::cout << "Syncing (P2P/SPV)…\n";
-    if(!try_spv_collect_any_seed(seeds, pkhs, /*recent*/8000, utxos, seed_used, tip_height, perr)){
+    if(!try_spv_collect_any_seed(seeds, pkhs, /*recent_block_window=*/8000, utxos,
+                                 used_host, used_port, tip_height, perr)){
         std::cout << "SPV collection failed: " << perr << "\n";
         return false;
     }
 
-    // Enforce coinbase maturity: do NOT spend immature coinbase
+    if(utxos.empty()){
+        std::cout << "No spendable UTXOs found for this seed yet.\n";
+        return false;
+    }
+
+    // Filter out immature coinbase UTXOs (depth must be >= COINBASE_MATURITY for next block)
     std::vector<miq::UtxoLite> spendable;
     spendable.reserve(utxos.size());
-    for(const auto& u: utxos){
+    for(const auto& u : utxos){
         if(u.coinbase){
-            if(tip_height <= u.height) continue;
-            uint32_t conf = tip_height - u.height; // header count since mined (exclude current)
-            if(conf < COINBASE_MATURITY) continue;
+            // depth relative to next block (tip+1): depth = (tip+1) - u.height
+            uint64_t depth = (tip_height + 1 >= u.height) ? (uint64_t)((tip_height + 1) - u.height) : 0;
+            if(depth < miq::COINBASE_MATURITY) continue; // not mature
         }
         spendable.push_back(u);
     }
     if(spendable.empty()){
-        std::cout << "No mature UTXOs available for spending.\n";
+        std::cout << "All discovered UTXOs are coinbase and still immature.\n";
         return false;
     }
 
-    // Build transaction: prefer coinbase (common for mined payouts), then largest first
+    // Build transaction (prefer coinbase first, otherwise larger first)
     miq::Transaction tx;
     uint64_t in_sum=0;
     std::stable_sort(spendable.begin(), spendable.end(), [](const miq::UtxoLite& a, const miq::UtxoLite& b){
@@ -272,7 +289,7 @@ static bool flow_send_p2p_only(const std::string& p2p_host, const std::string& p
         miq::TxIn in; in.prev.txid = u.txid; in.prev.vout = u.vout;
         tx.vin.push_back(in);
         in_sum += u.value;
-        uint64_t fee_guess = fee_for(tx.vin.size(), 2, 1000);
+        uint64_t fee_guess = fee_for(tx.vin.size(), 2, 1000); // 1000 miqron/kB
         if(in_sum >= amount + fee_guess) break;
     }
     if(tx.vin.empty()){ std::cout << "Insufficient funds.\n"; return false; }
@@ -299,12 +316,18 @@ static bool flow_send_p2p_only(const std::string& p2p_host, const std::string& p
         miq::TxOut ch; ch.value = change; ch.pkh = cpkh; tx.vout.push_back(ch); used_change=true;
     }
 
-    // sign each input
-    auto sighash = [&](){ miq::Transaction t=tx; for(auto& i: t.vin){ i.sig.clear(); i.pubkey.clear(); } return miq::dsha256(miq::ser_tx(t)); }();
+    // sign each input (legacy SIGHASH_ALL over our wire format)
+    auto sighash = [&](){
+        miq::Transaction t=tx;
+        for(auto& i: t.vin){ i.sig.clear(); i.pubkey.clear(); }
+        return miq::dsha256(miq::ser_tx(t));
+    }();
+
     auto find_key_for_pkh = [&](const std::vector<uint8_t>& pkh)->const Key*{
         for(const auto& k: keys) if(k.pkh==pkh) return &k;
         return nullptr;
     };
+
     for(auto& in : tx.vin){
         const miq::UtxoLite* u=nullptr;
         for(const auto& x: spendable) if(x.txid==in.prev.txid && x.vout==in.prev.vout){ u=&x; break; }
@@ -316,16 +339,14 @@ static bool flow_send_p2p_only(const std::string& p2p_host, const std::string& p
         in.sig = sig64; in.pubkey = K->pub;
     }
 
-    // serialize + broadcast
+    // serialize + broadcast via the seed that succeeded for SPV
     auto raw = miq::ser_tx(tx);
     std::string txid_hex = miq::to_hex(tx.txid());
-    std::cout << "Broadcasting via P2P to " << seed_used << " ...\n";
-    std::string perr2;
-    // use the exact peer we synced from (best odds the peer will relay immediately)
-    std::string host = seed_used.substr(0, seed_used.find(':'));
-    std::string port = seed_used.substr(seed_used.find(':')+1);
-    if(!p2p_broadcast_tx(host, port, raw, perr2)){
-        std::cout << "P2P broadcast failed: " << perr2 << "\n";
+    std::cout << "Broadcasting via P2P to " << used_host << ":" << used_port << " ...\n";
+
+    std::string berr;
+    if(!p2p_broadcast_tx(used_host, used_port, raw, berr)){
+        std::cout << "P2P broadcast failed: " << berr << "\n";
         return false;
     }
     std::cout << "Broadcasted (P2P). Txid: " << txid_hex << "\n";
@@ -340,7 +361,7 @@ static bool flow_send_p2p_only(const std::string& p2p_host, const std::string& p
     return true;
 }
 
-static bool show_balance_spv(const std::string& p2p_host, const std::string& p2p_port){
+static bool show_balance_spv(const std::string& cli_host, const std::string& cli_port){
     // load wallet meta/seed to derive PKHs
     std::string wdir = miq::default_wallet_file();
     if(!wdir.empty()){
@@ -357,7 +378,8 @@ static bool show_balance_spv(const std::string& p2p_host, const std::string& p2p
     struct Key { std::vector<uint8_t> priv, pub, pkh; };
     std::vector<Key> keys;
     auto add_range = [&](uint32_t chain, uint32_t upto){
-        for(uint32_t i=0;i<=upto + 20; ++i){
+        uint32_t limit = upto + 20;
+        for(uint32_t i=0;i<=limit; ++i){
             Key k;
             if(!w.DerivePrivPub(meta.account, chain, i, k.priv, k.pub)) continue;
             k.pkh = miq::hash160(k.pub);
@@ -370,42 +392,35 @@ static bool show_balance_spv(const std::string& p2p_host, const std::string& p2p
     std::vector<std::vector<uint8_t>> pkhs; pkhs.reserve(keys.size());
     for(auto& k: keys) pkhs.push_back(k.pkh);
 
-    // seeds to try
     std::vector<std::pair<std::string,std::string>> seeds;
-    seeds.emplace_back(p2p_host, p2p_port);
-    for(size_t i=0;i<miq::DNS_SEEDS_COUNT;i++){
-        seeds.emplace_back(miq::DNS_SEEDS[i], std::to_string(miq::P2P_PORT));
-    }
+    build_seed_list(cli_host, cli_port, seeds);
 
-    std::vector<miq::UtxoLite> utxos; std::string seed_used; uint32_t tip_height=0; std::string err;
+    std::vector<miq::UtxoLite> utxos; std::string err;
+    uint32_t tip_height = 0; std::string used_h, used_p;
     std::cout << "Syncing (P2P/SPV)…\n";
-    if(!try_spv_collect_any_seed(seeds, pkhs, 8000, utxos, seed_used, tip_height, err)){
+    if(!try_spv_collect_any_seed(seeds, pkhs, 8000, utxos, used_h, used_p, tip_height, err)){
         std::cout << "SPV collection failed: " << err << "\n";
         return false;
     }
 
-    // Split matured vs. immature coinbase for display
-    uint64_t matured=0, immature_cb=0, other=0;
-    for(const auto& u: utxos){
+    // Only count mature coinbase in "confirmed" balance.
+    uint64_t confirmed = 0, immature_cb = 0, normal = 0;
+    for(const auto& u : utxos){
         if(u.coinbase){
-            if(tip_height > u.height && (tip_height - u.height) >= COINBASE_MATURITY) matured += u.value;
-            else immature_cb += u.value;
+            uint64_t depth = (tip_height + 1 >= u.height) ? (uint64_t)((tip_height + 1) - u.height) : 0;
+            if(depth < miq::COINBASE_MATURITY) immature_cb += u.value;
+            else confirmed += u.value;
         }else{
-            other += u.value;
+            confirmed += u.value;
+            normal += u.value;
         }
     }
-    uint64_t total = matured + other + immature_cb;
-
-    auto fmt = [&](uint64_t v){
-        std::ostringstream s; s << (v/COIN) << "." << std::setw(8) << std::setfill('0') << (v%COIN);
-        return s.str();
-    };
-
-    std::cout << "Seed: " << seed_used << "\n";
-    std::cout << "Tip height: " << tip_height << "\n";
-    std::cout << "Balance (SPV): " << fmt(total)      << " MIQ (" << total      << " miqron)\n";
-    std::cout << "  Spendable:   " << fmt(matured+other) << " MIQ (" << (matured+other) << " miqron)\n";
-    std::cout << "  Immature CB: " << fmt(immature_cb) << " MIQ (" << immature_cb << " miqron)\n";
+    auto fmt = [&](uint64_t v){ std::ostringstream s; s << (v/COIN) << "." << std::setw(8) << std::setfill('0') << (v%COIN); return s.str(); };
+    std::cout << "Node: " << used_h << ":" << used_p << " | Tip height: " << tip_height << "\n";
+    std::cout << "Balance (confirmed): " << fmt(confirmed) << " MIQ (" << confirmed << " miqron)\n";
+    if(immature_cb){
+        std::cout << "  + Immature coinbase: " << fmt(immature_cb) << " MIQ (" << immature_cb << " miqron) — not spendable yet\n";
+    }
     return true;
 }
 
