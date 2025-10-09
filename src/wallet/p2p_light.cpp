@@ -6,8 +6,7 @@
 #include <chrono>
 #include <random>
 #include <sstream>
-#include <unordered_map>
-#include <unordered_set>
+#include <vector>
 #include <algorithm>
 
 #ifdef _WIN32
@@ -21,21 +20,36 @@
   #include <ws2tcpip.h>
   #pragma comment(lib, "ws2_32.lib")
   static inline void closesock(int s){ closesocket(s); }
+  static inline void set_timeouts(int s, int ms){
+      if(ms <= 0) return;
+      DWORD t = (DWORD)ms;
+      setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&t, sizeof(t));
+      setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&t, sizeof(t));
+  }
 #else
   #include <sys/types.h>
   #include <sys/socket.h>
   #include <netdb.h>
   #include <unistd.h>
   #include <fcntl.h>
+  #include <sys/time.h>
   static inline void closesock(int s){ if(s>=0) ::close(s); }
+  static inline void set_timeouts(int s, int ms){
+      if(ms <= 0) return;
+      timeval tv{};
+      tv.tv_sec  = ms / 1000;
+      tv.tv_usec = (ms % 1000) * 1000;
+      setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  }
 #endif
 
 namespace miq {
 
-// ---- network magic (match daemon) -------------------------------------------
+// ---- network magic (match daemon wire bytes exactly) ------------------------
+// We want the header to carry MAGIC_BE in order. We build a 32-bit integer that,
+// when written out byte-by-byte in [0..3], yields MAGIC_BE[0..3].
 #ifndef MIQ_P2P_MAGIC
-// constants.h exposes MAGIC_BE (big-endian canonical bytes).
-// Our header writes the magic as 4 bytes [0..3], so we build the same byte-sequence.
 static constexpr uint32_t MIQ_P2P_MAGIC =
     (uint32_t(MAGIC_BE[0])      ) |
     (uint32_t(MAGIC_BE[1]) <<  8) |
@@ -113,6 +127,7 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     for (; rp; rp = rp->ai_next) {
         fd = (int)socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd < 0) continue;
+        set_timeouts(fd, o_.io_timeout_ms);
         if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) break;
         closesock(fd); fd = -1;
     }
@@ -314,7 +329,7 @@ bool P2PLight::send_version(std::string& err){
     // remote addr (ignored by most)
     const uint64_t srv_recv = 0;
     uint8_t ip_zero[16]{}; // ::0
-    const uint16_t port_recv = 9833;
+    const uint16_t port_recv = P2P_PORT;
 
     // local addr
     const uint64_t srv_from = 0;
