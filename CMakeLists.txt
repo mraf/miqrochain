@@ -268,6 +268,7 @@ add_executable(miqwallet
   src/cli/miqwallet.cpp
   src/nat.cpp              # compile without MIQ_ENABLE_UPNP for wallet (stub path)
   ${MIQ_P2P_LIGHT_SRC}
+  src/wallet/spv_simple.cpp
 )
 target_include_directories(miqwallet PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(miqwallet PRIVATE miqcore)   # no OpenSSL::SSL here
