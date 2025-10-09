@@ -211,26 +211,42 @@ else()
 endif()
 
 # ------------------------------------------------------------------
-# UPnP/NAT-PMP (miniupnpc) with auto-fetch + graceful fallback
+# UPnP/NAT-PMP (miniupnpc) – system / local vendored / optional fetch
 # ------------------------------------------------------------------
-option(MIQ_FETCH_MINIUPNPC "Auto-fetch miniupnpc when enabling UPnP" ON)
+option(MIQ_ENABLE_UPNP          "Enable UPnP/NAT-PMP port mapping" ON)
+option(MIQ_FETCH_MINIUPNPC      "Auto-fetch miniupnpc if not found" OFF)  # default OFF for CI
 set(MIQ_MINIUPNPC_TAG "miniupnpc_2_2_7" CACHE STRING "miniupnpc git tag/commit")
+set(MIQ_MINIUPNPC_LOCAL_DIR "" CACHE PATH "Path to a local miniupnpc source tree (with CMakeLists.txt)")
 
 if(MIQ_ENABLE_UPNP)
   set(_MINIUPNPC_INC "")
   set(_MINIUPNPC_LIBS "")
 
-  # Try pkg-config first
-  find_package(PkgConfig QUIET)
-  if(PKG_CONFIG_FOUND)
-    pkg_check_modules(MINIUPNPC QUIET miniupnpc)
-    if(MINIUPNPC_FOUND)
-      set(_MINIUPNPC_INC  ${MINIUPNPC_INCLUDE_DIRS})
-      set(_MINIUPNPC_LIBS ${MINIUPNPC_LINK_LIBRARIES})
+  # 1) Local vendored tree (preferred when CI has no network)
+  if(MIQ_MINIUPNPC_LOCAL_DIR AND EXISTS "${MIQ_MINIUPNPC_LOCAL_DIR}/CMakeLists.txt")
+    message(STATUS "Using vendored miniupnpc at: ${MIQ_MINIUPNPC_LOCAL_DIR}")
+    add_subdirectory("${MIQ_MINIUPNPC_LOCAL_DIR}" _miniupnpc_build)
+    if(TARGET miniupnpc)
+      set(_MINIUPNPC_LIBS miniupnpc)
+    elseif(TARGET libminiupnpc-static)
+      set(_MINIUPNPC_LIBS libminiupnpc-static)
+    elseif(TARGET libminiupnpc)
+      set(_MINIUPNPC_LIBS libminiupnpc)
     endif()
+    set(_MINIUPNPC_INC "${MIQ_MINIUPNPC_LOCAL_DIR}/include")
   endif()
 
-  # Try classic cmake find
+  # 2) System package (pkg-config or classic find)
+  if(NOT _MINIUPNPC_LIBS)
+    find_package(PkgConfig QUIET)
+    if(PKG_CONFIG_FOUND)
+      pkg_check_modules(MINIUPNPC QUIET miniupnpc)
+      if(MINIUPNPC_FOUND)
+        set(_MINIUPNPC_INC  ${MINIUPNPC_INCLUDE_DIRS})
+        set(_MINIUPNPC_LIBS ${MINIUPNPC_LINK_LIBRARIES})
+      endif()
+    endif()
+  endif()
   if(NOT _MINIUPNPC_LIBS)
     find_path(MINIUPNPC_INCLUDE_DIR miniupnpc/miniupnpc.h)
     find_library(MINIUPNPC_LIBRARY NAMES miniupnpc)
@@ -240,7 +256,7 @@ if(MIQ_ENABLE_UPNP)
     endif()
   endif()
 
-  # Auto-fetch from the correct repo if still missing
+  # 3) Optional fetch (only if explicitly enabled)
   if(NOT _MINIUPNPC_LIBS AND MIQ_FETCH_MINIUPNPC)
     message(STATUS "miniupnpc not found; fetching miniupnp/miniupnpc @ ${MIQ_MINIUPNPC_TAG}")
     include(FetchContent)
@@ -250,9 +266,8 @@ if(MIQ_ENABLE_UPNP)
       GIT_TAG        ${MIQ_MINIUPNPC_TAG}
       GIT_PROGRESS   TRUE
     )
+    # NOTE: If your environment blocks GitHub, leave MIQ_FETCH_MINIUPNPC=OFF.
     FetchContent_MakeAvailable(miniupnpc_src)
-
-    # The standalone repo defines targets; detect robustly.
     if(TARGET miniupnpc)
       set(_MINIUPNPC_LIBS miniupnpc)
     elseif(TARGET libminiupnpc-static)
@@ -261,10 +276,8 @@ if(MIQ_ENABLE_UPNP)
       set(_MINIUPNPC_LIBS libminiupnpc)
     endif()
     set(_MINIUPNPC_INC "${miniupnpc_src_SOURCE_DIR}/include")
-    set(MINIUPNPC_FETCHED 1)
   endif()
 
-  # Link if available; otherwise continue without UPnP
   if(_MINIUPNPC_LIBS)
     target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_UPNP=1)
     target_include_directories(miqrod PRIVATE ${_MINIUPNPC_INC})
@@ -272,16 +285,13 @@ if(MIQ_ENABLE_UPNP)
     if(WIN32)
       target_link_libraries(miqrod PRIVATE iphlpapi ws2_32)
     endif()
-    if(DEFINED MINIUPNPC_FETCHED)
-      message(STATUS "UPnP enabled (miniupnpc fetched)")
-    else()
-      message(STATUS "UPnP enabled (miniupnpc system)")
-    endif()
+    message(STATUS "UPnP enabled")
   else()
-    message(WARNING "UPnP requested but miniupnpc not available; continuing WITHOUT UPnP.")
+    message(WARNING "UPnP requested but miniupnpc not available; continuing WITHOUT UPnP. \
+Provide system package, set MIQ_MINIUPNPC_LOCAL_DIR, or enable MIQ_FETCH_MINIUPNPC on a networked runner.")
   endif()
 else()
-  message(STATUS "UPnP disabled (set -DMIQ_ENABLE_UPNP=ON to enable)")
+  message(STATUS "UPnP disabled")
 endif()
 
 
