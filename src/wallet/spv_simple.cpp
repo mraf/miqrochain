@@ -1,446 +1,333 @@
-// src/cli/miqwallet.cpp
-// MIQ wallet CLI (P2P-only): local HD + SPV UTXO discovery + P2P tx broadcast.
-//
-// Build deps: hd_wallet, wallet_store, sha256, ripemd160, hash160,
-// base58*, hex, serialize, tx, secp256k1,
-// wallet/p2p_light.*, wallet/spv_simple.*
-
-#include <iostream>
-#include <iomanip>
-#include <sstream>
-#include <string>
-#include <vector>
-#include <tuple>
-#include <algorithm>
-#include <cctype>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <chrono>
-#include <thread>
-#include <fstream>
-#include <random>
-#include <cmath>
-#include <stdexcept>
-
-#include "constants.h"
-#include "hd_wallet.h"
-#include "wallet_store.h"
-#include "sha256.h"
-#include "hash160.h"
-#include "base58check.h"
-#include "hex.h"
-#include "serialize.h"
-#include "tx.h"
-#include "crypto/ecdsa_iface.h"
-
+// src/wallet/spv_simple.cpp
+#include "wallet/spv_simple.h"
 #include "wallet/p2p_light.h"
-#include "wallet/spv_simple.h"   // SpvOptions, UtxoLite, spv_collect_utxos
+#include "sha256.h"
+#include "constants.h"
 
-using miq::CHAIN_NAME;
-using miq::COIN;
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
-// ----------------- tiny helpers -----------------
-static std::string trim(const std::string& s) {
-    size_t a = 0, b = s.size();
-    while (a < b && std::isspace((unsigned char)s[a])) ++a;
-    while (b > a && std::isspace((unsigned char)s[b-1])) --b;
-    return s.substr(a, b-a);
+namespace miq {
+
+// ---------- tiny helpers ----------
+static inline uint32_t rd_u32_le(const uint8_t* p){
+    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+}
+static inline uint64_t rd_u64_le(const uint8_t* p){
+    uint64_t v=0; for(int i=0;i<8;i++) v |= (uint64_t)p[i] << (8*i); return v;
 }
 
-static uint64_t parse_amount_miqron(const std::string& s){
-    if(s.find('.')!=std::string::npos){
-        long double v = std::stold(s);
-        long double sat = v * (long double)COIN;
-        if(sat < 0) throw std::runtime_error("negative");
-        return (uint64_t) std::llround(sat);
-    } else {
-        unsigned long long x = std::stoull(s);
-        return (uint64_t)x;
-    }
-}
+struct R {
+    const uint8_t* p; size_t n, pos;
+    explicit R(const std::vector<uint8_t>& v): p(v.data()), n(v.size()), pos(0) {}
+    bool need(size_t k) const { return pos + k <= n; }
+    bool get(void* out, size_t k){ if(!need(k)) return false; std::memcpy(out, p+pos, k); pos+=k; return true; }
+    bool skip(size_t k){ if(!need(k)) return false; pos+=k; return true; }
+    size_t tell() const { return pos; }
+};
 
-static size_t est_size_bytes(size_t nin, size_t nout){ return nin*148 + nout*34 + 10; }
-static uint64_t fee_for(size_t nin, size_t nout, uint64_t feerate){
-    size_t sz = est_size_bytes(nin, nout);
-    uint64_t kb = (uint64_t)((sz + 999) / 1000);
-    if(kb==0) kb=1;
-    return kb * feerate;
-}
-
-// -----------------------------------------------------------------------------
-// P2P helpers
-// -----------------------------------------------------------------------------
-static bool p2p_broadcast_tx_one(const std::string& seed_host, const std::string& seed_port,
-                                 const std::vector<uint8_t>& raw_tx,
-                                 std::string& err)
-{
-    miq::P2POpts o;
-    o.host = seed_host;
-    o.port = seed_port;
-    o.user_agent = "/miqwallet-p2p:0.1/";
-    miq::P2PLight p2p;
-    if(!p2p.connect_and_handshake(o, err)) return false;
-    bool ok = p2p.send_tx(raw_tx, err);
-    p2p.close();
-    return ok;
-}
-
-static std::vector<std::pair<std::string,std::string>>
-build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
-{
-    std::vector<std::pair<std::string,std::string>> seeds;
-
-    // 0) explicit CLI
-    if(!cli_host.empty()) seeds.emplace_back(cli_host, cli_port);
-
-    // 1) env override
-    if(const char* e = std::getenv("MIQ_P2P_SEED"); e && *e){
-        std::string v = e;
-        auto c = v.find(':');
-        if(c != std::string::npos) seeds.emplace_back(v.substr(0,c), v.substr(c+1));
-        else                       seeds.emplace_back(v, std::to_string(miq::P2P_PORT));
-    }
-
-    // 2) local daemon first (works best if wallet & node on same box)
-    seeds.emplace_back("127.0.0.1", std::to_string(miq::P2P_PORT));
-
-    // 3) your primary static seed/IP from constants.h (e.g. 62.38.73.147)
-    seeds.emplace_back(miq::DNS_SEED, std::to_string(miq::P2P_PORT));
-
-    // 4) extra DNS seeds
-    for(size_t i=0;i<miq::DNS_SEEDS_COUNT;i++){
-        seeds.emplace_back(miq::DNS_SEEDS[i], std::to_string(miq::P2P_PORT));
-    }
-
-    // de-dup while preserving order
-    std::vector<std::pair<std::string,std::string>> uniq;
-    std::unordered_set<std::string> seen;
-    for(auto& hp: seeds){
-        std::string key = hp.first + ":" + hp.second;
-        if(seen.insert(key).second) uniq.push_back(hp);
-    }
-    return uniq;
-}
-
-static bool try_broadcast_any_seed(const std::vector<std::pair<std::string,std::string>>& seeds,
-                                   const std::vector<uint8_t>& raw,
-                                   std::string& used_host,
-                                   std::string& last_err)
-{
-    used_host.clear(); last_err.clear();
-    for(const auto& [h,p] : seeds){
-        std::string e;
-        if(p2p_broadcast_tx_one(h, p, raw, e)){
-            used_host = h + ":" + p;
-            return true;
-        }
-        last_err = e.empty() ? "connect failed" : e;
-    }
+static bool get_varint(R& r, uint64_t& v){
+    if(!r.need(1)) return false;
+    uint8_t x = r.p[r.pos++];
+    if(x < 0xFD){ v=x; return true; }
+    if(x == 0xFD){ if(!r.need(2)) return false; v = (uint64_t)r.p[r.pos] | ((uint64_t)r.p[r.pos+1]<<8); r.pos+=2; return true; }
+    if(x == 0xFE){ if(!r.need(4)) return false; v = rd_u32_le(r.p+r.pos); r.pos+=4; return true; }
+    if(x == 0xFF){ if(!r.need(8)) return false; v = rd_u64_le(r.p+r.pos); r.pos+=8; return true; }
     return false;
 }
 
-static bool try_spv_collect_any_seed(const std::vector<std::pair<std::string,std::string>>& seeds,
-                                     const std::vector<std::vector<uint8_t>>& pkhs,
-                                     uint32_t recent_window,
-                                     std::vector<miq::UtxoLite>& out,
-                                     std::string& used_host,
-                                     uint32_t& used_tip_height,
-                                     std::string& last_err)
+static inline std::vector<uint8_t> dsha256_bytes(const uint8_t* b, size_t len){
+    std::vector<uint8_t> tmp(b,b+len); return dsha256(tmp);
+}
+static inline std::vector<uint8_t> to_le32(const std::vector<uint8_t>& h){
+    std::vector<uint8_t> r=h; std::reverse(r.begin(), r.end()); return r;
+}
+
+// key = txid (bytes, LE) + vout u32 LE
+static inline std::string key_of(const std::vector<uint8_t>& txid, uint32_t vout){
+    std::string k; k.reserve(36);
+    k.assign((const char*)txid.data(), txid.size());
+    k.push_back((char)((vout>>0)&0xFF));
+    k.push_back((char)((vout>>8)&0xFF));
+    k.push_back((char)((vout>>16)&0xFF));
+    k.push_back((char)((vout>>24)&0xFF));
+    return k;
+}
+
+struct VecHash {
+    size_t operator()(const std::vector<uint8_t>& v) const noexcept {
+        size_t h = 1469598103934665603ull; // FNV-1a
+        for(uint8_t b: v){ h ^= b; h *= 1099511628211ull; }
+        return h;
+    }
+};
+
+// ---------- tx / block parsing ----------
+
+struct TxParsed {
+    std::vector<uint8_t> txid_le; // wire order (LE)
+    bool coinbase{false};
+    struct In  { std::vector<uint8_t> prev_txid; uint32_t vout; };
+    struct Out { uint64_t value; std::vector<uint8_t> pkh;      };
+    std::vector<In>  vin;
+    std::vector<Out> vout;
+};
+
+static bool parse_tx_bitcoin(R& r, TxParsed& out){
+    size_t start = r.tell();
+    uint32_t version=0; if(!r.get(&version,4)) return false;
+
+    uint64_t in_count=0; if(!get_varint(r, in_count)) return false;
+    out.vin.clear(); out.vin.reserve((size_t)in_count);
+    for(uint64_t i=0;i<in_count;i++){
+        if(!r.need(36)) return false;
+        TxParsed::In in{};
+        in.prev_txid.assign(r.p + r.pos, r.p + r.pos + 32); r.pos += 32; // txid (LE on wire)
+        uint32_t vout=0; if(!r.get(&vout,4)) return false; in.vout=vout;
+        uint64_t sl=0; if(!get_varint(r,sl)) return false;
+        if(!r.skip((size_t)sl)) return false;
+        uint32_t seq=0; if(!r.get(&seq,4)) return false;
+        out.vin.push_back(std::move(in));
+    }
+
+    uint64_t out_count=0; if(!get_varint(r, out_count)) return false;
+    out.vout.clear(); out.vout.reserve((size_t)out_count);
+    for(uint64_t i=0;i<out_count;i++){
+        if(!r.need(8)) return false;
+        uint64_t val = rd_u64_le(r.p + r.pos); r.pos += 8;
+        uint64_t pk_len=0; if(!get_varint(r, pk_len)) return false;
+        if(!r.need((size_t)pk_len)) return false;
+
+        TxParsed::Out o{val, {}};
+        // P2PKH: OP_DUP OP_HASH160 0x14 <20> OP_EQUALVERIFY OP_CHECKSIG
+        if(pk_len == 25
+           && r.p[r.pos+0] == 0x76 && r.p[r.pos+1] == 0xA9
+           && r.p[r.pos+2] == 0x14 && r.p[r.pos+23] == 0x88 && r.p[r.pos+24] == 0xAC)
+        {
+            o.pkh.assign(r.p + r.pos + 3, r.p + r.pos + 23);
+        }
+        r.pos += (size_t)pk_len;
+        out.vout.push_back(std::move(o));
+    }
+
+    uint32_t lock_time=0; if(!r.get(&lock_time,4)) return false;
+
+    // coinbase: single input, prev_hash=0..0, vout=0xffffffff
+    out.coinbase = false;
+    if(in_count==1){
+        const auto& in0 = out.vin[0];
+        bool allz=true; for(uint8_t b: in0.prev_txid) if(b){ allz=false; break; }
+        if(allz && in0.vout==0xffffffffu) out.coinbase = true;
+    }
+
+    auto h = dsha256_bytes(r.p + start, r.tell() - start);
+    out.txid_le = to_le32(h);
+    return true;
+}
+
+// MIQ-compact tx (prefixed by u32 size)
+static bool parse_tx_miq_blockwrapped(R& r, TxParsed& out){
+    if(!r.need(4)) return false;
+    uint32_t tx_size = rd_u32_le(r.p + r.pos); r.pos += 4;
+    if(!r.need(tx_size)) return false;
+
+    size_t start = r.tell();
+    size_t end   = start + tx_size;
+
+    // sub-reader over the tx payload
+    std::vector<uint8_t> slice(r.p + start, r.p + end);
+    R tr(slice);
+
+    uint32_t version=0; if(!tr.get(&version,4)) return false;
+
+    uint32_t in_count=0; if(!tr.get(&in_count,4)) return false;
+    out.vin.clear(); out.vin.reserve(in_count);
+    for(uint32_t i=0;i<in_count;i++){
+        uint32_t pt_len=0; if(!tr.get(&pt_len,4)) return false;
+        if(pt_len!=32 || !tr.need(32)) return false;
+        TxParsed::In in{};
+        in.prev_txid.assign(tr.p + tr.pos, tr.p + tr.pos + 32); tr.pos += 32;
+        uint32_t vout=0; if(!tr.get(&vout,4)) return false; in.vout=vout;
+
+        uint32_t sig_len=0; if(!tr.get(&sig_len,4)) return false; if(!tr.skip(sig_len)) return false;
+        uint32_t pub_len=0; if(!tr.get(&pub_len,4)) return false; if(!tr.skip(pub_len)) return false;
+
+        out.vin.push_back(std::move(in));
+    }
+
+    uint32_t out_count=0; if(!tr.get(&out_count,4)) return false;
+    out.vout.clear(); out.vout.reserve(out_count);
+    for(uint32_t i=0;i<out_count;i++){
+        if(!tr.need(8)) return false;
+        uint64_t val = rd_u64_le(tr.p + tr.pos); tr.pos += 8;
+        uint32_t pkh_len=0; if(!tr.get(&pkh_len,4)) return false;
+        if(pkh_len!=20 || !tr.need(20)) return false;
+        TxParsed::Out o{val, {}};
+        o.pkh.assign(tr.p + tr.pos, tr.p + tr.pos + 20); tr.pos += 20;
+        out.vout.push_back(std::move(o));
+    }
+
+    uint32_t lock_time=0; if(!tr.get(&lock_time,4)) return false;
+
+    // coinbase heuristic for MIQ: single input with zero prev hash (vout may be 0)
+    out.coinbase = false;
+    if(in_count==1){
+        const auto& in0 = out.vin[0];
+        bool allz=true; for(uint8_t b: in0.prev_txid) if(b){ allz=false; break; }
+        if(allz) out.coinbase = true;
+    }
+
+    auto h = dsha256_bytes(r.p + start, tx_size);
+    out.txid_le = to_le32(h);
+
+    // advance outer reader
+    r.pos = end;
+    return true;
+}
+
+static bool parse_block_collect(const std::vector<uint8_t>& raw,
+                                std::vector<TxParsed>& out_txs)
 {
-    used_host.clear(); used_tip_height = 0; last_err.clear();
+    out_txs.clear();
+
+    // Try Bitcoin-like block first
+    {
+        R r(raw);
+        if(!r.need(80)) goto try_miq;
+        r.skip(80);
+        uint64_t txcnt=0; if(!get_varint(r, txcnt)) goto try_miq;
+        std::vector<TxParsed> txs; txs.reserve((size_t)txcnt);
+        for(uint64_t i=0;i<txcnt;i++){
+            TxParsed t; if(!parse_tx_bitcoin(r, t)) goto try_miq;
+            txs.push_back(std::move(t));
+        }
+        out_txs.swap(txs);
+        return true;
+    }
+
+try_miq:
+    // MIQ-compact
+    {
+        R r2(raw);
+        if(!r2.need(80)) return false;
+        r2.skip(80);
+        if(!r2.need(4)) return false;
+        uint32_t txcnt = rd_u32_le(r2.p + r2.pos); r2.pos += 4;
+        std::vector<TxParsed> txs; txs.reserve(txcnt);
+        for(uint32_t i=0;i<txcnt;i++){
+            TxParsed t; if(!parse_tx_miq_blockwrapped(r2, t)) return false;
+            txs.push_back(std::move(t));
+        }
+        out_txs.swap(txs);
+        return true;
+    }
+}
+
+// ---------- SPV main ----------
+
+bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
+                       const std::vector<std::vector<uint8_t>>& pkhs,
+                       const SpvOptions& /*opts*/,
+                       std::vector<UtxoLite>& out,
+                       std::string& err)
+{
     out.clear();
 
-    miq::SpvOptions opts{};           // keep defaults from spv_simple.h/cpp
-    opts.recent_block_window = recent_window;   // safe default; file handles maturity & confs
+    // 1) connect + handshake
+    P2POpts po;
+    po.host = p2p_host;
+    po.port = p2p_port;
+    po.user_agent = "/miqwallet-spv:0.3/";
+    P2PLight p2p;
+    if(!p2p.connect_and_handshake(po, err)) return false;
 
-    for(const auto& [h,p] : seeds){
-        std::vector<miq::UtxoLite> v; std::string e;
-        if(miq::spv_collect_utxos(h, p, pkhs, opts, v, e)){
-            out.swap(v);
-            used_host = h + ":" + p;
-            used_tip_height = opts.tip_height;  // spv_simple.cpp can set this in opts by reference
-            return true;
-        }
-        last_err = e.empty() ? "tip query failed" : e;
-    }
-    return false;
-}
+    // 2) headers -> tip
+    uint32_t tip_height=0; std::vector<uint8_t> tip_hash_le;
+    if(!p2p.get_best_header(tip_height, tip_hash_le, err)){ p2p.close(); return false; }
 
-// -----------------------------------------------------------------------------
-// Wallet ops
-// -----------------------------------------------------------------------------
-static bool make_or_restore_wallet(bool restore){
-    std::string wdir = miq::default_wallet_file();
-    if(!wdir.empty()){
-        size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
-    } else {
-        wdir = "wallets/default";
-    }
+    // 3) choose a conservative scan window (8k blocks back)
+    const uint32_t recent_block_window = 8000;
+    uint32_t from_h = (tip_height > recent_block_window) ? (tip_height - recent_block_window) : 0;
 
-    std::string mnemonic, mpass, wpass;
-    if(restore){
-        std::cout << "Paste 12/24-word mnemonic:\n> ";
-        std::getline(std::cin, mnemonic);
-        std::cout << "Mnemonic passphrase (ENTER for none): ";
-        std::getline(std::cin, mpass);
-        std::cout << "Wallet encryption passphrase (ENTER for none): ";
-        std::getline(std::cin, wpass);
-        mnemonic = trim(mnemonic);
-    } else {
-        std::cout << "Wallet encryption passphrase (ENTER for none): ";
-        std::getline(std::cin, wpass);
-        std::string outmn;
-        if(!miq::HdWallet::GenerateMnemonic(128, outmn)) { std::cout << "mnemonic generation failed\n"; return false; }
-        mnemonic = outmn;
-        std::cout << "\nYour mnemonic:\n  " << mnemonic << "\n\n";
-    }
+    // 4) enumerate candidate blocks (no filters yet)
+    std::vector<std::pair<std::vector<uint8_t>, uint32_t>> blocks;
+    if(!p2p.match_recent_blocks(pkhs, from_h, tip_height, blocks, err)){ p2p.close(); return false; }
 
-    std::vector<uint8_t> seed;
-    if(!miq::HdWallet::MnemonicToSeed(mnemonic, mpass, seed)) { std::cout << "mnemonic->seed failed\n"; return false; }
-    miq::HdAccountMeta meta; meta.account=0; meta.next_recv=0; meta.next_change=0;
-    std::string e;
-    if(!miq::SaveHdWallet(wdir, seed, meta, wpass, e)) { std::cout << "save failed: " << e << "\n"; return false; }
+    // 5) fast PKH lookup
+    std::unordered_set<std::vector<uint8_t>, VecHash> pkhset(pkhs.begin(), pkhs.end());
 
-    miq::HdWallet w(seed, meta);
-    std::string addr;
-    if(!w.GetNewAddress(addr)) { std::cout << "derive address failed\n"; return false; }
-    if(!miq::SaveHdWallet(wdir, seed, w.meta(), wpass, e)) { std::cout << "save meta failed: " << e << "\n"; }
-    std::cout << "First receive address: " << addr << "\n";
-    return true;
-}
+    // 6) rolling UTXO view
+    std::vector<UtxoLite> view;
+    std::unordered_map<std::string,size_t> idx;
 
-static bool flow_send_p2p_only(const std::string& cli_host, const std::string& cli_port){
-    // load wallet
-    std::string wdir = miq::default_wallet_file();
-    if(!wdir.empty()){
-        size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
-    } else wdir = "wallets/default";
-
-    std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
-    std::string pass; // prompt
-    std::cout << "Wallet passphrase (ENTER if none): ";
-    std::getline(std::cin, pass);
-    if(!miq::LoadHdWallet(wdir, seed, meta, pass, e)){ std::cout << "Load wallet failed: " << e << "\n"; return false; }
-    miq::HdWallet w(seed, meta);
-
-    // recipient & amount
-    std::cout << "Recipient address: "; std::string to; std::getline(std::cin, to); to=trim(to);
-    std::cout << "Amount (MIQ, e.g. 1.23456789): "; std::string amt; std::getline(std::cin, amt); amt=trim(amt);
-    uint64_t amount=0; try{ amount = parse_amount_miqron(amt);}catch(...){ std::cout<<"Bad amount\n"; return false;}
-
-    // decode dest
-    uint8_t ver=0; std::vector<uint8_t> payload;
-    if(!miq::base58check_decode(to, ver, payload) || ver!=miq::VERSION_P2PKH || payload.size()!=20){
-        std::cout << "Bad address.\n"; return false;
-    }
-
-    // Derive a horizon of keys (simple gap limit)
-    struct Key { std::vector<uint8_t> priv, pub, pkh; uint32_t chain, index; };
-    std::vector<Key> keys;
-    auto add_range = [&](uint32_t chain, uint32_t upto){
-        for(uint32_t i=0;i<=upto + 20; ++i){
-            Key k; k.chain=chain; k.index=i;
-            if(!w.DerivePrivPub(meta.account, chain, i, k.priv, k.pub)) continue;
-            k.pkh = miq::hash160(k.pub);
-            keys.push_back(std::move(k));
-        }
-    };
-    add_range(0, meta.next_recv);
-    add_range(1, meta.next_change);
-
-    // SPV UTXO discovery over P2P (any seed)
-    std::vector<std::vector<uint8_t>> pkhs; pkhs.reserve(keys.size());
-    for(auto& k: keys) pkhs.push_back(k.pkh);
-
-    auto seeds = build_seed_candidates(cli_host, cli_port);
-
-    std::vector<miq::UtxoLite> utxos; std::string used_seed, perr;
-    uint32_t tip_h=0;
-    std::cout << "Syncing (P2P/SPV)…\n";
-    if(!try_spv_collect_any_seed(seeds, pkhs, /*recent_window=*/8000, utxos, used_seed, tip_h, perr)){
-        std::cout << "SPV collection failed: " << perr << "\n";
-        return false;
-    }
-    if(utxos.empty()){
-        std::cout << "No spendable UTXOs found for this seed yet.\n";
-        return false;
-    }
-
-    // Build transaction: prefer coinbase first, then larger outputs
-    miq::Transaction tx;
-    uint64_t in_sum=0;
-    std::stable_sort(utxos.begin(), utxos.end(), [](const miq::UtxoLite& a, const miq::UtxoLite& b){
-        if(a.coinbase != b.coinbase) return a.coinbase && !b.coinbase;
-        return a.value > b.value;
-    });
-
-    for(const auto& u : utxos){
-        miq::TxIn in; in.prev.txid = u.txid; in.prev.vout = u.vout;
-        tx.vin.push_back(in);
-        in_sum += u.value;
-        uint64_t fee_guess = fee_for(tx.vin.size(), 2, 1000);
-        if(in_sum >= amount + fee_guess) break;
-    }
-    if(tx.vin.empty()){ std::cout << "Insufficient funds.\n"; return false; }
-
-    // outputs + fee
-    uint64_t fee_final = 0, change = 0;
+    auto add_out = [&](const std::vector<uint8_t>& txid_le, uint32_t vout,
+                       uint64_t value, const std::vector<uint8_t>& pkh,
+                       uint32_t height, bool coinbase)
     {
-        auto fee2 = fee_for(tx.vin.size(), 2, 1000);
-        if(in_sum < amount + fee2){
-            auto fee1 = fee_for(tx.vin.size(), 1, 1000);
-            if(in_sum < amount + fee1){ std::cout << "Insufficient (need fee).\n"; return false; }
-            fee_final = fee1; change = 0;
-        }else{
-            fee_final = fee2; change = in_sum - amount - fee_final;
-            if(change < 1000){ change = 0; fee_final = fee_for(tx.vin.size(), 1, 1000); }
-        }
-    }
-    (void)fee_final; // currently fixed feerate; tx serialization doesn’t embed fee explicitly
-
-    miq::TxOut o; o.pkh = payload; o.value = amount; tx.vout.push_back(o);
-
-    bool used_change=false; std::vector<uint8_t> cpub, cpriv, cpkh;
-    if(change>0){
-        if(!w.DerivePrivPub(meta.account, 1, meta.next_change, cpriv, cpub)){ std::cout << "derive change failed\n"; return false; }
-        cpkh = miq::hash160(cpub);
-        miq::TxOut ch; ch.value = change; ch.pkh = cpkh; tx.vout.push_back(ch); used_change=true;
-    }
-
-    // sign each input
-    auto sighash = [&](){ miq::Transaction t=tx; for(auto& i: t.vin){ i.sig.clear(); i.pubkey.clear(); } return miq::dsha256(miq::ser_tx(t)); }();
-    auto find_key_for_pkh = [&](const std::vector<uint8_t>& pkh)->const Key*{
-        for(const auto& k: keys) if(k.pkh==pkh) return &k;
-        return nullptr;
+        if(pkhset.find(pkh)==pkhset.end()) return;
+        UtxoLite u;
+        u.txid = txid_le; u.vout=vout; u.value=value; u.pkh=pkh; u.height=height; u.coinbase=coinbase;
+        idx[key_of(u.txid, u.vout)] = (uint32_t)view.size();
+        view.push_back(std::move(u));
     };
-    for(auto& in : tx.vin){
-        const miq::UtxoLite* u=nullptr;
-        for(const auto& x: utxos) if(x.txid==in.prev.txid && x.vout==in.prev.vout){ u=&x; break; }
-        if(!u){ std::cout << "internal: utxo lookup failed\n"; return false; }
-        auto* K = find_key_for_pkh(u->pkh);
-        if(!K){ std::cout << "internal: key lookup failed\n"; return false; }
-        std::vector<uint8_t> sig64;
-        if(!miq::crypto::ECDSA::sign(K->priv, sighash, sig64)){ std::cout << "sign failed\n"; return false; }
-        in.sig = sig64; in.pubkey = K->pub;
-    }
 
-    // serialize + broadcast (any seed)
-    auto raw = miq::ser_tx(tx);
-    std::string txid_hex = miq::to_hex(tx.txid());
-    std::string used_bcast_seed, berr;
-    std::cout << "Broadcasting via P2P (multi-seed)…\n";
-    if(!try_broadcast_any_seed(seeds, raw, used_bcast_seed, berr)){
-        std::cout << "P2P broadcast failed: " << berr << "\n";
-        return false;
-    }
-    std::cout << "Broadcasted via " << used_bcast_seed << ". Txid: " << txid_hex << "\n";
-
-    // bump change index if used
-    if(used_change){
-        auto m = w.meta(); m.next_change = meta.next_change + 1;
-        if(!miq::SaveHdWallet(wdir, seed, m, pass, e)){
-            std::cout << "WARN: SaveHdWallet(next_change) failed: " << e << "\n";
+    auto del_in = [&](const std::vector<uint8_t>& prev_txid, uint32_t vout){
+        auto k = key_of(prev_txid, vout);
+        auto it = idx.find(k);
+        if(it==idx.end()){
+            std::vector<uint8_t> rev = prev_txid; std::reverse(rev.begin(), rev.end());
+            k = key_of(rev, vout);
+            it = idx.find(k);
         }
-    }
-    return true;
-}
-
-static bool show_balance_spv(const std::string& cli_host, const std::string& cli_port){
-    // load wallet meta/seed to derive PKHs
-    std::string wdir = miq::default_wallet_file();
-    if(!wdir.empty()){
-        size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
-    } else wdir = "wallets/default";
-
-    std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
-    std::string pass;
-    std::cout << "Wallet passphrase (ENTER if none): ";
-    std::getline(std::cin, pass);
-    if(!miq::LoadHdWallet(wdir, seed, meta, pass, e)){ std::cout << "Load wallet failed: " << e << "\n"; return false; }
-    miq::HdWallet w(seed, meta);
-
-    struct Key { std::vector<uint8_t> priv, pub, pkh; };
-    std::vector<Key> keys;
-    auto add_range = [&](uint32_t chain, uint32_t upto){
-        for(uint32_t i=0;i<=upto + 20; ++i){
-            Key k;
-            if(!w.DerivePrivPub(meta.account, chain, i, k.priv, k.pub)) continue;
-            k.pkh = miq::hash160(k.pub);
-            keys.push_back(std::move(k));
-        }
-    };
-    add_range(0, meta.next_recv);
-    add_range(1, meta.next_change);
-
-    std::vector<std::vector<uint8_t>> pkhs; pkhs.reserve(keys.size());
-    for(auto& k: keys) pkhs.push_back(k.pkh);
-
-    auto seeds = build_seed_candidates(cli_host, cli_port);
-
-    std::vector<miq::UtxoLite> utxos; std::string used_seed, err;
-    uint32_t tip_h=0;
-    std::cout << "Syncing (P2P/SPV)…\n";
-    if(!try_spv_collect_any_seed(seeds, pkhs, 8000, utxos, used_seed, tip_h, err)){
-        std::cout << "SPV collection failed: " << err << "\n";
-        return false;
-    }
-    uint64_t v=0; for(const auto& u: utxos) v += u.value;
-    std::ostringstream s; s << (v/COIN) << "." << std::setw(8) << std::setfill('0') << (v%COIN);
-    std::cout << "Balance (SPV via " << used_seed << "): " << s.str() << " MIQ (" << v << " miqron)\n";
-    return true;
-}
-
-// -----------------------------------------------------------------------------
-// main
-// -----------------------------------------------------------------------------
-int main(int argc, char** argv){
-    std::ios::sync_with_stdio(false);
-
-    // CLI seed (optional). If empty, we auto-build candidate list.
-    std::string cli_host;
-    std::string cli_port = std::to_string(miq::P2P_PORT);
-
-    // parse flags
-    for(int i=1;i<argc;i++){
-        std::string a = argv[i];
-        auto eat = [&](const char* k, std::string& dst)->bool{
-            size_t L = std::strlen(k);
-            if(a.rfind(k, 0)==0){
-                if(a.size()>L && a[L]=='='){ dst = a.substr(L+1); return true; }
-                if(i+1<argc){ dst = argv[++i]; return true; }
+        if(it!=idx.end()){
+            size_t pos  = it->second;
+            size_t last = view.size()-1;
+            if(pos!=last){
+                idx[key_of(view[last].txid, view[last].vout)] = pos;
+                std::swap(view[pos], view[last]);
             }
-            return false;
-        };
-        if(eat("--p2pseed", cli_host)) { auto c=cli_host.find(':'); if(c!=std::string::npos){ cli_port=cli_host.substr(c+1); cli_host=cli_host.substr(0,c);} continue; }
-        if(eat("--p2pport", cli_port)) continue;
-    }
-
-    std::cout << "Chain: " << CHAIN_NAME << "\n";
-    {
-        auto seeds = build_seed_candidates(cli_host, cli_port);
-        std::cout << "Seed order:";
-        for(size_t i=0;i<seeds.size();++i){
-            if(i==0) std::cout << " ";
-            else     std::cout << ", ";
-            std::cout << seeds[i].first << ":" << seeds[i].second;
+            view.pop_back();
+            idx.erase(it);
         }
-        std::cout << "\n";
+    };
+
+    // 7) stream blocks, update view
+    for(const auto& [hash_le, height] : blocks){
+        std::vector<uint8_t> raw;
+        if(!p2p.get_block_by_hash(hash_le, raw, err)){ p2p.close(); return false; }
+
+        std::vector<TxParsed> txs;
+        if(!parse_block_collect(raw, txs)){ err = "failed to parse block @" + std::to_string(height); p2p.close(); return false; }
+
+        for(const auto& tx : txs){
+            for(const auto& in : tx.vin) del_in(in.prev_txid, in.vout);
+        }
+        for(const auto& tx : txs){
+            for(uint32_t i=0;i<(uint32_t)tx.vout.size(); ++i){
+                const auto& o = tx.vout[i];
+                if(o.pkh.size()==20) add_out(tx.txid_le, i, o.value, o.pkh, height, tx.coinbase);
+            }
+        }
     }
 
-    for(;;){
-        std::cout << "\n==== MIQ Wallet (P2P) ====\n";
-        std::cout << "1) Create wallet\n";
-        std::cout << "2) Recover wallet\n";
-        std::cout << "3) Send MIQ (P2P broadcast)\n";
-        std::cout << "4) Show balance (SPV)\n";
-        std::cout << "q) Quit\n> ";
-        std::string c; std::getline(std::cin, c); c=trim(c);
-        if(c=="1"){ (void)make_or_restore_wallet(false); }
-        else if(c=="2"){ (void)make_or_restore_wallet(true); }
-        else if(c=="3"){ (void)flow_send_p2p_only(cli_host, cli_port); }
-        else if(c=="4"){ (void)show_balance_spv(cli_host, cli_port); }
-        else if(c=="q"||c=="Q"||c=="exit") break;
+    p2p.close();
+
+    // 8) post-filter: require ≥1 conf for all; coinbases need full maturity
+    std::vector<UtxoLite> finalv; finalv.reserve(view.size());
+    for(const auto& u : view){
+        uint32_t conf = (u.height <= tip_height) ? (tip_height - u.height + 1) : 0;
+        if(conf < 1) continue;
+        if(u.coinbase && conf < COINBASE_MATURITY) continue;
+        finalv.push_back(u);
     }
-    return 0;
+
+    out.swap(finalv);
+    return true;
+}
+
 }
