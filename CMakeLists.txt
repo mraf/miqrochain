@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
+# Keep old behavior for FetchContent_Populate
 if(POLICY CMP0169)
   cmake_policy(SET CMP0169 OLD)
 endif()
@@ -12,15 +13,12 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include(FetchContent)
-find_package(PkgConfig QUIET)
 
 # ------------------------------------------------------------------
 # Options
 # ------------------------------------------------------------------
 option(MIQ_ENABLE_WALLET_ENC "Enable wallet at-rest encryption" OFF)
-option(MIQ_ENABLE_UPNP       "Enable UPnP/NAT-PMP port mapping" ON)  # default ON
-option(MIQ_FETCH_MINIUPNPC   "Auto-fetch miniupnpc when enabling UPnP" ON)
-option(MIQ_BUILD_TESTS       "Build tests" OFF)
+option(MIQ_BUILD_TESTS       "Build tests"                       OFF)
 
 # DB backend options
 option(MIQ_USE_ROCKSDB       "Use RocksDB instead of LevelDB"              OFF)
@@ -154,9 +152,14 @@ set(MIQ_CORE_SOURCES
     src/block.h src/block.cpp
     src/difficulty.h src/difficulty.cpp
     src/storage.h src/storage.cpp
+
+    # Legacy/simple UTXO backend
     src/utxo.h src/utxo.cpp
+
+    # KV-backed chainstate
     src/kvdb.h src/kvdb.cpp
     src/utxo_kv.h src/utxo_kv.cpp
+
     src/mempool.h src/mempool.cpp
     src/hasher.h src/hasher.cpp
     src/lut.h src/lut.cpp
@@ -167,16 +170,24 @@ set(MIQ_CORE_SOURCES
     src/p2p.h src/p2p.cpp
     src/http.h src/http.cpp
     src/rpc.h src/rpc.cpp
+
+    # Crypto interface + libsecp backend wrapper
     src/crypto/ecdsa_iface.h
     src/crypto/ecdsa_libsecp256k1.cpp
+
+    # Reorg / NAT / Seeds / MTP
     src/reorg_manager.h
     src/reorg_manager.cpp
     src/nat.cpp
     src/seeds.cpp
     src/mtp.h
     src/mtp.cpp
+
+    # TLS proxy & IBD monitor
     src/tls_proxy.h src/tls_proxy.cpp
     src/ibd_monitor.h src/ibd_monitor.cpp
+
+    # RNG / wallet encryption stubs
     src/wallet_encryptor.cpp
     src/crypto/secure_random.cpp
 )
@@ -185,23 +196,28 @@ set(MIQ_CORE_SOURCES
 # Daemon (miqrod)
 # ------------------------------------------------------------------
 add_executable(miqrod src/main.cpp ${MIQ_CORE_SOURCES})
-
 target_include_directories(miqrod PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Link DB backend & define flavor
 target_link_libraries(miqrod PRIVATE ${MIQ_DB_TARGET})
 if(MIQ_DB_DEFINE)
   target_compile_definitions(miqrod PRIVATE ${MIQ_DB_DEFINE})
 endif()
 
+# Platform libs
 if(WIN32)
   target_link_libraries(miqrod PRIVATE Ws2_32)
 endif()
 
+# TLS + Threads
 target_link_libraries(miqrod PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+
+# libsecp256k1
 if(MIQ_USE_LIBSECP)
   target_link_libraries(miqrod PRIVATE ${MIQ_LIBSECP_TARGET})
 endif()
 
+# Optional wallet encryption
 if(MIQ_ENABLE_WALLET_ENC)
   target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_WALLET_ENC=1)
   target_link_libraries(miqrod PRIVATE OpenSSL::Crypto)
@@ -209,91 +225,6 @@ if(MIQ_ENABLE_WALLET_ENC)
 else()
   message(STATUS "Wallet encryption: DISABLED (default)")
 endif()
-
-# ------------------------------------------------------------------
-# UPnP/NAT-PMP (miniupnpc) – system / local vendored / optional fetch
-# ------------------------------------------------------------------
-option(MIQ_ENABLE_UPNP          "Enable UPnP/NAT-PMP port mapping" ON)
-option(MIQ_FETCH_MINIUPNPC      "Auto-fetch miniupnpc if not found" OFF)  # default OFF for CI
-set(MIQ_MINIUPNPC_TAG "miniupnpc_2_2_7" CACHE STRING "miniupnpc git tag/commit")
-set(MIQ_MINIUPNPC_LOCAL_DIR "" CACHE PATH "Path to a local miniupnpc source tree (with CMakeLists.txt)")
-
-if(MIQ_ENABLE_UPNP)
-  set(_MINIUPNPC_INC "")
-  set(_MINIUPNPC_LIBS "")
-
-  # 1) Local vendored tree (preferred when CI has no network)
-  if(MIQ_MINIUPNPC_LOCAL_DIR AND EXISTS "${MIQ_MINIUPNPC_LOCAL_DIR}/CMakeLists.txt")
-    message(STATUS "Using vendored miniupnpc at: ${MIQ_MINIUPNPC_LOCAL_DIR}")
-    add_subdirectory("${MIQ_MINIUPNPC_LOCAL_DIR}" _miniupnpc_build)
-    if(TARGET miniupnpc)
-      set(_MINIUPNPC_LIBS miniupnpc)
-    elseif(TARGET libminiupnpc-static)
-      set(_MINIUPNPC_LIBS libminiupnpc-static)
-    elseif(TARGET libminiupnpc)
-      set(_MINIUPNPC_LIBS libminiupnpc)
-    endif()
-    set(_MINIUPNPC_INC "${MIQ_MINIUPNPC_LOCAL_DIR}/include")
-  endif()
-
-  # 2) System package (pkg-config or classic find)
-  if(NOT _MINIUPNPC_LIBS)
-    find_package(PkgConfig QUIET)
-    if(PKG_CONFIG_FOUND)
-      pkg_check_modules(MINIUPNPC QUIET miniupnpc)
-      if(MINIUPNPC_FOUND)
-        set(_MINIUPNPC_INC  ${MINIUPNPC_INCLUDE_DIRS})
-        set(_MINIUPNPC_LIBS ${MINIUPNPC_LINK_LIBRARIES})
-      endif()
-    endif()
-  endif()
-  if(NOT _MINIUPNPC_LIBS)
-    find_path(MINIUPNPC_INCLUDE_DIR miniupnpc/miniupnpc.h)
-    find_library(MINIUPNPC_LIBRARY NAMES miniupnpc)
-    if(MINIUPNPC_INCLUDE_DIR AND MINIUPNPC_LIBRARY)
-      set(_MINIUPNPC_INC  ${MINIUPNPC_INCLUDE_DIR})
-      set(_MINIUPNPC_LIBS ${MINIUPNPC_LIBRARY})
-    endif()
-  endif()
-
-  # 3) Optional fetch (only if explicitly enabled)
-  if(NOT _MINIUPNPC_LIBS AND MIQ_FETCH_MINIUPNPC)
-    message(STATUS "miniupnpc not found; fetching miniupnp/miniupnpc @ ${MIQ_MINIUPNPC_TAG}")
-    include(FetchContent)
-    FetchContent_Declare(
-      miniupnpc_src
-      GIT_REPOSITORY https://github.com/miniupnp/miniupnpc.git
-      GIT_TAG        ${MIQ_MINIUPNPC_TAG}
-      GIT_PROGRESS   TRUE
-    )
-    # NOTE: If your environment blocks GitHub, leave MIQ_FETCH_MINIUPNPC=OFF.
-    FetchContent_MakeAvailable(miniupnpc_src)
-    if(TARGET miniupnpc)
-      set(_MINIUPNPC_LIBS miniupnpc)
-    elseif(TARGET libminiupnpc-static)
-      set(_MINIUPNPC_LIBS libminiupnpc-static)
-    elseif(TARGET libminiupnpc)
-      set(_MINIUPNPC_LIBS libminiupnpc)
-    endif()
-    set(_MINIUPNPC_INC "${miniupnpc_src_SOURCE_DIR}/include")
-  endif()
-
-  if(_MINIUPNPC_LIBS)
-    target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_UPNP=1)
-    target_include_directories(miqrod PRIVATE ${_MINIUPNPC_INC})
-    target_link_libraries(miqrod PRIVATE ${_MINIUPNPC_LIBS})
-    if(WIN32)
-      target_link_libraries(miqrod PRIVATE iphlpapi ws2_32)
-    endif()
-    message(STATUS "UPnP enabled")
-  else()
-    message(WARNING "UPnP requested but miniupnpc not available; continuing WITHOUT UPnP. \
-Provide system package, set MIQ_MINIUPNPC_LOCAL_DIR, or enable MIQ_FETCH_MINIUPNPC on a networked runner.")
-  endif()
-else()
-  message(STATUS "UPnP disabled")
-endif()
-
 
 # ------------------------------------------------------------------
 # CLI wallet (miqwallet) — minimal deps (just sockets)
