@@ -1,7 +1,9 @@
 // src/cli/miqwallet.cpp
-// Menu-driven MIQ wallet CLI (create/recover/send + live confirmations).
-// Portable remote mode: --host/--port/--token/--cookiepath OR env overrides.
-// Falls back to a compiled-in static token so it "just works" remotely.
+// MIQ wallet CLI with Bitcoin-like cookie-based HTTP Basic auth.
+// - Works locally or remotely (no node required on the same machine).
+// - Finds cookie automatically in common paths OR via env/flags.
+// - Supports direct user/password if server uses rpcauth-style creds.
+// Menu: 1) Create wallet  2) Recover  3) Send  4) Show balance  q) Quit
 
 #include <iostream>
 #include <iomanip>
@@ -18,9 +20,14 @@
 #include <fstream>
 
 #ifdef _WIN32
+  #include <windows.h>
+  #include <shlobj.h>
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #pragma comment(lib, "ws2_32.lib")
+  #ifndef NOMINMAX
+  #define NOMINMAX 1
+  #endif
 #else
   #include <sys/types.h>
   #include <sys/socket.h>
@@ -30,21 +37,11 @@
 
 #include "constants.h"  // miq::RPC_PORT, miq::CHAIN_NAME, miq::COIN
 
-// ---- default host/port/token (compile-time) ----
-#ifndef MIQ_DEFAULT_RPC_HOST
-#define MIQ_DEFAULT_RPC_HOST "127.0.0.1"
-#endif
-#ifndef MIQ_DEFAULT_RPC_PORT
-#define MIQ_DEFAULT_RPC_PORT "9834"
-#endif
-#ifndef MIQ_STATIC_RPC_TOKEN_STR
-#define MIQ_STATIC_RPC_TOKEN_STR "miq_static_token_change_me" // MUST match server default
-#endif
-#ifndef MIQ_DEFAULT_RPC_TOKEN
-#define MIQ_DEFAULT_RPC_TOKEN MIQ_STATIC_RPC_TOKEN_STR
-#endif
+using miq::RPC_PORT;
+using miq::CHAIN_NAME;
+using miq::COIN;
 
-// ---------- helpers ----------
+// ----------------- tiny helpers -----------------
 static std::string trim(const std::string& s) {
     size_t a = 0, b = s.size();
     while (a < b && std::isspace((unsigned char)s[a])) ++a;
@@ -52,24 +49,12 @@ static std::string trim(const std::string& s) {
     return s.substr(a, b-a);
 }
 
-static bool read_cookie_token_file(const std::string& fullpath, std::string& out_tok) {
-    std::ifstream f(fullpath, std::ios::in | std::ios::binary);
+static bool read_first_line(const std::string& path, std::string& out) {
+    std::ifstream f(path, std::ios::in | std::ios::binary);
     if (!f.good()) return false;
-    std::string line; std::getline(f, line);
-    while (!line.empty() && (line.back()=='\r'||line.back()=='\n'||line.back()==' '||line.back()=='\t')) line.pop_back();
-    out_tok = line;
-    return !out_tok.empty();
-}
-
-static bool read_cookie_token_default_dir(std::string& out_tok) {
-#ifdef _WIN32
-    const char* app = std::getenv("APPDATA");
-    std::string dd = app && *app ? std::string(app) + "\\miqrochain\\.cookie" : std::string(".\\.cookie");
-#else
-    const char* home = std::getenv("HOME");
-    std::string dd = home && *home ? std::string(home) + "/.miqrochain/.cookie" : std::string("./.cookie");
-#endif
-    return read_cookie_token_file(dd, out_tok);
+    std::getline(f, out);
+    out = trim(out);
+    return !out.empty();
 }
 
 static std::string json_escape(const std::string& s) {
@@ -146,9 +131,178 @@ static bool json_is_string_value(const std::string& body, std::string& out) {
     return false;
 }
 
-// ---------- raw HTTP ----------
+// --------------- Base64 for HTTP Basic ---------------
+static std::string b64_encode(const std::string& in){
+    static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out; out.reserve(((in.size()+2)/3)*4);
+    size_t i=0;
+    while(i+3 <= in.size()){
+        unsigned v = (unsigned((unsigned char)in[i])<<16) | (unsigned((unsigned char)in[i+1])<<8) | unsigned((unsigned char)in[i+2]);
+        out.push_back(T[(v>>18)&63]); out.push_back(T[(v>>12)&63]); out.push_back(T[(v>>6)&63]); out.push_back(T[v&63]);
+        i += 3;
+    }
+    if(i+1 == in.size()){
+        unsigned v = (unsigned((unsigned char)in[i])<<16);
+        out.push_back(T[(v>>18)&63]); out.push_back(T[(v>>12)&63]); out.push_back('='); out.push_back('=');
+    } else if(i+2 == in.size()){
+        unsigned v = (unsigned((unsigned char)in[i])<<16) | (unsigned((unsigned char)in[i+1])<<8);
+        out.push_back(T[(v>>18)&63]); out.push_back(T[(v>>12)&63]); out.push_back(T[(v>>6)&63]); out.push_back('=');
+    }
+    return out;
+}
+static std::string make_basic_auth(const std::string& userpass){
+    return "Basic " + b64_encode(userpass);
+}
+
+// --------------- Cookie discovery (Bitcoin-like) ---------------
+static std::string join_path(const std::string& a, const std::string& b){
+#ifdef _WIN32
+    const char sep='\\';
+#else
+    const char sep='/';
+#endif
+    if(a.empty()) return b;
+    if(a.back()==sep) return a+b;
+    return a + sep + b;
+}
+
+#ifdef _WIN32
+static std::string win_get_known_folder(REFKNOWNFOLDERID rfid) {
+    PWSTR p = nullptr;
+    std::string out;
+    if (SHGetKnownFolderPath(rfid, KF_FLAG_DEFAULT, NULL, &p) == S_OK && p) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, p, -1, nullptr, 0, nullptr, nullptr);
+        if (len > 0) {
+            std::string s; s.resize((size_t)len-1);
+            WideCharToMultiByte(CP_UTF8, 0, p, -1, &s[0], len, nullptr, nullptr);
+            out = s;
+        }
+        CoTaskMemFree(p);
+    }
+    return out;
+}
+#endif
+
+struct RpcEndpoint {
+    std::string host = "127.0.0.1";
+    std::string port = std::to_string(RPC_PORT);
+    std::string auth_header;      // "Authorization: Basic <...>"
+    std::string auth_source;      // human-readable (cookie path, env, user:pass)
+};
+
+static bool find_cookie_auto(std::string& out_userpass, std::string& source_hint,
+                             const std::string& cmd_cookiefile,
+                             const std::string& cmd_datadir)
+{
+    // 1) MIQ_RPC_COOKIE (contents like "__cookie__:abcdef...")
+    const char* env_cookie_line = std::getenv("MIQ_RPC_COOKIE");
+    if(env_cookie_line && *env_cookie_line){
+        out_userpass = env_cookie_line;
+        source_hint  = "env:MIQ_RPC_COOKIE";
+        return true;
+    }
+
+    // 2) Explicit cookie file via flag or env
+    std::string cf;
+    if(!cmd_cookiefile.empty()) cf = cmd_cookiefile;
+    else {
+        const char* e = std::getenv("MIQ_RPC_COOKIEFILE");
+        if(e && *e) cf = e;
+    }
+    if(!cf.empty()){
+        if(read_first_line(cf, out_userpass)) { source_hint = cf; return true; }
+    }
+
+    // 3) datadir/.cookie via flag
+    if(!cmd_datadir.empty()){
+        std::string p = join_path(cmd_datadir, ".cookie");
+        if(read_first_line(p, out_userpass)) { source_hint = p; return true; }
+    }
+
+    // 4) Default locations (Windows-first)
+#ifdef _WIN32
+    {
+        std::vector<std::string> cands;
+
+        // %APPDATA%\miqrochain\.cookie
+        char* appdata = nullptr; size_t _sz=0;
+        _dupenv_s(&appdata, &_sz, "APPDATA");
+        if(appdata && *appdata) cands.push_back(join_path(std::string(appdata), "miqrochain\\.cookie"));
+        if(appdata) free(appdata);
+
+        // %LOCALAPPDATA%\miqrochain\.cookie
+        char* lad = nullptr; _dupenv_s(&lad, &_sz, "LOCALAPPDATA");
+        if(lad && *lad) cands.push_back(join_path(std::string(lad), "miqrochain\\.cookie"));
+        if(lad) free(lad);
+
+        // KnownFolder Roaming
+        auto roaming = win_get_known_folder(FOLDERID_RoamingAppData);
+        if(!roaming.empty()) cands.push_back(join_path(roaming, "miqrochain\\.cookie"));
+
+        // %USERPROFILE%\.miqrochain\.cookie
+        char* up = nullptr; _dupenv_s(&up, &_sz, "USERPROFILE");
+        if(up && *up) cands.push_back(join_path(std::string(up), ".miqrochain\\.cookie"));
+        if(up) free(up);
+
+        for(const auto& p : cands){
+            if(read_first_line(p, out_userpass)) { source_hint = p; return true; }
+        }
+    }
+#else
+    {
+        std::vector<std::string> cands;
+        const char* home = std::getenv("HOME");
+        if(home && *home){
+            cands.push_back(std::string(home) + "/.miqrochain/.cookie");
+            cands.push_back(std::string(home) + "/.config/miqrochain/.cookie");
+            cands.push_back(std::string(home) + "/.local/share/miqrochain/.cookie");
+        }
+        const char* xdg = std::getenv("XDG_DATA_HOME");
+        if(xdg && *xdg) cands.push_back(std::string(xdg) + "/miqrochain/.cookie");
+        cands.push_back("/var/lib/miqrochain/.cookie");
+
+        for(const auto& p : cands){
+            if(read_first_line(p, out_userpass)) { source_hint = p; return true; }
+        }
+    }
+#endif
+    return false;
+}
+
+static void parse_argv(int argc, char** argv,
+                       std::string& host, std::string& port,
+                       std::string& cookiefile, std::string& datadir,
+                       std::string& user, std::string& pass)
+{
+    // Env defaults
+    if(const char* eh = std::getenv("MIQ_RPC_HOST")) host = eh;
+    if(const char* ep = std::getenv("MIQ_RPC_PORT")) port = ep;
+    if(const char* ed = std::getenv("MIQ_DATADIR"))  datadir = ed;
+    if(const char* ec = std::getenv("MIQ_RPC_COOKIEFILE")) cookiefile = ec;
+    if(const char* eu = std::getenv("MIQ_RPC_USER")) user = eu;
+    if(const char* ew = std::getenv("MIQ_RPC_PASSWORD")) pass = ew;
+
+    for(int i=1;i<argc;i++){
+        std::string a = argv[i];
+        auto eat = [&](const char* k, std::string& dst)->bool{
+            if(a.rfind(k, 0)==0){
+                if(a.size()>std::strlen(k) && a[std::strlen(k)]=='='){ dst = a.substr(std::strlen(k)+1); return true; }
+                if(i+1<argc){ dst = argv[++i]; return true; }
+            }
+            return false;
+        };
+        if(eat("--rpcconnect", host)) continue;
+        if(eat("--rpcport",    port)) continue;
+        if(eat("--cookiefile", cookiefile)) continue;
+        if(eat("--datadir",    datadir)) continue;
+        if(eat("--rpcuser",    user)) continue;
+        if(eat("--rpcpassword",pass)) continue;
+    }
+}
+
+// --------------- very small HTTP POST (with Basic auth) ---------------
 static bool http_post(const std::string& host, const std::string& port,
-                      const std::string& path, const std::string& token,
+                      const std::string& path, const std::string& auth_header,
                       const std::string& body, std::string& out_body, std::string* out_status=nullptr)
 {
 #ifdef _WIN32
@@ -187,7 +341,7 @@ static bool http_post(const std::string& host, const std::string& port,
         << "Host: " << host << ":" << port << "\r\n"
         << "Connection: close\r\n"
         << "Content-Type: application/json\r\n";
-    if (!token.empty()) req << "Authorization: " << token << "\r\n";
+    if (!auth_header.empty()) req << "Authorization: " << auth_header << "\r\n";
     req << "Content-Length: " << body.size() << "\r\n\r\n"
         << body;
 
@@ -232,89 +386,42 @@ static bool http_post(const std::string& host, const std::string& port,
             if (sp2 != std::string::npos) *out_status = headers.substr(sp+1, sp2-sp-1);
         }
     }
-    out_body = bodyOut;
+    out_body = trim(bodyOut);
     return true;
 }
 
-static std::string rpc_call(const std::string& method, const std::vector<std::string>& params_json,
-                            const std::string& token,
-                            const std::string& host="127.0.0.1",
-                            const std::string& port=std::to_string(miq::RPC_PORT))
-{
-    std::ostringstream b;
-    b << "{\"method\":" << json_escape(method);
-    if (!params_json.empty()) {
-        b << ",\"params\":[";
-        for (size_t i=0;i<params_json.size();++i) {
-            if (i) b << ',';
-            b << params_json[i];
-        }
-        b << "]";
-    }
-    b << "}";
-    std::string resp, status;
-    if (!http_post(host, port, "/", token, b.str(), resp, &status)) return "";
-    return trim(resp);
-}
-
+// convenience
 static std::string jstrp(const std::string& s) { return json_escape(s); }
 
-// ---------- option parsing ----------
-struct Opts {
-    std::string host;
-    std::string port;
-    std::string token;
-    std::string cookiepath;
+struct Rpc {
+    std::string host = "127.0.0.1";
+    std::string port = std::to_string(RPC_PORT);
+    std::string auth_header; // "Basic ..."
+
+    std::string call(const std::string& method, const std::vector<std::string>& params_json) const {
+        std::ostringstream b;
+        b << "{\"method\":" << json_escape(method);
+        if (!params_json.empty()) {
+            b << ",\"params\":[";
+            for (size_t i=0;i<params_json.size();++i) {
+                if (i) b << ',';
+                b << params_json[i];
+            }
+            b << "]";
+        }
+        b << "}";
+        std::string resp, status;
+        if (!http_post(host, port, "/", auth_header, b.str(), resp, &status)) return "";
+        return trim(resp);
+    }
 };
 
-static Opts parse_opts(int argc, char** argv){
-    Opts o;
-
-    // compile-time defaults
-    o.host = MIQ_DEFAULT_RPC_HOST;
-    o.port = MIQ_DEFAULT_RPC_PORT;
-    // token left empty here; we'll fill later
-
-    // env overrides
-    if (const char* e=getenv("MIQ_RPC_HOST"))  o.host = e;
-    if (const char* e=getenv("MIQ_RPC_PORT"))  o.port = e;
-    if (const char* e=getenv("MIQ_RPC_TOKEN")) o.token = e;
-
-    // CLI overrides
-    for (int i=1;i<argc;i++){
-        std::string a = argv[i];
-        auto getv=[&](std::string& dst){
-            if (i+1<argc) { dst = argv[++i]; return true; }
-            return false;
-        };
-        if (a=="--host") getv(o.host);
-        else if (a=="--port") getv(o.port);
-        else if (a=="--token") getv(o.token);
-        else if (a=="--cookiepath") getv(o.cookiepath);
-    }
-
-    // resolve token
-    if (o.token.empty()) {
-        if (!o.cookiepath.empty()) {
-            std::string t; if (read_cookie_token_file(o.cookiepath, t)) o.token = t;
-        }
-    }
-    if (o.token.empty()) {
-        std::string t; if (read_cookie_token_default_dir(t)) o.token = t;
-    }
-    if (o.token.empty()) {
-        // final fallback: compiled-in static token
-        o.token = MIQ_DEFAULT_RPC_TOKEN;
-    }
-    return o;
-}
-
-// ---------- wallet ops (fully qualifies miq::COIN) ----------
-static bool unlock_if_needed(const std::string& token, const std::string& host, const std::string& port) {
+// ---------------- wallet ops -----------------
+static bool unlock_if_needed(const Rpc& rpc) {
     std::cout << "\nWallet passphrase (leave blank if not encrypted): ";
     std::string pass; std::getline(std::cin, pass);
     if (trim(pass).empty()) return true;
-    std::string r = rpc_call("walletunlock", { jstrp(pass), "600" }, token, host, port);
+    std::string r = rpc.call("walletunlock", { jstrp(pass), "600" });
     if (r.find("\"error\"") != std::string::npos) {
         std::cout << "Unlock failed: " << r << "\n";
         return false;
@@ -322,12 +429,12 @@ static bool unlock_if_needed(const std::string& token, const std::string& host, 
     return true;
 }
 
-static bool op_create_wallet(const std::string& token, const std::string& host, const std::string& port) {
+static bool op_create_wallet(const Rpc& rpc) {
     std::cout << "\n-- Create new HD wallet --\n";
     std::cout << "Optional wallet passphrase (ENTER for none): ";
     std::string wpass; std::getline(std::cin, wpass);
 
-    std::string r = rpc_call("createhdwallet", { "\"\"", "\"\"", jstrp(wpass) }, token, host, port);
+    std::string r = rpc.call("createhdwallet", { "\"\"", "\"\"", jstrp(wpass) });
     if (r.empty() || r.find("\"error\"") != std::string::npos) {
         std::cout << "Create failed: " << r << "\n";
         return false;
@@ -338,26 +445,25 @@ static bool op_create_wallet(const std::string& token, const std::string& host, 
         return false;
     }
 
-    std::cout << "\nYour mnemonic (WRITE IT DOWN, keep offline!):\n\n";
+    std::cout << "\nYour 12-word mnemonic (WRITE IT DOWN, keep offline!):\n\n";
     std::cout << "  " << mnemonic << "\n\n";
 
     if (!wpass.empty()) {
-        std::string ur = rpc_call("walletunlock", { jstrp(wpass), "600" }, token, host, port);
+        std::string ur = rpc.call("walletunlock", { jstrp(wpass), "600" });
         if (ur.find("\"error\"") != std::string::npos) {
             std::cout << "Unlock failed: " << ur << "\n";
             return false;
         }
     }
 
-    std::string addr = rpc_call("getnewaddress", {}, token, host, port);
+    std::string addr = rpc.call("getnewaddress", {});
     if (!json_is_string_value(addr, addr)) {
         std::cout << "Could not get receive address: " << addr << "\n";
         return false;
     }
-    std::cout << "First receive address:\n";
-    std::cout << "  " << addr << "\n";
+    std::cout << "First receive address:\n  " << addr << "\n";
 
-    std::string bal = rpc_call("getbalance", {}, token, host, port);
+    std::string bal = rpc.call("getbalance", {});
     long long miqron=0; std::string miqPretty;
     json_get_number_field_ll(bal, "miqron", miqron);
     json_get_string_field(bal, "miq", miqPretty);
@@ -365,7 +471,7 @@ static bool op_create_wallet(const std::string& token, const std::string& host, 
     return true;
 }
 
-static bool op_recover_wallet(const std::string& token, const std::string& host, const std::string& port) {
+static bool op_recover_wallet(const Rpc& rpc) {
     std::cout << "\n-- Recover HD wallet --\n";
     std::cout << "Paste 12 or 24-word mnemonic:\n> ";
     std::string mnemonic; std::getline(std::cin, mnemonic);
@@ -377,7 +483,7 @@ static bool op_recover_wallet(const std::string& token, const std::string& host,
     std::cout << "Wallet encryption passphrase (new; ENTER for none): ";
     std::string wpass; std::getline(std::cin, wpass);
 
-    std::string r = rpc_call("restorehdwallet", { jstrp(mnemonic), jstrp(mpass), jstrp(wpass) }, token, host, port);
+    std::string r = rpc.call("restorehdwallet", { jstrp(mnemonic), jstrp(mpass), jstrp(wpass) });
     if (r.find("\"error\"") != std::string::npos) {
         std::cout << "Restore failed: " << r << "\n";
         return false;
@@ -385,61 +491,34 @@ static bool op_recover_wallet(const std::string& token, const std::string& host,
     std::cout << "Restored.\n";
 
     if (!wpass.empty()) {
-        std::string ur = rpc_call("walletunlock", { jstrp(wpass), "600" }, token, host, port);
+        std::string ur = rpc.call("walletunlock", { jstrp(wpass), "600" });
         if (ur.find("\"error\"") != std::string::npos) {
             std::cout << "Unlock failed: " << ur << "\n";
         }
     }
 
-    const int SCAN_RECEIVE = 50;
-    const int SCAN_CHANGE  = 10;
-    unsigned long long total_miqron = 0;
-
-    auto scan_range = [&](int count){
-        for (int i=0;i<count;i++){
-            std::string addrJson = rpc_call("deriveaddressat", { std::to_string(i) }, token, host, port);
-            std::string addr;
-            if (!json_is_string_value(addrJson, addr)) continue;
-
-            std::string utx = rpc_call("getaddressutxos", { jstrp(addr) }, token, host, port);
-            size_t p = 0;
-            while ((p = utx.find("\"value\"", p)) != std::string::npos) {
-                p = utx.find(':', p);
-                if (p == std::string::npos) break;
-                ++p;
-                while (p < utx.size() && std::isspace((unsigned char)utx[p])) ++p;
-                unsigned long long v = 0; bool any=false;
-                while (p < utx.size() && std::isdigit((unsigned char)utx[p])) { any=true; v = v*10 + (utx[p]-'0'); ++p; }
-                if (any) total_miqron += v;
-            }
-        }
-    };
-    scan_range(SCAN_RECEIVE);
-    scan_range(SCAN_CHANGE);
-
-    std::cout << "Discovered balance (first " << SCAN_RECEIVE << " receive + " << SCAN_CHANGE << " change): ";
-    std::cout << (total_miqron / (unsigned long long)miq::COIN) << "."
-              << std::setw(8) << std::setfill('0') << (total_miqron % (unsigned long long)miq::COIN)
-              << " MIQ\n";
-
+    // Simple balance after restore
+    std::string bal = rpc.call("getbalance", {});
+    long long miqron=0; std::string miqPretty;
+    json_get_number_field_ll(bal, "miqron", miqron);
+    json_get_string_field(bal, "miq", miqPretty);
+    std::cout << "Discovered balance: " << miqPretty << " MIQ (" << miqron << " miqron)\n";
     return true;
 }
 
-static bool tx_in_mempool(const std::string& token, const std::string& host, const std::string& port, const std::string& txid) {
-    std::string mp = rpc_call("getrawmempool", {}, token, host, port);
+static bool tx_in_mempool(const Rpc& rpc, const std::string& txid) {
+    std::string mp = rpc.call("getrawmempool", {});
     std::string needle = "\"" + txid + "\"";
     return mp.find(needle) != std::string::npos;
 }
 
-static int tx_confirmations_via_recipient(const std::string& token,
-                                          const std::string& host,
-                                          const std::string& port,
+static int tx_confirmations_via_recipient(const Rpc& rpc,
                                           const std::string& txid,
                                           const std::string& recipient_addr)
 {
-    if (tx_in_mempool(token, host, port, txid)) return 0;
+    if (tx_in_mempool(rpc, txid)) return 0;
 
-    std::string utx = rpc_call("getaddressutxos", { jstrp(recipient_addr) }, token, host, port);
+    std::string utx = rpc.call("getaddressutxos", { jstrp(recipient_addr) });
     size_t pos = 0;
     int txHeight = -1;
     while (true) {
@@ -472,7 +551,7 @@ static int tx_confirmations_via_recipient(const std::string& token,
     }
     if (txHeight < 0) return 0;
 
-    std::string hjson = rpc_call("getblockcount", {}, token, host, port);
+    std::string hjson = rpc.call("getblockcount", {});
     std::string hs; if (!json_is_string_value(hjson, hs)) hs = hjson;
     int curH = std::stoi(hs);
     int confs = (curH - txHeight + 1);
@@ -480,9 +559,9 @@ static int tx_confirmations_via_recipient(const std::string& token,
     return confs;
 }
 
-static bool op_send_flow(const std::string& token, const std::string& host, const std::string& port) {
+static bool op_send_flow(const Rpc& rpc) {
     std::cout << "\n-- Send MIQ --\n";
-    if (!unlock_if_needed(token, host, port)) return false;
+    if (!unlock_if_needed(rpc)) return false;
 
     std::cout << "Recipient address: ";
     std::string addr; std::getline(std::cin, addr); addr = trim(addr);
@@ -493,7 +572,7 @@ static bool op_send_flow(const std::string& token, const std::string& host, cons
     if (amt.empty()) { std::cout << "Canceled.\n"; return false; }
 
     std::cout << "Sending " << amt << " MIQ to " << addr << " ...\n";
-    std::string r = rpc_call("sendfromhd", { jstrp(addr), jstrp(amt) }, token, host, port);
+    std::string r = rpc.call("sendfromhd", { jstrp(addr), jstrp(amt) });
     if (r.find("\"error\"") != std::string::npos) {
         std::cout << "Send failed: " << r << "\n";
         return false;
@@ -508,7 +587,7 @@ static bool op_send_flow(const std::string& token, const std::string& host, cons
     std::cout << "Waiting for confirmations (target: 3). Press Ctrl+C to stop watching.\n";
     int last = -1;
     for (;;) {
-        int c = tx_confirmations_via_recipient(token, host, port, txid, addr);
+        int c = tx_confirmations_via_recipient(rpc, txid, addr);
         if (c != last) {
             if (c == 0) std::cout << "  0-conf (in mempool or not yet seen)\n";
             else std::cout << "  confirmations: " << c << "\n";
@@ -521,30 +600,58 @@ static bool op_send_flow(const std::string& token, const std::string& host, cons
     return true;
 }
 
-static bool op_show_balance(const std::string& token, const std::string& host, const std::string& port) {
-    std::string bal = rpc_call("getbalance", {}, token, host, port);
+static bool op_show_balance(const Rpc& rpc){
+    std::string bal = rpc.call("getbalance", {});
+    if (bal.empty()) { std::cout << "RPC failed.\n"; return false; }
     long long miqron=0; std::string miqPretty;
     json_get_number_field_ll(bal, "miqron", miqron);
-    if (!json_get_string_field(bal, "miq", miqPretty)) {
-        std::ostringstream s; s << (miqron / (long long)miq::COIN) << "." << std::setw(8) << std::setfill('0') << (miqron % (long long)miq::COIN);
+    json_get_string_field(bal, "miq", miqPretty);
+    if(miqPretty.empty()){
+        std::ostringstream s; s << (miqron / (long long)COIN) << "." << std::setw(8) << std::setfill('0') << (miqron % (long long)COIN);
         miqPretty = s.str();
     }
     std::cout << "Balance: " << miqPretty << " MIQ (" << miqron << " miqron)\n";
     return true;
 }
 
-// ---------- main ----------
+// ---------------- main -----------------
 int main(int argc, char** argv){
     std::ios::sync_with_stdio(false);
 
-    Opts o = parse_opts(argc, argv);
+    // Parse endpoint/auth options (env + flags)
+    std::string host = "127.0.0.1";
+    std::string port = std::to_string(RPC_PORT);
+    std::string cookiefile, datadir, user, pass;
+    parse_argv(argc, argv, host, port, cookiefile, datadir, user, pass);
 
-    std::cout << "Target: miqrochain RPC at " << o.host << ":" << o.port << "\n";
-    if (!o.token.empty()) {
-        std::cout << "Auth: using token (length " << o.token.size() << ")\n";
-    } else {
-        std::cout << "Auth: <empty> (server must be unauthenticated)\n";
+    // Build auth: prefer cookie; else user/pass; else prompt once.
+    std::string userpass;
+    std::string source_hint;
+    if(!find_cookie_auto(userpass, source_hint, cookiefile, datadir)){
+        if(!user.empty() || !pass.empty()){
+            userpass = user + ":" + pass;
+            source_hint = "rpcuser/rpcpassword";
+        } else {
+            // Last resort: interactive paste (keeps "click & run" if env/flags set)
+            std::cout << "No cookie/userpass found automatically.\n";
+            std::cout << "Paste cookie line (user:pass) or press ENTER to abort:\n> ";
+            std::string line; std::getline(std::cin, line); line = trim(line);
+            if(line.empty()){
+                std::cerr << "No credentials provided. Exiting.\n";
+                return 1;
+            }
+            userpass = line;
+            source_hint = "stdin";
+        }
     }
+
+    Rpc rpc;
+    rpc.host = host;
+    rpc.port = port;
+    rpc.auth_header = make_basic_auth(userpass);
+
+    std::cout << "Target: " << CHAIN_NAME << " RPC at " << host << ":" << port << "\n";
+    std::cout << "Auth source: " << source_hint << "\n";
 
     for (;;) {
         std::cout << "\n==== MIQ Wallet ====\n";
@@ -556,12 +663,11 @@ int main(int argc, char** argv){
         std::cout << "> ";
         std::string choice; std::getline(std::cin, choice);
         choice = trim(choice);
-        if (choice=="1") { (void)op_create_wallet(o.token, o.host, o.port); }
-        else if (choice=="2") { (void)op_recover_wallet(o.token, o.host, o.port); }
-        else if (choice=="3") { (void)op_send_flow(o.token, o.host, o.port); }
-        else if (choice=="4") { (void)op_show_balance(o.token, o.host, o.port); }
+        if (choice=="1") { (void)op_create_wallet(rpc); }
+        else if (choice=="2") { (void)op_recover_wallet(rpc); }
+        else if (choice=="3") { (void)op_send_flow(rpc); }
+        else if (choice=="4") { (void)op_show_balance(rpc); }
         else if (choice=="q" || choice=="Q" || choice=="exit") break;
     }
-
     return 0;
 }
