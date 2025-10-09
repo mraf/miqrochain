@@ -14,29 +14,19 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 include(FetchContent)
 find_package(PkgConfig QUIET)
 
-# ------------------------------------------------------------------
-# Options
-# ------------------------------------------------------------------
+# ---------------- Options ----------------
 option(MIQ_ENABLE_WALLET_ENC "Enable wallet at-rest encryption" OFF)
-
-# Try to enable UPnP if available. We will ONLY define MIQ_ENABLE_UPNP
-# when miniupnpc is actually found; otherwise we build a stub path.
-option(MIQ_ENABLE_UPNP       "Enable UPnP/NAT-PMP port mapping (auto-detect)" ON)
+option(MIQ_ENABLE_UPNP       "Enable UPnP/NAT-PMP port mapping (daemon only; auto-detect)" ON)
 option(MIQ_FETCH_MINIUPNPC   "Auto-fetch miniupnpc if not found (needs network)" OFF)
-
 option(MIQ_BUILD_TESTS       "Build tests" OFF)
 
-# DB backend options
-option(MIQ_USE_ROCKSDB       "Use RocksDB instead of LevelDB"              OFF)
-option(MIQ_FETCH_LEVELDB     "Automatically fetch/build LevelDB if missing" ON)
+option(MIQ_USE_ROCKSDB       "Use RocksDB instead of LevelDB"               OFF)
+option(MIQ_FETCH_LEVELDB     "Auto-fetch LevelDB if missing"                ON)
 
-# libsecp256k1 options
-option(MIQ_USE_LIBSECP "Use bitcoin-core/libsecp256k1 backend" ON)
-set(MIQ_LIBSECP_TAG "master" CACHE STRING "bitcoin-core/secp256k1 git tag or commit to fetch")
+option(MIQ_USE_LIBSECP       "Use bitcoin-core/libsecp256k1 backend"        ON)
+set(MIQ_LIBSECP_TAG "master" CACHE STRING "bitcoin-core/secp256k1 tag/commit")
 
-# ------------------------------------------------------------------
-# Warnings / Optimization
-# ------------------------------------------------------------------
+# ---------------- Warnings / Opt ----------------
 if(MSVC)
   add_compile_options(/O2 /Ot /Oi /GL /GF /Gy /Zc:inline)
   add_link_options(/LTCG)
@@ -47,22 +37,18 @@ else()
   add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 endif()
 
-# ------------------------------------------------------------------
-# TLS / Threads
-# ------------------------------------------------------------------
+# ---------------- Deps ----------------
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
-# ------------------------------------------------------------------
-# Key-Value DB backend (daemon only)
-# ------------------------------------------------------------------
+# ---- DB (LevelDB default) ----
 set(MIQ_DB_TARGET "")
 set(MIQ_DB_DEFINE "")
 
 if(MIQ_USE_ROCKSDB)
   find_package(rocksdb QUIET)
   if(NOT rocksdb_FOUND)
-    message(FATAL_ERROR "MIQ_USE_ROCKSDB=ON but RocksDB package not found.")
+    message(FATAL_ERROR "MIQ_USE_ROCKSDB=ON but RocksDB not found")
   endif()
   set(MIQ_DB_TARGET RocksDB::rocksdb)
   set(MIQ_DB_DEFINE MIQ_USE_ROCKSDB=1)
@@ -72,7 +58,7 @@ else()
     set(MIQ_DB_TARGET LevelDB::LevelDB)
   else()
     if(NOT MIQ_FETCH_LEVELDB)
-      message(FATAL_ERROR "LevelDB not found. Install LevelDB or enable MIQ_FETCH_LEVELDB.")
+      message(FATAL_ERROR "LevelDB not found. Install it or enable MIQ_FETCH_LEVELDB.")
     endif()
     FetchContent_Declare(
       leveldb_src
@@ -91,9 +77,7 @@ else()
   set(MIQ_DB_DEFINE MIQ_USE_LEVELDB=1)
 endif()
 
-# ------------------------------------------------------------------
-# libsecp256k1
-# ------------------------------------------------------------------
+# ---- libsecp256k1 ----
 set(MIQ_LIBSECP_TARGET "")
 if(MIQ_USE_LIBSECP)
   find_package(secp256k1 CONFIG QUIET)
@@ -102,11 +86,10 @@ if(MIQ_USE_LIBSECP)
       set(MIQ_LIBSECP_TARGET secp256k1::secp256k1)
     elseif(TARGET secp256k1)
       set(MIQ_LIBSECP_TARGET secp256k1)
-    else()
-      message(FATAL_ERROR "secp256k1 package found but no usable CMake target exported.")
     endif()
-  else()
-    message(STATUS "secp256k1 not found; fetching bitcoin-core/secp256k1 @ ${MIQ_LIBSECP_TAG}")
+  endif()
+  if(NOT MIQ_LIBSECP_TARGET)
+    message(STATUS "Fetching bitcoin-core/secp256k1 @ ${MIQ_LIBSECP_TAG}")
     set(SECP256K1_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(SECP256K1_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
     set(SECP256K1_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -122,15 +105,13 @@ if(MIQ_USE_LIBSECP)
     elseif(TARGET secp256k1)
       set(MIQ_LIBSECP_TARGET secp256k1)
     else()
-      message(FATAL_ERROR "Fetched secp256k1 but no target named 'secp256k1' was created.")
+      message(FATAL_ERROR "Fetched secp256k1 but no target named secp256k1")
     endif()
   endif()
   add_compile_definitions(MIQ_USE_LIBSECP256K1=1)
 endif()
 
-# ------------------------------------------------------------------
-# Shared core sources (daemon)
-# ------------------------------------------------------------------
+# ---------------- Core sources (shared) ----------------
 set(MIQ_CORE_SOURCES
     src/hd_wallet.cpp
     src/hd_wallet.h
@@ -185,9 +166,7 @@ set(MIQ_CORE_SOURCES
     src/crypto/secure_random.cpp
 )
 
-# ------------------------------------------------------------------
-# UPnP/NAT-PMP detection (daemon)
-# ------------------------------------------------------------------
+# ---------------- miniupnpc (daemon only) ----------------
 set(_HAVE_MINIUPNPC OFF)
 set(_MINIUPNPC_INC "")
 set(_MINIUPNPC_LIBS "")
@@ -201,7 +180,6 @@ if(MIQ_ENABLE_UPNP)
       set(_HAVE_MINIUPNPC ON)
     endif()
   endif()
-
   if(NOT _HAVE_MINIUPNPC)
     find_path(MINIUPNPC_INCLUDE_DIR miniupnpc/miniupnpc.h)
     find_library(MINIUPNPC_LIBRARY NAMES miniupnpc)
@@ -211,7 +189,6 @@ if(MIQ_ENABLE_UPNP)
       set(_HAVE_MINIUPNPC ON)
     endif()
   endif()
-
   if(NOT _HAVE_MINIUPNPC AND MIQ_FETCH_MINIUPNPC)
     message(STATUS "miniupnpc not found; fetching (network required)")
     FetchContent_Declare(
@@ -233,19 +210,16 @@ if(MIQ_ENABLE_UPNP)
       set(_HAVE_MINIUPNPC ON)
     endif()
   endif()
-
   if(_HAVE_MINIUPNPC)
-    message(STATUS "UPnP enabled (miniupnpc detected)")
+    message(STATUS "UPnP enabled (daemon): miniupnpc detected")
   else()
-    message(WARNING "UPnP requested but miniupnpc not found; building WITHOUT UPnP.")
+    message(WARNING "UPnP requested but miniupnpc not available; daemon will build WITHOUT UPnP.")
   endif()
 else()
-  message(STATUS "UPnP disabled by option; building WITHOUT UPnP.")
+  message(STATUS "UPnP disabled (daemon).")
 endif()
 
-# ------------------------------------------------------------------
-# Daemon (miqrod)
-# ------------------------------------------------------------------
+# ---------------- Daemon ----------------
 add_executable(miqrod src/main.cpp ${MIQ_CORE_SOURCES})
 target_include_directories(miqrod PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(miqrod PRIVATE ${MIQ_DB_TARGET})
@@ -253,14 +227,13 @@ if(MIQ_DB_DEFINE)
   target_compile_definitions(miqrod PRIVATE ${MIQ_DB_DEFINE})
 endif()
 
-# Only define MIQ_ENABLE_UPNP when we actually have miniupnpc
 if(_HAVE_MINIUPNPC)
   target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_UPNP=1)
   if(_MINIUPNPC_INC)
     target_include_directories(miqrod PRIVATE ${_MINIUPNPC_INC})
   endif()
   if(_MINIUPNPC_LIBS)
-    target_link_libraries(miqrod PRIVATE ${_MINIUPNPC_LIBS})
+    target_link_libraries(miqrod PRIVATE ${(_MINIUPNPC_LIBS)})
   endif()
   if(WIN32)
     target_link_libraries(miqrod PRIVATE iphlpapi ws2_32)
@@ -283,34 +256,17 @@ else()
   message(STATUS "Wallet encryption: DISABLED (default)")
 endif()
 
-# ------------------------------------------------------------------
-# Wallet (miqwallet)
-# Link only what the CLI needs (crypto/tx/hdwallet + p2p light pieces),
-# and DO NOT define MIQ_ENABLE_UPNP here (wallet doesn't need router mapping).
-# ------------------------------------------------------------------
-set(MIQ_WALLET_SOURCES
-    src/cli/miqwallet.cpp
-    src/hd_wallet.cpp
-    src/wallet_store.cpp
-    src/sha256.cpp
-    src/hex.cpp
-    src/base58.cpp
-    src/base58check.cpp
-    src/ripemd160.cpp
-    src/hash160.cpp
-    src/serialize.cpp
-    src/tx.cpp
-    src/crypto/secure_random.cpp
-    src/crypto/ecdsa_libsecp256k1.cpp
-    src/netmsg.cpp
-    src/p2p.cpp          # provides P2PLight used by the wallet
-    src/seeds.cpp
-    src/lut.cpp
+# ---------------- Wallet CLI ----------------
+# Build wallet against core sources so P2PLight & friends resolve cleanly.
+add_executable(miqwallet
+  src/cli/miqwallet.cpp
+  ${MIQ_CORE_SOURCES}           # reuse core (no main.cpp)
 )
-
-add_executable(miqwallet ${MIQ_WALLET_SOURCES})
-target_include_directories(miqwallet PRIVATE src)
-target_link_libraries(miqwallet PRIVATE OpenSSL::Crypto)
+target_include_directories(miqwallet PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(miqwallet PRIVATE OpenSSL::Crypto Threads::Threads ${MIQ_DB_TARGET})
+if(MIQ_DB_DEFINE)
+  target_compile_definitions(miqwallet PRIVATE ${MIQ_DB_DEFINE})
+endif()
 if(MIQ_USE_LIBSECP)
   target_link_libraries(miqwallet PRIVATE ${MIQ_LIBSECP_TARGET})
 endif()
@@ -319,9 +275,7 @@ if(WIN32)
 endif()
 set_target_properties(miqwallet PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
 
-# ------------------------------------------------------------------
-# Simple key tool
-# ------------------------------------------------------------------
+# ---------------- Key tool ----------------
 add_executable(miq-keygen
     src/tools/miq_keygen.cpp
     src/sha256.h src/sha256.cpp
@@ -341,9 +295,7 @@ if(WIN32)
   target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
 
-# ------------------------------------------------------------------
-# Tests (optional)
-# ------------------------------------------------------------------
+# ---------------- Tests (optional) ----------------
 if(MIQ_BUILD_TESTS)
   enable_testing()
 
