@@ -25,6 +25,19 @@
 #include <cstring>         // std::memcmp, std::memset
 #include <type_traits>     // compile-time detection (SFINAE)
 
+// --- Optional GCS block filters (guarded; won’t break builds if not present) ---
+#ifndef __has_include
+  #define __has_include(x) 0
+#endif
+
+#if __has_include("filters/blockfilter.h") && __has_include("filters/filter_store.h")
+  #define MIQ_HAVE_GCS_FILTERS 1
+  #include "filters/blockfilter.h"   // miq::gcs::build_block_filter(const Block&, std::vector<uint8_t>&)
+  #include "filters/filter_store.h"  // class miq::gcs::FilterStore
+#else
+  #define MIQ_HAVE_GCS_FILTERS 0
+#endif
+
 #ifndef MAX_TX_SIZE
 #define MIQ_FALLBACK_MAX_TX_SIZE (100u * 1024u) // 100 KiB default
 #else
@@ -304,6 +317,11 @@ static std::unordered_map<std::string, std::vector<UndoIn>> g_undo;
 // keep your other statics (e.g., the reorg manager) here too:
 
 static miq::ReorgManager g_reorg;
+
+// === Optional global filter store (constructed at open())
+#if MIQ_HAVE_GCS_FILTERS
+static miq::gcs::FilterStore g_filter_store;
+#endif
 
 // === Local constants (non-breaking) ===
 static constexpr size_t MAX_BLOCK_SIZE_LOCAL = 1 * 1024 * 1024; // 1 MiB
@@ -681,6 +699,16 @@ bool Chain::open(const std::string& dir){
     datadir_ = dir;
     ensure_dir_exists(undo_dir(datadir_));
     (void)load_state();
+
+#if MIQ_HAVE_GCS_FILTERS
+    {
+        // Filters live under <datadir>/filters
+        std::string fdir = join_path(datadir_, "filters");
+        if (!g_filter_store.open(fdir)) {
+            log_warn(std::string("FilterStore: open failed at ") + fdir);
+        }
+    }
+#endif
     return true;
 }
 
@@ -821,6 +849,19 @@ bool Chain::init_genesis(const Block& g){
     tip_ = Tip{0, g.block_hash(), g.header.bits, g.header.time, cb_sum};
     index_.reset(tip_.hash, tip_.time, tip_.bits);
     save_state();
+
+#if MIQ_HAVE_GCS_FILTERS
+    // Build & store genesis filter (best-effort)
+    std::vector<uint8_t> fbytes;
+    if (miq::gcs::build_block_filter(g, fbytes)) {
+        if (!g_filter_store.put(/*height=*/0, g.block_hash(), fbytes)) {
+            log_warn("FilterStore: put(genesis) failed");
+        }
+    } else {
+        log_warn("BlockFilter: build(genesis) failed");
+    }
+#endif
+
     return true;
 }
 
@@ -1096,6 +1137,15 @@ bool Chain::disconnect_tip_once(std::string& err){
     // Commit reversals atomically if backend supports it
     if (!utxo_apply_ops(utxo_, ops, err)) return false;
 
+#if MIQ_HAVE_GCS_FILTERS
+    // Remove the filter for the block being disconnected (best-effort).
+    if (!g_filter_store.remove(tip_.height, tip_.hash)) {
+        // not fatal; log best-effort
+        log_warn("FilterStore: remove failed for height=" + std::to_string(tip_.height) +
+                 " hash=" + hexstr(tip_.hash));
+    }
+#endif
+
     Block prev;
     if (!get_block_by_hash(cur.header.prev_hash, prev)) {
         err = "failed to read prev block";
@@ -1180,7 +1230,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
     // Apply all UTXO changes (atomically if supported)
     if (!utxo_apply_ops(utxo_, ops, err)) return false;
 
-    // Advance tip
+    // Advance tip (state)
     tip_.height = new_height;
     tip_.hash   = new_hash;
     tip_.bits   = b.header.bits;
@@ -1198,6 +1248,23 @@ bool Chain::submit_block(const Block& b, std::string& err){
             remove_undo_file(datadir_, prune_h, prune_hash);
         }
     }
+
+    // === Build & persist GCS block filter (best-effort; guarded) ===========
+#if MIQ_HAVE_GCS_FILTERS
+    {
+        std::vector<uint8_t> fbytes;
+        if (miq::gcs::build_block_filter(b, fbytes)) {
+            if (!g_filter_store.put(new_height, new_hash, fbytes)) {
+                log_warn("FilterStore: put failed for height=" + std::to_string(new_height) +
+                         " hash=" + hexstr(new_hash));
+            }
+        } else {
+            log_warn("BlockFilter: build failed for height=" + std::to_string(new_height) +
+                     " hash=" + hexstr(new_hash));
+        }
+    }
+#endif
+    // ======================================================================
 
     // Notify reorg manager
     miq::HeaderView hv;
