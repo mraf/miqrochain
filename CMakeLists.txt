@@ -214,6 +214,7 @@ endif()
 # UPnP/NAT-PMP (miniupnpc) with auto-fetch + graceful fallback
 # ------------------------------------------------------------------
 option(MIQ_FETCH_MINIUPNPC "Auto-fetch miniupnpc when enabling UPnP" ON)
+set(MIQ_MINIUPNPC_TAG "miniupnpc_2_2_7" CACHE STRING "miniupnpc git tag/commit")
 
 if(MIQ_ENABLE_UPNP)
   set(_MINIUPNPC_INC "")
@@ -239,37 +240,31 @@ if(MIQ_ENABLE_UPNP)
     endif()
   endif()
 
-  # Auto-fetch if still missing
+  # Auto-fetch from the correct repo if still missing
   if(NOT _MINIUPNPC_LIBS AND MIQ_FETCH_MINIUPNPC)
-    message(STATUS "miniupnpc not found; fetching via FetchContent")
+    message(STATUS "miniupnpc not found; fetching miniupnp/miniupnpc @ ${MIQ_MINIUPNPC_TAG}")
     include(FetchContent)
     FetchContent_Declare(
       miniupnpc_src
-      GIT_REPOSITORY https://github.com/miniupnp/miniupnp.git
-      GIT_TAG        release-miniupnpc-2.2.7
+      GIT_REPOSITORY https://github.com/miniupnp/miniupnpc.git
+      GIT_TAG        ${MIQ_MINIUPNPC_TAG}
       GIT_PROGRESS   TRUE
     )
     FetchContent_MakeAvailable(miniupnpc_src)
 
-    # The repo has a 'miniupnpc' subdir with its own CMakeLists.
-    if(EXISTS "${miniupnpc_src_SOURCE_DIR}/miniupnpc/CMakeLists.txt")
-      add_subdirectory("${miniupnpc_src_SOURCE_DIR}/miniupnpc"
-                       "${miniupnpc_src_BINARY_DIR}/miniupnpc"
-                       EXCLUDE_FROM_ALL)
-      # Robust target detection across versions
-      if(TARGET miniupnpc)
-        set(_MINIUPNPC_LIBS miniupnpc)
-      elseif(TARGET libminiupnpc-static)
-        set(_MINIUPNPC_LIBS libminiupnpc-static)
-      elseif(TARGET libminiupnpc)
-        set(_MINIUPNPC_LIBS libminiupnpc)
-      endif()
-      set(_MINIUPNPC_INC "${miniupnpc_src_SOURCE_DIR}/miniupnpc")
-      set(MINIUPNPC_FETCHED 1)
+    # The standalone repo defines targets; detect robustly.
+    if(TARGET miniupnpc)
+      set(_MINIUPNPC_LIBS miniupnpc)
+    elseif(TARGET libminiupnpc-static)
+      set(_MINIUPNPC_LIBS libminiupnpc-static)
+    elseif(TARGET libminiupnpc)
+      set(_MINIUPNPC_LIBS libminiupnpc)
     endif()
+    set(_MINIUPNPC_INC "${miniupnpc_src_SOURCE_DIR}/include")
+    set(MINIUPNPC_FETCHED 1)
   endif()
 
-  # Link if we have it, otherwise continue without UPnP (no hard fail)
+  # Link if available; otherwise continue without UPnP
   if(_MINIUPNPC_LIBS)
     target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_UPNP=1)
     target_include_directories(miqrod PRIVATE ${_MINIUPNPC_INC})
@@ -288,6 +283,7 @@ if(MIQ_ENABLE_UPNP)
 else()
   message(STATUS "UPnP disabled (set -DMIQ_ENABLE_UPNP=ON to enable)")
 endif()
+
 
 # ------------------------------------------------------------------
 # CLI wallet (miqwallet) — minimal deps (just sockets)
