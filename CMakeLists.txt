@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
+# Keep current FetchContent behavior on newer CMake
 if(POLICY CMP0169)
   cmake_policy(SET CMP0169 OLD)
 endif()
@@ -12,6 +13,7 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include(FetchContent)
+find_package(PkgConfig QUIET)
 
 # ------------------------------------------------------------------
 # Options
@@ -122,7 +124,7 @@ if(MIQ_USE_LIBSECP)
 endif()
 
 # ------------------------------------------------------------------
-# Core sources for daemon
+# Core sources (reused by daemon)
 # ------------------------------------------------------------------
 set(MIQ_CORE_SOURCES
     src/hd_wallet.cpp
@@ -164,16 +166,23 @@ set(MIQ_CORE_SOURCES
     src/p2p.h src/p2p.cpp
     src/http.h src/http.cpp
     src/rpc.h src/rpc.cpp
+
+    # Crypto interface + libsecp backend wrapper
     src/crypto/ecdsa_iface.h
     src/crypto/ecdsa_libsecp256k1.cpp
+
+    # Reorg / Seeds / MTP (REQUIRED for link)
     src/reorg_manager.h
     src/reorg_manager.cpp
-    src/nat.cpp         # harmless if MIQ_ENABLE_UPNP not defined
     src/seeds.cpp
     src/mtp.h
     src/mtp.cpp
+
+    # TLS proxy & IBD monitor
     src/tls_proxy.h src/tls_proxy.cpp
     src/ibd_monitor.h src/ibd_monitor.cpp
+
+    # RNG + wallet encryption impls (always compiled)
     src/wallet_encryptor.cpp
     src/crypto/secure_random.cpp
 )
@@ -201,46 +210,43 @@ endif()
 
 if(MIQ_ENABLE_WALLET_ENC)
   target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_WALLET_ENC=1)
-  target_link_libraries(miqrod PRIVATE OpenSSL::Crypto)
   message(STATUS "Wallet encryption: ENABLED (OpenSSL)")
 else()
   message(STATUS "Wallet encryption: DISABLED (default)")
 endif()
 
 # ------------------------------------------------------------------
-# Wallet P2P helper (new)
-# ------------------------------------------------------------------
-# Tiny P2P light client used by the CLI.
-add_library(miqwallet_p2p STATIC
-    src/wallet/p2p_light.cpp
-    src/wallet/p2p_light.h
-)
-target_include_directories(miqwallet_p2p PUBLIC src)
-if(WIN32)
-  target_link_libraries(miqwallet_p2p PUBLIC ws2_32)
-endif()
-
-# ------------------------------------------------------------------
-# CLI wallet (miqwallet)
+# CLI wallet (miqwallet) — link all needed wallet/signing/P2P bits
 # ------------------------------------------------------------------
 add_executable(miqwallet
     src/cli/miqwallet.cpp
-    # link core bits it uses (HD, tx, crypto, ser, base58, hash160)
+
+    # HD wallet + store + encryption + RNG
     src/hd_wallet.cpp
     src/wallet_store.cpp
+    src/wallet_encryptor.cpp
+    src/crypto/secure_random.cpp
+
+    # tx/ser + hashing + codecs
+    src/tx.cpp
+    src/serialize.cpp
     src/sha256.cpp
     src/ripemd160.cpp
     src/hash160.cpp
     src/base58.cpp
     src/base58check.cpp
     src/hex.cpp
-    src/serialize.cpp
-    src/tx.cpp
-    src/crypto/secure_random.cpp
+    src/util.cpp
+
+    # lightweight P2P helper used by the wallet
+    src/netmsg.cpp
+    src/wallet/p2p_light.cpp
+
+    # secp256k1 backend wrapper
     src/crypto/ecdsa_libsecp256k1.cpp
 )
-target_include_directories(miqwallet PRIVATE src)
-target_link_libraries(miqwallet PRIVATE miqwallet_p2p)
+target_include_directories(miqwallet PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(miqwallet PRIVATE OpenSSL::Crypto)
 if(MIQ_USE_LIBSECP)
   target_link_libraries(miqwallet PRIVATE ${MIQ_LIBSECP_TARGET})
 endif()
@@ -254,18 +260,20 @@ set_target_properties(miqwallet PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED
 # ------------------------------------------------------------------
 add_executable(miq-keygen
     src/tools/miq_keygen.cpp
-    src/sha256.cpp
-    src/ripemd160.cpp
-    src/hash160.cpp
-    src/base58.cpp
-    src/hex.cpp
+    src/sha256.h src/sha256.cpp
+    src/ripemd160.h src/ripemd160.cpp
+    src/hash160.h src/hash160.cpp
+    src/base58.h src/base58.cpp
+    src/hex.h src/hex.cpp
     src/crypto/secure_random.cpp
+    src/crypto/ecdsa_iface.h
     src/crypto/ecdsa_libsecp256k1.cpp
 )
 target_include_directories(miq-keygen PRIVATE src)
 if(MIQ_USE_LIBSECP)
   target_link_libraries(miq-keygen PRIVATE ${MIQ_LIBSECP_TARGET})
 endif()
+target_link_libraries(miq-keygen PRIVATE OpenSSL::Crypto)
 if(WIN32)
   target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
@@ -275,6 +283,26 @@ endif()
 # ------------------------------------------------------------------
 if(MIQ_BUILD_TESTS)
   enable_testing()
+
+  add_executable(test_crypto tests/test_crypto.cpp
+      src/sha256.h src/sha256.cpp
+      src/ripemd160.h src/ripemd160.cpp
+      src/hash160.h src/hash160.cpp
+      src/base58check.h src/base58check.cpp
+      src/hex.h src/hex.cpp
+      src/crypto/secure_random.cpp
+      src/crypto/ecdsa_iface.h
+      src/crypto/ecdsa_libsecp256k1.cpp
+  )
+  target_include_directories(test_crypto PRIVATE src)
+  if(MIQ_USE_LIBSECP)
+    target_link_libraries(test_crypto PRIVATE ${MIQ_LIBSECP_TARGET})
+  endif()
+  if(WIN32)
+    target_link_libraries(test_crypto PRIVATE Ws2_32)
+  endif()
+  add_test(NAME test_crypto COMMAND test_crypto)
+
   add_executable(test_ser tests/test_ser.cpp
       src/serialize.h src/serialize.cpp
       src/tx.h src/tx.cpp
