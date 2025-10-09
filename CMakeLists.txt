@@ -213,44 +213,63 @@ endif()
 # ------------------------------------------------------------------
 # UPnP/NAT-PMP (miniupnpc) with auto-fetch + graceful fallback
 # ------------------------------------------------------------------
+option(MIQ_FETCH_MINIUPNPC "Auto-fetch miniupnpc when enabling UPnP" ON)
+
 if(MIQ_ENABLE_UPNP)
   set(_MINIUPNPC_INC "")
   set(_MINIUPNPC_LIBS "")
 
+  # Try pkg-config first
+  find_package(PkgConfig QUIET)
   if(PKG_CONFIG_FOUND)
     pkg_check_modules(MINIUPNPC QUIET miniupnpc)
+    if(MINIUPNPC_FOUND)
+      set(_MINIUPNPC_INC  ${MINIUPNPC_INCLUDE_DIRS})
+      set(_MINIUPNPC_LIBS ${MINIUPNPC_LINK_LIBRARIES})
+    endif()
   endif()
 
-  if(MINIUPNPC_FOUND)
-    set(_MINIUPNPC_INC  ${MINIUPNPC_INCLUDE_DIRS})
-    set(_MINIUPNPC_LIBS ${MINIUPNPC_LINK_LIBRARIES})
-  else()
+  # Try classic cmake find
+  if(NOT _MINIUPNPC_LIBS)
     find_path(MINIUPNPC_INCLUDE_DIR miniupnpc/miniupnpc.h)
     find_library(MINIUPNPC_LIBRARY NAMES miniupnpc)
     if(MINIUPNPC_INCLUDE_DIR AND MINIUPNPC_LIBRARY)
       set(_MINIUPNPC_INC  ${MINIUPNPC_INCLUDE_DIR})
       set(_MINIUPNPC_LIBS ${MINIUPNPC_LIBRARY})
-    elseif(MIQ_FETCH_MINIUPNPC)
-      message(STATUS "miniupnpc not found; fetching via FetchContent")
-      # Use a stable tag; adjust if you prefer a different version
-      FetchContent_Declare(
-        miniupnpc_src
-        GIT_REPOSITORY https://github.com/miniupnp/miniupnp.git
-        GIT_TAG        release-miniupnpc-2.2.7
-        GIT_PROGRESS   TRUE
-      )
-      FetchContent_MakeAvailable(miniupnpc_src)
-      if(EXISTS "${miniupnpc_src_SOURCE_DIR}/miniupnpc/CMakeLists.txt")
-        add_subdirectory("${miniupnpc_src_SOURCE_DIR}/miniupnpc"
-                         "${miniupnpc_src_BINARY_DIR}/miniupnpc"
-                         EXCLUDE_FROM_ALL)
-        set(_MINIUPNPC_INC  "${miniupnpc_src_SOURCE_DIR}/miniupnpc")
-        set(_MINIUPNPC_LIBS miniupnpc)
-        set(MINIUPNPC_FETCHED 1)
-      endif()
     endif()
   endif()
 
+  # Auto-fetch if still missing
+  if(NOT _MINIUPNPC_LIBS AND MIQ_FETCH_MINIUPNPC)
+    message(STATUS "miniupnpc not found; fetching via FetchContent")
+    include(FetchContent)
+    FetchContent_Declare(
+      miniupnpc_src
+      GIT_REPOSITORY https://github.com/miniupnp/miniupnp.git
+      GIT_TAG        release-miniupnpc-2.2.7
+      GIT_PROGRESS   TRUE
+    )
+    FetchContent_MakeAvailable(miniupnpc_src)
+
+    # The repo has a 'miniupnpc' subdir with its own CMakeLists.
+    if(EXISTS "${miniupnpc_src_SOURCE_DIR}/miniupnpc/CMakeLists.txt")
+      add_subdirectory("${miniupnpc_src_SOURCE_DIR}/miniupnpc"
+                       "${miniupnpc_src_BINARY_DIR}/miniupnpc"
+                       EXCLUDE_FROM_ALL)
+      # Robust target detection across versions
+      if(TARGET miniupnpc)
+        set(_MINIUPNPC_LIBS miniupnpc)
+      elseif(TARGET libminiupnpc-static)
+        set(_MINIUPNPC_LIBS libminiupnpc-static)
+      elseif(TARGET libminiupnpc)
+        set(_MINIUPNPC_LIBS libminiupnpc)
+      endif()
+      set(_MINIUPNPC_INC "${miniupnpc_src_SOURCE_DIR}/miniupnpc")
+      set(MINIUPNPC_FETCHED 1)
+    endif()
+  endif()
+
+  # Link if we have it, otherwise continue without UPnP (no hard fail)
   if(_MINIUPNPC_LIBS)
     target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_UPNP=1)
     target_include_directories(miqrod PRIVATE ${_MINIUPNPC_INC})
