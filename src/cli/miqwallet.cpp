@@ -23,9 +23,17 @@
 #include <stdexcept>
 
 #ifdef _WIN32
-  #include <windows.h>
+  // --- Fix Winsock header clash on MSVC ---
+  // winsock2.h MUST be included before windows.h (and winsock.h).
+  #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN
+  #endif
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #include <windows.h>
   #pragma comment(lib, "ws2_32.lib")
 #else
   #include <sys/types.h>
@@ -322,12 +330,12 @@ static bool make_or_restore_wallet(bool restore){
     if(!miq::HdWallet::MnemonicToSeed(mnemonic, mpass, seed)) { std::cout << "mnemonic->seed failed\n"; return false; }
     miq::HdAccountMeta meta; meta.account=0; meta.next_recv=0; meta.next_change=0;
     std::string e;
-    if(!SaveHdWallet(wdir, seed, meta, wpass, e)) { std::cout << "save failed: " << e << "\n"; return false; }
+    if(!miq::SaveHdWallet(wdir, seed, meta, wpass, e)) { std::cout << "save failed: " << e << "\n"; return false; }
 
     miq::HdWallet w(seed, meta);
     std::string addr;
     if(!w.GetNewAddress(addr)) { std::cout << "derive address failed\n"; return false; }
-    if(!SaveHdWallet(wdir, seed, w.meta(), wpass, e)) { std::cout << "save meta failed: " << e << "\n"; }
+    if(!miq::SaveHdWallet(wdir, seed, w.meta(), wpass, e)) { std::cout << "save meta failed: " << e << "\n"; }
     std::cout << "First receive address: " << addr << "\n";
     return true;
 }
