@@ -1,4 +1,4 @@
-// wallet/p2p_light.h
+// src/wallet/p2p_light.h
 #pragma once
 #include <string>
 #include <vector>
@@ -6,8 +6,9 @@
 
 namespace miq {
 
-// Minimal, blocking P2P client: version/verack + headers sync + block fetch + tx broadcast.
-// Magic MUST match your daemon.
+// Minimal, blocking P2P client for SPV: version/verack + headers sync + block fetch + tx broadcast.
+// Wire framing: auto-decodes both Bitcoin-style (magic+checksum) and legacy (cmd|len).
+// Sending defaults to Bitcoin-style; set prefer_new_frame=false to send legacy.
 struct P2POpts {
     std::string host = "62.38.73.147";
     std::string port = "9833";
@@ -16,6 +17,7 @@ struct P2POpts {
     uint32_t    start_height       = 0;
     bool        send_verack        = true;
     std::string user_agent         = "/miqwallet:0.1/";
+    bool        prefer_new_frame   = true;   // set false if talking to legacy-only peers
 };
 
 class P2PLight {
@@ -35,9 +37,9 @@ public:
     // Graceful close.
     void close();
 
-    // -------- SPV helpers (used by miqwallet.cpp) --------
+    // -------- SPV helpers --------
 
-    // Sync headers (or reuse memoized ones) and return current tip.
+    // Sync headers (memoized) and return tip.
     // tip_hash_le is LE (wire-style) 32 bytes.
     bool get_best_header(uint32_t& tip_height,
                          std::vector<uint8_t>& tip_hash_le,
@@ -56,7 +58,6 @@ public:
                            std::string& err);
 
     // Compact filters — not implemented yet; wallet will fall back automatically.
-    // Keep inline stubs so there’s no link dependency.
     bool has_compact_filters() const { return false; }
     bool scan_blocks_with_filters(const std::vector<std::vector<uint8_t>>& /*pkhs*/,
                                   uint32_t /*tip_height*/,
@@ -72,7 +73,7 @@ private:
 
     // Wire helpers
     bool send_msg(const char cmd[12], const std::vector<uint8_t>& payload, std::string& err);
-    bool read_msg_header(std::string& cmd_out, uint32_t& len_out, uint32_t& csum_out, std::string& err);
+    bool read_msg_header(std::string& cmd_out, uint32_t& len_out, uint32_t& csum_out, bool& legacy_out, std::string& err);
     bool read_exact(void* buf, size_t len, std::string& err);
     bool write_all(const void* buf, size_t len, std::string& err);
 
