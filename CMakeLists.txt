@@ -12,11 +12,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+include(FetchContent)
+find_package(PkgConfig QUIET)
+
 # ------------------------------------------------------------------
 # Options
 # ------------------------------------------------------------------
 option(MIQ_ENABLE_WALLET_ENC "Enable wallet at-rest encryption" OFF)
-option(MIQ_ENABLE_UPNP       "Enable UPnP/NAT-PMP port mapping" OFF)
+option(MIQ_ENABLE_UPNP       "Enable UPnP/NAT-PMP port mapping" ON) # <— enabled by default now
 option(MIQ_BUILD_TESTS       "Build tests"                                 OFF)
 
 # DB backend options
@@ -40,7 +43,11 @@ else()
   add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 endif()
 
-include(FetchContent)
+# ------------------------------------------------------------------
+# TLS / Threads
+# ------------------------------------------------------------------
+find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED)
 
 # ------------------------------------------------------------------
 # Key-Value DB backend
@@ -81,12 +88,6 @@ else()
 endif()
 
 # ------------------------------------------------------------------
-# TLS / Threads
-# ------------------------------------------------------------------
-find_package(OpenSSL REQUIRED)
-find_package(Threads REQUIRED)
-
-# ------------------------------------------------------------------
 # libsecp256k1
 # ------------------------------------------------------------------
 set(MIQ_LIBSECP_TARGET "")
@@ -124,9 +125,9 @@ if(MIQ_USE_LIBSECP)
 endif()
 
 # ------------------------------------------------------------------
-# Main daemon
+# Core sources (used by daemon; wallet only needs a subset but linking is fine)
 # ------------------------------------------------------------------
-add_executable(miqrod
+set(MIQ_CORE_SOURCES
     src/hd_wallet.cpp
     src/hd_wallet.h
     src/bip39_words_en.h
@@ -136,7 +137,6 @@ add_executable(miqrod
     src/wallet_store.h src/wallet_store.cpp
     src/reindex_utxo.h
     src/reindex_utxo.cpp
-    src/main.cpp
     src/constants.h
     src/config.h src/config.cpp
     src/log.h src/log.cpp
@@ -177,7 +177,7 @@ add_executable(miqrod
     src/crypto/ecdsa_iface.h
     src/crypto/ecdsa_libsecp256k1.cpp
 
-    # Reorg / NAT / Seeds / MTP (REQUIRED for link)
+    # Reorg / NAT / Seeds / MTP
     src/reorg_manager.h
     src/reorg_manager.cpp
     src/nat.cpp
@@ -188,6 +188,18 @@ add_executable(miqrod
     # TLS proxy & IBD monitor
     src/tls_proxy.h src/tls_proxy.cpp
     src/ibd_monitor.h src/ibd_monitor.cpp
+
+    # RNG + optional wallet encrypter (compiled always; gated by define)
+    src/wallet_encryptor.cpp
+    src/crypto/secure_random.cpp
+)
+
+# ------------------------------------------------------------------
+# Daemon (miqrod)
+# ------------------------------------------------------------------
+add_executable(miqrod
+    src/main.cpp
+    ${MIQ_CORE_SOURCES}
 )
 
 target_include_directories(miqrod PRIVATE
@@ -217,33 +229,143 @@ endif()
 # Optional wallet encryption
 if(MIQ_ENABLE_WALLET_ENC)
   target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_WALLET_ENC=1)
+  target_link_libraries(miqrod PRIVATE OpenSSL::Crypto)
   message(STATUS "Wallet encryption: ENABLED (OpenSSL)")
 else()
   message(STATUS "Wallet encryption: DISABLED (default)")
 endif()
 
-# Always include RNG/enc impls
-target_sources(miqrod PRIVATE
-    src/wallet_encryptor.cpp
-    src/crypto/secure_random.cpp
-)
-
 # ------------------------------------------------------------------
 # Optional UPnP/NAT-PMP (miniupnpc)
 # ------------------------------------------------------------------
 if(MIQ_ENABLE_UPNP)
-  find_path(MINIUPNP_INCLUDE_DIR miniupnpc/miniupnpc.h)
-  find_library(MINIUPNP_LIBRARY NAMES miniupnpc)
-  if(MINIUPNP_INCLUDE_DIR AND MINIUPNP_LIBRARY)
+  set(_MINIUPNPC_LIBS "")
+  set(_MINIUPNPC_INC  "")
+
+  if(PKG_CONFIG_FOUND)
+    pkg_check_modules(MINIUPNPC QUIET miniupnpc)
+  endif()
+
+  if(MINIUPNPC_FOUND)
+    set(_MINIUPNPC_LIBS ${MINIUPNPC_LINK_LIBRARIES})
+    set(_MINIUPNPC_INC  ${MINIUPNPC_INCLUDE_DIRS})
+  else()
+    # Fallback manual find
+    find_path(MINIUPNP_INCLUDE_DIR miniupnpc/miniupnpc.h)
+    find_library(MINIUPNP_LIBRARY NAMES miniupnpc)
+    if(MINIUPNP_INCLUDE_DIR AND MINIUPNP_LIBRARY)
+      set(_MINIUPNPC_LIBS ${MINIUPNP_LIBRARY})
+      set(_MINIUPNPC_INC  ${MINIUPNP_INCLUDE_DIR})
+    endif()
+  endif()
+
+  if(_MINIUPNPC_LIBS)
     target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_UPNP=1)
-    target_include_directories(miqrod PRIVATE ${MINIUPNP_INCLUDE_DIR})
-    target_link_libraries(miqrod PRIVATE ${MINIUPNP_LIBRARY})
+    target_include_directories(miqrod PRIVATE ${_MINIUPNPC_INC})
+    target_link_libraries(miqrod PRIVATE ${_MINIUPNPC_LIBS})
+    if(WIN32)
+      # miniupnpc on Windows typically needs these:
+      target_link_libraries(miqrod PRIVATE iphlpapi ws2_32)
+    endif()
     message(STATUS "UPnP enabled (miniupnpc)")
   else()
-    message(FATAL_ERROR "MIQ_ENABLE_UPNP=ON but miniupnpc not found.")
+    message(FATAL_ERROR "MIQ_ENABLE_UPNP=ON but miniupnpc not found (try: sudo apt install miniupnpc-dev / brew install miniupnpc).")
   endif()
 else()
-  message(STATUS "UPnP disabled (default)")
+  message(STATUS "UPnP disabled (set MIQ_ENABLE_UPNP=ON to enable)")
+endif()
+
+# ------------------------------------------------------------------
+# Wallet client helper (for CLI wallet)
+# ------------------------------------------------------------------
+add_library(wallet_client STATIC
+    src/wallet/http_client.cpp
+    src/wallet/node_client.cpp
+    src/wallet/node_discovery.cpp
+    src/wallet/paths.cpp
+)
+target_include_directories(wallet_client PUBLIC src)
+if(WIN32)
+  target_link_libraries(wallet_client PUBLIC ws2_32)
+endif()
+target_link_libraries(wallet_client PUBLIC Threads::Threads)
+
+# ------------------------------------------------------------------
+# CLI wallet tool (miqwallet)
+# ------------------------------------------------------------------
+add_executable(miqwallet
+    src/cli/miqwallet.cpp
+
+    # Core bits the CLI uses directly (client-side signing + encode)
+    src/hd_wallet.cpp
+    src/wallet_store.cpp
+    src/serialize.cpp
+    src/tx.cpp
+    src/sha256.cpp
+    src/ripemd160.cpp
+    src/hash160.cpp
+    src/base58.cpp
+    src/base58check.cpp
+    src/hex.cpp
+    src/crypto/secure_random.cpp
+    src/crypto/ecdsa_libsecp256k1.cpp
+
+    # Wallet client helpers
+    src/wallet/http_client.cpp
+    src/wallet/node_client.cpp
+    src/wallet/node_discovery.cpp
+    src/wallet/paths.cpp
+
+    # Optional wallet encryption implementation (compiled always; gated by define)
+    src/wallet_encryptor.cpp
+)
+
+target_include_directories(miqwallet PRIVATE src)
+
+if(MIQ_USE_LIBSECP)
+  target_link_libraries(miqwallet PRIVATE ${MIQ_LIBSECP_TARGET})
+endif()
+
+target_link_libraries(miqwallet
+  PRIVATE
+    wallet_client
+    Threads::Threads
+    OpenSSL::Crypto
+)
+
+if(MIQ_ENABLE_WALLET_ENC)
+  target_compile_definitions(miqwallet PRIVATE MIQ_ENABLE_WALLET_ENC=1)
+endif()
+
+if(WIN32)
+  target_link_libraries(miqwallet PRIVATE ws2_32)
+endif()
+
+set_target_properties(miqwallet PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED YES
+)
+
+# ------------------------------------------------------------------
+# Simple key tool
+# ------------------------------------------------------------------
+add_executable(miq-keygen
+    src/tools/miq_keygen.cpp
+    src/sha256.h src/sha256.cpp
+    src/ripemd160.h src/ripemd160.cpp
+    src/hash160.h src/hash160.cpp
+    src/base58.h src/base58.cpp
+    src/hex.h src/hex.cpp
+    src/crypto/secure_random.cpp
+    src/crypto/ecdsa_iface.h
+    src/crypto/ecdsa_libsecp256k1.cpp
+)
+target_include_directories(miq-keygen PRIVATE src)
+if(MIQ_USE_LIBSECP)
+  target_link_libraries(miq-keygen PRIVATE ${MIQ_LIBSECP_TARGET})
+endif()
+if(WIN32)
+  target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
 
 # ------------------------------------------------------------------
@@ -279,36 +401,4 @@ if(MIQ_BUILD_TESTS)
   )
   target_include_directories(test_ser PRIVATE src)
   add_test(NAME test_ser COMMAND test_ser)
-endif()
-
-# ------------------------------------------------------------------
-# CLI wallet tool
-# ------------------------------------------------------------------
-add_executable(miqwallet src/cli/miqwallet.cpp)
-target_include_directories(miqwallet PRIVATE src)
-if(WIN32)
-  target_link_libraries(miqwallet PRIVATE ws2_32)
-endif()
-set_target_properties(miqwallet PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
-
-# ------------------------------------------------------------------
-# Simple key tool
-# ------------------------------------------------------------------
-add_executable(miq-keygen
-    src/tools/miq_keygen.cpp
-    src/sha256.h src/sha256.cpp
-    src/ripemd160.h src/ripemd160.cpp
-    src/hash160.h src/hash160.cpp
-    src/base58.h src/base58.cpp
-    src/hex.h src/hex.cpp
-    src/crypto/secure_random.cpp
-    src/crypto/ecdsa_iface.h
-    src/crypto/ecdsa_libsecp256k1.cpp
-)
-target_include_directories(miq-keygen PRIVATE src)
-if(MIQ_USE_LIBSECP)
-  target_link_libraries(miq-keygen PRIVATE ${MIQ_LIBSECP_TARGET})
-endif()
-if(WIN32)
-  target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
