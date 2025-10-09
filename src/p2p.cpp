@@ -1,3 +1,4 @@
+// src/p2p.cpp
 #include "p2p.h"
 #include "nat.h"
 #include "seeds.h"
@@ -6,14 +7,13 @@
 #include "serialize.h"
 #include "chain.h"
 #include "constants.h"
-#include "utxo.h"   // fee calc (UTXOEntry)
-#include "base58check.h"  // ← NEW: for Base58Check address display
+#include "utxo.h"           // fee calc (UTXOEntry)
+#include "base58check.h"    // Base58Check address display (miner logs)
 
 #include <chrono>
 #include <tuple>
-#include <cstring> 
-#include <fstream>
 #include <cstring>
+#include <fstream>
 #include <algorithm>
 #include <vector>
 #include <unordered_set>
@@ -186,7 +186,6 @@
   #ifndef WIN32_LEAN_AND_MEAN
   #define WIN32_LEAN_AND_MEAN
   #endif
-  // Prevent <windows.h> family from defining min/max macros that break std::min/std::max
   #ifndef NOMINMAX
   #define NOMINMAX
   #endif
@@ -593,6 +592,28 @@ static int dial_be_ipv4(uint32_t be_ip, uint16_t port){
         return -1;
     }
     return s;
+}
+
+// Detect if an accepted fd is a clear self-hairpin (we dialed ourselves).
+static bool is_self_endpoint(int fd, uint16_t listen_port){
+    sockaddr_storage peer{}, local{};
+#ifdef _WIN32
+    int alen = (int)sizeof(peer), blen = (int)sizeof(local);
+#else
+    socklen_t alen = sizeof(peer), blen = sizeof(local);
+#endif
+    if (getpeername(fd, (sockaddr*)&peer, &alen) != 0) return false;
+    if (getsockname(fd, (sockaddr*)&local, &blen) != 0) return false;
+
+    if (peer.ss_family == AF_INET && local.ss_family == AF_INET) {
+        auto* p = (sockaddr_in*)&peer;
+        auto* l = (sockaddr_in*)&local;
+        // If the peer IP is one of ours (incl. loopback) and local listens on listen_port,
+        // treat as self-connection. This will NOT block a local wallet (peer port != listen_port).
+        bool peer_is_self = is_self_be(p->sin_addr.s_addr) || ((ntohl(p->sin_addr.s_addr) >> 24) == 127);
+        if (peer_is_self && ntohs(l->sin_port) == listen_port) return true;
+    }
+    return false;
 }
 
 // ---- NEW (helper): convert coinbase PKH → Base58 P2PKH and extract from block
@@ -1758,6 +1779,13 @@ void P2P::loop(){
                 sockaddr_in ca{}; socklen_t clen = sizeof(ca);
                 int c = (int)accept(srv_, (sockaddr*)&ca, &clen);
                 if (c >= 0) {
+                    // Hard drop clear self-hairpin (we dialed ourselves or addrman looped back)
+                    if (is_self_endpoint(c, g_listen_port)) {
+                        // Just close that socket; keep running.
+                        CLOSESOCK(c);
+                        continue;
+                    }
+
                     int64_t tnow = now_ms();
                     if (tnow - inbound_win_start_ms_ > 60000) {
                         inbound_win_start_ms_ = tnow;
