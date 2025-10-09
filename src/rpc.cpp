@@ -29,7 +29,7 @@
 #include <string>
 #include <vector>
 #include <cstring>  // std::memset
-#include <cstdlib>  // std::getenv
+#include <cstdlib>  // std::getenv, setenv
 #include <iomanip>  // std::setw, std::setfill
 
 #include <fstream>
@@ -41,6 +41,7 @@
   #include <unistd.h>
 #else
   #include <windows.h>
+  #include <direct.h>
 #endif
 
 #ifndef MIN_RELAY_FEE_RATE
@@ -78,6 +79,12 @@ static std::string join_path(const std::string& a, const std::string& b){
     return a + sep + b;
 }
 
+static std::string dirname1(const std::string& p){
+    size_t pos = p.find_last_of("/\\");
+    if(pos == std::string::npos) return std::string();
+    return p.substr(0, pos);
+}
+
 static std::string hex32_random() {
     std::array<uint8_t,32> buf{};
     std::random_device rd;
@@ -101,11 +108,29 @@ static bool read_first_line_trim(const std::string& p, std::string& out) {
     return true;
 }
 
+static bool ensure_dir_exists_simple(const std::string& path){
+    if(path.empty()) return false;
+#ifndef _WIN32
+    // mkdir returns 0 if created, -1 if exists or error
+    if(::mkdir(path.c_str(), 0700) == 0) return true;
+    if(errno == EEXIST) return true;
+    return false;
+#else
+    if(_mkdir(path.c_str()) == 0) return true;
+    if(errno == EEXIST) return true;
+    return false;
+#endif
+}
+
 static bool write_cookie_file_secure(const std::string& p, const std::string& tok) {
 #ifndef _WIN32
     // best-effort: 0600
     umask(0077);
 #endif
+    // ensure parent exists
+    auto parent = dirname1(p);
+    if(!parent.empty()) ensure_dir_exists_simple(parent);
+
     std::ofstream f(p, std::ios::out | std::ios::trunc | std::ios::binary);
     if(!f.good()) return false;
     f << tok << "\n";
@@ -174,8 +199,49 @@ static bool try_load_static_token(const std::string& datadir, std::string& out_t
     return false;
 }
 
+// Try to detect datadir for cookie:
+// 1) MIQ_DATADIR
+// 2) From wallet path: .../wallets/default  -> strip "/wallets"
+// 3) Fallback: $HOME/.miqrochain or %APPDATA%\Miqrochain
+static std::string detect_datadir_for_cookie(){
+    if (const char* d = std::getenv("MIQ_DATADIR"); d && *d) {
+        return std::string(d);
+    }
+    // derive from wallet folder if possible
+    std::string wfile = default_wallet_file();
+    if(!wfile.empty()){
+        // default_wallet_file() typically points to ".../wallets/default/<file>"
+        std::string wdir = dirname1(wfile);             // .../wallets/default
+        if(!wdir.empty()){
+            // strip trailing "/default"
+            std::string parent = dirname1(wdir);        // .../wallets
+            if(!parent.empty()){
+                // strip "/wallets" to reach datadir
+                size_t pos = parent.find_last_of("/\\");
+                if(pos != std::string::npos){
+                    std::string last = parent.substr(pos+1);
+                    if(last == "wallets"){
+                        return parent.substr(0, pos);
+                    }
+                }
+            }
+            // if not matching expected layout, use parent of parent as best-effort
+            std::string maybe = dirname1(parent);
+            if(!maybe.empty()) return maybe;
+        }
+    }
+#ifdef _WIN32
+    const char* appdata = std::getenv("APPDATA");
+    std::string base = appdata && *appdata ? std::string(appdata) : std::string(".");
+    return join_path(base, "Miqrochain");
+#else
+    const char* home = std::getenv("HOME");
+    std::string base = home && *home ? std::string(home) : std::string(".");
+    return join_path(base, ".miqrochain");
+#endif
+}
+
 void rpc_enable_auth_cookie(const std::string& datadir) {
-    // Prefer a static token (env/.rpctoken/miq.conf). Otherwise use cookie.
     std::string tok;
     bool have_static = try_load_static_token(datadir, tok);
 
@@ -306,7 +372,23 @@ namespace {
 }
 
 void RpcService::start(uint16_t port){
-    // http.cpp authenticates via Authorization / X-Auth-Token (MIQ_RPC_TOKEN).
+    // 1) Detect datadir and ensure RPC cookie/token is ready BEFORE HTTP starts,
+    //    so http.cpp will immediately see MIQ_RPC_TOKEN.
+    {
+        std::string ddir = detect_datadir_for_cookie();
+        if(ddir.empty()){
+#ifdef _WIN32
+            ddir = ".";
+#else
+            ddir = ".";
+#endif
+        }
+        // best-effort ensure dir exists (important for first run)
+        ensure_dir_exists_simple(ddir);
+        rpc_enable_auth_cookie(ddir);
+    }
+
+    // 2) Start HTTP server; Authorization/X-Auth-Token is validated there.
     http_.start(
         port,
         [this](const std::string& b,
