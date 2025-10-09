@@ -860,6 +860,24 @@ bool P2P::start(uint16_t port){
         log_info("P2P: self-ip guard active: " + self_list_for_log());
     }
 
+    // --- SANITIZE LEGACY STORE: drop loopback/private/self that may have leaked ---
+    {
+        size_t dropped = 0;
+        for (auto it = addrv4_.begin(); it != addrv4_.end(); ) {
+            uint32_t be_ip = *it;
+            if (!ipv4_is_public(be_ip) || is_loopback_be(be_ip) || is_self_be(be_ip)) {
+                it = addrv4_.erase(it);
+                ++dropped;
+            } else {
+                ++it;
+            }
+        }
+        if (dropped) {
+            log_warn("P2P: pruned " + std::to_string(dropped) +
+                     " non-public/loopback/self addrs from legacy store");
+        }
+    }
+
     // Resolve bootstrap seeds from constants.h and stash into stores
     {
         std::vector<miq::SeedEndpoint> seeds;
@@ -1640,7 +1658,8 @@ void P2P::loop(){
                     std::vector<uint32_t> candidates;
                     candidates.reserve(addrv4_.size());
                     for (uint32_t ip : addrv4_) {
-                        if (is_self_be(ip)) continue; // never dial ourselves
+                        if (is_self_be(ip)) continue;      // never dial ourselves
+                        if (is_loopback_be(ip)) continue;   // NEW: never dial loopback (e.g., 127.0.0.1)
                         std::string dotted = be_ip_to_string(ip);
                         if (banned_.count(dotted)) continue;
                         bool connected = false;
@@ -1654,25 +1673,31 @@ void P2P::loop(){
                     if (!candidates.empty()) {
                         std::uniform_int_distribution<size_t> dist(0, candidates.size()-1);
                         uint32_t pick = candidates[dist(rng())];
-                        int s = dial_be_ipv4(pick, g_listen_port);
-                        if (s >= 0) {
-                            // Build PeerState
-                            PeerState ps;
-                            ps.sock = s;
-                            ps.ip   = be_ip_to_string(pick);
-                            ps.mis  = 0;
-                            ps.last_ms = now_ms();
-                            ps.blk_tokens = MIQ_RATE_BLOCK_BURST;
-                            ps.tx_tokens  = MIQ_RATE_TX_BURST;
-                            ps.last_refill_ms = ps.last_ms;
-                            ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
-                            peers_[s] = ps;
-                            g_trickle_last_ms[s] = 0;
 
-                            log_info("P2P: outbound to known " + ps.ip);
-                            gate_on_connect(s);
-                            auto msg = encode_msg("version", {});
-                            send(s, (const char*)msg.data(), (int)msg.size(), 0);
+                        // Paranoia guard (belt-and-suspenders)
+                        if (is_loopback_be(pick)) {
+                            // Shouldn't happen due to filter above
+                        } else {
+                            int s = dial_be_ipv4(pick, g_listen_port);
+                            if (s >= 0) {
+                                // Build PeerState
+                                PeerState ps;
+                                ps.sock = s;
+                                ps.ip   = be_ip_to_string(pick);
+                                ps.mis  = 0;
+                                ps.last_ms = now_ms();
+                                ps.blk_tokens = MIQ_RATE_BLOCK_BURST;
+                                ps.tx_tokens  = MIQ_RATE_TX_BURST;
+                                ps.last_refill_ms = ps.last_ms;
+                                ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
+                                peers_[s] = ps;
+                                g_trickle_last_ms[s] = 0;
+
+                                log_info("P2P: outbound to known " + ps.ip);
+                                gate_on_connect(s);
+                                auto msg = encode_msg("version", {});
+                                send(s, (const char*)msg.data(), (int)msg.size(), 0);
+                            }
                         }
                     }
 #if MIQ_ENABLE_ADDRMAN
