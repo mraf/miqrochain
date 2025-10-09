@@ -87,6 +87,15 @@ static bool get_varint(const uint8_t* p, size_t n, uint64_t& v, size_t& used){
     return false;
 }
 
+// ---- FNV-1a hasher for vector<uint8_t> (must be defined before use) ---------
+struct HashVec {
+    size_t operator()(const std::vector<uint8_t>& v) const noexcept {
+        size_t h = 1469598103934665603ull;
+        for(uint8_t b: v){ h ^= b; h *= 1099511628211ull; }
+        return h;
+    }
+};
+
 // -----------------------------------------------------------------------------
 // P2P helpers (broadcast + simple SPV UTXO discovery)
 // -----------------------------------------------------------------------------
@@ -192,7 +201,7 @@ static bool parse_miq_tx(const uint8_t* tx, size_t txlen,
 // ---- block scan: supports MIQ (u32 count + u32 size) and BTC style -----------
 static bool scan_block_for_wallet(
     const std::vector<uint8_t>& raw_block,
-    const std::unordered_set<std::vector<uint8_t>, struct HashVec>& pkhset,
+    const std::unordered_set<std::vector<uint8_t>, HashVec>& pkhset,
     uint32_t block_height,
     std::vector<UtxoLite>& view,
     std::unordered_map<std::string,size_t>& idx,
@@ -215,7 +224,7 @@ static bool scan_block_for_wallet(
     auto handle_tx = [&](const uint8_t* tptr, size_t tlen){
         // txid = little-endian dsha256(tx_bytes)
         std::vector<uint8_t> tx_bytes(tptr, tptr+tlen);
-        auto h  = dsha256(tx_bytes);
+        auto h  = miq::dsha256(tx_bytes);
         auto hl = to_le32(h);
 
         bool is_cb=false;
@@ -259,7 +268,6 @@ static bool scan_block_for_wallet(
     if(pos + 4 <= raw_block.size()){
         uint32_t tx_count = rd_u32_le(&raw_block[pos]); pos += 4;
 
-        // Heuristic: if the next u32 looks like a sane tx size, assume MIQ-style.
         if(pos + 4 <= raw_block.size()){
             uint32_t first_size = rd_u32_le(&raw_block[pos]);
             if(first_size >= 4 && first_size <= miq::MAX_TX_SIZE){
@@ -274,22 +282,15 @@ static bool scan_block_for_wallet(
                 return true;
             }
         }
-        // If that check failed, fall through to varint path below (Bitcoin style).
-        pos -= 4; // rewind count read
+        pos -= 4; // rewind if MIQ-style check failed
     }
 
-    // Bitcoin-style: varint tx_count; then txs back-to-back (we can parse MIQ txs)
+    // Bitcoin-style: varint tx_count; then txs back-to-back (parse MIQ txs)
     uint64_t vcnt=0, used=0;
     if(!get_varint(&raw_block[pos], raw_block.size()-pos, vcnt, used)) return false;
     pos += used;
     for(uint64_t i=0;i<vcnt;i++){
-        // We don't know the tx size up-front; parse_miq_tx will verify and we can
-        // detect the consumed length by binary searching, but we actually know the
-        // exact boundary because our MIQ tx format uses fixed-length fields + sizes.
-        // So we parse once, then walk forward until the end returned by a sentinel.
-        // Easiest: incrementally grow a window until parse succeeds on exactly that size.
         size_t start = pos;
-        // upper bound clamp
         size_t max_win = std::min(raw_block.size()-start, (size_t)miq::MAX_TX_SIZE);
         bool ok=false;
         for(size_t win=16; win<=max_win; win+=16){
@@ -306,14 +307,6 @@ static bool scan_block_for_wallet(
 }
 
 // SPV: collect UTXOs for a set of PKHs using only P2P.
-struct HashVec {
-    size_t operator()(const std::vector<uint8_t>& v) const noexcept {
-        size_t h = 1469598103934665603ull; // FNV-1a
-        for(uint8_t b: v){ h ^= b; h *= 1099511628211ull; }
-        return h;
-    }
-};
-
 static bool spv_collect_utxos(
     const std::string& host, const std::string& port,
     const std::vector<std::vector<uint8_t>>& pkhs,
