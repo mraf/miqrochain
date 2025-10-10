@@ -23,6 +23,10 @@
 #include <random>
 #include <cstdlib>  // getenv
 
+#ifndef _WIN32
+#include <signal.h>
+#endif
+
 // === Optional persisted addrman =============================================
 // This block is 100% backward compatible: if addrman.h is absent, we disable it.
 #if defined(__has_include)
@@ -815,6 +819,11 @@ void P2P::save_bans(){
 // === start/stop now also load/save peers files ===============================
 bool P2P::start(uint16_t port){
     if (running_) return true;
+
+#ifndef _WIN32
+    signal(SIGPIPE, SIG_IGN);
+#endif
+
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
