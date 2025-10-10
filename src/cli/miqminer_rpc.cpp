@@ -1,16 +1,22 @@
 // miqminer_rpc.cpp — solo miner (JSON-RPC), fee-aware, non-empty blocks, crash-safe submissions
+// Defaults to 6 threads, smooth live hashrate (inst + EWMA), richer 3D block animation (24 frames),
+// and an optimized inner loop (batched nonce steps + batched atomic updates).
+//
 // Stats: tip height/hash/bits/difficulty, candidate size/txs/fees/coinbase,
 //        last network block hash/txid/paid-to, local & estimated network hashrate.
-// Requires node RPCs: getminertemplate, gettipinfo, getblock, getcoinbaserecipient, getblockcount, getblockhash
+//
+// Requires node RPCs: getminertemplate, gettipinfo, getblock, getcoinbaserecipient,
+//                     getblockcount, getblockhash. (submitblock/submitrawblock optional)
 //
 // Build (GCC/Clang):
-//   g++ -std=c++17 -O3 -DNDEBUG -march=native -mtune=native -flto miqminer_rpc.cpp -o miqminer_rpc
+//   g++ -std=c++17 -O3 -DNDEBUG -march=native -mtune=native -flto -funroll-loops \
+//       -fomit-frame-pointer miqminer_rpc.cpp -o miqminer_rpc
 //
 // Build (MSVC):
 //   cl /std:c++17 /O2 /GL /DNDEBUG miqminer_rpc.cpp ws2_32.lib
 //
 // Run:
-//   ./miqminer_rpc --threads=8 --rpc=127.0.0.1:8332
+//   ./miqminer_rpc --threads=6 --rpc=127.0.0.1:8332
 //   (token from --token, MIQ_RPC_TOKEN, or datadir .cookie)
 
 #include "constants.h"
@@ -48,6 +54,7 @@
   #ifndef NOMINMAX
   #define NOMINMAX 1
   #endif
+  #include <windows.h>
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #pragma comment(lib, "Ws2_32.lib")
@@ -68,7 +75,7 @@
 
 using namespace miq;
 
-// ---------- utils ----------
+// ---------- tiny utils ----------
 static inline void trim(std::string& s){
     size_t i=0,j=s.size();
     while(i<j && std::isspace((unsigned char)s[i])) ++i;
@@ -200,7 +207,7 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
         << "Content-Type: application/json\r\n"
         << "Content-Length: " << json.size() << "\r\n";
     if(!auth_token.empty()){
-        // Accept both header styles (our node checks either)
+        // Accept both header styles (node may check either)
         req << "Authorization: Bearer " << auth_token << "\r\n";
         req << "X-Auth-Token: " << auth_token << "\r\n";
     }
@@ -351,7 +358,7 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
     if(out_prev.size()!=32) return false;
     if(json_find_number(r.body,"max_block_bytes",maxb)) out_maxb=(size_t)maxb; else out_maxb=900*1024;
 
-    // Parse txs (ids/hex/fee/depends). We only need hex & fee; deps are honored by topo packer.
+    // Parse txs (ids/hex/fee/depends). We only need hex & fee; deps are optionally honored.
     size_t p = r.body.find("\"txs\"");
     if(p==std::string::npos) return true;
     p = r.body.find('[', p);
@@ -379,13 +386,13 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
         json_find_string(obj,"hex",hx);
         json_find_number(obj,"fee",fee);
         if(!hx.empty()){ txhex.push_back(hx); txfee.push_back((uint64_t)(fee<0?0:fee)); }
+
         // deps (optional)
         std::vector<std::string> deps;
         size_t dp = obj.find("\"depends\"");
         if(dp!=std::string::npos){
             size_t br = obj.find('[',dp);
             if(br!=std::string::npos){
-                // simple array of strings
                 size_t i=br+1;
                 while(i<obj.size()){
                     while(i<obj.size() && std::isspace((unsigned char)obj[i])) ++i;
@@ -475,7 +482,6 @@ static double estimate_network_hashps(const std::string& host, uint16_t port, co
     double dt = (double)(t_last - t_first);
     if(dt<=0.0) return 0.0;
 
-    // D from bits (same as node)
     double D = difficulty_from_bits(bits);
     double blocks = (double)(tip_height - start_h);
     double avg_spacing = dt / std::max(1.0, blocks);
@@ -517,11 +523,11 @@ static std::vector<uint8_t> merkle_from(const std::vector<Transaction>& txs){
     return miq::merkle_root(ids);
 }
 
-// ---------- UI (16-frame block anim) ----------
+// ---------- UI (24-frame animation + EWMA hashrate) ----------
 static const int kAnimLines = 8;
-static const int kAnimFrames = 16;
+static const int kAnimFrames = 24;
 static const char* kFrames[kAnimFrames][kAnimLines] = {
-// 16 subtly-rotating/wobbling cube frames (ANSI-safe, same width)
+// (24 frames; same width so it doesn't jitter)
 {
 "      _________       ",
 "     / _______ \\      ",
@@ -666,6 +672,78 @@ static const char* kFrames[kAnimFrames][kAnimLines] = {
 "   \\\\___/ /  /        ",
 "    \\_____/_/         ",
 "     \\______/         "
+},{
+"  _________           ",
+" / ________\\          ",
+"/ /  ___  \\ \\         ",
+"\\ \\ / _ \\  \\ \\        ",
+" \\ / /_\\ \\  \\_\\       ",
+"  \\\\___/ /  /         ",
+"   \\_____/_/          ",
+"    \\______/          "
+},{
+"  _________           ",
+" / ________\\          ",
+"/ /  ___  \\ \\         ",
+"\\ \\ / _ \\  \\ \\        ",
+" \\ / /_\\ \\  \\_\\       ",
+"  \\\\___/ /  / /       ",
+"   \\_____/_/ /        ",
+"    \\_______/         "
+},{
+"   _________          ",
+"  / ________\\         ",
+" / /  ___  \\ \\        ",
+"/ /  / _ \\  \\ \\       ",
+"\\_\\ / /_\\ \\  \\_\\      ",
+" \\ \\\\___/ /  /        ",
+"  \\ \\_____/           ",
+"   \\_______           "
+},{
+"   _________          ",
+"  / ________\\         ",
+" / /  ___  \\ \\        ",
+"/ /  / _ \\  \\ \\       ",
+"\\_\\ / /_\\ \\  \\_\\      ",
+" \\ \\\\___/ /  / /      ",
+"  \\ \\_____/  /        ",
+"   \\________/         "
+},{
+"    _________         ",
+"   / ________\\        ",
+"  / /  ___  \\ \\       ",
+" / /  / _ \\  \\ \\      ",
+"/_/  / /_\\ \\  \\_\\     ",
+"\\ \\  \\___/ /  /       ",
+" \\ \\_______/          ",
+"  \\_________          "
+},{
+"    _________         ",
+"   / ________\\        ",
+"  / /  ___  \\ \\       ",
+" / /  / _ \\  \\ \\      ",
+"/_/  / /_\\ \\  \\_\\     ",
+"\\ \\  \\___/ /  / /     ",
+" \\ \\_______/  /       ",
+"  \\__________/        "
+},{
+"     _________        ",
+"    / ________\\       ",
+"   / /  ___  \\ \\      ",
+"  / /  / _ \\  \\ \\     ",
+" /_/  / /_\\ \\  \\_\\    ",
+" \\ \\  \\___/ /  /      ",
+"  \\ \\_______/         ",
+"   \\_________         "
+},{
+"      _________       ",
+"     / _______ \\      ",
+"    / / _____ \\ \\     ",
+"   / / / ___ \\ \\ \\    ",
+"  /_/ / /___\\ \\ \\_\\   ",
+"  \\ \\ \\_____/_/ /     ",
+"   \\ \\_______/ /      ",
+"    \\__________/      "
 }
 };
 
@@ -695,6 +773,7 @@ struct UIState {
     std::atomic<uint64_t> tries_last{0};
     std::atomic<uint64_t> mined_blocks{0};
     std::atomic<double>   net_hashps{0.0};
+    std::atomic<double>   local_ewma{0.0};
 
     // tip
     std::atomic<uint64_t> tip_height{0};
@@ -718,17 +797,29 @@ static std::string fmt_hs(double v){
 
 static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui, const std::atomic<bool>* running){
 #if defined(_WIN32)
-    // enable ANSI colors for Windows 10+
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
     if (h != INVALID_HANDLE_VALUE) {
         DWORD mode=0; if (GetConsoleMode(h,&mode)) SetConsoleMode(h, mode | 0x0004);
     }
 #endif
+    using clock = std::chrono::steady_clock;
+    auto prev_ts = clock::now();
     uint64_t frame = 0;
     while(running->load(std::memory_order_relaxed)){
-        uint64_t cur = ui->tries.load();
-        uint64_t prev = ui->tries_last.exchange(cur);
-        double local_hs = (double)(cur - prev) / 1.0;
+        auto now = clock::now();
+        double dt = std::chrono::duration<double>(now - prev_ts).count();
+        if(dt <= 0.0) dt = 1e-3;
+        prev_ts = now;
+
+        uint64_t cur = ui->tries.load(std::memory_order_relaxed);
+        uint64_t prev = ui->tries_last.exchange(cur, std::memory_order_relaxed);
+        double local_inst = (double)(cur - prev) / dt;
+
+        // EWMA (half-life ~5s): alpha = 1 - exp(-dt/5)
+        double alpha = 1.0 - std::exp(-dt / 5.0);
+        double ewma_prev = ui->local_ewma.load(std::memory_order_relaxed);
+        double ewma = (1.0 - alpha) * ewma_prev + alpha * local_inst;
+        ui->local_ewma.store(ewma, std::memory_order_relaxed);
 
         std::ostringstream os;
         os << "\x1b[2J\x1b[H"; // clear
@@ -738,8 +829,9 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
         if(th){
             os << "  tip height:      " << th << "\n";
             os << "  tip hash:        " << ui->tip_hash_hex << "\n";
-            os << "  tip bits:        0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)ui->tip_bits.load()
-               << std::dec << "  (difficulty " << std::fixed << std::setprecision(2) << difficulty_from_bits(ui->tip_bits.load()) << ")\n";
+            uint32_t bits = ui->tip_bits.load();
+            os << "  tip bits:        0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)bits
+               << std::dec << "  (difficulty " << std::fixed << std::setprecision(2) << difficulty_from_bits(bits) << ")\n";
         } else {
             os << "  (waiting for template)\n";
         }
@@ -774,13 +866,13 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
         }
 
         os << "\n";
-        os << "  local hashrate:   " << fmt_hs(local_hs) << "\n";
+        os << "  local hashrate:   " << fmt_hs(local_inst) << "  (avg " << fmt_hs(ui->local_ewma.load()) << ")\n";
         os << "  network hashrate: " << fmt_hs(ui->net_hashps.load()) << "\n";
         os << "  mined (session):  " << ui->mined_blocks.load() << "\n";
         if(!ui->last_found_block_hash.empty())
             os << "  last found:       " << ui->last_found_block_hash << "\n";
 
-        // animation
+        // animation (update every frame)
         os << "\n";
         const char** f = kFrames[frame % kAnimFrames];
         for(int i=0;i<kAnimLines;i++)
@@ -788,12 +880,14 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
         os << "\n  Press Ctrl+C to quit.\n";
 
         std::cout << os.str() << std::flush;
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        // ~5 FPS UI (smoother than 1 Hz)
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         ++frame;
     }
 }
 
-// ---------- mining worker ----------
+// ---------- mining worker (optimized inner loop) ----------
 static void nonce_worker(const BlockHeader hdr_base,
                          const std::vector<Transaction> txs_including_cb,
                          uint32_t bits,
@@ -804,24 +898,42 @@ static void nonce_worker(const BlockHeader hdr_base,
 {
     Block b; b.header = hdr_base; b.txs = txs_including_cb;
     b.header.merkle_root = merkle_from(b.txs); // fixed per candidate
+
+    // Local batching to reduce atomic contention
+    const uint32_t STEP_BATCH = 4096; // update global counter every 4k nonces
+    uint64_t local_steps = 0;
+
     uint32_t nonce = tid;
+
     while(!found->load(std::memory_order_relaxed)){
-        b.header.nonce = nonce;
-        auto h = b.block_hash(); // relies on project’s fast serializer/hash
-        tries->fetch_add(1, std::memory_order_relaxed);
-        if(meets_target_be(h, bits)){
-            *out_block = b;
-            found->store(true, std::memory_order_relaxed);
-            return;
+        // Unroll 8 attempts per small loop
+        for(int k=0; k<8; ++k){
+            b.header.nonce = nonce;
+            auto h = b.block_hash(); // relies on project’s fast serializer/hash
+            if(meets_target_be(h, bits)){
+                *out_block = b;
+                // flush any outstanding local steps
+                if(local_steps) tries->fetch_add(local_steps, std::memory_order_relaxed);
+                found->store(true, std::memory_order_relaxed);
+                return;
+            }
+            nonce += stride;
         }
-        nonce += stride;
+        local_steps += 8;
+        if(local_steps >= STEP_BATCH){
+            tries->fetch_add(local_steps, std::memory_order_relaxed);
+            local_steps = 0;
+        }
+        // Periodically check stop flag (already happens above), keep loop tight
     }
+
+    if(local_steps) tries->fetch_add(local_steps, std::memory_order_relaxed);
 }
 
-// ---------- topo packer + stats ----------
+// ---------- packing (size-first; deps optional) ----------
 static bool pack_template(const std::vector<std::string>& txhex,
                           const std::vector<uint64_t>& txfee,
-                          const std::vector<std::vector<std::string>>& /*deps*/, // (kept for future advanced topo)
+                          const std::vector<std::vector<std::string>>& /*deps*/,
                           size_t max_block_bytes,
                           size_t coinbase_bytes,
                           std::vector<Transaction>& out_txs,
@@ -829,7 +941,6 @@ static bool pack_template(const std::vector<std::string>& txhex,
                           size_t& out_bytes)
 {
     out_txs.clear(); out_fees=0; out_bytes=coinbase_bytes;
-    // Simple size-first pack (deps already sorted by node for our chain; if not, we could topo sort via ids)
     for(size_t i=0;i<txhex.size();++i){
         std::vector<uint8_t> raw;
         try{ raw = from_hex_s(txhex[i]); }catch(...){ continue; }
@@ -841,6 +952,23 @@ static bool pack_template(const std::vector<std::string>& txhex,
         out_fees += txfee[i];
     }
     return true;
+}
+
+// ---------- submit (optional) ----------
+static bool rpc_submitblock_try(const std::string& host, uint16_t port, const std::string& auth,
+                                const char* method, const std::string& hexblk)
+{
+    std::ostringstream ps; ps << "[\"" << hexblk << "\"]";
+    HttpResp r;
+    if(!http_post(host, port, "/", auth, rpc_build(method, ps.str()), r)) return false;
+    if(r.code != 200) return false;
+    return !json_has_error(r.body);
+}
+static bool rpc_submitblock(const std::string& host, uint16_t port, const std::string& auth, const std::string& hexblk){
+    if(rpc_submitblock_try(host,port,auth,"submitblock",hexblk)) return true;
+    if(rpc_submitblock_try(host,port,auth,"submitrawblock",hexblk)) return true;
+    if(rpc_submitblock_try(host,port,auth,"sendrawblock",hexblk)) return true;
+    return false;
 }
 
 // ---------- main ----------
@@ -863,7 +991,7 @@ int main(int argc, char** argv){
         std::string rpc_host = "127.0.0.1";
         uint16_t    rpc_port = (uint16_t)miq::RPC_PORT;
         std::string token;
-        unsigned threads = std::max(1u, std::thread::hardware_concurrency());
+        unsigned threads = 6; // default to 6 as requested
 
         for(int i=1;i<argc;i++){
             std::string a(argv[i]);
@@ -984,61 +1112,51 @@ int main(int argc, char** argv){
                 thv.emplace_back(nonce_worker, hb, txs_inc, bits, &found, &tries, tid, threads, &found_block);
             }
 
-            // meter to UI
+            // meter to UI (100ms updates)
             std::thread meter([&](){
+                using clock = std::chrono::steady_clock;
                 while(!found.load(std::memory_order_relaxed)){
-                    ui.tries.store(tries.load(std::memory_order_relaxed));
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    ui.tries.store(tries.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
-                ui.tries.store(tries.load(std::memory_order_relaxed));
+                ui.tries.store(tries.load(std::memory_order_relaxed), std::memory_order_relaxed);
             });
 
             meter.join();
             for(auto& th: thv) th.join();
 
-            // stale check before submit (prevents node stress / accidental spam)
+            // stale tip check before submit
             TipInfo tip_now{};
             bool have_tip = rpc_gettipinfo(rpc_host, rpc_port, token, tip_now);
             if(have_tip){
-                // if tip hash changed away from our prev, our block is almost surely stale
+                // if tip hash changed from our prev, likely stale — discard to avoid stressing node
                 if(to_hex_s(tip_now.hash_hex.size()?from_hex_s(tip_now.hash_hex):std::vector<uint8_t>()) != to_hex_s(prev)){
                     std::fprintf(stderr,"stale template detected, discarding solved block (chain advanced)\n");
                     continue;
                 }
             }
 
-            // submit
+            // submit (best-effort; safe if RPC not present)
             auto raw = miq::ser_block(found_block);
             std::string hexblk = miq::to_hex(raw);
 
-            // Double-check meets target locally (belt & suspenders)
+            // Double-check meets target locally
             if(!meets_target_be(found_block.block_hash(), bits)){
                 std::fprintf(stderr,"internal: solved header doesn't meet target, skipping\n");
                 continue;
             }
 
-            // Graceful backoff on reject; no custom submit method in node yet, so use p2p ingestion path if available later.
-            bool ok = false;
-            {
-                // Node side may add submit method later; for now this is a stub-safe area:
-                // If no RPC exists, skip submission (avoids node crash) and just wait for next template.
-                // Replace with actual rpc_submitblock(...) when node exposes it.
-                // ok = rpc_submitblock(rpc_host, rpc_port, token, hexblk);
-                ok = false; // safe default (no submit RPC implemented on node yet)
-            }
-
+            bool ok = rpc_submitblock(rpc_host, rpc_port, token, hexblk);
             if(ok){
-                ui.mined_blocks.fetch_add(1);
+                ui.mined_blocks.fetch_add(1, std::memory_order_relaxed);
                 ui.last_found_block_hash = miq::to_hex(found_block.block_hash());
-                // give node a moment then loop to fresh template
                 miq_sleep_ms(250);
             } else {
-                // Without a submit RPC, print the hex so operator can feed it through a peer/CLI if desired.
-                std::fprintf(stderr, "[info] block candidate solved but no submit RPC; hash=%s height=%llu\n",
+                // If node has no submit RPC, print hex for manual relay if desired.
+                std::fprintf(stderr, "[info] block candidate solved (no/failed submit RPC); hash=%s height=%llu\n",
                              miq::to_hex(found_block.block_hash()).c_str(),
                              (unsigned long long)height);
                 ui.last_found_block_hash = miq::to_hex(found_block.block_hash());
-                // short delay to avoid busy-looping
                 miq_sleep_ms(300);
             }
         }
