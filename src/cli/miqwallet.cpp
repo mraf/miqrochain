@@ -80,9 +80,7 @@ static bool p2p_broadcast_tx_one(const std::string& seed_host, const std::string
     o.host = seed_host;
     o.port = seed_port;
     o.user_agent = "/miqwallet-p2p:0.1/";
-    // modest timeouts so a dead seed can't hang the CLI
-    o.io_timeout_ms = 5000;
-
+    o.io_timeout_ms = 5000;             // valid for P2PLight::P2POpts (NOT SpvOptions)
     miq::P2PLight p2p;
     if(!p2p.connect_and_handshake(o, err)) return false;
     bool ok = p2p.send_tx(raw_tx, err);
@@ -90,10 +88,12 @@ static bool p2p_broadcast_tx_one(const std::string& seed_host, const std::string
     return ok;
 }
 
-static bool is_localhost(const std::string& h){
-    if (h == "127.0.0.1" || h == "localhost") return true;
-    if (h.rfind("127.", 0) == 0) return true;
-    return false;
+static bool env_truthy(const char* name){
+    const char* v = std::getenv(name);
+    if(!v) return false;
+    std::string s = v;
+    for(char& c: s) c = (char)std::tolower((unsigned char)c);
+    return (s=="1" || s=="true" || s=="yes" || s=="on");
 }
 
 static std::vector<std::pair<std::string,std::string>>
@@ -101,12 +101,10 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
 {
     std::vector<std::pair<std::string,std::string>> seeds;
 
-    // 0) explicit CLI (honor exactly what the user asked for)
-    if(!cli_host.empty()){
-        seeds.emplace_back(cli_host, cli_port);
-    }
+    // 0) explicit CLI
+    if(!cli_host.empty()) seeds.emplace_back(cli_host, cli_port);
 
-    // 1) env override (MIQ_P2P_SEED=host[:port])
+    // 1) env override (MIQ_P2P_SEED="host[:port]")
     if(const char* e = std::getenv("MIQ_P2P_SEED"); e && *e){
         std::string v = e;
         auto c = v.find(':');
@@ -114,33 +112,20 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
         else                       seeds.emplace_back(v, std::to_string(miq::P2P_PORT));
     }
 
-    // 2) stable remote seeds from constants (shuffled to avoid hot-spotting)
-    {
-        std::vector<std::pair<std::string,std::string>> remote;
-        remote.emplace_back(miq::DNS_SEED, std::to_string(miq::P2P_PORT));
-        for(size_t i=0;i<miq::DNS_SEEDS_COUNT;i++){
-            remote.emplace_back(miq::DNS_SEEDS[i], std::to_string(miq::P2P_PORT));
-        }
-        std::mt19937 rng{std::random_device{}()};
-        std::shuffle(remote.begin(), remote.end(), rng);
-        seeds.insert(seeds.end(), remote.begin(), remote.end());
+    // 2) global static seeds from constants.h (worldwide reach)
+    seeds.emplace_back(miq::DNS_SEED, std::to_string(miq::P2P_PORT));
+    for(size_t i=0;i<miq::DNS_SEEDS_COUNT;i++){
+        seeds.emplace_back(miq::DNS_SEEDS[i], std::to_string(miq::P2P_PORT));
     }
 
-    // 3) localhost is added ONLY if explicitly requested:
-    //    * CLI specified 127.0.0.1/localhost, OR
-    //    * env MIQ_ALLOW_LOCALHOST=1
-    if (cli_host.size() && is_localhost(cli_host)) {
-        // already present from step 0
-    } else if(const char* ok = std::getenv("MIQ_ALLOW_LOCALHOST")){
-        if(std::string(ok)=="1"){
-            seeds.emplace_back("127.0.0.1", std::to_string(miq::P2P_PORT));
-        }
+    // 3) localhost LAST — only if explicitly allowed (avoids accidental self-dials)
+    if (env_truthy("MIQ_ALLOW_LOCALHOST")) {
+        seeds.emplace_back("127.0.0.1", std::to_string(miq::P2P_PORT));
     }
 
     // de-dup while preserving order
     std::vector<std::pair<std::string,std::string>> uniq;
     std::unordered_set<std::string> seen;
-    uniq.reserve(seeds.size());
     for(auto& hp: seeds){
         std::string key = hp.first + ":" + hp.second;
         if(seen.insert(key).second) uniq.push_back(hp);
@@ -154,16 +139,13 @@ static bool try_broadcast_any_seed(const std::vector<std::pair<std::string,std::
                                    std::string& last_err)
 {
     used_host.clear(); last_err.clear();
-    for(size_t i=0;i<seeds.size();++i){
-        const auto& [h,p] = seeds[i];
+    for(const auto& [h,p] : seeds){
         std::string e;
         if(p2p_broadcast_tx_one(h, p, raw, e)){
             used_host = h + ":" + p;
             return true;
         }
         last_err = e.empty() ? "connect failed" : e;
-        // brief backoff before next peer to avoid hammering
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return false;
 }
@@ -179,22 +161,19 @@ static bool try_spv_collect_any_seed(const std::vector<std::pair<std::string,std
     used_host.clear(); used_tip_height = 0; last_err.clear();
     out.clear();
 
-    miq::SpvOptions opts{};
+    miq::SpvOptions opts{};                 // use what exists in your tree
     opts.recent_block_window = recent_window;
-    // prefer shortish timeouts to avoid long hangs on dead seeds
-    opts.io_timeout_ms = 5000;
+    // NOTE: Do NOT set opts.io_timeout_ms here — it doesn't exist in your repo.
 
-    for(size_t i=0;i<seeds.size();++i){
-        const auto& [h,p] = seeds[i];
+    for(const auto& [h,p] : seeds){
         std::vector<miq::UtxoLite> v; std::string e;
         if(miq::spv_collect_utxos(h, p, pkhs, opts, v, e)){
             out.swap(v);
             used_host = h + ":" + p;
-            used_tip_height = 0; // simple SPV collector doesn’t expose tip
+            used_tip_height = 0;            // SpvOptions in your tree has no tip_height field
             return true;
         }
-        last_err = e.empty() ? "connect failed" : e;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        last_err = e.empty() ? "tip query failed" : e;
     }
     return false;
 }
@@ -429,7 +408,7 @@ static bool show_balance_spv(const std::string& cli_host, const std::string& cli
 int main(int argc, char** argv){
     std::ios::sync_with_stdio(false);
 
-    // CLI seed (optional). If empty, we auto-build candidate list from DNS seeds.
+    // CLI seed (optional). If empty, we auto-build candidate list.
     std::string cli_host;
     std::string cli_port = std::to_string(miq::P2P_PORT);
 
