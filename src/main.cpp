@@ -385,6 +385,11 @@ int main(int argc, char** argv){
         std::signal(SIGINT,  handle_signal);
         std::signal(SIGTERM, handle_signal);
 
+#ifndef _WIN32
+        // Prevent process death on write to a closed socket (Linux/Unix/BSD/macOS)
+        std::signal(SIGPIPE, SIG_IGN);
+#endif
+
         // ----- Parse CLI FIRST (no heavy work yet) -----------------------
         Config cfg;
         std::string conf;
