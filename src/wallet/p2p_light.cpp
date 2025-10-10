@@ -105,7 +105,6 @@ static bool resolve_ipv4(const std::string& host, const std::string& port, socka
     std::string h = host.empty() ? std::string("127.0.0.1") : host;
     std::string p = port.empty() ? std::to_string((unsigned)P2P_PORT) : port;
 
-    // Try dotted-quad first (fast path, no DNS)
 #ifdef _WIN32
     if (InetPtonA(AF_INET, h.c_str(), &out.sin_addr) == 1) {
 #else
@@ -118,7 +117,6 @@ static bool resolve_ipv4(const std::string& host, const std::string& port, socka
         return true;
     }
 
-    // DNS/hosts lookup (IPv4 only)
     addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_INET;
 #ifdef _WIN32
     PADDRINFOA res=nullptr;
@@ -158,21 +156,17 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
 
-    // Default host/port if caller left them empty
     if (o_.host.empty()) o_.host = "127.0.0.1";
     if (o_.port.empty()) o_.port = std::to_string((unsigned)P2P_PORT);
 
-    // Resolve (IPv4 only) with hard fallback to 127.0.0.1:P2P_PORT
     sockaddr_in dst{};
     if (!resolve_ipv4(o_.host, o_.port, dst)) {
-        // final fallback: 127.0.0.1 : P2P_PORT
         if (!resolve_ipv4("127.0.0.1", std::to_string((unsigned)P2P_PORT), dst)) {
             err = "resolve failed";
             return false;
         }
     }
 
-    // Connect
 #ifdef _WIN32
     int fd = (int)socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 #else
@@ -185,12 +179,12 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     }
     sock_ = fd;
 
-    // Strict handshake: version -> verack (send our verack immediately)
+    // Strict handshake: version -> verack (we send our verack proactively)
     if(!send_version(err)) { close(); return false; }
-    if(!send_verack(err))  { close(); return false; }  // ALWAYS send once
+    if(!send_verack(err))  { close(); return false; }  // <-- now declared in header
     if(!read_until_verack(err)) { close(); return false; }
 
-    // Best-effort peer discovery (doesn't affect handshake)
+    // Best-effort peer discovery
     std::string e2; (void)send_getaddr(e2);
 
     header_hashes_le_.clear();
@@ -220,14 +214,12 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
     tip_height = 0; tip_hash_le.clear();
     if (sock_ < 0){ err = "not connected"; return false; }
 
-    // Cached?
     if(!header_hashes_le_.empty()){
         tip_height = (uint32_t)(header_hashes_le_.size() - 1);
         tip_hash_le = header_hashes_le_.back();
         return true;
     }
 
-    // Start from "null" locator to get headers from genesis.
     std::vector<std::vector<uint8_t>> locator;
     locator.emplace_back(32, 0x00);
     std::vector<uint8_t> stop(32, 0x00);
@@ -239,14 +231,11 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
         if(!read_headers_batch(batch, err)) return false;
 
         if(batch.empty()){
-            // No more headers; at tip.
-            break;
+            break; // at tip
         }
 
-        // Append
         for(auto& h : batch) header_hashes_le_.push_back(std::move(h));
 
-        // New locator = last hash (simple)
         locator.clear();
         locator.push_back(header_hashes_le_.back());
     }
@@ -294,11 +283,10 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
         }
 
         if(cmd != "headers"){
-            // swallow unrelated messages (inv, addr, etc.)
-            continue;
+            continue; // swallow unrelated
         }
 
-        // Try daemon format first: [u16 count][count * 88 bytes]
+        // Daemon format: [u16 count][count * 88 bytes]
         if(payload.size() >= 2){
             uint16_t count = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
             size_t pos = 2;
@@ -316,7 +304,7 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
             }
         }
 
-        // Fallback: Bitcoin-style [varint count][count*(80-byte header + varint txcount)]
+        // Bitcoin-style: [varint count][count*(80-byte header + varint txcount)]
         if(!payload.empty()){
             size_t pos = 0; uint64_t count=0, used=0;
             if(get_varint(payload.data(), payload.size(), count, used)){
@@ -331,7 +319,6 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
                     auto hl = to_le32(h);
                     tmp.push_back(std::move(hl));
                     pos += 80;
-                    // txcount varint may follow; if parse fails, treat as absent (0)
                     if(pos < payload.size()){
                         uint64_t tcnt=0, u2=0;
                         if(get_varint(payload.data()+pos, payload.size()-pos, tcnt, u2)) pos += u2;
@@ -356,12 +343,11 @@ bool P2PLight::match_recent_blocks(const std::vector<std::vector<uint8_t>>& /*pk
     matched.clear();
     if (sock_ < 0){ err = "not connected"; return false; }
 
-    // Ensure we have headers
     uint32_t tip=0; std::vector<uint8_t> tip_hash;
     if(!get_best_header(tip, tip_hash, err)) return false;
 
     if(to_height > tip) to_height = tip;
-    if(from_height > to_height) return true; // empty window
+    if(from_height > to_height) return true; // empty
 
     for(uint32_t h = from_height; h <= to_height; ++h){
         matched.emplace_back(header_hashes_le_[h], h);
@@ -380,7 +366,6 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
 
     if(!send_msg("getb", hash_le, err)) return false;
 
-    // read messages until we get "block"
     for(;;){
         std::string cmd; uint32_t len=0, csum=0;
         if(!read_msg_header(cmd, len, csum, err)) return false;
@@ -402,27 +387,22 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
 
 // ---- internals: version/verack and IO ----------------------------------------
 bool P2PLight::send_version(std::string& err){
-    // Build Bitcoin-like "version" payload; daemon reads first fields and ignores extras.
     std::vector<uint8_t> p;
 
     const int32_t  version   = 70015;
     const uint64_t services  = 0;
     const int64_t  timestamp = (int64_t) (std::chrono::system_clock::now().time_since_epoch() / std::chrono::seconds(1));
 
-    // remote addr (ignored by most)
     const uint64_t srv_recv = 0;
     uint8_t ip_zero[16]{}; // ::0
     const uint16_t port_recv = P2P_PORT;
 
-    // local addr
     const uint64_t srv_from = 0;
     const uint16_t port_from = 0;
 
-    // random nonce
     std::mt19937_64 rng{std::random_device{}()};
     uint64_t nonce = rng();
 
-    // version
     put_u32_le(p, (uint32_t)version);
     put_u64_le(p, services);
     put_i64_le(p, timestamp);
@@ -436,7 +416,6 @@ bool P2PLight::send_version(std::string& err){
     put_u16_be(p, port_from);
 
     put_u64_le(p, nonce);
-    // user agent
     {
         std::string ua = o_.user_agent.empty() ? "/miqwallet:0.1/" : o_.user_agent;
         if (ua.size() < 0xFD) { p.push_back((uint8_t)ua.size()); }
@@ -444,7 +423,7 @@ bool P2PLight::send_version(std::string& err){
         p.insert(p.end(), ua.begin(), ua.end());
     }
     put_u32_le(p, o_.start_height);
-    p.push_back(1); // relay = true
+    p.push_back(1); // relay
 
     return send_msg("version", p, err);
 }
@@ -455,7 +434,6 @@ bool P2PLight::send_verack(std::string& err){
 }
 
 // Read until we see verack from the node; reply to ping as needed.
-// We ignore node's "version" since we already sent our verack proactively.
 bool P2PLight::read_until_verack(std::string& err){
     for (int i=0;i<100;i++){
         std::string cmd; uint32_t len=0, csum=0;
@@ -476,18 +454,14 @@ bool P2PLight::send_msg(const char cmd12[12], const std::vector<uint8_t>& payloa
     if (sock_ < 0) { err = "not connected"; return false; }
 
     uint8_t header[24]{};
-    // magic (the 4 canonical bytes)
     uint32_t m = MIQ_P2P_MAGIC;
     header[0]=uint8_t(m); header[1]=uint8_t(m>>8); header[2]=uint8_t(m>>16); header[3]=uint8_t(m>>24);
 
-    // command (null-padded to 12)
     for (int i=0;i<12 && cmd12[i]; ++i) header[4+i] = (uint8_t)cmd12[i];
 
-    // length
     uint32_t L = (uint32_t)payload.size();
     header[16]=uint8_t(L); header[17]=uint8_t(L>>8); header[18]=uint8_t(L>>16); header[19]=uint8_t(L>>24);
 
-    // checksum
     uint32_t c = checksum4(payload);
     header[20]=uint8_t(c); header[21]=uint8_t(c>>8); header[22]=uint8_t(c>>16); header[23]=uint8_t(c>>24);
 
@@ -509,7 +483,7 @@ bool P2PLight::read_msg_header(std::string& cmd_out, uint32_t& len_out, uint32_t
 
     len_out  = (uint32_t)h[16] | ((uint32_t)h[17]<<8) | ((uint32_t)h[18]<<16) | ((uint32_t)h[19]<<24);
     csum_out = (uint32_t)h[20] | ((uint32_t)h[21]<<8) | ((uint32_t)h[22]<<16) | ((uint32_t)h[23]<<24);
-    (void)csum_out; // checksum is not enforced here (daemon enforces it)
+    (void)csum_out; // node enforces checksum; wallet doesn't re-check here
     return true;
 }
 
