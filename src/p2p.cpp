@@ -657,11 +657,34 @@ namespace miq {
 // Allow at most `tokens_per_second` events (non-integer supported) by enforcing
 // a minimum interval between allows. Used by existing call sites like
 // check_rate(ps, "get", 1.0, now_ms()) and 0.5/0.25 for inv.
-    if (now - it->second >= min_interval_ms) {
-        it->second = now;
+bool P2P::check_rate(PeerState& ps,
+                     const char* family,
+                     double tokens_per_second,
+                     int64_t now)
+{
+    const char* fam = family ? family : "misc";
+    if (tokens_per_second <= 0.0) tokens_per_second = 1.0;
+
+    // Convert rate to min interval (ms), clamp to [1, INT64_MAX]
+    int64_t min_interval_ms;
+    if (tokens_per_second >= 1000.0) {
+        min_interval_ms = 1;
+    } else {
+        double ms = 1000.0 / tokens_per_second;
+        if (ms < 1.0) ms = 1.0;
+        if (ms > static_cast<double>(INT64_MAX)) ms = static_cast<double>(INT64_MAX);
+        min_interval_ms = static_cast<int64_t>(ms);
+    }
+
+    // Per-peer, per-family last allow timestamp
+    auto& perPeer = g_cmd_last_allow[ps.sock];             // creates on first use
+    int64_t& last_allow = perPeer[std::string(fam)];       // defaults to 0
+
+    if (last_allow == 0 || (now - last_allow) >= min_interval_ms) {
+        last_allow = now;
         return true;
     }
-    // gentle nudge on spam
+    // gentle nudge on spam; hard drops handled by callers when score trips
     if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
     return false;
 }
