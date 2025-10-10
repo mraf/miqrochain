@@ -657,20 +657,6 @@ namespace miq {
 // Allow at most `tokens_per_second` events (non-integer supported) by enforcing
 // a minimum interval between allows. Used by existing call sites like
 // check_rate(ps, "get", 1.0, now_ms()) and 0.5/0.25 for inv.
-bool P2P::check_rate(PeerState& ps, const char* family, double tokens_per_second, int64_t now)
-{
-    if (!family || tokens_per_second <= 0.0) return true; // disabled
-    double tps = tokens_per_second;
-    if (tps > 1000.0) tps = 1000.0;
-    int64_t min_interval_ms = (int64_t)std::max(1.0, 1000.0 / tps);
-
-    auto& perPeer = g_cmd_last_allow[ps.sock];
-    std::string fam(family);
-    auto it = perPeer.find(fam);
-    if (it == perPeer.end()) {
-        perPeer[fam] = now;
-        return true;
-    }
     if (now - it->second >= min_interval_ms) {
         it->second = now;
         return true;
