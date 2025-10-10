@@ -162,6 +162,36 @@ static bool load_existing_genesis_priv(const std::string& datadir, std::vector<u
     return false; // not found
 }
 
+// Simple read of "mining_address" from a key=value conf file (non-fatal if absent)
+static bool try_read_miningaddr_from_conf(const std::string& path, std::string& out) {
+    out.clear();
+    if (path.empty()) return false;
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        // strip comments (# ... or // ...)
+        auto hash = line.find('#'); if (hash != std::string::npos) line.resize(hash);
+        auto sl   = line.find("//"); if (sl  != std::string::npos) line.resize(sl);
+        trim_inplace(line);
+        if (line.empty()) continue;
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = line.substr(0, eq);
+        std::string v = line.substr(eq+1);
+        trim_inplace(k); trim_inplace(v);
+        if (k == "mining_address") {
+            out = v;
+            trim_inplace(out);
+            // drop surrounding quotes if any
+            if (!out.empty() && (out.front()=='"' || out.front()=='\'')) out.erase(out.begin());
+            if (!out.empty() && (out.back() =='"' || out.back()=='\''))  out.pop_back();
+            return !out.empty();
+        }
+    }
+    return false;
+}
+
 // POSIX-style simple signal handler (safe operations only).
 static void handle_signal(int /*sig*/){
     g_shutdown_requested.store(true);
@@ -323,7 +353,8 @@ static void miner_worker(Chain* chain,
     }
 }
 
-// Resolve mining address. Interactive prompt if mining_enabled=true; otherwise try env/default wallet.
+// Resolve mining address: prefer CLI/config, then env, then default wallet,
+// and only prompt if interactive TTY is available.
 static bool resolve_mining_address(std::vector<uint8_t>& out_pkh,
                                    bool mining_enabled,
                                    const std::string& conf_hint,
@@ -336,7 +367,7 @@ static bool resolve_mining_address(std::vector<uint8_t>& out_pkh,
         std::string err;
         if(parse_p2pkh(conf_hint, out_pkh, &err)) {
             log_info("Mining address: using CLI/config");
-            log_info(std::string("  addr=") + conf_hint + "  pkh=" + hex(out_pkh));
+            log_info(std::string("  addr=") + conf_hint + "  pkh=" + to_hex(out_pkh));
             return true;
         } else {
             log_error(std::string("Invalid --miningaddr/mining_address: ") + err);
@@ -352,7 +383,7 @@ static bool resolve_mining_address(std::vector<uint8_t>& out_pkh,
             std::string err;
             if(parse_p2pkh(env, out_pkh, &err)) {
                 log_info("Mining address: using MIQ_MINING_ADDR");
-                log_info(std::string("  addr=") + env + "  pkh=" + hex(out_pkh));
+                log_info(std::string("  addr=") + env + "  pkh=" + to_hex(out_pkh));
                 return true;
             } else {
                 log_warn(std::string("MIQ_MINING_ADDR invalid: ") + err + " (ignoring)");
@@ -367,7 +398,7 @@ static bool resolve_mining_address(std::vector<uint8_t>& out_pkh,
             std::string err;
             if(parse_p2pkh(a, out_pkh, &err)) {
                 log_info("Mining address: using default wallet store");
-                log_info(std::string("  addr=") + a + "  pkh=" + hex(out_pkh));
+                log_info(std::string("  addr=") + a + "  pkh=" + to_hex(out_pkh));
                 return true;
             } else {
                 log_warn(std::string("Default wallet address invalid: ") + err + " (ignoring)");
@@ -401,7 +432,7 @@ static bool resolve_mining_address(std::vector<uint8_t>& out_pkh,
         std::string err;
         if(parse_p2pkh(addr, out_pkh, &err)) {
             log_info("Mining address: using interactive prompt");
-            log_info(std::string("  addr=") + addr + "  pkh=" + hex(out_pkh));
+            log_info(std::string("  addr=") + addr + "  pkh=" + to_hex(out_pkh));
             return true;
         } else {
             std::fprintf(stderr, "[ERROR] Invalid address: %s\n"
@@ -418,15 +449,17 @@ static bool resolve_mining_address(std::vector<uint8_t>& out_pkh,
     }
     return false;
 }
+
 static void print_usage(){
     std::cout
       << "miqrod options:\n"
       << "  --conf=<path>                                config file (key=value)\n"
       << "  --datadir=<path>                             data directory (overrides config)\n"
-      << "  --genaddress                                generate ECDSA-P2PKH address (priv/pk/address)\n"
+      << "  --miningaddr=<Base58-P2PKH>                  mine rewards to this address (no prompt)\n"
+      << "  --genaddress                                 generate ECDSA-P2PKH address (priv/pk/address)\n"
       << "  --buildtx <priv_hex> <prev_txid_hex> <vout> <value> <to_address>  (prints txhex)\n"
-      << "  --reindex_utxo                              rebuild chainstate/UTXO from current chain\n"
-      << "  --utxo_kv                                   (reserved) enable KV-backed UTXO at runtime if supported\n"
+      << "  --reindex_utxo                               rebuild chainstate/UTXO from current chain\n"
+      << "  --utxo_kv                                    (reserved) enable KV-backed UTXO at runtime if supported\n"
       << "Env:\n"
       << "  MIQ_MINING_ADDR     If set, node will mine to this address (Base58 P2PKH)\n"
       << "  MIQ_MINER_THREADS   If set, overrides miner thread count\n";
@@ -435,6 +468,7 @@ static void print_usage(){
 static bool is_recognized_arg(const std::string& s){
     if(s.rfind("--conf=",0)==0) return true;
     if(s.rfind("--datadir=",0)==0) return true;
+    if(s.rfind("--miningaddr=",0)==0) return true;
     if(s=="--genaddress") return true;
     if(s=="--buildtx") return true;
     if(s=="--reindex_utxo") return true;
@@ -474,6 +508,9 @@ int main(int argc, char** argv){
         uint32_t vout=0;
         uint64_t value=0;
 
+        // mining-addr (CLI) hint
+        std::string mining_addr_cli;
+
         // Guard unsupported flags
         for(int i=1;i<argc;i++){
             std::string a(argv[i]);
@@ -490,6 +527,8 @@ int main(int argc, char** argv){
                 conf = a.substr(7);
             } else if(a.rfind("--datadir=",0)==0){
                 cfg.datadir = a.substr(10);
+            } else if(a.rfind("--miningaddr=",0)==0){
+                mining_addr_cli = a.substr(std::string("--miningaddr=").size());
             } else if(a=="--genaddress"){
                 genaddr = true;
             } else if(a=="--buildtx" && i+5<argc){
@@ -656,11 +695,23 @@ int main(int argc, char** argv){
         }
         // ===================================================================
 
-        // Resolve mining address (prompt if needed — ALWAYS prompts first)
+        // ---- Resolve mining address (deterministic; no headless prompts) ---
+        std::string mining_addr_conf;
+        if (mining_addr_cli.empty()) {
+            // Only bother reading conf file if CLI didn't provide it
+            try_read_miningaddr_from_conf(conf, mining_addr_conf);
+        }
+        const std::string mining_addr_hint = !mining_addr_cli.empty() ? mining_addr_cli
+                                                                      : mining_addr_conf;
+
         std::vector<uint8_t> g_mine_pkh;
-        bool have_addr = resolve_mining_address(g_mine_pkh, !cfg.no_mine, conf);
+        const bool allow_prompt = MIQ_ISATTY();
+        bool have_addr = resolve_mining_address(g_mine_pkh, !cfg.no_mine, mining_addr_hint, allow_prompt);
         if(!have_addr){
             cfg.no_mine = true; // disable mining for this run
+            log_info("Mining disabled (no valid destination address).");
+        } else {
+            log_info(std::string("Mining enabled to PKH: ") + to_hex(g_mine_pkh));
         }
 
         // --- Services ---
