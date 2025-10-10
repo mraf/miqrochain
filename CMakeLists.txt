@@ -14,7 +14,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 find_package(PkgConfig QUIET)
-find_package(OpenSSL REQUIRED)
+find_package(OpenSSL REQUIRED)      # Provides OpenSSL::Crypto and OpenSSL::SSL
 find_package(Threads REQUIRED)
 
 # ---------------- Options ----------------
@@ -246,6 +246,9 @@ if(_HAVE_MINIUPNPC)
   if(_MINIUPNPC_LIBS)
     target_link_libraries(miqrod PRIVATE ${_MINIUPNPC_LIBS})
   endif()
+else()
+  # Be explicit so the code can print "disabled at build time"
+  target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_UPNP=0)
 endif()
 if(WIN32)
   target_link_libraries(miqrod PRIVATE ws2_32 iphlpapi bcrypt)
@@ -266,7 +269,7 @@ endforeach()
 
 add_executable(miqwallet
   src/cli/miqwallet.cpp
-  src/nat.cpp              # compile without MIQ_ENABLE_UPNP for wallet (stub path)
+  src/nat.cpp              # compiled without MIQ_ENABLE_UPNP for wallet (stub path)
   ${MIQ_P2P_LIGHT_SRC}
   src/wallet/spv_simple.cpp
 )
@@ -281,14 +284,6 @@ set_target_properties(miqwallet PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED
 # ---------------- Key tool ----------------
 add_executable(miq-keygen
     src/tools/miq_keygen.cpp
-    src/sha256.h src/sha256.cpp
-    src/ripemd160.h src/ripemd160.cpp
-    src/hash160.h src/hash160.cpp
-    src/base58.h src/base58.cpp
-    src/hex.h src/hex.cpp
-    src/crypto/secure_random.cpp
-    src/crypto/ecdsa_iface.h
-    src/crypto/ecdsa_libsecp256k1.cpp
 )
 target_include_directories(miq-keygen PRIVATE src)
 target_link_libraries(miq-keygen PRIVATE miqcore)
@@ -296,20 +291,40 @@ if(WIN32)
   target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
 
+# ---------------- Miner app (new, stand-alone) ----------------
+# Auto-detect the app source file so you can place it where you like.
+set(MIQ_MINER_SRC "")
+foreach(cand IN ITEMS
+        src/tools/miqminer.cpp
+        src/cli/miqminer.cpp
+        src/miqminer.cpp
+        src/miner_app.cpp
+        src/apps/miqminer.cpp)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${cand}")
+    set(MIQ_MINER_SRC "${cand}")
+    break()
+  endif()
+endforeach()
+
+if(MIQ_MINER_SRC)
+  add_executable(miqminer ${MIQ_MINER_SRC})
+  target_include_directories(miqminer PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(miqminer PRIVATE miqcore)  # uses miner.cpp/hasher.cpp from core
+  if(WIN32)
+    target_link_libraries(miqminer PRIVATE ws2_32 bcrypt)
+    target_compile_definitions(miqminer PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  set_target_properties(miqminer PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
+  message(STATUS "Building miner app from ${MIQ_MINER_SRC}")
+else()
+  message(STATUS "Miner app source not found. Put it at src/tools/miqminer.cpp (or one of the probed paths) to build miqminer.")
+endif()
+
 # ---------------- Tests (optional) ----------------
 if(MIQ_BUILD_TESTS)
   enable_testing()
 
-  add_executable(test_crypto tests/test_crypto.cpp
-      src/sha256.h src/sha256.cpp
-      src/ripemd160.h src/ripemd160.cpp
-      src/hash160.h src/hash160.cpp
-      src/base58check.h src/base58check.cpp
-      src/hex.h src/hex.cpp
-      src/crypto/secure_random.cpp
-      src/crypto/ecdsa_iface.h
-      src/crypto/ecdsa_libsecp256k1.cpp
-  )
+  add_executable(test_crypto tests/test_crypto.cpp)
   target_include_directories(test_crypto PRIVATE src)
   target_link_libraries(test_crypto PRIVATE miqcore)
   if(WIN32)
@@ -317,12 +332,7 @@ if(MIQ_BUILD_TESTS)
   endif()
   add_test(NAME test_crypto COMMAND test_crypto)
 
-  add_executable(test_ser tests/test_ser.cpp
-      src/serialize.h src/serialize.cpp
-      src/tx.h src/tx.cpp
-      src/block.h src/block.cpp
-      src/sha256.h src/sha256.cpp
-  )
+  add_executable(test_ser tests/test_ser.cpp)
   target_include_directories(test_ser PRIVATE src)
   target_link_libraries(test_ser PRIVATE miqcore)
   add_test(NAME test_ser COMMAND test_ser)
