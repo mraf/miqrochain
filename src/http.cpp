@@ -599,314 +599,331 @@ void HttpServer::start(
     auto thread_fn = [this, s, bound_sa, bound_len, on_json, env_token, env_req, allow_cors,
                       max_conn, ip_rps, ip_burst, max_hdr_bytes, max_body_bytes, recv_timeout_ms,
                       enable_metrics, metrics_public, enable_healthz, access_log](){
-        bool bound_loopback = is_loopback_sockaddr((const sockaddr*)&bound_sa);
-        bool require_always = env_truthy(env_req); // keep backward-compat default
+        try {
+            bool bound_loopback = is_loopback_sockaddr((const sockaddr*)&bound_sa);
+            bool require_always = env_truthy(env_req); // keep backward-compat default
 
-        // Build allowlist for unauthenticated access
-        std::unordered_set<std::string> safe = default_safe_methods();
-        load_env_allowlist(safe);
+            // Build allowlist for unauthenticated access
+            std::unordered_set<std::string> safe = default_safe_methods();
+            load_env_allowlist(safe);
 
-        for(;;){
-            if(!running_.load()){
-                break;
-            }
-            fd_set rfds;
-            FD_ZERO(&rfds);
+            for(;;){
+                if(!running_.load()){
+                    break;
+                }
+                fd_set rfds;
+                FD_ZERO(&rfds);
 #ifdef _WIN32
-            FD_SET(s, &rfds);
-            timeval tv; tv.tv_sec = 0; tv.tv_usec = 200000; // 200ms
-            int sel = select(0, &rfds, nullptr, nullptr, &tv);
+                FD_SET(s, &rfds);
+                timeval tv; tv.tv_sec = 0; tv.tv_usec = 200000; // 200ms
+                int sel = select(0, &rfds, nullptr, nullptr, &tv);
 #else
-            FD_SET(s, &rfds);
-            timeval tv; tv.tv_sec = 0; tv.tv_usec = 200000;
-            int sel = select((int)s+1, &rfds, nullptr, nullptr, &tv);
+                FD_SET(s, &rfds);
+                timeval tv; tv.tv_sec = 0; tv.tv_usec = 200000;
+                int sel = select((int)s+1, &rfds, nullptr, nullptr, &tv);
 #endif
-            if(sel <= 0) {
-                continue;
-            }
-            sockaddr_storage cli{}; socklen_t clen = sizeof(cli);
+                if(sel <= 0) {
+                    continue;
+                }
+                sockaddr_storage cli{}; socklen_t clen = sizeof(cli);
 #ifdef _WIN32
-            sock_t fd = accept(s, (sockaddr*)&cli, &clen);
-            if(fd == INVALID_SOCKET){ continue; }
+                sock_t fd = accept(s, (sockaddr*)&cli, &clen);
+                if(fd == INVALID_SOCKET){ continue; }
 #else
-            sock_t fd = accept(s, (sockaddr*)&cli, &clen);
-            if(fd < 0){ continue; }
+                sock_t fd = accept(s, (sockaddr*)&cli, &clen);
+                if(fd < 0){ continue; }
 #endif
-            // Hard connection cap
-            int live = ++g_live_conns;
-            if(live > max_conn){
-                const std::string body_rlc = "{\"error\":\"too many connections\"}";
-                send_http_simple(fd, 503, "Service Unavailable", "application/json", body_rlc);
-                closesocket(fd);
-                --g_live_conns;
-                continue;
-            }
-
-            std::thread([fd, on_json, env_token, bound_loopback, require_always, safe,
-                         ip_rps, ip_burst, max_hdr_bytes, max_body_bytes, recv_timeout_ms,
-                         cli, allow_cors, enable_metrics, metrics_public, enable_healthz, access_log]() {
-                auto guard = std::unique_ptr<void, void(*)(void*)>(nullptr, [](void*){ --g_live_conns; });
-
-                auto t_start = std::chrono::steady_clock::now();
-
-                // simple reqid + access log
-                auto gen_reqid = [](){
-                    std::array<unsigned char,8> r{}; for(auto& b: r) b = (unsigned char)std::rand();
-                    std::ostringstream os; os << std::hex << std::setw(2) << std::setfill('0');
-                    for(unsigned char b: r){ os << std::setw(2) << (int)b; }
-                    return os.str();
-                };
-
-                auto access_logf = [&](int code, const std::string& ip, const std::string& method,
-                                       const std::string& path, const std::string& rpc_method,
-                                       size_t in_bytes, size_t out_bytes, const std::string& reqid){
-                    if(!access_log) return;
-                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                  std::chrono::steady_clock::now() - t_start).count();
-                    log_info("http " + std::to_string(code) + " ip=" + ip +
-                             " method=" + method + " path=" + path +
-                             " rpc=" + (rpc_method.empty()?"-":rpc_method) +
-                             " in=" + std::to_string(in_bytes) +
-                             " out=" + std::to_string(out_bytes) +
-                             " dur_ms=" + std::to_string(ms) +
-                             " reqid=" + reqid);
-                    g_metrics.observe_duration_ms((uint64_t)ms);
-                };
-
-                // Per-IP token bucket (EXEMPT loopback)
-                std::string ip = sock_ntop(cli);
-                bool is_local = is_loopback_sockaddr(reinterpret_cast<const sockaddr*>(&cli));
-                if (!is_local) {
-                    if (!rl_allow(ip, ip_rps, ip_burst)) {
-                        g_metrics.http_rate_limited_total += 1;
-                        std::string reqid = gen_reqid();
-                        const std::string body_rl = "{\"error\":\"rate limit\"}";
-                        send_http_simple(fd, 429, "Too Many Requests", "application/json",
-                                         body_rl, {{"Retry-After","0"},{"X-Request-Id", reqid}});
-                        access_logf(429, ip, "?", "?", "", 0, body_rl.size(), reqid);
-                        closesocket(fd);
-                        return;
-                    }
-                }
-
-                // Parse one request (with time/size caps)
-                std::string method, path, body;
-                std::vector<std::pair<std::string,std::string>> headers;
-                if(!parse_http_request(fd, method, path, body, headers, max_hdr_bytes, max_body_bytes, recv_timeout_ms)){
+                // Hard connection cap
+                int live = ++g_live_conns;
+                if(live > max_conn){
+                    const std::string body_rlc = "{\"error\":\"too many connections\"}";
+                    send_http_simple(fd, 503, "Service Unavailable", "application/json", body_rlc);
                     closesocket(fd);
-                    return;
+                    --g_live_conns;
+                    continue;
                 }
 
-                std::string reqid = get_header(headers, "x-request-id");
-                if(reqid.empty()) reqid = gen_reqid();
+                std::thread([fd, on_json, env_token, bound_loopback, require_always, safe,
+                             ip_rps, ip_burst, max_hdr_bytes, max_body_bytes, recv_timeout_ms,
+                             cli, allow_cors, enable_metrics, metrics_public, enable_healthz, access_log]() {
+                    // Ensure live-conns is decremented exactly once
+                    auto guard = std::unique_ptr<void, void(*)(void*)>(nullptr, [](void*){ --g_live_conns; });
+                    try {
+                        auto t_start = std::chrono::steady_clock::now();
 
-                g_metrics.http_requests_total += 1;
-                g_metrics.http_bytes_in_total += body.size();
+                        // simple reqid + access log
+                        auto gen_reqid = [](){
+                            std::array<unsigned char,8> r{}; for(auto& b: r) b = (unsigned char)std::rand();
+                            std::ostringstream os; os << std::hex << std::setw(2) << std::setfill('0');
+                            for(unsigned char b: r){ os << std::setw(2) << (int)b; }
+                            return os.str();
+                        };
 
-                // Collect headers
-                std::string auth  = get_header(headers, "authorization");
-                std::string xauth = get_header(headers, "x-auth-token");
-                std::string content_type = get_header(headers, "content-type");
-                if(content_type.empty()) content_type = "application/json";
+                        auto access_logf = [&](int code, const std::string& ip, const std::string& method,
+                                               const std::string& path, const std::string& rpc_method,
+                                               size_t in_bytes, size_t out_bytes, const std::string& reqid){
+                            if(!access_log) return;
+                            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::steady_clock::now() - t_start).count();
+                            log_info("http " + std::to_string(code) + " ip=" + ip +
+                                     " method=" + method + " path=" + path +
+                                     " rpc=" + (rpc_method.empty()?"-":rpc_method) +
+                                     " in=" + std::to_string(in_bytes) +
+                                     " out=" + std::to_string(out_bytes) +
+                                     " dur_ms=" + std::to_string(ms) +
+                                     " reqid=" + reqid);
+                            g_metrics.observe_duration_ms((uint64_t)ms);
+                        };
 
-                // =================== EARLY HANDLERS (no auth gate) ===================
-                // CORS preflight
-                if(lc(method) == "options"){
-                    std::vector<std::pair<std::string,std::string>> hdrs = {
-                        {"X-Request-Id", reqid}
-                    };
-                    if(allow_cors){
-                        hdrs.emplace_back("Access-Control-Allow-Origin","*");
-                        hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type, X-Request-Id");
-                        hdrs.emplace_back("Access-Control-Allow-Methods","POST, OPTIONS");
-                        hdrs.emplace_back("Access-Control-Max-Age","600");
-                    }
-                    send_http_simple(fd, 204, "No Content", "text/plain", "", hdrs);
-                    access_logf(204, ip, method, path, "", 0, 0, reqid);
-                    closesocket(fd);
-                    return;
-                }
-
-                // /healthz
-                if(lc(method) == "get" && enable_healthz && path == "/healthz"){
-                    std::string resp = std::string("{\"ok\":true,\"live_conns\":") +
-                                       std::to_string(g_live_conns.load()) + "}";
-                    std::vector<std::pair<std::string,std::string>> hdrs = {{"X-Request-Id", reqid}};
-                    if(allow_cors){
-                        hdrs.emplace_back("Access-Control-Allow-Origin","*");
-                        hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type, X-Request-Id");
-                    }
-                    send_http_simple(fd, 200, "OK", "application/json", resp, hdrs);
-                    access_logf(200, ip, method, path, "", 0, resp.size(), reqid);
-                    closesocket(fd);
-                    return;
-                }
-
-                // /metrics
-                if(lc(method) == "get" && enable_metrics && path == "/metrics"){
-                    bool ok = true;
-                    if(!bound_loopback && !metrics_public){
-                        std::string token = env_token ? std::string(env_token) : std::string();
-                        // Very small check: bearer or x-auth-token must match token
-                        auto auth_hdr = get_header(headers,"authorization");
-                        std::string auth_trim = auth_hdr;
-                        trim(auth_trim);
-                        bool bearer_ok=false;
-                        if(auth_trim.size() >= 7 && lc(auth_trim.substr(0,6)) == "bearer"){
-                            size_t sp = auth_trim.find(' ');
-                            if(sp != std::string::npos){
-                                std::string presented = auth_trim.substr(sp+1);
-                                trim(presented);
-                                bearer_ok = (!token.empty() && presented == token);
+                        // Per-IP token bucket (EXEMPT loopback)
+                        std::string ip = sock_ntop(cli);
+                        bool is_local = is_loopback_sockaddr(reinterpret_cast<const sockaddr*>(&cli));
+                        if (!is_local) {
+                            if (!rl_allow(ip, ip_rps, ip_burst)) {
+                                g_metrics.http_rate_limited_total += 1;
+                                std::string reqid = gen_reqid();
+                                const std::string body_rl = "{\"error\":\"rate limit\"}";
+                                send_http_simple(fd, 429, "Too Many Requests", "application/json",
+                                                 body_rl, {{"Retry-After","0"},{"X-Request-Id", reqid}});
+                                access_logf(429, ip, "?", "?", "", 0, body_rl.size(), reqid);
+                                closesocket(fd);
+                                return;
                             }
                         }
-                        ok = bearer_ok || (!get_header(headers,"x-auth-token").empty() && get_header(headers,"x-auth-token")==token);
-                    }
-                    if(!ok){
-                        g_metrics.http_unauthorized_total += 1;
-                        std::vector<std::pair<std::string,std::string>> hdrs = {{"WWW-Authenticate","Bearer"}, {"X-Request-Id", reqid}};
-                        const std::string body_u = "{\"error\":\"unauthorized\"}";
-                        send_http_simple(fd, 401, "Unauthorized", "application/json", body_u, hdrs);
-                        access_logf(401, ip, method, path, "", body.size(), body_u.size(), reqid);
-                        closesocket(fd);
-                        return;
-                    }
-                    std::string prom = g_metrics.render_prom();
-                    std::vector<std::pair<std::string,std::string>> hdrs = {{"X-Request-Id", reqid}};
-                    send_http_simple(fd, 200, "OK", "text/plain; version=0.0.4", prom, hdrs);
-                    access_logf(200, ip, method, path, "", 0, prom.size(), reqid);
-                    closesocket(fd);
-                    return;
-                }
-                // =====================================================================
 
-                // Token policy (legacy env-based gate; OK to disable by leaving env unset)
-                bool token_required = require_always || !bound_loopback;
-                std::string token = env_token ? std::string(env_token) : std::string();
-
-                auto unauthorized = [&](const char* why){
-                    g_metrics.http_unauthorized_total += 1;
-                    std::vector<std::pair<std::string,std::string>> hdrs = {{"WWW-Authenticate","Bearer"},{"X-Request-Id",reqid}};
-                    if(allow_cors){
-                        hdrs.emplace_back("Access-Control-Allow-Origin","*");
-                        hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type, X-Request-Id");
-                    }
-                    const std::string body_u = std::string("{\"error\":\"unauthorized\",\"reason\":\"") + why + "\"}";
-                    send_http_simple(fd, 401, "Unauthorized", "application/json", body_u, hdrs);
-                    access_logf(401, ip, method, path, "", body.size(), body_u.size(), reqid);
-                    closesocket(fd);
-                };
-
-                bool token_present = false;
-
-                auto check_bearer = [&](const std::string& a)->bool{
-                    std::string s = a; trim(s);
-                    if(s.size() >= 7 && lc(s.substr(0,6)) == "bearer"){
-                        size_t sp = s.find(' ');
-                        if(sp != std::string::npos){
-                            std::string presented = s.substr(sp+1); trim(presented);
-                            return (!token.empty() && presented == token);
-                        }
-                    }
-                    return false;
-                };
-
-                if(token_required){
-                    if(token.empty()){
-                        // If no env token configured, skip this legacy gate
-                        // (RPC will enforce cookie-based Authorization itself).
-                    } else {
-                        if(!(check_bearer(auth) || (!xauth.empty() && xauth == token))){
-                            unauthorized("invalid-token");
+                        // Parse one request (with time/size caps)
+                        std::string method, path, body;
+                        std::vector<std::pair<std::string,std::string>> headers;
+                        if(!parse_http_request(fd, method, path, body, headers, max_hdr_bytes, max_body_bytes, recv_timeout_ms)){
+                            closesocket(fd);
                             return;
                         }
-                        token_present = true;
-                    }
-                } else {
-                    // Not required (loopback), but if provided and matches env token, mark present
-                    if(check_bearer(auth) || (!xauth.empty() && xauth == token)) token_present = true;
-                }
 
-                // Method check for unauthenticated *per the legacy gate only*.
-                // NOTE: RPC still gets headers and will do its own cookie-based auth.
-                if(!token_present){
-                    std::string m = extract_json_method(body);
-                    if(m.empty() || safe.find(m) == safe.end()){
-                        g_metrics.http_forbidden_total += 1;
-                        std::vector<std::pair<std::string,std::string>> hdrs;
-                        if(allow_cors){
-                            hdrs.emplace_back("Access-Control-Allow-Origin","*");
-                            hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type, X-Request-Id");
+                        std::string reqid = get_header(headers, "x-request-id");
+                        if(reqid.empty()) reqid = gen_reqid();
+
+                        g_metrics.http_requests_total += 1;
+                        g_metrics.http_bytes_in_total += body.size();
+
+                        // Collect headers
+                        std::string auth  = get_header(headers, "authorization");
+                        std::string xauth = get_header(headers, "x-auth-token");
+                        std::string content_type = get_header(headers, "content-type");
+                        if(content_type.empty()) content_type = "application/json";
+
+                        // =================== EARLY HANDLERS (no auth gate) ===================
+                        // CORS preflight
+                        if(lc(method) == "options"){
+                            std::vector<std::pair<std::string,std::string>> hdrs = {
+                                {"X-Request-Id", reqid}
+                            };
+                            if(allow_cors){
+                                hdrs.emplace_back("Access-Control-Allow-Origin","*");
+                                hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type, X-Request-Id");
+                                hdrs.emplace_back("Access-Control-Allow-Methods","POST, OPTIONS");
+                                hdrs.emplace_back("Access-Control-Max-Age","600");
+                            }
+                            send_http_simple(fd, 204, "No Content", "text/plain", "", hdrs);
+                            access_logf(204, ip, method, path, "", 0, 0, reqid);
+                            closesocket(fd);
+                            return;
                         }
-                        hdrs.emplace_back("X-Request-Id", reqid);
-                        const std::string body_f = "{\"error\":\"forbidden\",\"reason\":\"method requires token\"}";
-                        send_http_simple(fd, 403, "Forbidden", "application/json", body_f, hdrs);
-                        access_logf(403, ip, method, path, m, body.size(), body_f.size(), reqid);
+
+                        // /healthz
+                        if(lc(method) == "get" && enable_healthz && path == "/healthz"){
+                            std::string resp = std::string("{\"ok\":true,\"live_conns\":") +
+                                               std::to_string(g_live_conns.load()) + "}";
+                            std::vector<std::pair<std::string,std::string>> hdrs = {{"X-Request-Id", reqid}};
+                            if(allow_cors){
+                                hdrs.emplace_back("Access-Control-Allow-Origin","*");
+                                hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type, X-Request-Id");
+                            }
+                            send_http_simple(fd, 200, "OK", "application/json", resp, hdrs);
+                            access_logf(200, ip, method, path, "", 0, resp.size(), reqid);
+                            closesocket(fd);
+                            return;
+                        }
+
+                        // /metrics
+                        if(lc(method) == "get" && enable_metrics && path == "/metrics"){
+                            bool ok = true;
+                            if(!bound_loopback && !metrics_public){
+                                std::string token = env_token ? std::string(env_token) : std::string();
+                                // Very small check: bearer or x-auth-token must match token
+                                auto auth_hdr = get_header(headers,"authorization");
+                                std::string auth_trim = auth_hdr;
+                                trim(auth_trim);
+                                bool bearer_ok=false;
+                                if(auth_trim.size() >= 7 && lc(auth_trim.substr(0,6)) == "bearer"){
+                                    size_t sp = auth_trim.find(' ');
+                                    if(sp != std::string::npos){
+                                        std::string presented = auth_trim.substr(sp+1);
+                                        trim(presented);
+                                        bearer_ok = (!token.empty() && presented == token);
+                                    }
+                                }
+                                ok = bearer_ok || (!get_header(headers,"x-auth-token").empty() && get_header(headers,"x-auth-token")==token);
+                            }
+                            if(!ok){
+                                g_metrics.http_unauthorized_total += 1;
+                                std::vector<std::pair<std::string,std::string>> hdrs = {{"WWW-Authenticate","Bearer"}, {"X-Request-Id", reqid}};
+                                const std::string body_u = "{\"error\":\"unauthorized\"}";
+                                send_http_simple(fd, 401, "Unauthorized", "application/json", body_u, hdrs);
+                                access_logf(401, ip, method, path, "", body.size(), body_u.size(), reqid);
+                                closesocket(fd);
+                                return;
+                            }
+                            std::string prom = g_metrics.render_prom();
+                            std::vector<std::pair<std::string,std::string>> hdrs = {{"X-Request-Id", reqid}};
+                            send_http_simple(fd, 200, "OK", "text/plain; version=0.0.4", prom, hdrs);
+                            access_logf(200, ip, method, path, "", 0, prom.size(), reqid);
+                            closesocket(fd);
+                            return;
+                        }
+                        // =====================================================================
+
+                        // Token policy (legacy env-based gate; OK to disable by leaving env unset)
+                        bool token_required = require_always || !bound_loopback;
+                        std::string token = env_token ? std::string(env_token) : std::string();
+
+                        auto unauthorized = [&](const char* why){
+                            g_metrics.http_unauthorized_total += 1;
+                            std::vector<std::pair<std::string,std::string>> hdrs = {{"WWW-Authenticate","Bearer"},{"X-Request-Id",reqid}};
+                            if(allow_cors){
+                                hdrs.emplace_back("Access-Control-Allow-Origin","*");
+                                hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type, X-Request-Id");
+                            }
+                            const std::string body_u = std::string("{\"error\":\"unauthorized\",\"reason\":\"") + why + "\"}";
+                            send_http_simple(fd, 401, "Unauthorized", "application/json", body_u, hdrs);
+                            closesocket(fd);
+                        };
+
+                        bool token_present = false;
+
+                        auto check_bearer = [&](const std::string& a)->bool{
+                            std::string s = a; trim(s);
+                            if(s.size() >= 7 && lc(s.substr(0,6)) == "bearer"){
+                                size_t sp = s.find(' ');
+                                if(sp != std::string::npos){
+                                    std::string presented = s.substr(sp+1); trim(presented);
+                                    return (!token.empty() && presented == token);
+                                }
+                            }
+                            return false;
+                        };
+
+                        if(token_required){
+                            if(token.empty()){
+                                // If no env token configured, skip this legacy gate
+                                // (RPC will enforce cookie-based Authorization itself).
+                            } else {
+                                if(!(check_bearer(auth) || (!xauth.empty() && xauth == token))){
+                                    unauthorized("invalid-token");
+                                    return;
+                                }
+                                token_present = true;
+                            }
+                        } else {
+                            // Not required (loopback), but if provided and matches env token, mark present
+                            if(check_bearer(auth) || (!xauth.empty() && xauth == token)) token_present = true;
+                        }
+
+                        // Method check for unauthenticated *per the legacy gate only*.
+                        // NOTE: RPC still gets headers and will do its own cookie-based auth.
+                        if(!token_present){
+                            std::string m = extract_json_method(body);
+                            if(m.empty() || safe.find(m) == safe.end()){
+                                g_metrics.http_forbidden_total += 1;
+                                std::vector<std::pair<std::string,std::string>> hdrs;
+                                if(allow_cors){
+                                    hdrs.emplace_back("Access-Control-Allow-Origin","*");
+                                    hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type, X-Request-Id");
+                                }
+                                hdrs.emplace_back("X-Request-Id", reqid);
+                                const std::string body_f = "{\"error\":\"forbidden\",\"reason\":\"method requires token\"}";
+                                send_http_simple(fd, 403, "Forbidden", "application/json", body_f, hdrs);
+                                closesocket(fd);
+                                return;
+                            }
+                        }
+
+                        // Only POST (we already handled OPTIONS above)
+                        if(lc(method) != "post"){
+                            g_metrics.http_method_not_allowed_total += 1;
+                            std::vector<std::pair<std::string,std::string>> hdrs;
+                            if(allow_cors){
+                                hdrs.emplace_back("Access-Control-Allow-Origin","*");
+                                hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type, X-Request-Id");
+                                hdrs.emplace_back("Access-Control-Allow-Methods","POST, OPTIONS");
+                            }
+                            hdrs.emplace_back("X-Request-Id", reqid);
+                            const std::string body_405 = "{\"error\":\"only POST\"}";
+                            send_http_simple(fd, 405, "Method Not Allowed", "application/json", body_405, hdrs);
+                            closesocket(fd);
+                            return;
+                        }
+
+                        // Invoke headers-aware handler
+                        std::string rpc_method_name = extract_json_method(body);
+                        std::string resp_body;
+                        int code = 200;
+                        try{
+                            resp_body = on_json(body, headers);
+                            if(resp_body.empty()) resp_body = "{\"result\":null}";
+                        } catch(...){
+                            resp_body = "{\"error\":\"internal error\"}";
+                        }
+
+                        bool is_error = false;
+                        {
+                            // best-effort: starts with {"error":
+                            std::string s = resp_body;
+                            size_t i=0; while(i<s.size() && (s[i]==' '||s[i]=='\n'||s[i]=='\r'||s[i]=='\t')) ++i;
+                            is_error = (s.size() >= i+8 && s.compare(i,8,"{\"error\"")==0);
+                        }
+                        if(!rpc_method_name.empty()){
+                            g_metrics.add_method_call(rpc_method_name, is_error);
+                        }
+
+                        std::vector<std::pair<std::string,std::string>> out_hdrs = {
+                            {"X-RateLimit-Limit", std::to_string(ip_rps)},
+                            {"X-RateLimit-Policy", "token-bucket"},
+                            {"X-Request-Id", reqid},
+                        };
+                        if(allow_cors){
+                            out_hdrs.emplace_back("Access-Control-Allow-Origin","*");
+                            out_hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type, X-Request-Id");
+                        }
+                        send_http_simple(fd, code, "OK", "application/json", resp_body, out_hdrs);
+                        closesocket(fd);
+                    } catch (const std::exception& e) {
+                        log_error(std::string("HTTP conn thread exception: ") + e.what());
+                        closesocket(fd);
+                        return;
+                    } catch (...) {
+                        log_error("HTTP conn thread exception (unknown)");
                         closesocket(fd);
                         return;
                     }
-                }
+                }).detach();
+            }
 
-                // Only POST (we already handled OPTIONS above)
-                if(lc(method) != "post"){
-                    g_metrics.http_method_not_allowed_total += 1;
-                    std::vector<std::pair<std::string,std::string>> hdrs;
-                    if(allow_cors){
-                        hdrs.emplace_back("Access-Control-Allow-Origin","*");
-                        hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type, X-Request-Id");
-                        hdrs.emplace_back("Access-Control-Allow-Methods","POST, OPTIONS");
-                    }
-                    hdrs.emplace_back("X-Request-Id", reqid);
-                    const std::string body_405 = "{\"error\":\"only POST\"}";
-                    send_http_simple(fd, 405, "Method Not Allowed", "application/json", body_405, hdrs);
-                    access_logf(405, ip, method, path, "", body.size(), body_405.size(), reqid);
-                    closesocket(fd);
-                    return;
-                }
-
-                // Invoke headers-aware handler
-                std::string rpc_method_name = extract_json_method(body);
-                std::string resp_body;
-                int code = 200;
-                try{
-                    resp_body = on_json(body, headers);
-                    if(resp_body.empty()) resp_body = "{\"result\":null}";
-                } catch(...){
-                    resp_body = "{\"error\":\"internal error\"}";
-                }
-
-                bool is_error = false;
-                {
-                    // best-effort: starts with {"error":
-                    std::string s = resp_body;
-                    size_t i=0; while(i<s.size() && (s[i]==' '||s[i]=='\n'||s[i]=='\r'||s[i]=='\t')) ++i;
-                    is_error = (s.size() >= i+8 && s.compare(i,8,"{\"error\"")==0);
-                }
-                if(!rpc_method_name.empty()){
-                    g_metrics.add_method_call(rpc_method_name, is_error);
-                }
-
-                std::vector<std::pair<std::string,std::string>> out_hdrs = {
-                    {"X-RateLimit-Limit", std::to_string(ip_rps)},
-                    {"X-RateLimit-Policy", "token-bucket"},
-                    {"X-Request-Id", reqid},
-                };
-                if(allow_cors){
-                    out_hdrs.emplace_back("Access-Control-Allow-Origin","*");
-                    out_hdrs.emplace_back("Access-Control-Allow-Headers","Authorization, X-Auth-Token, Content-Type, X-Request-Id");
-                }
-                send_http_simple(fd, code, "OK", "application/json", resp_body, out_hdrs);
-                access_logf(code, ip, method, path, rpc_method_name, body.size(), resp_body.size(), reqid);
-                closesocket(fd);
-            }).detach();
-        }
-        closesocket(s);
+            closesocket(s);
 #ifdef _WIN32
-        WSACleanup();
+            WSACleanup();
 #endif
+        } catch (const std::exception& e) {
+            log_error(std::string("HTTP accept thread exception: ") + e.what());
+        } catch (...) {
+            log_error("HTTP accept thread exception (unknown)");
+        }
     };
 
-    std::thread(thread_fn).detach();
+    std::thread([thread_fn](){
+        try { thread_fn(); }
+        catch(const std::exception& e){ log_error(std::string("HTTP start thread exception: ") + e.what()); }
+        catch(...){ log_error("HTTP start thread exception (unknown)"); }
+    }).detach();
 }
 
 // Back-compat wrapper: ignores headers for the callback
