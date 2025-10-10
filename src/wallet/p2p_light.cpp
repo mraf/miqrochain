@@ -9,6 +9,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <unordered_set>
 
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
@@ -96,35 +97,67 @@ static uint32_t checksum4(const std::vector<uint8_t>& payload){
     return (uint32_t)d[0] | ((uint32_t)d[1]<<8) | ((uint32_t)d[2]<<16) | ((uint32_t)d[3]<<24);
 }
 
-// ---- connection helper: try many hosts (IPv4 first), random order ----------
+// ---- seed helpers ------------------------------------------------------------
+static std::string strip_port_if_present(const std::string& host){
+    // If it's bracketed IPv6 like "[::1]:9833" leave as-is.
+    if (!host.empty() && host.front()=='[') return host;
+    // Otherwise strip "host:port" (wallet passes port separately).
+    auto pos = host.find(':');
+    if (pos == std::string::npos) return host;
+    return host.substr(0, pos);
+}
+
+static void gather_default_candidates(std::vector<std::string>& out){
+    std::unordered_set<std::string> seen;
+
+    auto add = [&](const std::string& h){
+        if (h.empty()) return;
+        std::string s = strip_port_if_present(h);
+        if (s == "127.0.0.1") return; // NEVER auto-dial localhost
+        if (seen.insert(s).second) out.push_back(std::move(s));
+    };
+
+    // Primary single seed (can be IP)
+    add(miq::DNS_SEED);
+
+    // Additional seeds array
+    for (size_t i=0; i<miq::DNS_SEEDS_COUNT; ++i) {
+        add(miq::DNS_SEEDS[i]);
+    }
+
+    // Shuffle global seeds to distribute load
+    std::mt19937 rng{std::random_device{}()};
+    std::shuffle(out.begin(), out.end(), rng);
+}
+
+// ---- connection helper: try many hosts (IPv4 first), random order -----------
 static int resolve_and_connect_best(const std::vector<std::string>& hosts,
                                     const std::string& port,
                                     int timeout_ms,
                                     std::string& err)
 {
-    std::vector<std::string> shuffled = hosts;
-    if (shuffled.empty()) { err = "no hosts"; return -1; }
+    if (hosts.empty()) { err = "no hosts"; return -1; }
 
-    // Shuffle to distribute load across seeds
-    {
-        std::mt19937 rng{std::random_device{}()};
-        std::shuffle(shuffled.begin(), shuffled.end(), rng);
-    }
+    for (const auto& raw : hosts) {
+        const std::string host = strip_port_if_present(raw);
 
-    for (const auto& host : shuffled) {
-        // Skip accidental "host:port" inputs (port is provided separately)
+        // Skip malformed host strings like "host:port" (non-bracketed)
         if (host.find(':') != std::string::npos && host.find("]:") == std::string::npos) {
             continue;
         }
 
-        addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
+        addrinfo hints{};
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_family   = AF_UNSPEC;
+#ifdef AI_ADDRCONFIG
+        hints.ai_flags    = AI_ADDRCONFIG;
+#endif
         addrinfo* res = nullptr;
         if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res) {
-            // try next host
             continue;
         }
 
-        // Prefer IPv4 results first
+        // Prefer IPv4, then IPv6
         std::vector<addrinfo*> v4, v6;
         for (auto p = res; p; p = p->ai_next) {
             if (p->ai_family == AF_INET) v4.push_back(p);
@@ -169,18 +202,14 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
 
-    // Build the candidate list:
+    // Build candidate list
     std::vector<std::string> candidates;
     if (!o_.host.empty()) {
-        candidates.push_back(o_.host);
+        // Respect explicit host, including localhost if the user asked for it.
+        candidates.push_back(strip_port_if_present(o_.host));
     } else {
-        // Global seeds first (no ports embedded!)
-        candidates.push_back("62.38.73.147");
-        candidates.push_back("s626853.name-servers.gr");
-        candidates.push_back("miqseed1.duckdns.org");
-        candidates.push_back("miqseed2.freeddns.org");
-        // Localhost as very last resort only:
-        candidates.push_back("127.0.0.1");
+        // Use constants.h global seeds only (no localhost).
+        gather_default_candidates(candidates);
     }
 
     const std::string port = o_.port.empty() ? std::to_string(P2P_PORT) : o_.port;
@@ -189,7 +218,7 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
 
     if(!send_version(err))      { close(); return false; }
 
-    // Always send verack (node expects a verack from us after version)
+    // Always send verack (node expects one from us)
     {
         std::vector<uint8_t> empty;
         if(!send_msg("verack", empty, err)) { close(); return false; }
@@ -197,7 +226,7 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
 
     if(!read_until_verack(err)) { close(); return false; }
 
-    // Best-effort getaddr (for debug/diagnostics)
+    // Best-effort getaddr
     { std::string e2; (void)send_getaddr(e2); }
 
     header_hashes_le_.clear();
@@ -234,7 +263,7 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
         return true;
     }
 
-    // Start from a "null" locator (from genesis). Wallet/daemon format: u8 count + hashes + stop(32x00)
+    // Start from genesis locator (daemon format): u8 count + hashes + stop(32x00)
     std::vector<std::vector<uint8_t>> locator;
     locator.emplace_back(32, 0x00);
     std::vector<uint8_t> stop(32, 0x00);
@@ -253,7 +282,7 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
         // Append
         for(auto& h : batch) header_hashes_le_.push_back(std::move(h));
 
-        // New locator = last hash (simple linear walk)
+        // New locator = last hash (simple)
         locator.clear();
         locator.push_back(header_hashes_le_.back());
     }
@@ -268,7 +297,7 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
     return true;
 }
 
-// Your daemon's getheaders: [u8 count][count*32 hashes][32 stop]
+// Daemon getheaders: [u8 count][count*32 hashes][32 stop]
 bool P2PLight::request_headers_from_locator(const std::vector<std::vector<uint8_t>>& locator_hashes_le,
                                             std::vector<uint8_t>& stop_le,
                                             std::string& err)
@@ -338,7 +367,6 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
                     auto hl = to_le32(h);
                     tmp.push_back(std::move(hl));
                     pos += 80;
-                    // txcount varint may be present; if parse fails, treat as absent (0)
                     if(pos < payload.size()){
                         uint64_t tcnt=0, u2=0;
                         if(get_varint(payload.data()+pos, payload.size()-pos, tcnt, u2)) pos += u2;
@@ -477,7 +505,7 @@ bool P2PLight::send_msg(const char cmd12[12], const std::vector<uint8_t>& payloa
     if (sock_ < 0) { err = "not connected"; return false; }
 
     uint8_t header[24]{};
-    // magic (network byte order)
+    // magic
     uint32_t m = MIQ_P2P_MAGIC;
     header[0]=uint8_t(m); header[1]=uint8_t(m>>8); header[2]=uint8_t(m>>16); header[3]=uint8_t(m>>24);
 
@@ -510,7 +538,7 @@ bool P2PLight::read_msg_header(std::string& cmd_out, uint32_t& len_out, uint32_t
 
     len_out  = (uint32_t)h[16] | ((uint32_t)h[17]<<8) | ((uint32_t)h[18]<<16) | ((uint32_t)h[19]<<24);
     csum_out = (uint32_t)h[20] | ((uint32_t)h[21]<<8) | ((uint32_t)h[22]<<16) | ((uint32_t)h[23]<<24);
-    (void)csum_out; // peer/daemon ignores checksum mismatch at this layer
+    (void)csum_out; // not enforced here
     return true;
 }
 
