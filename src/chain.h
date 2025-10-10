@@ -3,7 +3,8 @@
 #include <vector>
 #include <utility>
 #include <unordered_map>
-#include <string>        // added
+#include <string>
+#include <mutex>      // NEW: coarse-grained thread-safety
 
 #include "block.h"
 #include "serialize.h"
@@ -36,12 +37,15 @@ struct Tip {
 
 class Chain {
 public:
+    // ---- Public API (unchanged signatures; now internally synchronized) ----
     static long double work_from_bits_public(uint32_t bits);
+
     const std::vector<uint8_t>& tip_hash() const { return tip_.hash; }
+
     bool read_block_any(const std::vector<uint8_t>& h, Block& out) const;
     bool validate_header(const BlockHeader& h, std::string& err) const;
     bool accept_header(const BlockHeader& h, std::string& err);
-    bool reconsider_best_chain(std::string& err);  
+    bool reconsider_best_chain(std::string& err);
     void orphan_put(const std::vector<uint8_t>& h, const std::vector<uint8_t>& raw);
     std::vector<uint8_t> best_header_hash() const;
     bool header_exists(const std::vector<uint8_t>& h) const;
@@ -49,8 +53,8 @@ public:
     bool get_hash_by_index(size_t idx, std::vector<uint8_t>& out) const;
     void build_locator(std::vector<std::vector<uint8_t>>& out) const;
     bool get_headers_from_locator(const std::vector<std::vector<uint8_t>>& locators,
-                              size_t max,
-                              std::vector<BlockHeader>& out) const;
+                                  size_t max,
+                                  std::vector<BlockHeader>& out) const;
     bool disconnect_tip_once(std::string& err);
     bool accept_block_for_reorg(const Block& b, std::string& err);
     bool open(const std::string& dir);
@@ -58,10 +62,13 @@ public:
     bool verify_block(const Block& b, std::string& err) const;
     bool submit_block(const Block& b, std::string& err);
 
-    Tip tip() const { return tip_; }
+    // Was inline; now implemented in chain.cpp so it can take the lock.
+    Tip tip() const;
 
     std::vector<std::pair<int64_t,uint32_t>> last_headers(size_t n) const;
 
+    // Note: callers should avoid mutating UTXOSet directly from multiple threads.
+    // Chain methods take the lock; returning references preserves API compatibility.
     UTXOSet& utxo(){ return utxo_; }
     const UTXOSet& utxo() const { return utxo_; }
 
@@ -76,15 +83,20 @@ public:
     const std::string& datadir() const { return datadir_; }
 
 private:
-    Storage  storage_;
+    // ---- State ----
+    mutable std::mutex mtx_;  // NEW: guards all members below
+
+    Storage     storage_;
     std::string datadir_;
-    UTXOSet  utxo_;
-    Tip      tip_{0, std::vector<uint8_t>(32,0), GENESIS_BITS, GENESIS_TIME, 0};
-    BlockIndex index_;
+    UTXOSet     utxo_;
+    Tip         tip_{0, std::vector<uint8_t>(32,0), GENESIS_BITS, GENESIS_TIME, 0};
+    BlockIndex  index_;
 
     bool save_state();
     bool load_state();
-        std::unordered_map<std::string, HeaderMeta> header_index_; // key = hk(hash)
+
+    // key = hk(hash)
+    std::unordered_map<std::string, HeaderMeta> header_index_;
     std::string best_header_key_; // hk(hash) of best header by work_sum
 
     // Orphan raw blocks keyed by block-hash (hk)
@@ -104,4 +116,5 @@ private:
                           std::vector<std::vector<uint8_t>>& path_up_from_b,
                           std::vector<std::vector<uint8_t>>& path_down_from_a) const;
 };
+
 }
