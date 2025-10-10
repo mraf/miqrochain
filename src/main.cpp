@@ -20,6 +20,9 @@
 #include "hash160.h"
 #include "crypto/ecdsa_iface.h"
 #include "difficulty.h"
+#include "miner.h"      // <- for miq::mine_block
+#include "sha256.h"     // <- for dsha256
+#include "hex.h"        // <- for to_hex / from_hex
 
 #include "tls_proxy.h"    // TLS terminator for RPC (if used)
 #include "ibd_monitor.h"  // IBD sampling for getibdinfo
@@ -267,25 +270,6 @@ static void miner_worker(Chain* chain,
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
-}
-
-// Simple P2PKH parser used by --buildtx (internal miner off by default)
-static bool parse_p2pkh(const std::string& addr, std::vector<uint8_t>& out_pkh, std::string* err=nullptr) {
-    uint8_t ver = 0; std::vector<uint8_t> payload;
-    if(!base58check_decode(addr, ver, payload)) {
-        if(err) *err = "Base58Check decode failed";
-        return false;
-    }
-    if(ver != VERSION_P2PKH) {
-        if(err) *err = "wrong version";
-        return false;
-    }
-    if(payload.size() != 20) {
-        if(err) *err = "payload length != 20";
-        return false;
-    }
-    out_pkh = payload;
-    return true;
 }
 
 static void print_usage(){
