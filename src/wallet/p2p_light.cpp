@@ -11,6 +11,10 @@
 #include <algorithm>
 #include <unordered_set>
 
+#ifndef _WIN32
+  #include <signal.h>
+#endif
+
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
   #define WIN32_LEAN_AND_MEAN
@@ -197,6 +201,10 @@ P2PLight::~P2PLight(){ close(); }
 
 bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     o_ = opts;
+
+#ifndef _WIN32
+    signal(SIGPIPE, SIG_IGN);
+#endif
 
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
