@@ -37,6 +37,7 @@
 // ============================================================================
 
 #include <thread>
+#include <cctype>
 #include <fstream>
 #include <iostream>
 #include <filesystem>
@@ -55,6 +56,14 @@
 #include <type_traits>
 #include <utility>
 #include <cstdint>   // uint64_t
+
+#if defined(_WIN32)
+  #include <io.h>
+  #define MIQ_ISATTY() (_isatty(_fileno(stdin)) != 0)
+#else
+  #include <unistd.h>
+  #define MIQ_ISATTY() (::isatty(fileno(stdin)) != 0)
+#endif
 
 // Belt-and-suspenders: if min/max slipped in, kill them.
 #ifdef _WIN32
@@ -92,6 +101,30 @@ static std::string default_datadir() {
     if (home && *home) return std::string(home) + "/.miqrochain";
     return "./miqdata";
 #endif
+}
+
+static inline void trim_inplace(std::string& s) {
+    auto notspace = [](int ch){ return !std::isspace(ch); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), notspace));
+    s.erase(std::find_if(s.rbegin(), s.rend(), notspace).base(), s.end());
+}
+
+static bool parse_p2pkh(const std::string& addr, std::vector<uint8_t>& out_pkh, std::string* err=nullptr) {
+    uint8_t ver = 0; std::vector<uint8_t> payload;
+    if(!base58check_decode(addr, ver, payload)) {
+        if(err) *err = "Base58Check decode failed";
+        return false;
+    }
+    if(ver != VERSION_P2PKH) {
+        if(err) *err = "wrong version";
+        return false;
+    }
+    if(payload.size() != 20) {
+        if(err) *err = "payload length != 20";
+        return false;
+    }
+    out_pkh = payload;
+    return true;
 }
 
 // ---------- small helpers (file + optional genesis key loader) --------------
@@ -291,61 +324,100 @@ static void miner_worker(Chain* chain,
 }
 
 // Resolve mining address. Interactive prompt if mining_enabled=true; otherwise try env/default wallet.
-static bool resolve_mining_address(std::vector<uint8_t>& out_pkh, bool mining_enabled, const std::string& /*conf_hint*/){
+static bool resolve_mining_address(std::vector<uint8_t>& out_pkh,
+                                   bool mining_enabled,
+                                   const std::string& conf_hint,
+                                   bool allow_prompt)
+{
     out_pkh.clear();
 
-    // 0) Interactive prompt (every run)
-    if(mining_enabled){
-        while(true){
-            std::cout << "Enter mining address (P2PKH Base58Check), or leave blank to skip mining: " << std::flush;
-            std::string addr;
-            if(!std::getline(std::cin, addr)){
-                log_warn("stdin closed; mining disabled for this run.");
-                return false;
-            }
-            if(addr.empty()){
-                log_info("No address provided; mining disabled for this run.");
-                return false;
-            }
-            uint8_t ver=0; std::vector<uint8_t> payload;
-            if(base58check_decode(addr, ver, payload) && ver==VERSION_P2PKH && payload.size()==20){
-                out_pkh = payload;
-                log_info("Using mining address from interactive prompt");
-                return true;
-            }
-            std::fprintf(stderr, "[ERROR] Invalid address. Expected P2PKH Base58Check (version 0x%02x). Try again.\n",
-                         (unsigned)VERSION_P2PKH);
-        }
-    }
-
-    // 1) Env override (used only if mining_enabled==false)
-    if(const char* e = std::getenv("MIQ_MINING_ADDR")){
-        uint8_t ver=0; std::vector<uint8_t> payload;
-        if(base58check_decode(e, ver, payload) && ver==VERSION_P2PKH && payload.size()==20){
-            out_pkh = payload;
-            log_info("Using mining address from MIQ_MINING_ADDR");
+    // 1) CLI/config (explicit) — fail fast if invalid to avoid silent surprises
+    if(!conf_hint.empty()) {
+        std::string err;
+        if(parse_p2pkh(conf_hint, out_pkh, &err)) {
+            log_info("Mining address: using CLI/config");
+            log_info(std::string("  addr=") + conf_hint + "  pkh=" + hex(out_pkh));
             return true;
         } else {
-            log_warn("MIQ_MINING_ADDR invalid (expects Base58Check P2PKH)");
+            log_error(std::string("Invalid --miningaddr/mining_address: ") + err);
+            return false; // Explicit but invalid: don't fall back; force the operator to fix it.
         }
     }
 
-    // 2) Default wallet store (used only if mining_enabled==false)
-    {
-        std::string a;
-        if(miq::load_default_wallet_address(a)){
-            uint8_t ver=0; std::vector<uint8_t> payload;
-            if(base58check_decode(a, ver, payload) && ver==VERSION_P2PKH && payload.size()==20){
-                out_pkh = payload;
-                log_info("Using mining address from default wallet store");
+    // 2) Environment override
+    if(const char* e = std::getenv("MIQ_MINING_ADDR")) {
+        std::string env = e;
+        trim_inplace(env);
+        if(!env.empty()) {
+            std::string err;
+            if(parse_p2pkh(env, out_pkh, &err)) {
+                log_info("Mining address: using MIQ_MINING_ADDR");
+                log_info(std::string("  addr=") + env + "  pkh=" + hex(out_pkh));
                 return true;
+            } else {
+                log_warn(std::string("MIQ_MINING_ADDR invalid: ") + err + " (ignoring)");
             }
         }
     }
 
-    return false; // Not mining or no address available
-}
+    // 3) Default wallet store (nice fallback for casual runs)
+    {
+        std::string a;
+        if(miq::load_default_wallet_address(a)) {
+            std::string err;
+            if(parse_p2pkh(a, out_pkh, &err)) {
+                log_info("Mining address: using default wallet store");
+                log_info(std::string("  addr=") + a + "  pkh=" + hex(out_pkh));
+                return true;
+            } else {
+                log_warn(std::string("Default wallet address invalid: ") + err + " (ignoring)");
+            }
+        }
+    }
 
+    // 4) Interactive prompt (last resort); never block headless daemons
+    if(mining_enabled && allow_prompt) {
+        std::cout << "\n"
+                     "=== Mining address required ===\n"
+                     "Paste a P2PKH (Base58Check) address to receive block rewards.\n"
+                     "• Leave blank and press Enter to DISABLE mining for this run.\n"
+                     "• You can avoid this prompt by setting one of:\n"
+                     "    --miningaddr=<Base58>\n"
+                     "    mining_address=<Base58>  (in miqrod.conf)\n"
+                     "    MIQ_MINING_ADDR=<Base58>\n"
+                     "\n> Address: " << std::flush;
+
+        std::string addr;
+        if(!std::getline(std::cin, addr)) {
+            log_warn("stdin closed; mining disabled for this run.");
+            return false;
+        }
+        trim_inplace(addr);
+        if(addr.empty()) {
+            log_info("Empty input; mining disabled for this run.");
+            return false;
+        }
+
+        std::string err;
+        if(parse_p2pkh(addr, out_pkh, &err)) {
+            log_info("Mining address: using interactive prompt");
+            log_info(std::string("  addr=") + addr + "  pkh=" + hex(out_pkh));
+            return true;
+        } else {
+            std::fprintf(stderr, "[ERROR] Invalid address: %s\n"
+                                  "Expected Base58Check P2PKH (version 0x%02x), 20-byte payload.\n"
+                                  "Tip: set --miningaddr=... to avoid prompts.\n",
+                         err.c_str(), (unsigned)VERSION_P2PKH);
+            return false;
+        }
+    }
+
+    // 5) No valid address + cannot prompt -> disable mining clearly
+    if(mining_enabled) {
+        log_warn("Mining requested but no valid address configured, and no TTY available for prompt; mining disabled for this run.");
+    }
+    return false;
+}
 static void print_usage(){
     std::cout
       << "miqrod options:\n"
