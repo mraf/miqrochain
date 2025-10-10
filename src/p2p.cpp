@@ -28,6 +28,14 @@
 #include <signal.h>
 #endif
 
+#if !defined(MIQ_MAYBE_UNUSED)
+  #if defined(__GNUC__) || defined(__clang__)
+    #define MIQ_MAYBE_UNUSED __attribute__((unused))
+  #else
+    #define MIQ_MAYBE_UNUSED
+  #endif
+#endif
+
 // === Optional persisted addrman =============================================
 // This block is 100% backward compatible: if addrman.h is absent, we disable it.
 #if defined(__has_include)
@@ -506,7 +514,7 @@ static inline bool is_loopback_be(uint32_t be_ip){
 static inline bool is_self_be(uint32_t be_ip){
     return g_self_v4.find(be_ip) != g_self_v4.end();
 }
-static void self_add_be(uint32_t be_ip){
+static MIQ_MAYBE_UNUSED void self_add_be(uint32_t be_ip){
     g_self_v4.insert(be_ip);
 }
 static void self_add_dotted(const std::string& ip){
