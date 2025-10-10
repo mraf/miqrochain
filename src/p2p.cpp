@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <random>
 #include <cstdlib>  // getenv
+#include <mutex>
 
 #ifndef _WIN32
 #include <signal.h>
@@ -1232,6 +1233,14 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
     }
 }
 
+void P2P::announce_block_async(const std::vector<uint8_t>& h) {
+    if (h.size() != 32) return;
+    std::lock_guard<std::mutex> lk(announce_mu_);
+    if (announce_blocks_q_.size() < 1024) { // small bound to avoid unbounded growth
+        announce_blocks_q_.push_back(h);
+    }
+}
+
 // =================== helpers for sync / serving ===================
 
 // Trickle enqueue for tx announcements (per-peer)
@@ -2315,6 +2324,23 @@ void P2P::loop(){
 
         // Tx INV trickle flush (time-based)
         trickle_flush();
+
+        // ---- NEW: flush async block announcements queued by other threads ----
+        {
+            std::vector<std::vector<uint8_t>> todo;
+            {
+                std::lock_guard<std::mutex> lk(announce_mu_);
+                if (!announce_blocks_q_.empty()) {
+                    todo.swap(announce_blocks_q_);
+                }
+            }
+            for (const auto& h : todo) {
+                auto m = encode_msg("invb", h);
+                for (auto& kv : peers_) {
+                    send(kv.first, (const char*)m.data(), (int)m.size(), 0);
+                }
+            }
+        }
 
         // Autosave legacy addrs periodically if we’ve learned new ones
         if (now_ms() - last_addr_save_ms > MIQ_ADDR_SAVE_INTERVAL_MS) {
