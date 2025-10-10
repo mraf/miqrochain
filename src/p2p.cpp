@@ -264,6 +264,10 @@ static std::unordered_map<int, int64_t> g_trickle_last_ms;
 static std::unordered_map<int,
     std::unordered_map<std::string, std::pair<int64_t,uint32_t>>> g_cmd_rl;
 
+// NEW: per-peer simple min-interval throttles (family → last_allow_ms)
+static std::unordered_map<int,
+    std::unordered_map<std::string, int64_t>> g_cmd_last_allow;
+
 // Per-socket parse deadlines for partial frames
 static std::unordered_map<int, int64_t> g_rx_started_ms;
 static inline void rx_track_start(int fd){
@@ -638,7 +642,7 @@ static std::string miq_addr_from_pkh(const std::vector<uint8_t>& pkh) {
     return miq::base58check_encode(miq::VERSION_P2PKH, pkh);
 }
 static std::string miq_miner_from_block(const miq::Block& b) {
-    // coinbase is tx[0], payout is vout[0].pkh (as constructed in miner in main.cpp)
+    // coinbase is tx[0], payout is vout[0].pkh (as constructed in miner)
     if (b.txs.empty()) return "(unknown)";
     const miq::Transaction& cb = b.txs[0];
     if (cb.vout.empty()) return "(unknown)";
@@ -648,6 +652,97 @@ static std::string miq_miner_from_block(const miq::Block& b) {
 }
 
 namespace miq {
+
+// === Simple per-family min-interval rate check ==============================
+// Allow at most `tokens_per_second` events (non-integer supported) by enforcing
+// a minimum interval between allows. Used by existing call sites like
+// check_rate(ps, "get", 1.0, now_ms()) and 0.5/0.25 for inv.
+bool P2P::check_rate(PeerState& ps, const char* family, double tokens_per_second, int64_t now)
+{
+    if (!family || tokens_per_second <= 0.0) return true; // disabled
+    double tps = tokens_per_second;
+    if (tps > 1000.0) tps = 1000.0;
+    int64_t min_interval_ms = (int64_t)std::max(1.0, 1000.0 / tps);
+
+    auto& perPeer = g_cmd_last_allow[ps.sock];
+    std::string fam(family);
+    auto it = perPeer.find(fam);
+    if (it == perPeer.end()) {
+        perPeer[fam] = now;
+        return true;
+    }
+    if (now - it->second >= min_interval_ms) {
+        it->second = now;
+        return true;
+    }
+    // gentle nudge on spam
+    if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
+    return false;
+}
+
+// === Legacy keyed helper (maps a few commands to families) ==================
+bool P2P::check_rate(PeerState& ps, const char* key) {
+    if (!key) return true;
+
+    struct Map { const char* key; const char* family; };
+    static const Map kTable[] = {
+        {"invb",   "inv"},
+        {"invtx",  "inv"},
+        {"getb",   "get"},
+        {"getbi",  "get"},
+        {"gettx",  "get"},
+        {"gethdr", "get"},
+        {"addr",   "addr"},
+        {"getaddr","addr"},
+    };
+
+    for (const auto& e : kTable) {
+        if (std::strcmp(e.key, key) == 0) {
+            return check_rate(ps, e.family, 1.0, now_ms());
+        }
+    }
+    // Conservative default
+    return check_rate(ps, "misc", 1.0, now_ms());
+}
+
+// 5-arg named-family/window helper kept for compatibility with header
+bool P2P::check_rate(PeerState& ps,
+                     const char* family,
+                     const char* name,
+                     uint32_t burst,
+                     uint32_t window_ms)
+{
+    const char* fam = family ? family : "misc";
+    const char* nam = name   ? name   : "";
+
+    // Compose key "family:name"
+    std::string k;
+    k.reserve(std::strlen(fam) + 1 + std::strlen(nam));
+    k.append(fam);
+    k.push_back(':');
+    k.append(nam);
+
+    const int64_t t = now_ms();
+
+    auto& perPeer = g_cmd_rl[ps.sock];          // creates on first use
+    auto& slot    = perPeer[k];                 // default-initializes to {0,0}
+    int64_t&  win_start = slot.first;
+    uint32_t& count     = slot.second;
+
+    if (win_start == 0 || (t - win_start) >= (int64_t)window_ms) {
+        win_start = t;
+        count = 0;
+    }
+
+    if (count >= burst) {
+        // Light penalty; hard disconnects are triggered elsewhere on score
+        if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
+        return false;
+    }
+
+    ++count;
+    return true;
+}
 
 #if MIQ_ENABLE_HEADERS_FIRST
 // ---- headers-first wire helpers -------------------------------------------
@@ -827,29 +922,16 @@ void P2P::save_bans(){
 
 // === start/stop now also load/save peers files ===============================
 bool P2P::start(uint16_t port){
-      running_ = true;
-      th_ = std::thread([this]{
-        for(;;){
-            try {
-                loop();                     // exits when running_ becomes false
-                break;                      // clean stop
-            } catch (const std::exception& e) {
-                log_error(std::string("P2P: loop exception: ") + e.what());
-            } catch (...) {
-                log_error("P2P: loop exception (unknown)");
-            }
-            if(!running_) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    });
-
 #ifndef _WIN32
+    // ignore SIGPIPE in this thread (before any sockets are created)
     signal(SIGPIPE, SIG_IGN);
 #endif
 
 #ifdef _WIN32
+    // MUST be before any socket usage (including seed DNS, etc.)
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
+
     load_bans();
     load_addrs_from_disk(datadir_, addrv4_);
 
@@ -938,7 +1020,23 @@ bool P2P::start(uint16_t port){
     }
 
     running_ = true;
-    th_ = std::thread([this]{ loop(); });
+
+    // Single P2P thread with a hard guard: no double-spawn, no early sockets
+    th_ = std::thread([this]{
+        for(;;){
+            try {
+                loop();                     // exits when running_ becomes false
+                break;                      // clean stop
+            } catch (const std::exception& e) {
+                log_error(std::string("P2P: loop exception: ") + e.what());
+            } catch (...) {
+                log_error("P2P: loop exception (unknown)");
+            }
+            if(!running_) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
+
     return true;
 }
 
@@ -967,69 +1065,6 @@ void P2P::stop(){
 }
 
 // === outbound connect helpers ===============================================
-
-bool P2P::check_rate(PeerState& ps, const char* key) {
-    if (!key) return true;
-
-    struct Map { const char* key; const char* family; };
-    static const Map kTable[] = {
-        {"invb",   "inv"},
-        {"invtx",  "inv"},
-        {"getb",   "get"},
-        {"getbi",  "get"},
-        {"gettx",  "get"},
-        {"gethdr", "get"},
-        {"addr",   "addr"},
-        {"getaddr","addr"},
-    };
-
-    for (const auto& e : kTable) {
-        if (std::strcmp(e.key, key) == 0) {
-            return check_rate(ps, e.family, 1.0, now_ms());
-        }
-    }
-    // Conservative default
-    return check_rate(ps, "misc", 1.0, now_ms());
-}
-
-// 5-arg overload used by the key-based helper above
-bool P2P::check_rate(PeerState& ps,
-                     const char* family,
-                     const char* name,
-                     uint32_t burst,
-                     uint32_t window_ms)
-{
-    const char* fam = family ? family : "misc";
-    const char* nam = name   ? name   : "";
-
-    // Compose key "family:name"
-    std::string k;
-    k.reserve(std::strlen(fam) + 1 + std::strlen(nam));
-    k.append(fam);
-    k.push_back(':');
-    k.append(nam);
-
-    const int64_t t = now_ms();
-
-    auto& perPeer = g_cmd_rl[ps.sock];          // creates on first use
-    auto& slot    = perPeer[k];                 // default-initializes to {0,0}
-    int64_t&  win_start = slot.first;
-    uint32_t& count     = slot.second;
-
-    if (win_start == 0 || (t - win_start) >= (int64_t)window_ms) {
-        win_start = t;
-        count = 0;
-    }
-
-    if (count >= burst) {
-        // Light penalty; hard disconnects are triggered elsewhere on score
-        if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
-        return false;
-    }
-
-    ++count;
-    return true;
-}
 
 bool P2P::connect_seed(const std::string& host, uint16_t port){
     // respect per-host cooldown
