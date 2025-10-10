@@ -819,7 +819,21 @@ void P2P::save_bans(){
 
 // === start/stop now also load/save peers files ===============================
 bool P2P::start(uint16_t port){
-    if (running_) return true;
+    if running_ = true;
+      th_ = std::thread([this]{
+        for(;;){
+            try {
+                loop();                     // exits when running_ becomes false
+                break;                      // clean stop
+            } catch (const std::exception& e) {
+                log_error(std::string("P2P: loop exception: ") + e.what());
+            } catch (...) {
+                log_error("P2P: loop exception (unknown)");
+            }
+            if(!running_) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
 
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
