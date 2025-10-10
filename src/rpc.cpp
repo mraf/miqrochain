@@ -31,6 +31,7 @@
 #include <cstring>  // std::memset
 #include <cstdlib>  // std::getenv, setenv
 #include <iomanip>  // std::setw, std::setfill
+#include <ctime>    // time()
 
 #include <fstream>
 #include <random>
@@ -1015,7 +1016,7 @@ std::string RpcService::handle(const std::string& body){
             std::string wpass    = get_opt(2);
 
             std::string wdir = default_wallet_file();
-            if(!wdir empty()){
+            if(!wdir.empty()){
                 size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
             } else {
                 wdir = "wallets/default";
