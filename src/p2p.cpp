@@ -1226,11 +1226,7 @@ void P2P::handle_new_peer(int c, const std::string& ip){
 }
 
 void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
-    auto msg = encode_msg("invb", h);
-    for (auto& kv : peers_) {
-        int s = kv.first;
-        send(s, (const char*)msg.data(), (int)msg.size(), 0);
-    }
+   announce_block_async(h);
 }
 
 void P2P::announce_block_async(const std::vector<uint8_t>& h) {
