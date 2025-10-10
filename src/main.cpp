@@ -148,8 +148,14 @@ static std::vector<Transaction> collect_mempool_for_block(Mempool& mp,
 
 // Fatal terminate hook extracted to a named function (avoids [] in set_terminate)
 static void fatal_terminate() noexcept {
-    std::fputs("[FATAL] std::terminate() called (likely from a background thread)\n", stderr);
-    std::abort();
+    // DO NOT abort; keep the node alive if a worker thread dies.
+    std::fputs("[FATAL] std::terminate() called from a background thread (suppressed to keep node alive)\n", stderr);
+    // best-effort sleep to avoid tight loop; the offending thread will end.
+#ifdef _WIN32
+    Sleep(10);
+#else
+    usleep(10 * 1000);
+#endif
 }
 
 // Miner worker extracted to a named function (no lambda captures)
