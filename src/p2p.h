@@ -177,8 +177,6 @@ public:
     // Broadcast inventory for a new block/tx we just accepted/mined
     void announce_block_async(const std::vector<uint8_t>& h);
     void broadcast_inv_block(const std::vector<uint8_t>& h);
-    void announce_block_async(const std::vector<uint8_t>& block_hash);
-    void broadcast_inv_block(const std::vector<uint8_t>& block_hash);
     void broadcast_inv_tx(const std::vector<uint8_t>& txid);
 
     // Optional: where to store bans.txt and peers.dat
@@ -241,7 +239,6 @@ private:
 
     // Small, bounded caches (in-memory)
     mutable std::mutex announce_mu_;
-    std::mutex announce_mu_;
     std::vector<std::vector<uint8_t>> announce_blocks_q_;
     std::unordered_set<std::string> seen_txids_;
     std::unordered_map<std::string, std::vector<uint8_t>> tx_store_;
