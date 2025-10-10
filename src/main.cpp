@@ -274,7 +274,7 @@ static void miner_worker(Chain* chain,
                              + ", txs=" + std::to_string(std::max(0, noncb)));
 
                     if (!g_shutdown_requested.load() && p2p) {
-                        p2p->broadcast_inv_block(b.block_hash());
+                        p2p->announce_block_async(b.block_hash());
                     }
                 } else {
                     log_warn(std::string("mined block rejected: ") + err);
