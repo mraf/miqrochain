@@ -238,6 +238,7 @@ add_executable(miqrod
   src/tls_proxy.h src/tls_proxy.cpp   # TLS is daemon-only
 )
 target_link_libraries(miqrod PRIVATE miqcore OpenSSL::SSL)
+
 if(_HAVE_MINIUPNPC)
   target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_UPNP=1)
   if(_MINIUPNPC_INC)
@@ -246,10 +247,12 @@ if(_HAVE_MINIUPNPC)
   if(_MINIUPNPC_LIBS)
     target_link_libraries(miqrod PRIVATE ${_MINIUPNPC_LIBS})
   endif()
+  message(STATUS "UPnP enabled for daemon (miniupnpc detected)")
 else()
-  # Be explicit so the code can print "disabled at build time"
-  target_compile_definitions(miqrod PRIVATE MIQ_ENABLE_UPNP=0)
+  # IMPORTANT: do NOT define MIQ_ENABLE_UPNP at all here. Leave it undefined.
+  message(STATUS "UPnP disabled for daemon (miniupnpc not found)")
 endif()
+
 if(WIN32)
   target_link_libraries(miqrod PRIVATE ws2_32 iphlpapi bcrypt)
   target_compile_definitions(miqrod PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
