@@ -1,4 +1,4 @@
-// src/main.cpp  — MIQ core entrypoint (MSVC-safe; no lambda-capture pitfalls)
+// src/main.cpp  — MIQ core entrypoint (node-only by default; miner is optional/extern)
 
 // Prevent Windows headers from defining min/max macros that break std::min/std::max
 #ifdef _WIN32
@@ -8,25 +8,18 @@
 #endif
 
 #include "constants.h"
-#include "address.h"
-#include "wallet_store.h"
-#include <exception>
 #include "config.h"
 #include "log.h"
 #include "chain.h"
 #include "mempool.h"
-#include "miner.h"
 #include "rpc.h"
 #include "p2p.h"
 #include "tx.h"
 #include "serialize.h"
-#include "sha256.h"
 #include "base58check.h"
 #include "hash160.h"
-#include "merkle.h"
 #include "crypto/ecdsa_iface.h"
-#include "hex.h"
-#include "difficulty.h"   // epoch_next_bits
+#include "difficulty.h"
 
 #include "tls_proxy.h"    // TLS terminator for RPC (if used)
 #include "ibd_monitor.h"  // IBD sampling for getibdinfo
@@ -109,24 +102,6 @@ static inline void trim_inplace(std::string& s) {
     s.erase(std::find_if(s.rbegin(), s.rend(), notspace).base(), s.end());
 }
 
-static bool parse_p2pkh(const std::string& addr, std::vector<uint8_t>& out_pkh, std::string* err=nullptr) {
-    uint8_t ver = 0; std::vector<uint8_t> payload;
-    if(!base58check_decode(addr, ver, payload)) {
-        if(err) *err = "Base58Check decode failed";
-        return false;
-    }
-    if(ver != VERSION_P2PKH) {
-        if(err) *err = "wrong version";
-        return false;
-    }
-    if(payload.size() != 20) {
-        if(err) *err = "payload length != 20";
-        return false;
-    }
-    out_pkh = payload;
-    return true;
-}
-
 // ---------- small helpers (file + optional genesis key loader) --------------
 static bool read_file_all(const std::string& path, std::vector<uint8_t>& out){
     std::ifstream f(path, std::ios::binary);
@@ -138,58 +113,6 @@ static bool read_file_all(const std::string& path, std::vector<uint8_t>& out){
     out.resize((size_t)n);
     if(n > 0 && !f.read(reinterpret_cast<char*>(out.data()), n)) return false;
     return true;
-}
-
-// Load the *existing* genesis private key.
-// Accepts: env MIQ_GENESIS_PRIV_HEX (64 hex) or <datadir>/genesis.key (32 raw bytes or 64 hex).
-static bool load_existing_genesis_priv(const std::string& datadir, std::vector<uint8_t>& out32){
-    // 1) Environment override
-    if (const char* h = std::getenv("MIQ_GENESIS_PRIV_HEX")) {
-        auto v = miq::from_hex(std::string(h));
-        if (v.size() == 32) { out32 = std::move(v); return true; }
-        return false;
-    }
-    // 2) datadir/genesis.key
-    std::vector<uint8_t> buf;
-    if (read_file_all(datadir + "/genesis.key", buf)) {
-        if (buf.size() == 32) { out32 = std::move(buf); return true; }
-        // allow text hex file
-        std::string s(reinterpret_cast<const char*>(buf.data()), buf.size());
-        auto v = miq::from_hex(s);
-        if (v.size() == 32) { out32 = std::move(v); return true; }
-        return false;
-    }
-    return false; // not found
-}
-
-// Simple read of "mining_address" from a key=value conf file (non-fatal if absent)
-static bool try_read_miningaddr_from_conf(const std::string& path, std::string& out) {
-    out.clear();
-    if (path.empty()) return false;
-    std::ifstream f(path);
-    if (!f) return false;
-    std::string line;
-    while (std::getline(f, line)) {
-        // strip comments (# ... or // ...)
-        auto hash = line.find('#'); if (hash != std::string::npos) line.resize(hash);
-        auto sl   = line.find("//"); if (sl  != std::string::npos) line.resize(sl);
-        trim_inplace(line);
-        if (line.empty()) continue;
-        auto eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        std::string k = line.substr(0, eq);
-        std::string v = line.substr(eq+1);
-        trim_inplace(k); trim_inplace(v);
-        if (k == "mining_address") {
-            out = v;
-            trim_inplace(out);
-            // drop surrounding quotes if any
-            if (!out.empty() && (out.front()=='"' || out.front()=='\'')) out.erase(out.begin());
-            if (!out.empty() && (out.back() =='"' || out.back()=='\''))  out.pop_back();
-            return !out.empty();
-        }
-    }
-    return false;
 }
 
 // POSIX-style simple signal handler (safe operations only).
@@ -204,7 +127,6 @@ static std::vector<Transaction> collect_mempool_for_block(Mempool& mp,
     const size_t coinbase_sz = ser_tx(coinbase).size();
     const size_t budget = (max_bytes > coinbase_sz) ? (max_bytes - coinbase_sz) : 0;
 
-    // Grab a generous number in feerate order, then trim by bytes.
     auto cands = mp.collect(100000);
     std::vector<Transaction> kept;
     kept.reserve(cands.size());
@@ -228,6 +150,7 @@ static void fatal_terminate() noexcept {
 }
 
 // Miner worker extracted to a named function (no lambda captures)
+// NOTE: internal miner is disabled by default; this worker runs only when --mine is used.
 static void miner_worker(Chain* chain,
                          Mempool* mempool,
                          P2P* p2p,
@@ -239,28 +162,23 @@ static void miner_worker(Chain* chain,
         (uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count())
         ^ (uint64_t)rd() ^ (uint64_t)(uintptr_t)&gen));
 
-    // Soft cap (bytes) to keep blocks < 1 MiB
     const size_t kBlockMaxBytes = 900 * 1024;
 
     while (!g_shutdown_requested.load()) {
         try {
-            // ---- A) get tip
             auto t = chain->tip();
 
-            // ---- B) build coinbase (vin)
+            // Build coinbase (vin)
             Transaction cbt;
             TxIn cin;
             cin.prev.txid = std::vector<uint8_t>(32, 0);
             cin.prev.vout = 0;
             cbt.vin.push_back(cin);
 
-            // ---- C) build coinbase (vout)
+            // Build coinbase (vout)
             TxOut cbout;
-
-            // C1: set value
             cbout.value = chain->subsidy_for_height(t.height + 1);
 
-            // C2: assign pkh (strict 20 bytes)
             if (mine_pkh.size() != 20) {
                 log_error(std::string("miner C2(assign pkh) fatal: pkh size != 20 (got ")
                           + std::to_string(mine_pkh.size()) + ")");
@@ -269,11 +187,9 @@ static void miner_worker(Chain* chain,
             }
             cbout.pkh.resize(20);
             std::memcpy(cbout.pkh.data(), mine_pkh.data(), 20);
-
-            // C3: push_back into vout
             cbt.vout.push_back(cbout);
 
-            // C4: ensure coinbase txid is UNIQUE per block
+            // Ensure coinbase txid uniqueness
             cbt.lock_time = static_cast<uint32_t>(t.height + 1);
             const uint32_t ch   = static_cast<uint32_t>(t.height + 1);
             const uint32_t now  = static_cast<uint32_t>(time(nullptr));
@@ -293,7 +209,7 @@ static void miner_worker(Chain* chain,
             for (int i=0;i<8;i++) tag.push_back(uint8_t((extraNonce >> (8*i)) & 0xff));
             cbt.vin[0].sig = std::move(tag);
 
-            // ---- D) collect mempool txs (size-capped)
+            // Gather mempool txs (size-capped)
             std::vector<Transaction> txs;
             try {
                 txs = collect_mempool_for_block(*mempool, cbt, kBlockMaxBytes);
@@ -301,7 +217,7 @@ static void miner_worker(Chain* chain,
                 txs.clear();
             }
 
-            // ---- E) mine_block using EPOCH retarget (matches consensus)
+            // Mine with epoch retarget
             Block b;
             try {
                 auto last = chain->last_headers(MIQ_RETARGET_INTERVAL);
@@ -318,7 +234,7 @@ static void miner_worker(Chain* chain,
                 continue;
             }
 
-            // ---- F) submit_block
+            // Submit
             try {
                 std::string err;
                 if (chain->submit_block(b, err)) {
@@ -353,126 +269,52 @@ static void miner_worker(Chain* chain,
     }
 }
 
-// Resolve mining address: prefer CLI/config, then env, then default wallet,
-// and only prompt if interactive TTY is available.
-static bool resolve_mining_address(std::vector<uint8_t>& out_pkh,
-                                   bool mining_enabled,
-                                   const std::string& conf_hint,
-                                   bool allow_prompt)
-{
-    out_pkh.clear();
-
-    // 1) CLI/config (explicit) — fail fast if invalid to avoid silent surprises
-    if(!conf_hint.empty()) {
-        std::string err;
-        if(parse_p2pkh(conf_hint, out_pkh, &err)) {
-            log_info("Mining address: using CLI/config");
-            log_info(std::string("  addr=") + conf_hint + "  pkh=" + to_hex(out_pkh));
-            return true;
-        } else {
-            log_error(std::string("Invalid --miningaddr/mining_address: ") + err);
-            return false; // Explicit but invalid: don't fall back; force the operator to fix it.
-        }
+// Simple P2PKH parser used by --buildtx (internal miner off by default)
+static bool parse_p2pkh(const std::string& addr, std::vector<uint8_t>& out_pkh, std::string* err=nullptr) {
+    uint8_t ver = 0; std::vector<uint8_t> payload;
+    if(!base58check_decode(addr, ver, payload)) {
+        if(err) *err = "Base58Check decode failed";
+        return false;
     }
-
-    // 2) Environment override
-    if(const char* e = std::getenv("MIQ_MINING_ADDR")) {
-        std::string env = e;
-        trim_inplace(env);
-        if(!env.empty()) {
-            std::string err;
-            if(parse_p2pkh(env, out_pkh, &err)) {
-                log_info("Mining address: using MIQ_MINING_ADDR");
-                log_info(std::string("  addr=") + env + "  pkh=" + to_hex(out_pkh));
-                return true;
-            } else {
-                log_warn(std::string("MIQ_MINING_ADDR invalid: ") + err + " (ignoring)");
-            }
-        }
+    if(ver != VERSION_P2PKH) {
+        if(err) *err = "wrong version";
+        return false;
     }
-
-    // 3) Default wallet store (nice fallback for casual runs)
-    {
-        std::string a;
-        if(miq::load_default_wallet_address(a)) {
-            std::string err;
-            if(parse_p2pkh(a, out_pkh, &err)) {
-                log_info("Mining address: using default wallet store");
-                log_info(std::string("  addr=") + a + "  pkh=" + to_hex(out_pkh));
-                return true;
-            } else {
-                log_warn(std::string("Default wallet address invalid: ") + err + " (ignoring)");
-            }
-        }
+    if(payload.size() != 20) {
+        if(err) *err = "payload length != 20";
+        return false;
     }
-
-    // 4) Interactive prompt (last resort); never block headless daemons
-    if(mining_enabled && allow_prompt) {
-        std::cout << "\n"
-                     "=== Mining address required ===\n"
-                     "Paste a P2PKH (Base58Check) address to receive block rewards.\n"
-                     "• Leave blank and press Enter to DISABLE mining for this run.\n"
-                     "• You can avoid this prompt by setting one of:\n"
-                     "    --miningaddr=<Base58>\n"
-                     "    mining_address=<Base58>  (in miqrod.conf)\n"
-                     "    MIQ_MINING_ADDR=<Base58>\n"
-                     "\n> Address: " << std::flush;
-
-        std::string addr;
-        if(!std::getline(std::cin, addr)) {
-            log_warn("stdin closed; mining disabled for this run.");
-            return false;
-        }
-        trim_inplace(addr);
-        if(addr.empty()) {
-            log_info("Empty input; mining disabled for this run.");
-            return false;
-        }
-
-        std::string err;
-        if(parse_p2pkh(addr, out_pkh, &err)) {
-            log_info("Mining address: using interactive prompt");
-            log_info(std::string("  addr=") + addr + "  pkh=" + to_hex(out_pkh));
-            return true;
-        } else {
-            std::fprintf(stderr, "[ERROR] Invalid address: %s\n"
-                                  "Expected Base58Check P2PKH (version 0x%02x), 20-byte payload.\n"
-                                  "Tip: set --miningaddr=... to avoid prompts.\n",
-                         err.c_str(), (unsigned)VERSION_P2PKH);
-            return false;
-        }
-    }
-
-    // 5) No valid address + cannot prompt -> disable mining clearly
-    if(mining_enabled) {
-        log_warn("Mining requested but no valid address configured, and no TTY available for prompt; mining disabled for this run.");
-    }
-    return false;
+    out_pkh = payload;
+    return true;
 }
 
 static void print_usage(){
     std::cout
-      << "miqrod options:\n"
+      << "miqrod (node) options:\n"
       << "  --conf=<path>                                config file (key=value)\n"
       << "  --datadir=<path>                             data directory (overrides config)\n"
-      << "  --miningaddr=<Base58-P2PKH>                  mine rewards to this address (no prompt)\n"
       << "  --genaddress                                 generate ECDSA-P2PKH address (priv/pk/address)\n"
       << "  --buildtx <priv_hex> <prev_txid_hex> <vout> <value> <to_address>  (prints txhex)\n"
       << "  --reindex_utxo                               rebuild chainstate/UTXO from current chain\n"
       << "  --utxo_kv                                    (reserved) enable KV-backed UTXO at runtime if supported\n"
+      << "  --mine                                       (optional) run built-in miner [NOT default]\n"
+      << "\n"
+      << "Recommended: run the separate miner executable (miqminer / miqp2pminer).\n"
+      << "The node forms the distributed timestamp server by validating & serving blocks\n"
+      << "over P2P; miners (external or --mine) timestamp by finding valid blocks.\n"
       << "Env:\n"
-      << "  MIQ_MINING_ADDR     If set, node will mine to this address (Base58 P2PKH)\n"
-      << "  MIQ_MINER_THREADS   If set, overrides miner thread count\n";
+      << "  MIQ_MINER_THREADS   If set, overrides miner thread count\n"
+      << "  MIQ_RPC_TOKEN       If set, HTTP gate token (synced to .cookie on start)\n";
 }
 
 static bool is_recognized_arg(const std::string& s){
     if(s.rfind("--conf=",0)==0) return true;
     if(s.rfind("--datadir=",0)==0) return true;
-    if(s.rfind("--miningaddr=",0)==0) return true;
     if(s=="--genaddress") return true;
     if(s=="--buildtx") return true;
     if(s=="--reindex_utxo") return true;
     if(s=="--utxo_kv") return true;
+    if(s=="--mine") return true;
     if(s=="--help") return true;
     return false;
 }
@@ -490,16 +332,15 @@ int main(int argc, char** argv){
         // Register SIGINT/SIGTERM for graceful shutdown
         std::signal(SIGINT,  handle_signal);
         std::signal(SIGTERM, handle_signal);
-
 #ifndef _WIN32
-        // Prevent process death on write to a closed socket (Linux/Unix/BSD/macOS)
         std::signal(SIGPIPE, SIG_IGN);
 #endif
 
         // ----- Parse CLI FIRST (no heavy work yet) -----------------------
         Config cfg;
         std::string conf;
-        bool genaddr=false, buildtx=false;
+        bool genaddr=false, buildtx=false, mine_flag=false;
+
         // NEW flags
         bool flag_reindex_utxo = false;
         bool flag_utxo_kv      = false;
@@ -507,9 +348,6 @@ int main(int argc, char** argv){
         std::string privh, prevtxid_hex, toaddr;
         uint32_t vout=0;
         uint64_t value=0;
-
-        // mining-addr (CLI) hint
-        std::string mining_addr_cli;
 
         // Guard unsupported flags
         for(int i=1;i<argc;i++){
@@ -527,8 +365,6 @@ int main(int argc, char** argv){
                 conf = a.substr(7);
             } else if(a.rfind("--datadir=",0)==0){
                 cfg.datadir = a.substr(10);
-            } else if(a.rfind("--miningaddr=",0)==0){
-                mining_addr_cli = a.substr(std::string("--miningaddr=").size());
             } else if(a=="--genaddress"){
                 genaddr = true;
             } else if(a=="--buildtx" && i+5<argc){
@@ -542,6 +378,8 @@ int main(int argc, char** argv){
                 flag_reindex_utxo = true;
             } else if(a=="--utxo_kv"){
                 flag_utxo_kv = true; // reserved
+            } else if(a=="--mine"){
+                mine_flag = true;     // opt-in internal miner
             } else if(a=="--help"){
                 print_usage();
                 return 0;
@@ -639,7 +477,6 @@ int main(int argc, char** argv){
         // --- Genesis from pinned raw block --------------------------------
         std::fprintf(stderr, "[BOOT] load genesis from constants raw hex\n");
         {
-            // Parse raw block bytes from constants
             std::vector<uint8_t> raw;
             try {
                 raw = miq::from_hex(GENESIS_RAW_BLOCK_HEX);
@@ -652,7 +489,6 @@ int main(int argc, char** argv){
                 return 1;
             }
 
-            // Deserialize and verify against pinned hash/merkle
             Block g;
             if (!deser_block(raw, g)) {
                 log_error("Failed to deserialize GENESIS_RAW_BLOCK_HEX");
@@ -695,25 +531,6 @@ int main(int argc, char** argv){
         }
         // ===================================================================
 
-        // ---- Resolve mining address (deterministic; no headless prompts) ---
-        std::string mining_addr_conf;
-        if (mining_addr_cli.empty()) {
-            // Only bother reading conf file if CLI didn't provide it
-            try_read_miningaddr_from_conf(conf, mining_addr_conf);
-        }
-        const std::string mining_addr_hint = !mining_addr_cli.empty() ? mining_addr_cli
-                                                                      : mining_addr_conf;
-
-        std::vector<uint8_t> g_mine_pkh;
-        const bool allow_prompt = MIQ_ISATTY();
-        bool have_addr = resolve_mining_address(g_mine_pkh, !cfg.no_mine, mining_addr_hint, allow_prompt);
-        if(!have_addr){
-            cfg.no_mine = true; // disable mining for this run
-            log_info("Mining disabled (no valid destination address).");
-        } else {
-            log_info(std::string("Mining enabled to PKH: ") + to_hex(g_mine_pkh));
-        }
-
         // --- Services ---
         Mempool mempool;
         RpcService rpc(chain, mempool);
@@ -733,7 +550,7 @@ int main(int argc, char** argv){
             }
         }
 
-        // start IBD monitor
+        // start IBD monitor (crash-safe in its own try/catch loop)
         start_ibd_monitor(&chain, &p2p);
 
         if(!cfg.no_rpc){
@@ -747,7 +564,7 @@ int main(int argc, char** argv){
             setenv("MIQ_RPC_REQUIRE_TOKEN", "1", 1);
 #endif
 
-            // NEW: synchronize HTTP gate token to the RPC cookie so clients only need Authorization: Bearer <cookie>
+            // Sync HTTP gate token to the RPC cookie so clients can use Authorization: Bearer <cookie>
             try {
                 std::string cookie_path =
 #ifdef _WIN32
@@ -760,7 +577,6 @@ int main(int argc, char** argv){
                     throw std::runtime_error("failed to read cookie");
                 }
                 std::string tok(buf.begin(), buf.end());
-                // trim trailing whitespace
                 while(!tok.empty() && (tok.back()=='\r'||tok.back()=='\n'||tok.back()==' '||tok.back()=='\t')) tok.pop_back();
 #ifdef _WIN32
                 _putenv_s("MIQ_RPC_TOKEN", tok.c_str());
@@ -776,32 +592,54 @@ int main(int argc, char** argv){
             log_info("RPC listening on " + std::to_string(RPC_PORT));
         }
 
-        // --- Miner (off if no_mine or no address). Keep coinbase prev.vout=0.
-        // Thread selection:
-        // 1) If config provided miner_threads, use it.
-        // 2) Else env MIQ_MINER_THREADS.
-        // 3) Else DEFAULT 6 (double-click UX).
-        unsigned threads = cfg.miner_threads;
-        if (threads == 0) {
-            if (const char* s = std::getenv("MIQ_MINER_THREADS")) {
-                char* end = nullptr;
-                long v = std::strtol(s, &end, 10);
-                if (end != s && v > 0 && v <= 256) {
-                    threads = static_cast<unsigned>(v);
+        // --- Built-in miner (OFF by default). Opt-in with --mine -----------
+        unsigned threads = 0;
+        if (mine_flag) {
+            // choose threads
+            if (cfg.miner_threads) threads = cfg.miner_threads;
+            if (threads == 0) {
+                if (const char* s = std::getenv("MIQ_MINER_THREADS")) {
+                    char* end = nullptr;
+                    long v = std::strtol(s, &end, 10);
+                    if (end != s && v > 0 && v <= 256) {
+                        threads = static_cast<unsigned>(v);
+                    }
                 }
             }
-        }
-        if (threads == 0) threads = 6;
-        log_info("miner: using " + std::to_string(threads) + " thread(s)");
+            if (threads == 0) threads = std::max(1u, std::thread::hardware_concurrency());
 
-        if(!cfg.no_mine){
-            // Pass pointers and values explicitly (no lambda captures)
-            P2P* p2p_ptr = cfg.no_p2p ? nullptr : &p2p;
-            std::thread th(miner_worker, &chain, &mempool, p2p_ptr, g_mine_pkh, threads);
-            th.detach();
+            // ask for mining address interactively ONLY when --mine was specified and a TTY exists
+            std::vector<uint8_t> mine_pkh;
+            if (MIQ_ISATTY()) {
+                std::string addr;
+                std::cout << "Enter P2PKH Base58 address to mine to (leave empty to cancel): ";
+                std::getline(std::cin, addr);
+                trim_inplace(addr);
+                if (!addr.empty()) {
+                    uint8_t ver=0; std::vector<uint8_t> payload;
+                    if (base58check_decode(addr, ver, payload) && ver==VERSION_P2PKH && payload.size()==20) {
+                        mine_pkh = payload;
+                    } else {
+                        log_error("Invalid mining address; built-in miner disabled.");
+                    }
+                } else {
+                    log_info("No address entered; built-in miner disabled.");
+                }
+            } else {
+                log_info("No TTY available; built-in miner disabled.");
+            }
+
+            if (!mine_pkh.empty()) {
+                P2P* p2p_ptr = cfg.no_p2p ? nullptr : &p2p;
+                std::thread th(miner_worker, &chain, &mempool, p2p_ptr, mine_pkh, threads);
+                th.detach();
+                log_info("Built-in miner started with " + std::to_string(threads) + " thread(s).");
+            }
+        } else {
+            log_info("Miner not started (run external miner or use --mine to opt in).");
         }
 
-        log_info(std::string(CHAIN_NAME) + " core running. RPC " + std::to_string(RPC_PORT) +
+        log_info(std::string(CHAIN_NAME) + " node running. RPC " + std::to_string(RPC_PORT) +
                  ", P2P " + std::to_string(P2P_PORT));
 
         // Wait loop, responsive to shutdown signals
@@ -813,10 +651,6 @@ int main(int argc, char** argv){
         log_info("Shutdown requested — stopping services...");
         try { rpc.stop(); } catch(...) {}
         try { p2p.stop(); } catch(...) {}
-        // stop TLS proxy by destroying it (if applicable)
-        try { /* if running */ } catch(...) {}
-        { /* explicit reset via RAII on scope exit */ }
-
         log_info("Shutdown complete.");
         return 0;
 
