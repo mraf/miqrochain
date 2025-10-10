@@ -15,11 +15,13 @@
 #include "base58check.h"
 #include "hash160.h"
 #include "utxo.h"          // UTXOEntry & list_for_pkh
+#include "block.h"         // Block, deser_block
 
 #include <sstream>
 #include <array>
 #include <string_view>
 #include <map>
+#include <set>
 #include <exception>
 #include <chrono>
 #include <algorithm>
@@ -448,7 +450,7 @@ std::string RpcService::handle(const std::string& body){
                 "getblock","getblockhash","getcoinbaserecipient",
                 "getrawmempool","gettxout",
                 "validateaddress","decodeaddress","decoderawtx",
-                "getminerstats","sendrawtransaction","sendtoaddress",
+                "getminerstats","getminertemplate","submitblock","sendrawtransaction","sendtoaddress",
                 "estimatemediantime","getdifficulty","getchaintips",
                 "getpeerinfo","getconnectioncount",
                 "createhdwallet","restorehdwallet","walletinfo","getnewaddress","deriveaddressat",
@@ -797,6 +799,105 @@ std::string RpcService::handle(const std::string& body){
             JNode jt; jt.v = (double)total;          o["total"]   = jt;
 
             JNode out; out.v = o; return json_dump(out);
+        }
+
+        // ---------------- miner template (fee-aware, with deps) ----------------
+        if (method=="getminertemplate") {
+            auto tip = chain_.tip();
+
+            std::map<std::string,JNode> o;
+            o["height"]         = jnum((double)(tip.height + 1));
+            o["prev_hash"]      = jstr(to_hex(tip.hash));
+            o["bits"]           = jnum((double)tip.bits);
+            o["time"]           = jnum((double)std::max<int64_t>((int64_t)time(nullptr), tip.time + 1));
+            o["max_block_bytes"]= jnum((double)(900*1024));
+
+            // Pull mempool
+            std::vector<Transaction> pool = mempool_.collect(100000);
+
+            // Map: txidhex -> tx
+            std::map<std::string, Transaction> mapTx;
+            mapTx.clear();
+            mapTx.insert(mapTx.end(), {}); // no-op to silence empty-base warnings in some compilers
+            for (const auto& t : pool) {
+                mapTx[to_hex(t.txid())] = t;
+            }
+            std::set<std::string> ids;
+            for (const auto& kv : mapTx) ids.insert(kv.first);
+
+            // Helper to read prevout value from UTXO or in-pool parent
+            auto prev_value = [&](const OutPoint& p)->uint64_t {
+                std::string pid = to_hex(p.txid);
+                auto itp = mapTx.find(pid);
+                if (itp != mapTx.end()) {
+                    if (p.vout < itp->second.vout.size())
+                        return itp->second.vout[p.vout].value;
+                }
+                UTXOEntry e;
+                if (chain_.utxo().get(p.txid, p.vout, e)) return e.value;
+                return 0;
+            };
+
+            // Emit tx array
+            std::vector<JNode> arr;
+            arr.reserve(pool.size());
+            for (const auto& t : pool) {
+                const std::string id = to_hex(t.txid());
+
+                // fee = sum(prevout) - sum(outputs)
+                uint64_t in_sum = 0, out_sum = 0;
+                for (const auto& in : t.vin) in_sum += prev_value(in.prev);
+                for (const auto& o2 : t.vout) out_sum += o2.value;
+                uint64_t fee = (in_sum > out_sum) ? (in_sum - out_sum) : 0;
+
+                // deps = parents that are also in pool
+                std::vector<JNode> deps;
+                {
+                    std::set<std::string> seen;
+                    for (const auto& in : t.vin) {
+                        std::string pid = to_hex(in.prev.txid);
+                        if (ids.count(pid) && !seen.count(pid)) {
+                            deps.push_back(jstr(pid));
+                            seen.insert(pid);
+                        }
+                    }
+                }
+
+                std::map<std::string,JNode> one;
+                one["id"]   = jstr(id);
+                one["hex"]  = jstr(to_hex(ser_tx(t)));
+                one["fee"]  = jnum((double)fee);
+                JNode dArr; dArr.v = deps; one["depends"] = dArr;
+
+                JNode obj; obj.v = one;
+                arr.push_back(obj);
+            }
+
+            JNode txs; txs.v = arr;
+            o["txs"] = txs;
+
+            JNode out; out.v = o; return json_dump(out);
+        }
+
+        // ---------------- submit mined block ----------------
+        if (method=="submitblock") {
+            if (params.size()<1 || !std::holds_alternative<std::string>(params[0].v))
+                return err("need block hex");
+
+            std::vector<uint8_t> raw;
+            try { raw = from_hex(std::get<std::string>(params[0].v)); }
+            catch(...) { return err("bad hex"); }
+
+            Block b;
+            if (!deser_block(raw, b)) return err("bad block");
+
+            std::string e;
+            if (chain_.submit_block(b, e)) {
+                // success; no "error" field → miner treats as OK
+                return "\"ok\"";
+            } else {
+                return err(e.empty() ? "rejected" : e);
+            }
         }
 
         // ---------------- address UTXO lookup (for mobile/GUI) ----------------
