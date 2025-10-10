@@ -1,6 +1,17 @@
 // miqminer_rpc.cpp — mainnet-grade solo miner (JSON-RPC), fee-aware, non-empty blocks
-// Builds coinbase = subsidy(height) + sum(selected fees), packs mempool txs
-// Requires node RPC 'getminertemplate' as described below.
+// Shows live chain/tip/last-block details + who got paid (coinbase recipient).
+// Requires node RPCs: getminertemplate, gettipinfo, getblock, getcoinbaserecipient, getblockcount, getblockhash
+//
+// Build (GCC/Clang):
+//   g++ -std=c++17 -O3 -DNDEBUG -march=native -mtune=native -fno-exceptions -fno-rtti miqminer_rpc.cpp -o miqminer_rpc
+//
+// Build (MSVC Developer Prompt):
+//   cl /std:c++17 /O2 /GL /DNDEBUG miqminer_rpc.cpp ws2_32.lib
+//
+// Runtime:
+//   ./miqminer_rpc --threads=8 --rpc=127.0.0.1:8332
+//   (token auto-loaded from MIQ_RPC_TOKEN or datadir .cookie; you can also pass --token=...)
+//
 
 #include "constants.h"
 #include "block.h"
@@ -69,20 +80,20 @@ static inline void trim(std::string& s){
 
 static std::string default_cookie_path(){
 #ifdef _WIN32
-    // %APPDATA%\miqrochain\.cookie
+    // %APPDATA%\Miqrochain\.cookie
     char* v=nullptr; size_t len=0;
     if (_dupenv_s(&v,&len,"APPDATA")==0 && v && len){
         std::string p(v); free(v);
-        return p + "\\miqrochain\\.cookie";
+        return p + "\\Miqrochain\\.cookie";
     }
-    return "C:\\miqrochain-data\\.cookie";
+    return "C:\\Miqrochain\\.cookie";
 #elif defined(__APPLE__)
     const char* home = std::getenv("HOME");
-    if(home && *home) return std::string(home) + "/Library/Application Support/miqrochain/.cookie";
+    if(home && *home) return std::string(home) + "/Library/Application Support/Miqrochain/.cookie";
     return "./.cookie";
 #else
     const char* xdg = std::getenv("XDG_DATA_HOME");
-    if (xdg && *xdg) return std::string(xdg) + "/miqrochain/.cookie";
+    if (xdg && *xdg) return std::string(xdg) + "/Miqrochain/.cookie";
     const char* home = std::getenv("HOME");
     if(home && *home) return std::string(home) + "/.miqrochain/.cookie";
     return "./.cookie";
@@ -150,7 +161,12 @@ static bool http_post(const std::string& host, uint16_t port,
     // resolve
     addrinfo hints{}; hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_STREAM;
     addrinfo* res=nullptr; char ps[16]; std::snprintf(ps,sizeof(ps), "%u", (unsigned)port);
-    if(getaddrinfo(host.c_str(), ps, &hints, &res)!=0) { return false; }
+    if(getaddrinfo(host.c_str(), ps, &hints, &res)!=0) {
+#if defined(_WIN32)
+        WSACleanup();
+#endif
+        return false;
+    }
 
     socket_t s = (socket_t)(~(socket_t)0);
     for(addrinfo* ai=res; ai; ai=ai->ai_next){
@@ -170,7 +186,7 @@ static bool http_post(const std::string& host, uint16_t port,
     }
     freeaddrinfo(res);
 #if defined(_WIN32)
-    if(s==INVALID_SOCKET) return false;
+    if(s==INVALID_SOCKET){ WSACleanup(); return false; }
 #else
     if(s<0) return false;
 #endif
@@ -180,7 +196,8 @@ static bool http_post(const std::string& host, uint16_t port,
         << "Host: " << host << "\r\n"
         << "Content-Type: application/json\r\n"
         << "Content-Length: " << json.size() << "\r\n";
-    if(!auth_header.empty()) req << "Authorization: " << auth_header << "\r\n";
+    if(!auth_header.empty()) req << "X-Auth-Token: " << auth_header << "\r\n"
+                                 << "Authorization: Bearer " << auth_header << "\r\n";
     req << "Connection: close\r\n\r\n" << json;
 
     std::string data = req.str();
@@ -191,7 +208,11 @@ static bool http_post(const std::string& host, uint16_t port,
 #else
         int n = ::send(s, data.data()+off, (int)(data.size()-off), 0);
 #endif
-        if(n<=0) { miq_closesocket(s); return false; }
+        if(n<=0) { miq_closesocket(s); 
+#if defined(_WIN32)
+            WSACleanup();
+#endif
+            return false; }
         off += (size_t)n;
     }
 
@@ -220,7 +241,7 @@ static bool http_post(const std::string& host, uint16_t port,
     return true;
 }
 
-// Minimal JSON helpers (good enough for our fixed-shaped RPC)
+// Minimal JSON helpers (good enough for fixed-shaped RPC)
 static std::string json_escape(const std::string& s){
     std::ostringstream o; o << '"';
     for(unsigned char c : s){
@@ -244,7 +265,11 @@ static std::string rpc_build(const std::string& method, const std::string& param
     return o.str();
 }
 static bool json_has_error(const std::string& json){
-    return json.find("\"error\"") != std::string::npos && json.find("\"result\"")==std::string::npos;
+    // Very light check for error field without result
+    size_t e = json.find("\"error\"");
+    if(e==std::string::npos) return false;
+    size_t r = json.find("\"result\"");
+    return (r==std::string::npos) || (e < r);
 }
 static bool json_find_string(const std::string& json, const std::string& key, std::string& out){
     std::string pat = "\"" + key + "\":";
@@ -254,8 +279,13 @@ static bool json_find_string(const std::string& json, const std::string& key, st
     while(p<json.size() && std::isspace((unsigned char)json[p])) ++p;
     if(p>=json.size() || json[p]!='"') return false;
     ++p;
-    size_t q = json.find('"', p);
-    if(q==std::string::npos) return false;
+    size_t q = p;
+    while(q<json.size()){
+        if(json[q]=='\\') { q+=2; continue; }
+        if(json[q]=='"') break;
+        ++q;
+    }
+    if(q==std::string::npos || q<=p) return false;
     out = json.substr(p, q-p);
     return true;
 }
@@ -290,8 +320,7 @@ struct TipInfo { uint64_t height{0}; std::string hash_hex; uint32_t bits{0}; int
 
 static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::string& auth, TipInfo& out){
     HttpResp r;
-    std::string req = rpc_build("gettipinfo", "[]");
-    if(!http_post(host, port, "/", auth, req, r) || r.code != 200) return false;
+    if(!http_post(host, port, "/", auth, rpc_build("gettipinfo", "[]"), r) || r.code != 200) return false;
     if(json_has_error(r.body)) return false;
     long long h=0, b=0, t=0; std::string hh;
     if(!json_find_number(r.body, "height", h)) return false;
@@ -302,22 +331,30 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
     return true;
 }
 
-static bool rpc_submitblock(const std::string& host, uint16_t port, const std::string& auth, const std::string& hexblk){
+static bool rpc_submitblock_try(const std::string& host, uint16_t port, const std::string& auth,
+                                const char* method, const std::string& hexblk)
+{
     std::ostringstream ps; ps << "[\"" << hexblk << "\"]";
     HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build("submitblock", ps.str()), r)) return false;
+    if(!http_post(host, port, "/", auth, rpc_build(method, ps.str()), r)) return false;
     if(r.code != 200) return false;
     return !json_has_error(r.body);
 }
+static bool rpc_submitblock(const std::string& host, uint16_t port, const std::string& auth, const std::string& hexblk){
+    // Try a few common method names
+    if(rpc_submitblock_try(host,port,auth,"submitblock",hexblk)) return true;
+    if(rpc_submitblock_try(host,port,auth,"submitrawblock",hexblk)) return true;
+    if(rpc_submitblock_try(host,port,auth,"sendrawblock",hexblk)) return true;
+    return false;
+}
 
 static bool rpc_getminerstats(const std::string& host, uint16_t port, const std::string& auth, double& out_net_hs){
+    // Prefer direct if node provides (optional)
     HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build("getminerstats","[]"), r) || r.code != 200) return false;
-    if(json_has_error(r.body)) return false;
-    double hs = 0.0;
-    if(!json_find_double(r.body, "network_hash_ps", hs)) return false;
-    out_net_hs = hs;
-    return true;
+    if(http_post(host, port, "/", auth, rpc_build("getminerstats","[]"), r) && r.code==200 && !json_has_error(r.body)){
+        if(json_find_double(r.body, "network_hash_ps", out_net_hs)) return true;
+    }
+    return false;
 }
 
 // ---- miner template ----
@@ -372,7 +409,7 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
 
     // Extract txs array region
     size_t p = r.body.find("\"txs\"");
-    if(p==std::string::npos) return true; // allowed: no txs (empty)
+    if(p==std::string::npos) return true; // allowed: no txs
     p = r.body.find('[', p);
     if(p==std::string::npos) return false;
     size_t q = p; int depth=0; bool ok=false;
@@ -446,6 +483,7 @@ static bool rpc_getblock_header_time(const std::string& host, uint16_t port, con
 
 static double estimate_network_hashps(const std::string& host, uint16_t port, const std::string& auth, uint64_t tip_height, uint32_t bits){
     const int LOOKBACK = 64;
+    if(tip_height <= 1) return 0.0;
     uint64_t start_h = (tip_height > (uint64_t)LOOKBACK) ? (tip_height - LOOKBACK) : 1;
     long long t_first=0, t_last=0;
     std::string hh_first, hh_last;
@@ -489,6 +527,10 @@ static bool parse_p2pkh(const std::string& addr, std::vector<uint8_t>& out_pkh){
     return true;
 }
 
+static std::string pkh_to_address(const std::vector<uint8_t>& pkh){
+    return miq::base58check_encode(miq::VERSION_P2PKH, pkh);
+}
+
 static Transaction make_coinbase(uint64_t height, uint64_t fees, const std::vector<uint8_t>& pkh){
     Transaction cbt;
     // vin: null prev
@@ -520,10 +562,49 @@ static std::vector<uint8_t> merkle_from(const std::vector<Transaction>& txs){
     return miq::merkle_root(ids);
 }
 
+// === extra RPCs for last-block detail ========================================
+
+struct LastBlockInfo {
+    uint64_t height{0};
+    std::string hash_hex;
+    uint64_t txs{0};
+    std::string coinbase_txid_hex;
+    std::vector<uint8_t> coinbase_pkh;
+    uint64_t reward_value{0};
+};
+
+static bool rpc_getblock_overview(const std::string& host, uint16_t port, const std::string& auth,
+                                  uint64_t height, LastBlockInfo& out)
+{
+    std::ostringstream ps; ps<<"["<<height<<"]";
+    HttpResp r;
+    if(!http_post(host, port, "/", auth, rpc_build("getblock", ps.str()), r) || r.code!=200) return false;
+    if(json_has_error(r.body)) return false;
+    std::string hh; long long txs=0;
+    if(!json_find_string(r.body, "hash", hh)) return false;
+    if(!json_find_number(r.body, "txs", txs)) return false;
+    out.height = height; out.hash_hex = hh; out.txs = (uint64_t)txs;
+    return true;
+}
+
+static bool rpc_getcoinbaserecipient(const std::string& host, uint16_t port, const std::string& auth,
+                                     uint64_t height, LastBlockInfo& io)
+{
+    std::ostringstream ps; ps<<"["<<height<<"]";
+    HttpResp r;
+    if(!http_post(host, port, "/", auth, rpc_build("getcoinbaserecipient", ps.str()), r) || r.code!=200) return false;
+    if(json_has_error(r.body)) return false;
+    std::string pkh_hex, txid_hex; long long val=0;
+    if(!json_find_string(r.body, "pkh", pkh_hex)) return false;
+    if(json_find_number(r.body, "value", val)) io.reward_value = (uint64_t)val;
+    if(json_find_string(r.body, "txid", txid_hex)) io.coinbase_txid_hex = txid_hex;
+    io.coinbase_pkh = from_hex_s(pkh_hex);
+    return true;
+}
+
 // === UI (cyan “3D block” + stats) ===========================================
 
 static std::vector<std::string> make_block_art(uint64_t frame){
-    // ASCII-only cube in cyan; rotate 4 frames
     static const char* frames[4][7] = {
       {
         "    _______        ",
@@ -568,16 +649,21 @@ struct UIState {
     std::atomic<uint64_t> last_hash_tries{0};
     std::atomic<uint64_t> mined_blocks{0};
     std::atomic<double>   net_hashps{0.0};
-    std::string last_block_hash;
+    std::string last_found_block_hash;
     std::mutex  mtx;
+
+    // chain/tip/last-block info
+    std::atomic<uint64_t> tip_height{0};
+    std::string tip_hash_hex;
+    std::atomic<uint32_t> tip_bits{0};
+    LastBlockInfo lastblk{};
 };
 
-static void draw_ui_loop(const std::string& addr, unsigned threads,
-                         const TipInfo* tip, MinerTemplate* last_tpl, UIState* ui)
+static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui, const std::atomic<bool>* running)
 {
     using namespace std::chrono;
     uint64_t frame = 0;
-    while(true){
+    while(running->load(std::memory_order_relaxed)){
         uint64_t tries = ui->hash_tries.load();
         uint64_t last  = ui->last_hash_tries.exchange(tries);
         double inst = (double)(tries - last) / 1.0; // ~1s
@@ -589,13 +675,31 @@ static void draw_ui_loop(const std::string& addr, unsigned threads,
         os << "  \x1b[1mMIQ Miner (RPC)\x1b[0m  —  address: " << addr
            << "     threads: " << threads << "\n\n";
 
-        if(tip && last_tpl){
-            os << "  tip height:  " << tip->height << "\n";
-            os << "  mining:      height=" << last_tpl->height
-               << " bits=0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)last_tpl->bits
-               << std::dec << "  prev=" << to_hex_s(last_tpl->prev_hash) << "\n";
+        uint64_t th = ui->tip_height.load();
+        if(th>0){
+            os << "  tip height:  " << th << "\n";
+            os << "  tip hash:    " << ui->tip_hash_hex << "\n";
+            os << "  tip bits:    0x" << std::hex << std::setw(8) << std::setfill('0')
+               << (unsigned)ui->tip_bits.load() << std::dec << "\n";
         } else {
             os << "  (waiting for template)\n";
+        }
+
+        // Last network block (who mined it)
+        if(ui->lastblk.height){
+            const auto& lb = ui->lastblk;
+            os << "\n";
+            os << "  last block:  height=" << lb.height
+               << "  hash=" << lb.hash_hex
+               << "  txs=" << lb.txs << "\n";
+            if(!lb.coinbase_txid_hex.empty()){
+                os << "               coinbase_txid=" << lb.coinbase_txid_hex << "\n";
+            }
+            if(!lb.coinbase_pkh.empty()){
+                std::string addrR = pkh_to_address(lb.coinbase_pkh);
+                os << "               paid to: " << addrR
+                   << "  (pkh=" << to_hex_s(lb.coinbase_pkh) << ")\n";
+            }
         }
 
         auto fmt_hs = [](double v)->std::string{
@@ -607,8 +711,8 @@ static void draw_ui_loop(const std::string& addr, unsigned threads,
         os << "  local hashrate:   " << fmt_hs(inst) << "\n";
         os << "  network hashrate: " << fmt_hs(net)  << "\n";
         os << "  mined (session):  " << mined << "\n";
-        if(!ui->last_block_hash.empty()){
-            os << "  last block:       " << ui->last_block_hash << "\n";
+        if(!ui->last_found_block_hash.empty()){
+            os << "  last found:       " << ui->last_found_block_hash << "\n";
         }
 
         // Cyan 3D block on the right
@@ -645,7 +749,7 @@ static void nonce_worker(const BlockHeader hdr_base,
         tries->fetch_add(1, std::memory_order_relaxed);
         if(meets_target_be(h, bits)){
             *out_block = b;
-            found->store(true);
+            found->store(true, std::memory_order_relaxed);
             return;
         }
         nonce += stride;
@@ -733,9 +837,9 @@ static bool topo_pack_and_sum_fees(const MinerTemplate& tpl,
 static void usage(){
     std::cout <<
     "miqminer_rpc — Solo miner for MIQ (JSON-RPC, fee-aware, non-empty blocks)\n"
-    "Usage: miqminer_rpc [--rpc=host:port] [--token=<Bearer>] [--threads=N]\n"
+    "Usage: miqminer_rpc [--rpc=host:port] [--token=<TOKEN>] [--threads=N]\n"
     "Notes:\n"
-    "  * Node must be running. Auth token is taken from MIQ_RPC_TOKEN or datadir/.cookie\n"
+    "  * Node must be running. Auth token is taken from --token, MIQ_RPC_TOKEN, or datadir/.cookie\n"
     "  * Miner will prompt for a P2PKH Base58 address to receive rewards.\n";
 }
 
@@ -750,7 +854,7 @@ int main(int argc, char** argv){
 #endif
         std::string rpc_host = "127.0.0.1";
         uint16_t    rpc_port = (uint16_t)miq::RPC_PORT;
-        std::string token; // Bearer token
+        std::string token; // raw token (we’ll send in both X-Auth-Token and Bearer for compatibility)
         unsigned threads = std::max(1u, std::thread::hardware_concurrency());
 
         for(int i=1;i<argc;i++){
@@ -780,8 +884,6 @@ int main(int argc, char** argv){
                 if(read_all_file(default_cookie_path(), cookie)) token = cookie;
             }
         }
-        std::string auth_header;
-        if(!token.empty()) auth_header = std::string("Bearer ") + token;
 
         // Prompt for mining address
         std::string addr;
@@ -796,41 +898,53 @@ int main(int argc, char** argv){
 
         // UI + miner state
         UIState ui;
-        TipInfo last_tip{};
-        MinerTemplate last_tpl{};
-        std::atomic<bool> have_tpl{false};
+        std::atomic<bool> running{true};
 
         // UI thread
-        std::thread ui_th([&](){ draw_ui_loop(addr, threads, have_tpl.load()?&last_tip:nullptr, have_tpl.load()?&last_tpl:nullptr, &ui); });
+        std::thread ui_th([&](){ draw_ui_loop(addr, threads, &ui, &running); });
         ui_th.detach();
 
-        // Net hash updater thread (every ~5s)
-        std::thread nh_th([&](){
-            while(true){
+        // Chain watcher: refresh tip + last block details + net hashrate
+        std::thread chain_watch([&](){
+            uint64_t last_seen_h = 0;
+            while(running.load()){
                 TipInfo t;
-                if(rpc_gettipinfo(rpc_host, rpc_port, auth_header, t)){
+                if(rpc_gettipinfo(rpc_host, rpc_port, token, t)){
+                    ui.tip_height.store(t.height);
+                    ui.tip_hash_hex = t.hash_hex;
+                    ui.tip_bits.store(t.bits);
+
+                    // network hashrate: direct or estimate fallback
                     double hs = 0.0;
-                    if(!rpc_getminerstats(rpc_host, rpc_port, auth_header, hs)){
-                        hs = estimate_network_hashps(rpc_host, rpc_port, auth_header, t.height, t.bits);
+                    if(!rpc_getminerstats(rpc_host, rpc_port, token, hs)){
+                        hs = estimate_network_hashps(rpc_host, rpc_port, token, t.height, t.bits);
                     }
                     ui.net_hashps.store(hs);
-                    last_tip = t;
+
+                    // On new height, fetch last block data + coinbase recipient
+                    if(t.height != 0 && t.height != last_seen_h){
+                        LastBlockInfo lb{};
+                        if(rpc_getblock_overview(rpc_host, rpc_port, token, t.height, lb)){
+                            // also coinbase recipient (who got paid)
+                            rpc_getcoinbaserecipient(rpc_host, rpc_port, token, t.height, lb);
+                            ui.lastblk = lb;
+                        }
+                        last_seen_h = t.height;
+                    }
                 }
-                for(int i=0;i<5;i++) miq_sleep_ms(200);
+                for(int i=0;i<10;i++) miq_sleep_ms(100); // ~1s
             }
         });
-        nh_th.detach();
+        chain_watch.detach();
 
         // Mining loop: fetch template → pack → mine → submit → repeat
         while(true){
             MinerTemplate tpl;
-            if(!rpc_getminertemplate(rpc_host, rpc_port, auth_header, tpl)){
+            if(!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)){
                 std::fprintf(stderr, "RPC getminertemplate failed, retrying...\n");
                 miq_sleep_ms(1000);
                 continue;
             }
-            last_tpl = tpl;
-            have_tpl.store(true);
 
             // PACK: topo + size limit
             // First create a dummy coinbase to know its size without fees
@@ -867,12 +981,13 @@ int main(int argc, char** argv){
                                  &found, &tries, tid, threads, &found_block);
             }
 
+            // metering -> UI
             std::thread meter([&](){
-                while(!found.load()){
-                    ui.hash_tries.store(tries.load());
+                while(!found.load(std::memory_order_relaxed)){
+                    ui.hash_tries.store(tries.load(std::memory_order_relaxed));
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                 }
-                ui.hash_tries.store(tries.load());
+                ui.hash_tries.store(tries.load(std::memory_order_relaxed));
             });
             meter.join();
 
@@ -881,12 +996,12 @@ int main(int argc, char** argv){
             // Submit found block
             auto raw = miq::ser_block(found_block);
             std::string hexblk = miq::to_hex(raw);
-            bool ok = rpc_submitblock(rpc_host, rpc_port, auth_header, hexblk);
+            bool ok = rpc_submitblock(rpc_host, rpc_port, token, hexblk);
             if(ok){
                 ui.mined_blocks.fetch_add(1);
-                ui.last_block_hash = miq::to_hex(found_block.block_hash());
+                ui.last_found_block_hash = miq::to_hex(found_block.block_hash());
             } else {
-                std::fprintf(stderr, "submitblock rejected or RPC error\n");
+                std::fprintf(stderr, "submitblock rejected or RPC error (ensure node exposes submitblock/submitrawblock)\n");
             }
         }
 
