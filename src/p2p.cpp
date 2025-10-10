@@ -264,10 +264,6 @@ static std::unordered_map<int, int64_t> g_trickle_last_ms;
 static std::unordered_map<int,
     std::unordered_map<std::string, std::pair<int64_t,uint32_t>>> g_cmd_rl;
 
-// NEW: per-peer simple min-interval throttles (family → last_allow_ms)
-static std::unordered_map<int,
-    std::unordered_map<std::string, int64_t>> g_cmd_last_allow;
-
 // Per-socket parse deadlines for partial frames
 static std::unordered_map<int, int64_t> g_rx_started_ms;
 static inline void rx_track_start(int fd){
@@ -653,42 +649,6 @@ static std::string miq_miner_from_block(const miq::Block& b) {
 
 namespace miq {
 
-// === Simple per-family min-interval rate check ==============================
-// Allow at most `tokens_per_second` events (non-integer supported) by enforcing
-// a minimum interval between allows. Used by existing call sites like
-// check_rate(ps, "get", 1.0, now_ms()) and 0.5/0.25 for inv.
-bool P2P::check_rate(PeerState& ps,
-                     const char* family,
-                     double tokens_per_second,
-                     int64_t now)
-{
-    const char* fam = family ? family : "misc";
-    if (tokens_per_second <= 0.0) tokens_per_second = 1.0;
-
-    // Convert rate to min interval (ms), clamp to [1, INT64_MAX]
-    int64_t min_interval_ms;
-    if (tokens_per_second >= 1000.0) {
-        min_interval_ms = 1;
-    } else {
-        double ms = 1000.0 / tokens_per_second;
-        if (ms < 1.0) ms = 1.0;
-        if (ms > static_cast<double>(INT64_MAX)) ms = static_cast<double>(INT64_MAX);
-        min_interval_ms = static_cast<int64_t>(ms);
-    }
-
-    // Per-peer, per-family last allow timestamp
-    auto& perPeer = g_cmd_last_allow[ps.sock];             // creates on first use
-    int64_t& last_allow = perPeer[std::string(fam)];       // defaults to 0
-
-    if (last_allow == 0 || (now - last_allow) >= min_interval_ms) {
-        last_allow = now;
-        return true;
-    }
-    // gentle nudge on spam; hard drops handled by callers when score trips
-    if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
-    return false;
-}
-
 // === Legacy keyed helper (maps a few commands to families) ==================
 bool P2P::check_rate(PeerState& ps, const char* key) {
     if (!key) return true;
@@ -707,6 +667,7 @@ bool P2P::check_rate(PeerState& ps, const char* key) {
 
     for (const auto& e : kTable) {
         if (std::strcmp(e.key, key) == 0) {
+            // Calls the inline min-interval limiter defined in p2p.h
             return check_rate(ps, e.family, 1.0, now_ms());
         }
     }
@@ -732,6 +693,10 @@ bool P2P::check_rate(PeerState& ps,
     k.append(nam);
 
     const int64_t t = now_ms();
+
+    static_assert(std::is_same<decltype(g_cmd_rl),
+        std::unordered_map<int, std::unordered_map<std::string, std::pair<int64_t,uint32_t>>>>::value,
+        "g_cmd_rl type changed");
 
     auto& perPeer = g_cmd_rl[ps.sock];          // creates on first use
     auto& slot    = perPeer[k];                 // default-initializes to {0,0}
@@ -2014,7 +1979,7 @@ void P2P::loop(){
                         ps.features |= (1ull<<1); // feefilter
 
                         if (ps.version > 0 && ps.version < min_peer_version_) {
-                            log_warn("P2P: dropping old peer " + ps.ip);
+                            log_warn("P2P: dropping old peer " + ps.ip");
                             dead.push_back(s);
                             break;
                         }
