@@ -175,6 +175,8 @@ public:
     bool connect_seed(const std::string& host, uint16_t port);
 
     // Broadcast inventory for a new block/tx we just accepted/mined
+    void announce_block_async(const std::vector<uint8_t>& h);
+    void broadcast_inv_block(const std::vector<uint8_t>& h);
     void announce_block_async(const std::vector<uint8_t>& block_hash);
     void broadcast_inv_block(const std::vector<uint8_t>& block_hash);
     void broadcast_inv_tx(const std::vector<uint8_t>& txid);
@@ -238,6 +240,7 @@ private:
     void send_tx(int sock, const std::vector<uint8_t>& raw);
 
     // Small, bounded caches (in-memory)
+    mutable std::mutex announce_mu_;
     std::mutex announce_mu_;
     std::vector<std::vector<uint8_t>> announce_blocks_q_;
     std::unordered_set<std::string> seen_txids_;
