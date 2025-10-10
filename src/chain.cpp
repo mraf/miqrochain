@@ -24,6 +24,7 @@
 #include <chrono>          // future-time bound
 #include <cstring>         // std::memcmp, std::memset
 #include <type_traits>     // compile-time detection (SFINAE)
+#include <mutex>           // locking
 
 // --- Optional GCS block filters (guarded; won’t break builds if not present) ---
 #ifndef __has_include
@@ -69,6 +70,9 @@
 #endif
 
 namespace miq {
+
+// Reentrant guard (chain.h uses std::recursive_mutex)
+#define MIQ_CHAIN_GUARD() std::lock_guard<std::recursive_mutex> _lk(mtx_)
 
 struct UndoIn {
     std::vector<uint8_t> prev_txid;
@@ -397,7 +401,14 @@ long double Chain::work_from_bits(uint32_t bits) {
     return difficulty;
 }
 
+Tip Chain::tip() const {
+    MIQ_CHAIN_GUARD();
+    return tip_;
+}
+
 bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
+    MIQ_CHAIN_GUARD();
+
     // Parent must exist in header index (except genesis)
     if (tip_.height == 0 && tip_.hash == std::vector<uint8_t>(32,0)) {
         // before genesis init
@@ -487,16 +498,19 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
 }
 
 bool Chain::header_exists(const std::vector<uint8_t>& h) const {
+    MIQ_CHAIN_GUARD();
     return header_index_.find(hk(h)) != header_index_.end();
 }
 
 std::vector<uint8_t> Chain::best_header_hash() const {
+    MIQ_CHAIN_GUARD();
     if (best_header_key_.empty()) return tip_.hash;
     const auto& m = header_index_.at(best_header_key_);
     return m.hash;
 }
 
 bool Chain::accept_header(const BlockHeader& h, std::string& err) {
+    MIQ_CHAIN_GUARD();
     if (!validate_header(h, err)) return false;
 
     const auto hh = header_hash_of(h);
@@ -536,10 +550,12 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
 }
 
 void Chain::orphan_put(const std::vector<uint8_t>& h, const std::vector<uint8_t>& raw){
+    MIQ_CHAIN_GUARD();
     orphan_blocks_[hk(h)] = raw;
 }
 
 void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, size_t max) const {
+    MIQ_CHAIN_GUARD();
     out.clear();
     if (best_header_key_.empty()) return;
 
@@ -549,7 +565,10 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
 
     for (const auto& hh : down) {
         if (out.size() >= max) break;
-        if (!have_block(hh) && orphan_blocks_.find(hk(hh)) == orphan_blocks_.end()) out.push_back(hh);
+        // Use global orphan cache to avoid requesting blocks we already hold as orphans
+        std::vector<uint8_t> tmp;
+        bool have_orphan = orphan_get(hh, tmp);
+        if (!have_block(hh) && !have_orphan) out.push_back(hh);
     }
 }
 
@@ -557,6 +576,7 @@ bool Chain::find_header_fork(const std::vector<uint8_t>& a,
                              const std::vector<uint8_t>& b,
                              std::vector<std::vector<uint8_t>>& path_up_from_b,
                              std::vector<std::vector<uint8_t>>& path_down_from_a) const {
+    MIQ_CHAIN_GUARD();
     path_up_from_b.clear();
     path_down_from_a.clear();
 
@@ -605,6 +625,7 @@ bool Chain::find_header_fork(const std::vector<uint8_t>& a,
 }
 
 bool Chain::reconsider_best_chain(std::string& err){
+    MIQ_CHAIN_GUARD();
     if (best_header_key_.empty()) return true;
     const auto& best = header_index_.at(best_header_key_);
     if (best.hash == tip_.hash) return true;
@@ -630,6 +651,7 @@ bool Chain::reconsider_best_chain(std::string& err){
 }
 
 bool Chain::get_hash_by_index(size_t idx, std::vector<uint8_t>& out) const{
+    MIQ_CHAIN_GUARD();
     Block b;
     if (!get_block_by_index(idx, b)) return false;
     out = b.block_hash();
@@ -637,6 +659,7 @@ bool Chain::get_hash_by_index(size_t idx, std::vector<uint8_t>& out) const{
 }
 
 void Chain::build_locator(std::vector<std::vector<uint8_t>>& out) const{
+    MIQ_CHAIN_GUARD();
     out.clear();
     if (tip_.time == 0) return;
     uint64_t step = 1;
@@ -656,6 +679,7 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
                                      size_t max,
                                      std::vector<BlockHeader>& out) const
 {
+    MIQ_CHAIN_GUARD();
     out.clear();
     std::unordered_map<std::string, int> lset;
     for (const auto& h : locators) lset[hk(h)] = 1;
@@ -687,6 +711,7 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
 }
 
 bool Chain::read_block_any(const std::vector<uint8_t>& h, Block& out) const{
+    MIQ_CHAIN_GUARD();
     std::vector<uint8_t> raw;
     if (storage_.read_block_by_hash(h, raw)) return deser_block(raw, out);
     if (orphan_get(h, raw)) return deser_block(raw, out);
@@ -694,6 +719,7 @@ bool Chain::read_block_any(const std::vector<uint8_t>& h, Block& out) const{
 }
 
 bool Chain::open(const std::string& dir){
+    MIQ_CHAIN_GUARD();
     bool ok = storage_.open(dir) && utxo_.open(dir);
     if(!ok) return false;
     datadir_ = dir;
@@ -713,6 +739,7 @@ bool Chain::open(const std::string& dir){
 }
 
 bool Chain::accept_block_for_reorg(const Block& b, std::string& err){
+    MIQ_CHAIN_GUARD();
     auto raw = ser_block(b);
     if (raw.size() > MAX_BLOCK_SIZE_LOCAL) { err = "oversize block"; return false; }
     if (have_block(b.block_hash())) return true;
@@ -762,6 +789,7 @@ bool Chain::accept_block_for_reorg(const Block& b, std::string& err){
 }
 
 bool Chain::save_state(){
+    MIQ_CHAIN_GUARD();
     std::vector<uint8_t> b;
     auto P64=[&](uint64_t x){ for(int i=0;i<8;i++) b.push_back((x>>(i*8))&0xff); };
     auto P32=[&](uint32_t x){ for(int i=0;i<4;i++) b.push_back((x>>(i*8))&0xff); };
@@ -776,6 +804,7 @@ bool Chain::save_state(){
 }
 
 bool Chain::load_state(){
+    MIQ_CHAIN_GUARD();
     std::vector<uint8_t> b;
 
     if(!storage_.read_state(b)){
@@ -824,10 +853,12 @@ bool Chain::load_state(){
 }
 
 uint64_t Chain::subsidy_for_height(uint64_t h) const {
+    // pure, no lock needed; but keep consistency
     return GetBlockSubsidy(static_cast<uint32_t>(h));
 }
 
 bool Chain::init_genesis(const Block& g){
+    MIQ_CHAIN_GUARD();
     if(tip_.hash != std::vector<uint8_t>(32,0)) return true;
     g_reorg.init_genesis(tip_.hash, tip_.bits, tip_.time);
 
@@ -866,6 +897,7 @@ bool Chain::init_genesis(const Block& g){
 }
 
 bool Chain::verify_block(const Block& b, std::string& err) const{
+    MIQ_CHAIN_GUARD();
     if(b.header.prev_hash != tip_.hash){ err="bad prev hash"; return false; }
 
     // MTP
@@ -1087,6 +1119,7 @@ static bool utxo_apply_ops(DB& db, const std::vector<UtxoOp>& ops, std::string& 
 // -----------------------------------------------------------------------
 
 bool Chain::disconnect_tip_once(std::string& err){
+    MIQ_CHAIN_GUARD();
     if (tip_.height == 0) { err = "cannot disconnect genesis"; return false; }
 
     Block cur;
@@ -1166,6 +1199,7 @@ bool Chain::disconnect_tip_once(std::string& err){
 }
 
 bool Chain::submit_block(const Block& b, std::string& err){
+    MIQ_CHAIN_GUARD();
     if (!verify_block(b, err)) return false;
 
     if (have_block(b.block_hash())) return true;
@@ -1280,6 +1314,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
 }
 
 std::vector<std::pair<int64_t,uint32_t>> Chain::last_headers(size_t n) const{
+    MIQ_CHAIN_GUARD();
     std::vector<std::pair<int64_t,uint32_t>> v;
     if (tip_.time == 0) return v;
 
@@ -1295,18 +1330,21 @@ std::vector<std::pair<int64_t,uint32_t>> Chain::last_headers(size_t n) const{
 }
 
 bool Chain::get_block_by_index(size_t idx, Block& out) const{
+    MIQ_CHAIN_GUARD();
     std::vector<uint8_t> raw;
     if(!storage_.read_block_by_index(idx, raw)) return false;
     return deser_block(raw, out);
 }
 
 bool Chain::get_block_by_hash(const std::vector<uint8_t>& h, Block& out) const{
+    MIQ_CHAIN_GUARD();
     std::vector<uint8_t> raw;
     if(!storage_.read_block_by_hash(h, raw)) return false;
     return deser_block(raw, out);
 }
 
 bool Chain::have_block(const std::vector<uint8_t>& h) const{
+    MIQ_CHAIN_GUARD();
     std::vector<uint8_t> raw;
     return storage_.read_block_by_hash(h, raw);
 }
