@@ -23,6 +23,7 @@
 #include <random>
 #include <cstdlib>  // getenv
 #include <mutex>
+#include <type_traits>
 
 #ifndef _WIN32
 #include <signal.h>
@@ -1979,12 +1980,12 @@ void P2P::loop(){
                         ps.features |= (1ull<<1); // feefilter
 
                         if (ps.version > 0 && ps.version < min_peer_version_) {
-                            log_warn("P2P: dropping old peer " + ps.ip");
+                            log_warn(std::string("P2P: dropping old peer ") + ps.ip);
                             dead.push_back(s);
                             break;
                         }
                         if ((ps.features & required_features_mask_) != required_features_mask_) {
-                            log_warn("P2P: dropping peer missing required features " + ps.ip);
+                            log_warn(std::string("P2P: dropping peer missing required features ") + ps.ip);
                             dead.push_back(s);
                             break;
                         }
