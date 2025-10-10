@@ -84,7 +84,7 @@ public:
 
 private:
     // ---- State ----
-    mutable std::mutex mtx_;  // NEW: guards all members below
+    mutable std::recursive_mutex mtx_;  // NEW: guards all members below
 
     Storage     storage_;
     std::string datadir_;
