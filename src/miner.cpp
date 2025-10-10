@@ -493,9 +493,7 @@ void Miner::run(){
         // Broadcast to peers as soon as the block is accepted locally.
         if (p2p_) {
             const auto bh = b.block_hash();
-            p2p_->broadcast_inv_block(bh);
-            // If you exposed announce_block_async in p2p.h, you can also queue it:
-            // p2p_->announce_block_async(bh);
+            p2p_->announce_block_async(bh);
         }
 
         log_info("miner: mined and accepted a block");
