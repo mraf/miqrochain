@@ -819,7 +819,7 @@ void P2P::save_bans(){
 
 // === start/stop now also load/save peers files ===============================
 bool P2P::start(uint16_t port){
-    if running_ = true;
+      running_ = true;
       th_ = std::thread([this]{
         for(;;){
             try {
