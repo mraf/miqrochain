@@ -294,7 +294,7 @@ if(WIN32)
   target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
 
-# ---------------- Miner app (new, stand-alone) ----------------
+# ---------------- Miner app (stand-alone) ----------------
 # Auto-detect the app source file so you can place it where you like.
 set(MIQ_MINER_SRC "")
 foreach(cand IN ITEMS
@@ -321,6 +321,32 @@ if(MIQ_MINER_SRC)
   message(STATUS "Building miner app from ${MIQ_MINER_SRC}")
 else()
   message(STATUS "Miner app source not found. Put it at src/tools/miqminer.cpp (or one of the probed paths) to build miqminer.")
+endif()
+
+# ---------------- Miner RPC app (talks to node RPC) ----------------
+set(MIQ_MINER_RPC_SRC "")
+foreach(cand IN ITEMS
+        src/cli/miqminer_rpc.cpp
+        src/tools/miqminer_rpc.cpp
+        src/miqminer_rpc.cpp)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${cand}")
+    set(MIQ_MINER_RPC_SRC "${cand}")
+    break()
+  endif()
+endforeach()
+
+if(MIQ_MINER_RPC_SRC)
+  add_executable(miqminer_rpc ${MIQ_MINER_RPC_SRC})
+  target_include_directories(miqminer_rpc PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(miqminer_rpc PRIVATE miqcore)
+  if(WIN32)
+    target_link_libraries(miqminer_rpc PRIVATE ws2_32 bcrypt)
+    target_compile_definitions(miqminer_rpc PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  set_target_properties(miqminer_rpc PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
+  message(STATUS "Building miner RPC app from ${MIQ_MINER_RPC_SRC}")
+else()
+  message(STATUS "RPC miner source not found (src/cli/miqminer_rpc.cpp or similar). Skipping miqminer_rpc.")
 endif()
 
 # ---------------- Tests (optional) ----------------
