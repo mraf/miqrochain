@@ -15,13 +15,11 @@
 #include "base58check.h"
 #include "hash160.h"
 #include "utxo.h"          // UTXOEntry & list_for_pkh
-#include "block.h"         // Block, deser_block
 
 #include <sstream>
 #include <array>
 #include <string_view>
 #include <map>
-#include <set>
 #include <exception>
 #include <chrono>
 #include <algorithm>
@@ -374,23 +372,33 @@ namespace {
 }
 
 void RpcService::start(uint16_t port){
-    // 1) Detect datadir and ensure RPC cookie/token is ready BEFORE HTTP starts,
-    //    so http.cpp will immediately see MIQ_RPC_TOKEN.
-    {
-        std::string ddir = detect_datadir_for_cookie();
-        if(ddir.empty()){
+    // Ensure an auth token is available for the HTTP layer *without* clobbering
+    // an existing one that main() may have already configured.
+    const char* env_tok = std::getenv("MIQ_RPC_TOKEN");
+    std::string tok = (env_tok && *env_tok) ? std::string(env_tok) : std::string();
+
+    // Preferred cookie location for external tools (wallet/CLI/miner)
+    std::string ddir = detect_datadir_for_cookie();
+    if (ddir.empty()) {
 #ifdef _WIN32
-            ddir = ".";
+        ddir = ".";
 #else
-            ddir = ".";
+        ddir = ".";
 #endif
-        }
-        // best-effort ensure dir exists (important for first run)
-        ensure_dir_exists_simple(ddir);
+    }
+    ensure_dir_exists_simple(ddir);
+    const std::string cookiep = join_path(ddir, ".cookie");
+
+    if (tok.empty()) {
+        // No token set yet — create a cookie+token at the standard location.
         rpc_enable_auth_cookie(ddir);
+    } else {
+        // A token is already active (set by main or environment). Mirror it into
+        // the standard cookie path so external clients can pick it up.
+        write_cookie_file_secure(cookiep, tok);
     }
 
-    // 2) Start HTTP server; Authorization/X-Auth-Token is validated there.
+    // Start HTTP server; Authorization/X-Auth-Token is validated there.
     http_.start(
         port,
         [this](const std::string& b,
@@ -450,12 +458,13 @@ std::string RpcService::handle(const std::string& body){
                 "getblock","getblockhash","getcoinbaserecipient",
                 "getrawmempool","gettxout",
                 "validateaddress","decodeaddress","decoderawtx",
-                "getminerstats","getminertemplate","submitblock","sendrawtransaction","sendtoaddress",
+                "getminerstats","sendrawtransaction","sendtoaddress",
                 "estimatemediantime","getdifficulty","getchaintips",
                 "getpeerinfo","getconnectioncount",
                 "createhdwallet","restorehdwallet","walletinfo","getnewaddress","deriveaddressat",
                 "walletunlock","walletlock","getwalletinfo","listaddresses","listutxos",
-                "sendfromhd","getaddressutxos","getbalance"
+                "sendfromhd","getaddressutxos","getbalance",
+                "getminertemplate" // added to help list
                 // (getibdinfo exists but not listed here to keep help stable)
             };
             std::vector<JNode> v;
@@ -666,6 +675,118 @@ std::string RpcService::handle(const std::string& body){
             JNode out; out.v = o; return json_dump(out);
         }
 
+        // ---------- MINER TEMPLATE (for external miners) ----------
+        if (method == "getminertemplate") {
+            // Return a compact template: prev hash, bits, time, height,
+            // coinbase_pkh (recommended pkh to receive fees), and a transaction list.
+            // Transactions are presented as raw hex with fee and dependency hints.
+            auto tip = chain_.tip();
+
+            // Choose coinbase receiver: for now we don't have a node-owned address
+            // so just return zeros; miners can override.
+            std::vector<uint8_t> pkh(20, 0);
+
+            // Collect mempool txs with simple fee & size estimates.
+            auto txs_vec = mempool_.collect(5000);
+            std::vector<JNode> arr;
+
+            // Build a quick index from txid -> (fee, vsize, raw, depends[])
+            std::map<std::string, std::tuple<uint64_t, uint32_t, std::string, std::vector<std::string>>> mapTx;
+            std::map<std::string, std::vector<std::string>> mapDeps;
+
+            for (const auto& tx : txs_vec) {
+                auto raw = ser_tx(tx);
+                uint32_t vsize = (uint32_t)raw.size();
+                uint64_t in_sum = 0, out_sum = 0;
+
+                // Sum in/out (best-effort using UTXO view; if missing, fee=0)
+                for (const auto& in : tx.vin) {
+                    UTXOEntry e;
+                    if (chain_.utxo().get(in.prev.txid, in.prev.vout, e)) {
+                        in_sum += e.value;
+                        // dependency edge
+                        mapDeps[to_hex(tx.txid())].push_back(to_hex(in.prev.txid));
+                    }
+                }
+                for (const auto& o : tx.vout) out_sum += o.value;
+                uint64_t fee = (in_sum > out_sum) ? (in_sum - out_sum) : 0;
+
+                // Store
+                mapTx[to_hex(tx.txid())] = std::make_tuple(fee, vsize, to_hex(raw), std::vector<std::string>{});
+            }
+
+            // Transfer to JSON
+            for (auto& kv : mapTx) {
+                const std::string& txid = kv.first;
+                auto& tup = kv.second;
+                auto itd = mapDeps.find(txid);
+                if (itd != mapDeps.end()) {
+                    std::get<3>(tup) = itd->second;
+                }
+                std::map<std::string, JNode> o;
+                o["txid"]   = jstr(txid);
+                o["fee"]    = jnum((double)std::get<0>(tup));
+                o["vsize"]  = jnum((double)std::get<1>(tup));
+                o["raw"]    = jstr(std::get<2>(tup));
+                // depends[]
+                std::vector<JNode> d; for (auto& dep : std::get<3>(tup)) d.push_back(jstr(dep));
+                JNode dd; dd.v = d; o["depends"] = dd;
+                JNode x; x.v = o; arr.push_back(x);
+            }
+
+            // Optionally adjust bits using epoch algorithm
+            uint32_t next_bits = tip.bits;
+            try {
+                auto last = chain_.last_headers(MIQ_RETARGET_INTERVAL);
+                next_bits = miq::epoch_next_bits(
+                    last,
+                    BLOCK_TIME_SECS,
+                    GENESIS_BITS,
+                    /*next_height=*/ tip.height + 1,
+                    /*interval=*/ MIQ_RETARGET_INTERVAL
+                );
+            } catch(...) {}
+
+            std::map<std::string, JNode> o;
+            o["version"]      = jnum(1.0);
+            o["prev_hash"]    = jstr(to_hex(tip.hash));
+            o["bits"]         = jnum((double)tip.bits);
+            o["time"]         = jnum((double)std::max<int64_t>((int64_t)time(nullptr), tip.time + 1));
+            o["height"]       = jnum((double)(tip.height + 1));
+            o["coinbase_pkh"] = jstr(to_hex(pkh));
+
+            // Big-endian target for pretty display
+            uint8_t target_be[32]; std::memset(target_be, 0, 32);
+            {
+                const uint32_t exp  = tip.bits >> 24;
+                const uint32_t mant = tip.bits & 0x007fffff;
+                if (mant) {
+                    if (exp <= 3) {
+                        uint32_t mant2 = mant >> (8 * (3 - exp));
+                        target_be[29] = uint8_t((mant2 >> 16) & 0xff);
+                        target_be[30] = uint8_t((mant2 >>  8) & 0xff);
+                        target_be[31] = uint8_t((mant2 >>  0) & 0xff);
+                    } else {
+                        int pos = int(32) - int(exp);
+                        if (pos < 0) { target_be[0]=target_be[1]=target_be[2]=0xff; }
+                        else {
+                            if (pos > 29) pos = 29;
+                            target_be[pos+0] = uint8_t((mant >> 16) & 0xff);
+                            target_be[pos+1] = uint8_t((mant >>  8) & 0xff);
+                            target_be[pos+2] = uint8_t((mant >>  0) & 0xff);
+                        }
+                    }
+                }
+            }
+            o["target_be_hex"] = jstr(to_hex(std::vector<uint8_t>(target_be, target_be+32)));
+
+            // txs array
+            JNode A; A.v = arr; o["txs"] = A;
+            o["adjusted_bits"] = jnum((double)next_bits);
+
+            JNode out; out.v = o; return json_dump(out);
+        }
+
         if(method=="decodeaddress"){
             if(params.size()<1 || !std::holds_alternative<std::string>(params[0].v))
                 return err("need address");
@@ -801,105 +922,6 @@ std::string RpcService::handle(const std::string& body){
             JNode out; out.v = o; return json_dump(out);
         }
 
-        // ---------------- miner template (fee-aware, with deps) ----------------
-        if (method=="getminertemplate") {
-            auto tip = chain_.tip();
-
-            std::map<std::string,JNode> o;
-            o["height"]         = jnum((double)(tip.height + 1));
-            o["prev_hash"]      = jstr(to_hex(tip.hash));
-            o["bits"]           = jnum((double)tip.bits);
-            o["time"]           = jnum((double)std::max<int64_t>((int64_t)time(nullptr), tip.time + 1));
-            o["max_block_bytes"]= jnum((double)(900*1024));
-
-            // Pull mempool
-            std::vector<Transaction> pool = mempool_.collect(100000);
-
-            // Map: txidhex -> tx
-            std::map<std::string, Transaction> mapTx;
-            mapTx.clear();
-            mapTx.insert(mapTx.end(), {}); // no-op to silence empty-base warnings in some compilers
-            for (const auto& t : pool) {
-                mapTx[to_hex(t.txid())] = t;
-            }
-            std::set<std::string> ids;
-            for (const auto& kv : mapTx) ids.insert(kv.first);
-
-            // Helper to read prevout value from UTXO or in-pool parent
-            auto prev_value = [&](const OutPoint& p)->uint64_t {
-                std::string pid = to_hex(p.txid);
-                auto itp = mapTx.find(pid);
-                if (itp != mapTx.end()) {
-                    if (p.vout < itp->second.vout.size())
-                        return itp->second.vout[p.vout].value;
-                }
-                UTXOEntry e;
-                if (chain_.utxo().get(p.txid, p.vout, e)) return e.value;
-                return 0;
-            };
-
-            // Emit tx array
-            std::vector<JNode> arr;
-            arr.reserve(pool.size());
-            for (const auto& t : pool) {
-                const std::string id = to_hex(t.txid());
-
-                // fee = sum(prevout) - sum(outputs)
-                uint64_t in_sum = 0, out_sum = 0;
-                for (const auto& in : t.vin) in_sum += prev_value(in.prev);
-                for (const auto& o2 : t.vout) out_sum += o2.value;
-                uint64_t fee = (in_sum > out_sum) ? (in_sum - out_sum) : 0;
-
-                // deps = parents that are also in pool
-                std::vector<JNode> deps;
-                {
-                    std::set<std::string> seen;
-                    for (const auto& in : t.vin) {
-                        std::string pid = to_hex(in.prev.txid);
-                        if (ids.count(pid) && !seen.count(pid)) {
-                            deps.push_back(jstr(pid));
-                            seen.insert(pid);
-                        }
-                    }
-                }
-
-                std::map<std::string,JNode> one;
-                one["id"]   = jstr(id);
-                one["hex"]  = jstr(to_hex(ser_tx(t)));
-                one["fee"]  = jnum((double)fee);
-                JNode dArr; dArr.v = deps; one["depends"] = dArr;
-
-                JNode obj; obj.v = one;
-                arr.push_back(obj);
-            }
-
-            JNode txs; txs.v = arr;
-            o["txs"] = txs;
-
-            JNode out; out.v = o; return json_dump(out);
-        }
-
-        // ---------------- submit mined block ----------------
-        if (method=="submitblock") {
-            if (params.size()<1 || !std::holds_alternative<std::string>(params[0].v))
-                return err("need block hex");
-
-            std::vector<uint8_t> raw;
-            try { raw = from_hex(std::get<std::string>(params[0].v)); }
-            catch(...) { return err("bad hex"); }
-
-            Block b;
-            if (!deser_block(raw, b)) return err("bad block");
-
-            std::string e;
-            if (chain_.submit_block(b, e)) {
-                // success; no "error" field → miner treats as OK
-                return "\"ok\"";
-            } else {
-                return err(e.empty() ? "rejected" : e);
-            }
-        }
-
         // ---------------- address UTXO lookup (for mobile/GUI) ----------------
         if (method == "getaddressutxos") {
             // Expect params = ["<Base58Check-P2PKH>"]
@@ -993,7 +1015,7 @@ std::string RpcService::handle(const std::string& body){
             std::string wpass    = get_opt(2);
 
             std::string wdir = default_wallet_file();
-            if(!wdir.empty()){
+            if(!wdir empty()){
                 size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
             } else {
                 wdir = "wallets/default";
