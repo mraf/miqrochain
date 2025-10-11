@@ -1,3 +1,4 @@
+// src/wallet/miqwallet.cpp
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -117,8 +118,12 @@ static void save_pending(const std::string& wdir, const std::set<OutpointKey>& s
 }
 
 // -------------------------------------------------------------
-// Seeds (remote-first, plus smart localhost fallback)
+// Seeds (remote-first; do NOT auto-hairpin to localhost)
 // -------------------------------------------------------------
+static inline bool is_loopback_host(const std::string& h){
+    return h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "[::1]";
+}
+
 static void push_unique(std::vector<std::pair<std::string,std::string>>& v,
                         const std::string& h, const std::string& p,
                         std::unordered_set<std::string>& seen)
@@ -127,19 +132,19 @@ static void push_unique(std::vector<std::pair<std::string,std::string>>& v,
     if(seen.insert(key).second) v.emplace_back(h,p);
 }
 
-// if env MIQ_DISABLE_LOCAL=1 -> no localhost fallback
+// if env MIQ_ENABLE_LOCAL=1 -> allow localhost fallback; otherwise only if user explicitly asked via CLI
 static std::vector<std::pair<std::string,std::string>>
 build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
 {
     std::vector<std::pair<std::string,std::string>> seeds;
     std::unordered_set<std::string> seen;
 
-    // 0) CLI seed (if provided)
+    // 0) CLI seed (if provided). Respect explicit localhost if user asked for it.
     if(!cli_host.empty()){
         push_unique(seeds, cli_host, cli_port, seen);
     }
 
-    // 1) MIQ_P2P_SEED (comma list)
+    // 1) MIQ_P2P_SEED (comma list) — treat as explicit config; keep as-is
     if(const char* e = std::getenv("MIQ_P2P_SEED"); e && *e){
         std::string v = e;
         size_t start = 0;
@@ -163,11 +168,13 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
         push_unique(seeds, miq::DNS_SEEDS[i], std::to_string(miq::P2P_PORT), seen);
     }
 
-    // 4) Smart localhost fallback unless disabled
-    if(!env_truthy("MIQ_DISABLE_LOCAL")){
-        push_unique(seeds, "127.0.0.1", std::to_string(miq::P2P_PORT), seen);
-        push_unique(seeds, "::1",       std::to_string(miq::P2P_PORT), seen);
-        push_unique(seeds, "localhost", std::to_string(miq::P2P_PORT), seen);
+    // 4) Localhost fallback ONLY if explicitly enabled
+    if (env_truthy("MIQ_ENABLE_LOCAL")) {
+        if (cli_host.empty()) { // only auto-add if not already explicitly chosen
+            push_unique(seeds, "127.0.0.1", std::to_string(miq::P2P_PORT), seen);
+            push_unique(seeds, "::1",       std::to_string(miq::P2P_PORT), seen);
+            push_unique(seeds, "localhost", std::to_string(miq::P2P_PORT), seen);
+        }
     }
 
     return seeds;
