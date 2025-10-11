@@ -59,13 +59,15 @@
 
 using namespace miq;
 
-// ===== utils =================================================================
+// ===== small utils ===========================================================
 static inline void trim(std::string& s){
     size_t i=0,j=s.size();
     while(i<j && std::isspace((unsigned char)s[i])) ++i;
     while(j>i && std::isspace((unsigned char)s[j-1])) --j;
     s.assign(s.data()+i, j-i);
 }
+static int count_lines(const std::string& s){ int c=0; for(char ch: s) if(ch=='\n') ++c; return c; }
+
 static std::string default_cookie_path(){
 #ifdef _WIN32
     char* v=nullptr; size_t len=0;
@@ -118,10 +120,25 @@ static void bits_to_target_be(uint32_t bits, uint8_t out[32]){
         out[pos+2] = uint8_t((mant >>  0) & 0xff);
     }
 }
+
+static inline bool compact_bits_valid(uint32_t bits){
+    uint32_t exp  = bits >> 24;
+    uint32_t mant = bits & 0x007fffff;
+    return exp >= 3 && mant != 0;
+}
+static inline uint32_t sanitize_bits(uint32_t bits){
+    // Force real difficulty-1 (GENESIS_BITS) if node returns junk (e.g., 0x00000004)
+    return compact_bits_valid(bits) ? bits : miq::GENESIS_BITS;
+}
+
 static inline bool meets_target_be_raw(const uint8_t hash32[32], uint32_t bits){
     uint8_t T[32]; bits_to_target_be(bits, T);
+    // Never accept an all-zero target
+    bool allz = true; for(int i=0;i<32;i++) if(T[i]) { allz=false; break; }
+    if(allz) return false;
     return std::memcmp(hash32, T, 32) <= 0;
 }
+
 static double difficulty_from_bits(uint32_t bits){
     uint32_t exp  = bits >> 24;
     uint32_t mant = bits & 0x007fffff;
@@ -136,7 +153,7 @@ static double difficulty_from_bits(uint32_t bits){
     return (double)D;
 }
 
-// ===== little-endian helpers used by fast hasher =============================
+// ===== little-endian helpers (fast hasher) ===================================
 static inline void put_u32_le(std::vector<uint8_t>& v, uint32_t x){
     v.push_back(uint8_t((x>>0)&0xff));
     v.push_back(uint8_t((x>>8)&0xff));
@@ -204,7 +221,6 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
         << "Content-Type: application/json\r\n"
         << "Content-Length: " << json.size() << "\r\n";
     if(!auth_token.empty()){
-        // Be liberal — some nodes expect either header
         req << "Authorization: Bearer " << auth_token << "\r\n";
         req << "X-Auth-Token: " << auth_token << "\r\n";
     }
@@ -330,9 +346,10 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
     if(!json_find_string(r.body,"hash",hh)) return false;
     if(!json_find_number(r.body,"bits",b)) return false;
     if(!json_find_number(r.body,"time",t)) return false;
-    out.height=(uint64_t)h; out.hash_hex=hh; out.bits=(uint32_t)b; out.time=(int64_t)t;
+    out.height=(uint64_t)h; out.hash_hex=hh; out.bits=sanitize_bits((uint32_t)b); out.time=(int64_t)t;
     return true;
 }
+
 static bool rpc_submitblock_try(const std::string& host, uint16_t port, const std::string& auth,
                                 const char* method, const std::string& hexblk)
 {
@@ -364,9 +381,7 @@ struct MinerTemplate {
     uint32_t bits{0};
     int64_t  time{0};
     size_t   max_block_bytes{900*1024};
-    struct TxTpl{
-        std::string hex; uint64_t fee{0};
-    };
+    struct TxTpl{ std::string hex; uint64_t fee{0}; };
     std::vector<TxTpl> txs;
 };
 
@@ -381,8 +396,12 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
     if(!json_find_number(r.body, "bits", b)) return false;
     if(!json_find_number(r.body, "time", t)) return false;
     if(json_find_number(r.body, "max_block_bytes", maxb)) out.max_block_bytes = (size_t)maxb;
-    out.height = (uint64_t)h; out.prev_hash = from_hex_s(ph); out.bits=(uint32_t)b; out.time=(int64_t)t;
+
+    out.height = (uint64_t)h;
+    out.prev_hash = from_hex_s(ph);
     if(out.prev_hash.size()!=32) return false;
+    out.bits = sanitize_bits((uint32_t)b); // force valid compact bits (diff-1 fallback)
+    out.time = (int64_t)t;
 
     // Parse txs
     size_t p = r.body.find("\"txs\"");
@@ -419,7 +438,7 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
     return true;
 }
 
-// fallbacks to estimate network hashrate: look back N blocks and use difficulty & spacing
+// fallbacks to estimate network hashrate
 static bool rpc_getblockcount(const std::string& host, uint16_t port, const std::string& auth, long long& out){
     HttpResp r;
     if(!http_post(host, port, "/", auth, rpc_build("getblockcount","[]"), r) || r.code != 200) return false;
@@ -540,11 +559,10 @@ static bool rpc_getcoinbaserecipient(const std::string& host, uint16_t port, con
     return true;
 }
 
-// ===== UI (128-frame cube) ===================================================
+// ===== 3D cube art (128 frames) =============================================
 static const int kAnimLines = 8;
 static const int kBaseFrames = 16;
 static const char* kBase[kBaseFrames][kAnimLines] = {
-// 16-frame cube (same width, ANSI-safe). 128 frames = base frame + horizontal wobble phase (8x).
 {
 "      _________       ",
 "     / _______ \\      ",
@@ -692,16 +710,14 @@ static const char* kBase[kBaseFrames][kAnimLines] = {
 }
 };
 
-// 128-frame generator: base frame (0..15) + wobble phase (0..7) = 128 frames
+// 128-frame generator: base (0..15) + wobble (0..7) => 128 frames
 static std::vector<std::string> make_block_frame(uint64_t frame){
     uint64_t base = frame & 15;             // 0..15
     uint64_t wobble = (frame >> 4) & 7;     // 0..7
-    int indent = (int)wobble;               // add spaces to "move" the cube
-
+    int indent = (int)wobble;
     std::vector<std::string> lines; lines.reserve(kAnimLines);
     for(int i=0;i<kAnimLines;i++){
-        std::string ln;
-        ln.assign(indent, ' ');
+        std::string ln(indent, ' ');
         ln += kBase[base][i];
         lines.push_back(std::move(ln));
     }
@@ -752,6 +768,30 @@ static std::string fmt_hs(double v){
     std::ostringstream o; o<<std::fixed<<std::setprecision(2)<<v<<" "<<u[i]; return o.str();
 }
 
+// Animator thread — draws only the cube region at ~128 FPS
+static void cube_anim_loop(std::atomic<bool>* running, int start_row, int start_col){
+#if defined(_WIN32)
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD mode=0; if (GetConsoleMode(h,&mode)) SetConsoleMode(h, mode | 0x0004);
+    }
+#endif
+    using clock = std::chrono::steady_clock;
+    auto next = clock::now();
+    uint64_t frame = 0;
+    while(running->load(std::memory_order_relaxed)){
+        next += std::chrono::microseconds(7813); // ~128 FPS
+        auto art = make_block_frame(frame++);
+        std::ostringstream os;
+        for(int i=0;i<kAnimLines;i++){
+            os << "\x1b[" << (start_row + i) << ";" << start_col << "H"
+               << "  \x1b[36m" << art[i] << "\x1b[0m";
+        }
+        std::cout << os.str() << std::flush;
+        std::this_thread::sleep_until(next);
+    }
+}
+
 static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui, const std::atomic<bool>* running){
 #if defined(_WIN32)
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -759,7 +799,9 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
         DWORD mode=0; if (GetConsoleMode(h,&mode)) SetConsoleMode(h, mode | 0x0004);
     }
 #endif
-    uint64_t frame = 0;
+    bool anim_started = false;
+    int cube_row = 0, cube_col = 3;
+
     while(running->load(std::memory_order_relaxed)){
         // instantaneous hashrate via tries diff
         uint64_t cur = ui->tries.load();
@@ -773,76 +815,74 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
         ema = ema*(1.0-alpha) + local_hs*alpha;
         ui->hashps_avg.store(ema);
 
-        std::ostringstream os;
-        os << "\x1b[2J\x1b[H"; // clear
-        os << "  \x1b[1mMIQ Miner (RPC)\x1b[0m  —  address: " << addr << "     threads: " << threads << "\n\n";
+        // Build top part (everything above the cube)
+        std::ostringstream top;
+        top << "\x1b[2J\x1b[H"; // clear + home
+        top << "  \x1b[1mMIQ Miner (RPC)\x1b[0m  —  address: " << addr << "     threads: " << threads << "\n\n";
 
         uint64_t th = ui->tip_height.load();
         if(th){
-            os << "  tip height:      " << th << "\n";
-            os << "  tip hash:        " << ui->tip_hash_hex << "\n";
+            top << "  tip height:      " << th << "\n";
+            top << "  tip hash:        " << ui->tip_hash_hex << "\n";
             uint32_t bits = ui->tip_bits.load();
-            os << "  tip bits:        0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)bits
-               << std::dec << "  (difficulty " << std::fixed << std::setprecision(2) << difficulty_from_bits(bits) << ")\n";
+            top << "  tip bits:        0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)bits
+                << std::dec << "  (difficulty " << std::fixed << std::setprecision(2) << difficulty_from_bits(bits) << ")\n";
         } else {
-            os << "  (waiting for template)\n";
+            top << "  (waiting for template)\n";
         }
 
-        // Candidate section
         {
             std::lock_guard<std::mutex> lk(ui->mtx);
             if(ui->cand.height){
-                os << "\n";
-                os << "  mining candidate:  height=" << ui->cand.height
-                   << "  prev=" << ui->cand.prev_hex << "\n";
-                os << "                     txs=" << ui->cand.txs
-                   << "  size=" << ui->cand.size_bytes << " bytes"
-                   << "  fees=" << ui->cand.fees
-                   << "  coinbase=" << ui->cand.coinbase << "\n";
+                top << "\n";
+                top << "  mining candidate:  height=" << ui->cand.height
+                    << "  prev=" << ui->cand.prev_hex << "\n";
+                top << "                     txs=" << ui->cand.txs
+                    << "  size=" << ui->cand.size_bytes << " bytes"
+                    << "  fees=" << ui->cand.fees
+                    << "  coinbase=" << ui->cand.coinbase << "\n";
             }
         }
 
-        // Last block on-chain (who got paid)
         if(ui->lastblk.height){
             const auto& lb = ui->lastblk;
-            os << "\n";
-            os << "  last block:       height=" << lb.height
-               << "  hash=" << lb.hash_hex
-               << "  txs=" << lb.txs << "\n";
+            top << "\n";
+            top << "  last block:       height=" << lb.height
+                << "  hash=" << lb.hash_hex
+                << "  txs=" << lb.txs << "\n";
             if(!lb.coinbase_txid_hex.empty())
-                os << "                     coinbase_txid=" << lb.coinbase_txid_hex << "\n";
+                top << "                     coinbase_txid=" << lb.coinbase_txid_hex << "\n";
             if(!lb.coinbase_pkh.empty()){
-                os << "                     paid to: " << pkh_to_address(lb.coinbase_pkh)
-                   << "  (pkh=" << to_hex_s(lb.coinbase_pkh) << ", value=" << lb.reward_value << ")\n";
+                top << "                     paid to: " << pkh_to_address(lb.coinbase_pkh)
+                    << "  (pkh=" << to_hex_s(lb.coinbase_pkh) << ", value=" << lb.reward_value << ")\n";
             }
         }
 
-        os << "\n";
-        os << "  local hashrate:   " << fmt_hs(ui->hashps_inst.load()) << "  (avg " << fmt_hs(ui->hashps_avg.load()) << ")\n";
-        os << "  network hashrate: " << fmt_hs(ui->net_hashps.load()) << "\n";
-        os << "  mined (session):  " << ui->mined_blocks.load() << "\n";
+        top << "\n";
+        top << "  local hashrate:   " << fmt_hs(ui->hashps_inst.load()) << "  (avg " << fmt_hs(ui->hashps_avg.load()) << ")\n";
+        top << "  network hashrate: " << fmt_hs(ui->net_hashps.load()) << "\n";
+        top << "  mined (session):  " << ui->mined_blocks.load() << "\n";
         if(!ui->last_found_block_hash.empty())
-            os << "  last found:       " << ui->last_found_block_hash << "\n";
+            top << "  last found:       " << ui->last_found_block_hash << "\n";
 
-        // 128-frame animation
-        os << "\n";
-        auto art = make_block_frame(frame++);
-        for(const auto& line : art) os << "  \x1b[36m" << line << "\x1b[0m\n";
-        os << "\n  Press Ctrl+C to quit.\n";
+        top << "\n";
+        // Reserve cube area: remember the row, then print placeholders so the rest stays below
+        cube_row = count_lines(top.str()) + 1;
+        for(int i=0;i<kAnimLines;i++) top << "\n";
 
-        std::cout << os.str() << std::flush;
+        top << "\n  Press Ctrl+C to quit.\n";
+        std::cout << top.str() << std::flush;
+
+        if(!anim_started){
+            anim_started = true;
+            std::thread(cube_anim_loop, (std::atomic<bool>*)running, cube_row, cube_col).detach();
+        }
+
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
 
 // ===== optimized mining worker ==============================================
-//
-// Follows your miner.cpp approach:
-//  * Header prefix (ver|prev|merkle|time|bits) midstate
-//  * 64-bit nonce appended (little-endian) per attempt
-//  * Batched checks (cut control overhead)
-//  * 8x unrolled hashing inside the inner loop
-//
 static void mine_worker_optimized(const BlockHeader hdr_base,
                                   const std::vector<Transaction> txs_including_cb,
                                   uint32_t bits,
@@ -852,7 +892,6 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
                                   Block* out_block)
 {
 #if defined(_WIN32) && defined(MIQ_SET_AFFINITY)
-    // optional: pin each thread to a CPU
     const int maskBits = static_cast<int>(sizeof(DWORD_PTR) * 8);
     const int cpu = static_cast<int>(tid % static_cast<unsigned>(maskBits));
     const DWORD_PTR mask = (DWORD_PTR(1) << cpu);
@@ -862,7 +901,7 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
     Block b; b.header = hdr_base; b.txs = txs_including_cb;
     b.header.merkle_root = merkle_from(b.txs); // fixed per candidate
 
-    // Build header prefix: 4|32|32|8|4 (80 bytes) — nonce (8) appended in loop
+    // Build header prefix: 4|32|32|8|4
     std::vector<uint8_t> header_prefix;
     header_prefix.reserve(4+32+32+8+4);
     put_u32_le(header_prefix, b.header.version);
@@ -872,7 +911,8 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
     put_u32_le(header_prefix, b.header.bits);
     const size_t nonce_off = header_prefix.size();
 
-    // Target BE
+    // Target
+    bits = sanitize_bits(bits);
     uint8_t Tglob[32]; bits_to_target_be(bits, Tglob);
 
 #if !defined(MIQ_POW_SALT)
@@ -881,7 +921,6 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
     fastsha_update(base1, header_prefix.data(), header_prefix.size());
 #endif
 
-    // Thread-local header buffer with room for nonce
     std::vector<uint8_t> hdr = header_prefix;
     hdr.resize(header_prefix.size() + 8);
     uint8_t* nonce_ptr = hdr.data() + nonce_off;
@@ -892,14 +931,12 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
     uint64_t nonce = base_nonce + (uint64_t)tid;
     const uint64_t step  = (uint64_t)stride;
 
-    // Batch size: large enough to amortize checks, small enough to stay responsive
     const uint64_t BATCH = (1ull<<15); // 32768 attempts per outer loop
-    const uint64_t FLUSH = (1ull<<20); // flush ~1M tries to the UI counter
+    const uint64_t FLUSH = (1ull<<20); // flush ~1M tries to UI
 
     uint64_t local_hashes = 0;
 
     while(!found->load(std::memory_order_relaxed)){
-        // Unrolled inner loop — do 8 nonces per iteration
         uint64_t todo = BATCH;
         while(todo && !found->load(std::memory_order_relaxed)){
             const uint64_t n0 = nonce; nonce += step;
@@ -934,7 +971,6 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
             store_u64_le(nonce_ptr, n7); { auto hv = salted_header_hash(hdr); std::memcpy(h[7], hv.data(), 32); }
         #endif
 
-            // Check meets target (big-endian compare)
             if(meets_target_be_raw(h[0], bits)){ b.header.nonce=n0; *out_block=b; found->store(true); break; }
             if(meets_target_be_raw(h[1], bits)){ b.header.nonce=n1; *out_block=b; found->store(true); break; }
             if(meets_target_be_raw(h[2], bits)){ b.header.nonce=n2; *out_block=b; found->store(true); break; }
@@ -954,7 +990,6 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
         }
 
         if(found->load(std::memory_order_relaxed)) break;
-        // Loop again with next BATCH
     }
 
     if(local_hashes){
@@ -1114,7 +1149,7 @@ int main(int argc, char** argv){
             hb.version = 1;
             hb.prev_hash = tpl.prev_hash;
             hb.time = std::max<int64_t>((int64_t)time(nullptr), tpl.time);
-            hb.bits = tpl.bits;
+            hb.bits = tpl.bits; // already sanitized in rpc_getminertemplate
             hb.nonce = 0;
 
             // Mine
@@ -1124,7 +1159,7 @@ int main(int argc, char** argv){
             Block found_block;
 
             for(unsigned tid=0; tid<threads; ++tid){
-                thv.emplace_back(mine_worker_optimized, hb, txs_inc, tpl.bits,
+                thv.emplace_back(mine_worker_optimized, hb, txs_inc, hb.bits,
                                  &found, &tries, tid, threads, &found_block);
             }
 
@@ -1151,7 +1186,7 @@ int main(int argc, char** argv){
 
             // Double-check meets target
             auto hchk = found_block.block_hash();
-            if(!meets_target_be_raw(hchk.data(), tpl.bits)){
+            if(!meets_target_be_raw(hchk.data(), hb.bits)){
                 std::fprintf(stderr,"internal: solved header doesn't meet target, skipping\n");
                 continue;
             }
