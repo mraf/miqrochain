@@ -378,7 +378,8 @@ static inline bool gate_on_bytes(int fd, size_t add){
 // Return true => drop immediately (bad sequence/timeout/banned)
 static inline bool gate_on_command(int fd, const std::string& cmd,
                                    /*out*/ bool& should_send_verack,
-                                   /*out*/ int& close_code){
+                                   /*out*/ int& close_code)
+{
     should_send_verack = false;
     close_code = 0;
 
@@ -386,58 +387,48 @@ static inline bool gate_on_command(int fd, const std::string& cmd,
     if (it == g_gate.end()) return false;
     auto& g = it->second;
 
-    // Handshake timeout: only fail if we still haven't seen a VERACK at all.
+    // handshake deadline
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - g.t_conn).count();
     if (!g.got_verack && ms > HANDSHAKE_MS){
-        close_code = 408; // handshake timeout
+        close_code = 408;
         return true;
     }
 
     if (!cmd.empty()){
         if (cmd == "version"){
-            // First version -> mark and schedule verack reply. Duplicate versions are ignored.
             if (!g.got_version){
                 g.got_version = true;
                 should_send_verack = true;
             }
+            // duplicates are ignored (no ban)
         } else if (cmd == "verack"){
-            // Always accept verack, whether it arrives before or after version.
+            // accept verack pre/post version
             g.got_verack = true;
         } else {
-            // Before we saw version: drop safe chatter silently (no ban / no disconnect).
+            // before version: ignore safe msgs, gentle nudge on odd ones
             if (!g.got_version) {
                 if (miq_safe_preverack_cmd(cmd)) {
-                    return false; // ignore until version arrives
+                    return false; // silently ignore until version
                 } else {
-                    // Truly odd pre-version chatter: nudge, but don't drop immediately.
                     g.banscore += 10;
                     if (g.banscore >= MAX_BANSCORE) { close_code = 400; return true; }
                     return false;
                 }
             }
-
-            // After version but before verack: allow a tiny queue of safe msgs, drop others.
+            // after version but before verack: allow only safe msgs, lightly bounded
             if (!g.got_verack){
-                if (!miq_safe_preverack_cmd(cmd)) {
-                    // ignore non-safe messages until verack without penalizing hard
-                    return false;
-                }
+                if (!miq_safe_preverack_cmd(cmd)) return false; // ignore until verack
                 int &cnt = g_preverack_counts[fd];
-                cnt++;
-                if (cnt > MIQ_PREVERACK_QUEUE_MAX) {
+                if (++cnt > MIQ_PREVERACK_QUEUE_MAX) {
                     g.banscore += 5;
                     if (g.banscore >= MAX_BANSCORE) { close_code = 402; return true; }
                     return false;
                 }
             }
-            // After verack: nothing special here; caller will process normally.
         }
     }
 
-    if (g.banscore >= MAX_BANSCORE){
-        close_code = 400;
-        return true;
-    }
+    if (g.banscore >= MAX_BANSCORE){ close_code = 400; return true; }
     return false;
 }
 
@@ -1927,7 +1918,16 @@ void P2P::loop(){
                 miq::NetMsg m;
                 while (decode_msg(ps.rx, off, m)) {
                     std::string cmd(m.cmd, m.cmd + 12);
-                    cmd.erase(cmd.find_first_of('\0'));
+size_t z = cmd.find('\0');
+if (z != std::string::npos) {
+    cmd.resize(z);
+} else {
+    // If exactly 12 non-NUL bytes were sent, keep as-is.
+    // (Optional) sanity: drop clearly bad control chars
+    bool bad = false;
+    for (unsigned char ch : cmd) { if (ch < 32 || ch > 126) { bad = true; break; } }
+    if (bad) { ++ps.mis; continue; }
+}
 
                     // Handshake/order gate
                     bool send_verack = false; int close_code = 0;
