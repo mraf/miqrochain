@@ -375,62 +375,65 @@ static inline bool gate_on_bytes(int fd, size_t add){
     return false;
 }
 // Return true => drop immediately (bad sequence/timeout/banned)
+// Return true => drop immediately (bad sequence/timeout/banned)
 static inline bool gate_on_command(int fd, const std::string& cmd,
                                    /*out*/ bool& should_send_verack,
                                    /*out*/ int& close_code){
     should_send_verack = false;
     close_code = 0;
+
     auto it = g_gate.find(fd);
     if (it == g_gate.end()) return false;
     auto& g = it->second;
 
-    // Handshake timeout
+    // Handshake timeout: only fail if we still haven't seen a VERACK at all.
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - g.t_conn).count();
     if (!g.got_verack && ms > HANDSHAKE_MS){
-        close_code = 408; // timeout
+        close_code = 408; // handshake timeout
         return true;
     }
 
     if (!cmd.empty()){
         if (cmd == "version"){
+            // First version -> mark and schedule verack reply. Duplicate versions are ignored.
             if (!g.got_version){
                 g.got_version = true;
-                should_send_verack = true; // reply once to version
-            } else {
-                g.banscore += 10; // duplicate version
+                should_send_verack = true;
             }
         } else if (cmd == "verack"){
-            if (g.got_version && !g.got_verack){
-                g.got_verack = true;
-            } else {
-                g.banscore += 10; // unexpected verack
-            }
+            // Always accept verack, whether it arrives before or after version.
+            g.got_verack = true;
         } else {
-            // STRICT: any command before 'version' => drop fast
+            // Before we saw version: drop safe chatter silently (no ban / no disconnect).
             if (!g.got_version) {
-                g.banscore += 50;
-                close_code = 400;
-                return true;
+                if (miq_safe_preverack_cmd(cmd)) {
+                    return false; // ignore until version arrives
+                } else {
+                    // Truly odd pre-version chatter: nudge, but don't drop immediately.
+                    g.banscore += 10;
+                    if (g.banscore >= MAX_BANSCORE) { close_code = 400; return true; }
+                    return false;
+                }
             }
-            // STRICT, but allow tiny window after version before verack
+
+            // After version but before verack: allow a tiny queue of safe msgs, drop others.
             if (!g.got_verack){
                 if (!miq_safe_preverack_cmd(cmd)) {
-                    g.banscore += 25;                 // harder nudge for out-of-order chatter
-                    if (g.banscore >= MAX_BANSCORE) { close_code = 401; return true; }
-                    return false;                      // ignore silently
+                    // ignore non-safe messages until verack without penalizing hard
+                    return false;
                 }
                 int &cnt = g_preverack_counts[fd];
                 cnt++;
-                g.banscore += 1;                       // light pressure on early messages
                 if (cnt > MIQ_PREVERACK_QUEUE_MAX) {
-                    g.banscore += 10;
-                    close_code = 402;                  // spamming safe msgs before verack
-                    return true;
+                    g.banscore += 5;
+                    if (g.banscore >= MAX_BANSCORE) { close_code = 402; return true; }
+                    return false;
                 }
-                // else: safe pre-verack command will be processed below by caller
             }
+            // After verack: nothing special here; caller will process normally.
         }
     }
+
     if (g.banscore >= MAX_BANSCORE){
         close_code = 400;
         return true;
