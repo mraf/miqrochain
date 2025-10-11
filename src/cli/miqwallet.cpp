@@ -1,13 +1,12 @@
 // src/cli/miqwallet.cpp
-// MIQ wallet CLI (Remote P2P/SPV; create or load from seed; send; show addresses).
+// MIQ wallet CLI (Remote P2P/SPV; create or load from seed; show balance; send).
 //
 // - First screen: 1) Create wallet  2) Load wallet from seed
-// - Remote-only by default (won't dial localhost unless --allow-localhost).
-// - Seeds: --p2pseed (host[:port]) → MIQ_P2P_SEED (comma list) → 62.38.73.147 → DNS seeds → localhost (optional).
-// - Mature coinbase filtering; pending-spent cache to avoid double-spend before confirmation.
-// - If a stored wallet is encrypted, asks for wallet passphrase; otherwise proceeds.
-// - Uses MIQ_WALLET_PASSPHRASE if present to unlock without prompt.
-// - Send flow signs with derived keys and broadcasts via P2P.
+// - Remote-only by default (no localhost unless --allow-localhost).
+// - Seeds: --p2pseed → MIQ_P2P_SEED (comma list) → 62.38.73.147 → DNS seeds → localhost (opt).
+// - Correct SaveHdWallet signature (5 args) and NO use of HdWallet::seed().
+// - Coinbase maturity respected; pending-spent cache to avoid double-spend before confirmation.
+// - Uses MIQ_WALLET_PASSPHRASE env if present to re-save metadata without re-prompt.
 //
 // Build deps: hd_wallet, wallet_store, sha256, hash160, base58check, hex,
 // serialize, tx, crypto/ecdsa_iface, wallet/p2p_light.*, wallet/spv_simple.*
@@ -84,7 +83,7 @@ static std::string join_path(const std::string& a, const std::string& b){
     return a + sep + b;
 }
 
-// -------- Pending-spent cache (simple text file) --------
+// -------- Pending-spent cache --------
 struct OutpointKey {
     std::string txid_hex;
     uint32_t vout{0};
@@ -117,7 +116,7 @@ static void save_pending(const std::string& wdir, const std::set<OutpointKey>& s
     }
 }
 
-// -------- Seeds (remote-first, your IP prioritized) --------
+// -------- Seeds (remote-first; your IP prioritized) --------
 static std::vector<std::pair<std::string,std::string>>
 build_seed_candidates(const std::string& cli_host, const std::string& cli_port, bool allow_localhost)
 {
@@ -143,7 +142,7 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port, 
         }
     }
 
-    // 2) Your currently reachable seed (user requested)
+    // 2) User’s working public node (prioritized)
     seeds.emplace_back("62.38.73.147", std::to_string(miq::P2P_PORT));
 
     // 3) DNS seeds
@@ -294,7 +293,7 @@ static WalletBalance compute_balance(const std::vector<miq::UtxoLite>& utxos,
     return wb;
 }
 
-// -------- Key derivation (receive/change + lookahead) --------
+// -------- Derivation & addresses --------
 struct KeyRec { std::vector<uint8_t> priv, pub, pkh; uint32_t chain{0}, index{0}; };
 static void derive_key_horizon(miq::HdWallet& w, const miq::HdAccountMeta& meta,
                                std::vector<KeyRec>& out)
@@ -311,8 +310,6 @@ static void derive_key_horizon(miq::HdWallet& w, const miq::HdAccountMeta& meta,
     push_range(0, meta.next_recv);
     push_range(1, meta.next_change);
 }
-
-// -------- Address pretty list (external chain only) --------
 static void list_receive_addresses(miq::HdWallet& w, const miq::HdAccountMeta& meta){
     std::cout << "Receive addresses (m/44'/coin'/0'/0/i):\n";
     for(uint32_t i=0;i<=meta.next_recv + 20; ++i){
@@ -329,6 +326,7 @@ static bool send_flow(miq::HdWallet& w,
                       miq::HdAccountMeta& meta,
                       const std::string& wdir,
                       const std::string& pass_for_store,
+                      const std::vector<uint8_t>& seed,
                       const std::vector<std::pair<std::string,std::string>>& seeds)
 {
     // Prompt dest & amount
@@ -407,7 +405,6 @@ static bool send_flow(miq::HdWallet& w,
             if(change < 1000){ change = 0; fee_final = fee_for(tx.vin.size(), 1, 1000); }
         }
     }
-    (void)fee_final;
 
     miq::TxOut o; o.pkh = payload; o.value = amount; tx.vout.push_back(o);
 
@@ -447,19 +444,20 @@ static bool send_flow(miq::HdWallet& w,
     std::cout << "Broadcasted via " << used_bcast_seed << "  txid=" << txid_hex << "\n";
 
     // Mark inputs pending & persist wallet metadata if change was used
+    std::set<OutpointKey> pending;
+    load_pending(wdir, pending);
     for(const auto& in : tx.vin){
         pending.insert(OutpointKey{ miq::to_hex(in.prev.txid), in.prev.vout });
     }
     save_pending(wdir, pending);
+
     if(used_change){
         miq::HdAccountMeta m2 = meta; m2.next_change = meta.next_change + 1;
         std::string e;
-        if(!wdir.empty()){
-            if(!miq::SaveHdWallet(wdir, w.seed(), m2, pass_for_store, e)){
-                std::cout << "WARN: SaveHdWallet(next_change) failed: " << e << "\n";
-            } else {
-                meta = m2;
-            }
+        if(!miq::SaveHdWallet(wdir, seed, m2, pass_for_store, e)){
+            std::cout << "WARN: SaveHdWallet(next_change) failed: " << e << "\n";
+        } else {
+            meta = m2;
         }
     }
     return true;
@@ -470,6 +468,7 @@ static void run_dashboard(miq::HdWallet& w,
                           miq::HdAccountMeta& meta,
                           const std::string& wdir,
                           const std::string& pass_for_store,
+                          const std::vector<uint8_t>& seed,
                           const std::vector<std::pair<std::string,std::string>>& seeds)
 {
     for(;;){
@@ -521,7 +520,7 @@ static void run_dashboard(miq::HdWallet& w,
         std::string c; std::getline(std::cin, c); c=trim(c);
         if(c=="1"){ list_receive_addresses(w, meta); continue; }
         if(c=="2"){
-            (void)send_flow(w, meta, wdir, pass_for_store, seeds);
+            (void)send_flow(w, meta, wdir, pass_for_store, seed, seeds);
             continue;
         }
         if(c=="r"||c=="R"){ continue; }
@@ -533,7 +532,8 @@ static void run_dashboard(miq::HdWallet& w,
 static bool flow_create_wallet(miq::HdWallet& outW,
                                miq::HdAccountMeta& outMeta,
                                std::string& outWdir,
-                               std::string& outPass)
+                               std::string& outPass,
+                               std::vector<uint8_t>& outSeed)
 {
     std::string wdir = miq::default_wallet_file();
     if(!wdir.empty()){
@@ -561,15 +561,16 @@ static bool flow_create_wallet(miq::HdWallet& outW,
     if(!miq::SaveHdWallet(wdir, seed, w.meta(), wpass, e)) { std::cout << "save meta failed: " << e << "\n"; }
     std::cout << "First receive address: " << addr << "\n";
 
-    outW = w; outMeta = w.meta(); outWdir = wdir; outPass = wpass;
+    outW = w; outMeta = w.meta(); outWdir = wdir; outPass = wpass; outSeed = seed;
     return true;
 }
 
-// -------- Load wallet from seed (and optionally store) --------
+// -------- Load wallet from seed --------
 static bool flow_load_from_seed(miq::HdWallet& outW,
                                 miq::HdAccountMeta& outMeta,
                                 std::string& outWdir,
-                                std::string& outPass)
+                                std::string& outPass,
+                                std::vector<uint8_t>& outSeed)
 {
     std::string wdir = miq::default_wallet_file();
     if(!wdir.empty()){
@@ -590,12 +591,10 @@ static bool flow_load_from_seed(miq::HdWallet& outW,
 
     miq::HdAccountMeta meta; meta.account=0; meta.next_recv=0; meta.next_change=0;
     std::string e;
-    // Save only if user provided a passphrase (including empty is allowed to save unencrypted)
     if(!miq::SaveHdWallet(wdir, seed, meta, wpass, e)) {
         std::cout << "save failed: " << e << "\n";
-        // Still proceed in-memory
     } else {
-        // bump with first address so next_recv=1
+        // derive first receive so next_recv increments
         miq::HdWallet tmp(seed, meta);
         std::string addr; tmp.GetNewAddress(addr);
         if(!miq::SaveHdWallet(wdir, seed, tmp.meta(), wpass, e)){
@@ -607,7 +606,7 @@ static bool flow_load_from_seed(miq::HdWallet& outW,
     }
 
     miq::HdWallet w(seed, meta);
-    outW = w; outMeta = meta; outWdir = wdir; outPass = wpass;
+    outW = w; outMeta = meta; outWdir = wdir; outPass = wpass; outSeed = seed;
     return true;
 }
 
@@ -616,7 +615,6 @@ int main(int argc, char** argv){
     std::ios::sync_with_stdio(false);
 
     bool allow_localhost = false;
-    bool force_interactive = true; // always show the two-option menu per request
 
     std::string cli_host;
     std::string cli_port = std::to_string(miq::P2P_PORT);
@@ -635,7 +633,6 @@ int main(int argc, char** argv){
         if(a=="--allow-localhost"){ allow_localhost = true; continue; }
         if(eat_str("--p2pseed", cli_host)) { auto c=cli_host.find(':'); if(c!=std::string::npos){ cli_port=cli_host.substr(c+1); cli_host=cli_host.substr(0,c);} continue; }
         if(eat_str("--p2pport", cli_port)) continue;
-        if(a=="--no-interactive"){ force_interactive = false; continue; }
     }
 
     // Seeds preview
@@ -651,7 +648,7 @@ int main(int argc, char** argv){
         std::cout << "\n";
     }
 
-    // Always interactive two-choice menu (as requested)
+    // Two-option menu (as requested)
     for(;;){
         std::cout << "\n=== MIQ Wallet ===\n";
         std::cout << "1) Create wallet\n";
@@ -663,10 +660,11 @@ int main(int argc, char** argv){
         miq::HdWallet w({}, {}); // will be replaced
         miq::HdAccountMeta meta{};
         std::string wdir, wpass;
+        std::vector<uint8_t> seed;
 
         bool ok=false;
-        if(c=="1"){ ok = flow_create_wallet(w, meta, wdir, wpass); }
-        else if(c=="2"){ ok = flow_load_from_seed(w, meta, wdir, wpass); }
+        if(c=="1"){ ok = flow_create_wallet(w, meta, wdir, wpass, seed); }
+        else if(c=="2"){ ok = flow_load_from_seed(w, meta, wdir, wpass, seed); }
         else { continue; }
 
         if(!ok) continue;
@@ -675,7 +673,7 @@ int main(int argc, char** argv){
         const bool allow_local = allow_localhost || env_truthy("MIQ_ALLOW_LOCALHOST");
         auto seeds = build_seed_candidates(cli_host, cli_port, allow_local);
 
-        run_dashboard(w, meta, wdir, wpass, seeds);
+        run_dashboard(w, meta, wdir, wpass, seed, seeds);
         // loop back to main menu after exit
     }
 }
