@@ -3,10 +3,11 @@
 //
 // - Launching the EXE shows wallet balance immediately (no prompts).
 // - Remote-only P2P/SPV (won't dial localhost unless --allow-localhost).
-// - Robust multi-seed failover: --p2pseed, MIQ_P2P_SEED (comma list), DNS seeds.
+// - Hard-default seed to your public node 62.38.73.147:9833.
+// - Robust failover: --p2pseed, MIQ_P2P_SEED (comma list); DNS seeds opt-in via MIQ_USE_DNS_SEEDS=1.
 // - Mature coinbase filtering, pending-spent cache, clear totals.
-// - Encrypted wallets: read MIQ_WALLET_PASSPHRASE env so double-click works.
-// - Interactive mode available with --interactive.
+// - Encrypted wallets: reads MIQ_WALLET_PASSPHRASE so double-click works.
+// - Interactive menu available with --interactive.
 //
 // Build deps: hd_wallet, wallet_store, sha256, hash160, base58check, hex,
 // serialize, tx, crypto/ecdsa_iface, wallet/p2p_light.*, wallet/spv_simple.*
@@ -124,14 +125,16 @@ static void save_pending(const std::string& wdir, const std::set<OutpointKey>& s
 }
 
 // -------------------------------------------------------------
-// Remote-only seeds
+// Remote-only seeds (default to your working IP)
 // -------------------------------------------------------------
+static const char* kDefaultSeedHost = "62.38.73.147";
+
 static std::vector<std::pair<std::string,std::string>>
 build_seed_candidates(const std::string& cli_host, const std::string& cli_port, bool allow_localhost)
 {
     std::vector<std::pair<std::string,std::string>> seeds;
 
-    // 0) CLI seed
+    // 0) CLI seed takes absolute precedence if provided
     if(!cli_host.empty()){
         seeds.emplace_back(cli_host, cli_port);
     }
@@ -151,13 +154,18 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port, 
         }
     }
 
-    // 2) DNS seeds (global)
-    seeds.emplace_back(miq::DNS_SEED, std::to_string(miq::P2P_PORT));
-    for(size_t i=0;i<miq::DNS_SEEDS_COUNT;i++){
-        seeds.emplace_back(miq::DNS_SEEDS[i], std::to_string(miq::P2P_PORT));
+    // 2) HARD DEFAULT: your public node
+    seeds.emplace_back(std::string(kDefaultSeedHost), std::to_string(miq::P2P_PORT));
+
+    // 3) DNS seeds are disabled by default; enable with MIQ_USE_DNS_SEEDS=1
+    if(env_truthy("MIQ_USE_DNS_SEEDS")){
+        seeds.emplace_back(miq::DNS_SEED, std::to_string(miq::P2P_PORT));
+        for(size_t i=0;i<miq::DNS_SEEDS_COUNT;i++){
+            seeds.emplace_back(miq::DNS_SEEDS[i], std::to_string(miq::P2P_PORT));
+        }
     }
 
-    // 3) Optional localhost (only if explicitly allowed)
+    // 4) Optional localhost (only if explicitly allowed)
     if(allow_localhost){
         seeds.emplace_back("127.0.0.1", std::to_string(miq::P2P_PORT));
         seeds.emplace_back("::1",       std::to_string(miq::P2P_PORT));
@@ -408,7 +416,7 @@ static bool try_broadcast_any_seed(const std::vector<std::pair<std::string,std::
     return false;
 }
 
-// Minimal interactive bits kept (send, balance, create/recover)
+// Minimal interactive bits (create/recover/balance)
 static bool make_or_restore_wallet(bool restore){
     std::string wdir = miq::default_wallet_file();
     if(!wdir.empty()){
