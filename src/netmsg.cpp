@@ -14,6 +14,7 @@
 #  endif
 #  if __has_include("sha256.h")
 #    include "sha256.h"
+#    define MIQ_HAVE_SHA256 1
 #  endif
 #endif
 
@@ -55,9 +56,7 @@
 #ifndef MIQ_VERSION_MAX_BYTES
 #define MIQ_VERSION_MAX_BYTES 1024
 #endif
-if (cmd == "version") {
-    return n == 0 || n <= (size_t)MIQ_VERSION_MAX_BYTES;
-}
+
 namespace miq {
 
 // Ensure the build actually provides the magic constants we need.
@@ -79,7 +78,7 @@ static inline void wr32le(uint8_t* p, uint32_t v){
 }
 
 static inline uint32_t dsha256_4(const uint8_t* data, size_t n) {
-#if __has_include("sha256.h")
+#ifdef MIQ_HAVE_SHA256
     uint8_t h[32];
     {
         SHA256 a; a.update(data, n); a.final(h);
@@ -121,7 +120,9 @@ static bool length_ok_for_command(const std::string& cmd, size_t n){
         return n == 0;
     }
 
-    // version: accept legacy zero-payload and small payloads (interop)
+    // version: accept legacy zero-payload and standard Bitcoin-style payloads
+    // (version, services, ts, addr_recv, addr_from, nonce, UA, start_height, relay)
+    // Typical size ~85–110 bytes; allow generous headroom.
     if (cmd == "version") {
         return n == 0 || n <= (size_t)MIQ_VERSION_MAX_BYTES;
     }
