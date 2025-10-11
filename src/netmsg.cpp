@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <cctype>
 
 #ifdef __has_include
 #  if __has_include("constants.h")
@@ -47,6 +48,12 @@
 #endif
 #ifndef MIQ_MAX_LOCATOR_HASHES
 #define MIQ_MAX_LOCATOR_HASHES 32        // locator cap used by p2p.cpp
+#endif
+
+// Accept non-empty Bitcoin-style "version" payloads for interoperability.
+// Generous cap so extra fields/extensions don't break handshake.
+#ifndef MIQ_VERSION_MAX_BYTES
+#define MIQ_VERSION_MAX_BYTES 1024
 #endif
 
 namespace miq {
@@ -114,7 +121,7 @@ static bool length_ok_for_command(const std::string& cmd, size_t n){
 
     // version: accept legacy zero-payload and small payloads (interop)
     if (cmd == "version") {
-        return n <= 24; // allow 0..24 bytes
+        return n == 0 || n <= (size_t)MIQ_VERSION_MAX_BYTES;
     }
 
     if (cmd == "invb" || cmd == "getb" || cmd == "invtx" || cmd == "gettx"){
