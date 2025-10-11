@@ -89,7 +89,7 @@ static bool env_truthy(const char* name){
     return (s=="1" || s=="true" || s=="yes" || s=="on");
 }
 
-// Path helpers (portable join/dirname)
+// Path helpers (portable join)
 static std::string join_path(const std::string& a, const std::string& b){
 #ifdef _WIN32
     const char sep='\\';
@@ -99,11 +99,6 @@ static std::string join_path(const std::string& a, const std::string& b){
     if(a.empty()) return b;
     if(a.back()==sep) return a+b;
     return a + sep + b;
-}
-static std::string dirname1(const std::string& p){
-    size_t pos = p.find_last_of("/\\");
-    if(pos == std::string::npos) return std::string();
-    return p.substr(0, pos);
 }
 
 // ---------------- pending-spent cache (avoid double-spend while unconfirmed) -
@@ -388,7 +383,7 @@ static bool flow_send_p2p_only(const std::string& cli_host, const std::string& c
     for(const auto& u : utxos){
         bool ok = true;
         if (u.coinbase) {
-            const uint64_t mature_h = (uint64_t)u.height + (uint64_t)COINBASE_MATURITY;
+            const uint64_t mature_h = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
             // next block height is approx_tip_h + 1
             if (approx_tip_h + 1 < mature_h) ok = false;
         }
@@ -587,7 +582,7 @@ static bool show_balance_spv(const std::string& cli_host, const std::string& cli
         total += u.value;
         bool is_immature = false;
         if(u.coinbase){
-            uint64_t mature_h = (uint64_t)u.height + (uint64_t)COINBASE_MATURITY;
+            uint64_t mature_h = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
             if(approx_tip_h + 1 < mature_h) is_immature = true;
         }
         OutpointKey k{ miq::to_hex(u.txid), u.vout };
