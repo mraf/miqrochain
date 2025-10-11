@@ -117,7 +117,7 @@ static uint32_t checksum4(const std::vector<uint8_t>& payload){
 
 // ---- seed/candidate helpers --------------------------------------------------
 static std::string strip_port_if_present(const std::string& host){
-    // If it's bracketed IPv6 like "[::1]:9833" leave as-is.
+    // If it's bracketed IPv6 like "[::1]:9833" leave as-is (we expect plain "::1" in practice).
     if (!host.empty() && host.front()=='[') return host;
     // Otherwise strip "host:port" (wallet passes port separately).
     auto pos = host.find(':');
