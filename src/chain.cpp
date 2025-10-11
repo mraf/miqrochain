@@ -31,10 +31,10 @@
   #define __has_include(x) 0
 #endif
 
-#if __has_include("filters/blockfilter.h") && __has_include("filters/filter_store.h")
+#if __has_include("filters/bip158.h") && __has_include("filters/gcs.h") && __has_include("filters/filter_store.h")
   #define MIQ_HAVE_GCS_FILTERS 1
-  #include "filters/blockfilter.h"   // miq::gcs::build_block_filter(const Block&, std::vector<uint8_t>&)
-  #include "filters/filter_store.h"  // class miq::gcs::FilterStore
+  #include "filters/gcs.h"          // miq::gcs::build_block_filter(...)
+  #include "filters/filter_store.h" // class miq::gcs::FilterStore
 #else
   #define MIQ_HAVE_GCS_FILTERS 0
 #endif
@@ -1170,14 +1170,8 @@ bool Chain::disconnect_tip_once(std::string& err){
     // Commit reversals atomically if backend supports it
     if (!utxo_apply_ops(utxo_, ops, err)) return false;
 
-#if MIQ_HAVE_GCS_FILTERS
-    // Remove the filter for the block being disconnected (best-effort).
-    if (!g_filter_store.remove(tip_.height, tip_.hash)) {
-        // not fatal; log best-effort
-        log_warn("FilterStore: remove failed for height=" + std::to_string(tip_.height) +
-                 " hash=" + hexstr(tip_.hash));
-    }
-#endif
+    // NOTE: we do NOT remove filters here. On future re-connect at the same height,
+    // the new filter will overwrite the old entry via FilterStore::put().
 
     Block prev;
     if (!get_block_by_hash(cur.header.prev_hash, prev)) {
@@ -1352,5 +1346,19 @@ bool Chain::have_block(const std::vector<uint8_t>& h) const{
 long double Chain::work_from_bits_public(uint32_t bits) {
     return work_from_bits(bits);
 }
+
+#if MIQ_HAVE_GCS_FILTERS
+bool Chain::get_filter_headers(uint32_t start, uint32_t count,
+                               std::vector<std::array<uint8_t,32>>& out) const {
+    MIQ_CHAIN_GUARD();
+    return g_filter_store.get_headers(start, count, out);
+}
+
+bool Chain::get_filters_with_hash(uint32_t start, uint32_t count,
+                                  std::vector<std::pair<std::array<uint8_t,32>, std::vector<uint8_t>>>& out) const {
+    MIQ_CHAIN_GUARD();
+    return g_filter_store.get_filters(start, count, out);
+}
+#endif
 
 }
