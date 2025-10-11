@@ -318,27 +318,30 @@ static bool wallet_session(const std::string& cli_host,
     miq::HdWallet w(seed, meta);
     const std::string wdir = default_wallet_dir();
 
-    // derive a key horizon (+20 lookahead)
+    // derive a key horizon (GAP lookahead)
     struct Key { std::vector<uint8_t> priv, pub, pkh; uint32_t chain, index; };
     std::vector<Key> keys;
     auto add_range = [&](uint32_t chain, uint32_t upto){
-        for(uint32_t i=0;i<=upto + 20; ++i){
+        const uint32_t GAP = (uint32_t)env_u64("MIQ_GAP_LIMIT", 100);
+        for(uint32_t i=0;i<=upto + GAP; ++i){
             Key k; k.chain=chain; k.index=i;
             if(!w.DerivePrivPub(meta.account, chain, i, k.priv, k.pub)) continue;
             k.pkh = miq::hash160(k.pub);
             keys.push_back(std::move(k));
         }
     };
-    const uint32_t GAP = (uint32_t)env_u64("MIQ_GAP_LIMIT", 100);
-    uint32_t end_recv = meta.next_recv + GAP;
-    add_range(0, end_recv);
-    uint32_t end_change = meta.next_change + GAP;
-    add_range(1, end_change);
+    add_range(0, meta.next_recv);
+    add_range(1, meta.next_change);
 
     std::vector<std::vector<uint8_t>> pkhs; pkhs.reserve(keys.size());
     for(auto& k: keys) pkhs.push_back(k.pkh);
+    // reverse map PKH -> (chain,index) for meta bump
     std::unordered_map<std::string, std::pair<uint32_t,uint32_t>> pkh2ci;
-    for (auto& k: keys) { pkh2ci[miq::to_hex(k.pkh)] = {k.chain, k.index}; }
+    pkh2ci.reserve(keys.size());
+    for (const auto& k : keys) {
+        pkh2ci[miq::to_hex(k.pkh)] = {k.chain, k.index};
+    }
+
 
     auto seeds = build_seed_candidates(cli_host, cli_port);
     std::cout << "Chain: " << CHAIN_NAME << "\n";
@@ -374,28 +377,29 @@ static bool wallet_session(const std::string& cli_host,
             save_pending(wdir, pending);
         }
 
-                // bump meta next indices based on highest seen PKH indexes in UTXOs
+        // advance meta.next_* based on highest used PKH indexes observed in UTXOs
         {
             uint32_t max_recv = meta.next_recv;
             uint32_t max_change = meta.next_change;
-            for (const auto& u: utxos) {
+            for (const auto& u : utxos) {
                 auto it = pkh2ci.find(miq::to_hex(u.pkh));
                 if (it != pkh2ci.end()) {
-                    if (it->second.first == 0) max_recv = std::max<uint32_t>(max_recv, it->second.second + 1);
-                    else if (it->second.first == 1) max_change = std::max<uint32_t>(max_change, it->second.second + 1);
+                    if (it->second.first == 0) { if (it->second.second + 1 > max_recv) max_recv = it->second.second + 1; }
+                    if (it->second.first == 1) { if (it->second.second + 1 > max_change) max_change = it->second.second + 1; }
                 }
             }
             if (max_recv != meta.next_recv || max_change != meta.next_change) {
                 auto m = meta; m.next_recv = max_recv; m.next_change = max_change;
-                std::string e2; (void)e2;
-                if(!miq::SaveHdWallet(wdir, seed, m, wpass, e2)) {
-                    std::cout << "WARN: SaveHdWallet(next_*) failed: " << e2 << "\n";
+                std::string e;
+                if(!miq::SaveHdWallet(wdir, seed, m, pass, e)){
+                    std::cout << "WARN: SaveHdWallet(next_*) failed: " << e << "\n";
                 } else {
                     meta = m;
                 }
             }
         }
-WalletBalance wb = compute_balance(utxos, pending);
+
+        WalletBalance wb = compute_balance(utxos, pending);
         std::cout << "=== Wallet (" << CHAIN_NAME << ") via " << used_seed << " ===\n";
         std::cout << "Total:        " << fmt_amount(wb.total)        << " MIQ  (" << wb.total        << ")\n";
         std::cout << "Spendable:    " << fmt_amount(wb.spendable)    << " MIQ  (" << wb.spendable    << ")\n";
