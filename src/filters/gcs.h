@@ -6,9 +6,12 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <limits>
 
-// Forward declare Block so callers (e.g., chain.cpp) can call build_block_filter.
-namespace miq { struct Block; }
+// Bring in the project types we actually use in the real build.
+#include "tx.h"        // Transaction, TxIn, TxOut, OutPoint
+#include "block.h"     // Block::block_hash(), Block::txs
+#include "hash160.h"   // std::vector<uint8_t> hash160(const std::vector<uint8_t>&)
 
 namespace miq {
 namespace gcs {
@@ -328,8 +331,64 @@ inline bool match_any(const Filter& f, const std::vector<std::vector<uint8_t>>& 
     return false;
 }
 
-// ---- Declaration used by chain.cpp (implemented elsewhere in your repo) ----
-bool build_block_filter(const ::miq::Block& b, std::vector<uint8_t>& out);
+// ---------------- Real element extraction + wiring ----------------
+
+// Helpers
+inline bool is_zero32(const std::vector<uint8_t>& v){
+    if (v.size() != 32) return false;
+    for (uint8_t b : v) if (b) return false;
+    return true;
+}
+inline bool is_coinbase(const Transaction& tx){
+    return tx.vin.size() == 1
+        && is_zero32(tx.vin[0].prev.txid)
+        && tx.vin[0].prev.vout == 0;
+}
+
+// BIP158 basic params
+static inline Params basic_params(){
+    return Params{19u, 784931u};
+}
+
+// Build a block filter:
+//  - Elements:
+//      * For every TxOut: 20-byte pkh (scriptPubKey key material in this P2PKH-only design).
+//      * For every non-coinbase TxIn: HASH160(pubkey) (equals prevout scriptPubKey’s pkh).
+//  - Key: first 16 bytes of the block hash.
+inline bool build_block_filter(const ::miq::Block& b, std::vector<uint8_t>& out_bytes)
+{
+    // Collect elements
+    std::vector<std::vector<uint8_t>> elements;
+    elements.reserve(64);
+
+    for (const auto& tx : b.txs) {
+        // Outputs: include pkh (20 bytes)
+        for (const auto& o : tx.vout) {
+            if (o.pkh.size() == 20) elements.push_back(o.pkh);
+        }
+        // Inputs: if not coinbase, include HASH160(pubkey)
+        if (!is_coinbase(tx)) {
+            for (const auto& in : tx.vin) {
+                if (!in.pubkey.empty()) {
+                    auto h = hash160(in.pubkey);
+                    if (h.size() == 20) elements.push_back(std::move(h));
+                }
+            }
+        }
+    }
+
+    // Derive SipHash key from the block hash (first 16 bytes)
+    auto bh = b.block_hash();
+    if (bh.size() < 16) return false;
+    std::array<uint8_t,16> key{};
+    std::copy(bh.begin(), bh.begin()+16, key.begin());
+
+    // Build the filter
+    const auto params = basic_params();
+    auto f = build(key, elements, params);
+    out_bytes = std::move(f.bytes);
+    return true;
+}
 
 }
 }
