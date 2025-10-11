@@ -1,3 +1,4 @@
+// src/miqwallet.cpp  (no-implicit-localhost, public-first, SPV-safe)
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -18,8 +19,6 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <set>
-#include <mutex>
-#include <atomic>
 
 #include "constants.h"
 #include "hd_wallet.h"
@@ -119,7 +118,62 @@ static void save_pending(const std::string& wdir, const std::set<OutpointKey>& s
 }
 
 // -------------------------------------------------------------
-// Seeds (remote-first; no automatic localhost)
+// Net helpers: drop loopback/private from seeds (defense-in-depth)
+// -------------------------------------------------------------
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+#else
+  #include <sys/types.h>
+  #include <sys/socket.h>
+  #include <netdb.h>
+  #include <arpa/inet.h>
+#endif
+
+static bool is_loopback_or_private_sockaddr(const sockaddr* sa){
+    if (!sa) return true;
+    if (sa->sa_family == AF_INET){
+        const sockaddr_in* a = (const sockaddr_in*)sa;
+        uint32_t be = a->sin_addr.s_addr;
+        uint8_t A = uint8_t(be>>24), B = uint8_t(be>>16);
+        if (A==127) return true;                 // loopback
+        if (A==10)  return true;                 // 10.0.0.0/8
+        if (A==192 && B==168) return true;       // 192.168.0.0/16
+        if (A==172 && ((uint8_t(be>>20)&0x0F)>=1 && (uint8_t(be>>20)&0x0F)<=15)) return true; // 172.16/12
+        if (A==0 || A>=224) return true;         // 0.0.0.0/8 or multicast etc.
+        return false;
+    }
+    if (sa->sa_family == AF_INET6){
+        const sockaddr_in6* a6 = (const sockaddr_in6*)sa;
+        const uint8_t* b = (const uint8_t*)&a6->sin6_addr;
+        bool loop = true; for (int i=0;i<15;i++){ if (b[i]!=0) { loop=false; break; } }
+        if (loop && b[15]==1) return true;       // ::1
+        // treat fc00::/7 (ULA) and fe80::/10 (link-local) as private
+        if ((b[0] & 0xFE) == 0xFC) return true;  // fc00::/7
+        if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) return true; // fe80::/10
+        return false;
+    }
+    return true;
+}
+
+// Resolve a host and return true if ANY addr looks public (non-loopback/private)
+static bool resolves_to_public_ip(const std::string& host, const std::string& port){
+    addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
+#ifdef AI_ADDRCONFIG
+    hints.ai_flags = AI_ADDRCONFIG;
+#endif
+    addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res) return false;
+    bool ok = false;
+    for (auto p = res; p; p = p->ai_next){
+        if (!is_loopback_or_private_sockaddr(p->ai_addr)) { ok = true; break; }
+    }
+    freeaddrinfo(res);
+    return ok;
+}
+
+// -------------------------------------------------------------
+// Seeds (public-first; NO implicit localhost)
 // -------------------------------------------------------------
 static void push_unique(std::vector<std::pair<std::string,std::string>>& v,
                         const std::string& h, const std::string& p,
@@ -135,12 +189,12 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
     std::vector<std::pair<std::string,std::string>> seeds;
     std::unordered_set<std::string> seen;
 
-    // 0) CLI seed (if provided) — explicit override by user
+    // 0) CLI seed (if provided) — explicit host always respected.
     if(!cli_host.empty()){
         push_unique(seeds, cli_host, cli_port, seen);
     }
 
-    // 1) MIQ_P2P_SEED (comma list)
+    // 1) MIQ_P2P_SEED (comma list). Each token may have optional :port
     if(const char* e = std::getenv("MIQ_P2P_SEED"); e && *e){
         std::string v = e;
         size_t start = 0;
@@ -155,30 +209,34 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
         }
     }
 
-    // 2) Public IP (if any is bundled)
+    // 2) Your public node FIRST by default (works globally)
     push_unique(seeds, "62.38.73.147", std::to_string(miq::P2P_PORT), seen);
 
-    // 3) DNS seeds from constants.h
+    // 3) DNS seeds (constants.h)
     push_unique(seeds, miq::DNS_SEED, std::to_string(miq::P2P_PORT), seen);
     for(size_t i=0;i<miq::DNS_SEEDS_COUNT;i++){
         push_unique(seeds, miq::DNS_SEEDS[i], std::to_string(miq::P2P_PORT), seen);
     }
 
-    // 4) Optional: allow localhost *only if explicitly enabled* (kept available for devs)
-    if (env_truthy("MIQ_TRY_LOCAL")) {
-        push_unique(seeds, "127.0.0.1", std::to_string(miq::P2P_PORT), seen);
-        push_unique(seeds, "::1",       std::to_string(miq::P2P_PORT), seen);
-        push_unique(seeds, "localhost", std::to_string(miq::P2P_PORT), seen);
-    }
+    // 4) NO implicit localhost fallback here (professional default).
+    // If you ever want to test localhost explicitly, run with:
+    //   --p2pseed 127.0.0.1  (or set MIQ_P2P_SEED=127.0.0.1)
 
-    return seeds;
+    // Final filter: drop entries that resolve only to loopback/private addrs.
+    std::vector<std::pair<std::string,std::string>> out;
+    out.reserve(seeds.size());
+    for (const auto& hp : seeds){
+        const std::string& h = hp.first;
+        const std::string& p = hp.second;
+        // If it's a literal IPv4/IPv6, check it right away; if it's a name, resolve once.
+        if (resolves_to_public_ip(h, p)) out.push_back(hp);
+    }
+    return out;
 }
 
 // -------------------------------------------------------------
-// SPV collection and broadcast helpers (concurrent seed racing)
+// SPV collection and broadcast helpers
 // -------------------------------------------------------------
-struct SeedDiag { std::string hostport, err; };
-
 static bool spv_collect_any_seed(const std::vector<std::pair<std::string,std::string>>& seeds,
                                  const std::vector<std::vector<uint8_t>>& pkhs,
                                  uint32_t recent_window,
@@ -189,58 +247,26 @@ static bool spv_collect_any_seed(const std::vector<std::pair<std::string,std::st
     used_host.clear(); last_err.clear();
     out.clear();
 
-    if (seeds.empty()) { last_err = "no seeds available"; return false; }
-
     miq::SpvOptions opts{};
-    // Conservative default; override via MIQ_SPV_WINDOW when you need deeper scan
+    // Slightly wider default to avoid missing older funds; override with MIQ_SPV_WINDOW as needed.
     opts.recent_block_window = recent_window;
 
-    std::atomic<bool> done{false};
-    std::mutex mu;
-    std::vector<miq::UtxoLite> best;
-    std::vector<SeedDiag> diags;
-
-    std::vector<std::thread> workers;
-    workers.reserve(seeds.size());
-
-    for (const auto& hp : seeds) {
-        workers.emplace_back([&, h = hp.first, p = hp.second](){
-            if (done.load(std::memory_order_relaxed)) return;
-            std::vector<miq::UtxoLite> v;
-            std::string e;
-            bool ok = miq::spv_collect_utxos(h, p, pkhs, opts, v, e);
-            if (ok) {
-                bool expected = false;
-                if (done.compare_exchange_strong(expected, true)) {
-                    std::lock_guard<std::mutex> lk(mu);
-                    best.swap(v);
-                    used_host = h + ":" + p;
-                }
-            } else {
-                std::lock_guard<std::mutex> lk(mu);
-                diags.push_back(SeedDiag{ h + ":" + p, (e.empty() ? "connect failed" : e) });
-            }
-        });
-    }
-
-    for (auto& t : workers) t.join();
-
-    if (done.load()) {
-        out.swap(best);
-        return true;
-    }
-
-    // Build aggregated error
     std::ostringstream diag;
-    diag << "all seeds failed:\n";
-    if (diags.empty()) {
-        diag << "  (no detailed errors)\n";
-    } else {
-        for (const auto& d : diags) {
-            diag << "  - " << d.hostport << " -> " << d.err << "\n";
+    bool any=false;
+
+    for(const auto& [h,p] : seeds){
+        any=true;
+        std::vector<miq::UtxoLite> v; std::string e;
+        if(miq::spv_collect_utxos(h, p, pkhs, opts, v, e)){
+            out.swap(v);
+            used_host = h + ":" + p;
+            return true;
         }
+        diag << "  - " << h << ":" << p << " -> " << (e.empty() ? "connect failed" : e) << "\n";
+        last_err = e.empty() ? "connect failed" : e;
     }
-    last_err = diag.str();
+    if(!any) last_err = "no seeds available";
+    else last_err = std::string("all seeds failed:\n") + diag.str();
     return false;
 }
 
@@ -267,42 +293,20 @@ static bool broadcast_any_seed(const std::vector<std::pair<std::string,std::stri
                                std::string& last_err)
 {
     used_host.clear(); last_err.clear();
-    if (seeds.empty()) { last_err = "no seeds available"; return false; }
-
-    std::atomic<bool> sent{false};
-    std::mutex mu;
-    std::vector<SeedDiag> diags;
-
-    std::vector<std::thread> workers;
-    workers.reserve(seeds.size());
-
-    for (const auto& hp : seeds) {
-        workers.emplace_back([&, h = hp.first, p = hp.second](){
-            if (sent.load(std::memory_order_relaxed)) return;
-            std::string e;
-            bool ok = p2p_broadcast_tx_one(h, p, raw, e);
-            if (ok) {
-                bool expected = false;
-                if (sent.compare_exchange_strong(expected, true)) {
-                    std::lock_guard<std::mutex> lk(mu);
-                    used_host = h + ":" + p;
-                }
-            } else {
-                std::lock_guard<std::mutex> lk(mu);
-                diags.push_back(SeedDiag{ h + ":" + p, (e.empty() ? "connect failed" : e) });
-            }
-        });
-    }
-
-    for (auto& t : workers) t.join();
-
-    if (sent.load()) return true;
-
     std::ostringstream diag;
-    diag << "all seeds failed:\n";
-    if (diags.empty()) diag << "  (no detailed errors)\n";
-    else for (const auto& d : diags) diag << "  - " << d.hostport << " -> " << d.err << "\n";
-    last_err = diag.str();
+    bool any=false;
+    for(const auto& [h,p] : seeds){
+        any=true;
+        std::string e;
+        if(p2p_broadcast_tx_one(h,p,raw,e)){
+            used_host = h + ":" + p;
+            return true;
+        }
+        diag << "  - " << h << ":" << p << " -> " << (e.empty() ? "connect failed" : e) << "\n";
+        last_err = e.empty() ? "connect failed" : e;
+    }
+    if(!any) last_err = "no seeds available";
+    else last_err = std::string("all seeds failed:\n") + diag.str();
     return false;
 }
 
@@ -410,15 +414,15 @@ static bool wallet_session(const std::string& cli_host,
     }
     std::cout << "\n";
 
-    // SAFE default; override with MIQ_SPV_WINDOW (e.g. 200000) when needed
-    const uint32_t spv_win = (uint32_t)env_u64("MIQ_SPV_WINDOW", 5000);
+    // Slightly wider default; override with MIQ_SPV_WINDOW (e.g., 200000) if scanning deep history
+    const uint32_t spv_win = (uint32_t)env_u64("MIQ_SPV_WINDOW", 8000);
 
     // Load pending-spent cache
     std::set<OutpointKey> pending;
     load_pending(wdir, pending);
 
     auto refresh_and_print = [&]()->std::vector<miq::UtxoLite>{
-        std::cout << "\nSyncing (P2P/SPV)...\n";
+        std::cout << "\nSyncing (P2P/SPV)…\n";
         std::vector<miq::UtxoLite> utxos; std::string used_seed, err;
         if(!spv_collect_any_seed(seeds, pkhs, spv_win, utxos, used_seed, err)){
             std::cout << "SPV failed:\n" << err << "\n";
@@ -478,9 +482,7 @@ static bool wallet_session(const std::string& cli_host,
         std::string c; std::getline(std::cin, c); c=trim(c);
 
         if(c=="1"){
-            // list first N receive addresses (derived up to next_recv)
-            int N = (int)meta.next_recv;
-            if(N<=0) N = 1;
+            int N = (int)meta.next_recv; if(N<=0) N = 1;
             std::cout << "Receive addresses:\n";
             for(int i=0;i<N;i++){
                 std::string addr;
@@ -490,22 +492,17 @@ static bool wallet_session(const std::string& cli_host,
                 }
             }
         } else if(c=="2"){
-            // send funds
             std::cout << "Recipient address: "; std::string to; std::getline(std::cin, to); to=trim(to);
             std::cout << "Amount (MIQ, e.g. 1.23456789): "; std::string amt; std::getline(std::cin, amt); amt=trim(amt);
             uint64_t amount=0; try{ amount = parse_amount_miqron(amt);}catch(...){ std::cout<<"Bad amount\n"; continue;}
 
-            // decode dest
             uint8_t ver=0; std::vector<uint8_t> payload;
             if(!miq::base58check_decode(to, ver, payload) || ver!=miq::VERSION_P2PKH || payload.size()!=20){
                 std::cout << "Bad address.\n"; continue;
             }
 
-            // recompute utxos fresh
             utxos = refresh_and_print();
 
-            // filter for spendable (mature coinbase + not pending-held)
-            // approximate tip height:
             uint64_t tip_h=0; for(const auto& u: utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
 
             std::vector<miq::UtxoLite> spendables;
@@ -522,7 +519,6 @@ static bool wallet_session(const std::string& cli_host,
 
             if(spendables.empty()){ std::cout<<"No spendable UTXOs (all immature or pending-held).\n"; continue; }
 
-            // oldest-first, then larger
             std::stable_sort(spendables.begin(), spendables.end(), [](const miq::UtxoLite& a, const miq::UtxoLite& b){
                 if(a.height != b.height) return a.height < b.height;
                 return a.value > b.value;
@@ -539,7 +535,6 @@ static bool wallet_session(const std::string& cli_host,
             }
             if(tx.vin.empty()){ std::cout << "Insufficient funds.\n"; continue; }
 
-            // outputs + fee
             uint64_t fee_final = 0, change = 0;
             {
                 auto fee2 = fee_for(tx.vin.size(), 2, 1000);
@@ -552,33 +547,34 @@ static bool wallet_session(const std::string& cli_host,
                     if(change < 1000){ change = 0; fee_final = fee_for(tx.vin.size(), 1, 1000); }
                 }
             }
-            (void)fee_final; // implied by inputs-outputs
 
             miq::TxOut o; o.pkh = payload; o.value = amount; tx.vout.push_back(o);
 
-            // change -> new change address
             bool used_change=false; std::vector<uint8_t> cpub, cpriv, cpkh;
             if(change>0){
-                if(!w.DerivePrivPub(meta.account, 1, meta.next_change, cpriv, cpub)){ std::cout << "derive change failed\n"; continue; }
+                miq::HdWallet w2(seed, meta);
+                if(!w2.DerivePrivPub(meta.account, 1, meta.next_change, cpriv, cpub)){ std::cout << "derive change failed\n"; continue; }
                 cpkh = miq::hash160(cpub);
                 miq::TxOut ch; ch.value = change; ch.pkh = cpkh; tx.vout.push_back(ch); used_change=true;
             }
 
-            // sign inputs
             auto sighash = [&](){ miq::Transaction t=tx; for(auto& i: t.vin){ i.sig.clear(); i.pubkey.clear(); } return miq::dsha256(miq::ser_tx(t)); }();
-            auto find_key_for_pkh = [&](const std::vector<uint8_t>& pkh)->const Key*{
-                for(const auto& k: keys) if(k.pkh==pkh) return &k;
+            auto find_key_for_pkh = [&](const std::vector<uint8_t>& pkh)->const std::vector<uint8_t>*{
+                for(const auto& k: keys) if(k.pkh==pkh) return &k.priv;
                 return nullptr;
             };
             for(auto& in : tx.vin){
                 const miq::UtxoLite* u=nullptr;
                 for(const auto& x: utxos) if(x.txid==in.prev.txid && x.vout==in.prev.vout){ u=&x; break; }
                 if(!u){ std::cout << "internal: utxo lookup failed\n"; goto send_done; }
-                auto* K = find_key_for_pkh(u->pkh);
-                if(!K){ std::cout << "internal: key lookup failed\n"; goto send_done; }
+                const std::vector<uint8_t>* priv = find_key_for_pkh(u->pkh);
+                if(!priv){ std::cout << "internal: key lookup failed\n"; goto send_done; }
                 std::vector<uint8_t> sig64;
-                if(!miq::crypto::ECDSA::sign(K->priv, sighash, sig64)){ std::cout << "sign failed\n"; goto send_done; }
-                in.sig = sig64; in.pubkey = K->pub;
+                if(!miq::crypto::ECDSA::sign(*priv, sighash, sig64)){ std::cout << "sign failed\n"; goto send_done; }
+                // retrieve the pubkey from our prepared list:
+                std::vector<uint8_t> pubkey;
+                for (const auto& k: keys) if (k.pkh == u->pkh) { pubkey = k.pub; break; }
+                in.sig = sig64; in.pubkey = pubkey;
             }
 
             {
@@ -586,33 +582,30 @@ static bool wallet_session(const std::string& cli_host,
                 std::string txid_hex = miq::to_hex(tx.txid());
                 std::string used_bcast_seed, berr;
                 auto seeds_b = build_seed_candidates(cli_host, cli_port);
-                std::cout << "Broadcasting via P2P...\n";
+                std::cout << "Broadcasting via P2P…\n";
                 if(!broadcast_any_seed(seeds_b, raw, used_bcast_seed, berr)){
                     std::cout << "P2P broadcast failed:\n" << berr << "\n";
                     goto send_done;
                 }
                 std::cout << "Broadcasted via " << used_bcast_seed << ". Txid: " << txid_hex << "\n";
 
-                // hold inputs in pending cache
                 for(const auto& in : tx.vin){
                     pending.insert(OutpointKey{ miq::to_hex(in.prev.txid), in.prev.vout });
                 }
                 save_pending(wdir, pending);
 
-                // bump change index if used
                 if(used_change){
                     auto m = w.meta(); m.next_change = meta.next_change + 1;
                     std::string e;
                     if(!miq::SaveHdWallet(wdir, seed, m, pass, e)){
                         std::cout << "WARN: SaveHdWallet(next_change) failed: " << e << "\n";
                     } else {
-                        meta = m; // keep in-session meta updated
+                        meta = m;
                     }
                 }
             }
 
         send_done:
-            // refresh view
             utxos = refresh_and_print();
         } else if(c=="r" || c=="R"){
             utxos = refresh_and_print();
@@ -645,7 +638,6 @@ static bool flow_create_wallet(const std::string& cli_host, const std::string& c
     std::string e;
     if(!miq::SaveHdWallet(wdir, seed, meta, wpass, e)){ std::cout << "save failed: " << e << "\n"; return false; }
 
-    // produce first address
     miq::HdWallet w(seed, meta);
     std::string addr;
     if(!w.GetNewAddress(addr)) { std::cout << "derive address failed\n"; return false; }
@@ -654,7 +646,6 @@ static bool flow_create_wallet(const std::string& cli_host, const std::string& c
 
     std::cout << "First receive address: " << addr << "\n";
 
-    // straight into session
     return wallet_session(cli_host, cli_port, seed, w.meta(), wpass);
 }
 
@@ -675,7 +666,6 @@ static bool flow_load_from_seed(const std::string& cli_host, const std::string& 
     std::string e;
     if(!miq::SaveHdWallet(wdir, seed, meta, wpass, e)){ std::cout << "save failed: " << e << "\n"; return false; }
 
-    // make first address now so wallet has next_recv advanced
     miq::HdWallet w(seed, meta);
     std::string addr;
     if(!w.GetNewAddress(addr)) { std::cout << "derive address failed\n"; return false; }
