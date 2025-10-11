@@ -1,10 +1,11 @@
-// miqminer_rpc.cpp  — fixed RPC miner for MIQ
-// - Robust JSON number parsing (handles 5e9, etc.) so rewards/fees display correctly
-// - Address sources: --address, MIQ_MINER_ADDRESS/MIQ_ADDRESS, prompt (if TTY), RPC getnewaddress
+// miqminer_rpc.cpp  — RPC solo miner for MIQ
+// - Smooth, non-flickery hashrate display (EMA ~2s, instant updates 1 Hz)
+// - Robust JSON number parsing (handles 5e9, etc.)
+// - Address sources: --address, MIQ_MINER_ADDRESS/MIQ_ADDRESS, prompt (if TTY), or RPC getnewaddress
 // - Aligns with node RPC (bits/adjusted_bits, top-level string getblockhash)
 // - Clear submit/accept UI; last-found only set after acceptance polling
-// - 128-frame generated cube; no static tables needed
-// - Safer console I/O, explicit flush, better diagnostics
+// - 128-frame generated cube
+// - POSIX build fix (ai_addrlen); remove unused nonce_ptr when MIQ_POW_SALT is off
 
 #include "constants.h"
 #include "block.h"
@@ -136,7 +137,7 @@ static bool json_find_string(const std::string& json, const std::string& key, st
         out = json.substr(p, q-p);
         return true;
     }
-    // also allow bare strings in top-level result wrappers
+    // allow bare strings too (top-level result wrapper on some nodes)
     size_t q=p;
     while(q<json.size() && (std::isalnum((unsigned char)json[q])||json[q]=='_'||json[q]=='.')) ++q;
     if(q>p){ out = json.substr(p, q-p); trim(out); return !out.empty(); }
@@ -276,7 +277,7 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
         miq_closesocket(s); s = INVALID_SOCKET;
 #else
         if(s<0) continue;
-        if(connect(s, ai->ai_addr, (socklen_t)ai->ailen)==0) break;
+        if(connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen)==0) break;
         miq_closesocket(s); s = -1;
 #endif
     }
@@ -599,7 +600,7 @@ static void generate_frames_128(){
         std::array<std::string,kAnimLines> block{};
         for(int i=0;i<kAnimLines;i++){
             std::string L(W,' ');
-            // draw a beveled block with moving diagonal shimmer
+            // beveled block with moving diagonal shimmer
             for(int x=1;x<W-1;++x){
                 bool edge = (i==0||i==kAnimLines-1||x==1||x==W-2);
                 if(edge){ L[x] = '#'; continue; }
@@ -629,13 +630,12 @@ struct CandidateStats {
 struct UIState {
     // hash metering
     std::atomic<uint64_t> tries{0};
-    std::atomic<uint64_t> tries_last{0};
     std::atomic<uint64_t> mined_blocks{0};
-    std::atomic<double>   net_hashps{0.0};
+    std::atomic<double>   hashps_inst{0.0};  // instant (1 Hz)
+    std::atomic<double>   hashps_avg{0.0};   // smoothed EMA (~2s)
 
-    // live + average hashrate (EMA)
-    std::atomic<double>   hashps_inst{0.0};
-    std::atomic<double>   hashps_avg{0.0};
+    // network
+    std::atomic<double>   net_hashps{0.0};
 
     // tip
     std::atomic<uint64_t> tip_height{0};
@@ -664,7 +664,7 @@ static std::string fmt_miq(uint64_t sat){
     return s.str();
 }
 
-// ===== UI draw loop (single-thread; cube fixed; ~12 FPS) =====================
+// ===== UI draw loop (single-thread; ~12 FPS) =================================
 static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui, const std::atomic<bool>* running){
 #if defined(_WIN32)
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -676,23 +676,9 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
     const int FPS = 12;
     const auto frame_dt = std::chrono::milliseconds(1000/FPS);
 
-    auto last_rate_t = clock::now();
-    uint64_t last_tries = ui->tries.load();
     uint64_t frame = 0;
 
     while(running->load(std::memory_order_relaxed)){
-        const auto now = clock::now();
-        const double dt = std::chrono::duration<double>(now - last_rate_t).count();
-        const uint64_t cur_tries = ui->tries.load();
-        if (dt > 0.0){
-            const double hps = (double)((cur_tries >= last_tries) ? (cur_tries - last_tries) : 0ULL) / dt;
-            ui->hashps_inst.store(hps);
-            double ema = ui->hashps_avg.load();
-            const double alpha = 0.25;
-            ui->hashps_avg.store(ema*(1.0-alpha) + hps*alpha);
-        }
-        last_rate_t = now; last_tries = cur_tries;
-
         std::ostringstream out;
         out << "\x1b[2J\x1b[H"; // clear + home
         out << "  \x1b[1mMIQ Miner (RPC)\x1b[0m  —  address: " << addr << "     threads: " << threads << "\n\n";
@@ -737,14 +723,15 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
         }
 
         out << "\n";
-        out << "  local hashrate:   " << fmt_hs(ui->hashps_inst.load()) << "  (avg " << fmt_hs(ui->hashps_avg.load()) << ")\n";
+        // Use smoothed hashrate as primary, instant (1 Hz) secondary
+        out << "  local hashrate:   " << fmt_hs(ui->hashps_avg.load()) << "  (inst " << fmt_hs(ui->hashps_inst.load()) << ")\n";
         out << "  network hashrate: " << fmt_hs(ui->net_hashps.load()) << "\n";
         out << "  mined (session):  " << ui->mined_blocks.load() << "\n";
         if(!ui->last_found_block_hash.empty())
             out << "  last found:       " << ui->last_found_block_hash << "  \x1b[2m(accepted)\x1b[0m\n";
 
         if(!ui->last_submit_msg.empty()){
-            auto age = std::chrono::duration<double>(now - ui->last_submit_when).count();
+            auto age = std::chrono::duration<double>(clock::now() - ui->last_submit_when).count();
             if(age < 5.0){
                 out << "  " << ui->last_submit_msg << "\n";
             }
@@ -797,11 +784,12 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
     FastSha256Ctx base1;
     fastsha_init(base1);
     fastsha_update(base1, header_prefix.data(), header_prefix.size());
-#endif
-
+#else
+    // Salted variant uses full header buffer with nonce pointer
     std::vector<uint8_t> hdr = header_prefix;
     hdr.resize(header_prefix.size() + 8);
     uint8_t* nonce_ptr = hdr.data() + nonce_off;
+#endif
 
     const uint64_t base_nonce =
         (static_cast<uint64_t>(time(nullptr)) << 32) ^ 0x9e3779b97f4a7c15ull;
@@ -1090,12 +1078,49 @@ int main(int argc, char** argv){
                                  &found, &tries, tid, threads, &found_block);
             }
 
-            // meter to UI
+            // Smooth hashrate meter thread:
+            // - updates ui.tries
+            // - instant hashrate at 1 Hz (reduces jitter)
+            // - EMA with ~2s time constant for smooth "local hashrate"
             std::thread meter([&](){
+                using clock = std::chrono::steady_clock;
+                auto prev_t = clock::now();
+                uint64_t prev_tries = 0;
+                double ema = ui.hashps_avg.load();
+
+                double inst_accum_time = 0.0;
+                uint64_t inst_prev_tries = 0;
+                auto inst_prev_t = prev_t;
+
                 while(!found.load(std::memory_order_relaxed)){
-                    ui.tries.store(tries.load(std::memory_order_relaxed));
                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    auto now = clock::now();
+                    double dt = std::chrono::duration<double>(now - prev_t).count();
+                    uint64_t cur = tries.load(std::memory_order_relaxed);
+                    uint64_t dT = (cur >= prev_tries) ? (cur - prev_tries) : 0ull;
+
+                    // EMA smoothing with time-based alpha (~2s tau)
+                    double sample_hps = (dt > 0.0) ? (double)dT / dt : 0.0;
+                    double alpha = 1.0 - std::exp(-dt / 2.0); // tau = 2s
+                    ema = ema*(1.0 - alpha) + sample_hps*alpha;
+                    ui.hashps_avg.store(ema);
+
+                    // instant at 1 Hz
+                    inst_accum_time += dt;
+                    if(inst_accum_time >= 1.0){
+                        double idt = std::chrono::duration<double>(now - inst_prev_t).count();
+                        uint64_t iT = (cur >= inst_prev_tries) ? (cur - inst_prev_tries) : 0ull;
+                        double inst = (idt > 0.0) ? (double)iT / idt : 0.0;
+                        ui.hashps_inst.store(inst);
+                        inst_prev_t = now;
+                        inst_prev_tries = cur;
+                        inst_accum_time = 0.0;
+                    }
+
+                    ui.tries.store(cur);
+                    prev_t = now; prev_tries = cur;
                 }
+                // final flush
                 ui.tries.store(tries.load(std::memory_order_relaxed));
             });
 
