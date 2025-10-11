@@ -69,6 +69,25 @@ static uint64_t fee_for(size_t nin, size_t nout, uint64_t feerate){
     return kb * feerate;
 }
 
+static uint64_t get_env_u64(const char* name, uint64_t defv){
+    if(const char* v = std::getenv(name)){
+        if(*v){
+            char* end=nullptr;
+            unsigned long long t = std::strtoull(v, &end, 10);
+            if(end && *end=='\0') return (uint64_t)t;
+        }
+    }
+    return defv;
+}
+
+static bool env_truthy(const char* name){
+    const char* v = std::getenv(name);
+    if(!v) return false;
+    std::string s = v;
+    for(char& c: s) c = (char)std::tolower((unsigned char)c);
+    return (s=="1" || s=="true" || s=="yes" || s=="on");
+}
+
 // -----------------------------------------------------------------------------
 // P2P helpers
 // -----------------------------------------------------------------------------
@@ -80,20 +99,12 @@ static bool p2p_broadcast_tx_one(const std::string& seed_host, const std::string
     o.host = seed_host;
     o.port = seed_port;
     o.user_agent = "/miqwallet-p2p:0.1/";
-    o.io_timeout_ms = 5000;             // valid for P2PLight::P2POpts (NOT SpvOptions)
+    o.io_timeout_ms = 5000;             // P2PLight option (not SpvOptions)
     miq::P2PLight p2p;
     if(!p2p.connect_and_handshake(o, err)) return false;
     bool ok = p2p.send_tx(raw_tx, err);
     p2p.close();
     return ok;
-}
-
-static bool env_truthy(const char* name){
-    const char* v = std::getenv(name);
-    if(!v) return false;
-    std::string s = v;
-    for(char& c: s) c = (char)std::tolower((unsigned char)c);
-    return (s=="1" || s=="true" || s=="yes" || s=="on");
 }
 
 static std::vector<std::pair<std::string,std::string>>
@@ -161,16 +172,15 @@ static bool try_spv_collect_any_seed(const std::vector<std::pair<std::string,std
     used_host.clear(); used_tip_height = 0; last_err.clear();
     out.clear();
 
-    miq::SpvOptions opts{};                 // use what exists in your tree
-    opts.recent_block_window = recent_window;
-    // NOTE: Do NOT set opts.io_timeout_ms here — it doesn't exist in your repo.
+    miq::SpvOptions opts{};
+    opts.recent_block_window = recent_window; // your SPV supports this; default increased below
 
     for(const auto& [h,p] : seeds){
         std::vector<miq::UtxoLite> v; std::string e;
         if(miq::spv_collect_utxos(h, p, pkhs, opts, v, e)){
             out.swap(v);
             used_host = h + ":" + p;
-            used_tip_height = 0;            // SpvOptions in your tree has no tip_height field
+            used_tip_height = 0; // not exposed by current SPV API; we’ll estimate below when needed
             return true;
         }
         last_err = e.empty() ? "tip query failed" : e;
@@ -250,6 +260,7 @@ static bool flow_send_p2p_only(const std::string& cli_host, const std::string& c
     struct Key { std::vector<uint8_t> priv, pub, pkh; uint32_t chain, index; };
     std::vector<Key> keys;
     auto add_range = [&](uint32_t chain, uint32_t upto){
+        // include +20 lookahead
         for(uint32_t i=0;i<=upto + 20; ++i){
             Key k; k.chain=chain; k.index=i;
             if(!w.DerivePrivPub(meta.account, chain, i, k.priv, k.pub)) continue;
@@ -266,31 +277,65 @@ static bool flow_send_p2p_only(const std::string& cli_host, const std::string& c
 
     auto seeds = build_seed_candidates(cli_host, cli_port);
 
+    // Larger default window so older funds are discovered
+    const uint32_t spv_win = (uint32_t)get_env_u64("MIQ_SPV_WINDOW", 200000);
+
     std::vector<miq::UtxoLite> utxos; std::string used_seed, perr;
-    uint32_t tip_h=0;
+    uint32_t tip_h_estimate=0;
     std::cout << "Syncing (P2P/SPV)…\n";
-    if(!try_spv_collect_any_seed(seeds, pkhs, /*recent_window=*/8000, utxos, used_seed, tip_h, perr)){
+    if(!try_spv_collect_any_seed(seeds, pkhs, spv_win, utxos, used_seed, tip_h_estimate, perr)){
         std::cout << "SPV collection failed: " << perr << "\n";
         return false;
     }
     if(utxos.empty()){
-        std::cout << "No spendable UTXOs found for this seed yet.\n";
+        std::cout << "No UTXOs found for these keys.\n";
         return false;
     }
 
-    // Build transaction: prefer coinbase first, then larger outputs
+    // Conservative tip-height estimate (SPV API doesn’t expose tip): use max UTXO height seen.
+    uint64_t approx_tip_h = 0;
+    for(const auto& u : utxos) if(u.height > approx_tip_h) approx_tip_h = u.height;
+
+    // Determine feerate: wallet default vs node min (env hints). Take the max.
+    const uint64_t wallet_feerate = get_env_u64("MIQ_WALLET_FEERATE", 1000);      // sat/KB
+    const uint64_t node_min_rate  = get_env_u64("MIQ_MIN_RELAY_FEE_RATE", 1000);  // sat/KB
+    const uint64_t feerate = std::max(wallet_feerate, node_min_rate);
+
+    // Filter for spendability: exclude immature coinbase. If we don’t know the tip exactly,
+    // use a conservative rule: require u.height + COINBASE_MATURITY <= approx_tip_h + 1
+    std::vector<miq::UtxoLite> spendables;
+    spendables.reserve(utxos.size());
+    for(const auto& u : utxos){
+        bool ok = true;
+        if (u.coinbase) {
+            const uint64_t mature_h = (uint64_t)u.height + (uint64_t)COINBASE_MATURITY;
+            // next block height is approx_tip_h + 1
+            if (approx_tip_h + 1 < mature_h) ok = false;
+        }
+        if (ok) spendables.push_back(u);
+    }
+
+    if(spendables.empty()){
+        std::cout << "No spendable UTXOs (all funds immature or locked).\n";
+        return false;
+    }
+
+    // Build transaction: oldest-first, then smallest-first (reduces change). No coinbase bias.
     miq::Transaction tx;
     uint64_t in_sum=0;
-    std::stable_sort(utxos.begin(), utxos.end(), [](const miq::UtxoLite& a, const miq::UtxoLite& b){
-        if(a.coinbase != b.coinbase) return a.coinbase && !b.coinbase;
-        return a.value > b.value;
-    });
+    std::stable_sort(spendables.begin(), spendables.end(),
+        [](const miq::UtxoLite& A, const miq::UtxoLite& B){
+            if (A.height != B.height) return A.height < B.height;  // older first
+            if (A.value  != B.value ) return A.value  < B.value;   // smaller first
+            if (A.txid   != B.txid  ) return A.txid   < B.txid;
+            return A.vout < B.vout;
+        });
 
-    for(const auto& u : utxos){
+    for(const auto& u : spendables){
         miq::TxIn in; in.prev.txid = u.txid; in.prev.vout = u.vout;
         tx.vin.push_back(in);
         in_sum += u.value;
-        uint64_t fee_guess = fee_for(tx.vin.size(), 2, 1000);
+        const uint64_t fee_guess = fee_for(tx.vin.size(), 2, feerate);
         if(in_sum >= amount + fee_guess) break;
     }
     if(tx.vin.empty()){ std::cout << "Insufficient funds.\n"; return false; }
@@ -298,17 +343,23 @@ static bool flow_send_p2p_only(const std::string& cli_host, const std::string& c
     // outputs + fee
     uint64_t fee_final = 0, change = 0;
     {
-        auto fee2 = fee_for(tx.vin.size(), 2, 1000);
+        const uint64_t fee2 = fee_for(tx.vin.size(), 2, feerate);
         if(in_sum < amount + fee2){
-            auto fee1 = fee_for(tx.vin.size(), 1, 1000);
-            if(in_sum < amount + fee1){ std::cout << "Insufficient (need fee).\n"; return false; }
+            const uint64_t fee1 = fee_for(tx.vin.size(), 1, feerate);
+            if(in_sum < amount + fee1){ std::cout << "Insufficient (need amount+fee).\n"; return false; }
             fee_final = fee1; change = 0;
         }else{
             fee_final = fee2; change = in_sum - amount - fee_final;
-            if(change < 1000){ change = 0; fee_final = fee_for(tx.vin.size(), 1, 1000); }
+            // fold dust change into fee
+            const uint64_t DUST = 1000; // 0.00001000 MIQ
+            if(change < DUST){
+                change = 0;
+                fee_final = fee_for(tx.vin.size(), 1, feerate);
+                if(in_sum < amount + fee_final){ std::cout << "Insufficient (after dust fold).\n"; return false; }
+            }
         }
     }
-    (void)fee_final; // fee implied by inputs-outputs
+    (void)fee_final; // implied by inputs-outputs
 
     miq::TxOut o; o.pkh = payload; o.value = amount; tx.vout.push_back(o);
 
@@ -320,14 +371,17 @@ static bool flow_send_p2p_only(const std::string& cli_host, const std::string& c
     }
 
     // sign each input
-    auto sighash = [&](){ miq::Transaction t=tx; for(auto& i: t.vin){ i.sig.clear(); i.pubkey.clear(); } return miq::dsha256(miq::ser_tx(t)); }();
+    auto sighash = [&](){
+        miq::Transaction t=tx; for(auto& i: t.vin){ i.sig.clear(); i.pubkey.clear(); }
+        return miq::dsha256(miq::ser_tx(t));
+    }();
     auto find_key_for_pkh = [&](const std::vector<uint8_t>& pkh)->const Key*{
         for(const auto& k: keys) if(k.pkh==pkh) return &k;
         return nullptr;
     };
     for(auto& in : tx.vin){
         const miq::UtxoLite* u=nullptr;
-        for(const auto& x: utxos) if(x.txid==in.prev.txid && x.vout==in.prev.vout){ u=&x; break; }
+        for(const auto& x: spendables) if(x.txid==in.prev.txid && x.vout==in.prev.vout){ u=&x; break; }
         if(!u){ std::cout << "internal: utxo lookup failed\n"; return false; }
         auto* K = find_key_for_pkh(u->pkh);
         if(!K){ std::cout << "internal: key lookup failed\n"; return false; }
@@ -389,10 +443,12 @@ static bool show_balance_spv(const std::string& cli_host, const std::string& cli
 
     auto seeds = build_seed_candidates(cli_host, cli_port);
 
+    const uint32_t spv_win = (uint32_t)get_env_u64("MIQ_SPV_WINDOW", 200000);
+
     std::vector<miq::UtxoLite> utxos; std::string used_seed, err;
     uint32_t tip_h=0;
     std::cout << "Syncing (P2P/SPV)…\n";
-    if(!try_spv_collect_any_seed(seeds, pkhs, 8000, utxos, used_seed, tip_h, err)){
+    if(!try_spv_collect_any_seed(seeds, pkhs, spv_win, utxos, used_seed, tip_h, err)){
         std::cout << "SPV collection failed: " << err << "\n";
         return false;
     }
@@ -413,9 +469,10 @@ int main(int argc, char** argv){
     std::string cli_port = std::to_string(miq::P2P_PORT);
 
     // parse flags
+    uint32_t cli_spv_window = 0; // 0 = use env/default
     for(int i=1;i<argc;i++){
         std::string a = argv[i];
-        auto eat = [&](const char* k, std::string& dst)->bool{
+        auto eat_str = [&](const char* k, std::string& dst)->bool{
             size_t L = std::strlen(k);
             if(a.rfind(k, 0)==0){
                 if(a.size()>L && a[L]=='='){ dst = a.substr(L+1); return true; }
@@ -423,8 +480,21 @@ int main(int argc, char** argv){
             }
             return false;
         };
-        if(eat("--p2pseed", cli_host)) { auto c=cli_host.find(':'); if(c!=std::string::npos){ cli_port=cli_host.substr(c+1); cli_host=cli_host.substr(0,c);} continue; }
-        if(eat("--p2pport", cli_port)) continue;
+        auto eat_u32 = [&](const char* k, uint32_t& dst)->bool{
+            size_t L = std::strlen(k);
+            if(a.rfind(k, 0)==0){
+                std::string v;
+                if(a.size()>L && a[L]=='=') v = a.substr(L+1);
+                else if(i+1<argc)           v = argv[++i];
+                else return false;
+                dst = (uint32_t)std::strtoul(v.c_str(), nullptr, 10);
+                return true;
+            }
+            return false;
+        };
+        if(eat_str("--p2pseed", cli_host)) { auto c=cli_host.find(':'); if(c!=std::string::npos){ cli_port=cli_host.substr(c+1); cli_host=cli_host.substr(0,c);} continue; }
+        if(eat_str("--p2pport", cli_port)) continue;
+        (void)eat_u32("--spvwindow", cli_spv_window);
     }
 
     std::cout << "Chain: " << CHAIN_NAME << "\n";
@@ -439,6 +509,12 @@ int main(int argc, char** argv){
         std::cout << "\n";
     }
 
+    // Show effective SPV window now (env/CLI/default)
+    {
+        uint32_t eff_spv = cli_spv_window ? cli_spv_window : (uint32_t)get_env_u64("MIQ_SPV_WINDOW", 200000);
+        std::cout << "SPV recent window: " << eff_spv << " blocks (override with --spvwindow N or MIQ_SPV_WINDOW)\n";
+    }
+
     for(;;){
         std::cout << "\n==== MIQ Wallet (P2P) ====\n";
         std::cout << "1) Create wallet\n";
@@ -449,8 +525,12 @@ int main(int argc, char** argv){
         std::string c; std::getline(std::cin, c); c=trim(c);
         if(c=="1"){ (void)make_or_restore_wallet(false); }
         else if(c=="2"){ (void)make_or_restore_wallet(true); }
-        else if(c=="3"){ (void)flow_send_p2p_only(cli_host, cli_port); }
-        else if(c=="4"){ (void)show_balance_spv(cli_host, cli_port); }
+        else if(c=="3"){
+            (void)flow_send_p2p_only(cli_host, cli_port);
+        }
+        else if(c=="4"){
+            (void)show_balance_spv(cli_host, cli_port);
+        }
         else if(c=="q"||c=="Q"||c=="exit") break;
     }
     return 0;
