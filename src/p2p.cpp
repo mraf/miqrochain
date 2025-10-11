@@ -667,12 +667,24 @@ static bool is_self_endpoint(int fd, uint16_t listen_port){
         auto* p = (sockaddr_in*)&peer;
         auto* l = (sockaddr_in*)&local;
 
-        // --- ALLOW localhost wallet connections ---
-        uint32_t peer_be = p->sin_addr.s_addr;
+        const uint32_t peer_be = p->sin_addr.s_addr;
+        const uint16_t peer_port = ntohs(p->sin_port);
+        (void)l; // local is our listen socket, its port == listen_port by definition.
+
+        // Always allow loopback (127.x) so a local wallet can connect.
         if ((ntohl(peer_be) >> 24) == 127) return false;
 
-        // --- Block only true hairpin to our own non-loopback IPs ---
-        if (is_self_be(peer_be) && ntohs(l->sin_port) == listen_port) return true;
+        // If the peer IP is one of our own non-loopback addresses,
+        // only drop the *true* self-dial case (remote port == our listen port).
+        // Otherwise allow same-host client connections (wallet on same box).
+        if (is_self_be(peer_be)) {
+            if (peer_port == listen_port) {
+                // This is us connecting to ourselves (bad). Drop it.
+                return true;
+            }
+            // Same-host but from an ephemeral port: allow.
+            return false;
+        }
     }
     return false;
 }
