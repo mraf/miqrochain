@@ -465,7 +465,8 @@ std::string RpcService::handle(const std::string& body){
                 "createhdwallet","restorehdwallet","walletinfo","getnewaddress","deriveaddressat",
                 "walletunlock","walletlock","getwalletinfo","listaddresses","listutxos",
                 "sendfromhd","getaddressutxos","getbalance",
-                "getminertemplate" // added to help list
+                "getminertemplate",
+                "submitblock","submitrawblock","sendrawblock" // NEW
                 // (getibdinfo exists but not listed here to keep help stable)
             };
             std::vector<JNode> v;
@@ -691,7 +692,7 @@ std::string RpcService::handle(const std::string& body){
             auto txs_vec = mempool_.collect(5000);
             std::vector<JNode> arr;
 
-            // Build a quick index from txid -> (fee, vsize, raw, depends[])
+            // Build a quick index from txid -> (fee, vsize, hex, depends[])
             std::map<std::string, std::tuple<uint64_t, uint32_t, std::string, std::vector<std::string>>> mapTx;
             std::map<std::string, std::vector<std::string>> mapDeps;
 
@@ -716,7 +717,7 @@ std::string RpcService::handle(const std::string& body){
                 mapTx[to_hex(tx.txid())] = std::make_tuple(fee, vsize, to_hex(raw), std::vector<std::string>{});
             }
 
-            // Transfer to JSON
+            // Transfer to JSON (use "hex" so external miner picks it up)
             for (auto& kv : mapTx) {
                 const std::string& txid = kv.first;
                 auto& tup = kv.second;
@@ -728,7 +729,7 @@ std::string RpcService::handle(const std::string& body){
                 o["txid"]   = jstr(txid);
                 o["fee"]    = jnum((double)std::get<0>(tup));
                 o["vsize"]  = jnum((double)std::get<1>(tup));
-                o["raw"]    = jstr(std::get<2>(tup));
+                o["hex"]    = jstr(std::get<2>(tup)); // CHANGED from "raw" -> "hex"
                 // depends[]
                 std::vector<JNode> d; for (auto& dep : std::get<3>(tup)) d.push_back(jstr(dep));
                 JNode dd; dd.v = d; o["depends"] = dd;
@@ -749,12 +750,13 @@ std::string RpcService::handle(const std::string& body){
             } catch(...) {}
 
             std::map<std::string, JNode> o;
-            o["version"]      = jnum(1.0);
-            o["prev_hash"]    = jstr(to_hex(tip.hash));
-            o["bits"]         = jnum((double)tip.bits);
-            o["time"]         = jnum((double)std::max<int64_t>((int64_t)time(nullptr), tip.time + 1));
-            o["height"]       = jnum((double)(tip.height + 1));
-            o["coinbase_pkh"] = jstr(to_hex(pkh));
+            o["version"]        = jnum(1.0);
+            o["prev_hash"]      = jstr(to_hex(tip.hash));
+            o["bits"]           = jnum((double)tip.bits);
+            o["time"]           = jnum((double)std::max<int64_t>((int64_t)time(nullptr), tip.time + 1));
+            o["height"]         = jnum((double)(tip.height + 1));
+            o["coinbase_pkh"]   = jstr(to_hex(pkh));
+            o["max_block_bytes"]= jnum((double)(900 * 1024)); // HINT for miners
 
             // Big-endian target for pretty display
             uint8_t target_be[32]; std::memset(target_be, 0, 32);
@@ -898,6 +900,32 @@ std::string RpcService::handle(const std::string& body){
             } else {
                 return err(e);
             }
+        }
+
+        // ------------- NEW: submitblock / submitrawblock / sendrawblock -------------
+        if (method=="submitblock" || method=="submitrawblock" || method=="sendrawblock") {
+            if (params.size()<1 || !std::holds_alternative<std::string>(params[0].v))
+                return err("submitblock: need hex string");
+
+            const std::string h = std::get<std::string>(params[0].v);
+            std::vector<uint8_t> raw;
+            try { raw = from_hex(h); }
+            catch(...) { return err("submitblock: bad hex"); }
+
+            Block b;
+            if(!deser_block(raw, b)) return err("submitblock: cannot deserialize block");
+
+            std::string e;
+            if(!chain_.submit_block(b, e)){
+                return err(std::string("submitblock: rejected: ")+e);
+            }
+
+            // Build a small success object
+            std::map<std::string,JNode> o;
+            o["accepted"] = jbool(true);
+            o["hash"]     = jstr(to_hex(b.block_hash()));
+            o["height"]   = jnum((double)chain_.tip().height);
+            JNode out; out.v = o; return json_dump(out);
         }
 
         // Miner stats
