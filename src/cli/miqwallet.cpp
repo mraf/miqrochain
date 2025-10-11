@@ -356,7 +356,7 @@ static bool send_flow(miq::HdWallet& w,
         return false;
     }
 
-    // Pending-hold cache
+    // Pending-hold cache (FIRST declaration)
     std::set<OutpointKey> pending;
     load_pending(wdir, pending);
 
@@ -443,9 +443,8 @@ static bool send_flow(miq::HdWallet& w,
     }
     std::cout << "Broadcasted via " << used_bcast_seed << "  txid=" << txid_hex << "\n";
 
-    // Mark inputs pending & persist wallet metadata if change was used
-    std::set<OutpointKey> pending;
-    load_pending(wdir, pending);
+    // Reuse SAME 'pending' (no redefinition). Reload, mark, save.
+    load_pending(wdir, pending); // refresh from disk
     for(const auto& in : tx.vin){
         pending.insert(OutpointKey{ miq::to_hex(in.prev.txid), in.prev.vout });
     }
@@ -657,7 +656,7 @@ int main(int argc, char** argv){
         std::string c; std::getline(std::cin, c); c=trim(c);
         if(c=="q"||c=="Q"||c=="exit"){ return 0; }
 
-        miq::HdWallet w({}, {}); // will be replaced
+        miq::HdWallet w({}, {}); // will be replaced by flows
         miq::HdAccountMeta meta{};
         std::string wdir, wpass;
         std::vector<uint8_t> seed;
