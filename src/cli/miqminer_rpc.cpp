@@ -1,3 +1,4 @@
+// miqminer_rpc.cpp
 #include "constants.h"
 #include "block.h"
 #include "tx.h"
@@ -328,6 +329,31 @@ static bool json_find_double(const std::string& json, const std::string& key, do
     out = std::strtod(json.c_str()+p, nullptr);
     return true;
 }
+static bool json_find_bool(const std::string& json, const std::string& key, bool& out){
+    std::string pat = "\"" + key + "\":";
+    size_t p = json.find(pat);
+    if(p==std::string::npos) return false;
+    p += pat.size();
+    while(p<json.size() && std::isspace((unsigned char)json[p])) ++p;
+    if(json.compare(p, 4, "true")==0){ out=true; return true; }
+    if(json.compare(p, 5, "false")==0){ out=false; return true; }
+    return false;
+}
+// Fallback: parse a top-level JSON string like: "abc..."
+static bool json_parse_top_string(const std::string& json, std::string& out){
+    size_t p=0; while(p<json.size() && std::isspace((unsigned char)json[p])) ++p;
+    if(p>=json.size() || json[p]!='"') return false;
+    ++p;
+    size_t q=p;
+    while(q<json.size()){
+        if(json[q]=='\\'){ q+=2; continue; }
+        if(json[q]=='"') break;
+        ++q;
+    }
+    if(q<=p) return false;
+    out = json.substr(p, q-p);
+    return true;
+}
 
 // ===== RPC wrappers ==========================================================
 struct TipInfo { uint64_t height{0}; std::string hash_hex; uint32_t bits{0}; int64_t time{0}; };
@@ -345,25 +371,50 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
     return true;
 }
 
-static bool rpc_submitblock_try(const std::string& host, uint16_t port, const std::string& auth,
-                                const char* method, const std::string& hexblk)
+struct SubmitResult {
+    bool ok{false};
+    bool accepted{false};
+    std::string hash;
+    long long height{-1};
+    std::string error;
+    std::string raw;
+};
+
+static bool rpc_submitblock_once(const std::string& host, uint16_t port, const std::string& auth,
+                                 const char* method, const std::string& hexblk, SubmitResult& sr)
 {
     std::ostringstream ps; ps << "[\"" << hexblk << "\"]";
     HttpResp r;
     if(!http_post(host, port, "/", auth, rpc_build(method, ps.str()), r)) return false;
+    sr.raw = r.body;
     if(r.code != 200) return false;
-    return !json_has_error(r.body);
+    if(json_has_error(r.body)){
+        std::string msg;
+        if(json_find_string(r.body,"error",msg)) sr.error = msg;
+        sr.ok = false; sr.accepted = false;
+        return true; // got a JSON error reply; counts as handled
+    }
+    // Happy path from our node: {"accepted":true,"hash":"..","height":N}
+    bool acc=false; (void)json_find_bool(r.body,"accepted",acc);
+    sr.accepted = acc;
+    std::string h; if(json_find_string(r.body,"hash",h)) sr.hash=h;
+    long long H=-1; if(json_find_number(r.body,"height",H)) sr.height=H;
+    sr.ok = true;
+    return true;
 }
-static bool rpc_submitblock(const std::string& host, uint16_t port, const std::string& auth, const std::string& hexblk){
-    if(rpc_submitblock_try(host,port,auth,"submitblock",hexblk)) return true;
-    if(rpc_submitblock_try(host,port,auth,"submitrawblock",hexblk)) return true;
-    if(rpc_submitblock_try(host,port,auth,"sendrawblock",hexblk)) return true;
-    return false;
+static SubmitResult rpc_submitblock(const std::string& host, uint16_t port, const std::string& auth, const std::string& hexblk){
+    SubmitResult sr;
+    if(rpc_submitblock_once(host,port,auth,"submitblock",hexblk,sr)) return sr;
+    if(rpc_submitblock_once(host,port,auth,"submitrawblock",hexblk,sr)) return sr;
+    if(rpc_submitblock_once(host,port,auth,"sendrawblock",hexblk,sr)) return sr;
+    return sr; // sr.ok=false
 }
 
 static bool rpc_getminerstats(const std::string& host, uint16_t port, const std::string& auth, double& out_net_hs){
     HttpResp r;
     if(http_post(host, port, "/", auth, rpc_build("getminerstats","[]"), r) && r.code==200 && !json_has_error(r.body)){
+        // Node returns {hashes, seconds, hps, total}; no true network hashrate here.
+        // If there was a "network_hash_ps" we would read it; otherwise return false.
         if(json_find_double(r.body, "network_hash_ps", out_net_hs)) return true;
     }
     return false;
@@ -439,6 +490,8 @@ static bool rpc_getblockhash(const std::string& host, uint16_t port, const std::
     HttpResp r;
     if(!http_post(host, port, "/", auth, rpc_build("getblockhash", ps.str()), r) || r.code != 200) return false;
     if(json_has_error(r.body)) return false;
+    // Node returns a top-level JSON string like "abcd..."; support either that or {"result":"..."} style.
+    if(json_parse_top_string(r.body, out)) return true;
     return json_find_string(r.body, "result", out);
 }
 static bool rpc_getblock_header_time(const std::string& host, uint16_t port, const std::string& auth, const std::string& hh, long long& out_time){
@@ -703,46 +756,36 @@ static const char* kBase[kBase16][kAnimLines] = {
 };
 
 // ===== 128 base frames generator ============================================
-// We build 128 unique frames by:
-//  - choosing a slow 16-step rotation (index = floor(f * 16 / 128))
-//  - overlaying per-frame face “shading/spark” characters inside the cube
-// This keeps the cube fixed in place while giving smoother/slower motion.
 
 static const char* kShadeLevels = " .:-=+*#";
 static std::vector<std::array<std::string, kAnimLines>> gFrames128;
 
 static void overlay_shading(std::array<std::string,kAnimLines>& lines, int phase)
 {
-    // shade level 0..7
     const char shade = kShadeLevels[phase & 7];
     if (shade == ' ') return;
 
-    // Apply shading only inside the visible footprint of each line
     for(int i=0;i<kAnimLines;i++){
         std::string& L = lines[i];
-        // Find first and last non-space to limit edits
         int l=0, r=(int)L.size()-1;
         while(l<=r && L[l]==' ') ++l;
         while(r>=l && L[r]==' ') --r;
         if(r-l < 4) continue;
 
-        // Dithered fill on interior spaces to create a subtle animation
         for(int p=l+1; p<r; ++p){
             if(L[p]==' '){
-                // stagger with line index and phase to simulate “hashing sparks”
                 if(((p + i*3 + phase*2) % 11) == 0) L[p] = shade;
             }
         }
     }
 }
-
 static void generate_frames_128()
 {
     gFrames128.clear();
     gFrames128.reserve(128);
     for(int f=0; f<128; ++f){
-        int base = (f * kBase16) / 128;       // 0..15 (slow rotation)
-        int shade_phase = f & 7;              // 0..7 (shading pattern)
+        int base = (f * kBase16) / 128;       // 0..15
+        int shade_phase = f & 7;              // 0..7
         std::array<std::string,kAnimLines> block{};
         for(int i=0;i<kAnimLines;i++) block[i] = kBase[base][i];
         overlay_shading(block, shade_phase);
@@ -786,6 +829,9 @@ struct UIState {
     // last network block + our last found
     LastBlockInfo lastblk{};
     std::string last_found_block_hash;
+
+    // submit status line (protected by mtx)
+    std::string submit_status;
 };
 
 static std::string fmt_hs(double v){
@@ -803,7 +849,7 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
     }
 #endif
     using clock = std::chrono::steady_clock;
-    const int FPS = 12;                         // slower so progress is visible
+    const int FPS = 12;
     const auto frame_dt = std::chrono::milliseconds(1000/FPS);
 
     auto last_rate_t = clock::now();
@@ -872,6 +918,13 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
         out << "  mined (session):  " << ui->mined_blocks.load() << "\n";
         if(!ui->last_found_block_hash.empty())
             out << "  last found:       " << ui->last_found_block_hash << "\n";
+
+        // show submit status (accepted/rejected)
+        {
+            std::lock_guard<std::mutex> lk(ui->mtx);
+            if(!ui->submit_status.empty())
+                out << "  submit:           " << ui->submit_status << "\n";
+        }
 
         // 128-frame cube (fixed position)
         out << "\n";
@@ -1041,7 +1094,7 @@ int main(int argc, char** argv){
         std::string rpc_host = "127.0.0.1";
         uint16_t    rpc_port = (uint16_t)miq::RPC_PORT;
         std::string token;
-        unsigned threads = 6; // default per your ask; override with --threads
+        unsigned threads = 6; // default
 
         for(int i=1;i<argc;i++){
             std::string a(argv[i]);
@@ -1148,6 +1201,7 @@ int main(int argc, char** argv){
                 ui.cand.size_bytes = used_bytes + ser_tx(cb).size();
                 ui.cand.fees = fees;
                 ui.cand.coinbase = GetBlockSubsidy((uint32_t)tpl.height) + fees;
+                ui.submit_status.clear(); // reset status for new candidate
             }
 
             // Assemble header base (nonce filled by workers)
@@ -1200,19 +1254,28 @@ int main(int argc, char** argv){
             // Submit
             auto raw = miq::ser_block(found_block);
             std::string hexblk = miq::to_hex(raw);
-            bool ok = rpc_submitblock(rpc_host, rpc_port, token, hexblk);
+            SubmitResult sr = rpc_submitblock(rpc_host, rpc_port, token, hexblk);
 
-            if(ok){
-                ui.mined_blocks.fetch_add(1);
-                ui.last_found_block_hash = miq::to_hex(found_block.block_hash());
-                miq_sleep_ms(250);
-            } else {
-                std::fprintf(stderr, "[info] block solved but submit RPC failed or unavailable; hash=%s height=%llu\n",
-                             miq::to_hex(found_block.block_hash()).c_str(),
-                             (unsigned long long)tpl.height);
-                ui.last_found_block_hash = miq::to_hex(found_block.block_hash());
-                miq_sleep_ms(300);
+            ui.last_found_block_hash = miq::to_hex(found_block.block_hash());
+
+            {
+                std::lock_guard<std::mutex> lk(ui.mtx);
+                if(!sr.ok){
+                    ui.submit_status = "RPC failed (no response/HTTP error)";
+                } else if(sr.accepted){
+                    ui.mined_blocks.fetch_add(1);
+                    std::ostringstream s; s << "accepted @ height=" << ( (sr.height>=0)? std::to_string(sr.height) : "?" )
+                                            << "  hash=" << (!sr.hash.empty()? sr.hash : ui.last_found_block_hash);
+                    ui.submit_status = s.str();
+                } else if(!sr.error.empty()){
+                    ui.submit_status = std::string("rejected: ") + sr.error;
+                } else {
+                    ui.submit_status = "rejected (unknown reason)";
+                }
             }
+
+            // small pause so the UI shows the accepted/rejected line distinctly
+            miq_sleep_ms(300);
         }
 
     } catch(const std::exception& ex){
