@@ -187,6 +187,8 @@ static bool spv_collect_any_seed(const std::vector<std::pair<std::string,std::st
     out.clear();
 
     miq::SpvOptions opts{};
+    // Default window is intentionally conservative to avoid bursting nodes.
+    // Override via MIQ_SPV_WINDOW when you need older funds discovered.
     opts.recent_block_window = recent_window;
 
     std::ostringstream diag;
@@ -217,6 +219,7 @@ static bool p2p_broadcast_tx_one(const std::string& seed_host, const std::string
     o.port = seed_port;
     o.user_agent = "/miqwallet:1.0/";
     o.io_timeout_ms = 8000; // keep conservative but robust
+
     miq::P2PLight p2p;
     if(!p2p.connect_and_handshake(o, err)) return false;
     bool ok = p2p.send_tx(raw_tx, err);
@@ -342,7 +345,6 @@ static bool wallet_session(const std::string& cli_host,
         pkh2ci[miq::to_hex(k.pkh)] = {k.chain, k.index};
     }
 
-
     auto seeds = build_seed_candidates(cli_host, cli_port);
     std::cout << "Chain: " << CHAIN_NAME << "\n";
     std::cout << "Seed order: ";
@@ -352,7 +354,8 @@ static bool wallet_session(const std::string& cli_host,
     }
     std::cout << "\n";
 
-    const uint32_t spv_win = (uint32_t)env_u64("MIQ_SPV_WINDOW", 200000);
+    // SAFE default to avoid bursting nodes; override with MIQ_SPV_WINDOW (e.g. 200000) when needed
+    const uint32_t spv_win = (uint32_t)env_u64("MIQ_SPV_WINDOW", 5000);
 
     // Load pending-spent cache
     std::set<OutpointKey> pending;
