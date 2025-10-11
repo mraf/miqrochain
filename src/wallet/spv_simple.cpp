@@ -232,7 +232,7 @@ try_miq:
 
 bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
                        const std::vector<std::vector<uint8_t>>& pkhs,
-                       const SpvOptions& /*opts*/,
+                       const SpvOptions& opt,
                        std::vector<UtxoLite>& out,
                        std::string& err)
 {
@@ -251,7 +251,7 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     if(!p2p.get_best_header(tip_height, tip_hash_le, err)){ p2p.close(); return false; }
 
     // 3) choose a conservative scan window (8k blocks back)
-    const uint32_t recent_block_window = 8000;
+    const uint32_t recent_block_window = (opt.recent_block_window ? opt.recent_block_window : 8000);
     uint32_t from_h = (tip_height > recent_block_window) ? (tip_height - recent_block_window) : 0;
 
     // 4) enumerate candidate blocks (no filters yet)
