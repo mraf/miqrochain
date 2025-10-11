@@ -1,7 +1,7 @@
 // miqminer_rpc.cpp — Solo RPC miner for MIQ (stable hashrate, correct bits)
-// - Mines using exactly the "bits" the node advertises in getminertemplate.bits.
+// - Mines using adjusted_bits (if provided) else bits from getminertemplate.
 // - Smooth H/s (≤2 updates/sec with EMA) so the UI doesn’t flicker.
-// - Shows candidate bits+difficulty so you see exactly what’s being mined.
+// - Shows candidate bits+difficulty in the UI.
 // - Accepts top-level-string getblockhash; robust template parsing.
 // - Linux build fix: ai->ai_addrlen (not ai->ailen).
 // - Warning fix: nonce_ptr marked used.
@@ -453,18 +453,21 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
     if(!http_post(host, port, "/", auth, rpc_build("getminertemplate","[]"), r) || r.code != 200) return false;
     if(json_has_error(r.body)) return false;
 
-    long long h=0, b=0, t=0, maxb=0;
+    long long h=0, b=0, adjb=0, t=0, maxb=0;
     std::string ph;
     if(!json_find_number(r.body, "height", h)) return false;
     if(!json_find_string(r.body, "prev_hash", ph)) return false;
-    if(!json_find_number(r.body, "bits", b)) return false;      // authoritative
+    if(!json_find_number(r.body, "bits", b)) return false;      // fallback bits
+    (void)json_find_number(r.body, "adjusted_bits", adjb);      // preferred when present
     if(!json_find_number(r.body, "time", t)) return false;
     if(json_find_number(r.body, "max_block_bytes", maxb)) out.max_block_bytes = (size_t)maxb;
 
     out.height = (uint64_t)h;
     out.prev_hash = from_hex_s(ph);
     if(out.prev_hash.size()!=32) return false;
-    out.bits = sanitize_bits((uint32_t)b);
+
+    uint32_t chosen = (adjb>0) ? (uint32_t)adjb : (uint32_t)b;
+    out.bits = sanitize_bits(chosen);
     out.time = (int64_t)t;
 
     // Parse tx list; accept "hex" or "raw"
@@ -1164,7 +1167,7 @@ int main(int argc, char** argv){
 
             // publish candidate stats
             {
-                std::lock_guard<std::mutex> lk(ui->mtx);
+                std::lock_guard<std::mutex> lk(ui.mtx); // FIX: ui.mtx (not ui->mtx)
                 ui.cand.height = tpl.height;
                 ui.cand.prev_hex = to_hex_s(tpl.prev_hash);
                 ui.cand.bits = tpl.bits;        // show the exact bits we will mine with
@@ -1180,7 +1183,7 @@ int main(int argc, char** argv){
             hb.version = 1;
             hb.prev_hash = tpl.prev_hash;
             hb.time = std::max<int64_t>((int64_t)time(nullptr), tpl.time);
-            hb.bits = tpl.bits;   // **authoritative** (matches node expectation)
+            hb.bits = tpl.bits;   // **authoritative** (adjusted_bits when present)
             hb.nonce = 0;
 
             // Mine
