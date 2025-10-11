@@ -55,7 +55,9 @@
 #ifndef MIQ_VERSION_MAX_BYTES
 #define MIQ_VERSION_MAX_BYTES 1024
 #endif
-
+if (cmd == "version") {
+    return n == 0 || n <= (size_t)MIQ_VERSION_MAX_BYTES;
+}
 namespace miq {
 
 // Ensure the build actually provides the magic constants we need.
