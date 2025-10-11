@@ -1,4 +1,4 @@
-// src/p2p.cpp
+// src/p2p.cpp  (strict-filter profile)
 #include "p2p.h"
 #include "nat.h"
 #include "seeds.h"
@@ -56,6 +56,41 @@
 #  endif
 #endif
 
+// ===== STRICT FILTER PROFILE (central knobs) ================================
+// You can tweak these in one place; everything else keys off of them.
+#ifndef MIQ_FILTER_PROFILE_STRICT
+#define MIQ_FILTER_PROFILE_STRICT 1
+#endif
+
+// Handshake & pacing
+#if MIQ_FILTER_PROFILE_STRICT
+  #ifndef MIQ_P2P_VERACK_TIMEOUT_MS
+  #define MIQ_P2P_VERACK_TIMEOUT_MS 7000    // stricter than default 10s
+  #endif
+  #ifndef MIQ_P2P_PING_EVERY_MS
+  #define MIQ_P2P_PING_EVERY_MS     20000   // ping more often
+  #endif
+  #ifndef MIQ_P2P_PONG_TIMEOUT_MS
+  #define MIQ_P2P_PONG_TIMEOUT_MS   10000   // faster timeout
+  #endif
+  #ifndef MIQ_PREVERACK_QUEUE_MAX
+  #define MIQ_PREVERACK_QUEUE_MAX   6       // tighter than 8
+  #endif
+#else
+  #ifndef MIQ_P2P_VERACK_TIMEOUT_MS
+  #define MIQ_P2P_VERACK_TIMEOUT_MS 10000
+  #endif
+  #ifndef MIQ_P2P_PING_EVERY_MS
+  #define MIQ_P2P_PING_EVERY_MS     30000
+  #endif
+  #ifndef MIQ_P2P_PONG_TIMEOUT_MS
+  #define MIQ_P2P_PONG_TIMEOUT_MS   15000
+  #endif
+  #ifndef MIQ_PREVERACK_QUEUE_MAX
+  #define MIQ_PREVERACK_QUEUE_MAX   8
+  #endif
+#endif
+
 #ifndef MIQ_ADDRMAN_FILE
 #define MIQ_ADDRMAN_FILE "peers2.dat"  // keep distinct from legacy "peers.dat"
 #endif
@@ -97,20 +132,6 @@
 #define MIQ_P2P_MAX_BUFSZ (MIQ_FALLBACK_MAX_MSG_SIZE + (512u * 1024u))
 #endif
 
-// timeouts
-#ifndef MIQ_P2P_VERACK_TIMEOUT_MS
-#define MIQ_P2P_VERACK_TIMEOUT_MS 10000
-#endif
-#ifndef MIQ_P2P_PING_EVERY_MS
-#define MIQ_P2P_PING_EVERY_MS     30000
-#endif
-#ifndef MIQ_P2P_PONG_TIMEOUT_MS
-#define MIQ_P2P_PONG_TIMEOUT_MS   15000
-#endif
-#ifndef MIQ_P2P_MAX_BANSCORE
-#define MIQ_P2P_MAX_BANSCORE      100
-#endif
-
 // --- rate limits (bytes/sec) and burst caps ---
 #ifndef MIQ_RATE_BLOCK_BPS
 #define MIQ_RATE_BLOCK_BPS (1024u * 1024u)   // 1 MB/s per peer for blocks
@@ -126,14 +147,26 @@
 #endif
 
 // --- addr filtering knobs ---
-#ifndef MIQ_ADDR_MAX_BATCH
-#define MIQ_ADDR_MAX_BATCH 1000
-#endif
-#ifndef MIQ_ADDR_MIN_INTERVAL_MS
-#define MIQ_ADDR_MIN_INTERVAL_MS 120000  // 2 minutes between accepted batches per peer
-#endif
-#ifndef MIQ_ADDR_RESPONSE_MAX
-#define MIQ_ADDR_RESPONSE_MAX 200        // max addrs we return to getaddr
+#if MIQ_FILTER_PROFILE_STRICT
+  #ifndef MIQ_ADDR_MAX_BATCH
+  #define MIQ_ADDR_MAX_BATCH 800            // slightly tighter than 1000
+  #endif
+  #ifndef MIQ_ADDR_MIN_INTERVAL_MS
+  #define MIQ_ADDR_MIN_INTERVAL_MS 150000   // 2.5 minutes
+  #endif
+  #ifndef MIQ_ADDR_RESPONSE_MAX
+  #define MIQ_ADDR_RESPONSE_MAX 150         // return fewer addrs to getaddr
+  #endif
+#else
+  #ifndef MIQ_ADDR_MAX_BATCH
+  #define MIQ_ADDR_MAX_BATCH 1000
+  #endif
+  #ifndef MIQ_ADDR_MIN_INTERVAL_MS
+  #define MIQ_ADDR_MIN_INTERVAL_MS 120000
+  #endif
+  #ifndef MIQ_ADDR_RESPONSE_MAX
+  #define MIQ_ADDR_RESPONSE_MAX 200
+  #endif
 #endif
 
 // Persisted addr store/addrman tuning
@@ -169,31 +202,49 @@
 #ifndef MIQ_P2P_GETADDR_INTERVAL_MS
 #define MIQ_P2P_GETADDR_INTERVAL_MS 120000  // ask each peer for addrs at most every 2 min
 #endif
-#ifndef MIQ_P2P_NEW_INBOUND_CAP_PER_MIN
-#define MIQ_P2P_NEW_INBOUND_CAP_PER_MIN 60  // soft cap on new inbound per minute
-#endif
-#ifndef MIQ_P2P_INV_WINDOW_MS
-#define MIQ_P2P_INV_WINDOW_MS 10000         // 10s INV window
-#endif
-#ifndef MIQ_P2P_INV_WINDOW_CAP
-#define MIQ_P2P_INV_WINDOW_CAP 500          // max INVs we accept in a 10s window
-#endif
-#ifndef MIQ_P2P_TRICKLE_MS
-#define MIQ_P2P_TRICKLE_MS 200              // trickle INV/tx every 200ms per peer
-#endif
-#ifndef MIQ_P2P_TRICKLE_BATCH
-#define MIQ_P2P_TRICKLE_BATCH 64            // up to 64 tx announcements per flush per peer
-#endif
-#ifndef MIQ_P2P_STALL_RETRY_MS
-#define MIQ_P2P_STALL_RETRY_MS 60000        // probe headers if no progress for 60s
+#if MIQ_FILTER_PROFILE_STRICT
+  #ifndef MIQ_P2P_NEW_INBOUND_CAP_PER_MIN
+  #define MIQ_P2P_NEW_INBOUND_CAP_PER_MIN 40   // stricter cap
+  #endif
+  #ifndef MIQ_P2P_INV_WINDOW_MS
+  #define MIQ_P2P_INV_WINDOW_MS 10000
+  #endif
+  #ifndef MIQ_P2P_INV_WINDOW_CAP
+  #define MIQ_P2P_INV_WINDOW_CAP 300          // tighter than 500
+  #endif
+  #ifndef MIQ_P2P_TRICKLE_MS
+  #define MIQ_P2P_TRICKLE_MS 250              // trickle a bit slower
+  #endif
+  #ifndef MIQ_P2P_TRICKLE_BATCH
+  #define MIQ_P2P_TRICKLE_BATCH 48            // smaller batch
+  #endif
+  #ifndef MIQ_P2P_STALL_RETRY_MS
+  #define MIQ_P2P_STALL_RETRY_MS 60000
+  #endif
+#else
+  #ifndef MIQ_P2P_NEW_INBOUND_CAP_PER_MIN
+  #define MIQ_P2P_NEW_INBOUND_CAP_PER_MIN 60
+  #endif
+  #ifndef MIQ_P2P_INV_WINDOW_MS
+  #define MIQ_P2P_INV_WINDOW_MS 10000
+  #endif
+  #ifndef MIQ_P2P_INV_WINDOW_CAP
+  #define MIQ_P2P_INV_WINDOW_CAP 500
+  #endif
+  #ifndef MIQ_P2P_TRICKLE_MS
+  #define MIQ_P2P_TRICKLE_MS 200
+  #endif
+  #ifndef MIQ_P2P_TRICKLE_BATCH
+  #define MIQ_P2P_TRICKLE_BATCH 64
+  #endif
+  #ifndef MIQ_P2P_STALL_RETRY_MS
+  #define MIQ_P2P_STALL_RETRY_MS 60000
+  #endif
 #endif
 
 // ===== Handshake strictness knobs (keep strict; just a tiny safe window) ====
 #ifndef MIQ_STRICT_HANDSHAKE
 #define MIQ_STRICT_HANDSHAKE 1
-#endif
-#ifndef MIQ_PREVERACK_QUEUE_MAX
-#define MIQ_PREVERACK_QUEUE_MAX 8   // tolerate a handful of early safe msgs
 #endif
 
 #ifdef _WIN32
