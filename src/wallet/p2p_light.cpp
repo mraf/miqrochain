@@ -10,6 +10,7 @@
 #include <string>
 #include <algorithm>
 #include <unordered_set>
+#include <thread>   // pacing safeguard
 
 #ifndef _WIN32
   #include <signal.h>
@@ -436,6 +437,12 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
             continue;
         }
         if(cmd=="block"){
+            // pacing: avoid tight loops when peers stream responses quickly
+            static uint32_t s_cnt = 0;
+            if((++s_cnt % 64) == 0){
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+
             raw_block = std::move(payload);
             return true;
         }
