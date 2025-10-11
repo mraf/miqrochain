@@ -2358,8 +2358,14 @@ void P2P::loop(){
             }
         }
 
-        for (int s : dead) { gate_on_close(s); CLOSESOCK(s); peers_.erase(s); }
-
+        for (int s : dead) {
+            gate_on_close(s);
+            CLOSESOCK(s);
+            peers_.erase(s);
+            g_zero_hdr_batches.erase(s);
+            g_preverack_counts.erase(s);
+            g_trickle_last_ms.erase(s);
+        }
         // Tx INV trickle flush (time-based)
         trickle_flush();
 
