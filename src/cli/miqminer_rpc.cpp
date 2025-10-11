@@ -59,6 +59,11 @@
 
 using namespace miq;
 
+// -----------------------------------------------------------------------------
+// Global IO lock to avoid interleaved writes between UI and animator
+static std::mutex g_io_mtx;
+// -----------------------------------------------------------------------------
+
 // ===== small utils ===========================================================
 static inline void trim(std::string& s){
     size_t i=0,j=s.size();
@@ -559,7 +564,7 @@ static bool rpc_getcoinbaserecipient(const std::string& host, uint16_t port, con
     return true;
 }
 
-// ===== 3D cube art (128 frames) =============================================
+// ===== 3D cube art (16 base frames; we’ll animate at 128 FPS but keep it fixed) ===
 static const int kAnimLines = 8;
 static const int kBaseFrames = 16;
 static const char* kBase[kBaseFrames][kAnimLines] = {
@@ -710,14 +715,12 @@ static const char* kBase[kBaseFrames][kAnimLines] = {
 }
 };
 
-// 128-frame generator: base (0..15) + wobble (0..7) => 128 frames
+// Static (non-moving) frame generator — keep rotation, no horizontal wobble
 static std::vector<std::string> make_block_frame(uint64_t frame){
-    uint64_t base = frame & 15;             // 0..15
-    uint64_t wobble = (frame >> 4) & 7;     // 0..7
-    int indent = (int)wobble;
+    uint64_t base = frame & 15;   // 0..15 (cycle)
     std::vector<std::string> lines; lines.reserve(kAnimLines);
     for(int i=0;i<kAnimLines;i++){
-        std::string ln(indent, ' ');
+        std::string ln;           // no indent — fixed position
         ln += kBase[base][i];
         lines.push_back(std::move(ln));
     }
@@ -768,7 +771,7 @@ static std::string fmt_hs(double v){
     std::ostringstream o; o<<std::fixed<<std::setprecision(2)<<v<<" "<<u[i]; return o.str();
 }
 
-// Animator thread — draws only the cube region at ~128 FPS
+// Animator thread — draws only the cube region at ~128 FPS; uses IO lock
 static void cube_anim_loop(std::atomic<bool>* running, int start_row, int start_col){
 #if defined(_WIN32)
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -787,7 +790,10 @@ static void cube_anim_loop(std::atomic<bool>* running, int start_row, int start_
             os << "\x1b[" << (start_row + i) << ";" << start_col << "H"
                << "  \x1b[36m" << art[i] << "\x1b[0m";
         }
-        std::cout << os.str() << std::flush;
+        {
+            std::lock_guard<std::mutex> lk(g_io_mtx);
+            std::cout << os.str() << std::flush;
+        }
         std::this_thread::sleep_until(next);
     }
 }
@@ -871,7 +877,10 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
         for(int i=0;i<kAnimLines;i++) top << "\n";
 
         top << "\n  Press Ctrl+C to quit.\n";
-        std::cout << top.str() << std::flush;
+        {
+            std::lock_guard<std::mutex> lk(g_io_mtx);
+            std::cout << top.str() << std::flush;
+        }
 
         if(!anim_started){
             anim_started = true;
@@ -1037,7 +1046,7 @@ int main(int argc, char** argv){
         std::string rpc_host = "127.0.0.1";
         uint16_t    rpc_port = (uint16_t)miq::RPC_PORT;
         std::string token;
-        unsigned threads = 6; // default per your ask; override with --threads
+        unsigned threads = 6; // default; override with --threads
 
         for(int i=1;i<argc;i++){
             std::string a(argv[i]);
