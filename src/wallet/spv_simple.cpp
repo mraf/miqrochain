@@ -11,6 +11,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <cstdlib>   // strtoull
+#include <thread>
+#include <chrono>
 
 namespace miq {
 
@@ -66,6 +69,16 @@ struct VecHash {
         return h;
     }
 };
+
+// Simple env reader for pacing knobs (with safe defaults)
+static inline uint32_t env_u32(const char* name, uint32_t defv){
+    const char* v = std::getenv(name);
+    if(!v || !*v) return defv;
+    char* end=nullptr;
+    unsigned long long t = std::strtoull(v, &end, 10);
+    if(end && *end=='\0') return (uint32_t)t;
+    return defv;
+}
 
 // ---------- tx / block parsing ----------
 
@@ -250,7 +263,7 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     uint32_t tip_height=0; std::vector<uint8_t> tip_hash_le;
     if(!p2p.get_best_header(tip_height, tip_hash_le, err)){ p2p.close(); return false; }
 
-    // 3) choose a conservative scan window (8k blocks back)
+    // 3) choose scan window (honor options; fallback to 8k)
     const uint32_t recent_block_window = (opt.recent_block_window ? opt.recent_block_window : 8000);
     uint32_t from_h = (tip_height > recent_block_window) ? (tip_height - recent_block_window) : 0;
 
@@ -296,8 +309,15 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
         }
     };
 
-    // 7) stream blocks, update view
-    for(const auto& [hash_le, height] : blocks){
+    // 7) stream blocks, update view — **chunked + paced** to protect the node
+    const uint32_t MAX_PER_CHUNK = env_u32("MIQ_MAX_BLOCKS_PER_CHUNK", 64);
+    const uint32_t SLEEP_MS      = env_u32("MIQ_SLEEP_BETWEEN_CHUNKS_MS", 50);
+    uint32_t chunk_count = 0;
+
+    for(const auto& bh : blocks){
+        const auto& hash_le = bh.first;
+        const uint32_t height = bh.second;
+
         std::vector<uint8_t> raw;
         if(!p2p.get_block_by_hash(hash_le, raw, err)){ p2p.close(); return false; }
 
@@ -312,6 +332,12 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
                 const auto& o = tx.vout[i];
                 if(o.pkh.size()==20) add_out(tx.txid_le, i, o.value, o.pkh, height, tx.coinbase);
             }
+        }
+
+        // pacing: sleep a little every MAX_PER_CHUNK blocks to avoid bursts
+        if(++chunk_count >= MAX_PER_CHUNK){
+            std::this_thread::sleep_for(std::chrono::milliseconds(SLEEP_MS));
+            chunk_count = 0;
         }
     }
 
