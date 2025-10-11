@@ -23,6 +23,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <unordered_set>
+#include <set>
 
 #include "constants.h"
 #include "hd_wallet.h"
@@ -86,6 +87,69 @@ static bool env_truthy(const char* name){
     std::string s = v;
     for(char& c: s) c = (char)std::tolower((unsigned char)c);
     return (s=="1" || s=="true" || s=="yes" || s=="on");
+}
+
+// Path helpers (portable join/dirname)
+static std::string join_path(const std::string& a, const std::string& b){
+#ifdef _WIN32
+    const char sep='\\';
+#else
+    const char sep='/';
+#endif
+    if(a.empty()) return b;
+    if(a.back()==sep) return a+b;
+    return a + sep + b;
+}
+static std::string dirname1(const std::string& p){
+    size_t pos = p.find_last_of("/\\");
+    if(pos == std::string::npos) return std::string();
+    return p.substr(0, pos);
+}
+
+// ---------------- pending-spent cache (avoid double-spend while unconfirmed) -
+struct OutpointKey {
+    std::string txid_hex;
+    uint32_t vout{0};
+    bool operator<(const OutpointKey& o) const {
+        if (txid_hex != o.txid_hex) return txid_hex < o.txid_hex;
+        return vout < o.vout;
+    }
+};
+static std::string pending_file_path_for_wdir(const std::string& wdir){
+    return join_path(wdir, "pending_spent.dat");
+}
+static void load_pending(const std::string& wdir, std::set<OutpointKey>& out){
+    out.clear();
+    std::ifstream f(pending_file_path_for_wdir(wdir));
+    if(!f.good()) return;
+    std::string line;
+    while(std::getline(f,line)){
+        if(line.empty()) continue;
+        size_t c = line.find(':'); if(c==std::string::npos) continue;
+        OutpointKey k; k.txid_hex = line.substr(0,c);
+        k.vout = (uint32_t)std::strtoul(line.c_str()+c+1, nullptr, 10);
+        out.insert(k);
+    }
+}
+static void save_pending(const std::string& wdir, const std::set<OutpointKey>& st){
+    std::ofstream f(pending_file_path_for_wdir(wdir), std::ios::out | std::ios::trunc);
+    if(!f.good()) return;
+    for(const auto& k : st){
+        f << k.txid_hex << ":" << k.vout << "\n";
+    }
+}
+static void add_to_pending(const std::string& wdir,
+                           const std::vector<miq::TxIn>& vin,
+                           std::set<OutpointKey>* cache /*optional*/)
+{
+    std::set<OutpointKey> st;
+    if(cache){ st = *cache; } else { load_pending(wdir, st); }
+    for(const auto& in : vin){
+        OutpointKey k{ miq::to_hex(in.prev.txid), in.prev.vout };
+        st.insert(k);
+    }
+    save_pending(wdir, st);
+    if(cache) *cache = std::move(st);
 }
 
 // -----------------------------------------------------------------------------
@@ -173,14 +237,14 @@ static bool try_spv_collect_any_seed(const std::vector<std::pair<std::string,std
     out.clear();
 
     miq::SpvOptions opts{};
-    opts.recent_block_window = recent_window; // your SPV supports this; default increased below
+    opts.recent_block_window = recent_window; // your SPV supports this
 
     for(const auto& [h,p] : seeds){
         std::vector<miq::UtxoLite> v; std::string e;
         if(miq::spv_collect_utxos(h, p, pkhs, opts, v, e)){
             out.swap(v);
             used_host = h + ":" + p;
-            used_tip_height = 0; // not exposed by current SPV API; we’ll estimate below when needed
+            used_tip_height = 0; // not exposed by current SPV API
             return true;
         }
         last_err = e.empty() ? "tip query failed" : e;
@@ -292,7 +356,7 @@ static bool flow_send_p2p_only(const std::string& cli_host, const std::string& c
         return false;
     }
 
-    // Conservative tip-height estimate (SPV API doesn’t expose tip): use max UTXO height seen.
+    // Conservative tip-height estimate (use max UTXO height seen).
     uint64_t approx_tip_h = 0;
     for(const auto& u : utxos) if(u.height > approx_tip_h) approx_tip_h = u.height;
 
@@ -300,9 +364,25 @@ static bool flow_send_p2p_only(const std::string& cli_host, const std::string& c
     const uint64_t wallet_feerate = get_env_u64("MIQ_WALLET_FEERATE", 1000);      // sat/KB
     const uint64_t node_min_rate  = get_env_u64("MIQ_MIN_RELAY_FEE_RATE", 1000);  // sat/KB
     const uint64_t feerate = std::max(wallet_feerate, node_min_rate);
+    const uint64_t DUST = 1000; // 0.00001000 MIQ
 
-    // Filter for spendability: exclude immature coinbase. If we don’t know the tip exactly,
-    // use a conservative rule: require u.height + COINBASE_MATURITY <= approx_tip_h + 1
+    // Load pending-spent cache and prune entries that no longer exist in UTXO set (confirmed).
+    std::set<OutpointKey> pending;
+    load_pending(wdir, pending);
+    {
+        std::set<OutpointKey> cur;
+        for(const auto& u : utxos){
+            cur.insert(OutpointKey{ miq::to_hex(u.txid), u.vout });
+        }
+        // remove entries that are no longer in UTXO set
+        for(auto it = pending.begin(); it != pending.end(); ){
+            if(cur.find(*it) == cur.end()) it = pending.erase(it);
+            else ++it;
+        }
+        save_pending(wdir, pending);
+    }
+
+    // Filter for spendability: exclude immature coinbase and pending-spent.
     std::vector<miq::UtxoLite> spendables;
     spendables.reserve(utxos.size());
     for(const auto& u : utxos){
@@ -312,11 +392,15 @@ static bool flow_send_p2p_only(const std::string& cli_host, const std::string& c
             // next block height is approx_tip_h + 1
             if (approx_tip_h + 1 < mature_h) ok = false;
         }
+        if(ok){
+            OutpointKey k{ miq::to_hex(u.txid), u.vout };
+            if(pending.find(k) != pending.end()) ok = false; // held by our unconfirmed tx
+        }
         if (ok) spendables.push_back(u);
     }
 
     if(spendables.empty()){
-        std::cout << "No spendable UTXOs (all funds immature or locked).\n";
+        std::cout << "No spendable UTXOs (all funds immature/locked/pending).\n";
         return false;
     }
 
@@ -341,6 +425,10 @@ static bool flow_send_p2p_only(const std::string& cli_host, const std::string& c
     if(tx.vin.empty()){ std::cout << "Insufficient funds.\n"; return false; }
 
     // outputs + fee
+    if (amount < DUST){
+        std::cout << "Amount below dust threshold.\n"; return false;
+    }
+
     uint64_t fee_final = 0, change = 0;
     {
         const uint64_t fee2 = fee_for(tx.vin.size(), 2, feerate);
@@ -351,7 +439,6 @@ static bool flow_send_p2p_only(const std::string& cli_host, const std::string& c
         }else{
             fee_final = fee2; change = in_sum - amount - fee_final;
             // fold dust change into fee
-            const uint64_t DUST = 1000; // 0.00001000 MIQ
             if(change < DUST){
                 change = 0;
                 fee_final = fee_for(tx.vin.size(), 1, feerate);
@@ -380,6 +467,7 @@ static bool flow_send_p2p_only(const std::string& cli_host, const std::string& c
         return nullptr;
     };
     for(auto& in : tx.vin){
+        // Find UTXO details for PKH (to locate key)
         const miq::UtxoLite* u=nullptr;
         for(const auto& x: spendables) if(x.txid==in.prev.txid && x.vout==in.prev.vout){ u=&x; break; }
         if(!u){ std::cout << "internal: utxo lookup failed\n"; return false; }
@@ -388,6 +476,24 @@ static bool flow_send_p2p_only(const std::string& cli_host, const std::string& c
         std::vector<uint8_t> sig64;
         if(!miq::crypto::ECDSA::sign(K->priv, sighash, sig64)){ std::cout << "sign failed\n"; return false; }
         in.sig = sig64; in.pubkey = K->pub;
+    }
+
+    // Present summary
+    {
+        std::ostringstream a, c, f;
+        a << (amount/COIN) << "." << std::setw(8) << std::setfill('0') << (amount%COIN);
+        c << (change/COIN) << "." << std::setw(8) << std::setfill('0') << (change%COIN);
+        uint64_t implied_fee = in_sum - amount - change;
+        f << (implied_fee/COIN) << "." << std::setw(8) << std::setfill('0') << (implied_fee%COIN);
+        std::cout << "Inputs: " << tx.vin.size() << "   Outputs: " << tx.vout.size() << "\n";
+        std::cout << "Send:   " << a.str() << " MIQ\n";
+        std::cout << "Change: " << c.str() << " MIQ\n";
+        std::cout << "Fee:    " << f.str() << " MIQ  (~" << feerate << " sat/kB)\n";
+    }
+    if(!env_truthy("MIQ_SEND_NOCONFIRM")){
+        std::cout << "Proceed? [Y/n] ";
+        std::string ans; std::getline(std::cin, ans); ans=trim(ans);
+        if(!ans.empty() && (ans[0]=='n'||ans[0]=='N')){ std::cout << "Cancelled.\n"; return false; }
     }
 
     // serialize + broadcast (any seed)
@@ -400,6 +506,9 @@ static bool flow_send_p2p_only(const std::string& cli_host, const std::string& c
         return false;
     }
     std::cout << "Broadcasted via " << used_bcast_seed << ". Txid: " << txid_hex << "\n";
+
+    // Record inputs as pending so we don't try to spend them again until confirmed.
+    add_to_pending(wdir, tx.vin, &pending);
 
     // bump change index if used
     if(used_change){
@@ -452,9 +561,53 @@ static bool show_balance_spv(const std::string& cli_host, const std::string& cli
         std::cout << "SPV collection failed: " << err << "\n";
         return false;
     }
-    uint64_t v=0; for(const auto& u: utxos) v += u.value;
-    std::ostringstream s; s << (v/COIN) << "." << std::setw(8) << std::setfill('0') << (v%COIN);
-    std::cout << "Balance (SPV via " << used_seed << "): " << s.str() << " MIQ (" << v << " miqron)\n";
+
+    // Load and prune pending-spent cache (so "spendable" excludes our unconfirmed sends).
+    std::string wdir2 = wdir; // already computed
+    std::set<OutpointKey> pending;
+    load_pending(wdir2, pending);
+    {
+        std::set<OutpointKey> cur;
+        for(const auto& u : utxos){
+            cur.insert(OutpointKey{ miq::to_hex(u.txid), u.vout });
+        }
+        for(auto it = pending.begin(); it != pending.end(); ){
+            if(cur.find(*it) == cur.end()) it = pending.erase(it);
+            else ++it;
+        }
+        save_pending(wdir2, pending);
+    }
+
+    // Totals
+    uint64_t total=0, spendable=0, immature=0, pending_hold=0;
+    // Approx tip height (max seen)
+    uint64_t approx_tip_h = 0; for(const auto& u: utxos) approx_tip_h = std::max<uint64_t>(approx_tip_h, u.height);
+
+    for(const auto& u: utxos){
+        total += u.value;
+        bool is_immature = false;
+        if(u.coinbase){
+            uint64_t mature_h = (uint64_t)u.height + (uint64_t)COINBASE_MATURITY;
+            if(approx_tip_h + 1 < mature_h) is_immature = true;
+        }
+        OutpointKey k{ miq::to_hex(u.txid), u.vout };
+        bool held = (pending.find(k) != pending.end());
+        if(is_immature) immature += u.value;
+        else if(held)   pending_hold += u.value;
+        else            spendable += u.value;
+    }
+
+    auto fmt = [](uint64_t v)->std::string{
+        std::ostringstream s; s << (v/COIN) << "." << std::setw(8) << std::setfill('0') << (v%COIN);
+        return s.str();
+    };
+
+    std::cout << "Balance via " << used_seed << " (window " << spv_win << "):\n";
+    std::cout << "  Total:      " << fmt(total)        << " MIQ  (" << total        << " miqron)\n";
+    std::cout << "  Spendable:  " << fmt(spendable)    << " MIQ  (" << spendable    << " miqron)\n";
+    std::cout << "  Immature:   " << fmt(immature)     << " MIQ  (" << immature     << " miqron)\n";
+    std::cout << "  Pending-hold (our unconfirmed spends): "
+              << fmt(pending_hold) << " MIQ  (" << pending_hold << " miqron)\n";
     return true;
 }
 
