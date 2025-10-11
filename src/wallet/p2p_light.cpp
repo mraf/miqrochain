@@ -103,13 +103,52 @@ static uint32_t checksum4(const std::vector<uint8_t>& payload){
 }
 
 // ---- seed helpers ------------------------------------------------------------
-static std::string strip_port_if_present(const std::string& host){
-    // If it's bracketed IPv6 like "[::1]:9833" leave as-is.
-    if (!host.empty() && host.front()=='[') return host;
-    // Otherwise strip "host:port" (wallet passes port separately).
-    auto pos = host.find(':');
-    if (pos == std::string::npos) return host;
-    return host.substr(0, pos);
+static bool is_digits(const std::string& s){
+    if (s.empty()) return false;
+    for(char c: s) if(c<'0' || c>'9') return false;
+    return true;
+}
+
+// IPv6/IPv4/hostname sanitizer:
+// - "[::1]:9833"  -> "::1"
+// - "[::1]"       -> "::1"
+// - "example.com:9833" -> "example.com"
+// - "127.0.0.1:9833"   -> "127.0.0.1"
+// - "::1" (bare IPv6)  -> "::1" (unchanged)
+// - "2001:db8::1:9833" (non-bracketed IPv6+port): if the tail is digits, strip to "2001:db8::1"
+static std::string strip_port_if_present(const std::string& host_in){
+    if (host_in.empty()) return host_in;
+
+    // Bracketed IPv6: "[...]" or "[...]:port"
+    if (host_in.front() == '[') {
+        auto rbr = host_in.find(']');
+        if (rbr == std::string::npos) {
+            // malformed, return as-is
+            return host_in;
+        }
+        // return inside brackets, ignoring any trailing ":port"
+        return host_in.substr(1, rbr - 1);
+    }
+
+    // Count colons
+    size_t first_colon = host_in.find(':');
+    if (first_colon == std::string::npos) return host_in; // no port marker
+
+    size_t last_colon = host_in.rfind(':');
+    // If there is exactly one colon and tail is digits -> strip ":port"
+    if (first_colon == last_colon) {
+        std::string tail = host_in.substr(last_colon + 1);
+        if (is_digits(tail)) return host_in.substr(0, last_colon);
+        return host_in; // not a numeric port; leave it
+    }
+
+    // Multiple colons: likely bare IPv6. If the very last segment looks like a numeric port,
+    // treat it as IPv6:port and strip the final ":port".
+    std::string tail = host_in.substr(last_colon + 1);
+    if (is_digits(tail)) return host_in.substr(0, last_colon);
+
+    // Bare IPv6 without port
+    return host_in;
 }
 
 static void gather_default_candidates(std::vector<std::string>& out){
@@ -143,13 +182,8 @@ static int resolve_and_connect_best(const std::vector<std::string>& hosts,
 {
     if (hosts.empty()) { err = "no hosts"; return -1; }
 
-    for (const auto& raw : hosts) {
-        const std::string host = strip_port_if_present(raw);
-
-        // Skip malformed host strings like "host:port" (non-bracketed)
-        if (host.find(':') != std::string::npos && host.find("]:") == std::string::npos) {
-            continue;
-        }
+    for (const auto& raw_host : hosts) {
+        const std::string host = strip_port_if_present(raw_host);
 
         addrinfo hints{};
         hints.ai_socktype = SOCK_STREAM;
@@ -225,40 +259,15 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     sock_ = resolve_and_connect_best(candidates, port, o_.io_timeout_ms, err);
     if (sock_ < 0) return false;
 
-    // --- Handshake attempt A: full Bitcoin-style version payload -------------
     if(!send_version(err))      { close(); return false; }
+
+    // Always send verack (node expects one from us)
     {
         std::vector<uint8_t> empty;
         if(!send_msg("verack", empty, err)) { close(); return false; }
     }
-    if(!read_until_verack(err)) {
-        // Save the first failure reason (often "no verack from peer")
-        std::string first_err = err;
-        err.clear();
 
-        // --- Fallback A': try empty 'version' on the SAME socket -------------
-        {
-            std::vector<uint8_t> empty;
-            (void)send_msg("version", empty, err); // best-effort
-            (void)send_msg("verack",  empty, err); // best-effort
-            if(read_until_verack(err)) goto post_handshake_ok;
-        }
-
-        // --- Fallback B: reconnect and try empty 'version' FIRST -------------
-        closesock(sock_); sock_ = -1;
-        std::string e2;
-        sock_ = resolve_and_connect_best(candidates, port, o_.io_timeout_ms, e2);
-        if (sock_ < 0) { err = first_err; return false; }
-        err.clear();
-        {
-            std::vector<uint8_t> empty;
-            if(!send_msg("version", empty, err)) { close(); return false; }
-            if(!send_msg("verack",  empty, err)) { close(); return false; }
-            if(!read_until_verack(err)) { close(); err = first_err; return false; }
-        }
-    }
-
-post_handshake_ok:
+    if(!read_until_verack(err)) { close(); return false; }
 
     // Best-effort getaddr
     { std::string e2; (void)send_getaddr(e2); }
