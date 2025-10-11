@@ -54,7 +54,8 @@ static constexpr uint64_t DUST_THRESHOLD = 1000; // 0.00001000 MIQ
 #endif
 
 // --- RPC request limits ---
-static constexpr size_t RPC_MAX_BODY_BYTES = 512 * 1024; // 512 KiB
+// Accept comfortably > 900 KiB blocks encoded as ~1.8 MiB hex + JSON overhead.
+static constexpr size_t RPC_MAX_BODY_BYTES = 8 * 1024 * 1024; // 8 MiB
 
 namespace miq {
 
@@ -729,14 +730,14 @@ std::string RpcService::handle(const std::string& body){
                 o["txid"]   = jstr(txid);
                 o["fee"]    = jnum((double)std::get<0>(tup));
                 o["vsize"]  = jnum((double)std::get<1>(tup));
-                o["hex"]    = jstr(std::get<2>(tup)); // CHANGED from "raw" -> "hex"
+                o["hex"]    = jstr(std::get<2>(tup)); // "hex" for miners
                 // depends[]
                 std::vector<JNode> d; for (auto& dep : std::get<3>(tup)) d.push_back(jstr(dep));
                 JNode dd; dd.v = d; o["depends"] = dd;
                 JNode x; x.v = o; arr.push_back(x);
             }
 
-            // Optionally adjust bits using epoch algorithm
+            // Compute bits for the *next* block height (tip.height + 1)
             uint32_t next_bits = tip.bits;
             try {
                 auto last = chain_.last_headers(MIQ_RETARGET_INTERVAL);
@@ -752,17 +753,19 @@ std::string RpcService::handle(const std::string& body){
             std::map<std::string, JNode> o;
             o["version"]        = jnum(1.0);
             o["prev_hash"]      = jstr(to_hex(tip.hash));
-            o["bits"]           = jnum((double)tip.bits);
+            // IMPORTANT: miners must mine with the next-bits, not the current tip bits.
+            o["bits"]           = jnum((double)next_bits);
+            o["tip_bits"]       = jnum((double)tip.bits); // informational
             o["time"]           = jnum((double)std::max<int64_t>((int64_t)time(nullptr), tip.time + 1));
             o["height"]         = jnum((double)(tip.height + 1));
             o["coinbase_pkh"]   = jstr(to_hex(pkh));
             o["max_block_bytes"]= jnum((double)(900 * 1024)); // HINT for miners
 
-            // Big-endian target for pretty display
+            // Big-endian target for pretty display (from next_bits)
             uint8_t target_be[32]; std::memset(target_be, 0, 32);
             {
-                const uint32_t exp  = tip.bits >> 24;
-                const uint32_t mant = tip.bits & 0x007fffff;
+                const uint32_t exp  = next_bits >> 24;
+                const uint32_t mant = next_bits & 0x007fffff;
                 if (mant) {
                     if (exp <= 3) {
                         uint32_t mant2 = mant >> (8 * (3 - exp));
@@ -785,6 +788,7 @@ std::string RpcService::handle(const std::string& body){
 
             // txs array
             JNode A; A.v = arr; o["txs"] = A;
+            // Keep adjusted_bits for older miners; equals bits above.
             o["adjusted_bits"] = jnum((double)next_bits);
 
             JNode out; out.v = o; return json_dump(out);
@@ -911,6 +915,11 @@ std::string RpcService::handle(const std::string& body){
             std::vector<uint8_t> raw;
             try { raw = from_hex(h); }
             catch(...) { return err("submitblock: bad hex"); }
+
+            // Defensive: drop absurdly large blocks (protocol says ~900 KiB)
+            if (raw.size() > 2 * 1024 * 1024) {
+                return err("submitblock: block too large");
+            }
 
             Block b;
             if(!deser_block(raw, b)) return err("submitblock: cannot deserialize block");
@@ -1328,7 +1337,7 @@ std::string RpcService::handle(const std::string& body){
 
             // Load wallet data
             std::string wdir = default_wallet_file();
-            if(!wdir.empty()){
+            if(!wdir empty()){
                 size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
             } else {
                 wdir = "wallets/default";
