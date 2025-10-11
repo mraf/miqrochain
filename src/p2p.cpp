@@ -375,7 +375,6 @@ static inline bool gate_on_bytes(int fd, size_t add){
     return false;
 }
 // Return true => drop immediately (bad sequence/timeout/banned)
-// Return true => drop immediately (bad sequence/timeout/banned)
 static inline bool gate_on_command(int fd, const std::string& cmd,
                                    /*out*/ bool& should_send_verack,
                                    /*out*/ int& close_code)
@@ -1814,7 +1813,9 @@ void P2P::loop(){
             }
         }
 
+        // --- build pollfd list (SNAPSHOT of peers_) ---
         std::vector<PollFD> fds;
+        std::vector<int>    peer_fd_order; // keep the same order as fds entries
         size_t base = 0;
 #ifdef _WIN32
         if (srv_ >= 0) fds.push_back(PollFD{ (SOCKET)srv_, (short)POLL_RD, 0 });
@@ -1823,10 +1824,12 @@ void P2P::loop(){
 #endif
         base = fds.size();
         for (auto& kv : peers_) {
+            int fd = kv.first;
+            peer_fd_order.push_back(fd);
 #ifdef _WIN32
-            fds.push_back(PollFD{ (SOCKET)kv.first, (short)POLL_RD, 0 });
+            fds.push_back(PollFD{ (SOCKET)fd, (short)POLL_RD, 0 });
 #else
-            fds.push_back(PollFD{ kv.first, (short)POLL_RD, 0 });
+            fds.push_back(PollFD{ fd, (short)POLL_RD, 0 });
 #endif
         }
 
@@ -1849,43 +1852,47 @@ void P2P::loop(){
                 if (c >= 0) {
                     // Hard drop clear self-hairpin (we dialed ourselves or addrman looped back)
                     if (is_self_endpoint(c, g_listen_port)) {
-                        // Just close that socket; keep running.
                         CLOSESOCK(c);
-                        continue;
-                    }
+                    } else {
+                        int64_t tnow = now_ms();
+                        if (tnow - inbound_win_start_ms_ > 60000) {
+                            inbound_win_start_ms_ = tnow;
+                            inbound_accepts_in_window_ = 0;
+                        }
+                        if (inbound_accepts_in_window_ >= MIQ_P2P_NEW_INBOUND_CAP_PER_MIN) {
+                            CLOSESOCK(c);
+                        } else {
+                            inbound_accepts_in_window_++;
 
-                    int64_t tnow = now_ms();
-                    if (tnow - inbound_win_start_ms_ > 60000) {
-                        inbound_win_start_ms_ = tnow;
-                        inbound_accepts_in_window_ = 0;
-                    }
-                    if (inbound_accepts_in_window_ >= MIQ_P2P_NEW_INBOUND_CAP_PER_MIN) {
-                        // Soft drop excess inbound to add Sybil friction
-                        CLOSESOCK(c);
-                        continue;
-                    }
-                    inbound_accepts_in_window_++;
-
-                    char ipbuf[64] = {0};
+                            char ipbuf[64] = {0};
 #ifdef _WIN32
-                    InetNtopA(AF_INET, &ca.sin_addr, ipbuf, (int)sizeof(ipbuf));
+                            InetNtopA(AF_INET, &ca.sin_addr, ipbuf, (int)sizeof(ipbuf));
 #else
-                    inet_ntop(AF_INET, &ca.sin_addr, ipbuf, (socklen_t)sizeof(ipbuf));
+                            inet_ntop(AF_INET, &ca.sin_addr, ipbuf, (socklen_t)sizeof(ipbuf));
 #endif
-                    if (banned_.count(ipbuf) || is_ip_banned(ipbuf, now_ms())) { CLOSESOCK(c); }
-                    else handle_new_peer(c, ipbuf);
+                            if (banned_.count(ipbuf) || is_ip_banned(ipbuf, now_ms())) {
+                                CLOSESOCK(c);
+                            } else {
+                                handle_new_peer(c, ipbuf); // peers_ mutates AFTER we snapshotted fds
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // Read/process peers
+        // Read/process peers using the SNAPSHOT order to keep fds indexes aligned
         std::vector<int> dead;
-        size_t p = 0;
-        for (auto it = peers_.begin(); it != peers_.end(); ++it, ++p) {
-            int s = it->first;
+        for (size_t i = 0; i < peer_fd_order.size(); ++i) {
+            if (base + i >= fds.size()) continue; // paranoia guard
+            int s = peer_fd_order[i];
+
+            auto it = peers_.find(s);
+            if (it == peers_.end()) continue; // could have been closed earlier
+
             auto &ps = it->second;
 
-            bool ready = (fds[base + p].revents & POLL_RD) != 0;
+            bool ready = (fds[base + i].revents & POLL_RD) != 0;
 
             if (ready) {
                 uint8_t buf[65536];
@@ -1918,16 +1925,16 @@ void P2P::loop(){
                 miq::NetMsg m;
                 while (decode_msg(ps.rx, off, m)) {
                     std::string cmd(m.cmd, m.cmd + 12);
-size_t z = cmd.find('\0');
-if (z != std::string::npos) {
-    cmd.resize(z);
-} else {
-    // If exactly 12 non-NUL bytes were sent, keep as-is.
-    // (Optional) sanity: drop clearly bad control chars
-    bool bad = false;
-    for (unsigned char ch : cmd) { if (ch < 32 || ch > 126) { bad = true; break; } }
-    if (bad) { ++ps.mis; continue; }
-}
+                    size_t z = cmd.find('\0');
+                    if (z != std::string::npos) {
+                        cmd.resize(z);
+                    } else {
+                        // If exactly 12 non-NUL bytes were sent, keep as-is.
+                        // (Optional) sanity: drop clearly bad control chars
+                        bool bad = false;
+                        for (unsigned char ch : cmd) { if (ch < 32 || ch > 126) { bad = true; break; } }
+                        if (bad) { ++ps.mis; continue; }
+                    }
 
                     // Handshake/order gate
                     bool send_verack = false; int close_code = 0;
