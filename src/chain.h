@@ -4,7 +4,8 @@
 #include <utility>
 #include <unordered_map>
 #include <string>
-#include <mutex>      // NEW: coarse-grained thread-safety
+#include <mutex>      // coarse-grained thread-safety
+#include <array>      // for filter headers payloads
 
 #include "block.h"
 #include "serialize.h"
@@ -14,6 +15,18 @@
 #include "difficulty.h"
 #include "constants.h"
 #include "blockindex.h"
+
+// --- Optional GCS block filters (header-level guard; matches chain.cpp) ---
+#ifndef __has_include
+  #define __has_include(x) 0
+#endif
+#ifndef MIQ_HAVE_GCS_FILTERS
+  #if __has_include("filters/bip158.h") && __has_include("filters/gcs.h") && __has_include("filters/filter_store.h")
+    #define MIQ_HAVE_GCS_FILTERS 1
+  #else
+    #define MIQ_HAVE_GCS_FILTERS 0
+  #endif
+#endif
 
 namespace miq {
 
@@ -37,7 +50,7 @@ struct Tip {
 
 class Chain {
 public:
-    // ---- Public API (unchanged signatures; now internally synchronized) ----
+    // ---- Public API (unchanged signatures; internally synchronized) ----
     static long double work_from_bits_public(uint32_t bits);
 
     const std::vector<uint8_t>& tip_hash() const { return tip_.hash; }
@@ -62,7 +75,7 @@ public:
     bool verify_block(const Block& b, std::string& err) const;
     bool submit_block(const Block& b, std::string& err);
 
-    // Was inline; now implemented in chain.cpp so it can take the lock.
+    // Access tip safely (locks internally)
     Tip tip() const;
 
     std::vector<std::pair<int64_t,uint32_t>> last_headers(size_t n) const;
@@ -79,12 +92,23 @@ public:
     bool get_block_by_hash(const std::vector<uint8_t>& h, Block& out) const;
     bool have_block(const std::vector<uint8_t>& h) const;
 
-    // NEW: expose datadir path (needed by reindex tool)
+    // Expose datadir path (useful for tools)
     const std::string& datadir() const { return datadir_; }
+
+#if MIQ_HAVE_GCS_FILTERS
+    // === Compact filter RPC helpers for the P2P server ===
+    // Returns rolling filter headers (BIP158-style) for [start, start+count).
+    bool get_filter_headers(uint32_t start, uint32_t count,
+                            std::vector<std::array<uint8_t,32>>& out) const;
+
+    // Returns (block_hash, filter_bytes) pairs for [start, start+count).
+    bool get_filters_with_hash(uint32_t start, uint32_t count,
+                               std::vector<std::pair<std::array<uint8_t,32>, std::vector<uint8_t>>>& out) const;
+#endif
 
 private:
     // ---- State ----
-    mutable std::recursive_mutex mtx_;  // NEW: guards all members below
+    mutable std::recursive_mutex mtx_;  // guards all members below
 
     Storage     storage_;
     std::string datadir_;
