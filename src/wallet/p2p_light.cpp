@@ -11,12 +11,17 @@
 #include <algorithm>
 #include <unordered_set>
 #include <thread>   // pacing safeguard
+#include <sstream>
 
 #ifndef _WIN32
   #include <signal.h>
-#endif
-
-#ifdef _WIN32
+  #include <sys/types.h>
+  #include <sys/socket.h>
+  #include <netdb.h>
+  #include <unistd.h>
+  #include <sys/time.h>
+  #include <arpa/inet.h>
+#else
   #ifndef WIN32_LEAN_AND_MEAN
   #define WIN32_LEAN_AND_MEAN
   #endif
@@ -26,6 +31,30 @@
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #pragma comment(lib, "ws2_32.lib")
+#endif
+
+namespace miq {
+
+// ---- tiny env helpers --------------------------------------------------------
+static bool env_truthy(const char* name){
+    const char* v = std::getenv(name);
+    if(!v) return false;
+    std::string s = v;
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+    return (s=="1"||s=="true"||s=="yes"||s=="on");
+}
+
+// ---- network magic from chain constants --------------------------------------
+#ifndef MIQ_P2P_MAGIC
+static constexpr uint32_t MIQ_P2P_MAGIC =
+    (uint32_t(MAGIC_BE[0])      ) |
+    (uint32_t(MAGIC_BE[1]) <<  8) |
+    (uint32_t(MAGIC_BE[2]) << 16) |
+    (uint32_t(MAGIC_BE[3]) << 24);
+#endif
+
+// ---- platform shims ----------------------------------------------------------
+#ifdef _WIN32
   static inline void closesock(int s){ closesocket(s); }
   static inline void set_timeouts(int s, int ms){
       if(ms <= 0) return;
@@ -34,11 +63,6 @@
       setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&t, sizeof(t));
   }
 #else
-  #include <sys/types.h>
-  #include <sys/socket.h>
-  #include <netdb.h>
-  #include <unistd.h>
-  #include <sys/time.h>
   static inline void closesock(int s){ if(s>=0) ::close(s); }
   static inline void set_timeouts(int s, int ms){
       if(ms <= 0) return;
@@ -48,17 +72,6 @@
       setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
       setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
   }
-#endif
-
-namespace miq {
-
-// ---- network magic from chain constants --------------------------------------
-#ifndef MIQ_P2P_MAGIC
-static constexpr uint32_t MIQ_P2P_MAGIC =
-    (uint32_t(MAGIC_BE[0])      ) |
-    (uint32_t(MAGIC_BE[1]) <<  8) |
-    (uint32_t(MAGIC_BE[2]) << 16) |
-    (uint32_t(MAGIC_BE[3]) << 24);
 #endif
 
 // ---- helpers -----------------------------------------------------------------
@@ -102,53 +115,14 @@ static uint32_t checksum4(const std::vector<uint8_t>& payload){
     return (uint32_t)d[0] | ((uint32_t)d[1]<<8) | ((uint32_t)d[2]<<16) | ((uint32_t)d[3]<<24);
 }
 
-// ---- seed helpers ------------------------------------------------------------
-static bool is_digits(const std::string& s){
-    if (s.empty()) return false;
-    for(char c: s) if(c<'0' || c>'9') return false;
-    return true;
-}
-
-// IPv6/IPv4/hostname sanitizer:
-// - "[::1]:9833"  -> "::1"
-// - "[::1]"       -> "::1"
-// - "example.com:9833" -> "example.com"
-// - "127.0.0.1:9833"   -> "127.0.0.1"
-// - "::1" (bare IPv6)  -> "::1" (unchanged)
-// - "2001:db8::1:9833" (non-bracketed IPv6+port): if the tail is digits, strip to "2001:db8::1"
-static std::string strip_port_if_present(const std::string& host_in){
-    if (host_in.empty()) return host_in;
-
-    // Bracketed IPv6: "[...]" or "[...]:port"
-    if (host_in.front() == '[') {
-        auto rbr = host_in.find(']');
-        if (rbr == std::string::npos) {
-            // malformed, return as-is
-            return host_in;
-        }
-        // return inside brackets, ignoring any trailing ":port"
-        return host_in.substr(1, rbr - 1);
-    }
-
-    // Count colons
-    size_t first_colon = host_in.find(':');
-    if (first_colon == std::string::npos) return host_in; // no port marker
-
-    size_t last_colon = host_in.rfind(':');
-    // If there is exactly one colon and tail is digits -> strip ":port"
-    if (first_colon == last_colon) {
-        std::string tail = host_in.substr(last_colon + 1);
-        if (is_digits(tail)) return host_in.substr(0, last_colon);
-        return host_in; // not a numeric port; leave it
-    }
-
-    // Multiple colons: likely bare IPv6. If the very last segment looks like a numeric port,
-    // treat it as IPv6:port and strip the final ":port".
-    std::string tail = host_in.substr(last_colon + 1);
-    if (is_digits(tail)) return host_in.substr(0, last_colon);
-
-    // Bare IPv6 without port
-    return host_in;
+// ---- seed/candidate helpers --------------------------------------------------
+static std::string strip_port_if_present(const std::string& host){
+    // If it's bracketed IPv6 like "[::1]:9833" leave as-is.
+    if (!host.empty() && host.front()=='[') return host;
+    // Otherwise strip "host:port" (wallet passes port separately).
+    auto pos = host.find(':');
+    if (pos == std::string::npos) return host;
+    return host.substr(0, pos);
 }
 
 static void gather_default_candidates(std::vector<std::string>& out){
@@ -157,7 +131,7 @@ static void gather_default_candidates(std::vector<std::string>& out){
     auto add = [&](const std::string& h){
         if (h.empty()) return;
         std::string s = strip_port_if_present(h);
-        if (s == "127.0.0.1") return; // NEVER auto-dial localhost
+        if (s == "127.0.0.1" || s == "::1" || s == "localhost") return; // no auto-local by default
         if (seen.insert(s).second) out.push_back(std::move(s));
     };
 
@@ -174,6 +148,47 @@ static void gather_default_candidates(std::vector<std::string>& out){
     std::shuffle(out.begin(), out.end(), rng);
 }
 
+// ---- local-interface discovery (for anti-hairpin fallback) -------------------
+static void collect_local_ipv4(std::vector<std::string>& out){
+#ifdef _WIN32
+    char host[256] = {0};
+    if (gethostname(host, (int)sizeof(host)) != 0) return;
+    ADDRINFOA hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    PADDRINFOA res = nullptr;
+    if (getaddrinfo(host, nullptr, &hints, &res) != 0 || !res) return;
+    for (auto p = res; p; p = p->ai_next) {
+        if (p->ai_family != AF_INET) continue;
+        auto sa = reinterpret_cast<sockaddr_in*>(p->ai_addr);
+        if (!sa) continue;
+        char buf[64] = {0};
+        InetNtopA(AF_INET, &sa->sin_addr, buf, (int)sizeof(buf));
+        if (buf[0]) {
+            std::string s(buf);
+            if (s != "127.0.0.1") out.push_back(s);
+        }
+    }
+    freeaddrinfo(res);
+#else
+    char host[256] = {0};
+    if (gethostname(host, sizeof(host)) != 0) return;
+    addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    if (getaddrinfo(host, nullptr, &hints, &res) != 0 || !res) return;
+    for (auto p = res; p; p = p->ai_next) {
+        if (p->ai_family != AF_INET) continue;
+        auto sa = reinterpret_cast<sockaddr_in*>(p->ai_addr);
+        if (!sa) continue;
+        char buf[64] = {0};
+        inet_ntop(AF_INET, &sa->sin_addr, buf, (socklen_t)sizeof(buf));
+        if (buf[0]) {
+            std::string s(buf);
+            if (s != "127.0.0.1") out.push_back(s);
+        }
+    }
+    freeaddrinfo(res);
+#endif
+}
+
 // ---- connection helper: try many hosts (IPv4 first), random order -----------
 static int resolve_and_connect_best(const std::vector<std::string>& hosts,
                                     const std::string& port,
@@ -182,8 +197,13 @@ static int resolve_and_connect_best(const std::vector<std::string>& hosts,
 {
     if (hosts.empty()) { err = "no hosts"; return -1; }
 
-    for (const auto& raw_host : hosts) {
-        const std::string host = strip_port_if_present(raw_host);
+    for (const auto& raw : hosts) {
+        const std::string host = strip_port_if_present(raw);
+
+        // Skip malformed host strings like "host:port" (non-bracketed)
+        if (host.find(':') != std::string::npos && host.find("]:") == std::string::npos) {
+            continue;
+        }
 
         addrinfo hints{};
         hints.ai_socktype = SOCK_STREAM;
@@ -230,6 +250,26 @@ static int resolve_and_connect_best(const std::vector<std::string>& hosts,
     return -1;
 }
 
+// ---- smart local fallback when remote seeds fail (hairpin-safe) --------------
+static int try_local_fallback(const std::string& port, int timeout_ms){
+    // Loopback first (fast path if node is on the same box)
+    {
+        std::vector<std::string> loop = {"127.0.0.1", "::1", "localhost"};
+        std::string e;
+        int fd = resolve_and_connect_best(loop, port, timeout_ms, e);
+        if (fd >= 0) return fd;
+    }
+    // Then any local interface IPv4s (e.g., 192.168.x.x)
+    std::vector<std::string> locals;
+    collect_local_ipv4(locals);
+    if (!locals.empty()) {
+        std::string e;
+        int fd = resolve_and_connect_best(locals, port, timeout_ms, e);
+        if (fd >= 0) return fd;
+    }
+    return -1;
+}
+
 // ---- class -------------------------------------------------------------------
 P2PLight::P2PLight(){}
 P2PLight::~P2PLight(){ close(); }
@@ -251,12 +291,25 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
         // Respect explicit host, including localhost if the user asked for it.
         candidates.push_back(strip_port_if_present(o_.host));
     } else {
-        // Use constants.h global seeds only (no localhost).
+        // Use constants.h global seeds only (no localhost here).
         gather_default_candidates(candidates);
     }
 
     const std::string port = o_.port.empty() ? std::to_string(P2P_PORT) : o_.port;
+
+    // 1) Try public/DNS seeds first
     sock_ = resolve_and_connect_best(candidates, port, o_.io_timeout_ms, err);
+
+    // 2) Smart local fallback (handles NAT hairpin / loopback routers)
+    if (sock_ < 0 && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
+        std::string e2;
+        int fd_local = try_local_fallback(port, o_.io_timeout_ms);
+        if (fd_local >= 0) {
+            sock_ = fd_local;
+            err.clear(); // connected via local fallback
+        }
+    }
+
     if (sock_ < 0) return false;
 
     if(!send_version(err))      { close(); return false; }
@@ -357,7 +410,7 @@ bool P2PLight::request_headers_from_locator(const std::vector<std::vector<uint8_
     return send_msg("getheaders", p, err);
 }
 
-// Accepts both daemon-style headers (u16 + count*88 bytes) and Bitcoin-style (varint + 80 + varint txcount).
+// Accepts daemon-style headers (u16 + count*88 bytes) and Bitcoin-style (varint + 80 + varint txcount).
 bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_le, std::string& err){
     out_hashes_le.clear();
     for(;;){
@@ -447,7 +500,7 @@ bool P2PLight::match_recent_blocks(const std::vector<std::vector<uint8_t>>& /*pk
     return true;
 }
 
-// ---- block fetch (your daemon uses `getb`) -----------------------------------
+// ---- block fetch (daemon uses `getb`) ----------------------------------------
 bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
                                  std::vector<uint8_t>& raw_block,
                                  std::string& err)
