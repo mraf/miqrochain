@@ -448,7 +448,7 @@ static inline bool gate_on_command(int fd, const std::string& cmd,
         if (cmd == "version"){
             if (!g.got_version){
                 g.got_version = true;
-                should_send_verack = true;
+                should_send_verack = true; // ALWAYS send verack on first version, regardless of payload size
             }
             // duplicates are ignored (no ban)
         } else if (cmd == "verack"){
@@ -1221,7 +1221,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 
     // Gate + handshake
     gate_on_connect(s);
-    auto msg = encode_msg("version", {});
+    auto msg = encode_msg("version", {}); // we may send empty version; we DO NOT assume peers do the same
     send(s, (const char*)msg.data(), (int)msg.size(), 0);
 
     return true;
@@ -1297,7 +1297,7 @@ void P2P::handle_new_peer(int c, const std::string& ip){
 
     // Gate + send version
     gate_on_connect(c);
-    auto msg = encode_msg("version", {});
+    auto msg = encode_msg("version", {}); // our side sends empty; we still accept non-empty from peers
     send(c, (const char*)msg.data(), (int)msg.size(), 0);
 }
 
@@ -1734,7 +1734,7 @@ void P2P::loop(){
                         g_trickle_last_ms[s] = 0;
                         log_info("P2P: outbound (addrman) " + ps.ip);
                         gate_on_connect(s);
-                        auto msg = encode_msg("version", {});
+                        auto msg = encode_msg("version", {}); // send empty; accept non-empty from peer
                         send(s, (const char*)msg.data(), (int)msg.size(), 0);
                         dialed = true;
                     } else {
@@ -1785,7 +1785,7 @@ void P2P::loop(){
 
                                 log_info("P2P: outbound to known " + ps.ip);
                                 gate_on_connect(s);
-                                auto msg = encode_msg("version", {});
+                                auto msg = encode_msg("version", {}); // send empty; accept non-empty from peer
                                 send(s, (const char*)msg.data(), (int)msg.size(), 0);
                             }
                         }
@@ -1821,7 +1821,7 @@ void P2P::loop(){
                                     g_trickle_last_ms[s] = 0;
                                     log_info("P2P: feeler " + dotted);
                                     gate_on_connect(s);
-                                    auto msg = encode_msg("version", {});
+                                    auto msg = encode_msg("version", {}); // send empty; accept non-empty from peer
                                     send(s, (const char*)msg.data(), (int)msg.size(), 0);
                                 }
                             }
@@ -2025,7 +2025,8 @@ void P2P::loop(){
                     };
 
                     if (cmd == "version") {
-                        // Parse peer version/services for gating
+                        // IMPORTANT: do NOT assume empty payload. We tolerate 0..1024 bytes as per netmsg.cpp.
+                        // We only *optionally* parse a few leading fields if present, guarded by size checks.
                         int32_t peer_ver = 0; uint64_t peer_services = 0;
                         if (m.payload.size() >= 4) {
                             peer_ver = (int32_t)((uint32_t)m.payload[0] | ((uint32_t)m.payload[1]<<8) | ((uint32_t)m.payload[2]<<16) | ((uint32_t)m.payload[3]<<24));
