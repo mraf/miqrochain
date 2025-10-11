@@ -1,7 +1,10 @@
 // miqminer_rpc.cpp  — fixed RPC miner for MIQ
-// - Aligns with node RPC (hps/raw/adjusted_bits/top-level-string getblockhash)
-// - Clear submit/accept UI; last-found only set after acceptance.
-// - 128-frame fixed cube; no cursor jumping.
+// - Never exits before offering a way to get a payout address
+// - Address sources (in order): --address, MIQ_MINER_ADDRESS/MIQ_ADDRESS, prompt (if TTY), RPC getnewaddress
+// - Aligns with node RPC (bits/adjusted_bits, top-level string getblockhash)
+// - Clear submit/accept UI; last-found only set after acceptance polling
+// - 128-frame generated cube; no static tables needed
+// - Safer console I/O, explicit flush, better diagnostics
 
 #include "constants.h"
 #include "block.h"
@@ -44,6 +47,7 @@
   #endif
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #include <io.h>
   #pragma comment(lib, "Ws2_32.lib")
   using socklen_t = int;
   using socket_t = SOCKET;
@@ -52,6 +56,7 @@
   #if defined(MIQ_SET_AFFINITY)
     #include <windows.h>
   #endif
+  static bool stdin_is_tty(){ return _isatty(_fileno(stdin)) != 0; }
 #else
   #include <sys/types.h>
   #include <sys/socket.h>
@@ -61,6 +66,7 @@
   using socket_t = int;
   #define miq_closesocket ::close
   static void miq_sleep_ms(unsigned ms){ usleep(ms*1000); }
+  static bool stdin_is_tty(){ return isatty(fileno(stdin)) != 0; }
 #endif
 
 using namespace miq;
@@ -117,17 +123,24 @@ static bool json_find_string(const std::string& json, const std::string& key, st
     if(p==std::string::npos) return false;
     p += pat.size();
     while(p<json.size() && std::isspace((unsigned char)json[p])) ++p;
-    if(p>=json.size() || json[p]!='"') return false;
-    ++p;
-    size_t q = p;
-    while(q<json.size()){
-        if(json[q]=='\\') { q+=2; continue; }
-        if(json[q]=='"') break;
-        ++q;
+    if(p>=json.size()) return false;
+    if(json[p]=='"'){
+        ++p;
+        size_t q = p;
+        while(q<json.size()){
+            if(json[q]=='\\') { q+=2; continue; }
+            if(json[q]=='"') break;
+            ++q;
+        }
+        if(q<=p) return false;
+        out = json.substr(p, q-p);
+        return true;
     }
-    if(q<=p) return false;
-    out = json.substr(p, q-p);
-    return true;
+    // also allow bare strings in top-level result wrappers
+    size_t q=p;
+    while(q<json.size() && (std::isalnum((unsigned char)json[q])||json[q]=='_'||json[q]=='.')) ++q;
+    if(q>p){ out = json.substr(p, q-p); trim(out); return !out.empty(); }
+    return false;
 }
 static bool json_find_number(const std::string& json, const std::string& key, long long& out){
     std::string pat = "\"" + key + "\":";
@@ -153,7 +166,6 @@ static bool json_find_double(const std::string& json, const std::string& key, do
     out = std::strtod(json.c_str()+p, nullptr);
     return true;
 }
-// Extract top-level string response: e.g. body == "abcdef..."
 static bool json_extract_top_string(const std::string& body, std::string& out){
     if(body.size()>=2 && body.front()=='"' && body.back()=='"'){
         out = body.substr(1, body.size()-2);
@@ -358,19 +370,16 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
     return true;
 }
 
-// Parse both "hps" (your node) and "network_hash_ps" (alt nodes)
 static bool rpc_getminerstats(const std::string& host, uint16_t port, const std::string& auth, double& out_net_hs){
     HttpResp r;
     if(!http_post(host, port, "/", auth, rpc_build("getminerstats","[]"), r) || r.code!=200) return false;
     if(json_has_error(r.body)) return false;
-    // prefer hps
     if(json_find_double(r.body, "hps", out_net_hs)) return true;
-    // fallback
     if(json_find_double(r.body, "network_hash_ps", out_net_hs)) return true;
     return false;
 }
 
-// Accept top-level JSON string OR {"result": "..."}
+// Accept top-level string or {"result":"..."}
 static bool rpc_getblockhash(const std::string& host, uint16_t port, const std::string& auth, uint64_t height, std::string& out){
     std::ostringstream ps; ps<<"["<<height<<"]";
     HttpResp r;
@@ -381,7 +390,6 @@ static bool rpc_getblockhash(const std::string& host, uint16_t port, const std::
     return false;
 }
 
-// getblock time reader (your node returns { time: ... } at top level)
 static bool rpc_getblock_header_time(const std::string& host, uint16_t port, const std::string& auth, const std::string& hh, long long& out_time){
     std::ostringstream ps; ps<<"[\""<<hh<<"\"]";
     HttpResp r;
@@ -413,7 +421,6 @@ static double estimate_network_hashps(const std::string& host, uint16_t port, co
     return D * (two32 / avg_spacing);
 }
 
-// Try three method names and return body for diagnostics
 static bool rpc_submitblock_verbose(const std::string& host, uint16_t port, const std::string& auth,
                                     std::string& out_body, const std::string& method, const std::string& hexblk){
     std::ostringstream ps; ps << "[\"" << hexblk << "\"]";
@@ -577,41 +584,29 @@ static bool rpc_getcoinbaserecipient(const std::string& host, uint16_t port, con
     return true;
 }
 
-// ===== 128 fixed cube frames (from 16 bases + shading) ======================
+// ===== 128 generated frames (no static tables) ==============================
 static const int kAnimLines = 8;
-static const int kBase16 = 16;
-static const char* kBase[kBase16][kAnimLines] = {
-    // ... (same 16 base frames you already have) ...
-    // (omitted here for brevity in this snippet—keep your existing kBase table)
-};
 static const char* kShadeLevels = " .:-=+*#";
 static std::vector<std::array<std::string, kAnimLines>> gFrames128;
 
-static void overlay_shading(std::array<std::string,kAnimLines>& lines, int phase){
-    const char shade = kShadeLevels[phase & 7];
-    if (shade == ' ') return;
-    for(int i=0;i<kAnimLines;i++){
-        std::string& L = lines[i];
-        int l=0, r=(int)L.size()-1;
-        while(l<=r && L[l]==' ') ++l;
-        while(r>=l && L[r]==' ') --r;
-        if(r-l < 4) continue;
-        for(int p=l+1; p<r; ++p){
-            if(L[p]==' '){
-                if(((p + i*3 + phase*2) % 11) == 0) L[p] = shade;
-            }
-        }
-    }
-}
 static void generate_frames_128(){
     gFrames128.clear();
     gFrames128.reserve(128);
+    const int W = 32;
     for(int f=0; f<128; ++f){
-        int base = (f * kBase16) / 128;       // 0..15 (slow)
-        int shade_phase = f & 7;              // 0..7
         std::array<std::string,kAnimLines> block{};
-        for(int i=0;i<kAnimLines;i++) block[i] = kBase[base][i];
-        overlay_shading(block, shade_phase);
+        for(int i=0;i<kAnimLines;i++){
+            std::string L(W,' ');
+            // draw a beveled block with moving diagonal shimmer
+            for(int x=1;x<W-1;++x){
+                bool edge = (i==0||i==kAnimLines-1||x==1||x==W-2);
+                if(edge){ L[x] = '#'; continue; }
+                int v = (i*3 + x + (f>>1)) & 15;
+                char shade = kShadeLevels[(v>>1) & 7];
+                if(shade!=' ') L[x]=shade;
+            }
+            block[i]=std::move(L);
+        }
         gFrames128.push_back(std::move(block));
     }
 }
@@ -651,7 +646,7 @@ struct UIState {
 
     // last network block + our last accepted
     LastBlockInfo lastblk{};
-    std::string last_found_block_hash;    // only set on ACCEPTED
+    std::string last_found_block_hash;    // only set on ACCEPTED/polled
     std::string last_submit_msg;          // status line
     std::chrono::steady_clock::time_point last_submit_when{};
 };
@@ -741,7 +736,6 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
         if(!ui->last_found_block_hash.empty())
             out << "  last found:       " << ui->last_found_block_hash << "  \x1b[2m(accepted)\x1b[0m\n";
 
-        // transient submit status (5s)
         if(!ui->last_submit_msg.empty()){
             auto age = std::chrono::duration<double>(now - ui->last_submit_when).count();
             if(age < 5.0){
@@ -749,7 +743,6 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
             }
         }
 
-        // 128-frame cube (fixed position)
         out << "\n";
         const auto& art = gFrames128[(size_t)(frame++ & 127)];
         for(int i=0;i<kAnimLines;i++)
@@ -793,7 +786,6 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
 
     // Target
     bits = sanitize_bits(bits);
-    uint8_t Tglob[32]; bits_to_target_be(bits, Tglob);
 
 #if !defined(MIQ_POW_SALT)
     FastSha256Ctx base1;
@@ -899,11 +891,21 @@ static bool pack_template(const MinerTemplate& tpl,
 }
 
 // ===== main ==================================================================
+// Extra RPC: getnewaddress (for non-interactive default)
+static bool rpc_getnewaddress(const std::string& host, uint16_t port, const std::string& auth, std::string& addr){
+    HttpResp r;
+    if(!http_post(host, port, "/", auth, rpc_build("getnewaddress","[]"), r) || r.code!=200) return false;
+    if(json_has_error(r.body)) return false;
+    if(json_find_string(r.body, "result", addr)) return true;
+    if(json_extract_top_string(r.body, addr)) return true;
+    return false;
+}
+
 static void usage(){
     std::cout <<
     "miqminer_rpc — Solo miner for MIQ (JSON-RPC, 128-frame UI)\n"
-    "Usage: miqminer_rpc [--rpc=host:port] [--token=<TOKEN>] [--threads=N]\n"
-    "Notes: token from --token, MIQ_RPC_TOKEN, or datadir/.cookie\n";
+    "Usage: miqminer_rpc [--rpc=host:port] [--token=<TOKEN>] [--threads=N] [--address=ADDR]\n"
+    "Notes: token from --token, MIQ_RPC_TOKEN, or datadir/.cookie; address can be provided via --address or MIQ_MINER_ADDRESS/MIQ_ADDRESS.\n";
 }
 
 int main(int argc, char** argv){
@@ -918,6 +920,7 @@ int main(int argc, char** argv){
         uint16_t    rpc_port = (uint16_t)miq::RPC_PORT;
         std::string token;
         unsigned threads = 6;
+        std::string addr_arg;
 
         for(int i=1;i<argc;i++){
             std::string a(argv[i]);
@@ -931,6 +934,9 @@ int main(int argc, char** argv){
             } else if(a.rfind("--threads=",0)==0){
                 long v = std::strtol(a.c_str()+10,nullptr,10);
                 if(v>0 && v<=256) threads = (unsigned)v;
+            } else if(a.rfind("--address=",0)==0){
+                addr_arg = a.substr(10);
+                trim(addr_arg);
             } else {
                 std::fprintf(stderr,"Unknown arg: %s\n", argv[i]); return 2;
             }
@@ -947,14 +953,53 @@ int main(int argc, char** argv){
         // Precompute 128 cube frames once
         generate_frames_128();
 
-        // Address prompt
+        // ---- Resolve mining payout address robustly ----
         std::string addr;
-        std::cout << "Enter P2PKH Base58 address to mine to: ";
-        if(!std::getline(std::cin, addr)){ std::fprintf(stderr,"stdin closed\n"); return 1; }
-        trim(addr);
+
+        // 1) command-line
+        if(!addr_arg.empty()) addr = addr_arg;
+
+        // 2) env
+        if(addr.empty()){
+            if(const char* e = std::getenv("MIQ_MINER_ADDRESS")) addr = e;
+            if(addr.empty()){
+                if(const char* e2 = std::getenv("MIQ_ADDRESS")) addr = e2;
+            }
+            trim(addr);
+        }
+
+        // 3) prompt only if TTY
+        if(addr.empty() && stdin_is_tty()){
+            std::cout << "Enter P2PKH Base58 address to mine to: " << std::flush;
+            if(!std::getline(std::cin, addr)){
+                // fall through to RPC attempt
+                addr.clear();
+            } else {
+                trim(addr);
+            }
+        }
+
+        // 4) RPC fallback (non-interactive or missing input)
         std::vector<uint8_t> pkh;
+        if(addr.empty()){
+            if(!token.empty()){
+                std::string rpc_addr;
+                if(rpc_getnewaddress(rpc_host, rpc_port, token, rpc_addr)){
+                    addr = rpc_addr;
+                }
+            }
+        }
+
+        // Validate / decode PKH
+        if(addr.empty()){
+            std::fprintf(stderr,
+                "No payout address provided.\n"
+                "Provide one with --address=<Base58 P2PKH>, MIQ_MINER_ADDRESS env, or interactive prompt.\n");
+            return 1;
+        }
         if(!parse_p2pkh(addr, pkh)){
-            std::fprintf(stderr,"Invalid address (expected Base58Check P2PKH, version 0x%02x)\n",(unsigned)miq::VERSION_P2PKH);
+            std::fprintf(stderr,"Invalid address (expected Base58Check P2PKH, version 0x%02x): %s\n",
+                         (unsigned)miq::VERSION_P2PKH, addr.c_str());
             return 1;
         }
 
@@ -1089,10 +1134,11 @@ int main(int argc, char** argv){
             if(ok){
                 // Poll for acceptance on-chain (tip should move to this block)
                 bool confirmed = false;
+                std::string found_hex = miq::to_hex(found_block.block_hash());
                 for(int i=0;i<40;i++){ // ~4s
                     TipInfo t2{};
                     if(rpc_gettipinfo(rpc_host, rpc_port, token, t2)){
-                        if(t2.height == tpl.height && t2.hash_hex == miq::to_hex(found_block.block_hash())){
+                        if(t2.height == tpl.height && t2.hash_hex == found_hex){
                             confirmed = true; break;
                         }
                     }
@@ -1108,7 +1154,6 @@ int main(int argc, char** argv){
                                                 << " hash=" << ui.last_found_block_hash;
                         ui.last_submit_msg = m.str();
                     }else{
-                        // Accepted RPC but tip not observed yet — still surface success
                         ui.last_found_block_hash = miq::to_hex(found_block.block_hash());
                         std::ostringstream m; m << "submit accepted (pending tip refresh) hash=" << ui.last_found_block_hash;
                         ui.last_submit_msg = m.str();
