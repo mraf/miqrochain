@@ -7,6 +7,9 @@
 #include <cstring>
 #include <stdexcept>
 
+// Forward declare Block so callers (e.g., chain.cpp) can call build_block_filter.
+namespace miq { struct Block; }
+
 namespace miq {
 namespace gcs {
 
@@ -78,81 +81,53 @@ class BitWriter {
 public:
     BitWriter() : bit_in_byte_(0) {}
 
-    // write a single bit (0/1), MSB-first in each byte
     inline void write_bit(uint32_t b){
         if (bit_in_byte_ == 0) buf_.push_back(0);
-        if (b & 1) {
-            buf_.back() |= (uint8_t)(0x80u >> bit_in_byte_);
-        }
-        bit_in_byte_++;
-        if (bit_in_byte_ == 8) bit_in_byte_ = 0;
+        if (b & 1) buf_.back() |= (uint8_t)(0x80u >> bit_in_byte_);
+        if (++bit_in_byte_ == 8) bit_in_byte_ = 0;
     }
-
-    inline void write_unary(uint64_t q){
-        for (uint64_t i=0;i<q;i++) write_bit(1);
-        write_bit(0);
-    }
-
-    // write nbits from value, MSB-first
+    inline void write_unary(uint64_t q){ for (uint64_t i=0;i<q;i++) write_bit(1); write_bit(0); }
     inline void write_bits_be(uint32_t nbits, uint64_t value){
-        if (nbits == 0) return;
-        for (int i = (int)nbits - 1; i >= 0; --i) {
-            write_bit( (uint32_t)((value >> i) & 1ull) );
-        }
+        for (int i = (int)nbits - 1; i >= 0; --i) write_bit((uint32_t)((value >> i) & 1ull));
     }
-
-    // Golomb-Rice: quotient in unary, remainder in P bits (big-endian)
     inline void write_golomb(uint64_t x, uint32_t P){
         uint64_t q = (P ? (x >> P) : x);
         uint64_t r = (P ? (x & ((1ull<<P)-1)) : 0ull);
         write_unary(q);
         if (P) write_bits_be(P, r);
     }
-
-    inline std::vector<uint8_t> take(){
-        return std::move(buf_);
-    }
-
+    inline std::vector<uint8_t> take(){ return std::move(buf_); }
 private:
     std::vector<uint8_t> buf_;
-    uint8_t bit_in_byte_; // 0..7; how many bits written in the current byte
+    uint8_t bit_in_byte_;
 };
 
 class BitReader {
 public:
     BitReader(const uint8_t* data, size_t len)
         : p_(data), n_(len), byte_pos_(0), bit_in_byte_(0) {}
-
     inline bool read_bit(uint32_t& b){
         if (byte_pos_ >= n_) return false;
         uint8_t cur = p_[byte_pos_];
         b = (cur >> (7 - bit_in_byte_)) & 1u;
-        bit_in_byte_++;
-        if (bit_in_byte_ == 8) { bit_in_byte_ = 0; ++byte_pos_; }
+        if (++bit_in_byte_ == 8) { bit_in_byte_ = 0; ++byte_pos_; }
         return true;
     }
-
     inline bool read_unary(uint64_t& q){
         q = 0;
         for (;;) {
-            uint32_t bit=0;
-            if (!read_bit(bit)) return false;  // ran out before a terminating 0
-            if (bit == 0) return true;
-            q++;
+            uint32_t bit=0; if (!read_bit(bit)) return false;
+            if (bit == 0) return true; ++q;
         }
     }
-
-    // read nbits into value, MSB-first
     inline bool read_bits_be(uint32_t nbits, uint64_t& value){
         value = 0;
         for (uint32_t i=0;i<nbits;i++){
-            uint32_t bit=0;
-            if (!read_bit(bit)) return false;
+            uint32_t bit=0; if (!read_bit(bit)) return false;
             value = (value << 1) | (uint64_t)bit;
         }
         return true;
     }
-
 private:
     const uint8_t* p_;
     size_t n_;
@@ -172,7 +147,6 @@ inline uint64_t load64_le(const uint8_t* p){
           | ((uint64_t)p[6] << 48)
           | ((uint64_t)p[7] << 56);
 }
-
 inline uint64_t rotl64(uint64_t x, int b){ return (x << b) | (x >> (64 - b)); }
 
 inline uint64_t siphash24(const uint8_t key[16], const uint8_t* data, size_t len){
@@ -188,7 +162,6 @@ inline uint64_t siphash24(const uint8_t key[16], const uint8_t* data, size_t len
     for (const uint8_t* p = data; p != end; p += 8) {
         uint64_t m = load64_le(p);
         v3 ^= m;
-        // 2 rounds
         for (int i=0;i<2;i++){
             v0 += v1; v2 += v3; v1 = rotl64(v1,13); v3 = rotl64(v3,16);
             v1 ^= v0; v3 ^= v2; v0 = rotl64(v0,32);
@@ -230,7 +203,6 @@ inline uint64_t siphash24(const uint8_t key[16], const uint8_t* data, size_t len
     return v0 ^ v1 ^ v2 ^ v3;
 }
 
-// Map SipHash output into [0, F) with low bias
 inline uint64_t hash_to_range(const uint8_t key16[16],
                               const std::vector<uint8_t>& item,
                               uint64_t F)
@@ -241,7 +213,6 @@ inline uint64_t hash_to_range(const uint8_t key16[16],
     __uint128_t wide = ( (__uint128_t)h * (__uint128_t)F );
     return (uint64_t)(wide >> 64);
 #else
-    // Portable fallback (minor bias, acceptable for our use)
     return h % F;
 #endif
 }
@@ -256,9 +227,7 @@ inline std::vector<uint64_t> hashed_set(const std::array<uint8_t,16>& key,
     const uint64_t F = N * (uint64_t)M;
     std::vector<uint64_t> vals; vals.reserve(items.size());
     if (F == 0) return vals;
-    for (const auto& it : items) {
-        vals.push_back(hash_to_range(key.data(), it, F));
-    }
+    for (const auto& it : items) vals.push_back(hash_to_range(key.data(), it, F));
     std::sort(vals.begin(), vals.end());
     return vals;
 }
@@ -269,11 +238,7 @@ inline gcs::Filter build(const std::array<uint8_t,16>& key16,
 {
     gcs::Filter f; f.key = key16;
     const uint64_t N = (uint64_t)items.size();
-    if (N == 0) {
-        // Per BIP158: zero-element filter serializes to a single 0x00 byte
-        f.bytes = {0x00};
-        return f;
-    }
+    if (N == 0) { f.bytes = {0x00}; return f; }
 
     const auto vals = hashed_set(key16, items, params.M);
 
@@ -287,7 +252,6 @@ inline gcs::Filter build(const std::array<uint8_t,16>& key16,
     }
     auto compressed = bw.take();
 
-    // Serialize: CompactSize(N) || compressed
     std::vector<uint8_t> out;
     write_compact_size(out, N);
     out.insert(out.end(), compressed.begin(), compressed.end());
@@ -298,25 +262,21 @@ inline gcs::Filter build(const std::array<uint8_t,16>& key16,
 // --------------- Query ------------------------------------------------------
 
 inline bool decode_next(BitReader& br, uint32_t P, uint64_t& val) {
-    uint64_t q=0;
-    if (!br.read_unary(q)) return false;
-    uint64_t r=0;
-    if (P > 0 && !br.read_bits_be(P, r)) return false;
-    val = (q << P) | r;
-    return true;
+    uint64_t q=0; if (!br.read_unary(q)) return false;
+    uint64_t r=0; if (P > 0 && !br.read_bits_be(P, r)) return false;
+    val = (q << P) | r; return true;
 }
 
 inline bool match_one(const Filter& f, const std::vector<uint8_t>& item, const Params& params){
     const auto& bytes = f.bytes;
     if (bytes.empty()) return false;
-    if (bytes.size()==1 && bytes[0]==0x00) return false; // empty set
+    if (bytes.size()==1 && bytes[0]==0x00) return false;
 
     const uint8_t* p = bytes.data();
     const uint8_t* e = bytes.data() + bytes.size();
 
     uint64_t N = 0;
-    if (!read_compact_size(p, e, N)) return false;
-    if (N == 0) return false;
+    if (!read_compact_size(p, e, N) || N == 0) return false;
 
     const uint64_t F = N * (uint64_t)params.M;
     const uint64_t target = hash_to_range(f.key.data(), item, F);
@@ -329,7 +289,7 @@ inline bool match_one(const Filter& f, const std::vector<uint8_t>& item, const P
         if (!decode_next(br, params.P, delta)) return false;
         uint64_t set_item = last + delta;
         if (set_item == target) return true;
-        if (set_item > target) return false; // early out
+        if (set_item > target) return false;
         last = set_item;
     }
     return false;
@@ -345,12 +305,10 @@ inline bool match_any(const Filter& f, const std::vector<std::vector<uint8_t>>& 
     const uint8_t* e = bytes.data() + bytes.size();
 
     uint64_t N = 0;
-    if (!read_compact_size(p, e, N)) return false;
-    if (N == 0) return false;
+    if (!read_compact_size(p, e, N) || N == 0) return false;
 
     const uint64_t F = N * (uint64_t)params.M;
 
-    // hash & sort queries
     std::vector<uint64_t> q; q.reserve(items.size());
     for (auto& it: items) q.push_back(hash_to_range(f.key.data(), it, F));
     std::sort(q.begin(), q.end());
@@ -363,13 +321,15 @@ inline bool match_any(const Filter& f, const std::vector<std::vector<uint8_t>>& 
         uint64_t delta = 0;
         if (!decode_next(br, params.P, delta)) return false;
         uint64_t val = last + delta;
-        // advance queries up to/including val
         while (qi < q.size() && q[qi] < val) ++qi;
         if (qi < q.size() && q[qi] == val) return true;
         last = val;
     }
     return false;
 }
+
+// ---- Declaration used by chain.cpp (implemented elsewhere in your repo) ----
+bool build_block_filter(const ::miq::Block& b, std::vector<uint8_t>& out);
 
 }
 }
