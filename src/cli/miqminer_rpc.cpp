@@ -31,6 +31,7 @@
 #include <cmath>
 #include <limits>
 #include <ctime>
+#include <array>
 
 #if defined(_WIN32)
   #ifndef NOMINMAX
@@ -59,11 +60,6 @@
 
 using namespace miq;
 
-// -----------------------------------------------------------------------------
-// Global IO lock to avoid interleaved writes between UI and animator
-static std::mutex g_io_mtx;
-// -----------------------------------------------------------------------------
-
 // ===== small utils ===========================================================
 static inline void trim(std::string& s){
     size_t i=0,j=s.size();
@@ -71,8 +67,6 @@ static inline void trim(std::string& s){
     while(j>i && std::isspace((unsigned char)s[j-1])) --j;
     s.assign(s.data()+i, j-i);
 }
-static int count_lines(const std::string& s){ int c=0; for(char ch: s) if(ch=='\n') ++c; return c; }
-
 static std::string default_cookie_path(){
 #ifdef _WIN32
     char* v=nullptr; size_t len=0;
@@ -125,25 +119,21 @@ static void bits_to_target_be(uint32_t bits, uint8_t out[32]){
         out[pos+2] = uint8_t((mant >>  0) & 0xff);
     }
 }
-
 static inline bool compact_bits_valid(uint32_t bits){
     uint32_t exp  = bits >> 24;
     uint32_t mant = bits & 0x007fffff;
     return exp >= 3 && mant != 0;
 }
 static inline uint32_t sanitize_bits(uint32_t bits){
-    // Force real difficulty-1 (GENESIS_BITS) if node returns junk (e.g., 0x00000004)
+    // Force real difficulty-1 if node gives nonsense (e.g., 0x00000004)
     return compact_bits_valid(bits) ? bits : miq::GENESIS_BITS;
 }
-
 static inline bool meets_target_be_raw(const uint8_t hash32[32], uint32_t bits){
     uint8_t T[32]; bits_to_target_be(bits, T);
-    // Never accept an all-zero target
     bool allz = true; for(int i=0;i<32;i++) if(T[i]) { allz=false; break; }
     if(allz) return false;
     return std::memcmp(hash32, T, 32) <= 0;
 }
-
 static double difficulty_from_bits(uint32_t bits){
     uint32_t exp  = bits >> 24;
     uint32_t mant = bits & 0x007fffff;
@@ -405,7 +395,7 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
     out.height = (uint64_t)h;
     out.prev_hash = from_hex_s(ph);
     if(out.prev_hash.size()!=32) return false;
-    out.bits = sanitize_bits((uint32_t)b); // force valid compact bits (diff-1 fallback)
+    out.bits = sanitize_bits((uint32_t)b);
     out.time = (int64_t)t;
 
     // Parse txs
@@ -444,12 +434,6 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
 }
 
 // fallbacks to estimate network hashrate
-static bool rpc_getblockcount(const std::string& host, uint16_t port, const std::string& auth, long long& out){
-    HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build("getblockcount","[]"), r) || r.code != 200) return false;
-    if(json_has_error(r.body)) return false;
-    return json_find_number(r.body, "result", out);
-}
 static bool rpc_getblockhash(const std::string& host, uint16_t port, const std::string& auth, uint64_t height, std::string& out){
     std::ostringstream ps; ps<<"["<<height<<"]";
     HttpResp r;
@@ -564,10 +548,13 @@ static bool rpc_getcoinbaserecipient(const std::string& host, uint16_t port, con
     return true;
 }
 
-// ===== 3D cube art (16 base frames; we’ll animate at 128 FPS but keep it fixed) ===
+// ===== 3D cube art (16 base frames) =========================================
+// We’ll generate 128 frames from these 16 via subtle face-shading so the cube
+// is smoother/slower but still fixed on screen.
+
 static const int kAnimLines = 8;
-static const int kBaseFrames = 16;
-static const char* kBase[kBaseFrames][kAnimLines] = {
+static const int kBase16 = 16;
+static const char* kBase[kBase16][kAnimLines] = {
 {
 "      _________       ",
 "     / _______ \\      ",
@@ -715,16 +702,52 @@ static const char* kBase[kBaseFrames][kAnimLines] = {
 }
 };
 
-// Static (non-moving) frame generator — keep rotation, no horizontal wobble
-static std::vector<std::string> make_block_frame(uint64_t frame){
-    uint64_t base = frame & 15;   // 0..15 (cycle)
-    std::vector<std::string> lines; lines.reserve(kAnimLines);
+// ===== 128 base frames generator ============================================
+// We build 128 unique frames by:
+//  - choosing a slow 16-step rotation (index = floor(f * 16 / 128))
+//  - overlaying per-frame face “shading/spark” characters inside the cube
+// This keeps the cube fixed in place while giving smoother/slower motion.
+
+static const char* kShadeLevels = " .:-=+*#";
+static std::vector<std::array<std::string, kAnimLines>> gFrames128;
+
+static void overlay_shading(std::array<std::string,kAnimLines>& lines, int phase)
+{
+    // shade level 0..7
+    const char shade = kShadeLevels[phase & 7];
+    if (shade == ' ') return;
+
+    // Apply shading only inside the visible footprint of each line
     for(int i=0;i<kAnimLines;i++){
-        std::string ln;           // no indent — fixed position
-        ln += kBase[base][i];
-        lines.push_back(std::move(ln));
+        std::string& L = lines[i];
+        // Find first and last non-space to limit edits
+        int l=0, r=(int)L.size()-1;
+        while(l<=r && L[l]==' ') ++l;
+        while(r>=l && L[r]==' ') --r;
+        if(r-l < 4) continue;
+
+        // Dithered fill on interior spaces to create a subtle animation
+        for(int p=l+1; p<r; ++p){
+            if(L[p]==' '){
+                // stagger with line index and phase to simulate “hashing sparks”
+                if(((p + i*3 + phase*2) % 11) == 0) L[p] = shade;
+            }
+        }
     }
-    return lines;
+}
+
+static void generate_frames_128()
+{
+    gFrames128.clear();
+    gFrames128.reserve(128);
+    for(int f=0; f<128; ++f){
+        int base = (f * kBase16) / 128;       // 0..15 (slow rotation)
+        int shade_phase = f & 7;              // 0..7 (shading pattern)
+        std::array<std::string,kAnimLines> block{};
+        for(int i=0;i<kAnimLines;i++) block[i] = kBase[base][i];
+        overlay_shading(block, shade_phase);
+        gFrames128.push_back(std::move(block));
+    }
 }
 
 // ===== UI state ==============================================================
@@ -771,33 +794,7 @@ static std::string fmt_hs(double v){
     std::ostringstream o; o<<std::fixed<<std::setprecision(2)<<v<<" "<<u[i]; return o.str();
 }
 
-// Animator thread — draws only the cube region at ~128 FPS; uses IO lock
-static void cube_anim_loop(std::atomic<bool>* running, int start_row, int start_col){
-#if defined(_WIN32)
-    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (h != INVALID_HANDLE_VALUE) {
-        DWORD mode=0; if (GetConsoleMode(h,&mode)) SetConsoleMode(h, mode | 0x0004);
-    }
-#endif
-    using clock = std::chrono::steady_clock;
-    auto next = clock::now();
-    uint64_t frame = 0;
-    while(running->load(std::memory_order_relaxed)){
-        next += std::chrono::microseconds(7813); // ~128 FPS
-        auto art = make_block_frame(frame++);
-        std::ostringstream os;
-        for(int i=0;i<kAnimLines;i++){
-            os << "\x1b[" << (start_row + i) << ";" << start_col << "H"
-               << "  \x1b[36m" << art[i] << "\x1b[0m";
-        }
-        {
-            std::lock_guard<std::mutex> lk(g_io_mtx);
-            std::cout << os.str() << std::flush;
-        }
-        std::this_thread::sleep_until(next);
-    }
-}
-
+// ===== UI draw loop (single-thread; cube fixed; ~12 FPS) =====================
 static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui, const std::atomic<bool>* running){
 #if defined(_WIN32)
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -805,45 +802,50 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
         DWORD mode=0; if (GetConsoleMode(h,&mode)) SetConsoleMode(h, mode | 0x0004);
     }
 #endif
-    bool anim_started = false;
-    int cube_row = 0, cube_col = 3;
+    using clock = std::chrono::steady_clock;
+    const int FPS = 12;                         // slower so progress is visible
+    const auto frame_dt = std::chrono::milliseconds(1000/FPS);
+
+    auto last_rate_t = clock::now();
+    uint64_t last_tries = ui->tries.load();
+    uint64_t frame = 0;
 
     while(running->load(std::memory_order_relaxed)){
-        // instantaneous hashrate via tries diff
-        uint64_t cur = ui->tries.load();
-        uint64_t prev = ui->tries_last.exchange(cur);
-        double local_hs = (double)(cur - prev); // per ~1s
-        ui->hashps_inst.store(local_hs);
+        // Update instantaneous and smoothed hashrate based on tries delta
+        const auto now = clock::now();
+        const double dt = std::chrono::duration<double>(now - last_rate_t).count();
+        const uint64_t cur_tries = ui->tries.load();
+        if (dt > 0.0){
+            const double hps = (double)((cur_tries >= last_tries) ? (cur_tries - last_tries) : 0ULL) / dt;
+            ui->hashps_inst.store(hps);
+            double ema = ui->hashps_avg.load();
+            const double alpha = 0.25;
+            ui->hashps_avg.store(ema*(1.0-alpha) + hps*alpha);
+        }
+        last_rate_t = now; last_tries = cur_tries;
 
-        // smoothed EMA
-        double ema = ui->hashps_avg.load();
-        const double alpha = 0.25; // responsive but stable
-        ema = ema*(1.0-alpha) + local_hs*alpha;
-        ui->hashps_avg.store(ema);
-
-        // Build top part (everything above the cube)
-        std::ostringstream top;
-        top << "\x1b[2J\x1b[H"; // clear + home
-        top << "  \x1b[1mMIQ Miner (RPC)\x1b[0m  —  address: " << addr << "     threads: " << threads << "\n\n";
+        std::ostringstream out;
+        out << "\x1b[2J\x1b[H"; // clear + home
+        out << "  \x1b[1mMIQ Miner (RPC)\x1b[0m  —  address: " << addr << "     threads: " << threads << "\n\n";
 
         uint64_t th = ui->tip_height.load();
         if(th){
-            top << "  tip height:      " << th << "\n";
-            top << "  tip hash:        " << ui->tip_hash_hex << "\n";
+            out << "  tip height:      " << th << "\n";
+            out << "  tip hash:        " << ui->tip_hash_hex << "\n";
             uint32_t bits = ui->tip_bits.load();
-            top << "  tip bits:        0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)bits
+            out << "  tip bits:        0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)bits
                 << std::dec << "  (difficulty " << std::fixed << std::setprecision(2) << difficulty_from_bits(bits) << ")\n";
         } else {
-            top << "  (waiting for template)\n";
+            out << "  (waiting for template)\n";
         }
 
         {
             std::lock_guard<std::mutex> lk(ui->mtx);
             if(ui->cand.height){
-                top << "\n";
-                top << "  mining candidate:  height=" << ui->cand.height
+                out << "\n";
+                out << "  mining candidate:  height=" << ui->cand.height
                     << "  prev=" << ui->cand.prev_hex << "\n";
-                top << "                     txs=" << ui->cand.txs
+                out << "                     txs=" << ui->cand.txs
                     << "  size=" << ui->cand.size_bytes << " bytes"
                     << "  fees=" << ui->cand.fees
                     << "  coinbase=" << ui->cand.coinbase << "\n";
@@ -852,42 +854,35 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
 
         if(ui->lastblk.height){
             const auto& lb = ui->lastblk;
-            top << "\n";
-            top << "  last block:       height=" << lb.height
+            out << "\n";
+            out << "  last block:       height=" << lb.height
                 << "  hash=" << lb.hash_hex
                 << "  txs=" << lb.txs << "\n";
             if(!lb.coinbase_txid_hex.empty())
-                top << "                     coinbase_txid=" << lb.coinbase_txid_hex << "\n";
+                out << "                     coinbase_txid=" << lb.coinbase_txid_hex << "\n";
             if(!lb.coinbase_pkh.empty()){
-                top << "                     paid to: " << pkh_to_address(lb.coinbase_pkh)
+                out << "                     paid to: " << pkh_to_address(lb.coinbase_pkh)
                     << "  (pkh=" << to_hex_s(lb.coinbase_pkh) << ", value=" << lb.reward_value << ")\n";
             }
         }
 
-        top << "\n";
-        top << "  local hashrate:   " << fmt_hs(ui->hashps_inst.load()) << "  (avg " << fmt_hs(ui->hashps_avg.load()) << ")\n";
-        top << "  network hashrate: " << fmt_hs(ui->net_hashps.load()) << "\n";
-        top << "  mined (session):  " << ui->mined_blocks.load() << "\n";
+        out << "\n";
+        out << "  local hashrate:   " << fmt_hs(ui->hashps_inst.load()) << "  (avg " << fmt_hs(ui->hashps_avg.load()) << ")\n";
+        out << "  network hashrate: " << fmt_hs(ui->net_hashps.load()) << "\n";
+        out << "  mined (session):  " << ui->mined_blocks.load() << "\n";
         if(!ui->last_found_block_hash.empty())
-            top << "  last found:       " << ui->last_found_block_hash << "\n";
+            out << "  last found:       " << ui->last_found_block_hash << "\n";
 
-        top << "\n";
-        // Reserve cube area: remember the row, then print placeholders so the rest stays below
-        cube_row = count_lines(top.str()) + 1;
-        for(int i=0;i<kAnimLines;i++) top << "\n";
+        // 128-frame cube (fixed position)
+        out << "\n";
+        const auto& art = gFrames128[(size_t)(frame++ & 127)];
+        for(int i=0;i<kAnimLines;i++)
+            out << "  \x1b[36m" << art[i] << "\x1b[0m\n";
 
-        top << "\n  Press Ctrl+C to quit.\n";
-        {
-            std::lock_guard<std::mutex> lk(g_io_mtx);
-            std::cout << top.str() << std::flush;
-        }
+        out << "\n  Press Ctrl+C to quit.\n";
 
-        if(!anim_started){
-            anim_started = true;
-            std::thread(cube_anim_loop, (std::atomic<bool>*)running, cube_row, cube_col).detach();
-        }
-
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::cout << out.str() << std::flush;
+        std::this_thread::sleep_for(frame_dt);
     }
 }
 
@@ -1030,7 +1025,7 @@ static bool pack_template(const MinerTemplate& tpl,
 // ===== main ==================================================================
 static void usage(){
     std::cout <<
-    "miqminer_rpc — Solo miner for MIQ (JSON-RPC, optimized)\n"
+    "miqminer_rpc — Solo miner for MIQ (JSON-RPC, optimized, 128-frame UI)\n"
     "Usage: miqminer_rpc [--rpc=host:port] [--token=<TOKEN>] [--threads=N]\n"
     "Notes: token taken from --token, MIQ_RPC_TOKEN, or datadir/.cookie\n";
 }
@@ -1046,7 +1041,7 @@ int main(int argc, char** argv){
         std::string rpc_host = "127.0.0.1";
         uint16_t    rpc_port = (uint16_t)miq::RPC_PORT;
         std::string token;
-        unsigned threads = 6; // default; override with --threads
+        unsigned threads = 6; // default per your ask; override with --threads
 
         for(int i=1;i<argc;i++){
             std::string a(argv[i]);
@@ -1073,6 +1068,9 @@ int main(int argc, char** argv){
             }
         }
 
+        // Precompute 128 cube frames once
+        generate_frames_128();
+
         // Address prompt
         std::string addr;
         std::cout << "Enter P2PKH Base58 address to mine to: ";
@@ -1084,13 +1082,12 @@ int main(int argc, char** argv){
             return 1;
         }
 
-        // UI + background threads
+        // UI + background watcher
         UIState ui;
         std::atomic<bool> running{true};
         std::thread ui_th([&](){ draw_ui_loop(addr, threads, &ui, &running); });
         ui_th.detach();
 
-        // chain watcher (tip + last block + net hashrate)
         std::thread watch([&](){
             uint64_t last_seen_h = 0;
             while(running.load()){
@@ -1158,7 +1155,7 @@ int main(int argc, char** argv){
             hb.version = 1;
             hb.prev_hash = tpl.prev_hash;
             hb.time = std::max<int64_t>((int64_t)time(nullptr), tpl.time);
-            hb.bits = tpl.bits; // already sanitized in rpc_getminertemplate
+            hb.bits = tpl.bits; // already sanitized
             hb.nonce = 0;
 
             // Mine
@@ -1176,7 +1173,7 @@ int main(int argc, char** argv){
             std::thread meter([&](){
                 while(!found.load(std::memory_order_relaxed)){
                     ui.tries.store(tries.load(std::memory_order_relaxed));
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 }
                 ui.tries.store(tries.load(std::memory_order_relaxed));
             });
