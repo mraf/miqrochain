@@ -1,6 +1,6 @@
 // miqminer_rpc.cpp  — fixed RPC miner for MIQ
-// - Never exits before offering a way to get a payout address
-// - Address sources (in order): --address, MIQ_MINER_ADDRESS/MIQ_ADDRESS, prompt (if TTY), RPC getnewaddress
+// - Robust JSON number parsing (handles 5e9, etc.) so rewards/fees display correctly
+// - Address sources: --address, MIQ_MINER_ADDRESS/MIQ_ADDRESS, prompt (if TTY), RPC getnewaddress
 // - Aligns with node RPC (bits/adjusted_bits, top-level string getblockhash)
 // - Clear submit/accept UI; last-found only set after acceptance polling
 // - 128-frame generated cube; no static tables needed
@@ -143,15 +143,18 @@ static bool json_find_string(const std::string& json, const std::string& key, st
     return false;
 }
 static bool json_find_number(const std::string& json, const std::string& key, long long& out){
+    // Accept integers, decimals, and scientific notation
     std::string pat = "\"" + key + "\":";
     size_t p = json.find(pat);
     if(p==std::string::npos) return false;
     p += pat.size();
     while(p<json.size() && std::isspace((unsigned char)json[p])) ++p;
     size_t q = p;
-    while(q<json.size() && (std::isdigit((unsigned char)json[q])||json[q]=='-'||json[q]=='+' )) ++q;
+    while(q<json.size() && (std::isdigit((unsigned char)json[q]) || json[q]=='-' || json[q]=='+' ||
+                            json[q]=='.' || json[q]=='e' || json[q]=='E')) ++q;
     if(q==p) return false;
-    out = std::strtoll(json.c_str()+p, nullptr, 10);
+    double d = std::strtod(json.c_str()+p, nullptr);
+    out = (long long)std::llround(d);
     return true;
 }
 static bool json_find_double(const std::string& json, const std::string& key, double& out){
@@ -273,7 +276,7 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
         miq_closesocket(s); s = INVALID_SOCKET;
 #else
         if(s<0) continue;
-        if(connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen)==0) break;
+        if(connect(s, ai->ai_addr, (socklen_t)ai->ailen)==0) break;
         miq_closesocket(s); s = -1;
 #endif
     }
@@ -379,7 +382,6 @@ static bool rpc_getminerstats(const std::string& host, uint16_t port, const std:
     return false;
 }
 
-// Accept top-level string or {"result":"..."}
 static bool rpc_getblockhash(const std::string& host, uint16_t port, const std::string& auth, uint64_t height, std::string& out){
     std::ostringstream ps; ps<<"["<<height<<"]";
     HttpResp r;
@@ -554,7 +556,7 @@ struct LastBlockInfo {
     uint64_t txs{0};
     std::string coinbase_txid_hex;
     std::vector<uint8_t> coinbase_pkh;
-    uint64_t reward_value{0};
+    uint64_t reward_value{0}; // miqron
 };
 static bool rpc_getblock_overview(const std::string& host, uint16_t port, const std::string& auth,
                                   uint64_t height, LastBlockInfo& out)
@@ -576,9 +578,9 @@ static bool rpc_getcoinbaserecipient(const std::string& host, uint16_t port, con
     HttpResp r;
     if(!http_post(host, port, "/", auth, rpc_build("getcoinbaserecipient", ps.str()), r) || r.code!=200) return false;
     if(json_has_error(r.body)) return false;
-    std::string pkh_hex, txid_hex; long long val=0;
+    std::string pkh_hex, txid_hex; double vald=0.0;
     if(!json_find_string(r.body, "pkh", pkh_hex)) return false;
-    if(json_find_number(r.body, "value", val)) io.reward_value = (uint64_t)val;
+    if(json_find_double(r.body, "value", vald)) io.reward_value = (uint64_t)std::llround(vald);
     if(json_find_string(r.body, "txid", txid_hex)) io.coinbase_txid_hex = txid_hex;
     io.coinbase_pkh = from_hex_s(pkh_hex);
     return true;
@@ -620,8 +622,8 @@ struct CandidateStats {
     int64_t time{0};
     size_t txs{0};
     size_t size_bytes{0};
-    uint64_t fees{0};
-    uint64_t coinbase{0};
+    uint64_t fees{0};     // miqron
+    uint64_t coinbase{0}; // miqron
 };
 
 struct UIState {
@@ -656,6 +658,11 @@ static std::string fmt_hs(double v){
     int i=0; while(v>=1000.0 && i<5){ v/=1000.0; ++i; }
     std::ostringstream o; o<<std::fixed<<std::setprecision(2)<<v<<" "<<u[i]; return o.str();
 }
+static std::string fmt_miq(uint64_t sat){
+    std::ostringstream s;
+    s << (sat/COIN) << "." << std::setw(8) << std::setfill('0') << (sat%COIN);
+    return s.str();
+}
 
 // ===== UI draw loop (single-thread; cube fixed; ~12 FPS) =====================
 static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui, const std::atomic<bool>* running){
@@ -674,7 +681,6 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
     uint64_t frame = 0;
 
     while(running->load(std::memory_order_relaxed)){
-        // Update instantaneous and smoothed hashrate
         const auto now = clock::now();
         const double dt = std::chrono::duration<double>(now - last_rate_t).count();
         const uint64_t cur_tries = ui->tries.load();
@@ -710,8 +716,8 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
                     << "  prev=" << ui->cand.prev_hex << "  \x1b[2m(prev=tip)\x1b[0m\n";
                 out << "                     txs=" << ui->cand.txs
                     << "  size=" << ui->cand.size_bytes << " bytes"
-                    << "  fees=" << ui->cand.fees
-                    << "  coinbase=" << ui->cand.coinbase << "\n";
+                    << "  fees=" << ui->cand.fees << " miqron (" << fmt_miq(ui->cand.fees) << " MIQ)"
+                    << "  coinbase=" << ui->cand.coinbase << " miqron (" << fmt_miq(ui->cand.coinbase) << " MIQ)\n";
             }
         }
 
@@ -725,7 +731,8 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
                 out << "                     coinbase_txid=" << lb.coinbase_txid_hex << "\n";
             if(!lb.coinbase_pkh.empty()){
                 out << "                     paid to: " << pkh_to_address(lb.coinbase_pkh)
-                    << "  (pkh=" << to_hex_s(lb.coinbase_pkh) << ", value=" << lb.reward_value << ")\n";
+                    << "  (pkh=" << to_hex_s(lb.coinbase_pkh) << ", value=" << lb.reward_value
+                    << " miqron, " << fmt_miq(lb.reward_value) << " MIQ)\n";
             }
         }
 
@@ -784,7 +791,6 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
     put_u32_le(header_prefix, b.header.bits);
     const size_t nonce_off = header_prefix.size();
 
-    // Target
     bits = sanitize_bits(bits);
 
 #if !defined(MIQ_POW_SALT)
@@ -803,8 +809,8 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
     uint64_t nonce = base_nonce + (uint64_t)tid;
     const uint64_t step  = (uint64_t)stride;
 
-    const uint64_t BATCH = (1ull<<15); // 32768 attempts per outer loop
-    const uint64_t FLUSH = (1ull<<20); // flush ~1M tries to UI
+    const uint64_t BATCH = (1ull<<15);
+    const uint64_t FLUSH = (1ull<<20);
 
     uint64_t local_hashes = 0;
 
@@ -905,7 +911,7 @@ static void usage(){
     std::cout <<
     "miqminer_rpc — Solo miner for MIQ (JSON-RPC, 128-frame UI)\n"
     "Usage: miqminer_rpc [--rpc=host:port] [--token=<TOKEN>] [--threads=N] [--address=ADDR]\n"
-    "Notes: token from --token, MIQ_RPC_TOKEN, or datadir/.cookie; address can be provided via --address or MIQ_MINER_ADDRESS/MIQ_ADDRESS.\n";
+    "Notes: token from --token, MIQ_RPC_TOKEN, or datadir/.cookie; address via --address or MIQ_MINER_ADDRESS/MIQ_ADDRESS.\n";
 }
 
 int main(int argc, char** argv){
@@ -956,10 +962,8 @@ int main(int argc, char** argv){
         // ---- Resolve mining payout address robustly ----
         std::string addr;
 
-        // 1) command-line
         if(!addr_arg.empty()) addr = addr_arg;
 
-        // 2) env
         if(addr.empty()){
             if(const char* e = std::getenv("MIQ_MINER_ADDRESS")) addr = e;
             if(addr.empty()){
@@ -968,18 +972,15 @@ int main(int argc, char** argv){
             trim(addr);
         }
 
-        // 3) prompt only if TTY
         if(addr.empty() && stdin_is_tty()){
             std::cout << "Enter P2PKH Base58 address to mine to: " << std::flush;
             if(!std::getline(std::cin, addr)){
-                // fall through to RPC attempt
                 addr.clear();
             } else {
                 trim(addr);
             }
         }
 
-        // 4) RPC fallback (non-interactive or missing input)
         std::vector<uint8_t> pkh;
         if(addr.empty()){
             if(!token.empty()){
@@ -990,7 +991,6 @@ int main(int argc, char** argv){
             }
         }
 
-        // Validate / decode PKH
         if(addr.empty()){
             std::fprintf(stderr,
                 "No payout address provided.\n"
@@ -1076,7 +1076,7 @@ int main(int argc, char** argv){
             hb.version = 1;
             hb.prev_hash = tpl.prev_hash;
             hb.time = std::max<int64_t>((int64_t)time(nullptr), tpl.time);
-            hb.bits = tpl.bits; // already sanitized/adjusted if present
+            hb.bits = tpl.bits;
             hb.nonce = 0;
 
             // Mine
