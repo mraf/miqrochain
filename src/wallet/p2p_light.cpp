@@ -225,15 +225,40 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     sock_ = resolve_and_connect_best(candidates, port, o_.io_timeout_ms, err);
     if (sock_ < 0) return false;
 
+    // --- Handshake attempt A: full Bitcoin-style version payload -------------
     if(!send_version(err))      { close(); return false; }
-
-    // Always send verack (node expects one from us)
     {
         std::vector<uint8_t> empty;
         if(!send_msg("verack", empty, err)) { close(); return false; }
     }
+    if(!read_until_verack(err)) {
+        // Save the first failure reason (often "no verack from peer")
+        std::string first_err = err;
+        err.clear();
 
-    if(!read_until_verack(err)) { close(); return false; }
+        // --- Fallback A': try empty 'version' on the SAME socket -------------
+        {
+            std::vector<uint8_t> empty;
+            (void)send_msg("version", empty, err); // best-effort
+            (void)send_msg("verack",  empty, err); // best-effort
+            if(read_until_verack(err)) goto post_handshake_ok;
+        }
+
+        // --- Fallback B: reconnect and try empty 'version' FIRST -------------
+        closesock(sock_); sock_ = -1;
+        std::string e2;
+        sock_ = resolve_and_connect_best(candidates, port, o_.io_timeout_ms, e2);
+        if (sock_ < 0) { err = first_err; return false; }
+        err.clear();
+        {
+            std::vector<uint8_t> empty;
+            if(!send_msg("version", empty, err)) { close(); return false; }
+            if(!send_msg("verack",  empty, err)) { close(); return false; }
+            if(!read_until_verack(err)) { close(); err = first_err; return false; }
+        }
+    }
+
+post_handshake_ok:
 
     // Best-effort getaddr
     { std::string e2; (void)send_getaddr(e2); }
