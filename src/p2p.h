@@ -21,13 +21,13 @@
   #ifndef socklen_t
     using socklen_t = int;
   #endif
-  using Sock = SOCKET;          // ← unified socket type
+  using Sock = SOCKET;          // unified socket type on Windows
 #else
   #include <netinet/in.h>
   #include <arpa/inet.h>
   #include <sys/socket.h>
   #include <unistd.h>
-  using Sock = int;             // ← unified socket type
+  using Sock = int;             // unified socket type on POSIX
 #endif
 
 #include "mempool.h"
@@ -219,7 +219,7 @@ public:
                 for (char ch : bits) { if (ch<'0'||ch>'9'){ b=-1; break; } b = b*10 + (ch-'0'); }
                 if (b < 0 || b > 32) continue;
                 uint32_t ip_host = ntohl(be_ip);
-                Cidr c;
+                struct Cidr c;
                 c.bits = (uint8_t)b;
                 c.net  = (b==0) ? 0u : (ip_host & (~uint32_t(0) << (32-b)));
                 whitelist_cidrs_.push_back(c);
@@ -228,18 +228,16 @@ public:
     }
 
 private:
-    // headers-first helpers
-    void send_getheaders(PeerState& ps);
-    void send_headers_snapshot(PeerState& ps, const std::vector<std::vector<uint8_t>>& locator);
-
     // tx relay (basic)
     void request_tx(PeerState& ps, const std::vector<uint8_t>& txid);
-    void send_tx(Sock sock, const std::vector<uint8_t>& raw);            // ← Sock
-    void send_block(Sock s, const std::vector<uint8_t>& raw);            // ← Sock
+    void send_tx(Sock sock, const std::vector<uint8_t>& raw);
+    void send_block(Sock s, const std::vector<uint8_t>& raw);
 
     // Small caches
     mutable std::mutex announce_mu_;
     std::vector<std::vector<uint8_t>> announce_blocks_q_;
+    mutable std::mutex announce_tx_mu_;
+    std::vector<std::vector<uint8_t>> announce_tx_q_;
     std::unordered_set<std::string> seen_txids_;
     std::unordered_map<std::string, std::vector<uint8_t>> tx_store_;
     std::deque<std::string> tx_order_;
@@ -253,7 +251,7 @@ private:
 #else
     Sock srv_{-1};
 #endif
-    std::unordered_map<Sock, PeerState> peers_;                           // ← Sock key
+    std::unordered_map<Sock, PeerState> peers_; // keyed by Sock everywhere
     std::unordered_set<std::string> banned_;
     std::string datadir_{"./miqdata"};
 
@@ -295,7 +293,7 @@ private:
 
     // core
     void loop();
-    void handle_new_peer(Sock c, const std::string& ip);                  // ← Sock
+    void handle_new_peer(Sock c, const std::string& ip);
     void load_bans();
     void save_bans();
 
@@ -303,7 +301,7 @@ private:
     void start_sync_with_peer(PeerState& ps);
     void request_block_index(PeerState& ps, uint64_t index);
     void request_block_hash(PeerState& ps, const std::vector<uint8_t>& h);
-    void handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw);// ← Sock
+    void handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw);
 
     // rate-limit helpers
     void rate_refill(PeerState& ps, int64_t now);
@@ -325,41 +323,6 @@ private:
     void try_connect_orphans(const std::string& parent_hex);
 
     // ================== Inline helpers required by p2p.cpp ===================
-
-    inline bool check_rate(PeerState& ps, const char* family, double cost, int64_t now_ms) {
-        if (!family || cost <= 0.0) return true;
-        auto it_cfg = rate_cfg_.find(family);
-        if (it_cfg == rate_cfg_.end()) return true;
-        auto& cfg = it_cfg->second;
-
-        auto& bmap = ps.rate.buckets;
-        auto it_b  = bmap.find(family);
-        if (it_b == bmap.end()) it_b = bmap.emplace(family, cfg.burst).first;
-
-        if (ps.rate.last_ms == 0) ps.rate.last_ms = now_ms;
-        int64_t dt = now_ms - ps.rate.last_ms;
-        if (dt > 0) {
-            double add = cfg.per_sec * (double)dt / 1000.0;
-            it_b->second = (it_b->second + add);
-            if (it_b->second > cfg.burst) it_b->second = cfg.burst;
-            ps.rate.last_ms = now_ms;
-        }
-
-        if (it_b->second + 1e-9 < cost) return false;
-        it_b->second -= cost;
-        return true;
-    }
-
-    inline void bump_ban(PeerState& ps, const std::string& ip, const char*, int64_t now_ms) {
-        if (is_loopback(ip) || is_whitelisted_ip(ip)) {
-            if (ps.banscore < 0) ps.banscore = 0;
-            return;
-        }
-        if (ps.banscore < 0) ps.banscore = 0;
-        if (ps.banscore >= MIQ_P2P_MAX_BANSCORE) {
-            timed_bans_[ip] = now_ms + default_ban_ms_;
-        }
-    }
 
     inline bool is_ip_banned(const std::string& ip, int64_t now_ms) const {
         if (is_loopback(ip) || is_whitelisted_ip(ip)) return false;
