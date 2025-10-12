@@ -253,6 +253,7 @@
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #pragma comment(lib, "Ws2_32.lib")
+  using Sock   = SOCKET;
   using PollFD = WSAPOLLFD;
   static const short POLL_RD = POLLRDNORM;
   #define MIQ_INVALID_SOCK INVALID_SOCKET
@@ -264,11 +265,15 @@
   #include <netdb.h>
   #include <unistd.h>
   #include <poll.h>
+  using Sock   = int;
   using PollFD = pollfd;
   static const short POLL_RD = POLLIN;
   #define MIQ_INVALID_SOCK (-1)
   #define CLOSESOCK(s) close(s)
 #endif
+
+// p2p.h uses int for PeerState::sock and for map keys; we cast to Sock
+// where needed on Windows to avoid narrowing and keep WSAPOLLFD happy.
 
 namespace {
 // === lightweight handshake/size gate ========================================
@@ -658,6 +663,7 @@ static bool is_self_endpoint(Sock fd, uint16_t listen_port){
         const uint16_t peer_port = ntohs(p->sin_port);
         (void)l;
 
+        // explicit: loopback inbound is allowed; only reject if hairpin on same port
         if ((ntohl(peer_be) >> 24) == 127) return false;
 
         if (is_self_be(peer_be)) {
@@ -730,7 +736,7 @@ bool P2P::check_rate(PeerState& ps,
         std::unordered_map<Sock, std::unordered_map<std::string, std::pair<int64_t,uint32_t>>>>::value,
         "g_cmd_rl type changed");
 
-    auto& perPeer = g_cmd_rl[ps.sock];
+    auto& perPeer = g_cmd_rl[(Sock)ps.sock];
     auto& slot    = perPeer[k];
     int64_t&  win_start = slot.first;
     uint32_t& count     = slot.second;
@@ -943,6 +949,7 @@ bool P2P::start(uint16_t port){
     }
 #endif
 
+    // NOTE: srv_ is Sock; Windows-safe
     srv_ = create_server(port);
     if (srv_ == MIQ_INVALID_SOCK) { log_error("P2P: failed to create server"); return false; }
     g_listen_port = port;
@@ -1290,9 +1297,9 @@ static inline void trickle_enqueue(Sock sock, const std::vector<uint8_t>& txid){
 
 void P2P::broadcast_inv_tx(const std::vector<uint8_t>& txid){
     if (txid.size()!=32) return;
-    for (auto& kv : peers_) {
-        trickle_enqueue(kv.first, txid);
-    }
+    // queue for loop thread so only the loop touches peers_
+    std::lock_guard<std::mutex> lk(announce_tx_mu_);
+    if (announce_tx_q_.size() < 8192) announce_tx_q_.push_back(txid);
 }
 
 static void trickle_flush(){
@@ -2240,7 +2247,9 @@ void P2P::loop(){
                                         trickle_enqueue(psock, txidv);
                                     }
                                 } else {
-                                    broadcast_inv_tx(tx.txid());
+                                    // no complete inputs: still advertise to help fetch deps
+                                    const std::vector<uint8_t> txidv = tx.txid();
+                                    for (auto& kvp : peers_) trickle_enqueue(kvp.first, txidv);
                                 }
                             } else if (!err.empty()) {
                                 if (++ps.mis > 25) bump_ban(ps, ps.ip, "tx-invalid", now_ms());
@@ -2399,6 +2408,21 @@ void P2P::loop(){
             g_preverack_counts.erase(s);
             g_trickle_last_ms.erase(s);
         }
+
+        // trickle any queued invtx payloads (enqueued by broadcast_inv_tx)
+        {
+            std::vector<std::vector<uint8_t>> todos;
+            {
+                std::lock_guard<std::mutex> lk(announce_tx_mu_);
+                if (!announce_tx_q_.empty()) { todos.swap(announce_tx_q_); }
+            }
+            if (!todos.empty()) {
+                for (const auto& txid : todos) {
+                    for (auto& kv : peers_) trickle_enqueue(kv.first, txid);
+                }
+            }
+        }
+
         trickle_flush();
 
         {
