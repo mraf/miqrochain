@@ -121,8 +121,22 @@ static void save_pending(const std::string& wdir, const std::set<OutpointKey>& s
 // Net helpers: drop loopback/private from seeds (defense-in-depth)
 // -------------------------------------------------------------
 #ifdef _WIN32
+  #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN
+  #endif
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #pragma comment(lib, "ws2_32.lib")
+  static void ensure_winsock(){
+      static bool inited = false;
+      if (!inited){
+          WSADATA wsa;
+          if (WSAStartup(MAKEWORD(2,2), &wsa) == 0) inited = true;
+      }
+  }
 #else
   #include <sys/types.h>
   #include <sys/socket.h>
@@ -158,6 +172,9 @@ static bool is_loopback_or_private_sockaddr(const sockaddr* sa){
 
 // Resolve a host and return true if ANY addr looks public (non-loopback/private)
 static bool resolves_to_public_ip(const std::string& host, const std::string& port){
+#ifdef _WIN32
+    ensure_winsock();
+#endif
     addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
 #ifdef AI_ADDRCONFIG
     hints.ai_flags = AI_ADDRCONFIG;
@@ -189,9 +206,15 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
     std::vector<std::pair<std::string,std::string>> seeds;
     std::unordered_set<std::string> seen;
 
+    const std::string defport = cli_port.empty() ? std::to_string(miq::P2P_PORT) : cli_port;
+
     // 0) CLI seed (if provided) — explicit host always respected.
     if(!cli_host.empty()){
-        push_unique(seeds, cli_host, cli_port, seen);
+        auto c = cli_host.find(':');
+        if (c != std::string::npos)
+            push_unique(seeds, cli_host.substr(0,c), cli_host.substr(c+1), seen);
+        else
+            push_unique(seeds, cli_host, defport, seen);
     }
 
     // 1) MIQ_P2P_SEED (comma list). Each token may have optional :port
@@ -203,19 +226,19 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
             std::string tok = (comma==std::string::npos)? v.substr(start) : v.substr(start, comma-start);
             auto c = tok.find(':');
             if(c != std::string::npos) push_unique(seeds, tok.substr(0,c), tok.substr(c+1), seen);
-            else                       push_unique(seeds, tok, std::to_string(miq::P2P_PORT), seen);
+            else                       push_unique(seeds, tok, defport, seen);
             if(comma==std::string::npos) break;
             start = comma + 1;
         }
     }
 
     // 2) Your public node FIRST by default (works globally)
-    push_unique(seeds, "62.38.73.147", std::to_string(miq::P2P_PORT), seen);
+    push_unique(seeds, "62.38.73.147", defport, seen);
 
     // 3) DNS seeds (constants.h)
-    push_unique(seeds, miq::DNS_SEED, std::to_string(miq::P2P_PORT), seen);
+    push_unique(seeds, miq::DNS_SEED, defport, seen);
     for(size_t i=0;i<miq::DNS_SEEDS_COUNT;i++){
-        push_unique(seeds, miq::DNS_SEEDS[i], std::to_string(miq::P2P_PORT), seen);
+        push_unique(seeds, miq::DNS_SEEDS[i], defport, seen);
     }
 
     // 4) NO implicit localhost fallback here (professional default).
@@ -228,7 +251,6 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
     for (const auto& hp : seeds){
         const std::string& h = hp.first;
         const std::string& p = hp.second;
-        // If it's a literal IPv4/IPv6, check it right away; if it's a name, resolve once.
         if (resolves_to_public_ip(h, p)) out.push_back(hp);
     }
     return out;
