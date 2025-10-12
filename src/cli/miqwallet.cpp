@@ -1,4 +1,4 @@
-// src/miqwallet.cpp  (no-implicit-localhost, public-first, SPV-safe)
+// src/miqwallet.cpp  (winsock-init early, public-first seeds, SPV-safe)
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -19,6 +19,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <set>
+#include <cstdint>
 
 #include "constants.h"
 #include "hd_wallet.h"
@@ -118,7 +119,7 @@ static void save_pending(const std::string& wdir, const std::set<OutpointKey>& s
 }
 
 // -------------------------------------------------------------
-// Net helpers: drop loopback/private from seeds (defense-in-depth)
+// Net helpers + Winsock bootstrap (Windows)
 // -------------------------------------------------------------
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
@@ -129,12 +130,12 @@ static void save_pending(const std::string& wdir, const std::set<OutpointKey>& s
   #endif
   #include <winsock2.h>
   #include <ws2tcpip.h>
-  #pragma comment(lib, "ws2_32.lib")
-  static void ensure_winsock(){
-      static bool inited = false;
-      if (!inited){
+  #pragma comment(lib, "Ws2_32.lib")
+  static void winsock_ensure(){
+      static bool inited=false;
+      if(!inited){
           WSADATA wsa;
-          if (WSAStartup(MAKEWORD(2,2), &wsa) == 0) inited = true;
+          if (WSAStartup(MAKEWORD(2,2), &wsa)==0) inited=true;
       }
   }
 #else
@@ -142,45 +143,84 @@ static void save_pending(const std::string& wdir, const std::set<OutpointKey>& s
   #include <sys/socket.h>
   #include <netdb.h>
   #include <arpa/inet.h>
+  static void winsock_ensure(){}
 #endif
 
-static bool is_loopback_or_private_sockaddr(const sockaddr* sa){
-    if (!sa) return true;
-    if (sa->sa_family == AF_INET){
-        const sockaddr_in* a = (const sockaddr_in*)sa;
-        uint32_t be = a->sin_addr.s_addr;
-        uint8_t A = uint8_t(be>>24), B = uint8_t(be>>16);
-        if (A==127) return true;                 // loopback
-        if (A==10)  return true;                 // 10.0.0.0/8
-        if (A==192 && B==168) return true;       // 192.168.0.0/16
-        if (A==172 && ((uint8_t(be>>20)&0x0F)>=1 && (uint8_t(be>>20)&0x0F)<=15)) return true; // 172.16/12
-        if (A==0 || A>=224) return true;         // 0.0.0.0/8 or multicast etc.
-        return false;
-    }
-    if (sa->sa_family == AF_INET6){
-        const sockaddr_in6* a6 = (const sockaddr_in6*)sa;
-        const uint8_t* b = (const uint8_t*)&a6->sin6_addr;
-        bool loop = true; for (int i=0;i<15;i++){ if (b[i]!=0) { loop=false; break; } }
-        if (loop && b[15]==1) return true;       // ::1
-        // treat fc00::/7 (ULA) and fe80::/10 (link-local) as private
-        if ((b[0] & 0xFE) == 0xFC) return true;  // fc00::/7
-        if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) return true; // fe80::/10
-        return false;
-    }
+static bool is_public_ipv4_literal(const std::string& host){
+    sockaddr_in a{}; 
+#ifdef _WIN32
+    if (InetPtonA(AF_INET, host.c_str(), &a.sin_addr) != 1) return false;
+#else
+    if (inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) return false;
+#endif
+    uint32_t be = a.sin_addr.s_addr;
+    uint8_t A = uint8_t(be>>24), B = uint8_t(be>>16);
+    if (A==127) return false;                 // loopback
+    if (A==10)  return false;                 // 10/8
+    if (A==192 && B==168) return false;       // 192.168/16
+    if (A==172 && ((uint8_t(be>>20)&0x0F)>=1 && (uint8_t(be>>20)&0x0F)<=15)) return false; // 172.16/12
+    if (A==0 || A>=224) return false;         // invalid/multicast/etc
+    return true;
+}
+static bool is_public_ipv6_literal(const std::string& host){
+    sockaddr_in6 a6{};
+#ifdef _WIN32
+    if (InetPtonA(AF_INET6, host.c_str(), &a6.sin6_addr) != 1) return false;
+#else
+    if (inet_pton(AF_INET6, host.c_str(), &a6.sin6_addr) != 1) return false;
+#endif
+    const uint8_t* b = (const uint8_t*)&a6.sin6_addr;
+    // ::1 loopback
+    bool loop = true; for (int i=0;i<15;i++){ if (b[i]!=0) { loop=false; break; } }
+    if (loop && b[15]==1) return false;
+    // ULA fc00::/7 or link-local fe80::/10
+    if ((b[0] & 0xFE) == 0xFC) return false;
+    if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) return false;
     return true;
 }
 
-// Resolve a host and return true if ANY addr looks public (non-loopback/private)
+// Resolve a host and return true if ANY addr looks public (non-loopback/private).
+// Accepts numeric IPs without DNS.
 static bool resolves_to_public_ip(const std::string& host, const std::string& port){
-#ifdef _WIN32
-    ensure_winsock();
-#endif
-    addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
+    // Fast-path: numeric literals
+    if (is_public_ipv4_literal(host) || is_public_ipv6_literal(host)) return true;
+
+    winsock_ensure(); // Windows: must initialize before getaddrinfo
+
+    addrinfo hints{};
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family   = AF_UNSPEC;
 #ifdef AI_ADDRCONFIG
-    hints.ai_flags = AI_ADDRCONFIG;
+    hints.ai_flags    = AI_ADDRCONFIG;
 #endif
     addrinfo* res = nullptr;
     if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res) return false;
+
+    auto is_loopback_or_private_sockaddr = [](const sockaddr* sa)->bool{
+        if (!sa) return true;
+        if (sa->sa_family == AF_INET){
+            const sockaddr_in* a = (const sockaddr_in*)sa;
+            uint32_t be = a->sin_addr.s_addr;
+            uint8_t A = uint8_t(be>>24), B = uint8_t(be>>16);
+            if (A==127) return true;
+            if (A==10)  return true;
+            if (A==192 && B==168) return true;
+            if (A==172 && ((uint8_t(be>>20)&0x0F)>=1 && (uint8_t(be>>20)&0x0F)<=15)) return true;
+            if (A==0 || A>=224) return true;
+            return false;
+        }
+        if (sa->sa_family == AF_INET6){
+            const sockaddr_in6* a6 = (const sockaddr_in6*)sa;
+            const uint8_t* b = (const uint8_t*)&a6->sin6_addr;
+            bool loop = true; for (int i=0;i<15;i++){ if (b[i]!=0) { loop=false; break; } }
+            if (loop && b[15]==1) return true;       // ::1
+            if ((b[0] & 0xFE) == 0xFC) return true;  // fc00::/7
+            if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) return true; // fe80::/10
+            return false;
+        }
+        return true;
+    };
+
     bool ok = false;
     for (auto p = res; p; p = p->ai_next){
         if (!is_loopback_or_private_sockaddr(p->ai_addr)) { ok = true; break; }
@@ -190,7 +230,7 @@ static bool resolves_to_public_ip(const std::string& host, const std::string& po
 }
 
 // -------------------------------------------------------------
-// Seeds (public-first; NO implicit localhost)
+// Seeds (public-first; NO implicit localhost unless asked)
 // -------------------------------------------------------------
 static void push_unique(std::vector<std::pair<std::string,std::string>>& v,
                         const std::string& h, const std::string& p,
@@ -203,18 +243,14 @@ static void push_unique(std::vector<std::pair<std::string,std::string>>& v,
 static std::vector<std::pair<std::string,std::string>>
 build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
 {
+    winsock_ensure(); // make sure getaddrinfo works on Windows
+
     std::vector<std::pair<std::string,std::string>> seeds;
     std::unordered_set<std::string> seen;
 
-    const std::string defport = cli_port.empty() ? std::to_string(miq::P2P_PORT) : cli_port;
-
     // 0) CLI seed (if provided) — explicit host always respected.
     if(!cli_host.empty()){
-        auto c = cli_host.find(':');
-        if (c != std::string::npos)
-            push_unique(seeds, cli_host.substr(0,c), cli_host.substr(c+1), seen);
-        else
-            push_unique(seeds, cli_host, defport, seen);
+        push_unique(seeds, cli_host, cli_port, seen);
     }
 
     // 1) MIQ_P2P_SEED (comma list). Each token may have optional :port
@@ -226,33 +262,42 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
             std::string tok = (comma==std::string::npos)? v.substr(start) : v.substr(start, comma-start);
             auto c = tok.find(':');
             if(c != std::string::npos) push_unique(seeds, tok.substr(0,c), tok.substr(c+1), seen);
-            else                       push_unique(seeds, tok, defport, seen);
+            else                       push_unique(seeds, tok, std::to_string(miq::P2P_PORT), seen);
             if(comma==std::string::npos) break;
             start = comma + 1;
         }
     }
 
-    // 2) Your public node FIRST by default (works globally)
-    push_unique(seeds, "62.38.73.147", defport, seen);
+    // 2) Your public node FIRST by default
+    push_unique(seeds, "62.38.73.147", std::to_string(miq::P2P_PORT), seen);
 
     // 3) DNS seeds (constants.h)
-    push_unique(seeds, miq::DNS_SEED, defport, seen);
+    push_unique(seeds, miq::DNS_SEED, std::to_string(miq::P2P_PORT), seen);
     for(size_t i=0;i<miq::DNS_SEEDS_COUNT;i++){
-        push_unique(seeds, miq::DNS_SEEDS[i], defport, seen);
+        push_unique(seeds, miq::DNS_SEEDS[i], std::to_string(miq::P2P_PORT), seen);
     }
 
     // 4) NO implicit localhost fallback here (professional default).
-    // If you ever want to test localhost explicitly, run with:
-    //   --p2pseed 127.0.0.1  (or set MIQ_P2P_SEED=127.0.0.1)
+    // If you want to test localhost explicitly: --p2pseed 127.0.0.1  (or MIQ_P2P_SEED=127.0.0.1)
 
-    // Final filter: drop entries that resolve only to loopback/private addrs.
+    // Final filter: numeric IPs are accepted if public; hostnames must resolve to public.
     std::vector<std::pair<std::string,std::string>> out;
     out.reserve(seeds.size());
     for (const auto& hp : seeds){
         const std::string& h = hp.first;
         const std::string& p = hp.second;
+
+        // Accept literal public IPs without DNS
+        if (is_public_ipv4_literal(h) || is_public_ipv6_literal(h)) {
+            out.push_back(hp);
+            continue;
+        }
+        // Hostname path
         if (resolves_to_public_ip(h, p)) out.push_back(hp);
     }
+
+    // Safety: if everything was filtered (e.g., DNS down), keep the original list
+    if (out.empty()) return seeds;
     return out;
 }
 
@@ -270,7 +315,6 @@ static bool spv_collect_any_seed(const std::vector<std::pair<std::string,std::st
     out.clear();
 
     miq::SpvOptions opts{};
-    // Slightly wider default to avoid missing older funds; override with MIQ_SPV_WINDOW as needed.
     opts.recent_block_window = recent_window;
 
     std::ostringstream diag;
@@ -359,7 +403,7 @@ static std::string fmt_amount(uint64_t v){
 }
 
 // -------------------------------------------------------------
-// Balance computation (Total/Spendable/Immature/Pending-hold)
+// Balance computation
 // -------------------------------------------------------------
 struct WalletBalance {
     uint64_t total{0};
@@ -420,7 +464,7 @@ static bool wallet_session(const std::string& cli_host,
 
     std::vector<std::vector<uint8_t>> pkhs; pkhs.reserve(keys.size());
     for(auto& k: keys) pkhs.push_back(k.pkh);
-    // reverse map PKH -> (chain,index) for meta bump
+    // reverse map PKH -> (chain,index)
     std::unordered_map<std::string, std::pair<uint32_t,uint32_t>> pkh2ci;
     pkh2ci.reserve(keys.size());
     for (const auto& k : keys) {
@@ -436,7 +480,6 @@ static bool wallet_session(const std::string& cli_host,
     }
     std::cout << "\n";
 
-    // Slightly wider default; override with MIQ_SPV_WINDOW (e.g., 200000) if scanning deep history
     const uint32_t spv_win = (uint32_t)env_u64("MIQ_SPV_WINDOW", 8000);
 
     // Load pending-spent cache
@@ -462,7 +505,7 @@ static bool wallet_session(const std::string& cli_host,
             save_pending(wdir, pending);
         }
 
-        // advance meta.next_* based on highest used PKH indexes observed in UTXOs
+        // advance meta.next_* based on highest used PKH indexes observed
         {
             uint32_t max_recv = meta.next_recv;
             uint32_t max_change = meta.next_change;
@@ -593,7 +636,6 @@ static bool wallet_session(const std::string& cli_host,
                 if(!priv){ std::cout << "internal: key lookup failed\n"; goto send_done; }
                 std::vector<uint8_t> sig64;
                 if(!miq::crypto::ECDSA::sign(*priv, sighash, sig64)){ std::cout << "sign failed\n"; goto send_done; }
-                // retrieve the pubkey from our prepared list:
                 std::vector<uint8_t> pubkey;
                 for (const auto& k: keys) if (k.pkh == u->pkh) { pubkey = k.pub; break; }
                 in.sig = sig64; in.pubkey = pubkey;
@@ -702,6 +744,7 @@ static bool flow_load_from_seed(const std::string& cli_host, const std::string& 
 // -------------------------------------------------------------
 int main(int argc, char** argv){
     std::ios::sync_with_stdio(false);
+    winsock_ensure(); // IMPORTANT: initialize before any getaddrinfo on Windows
 
     std::string cli_host;
     std::string cli_port = std::to_string(miq::P2P_PORT);
