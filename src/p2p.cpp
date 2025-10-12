@@ -272,8 +272,8 @@
   #define CLOSESOCK(s) close(s)
 #endif
 
-// NOTE: p2p.h should define PeerState::sock as `Sock` and peers_ as
-// std::unordered_map<Sock, PeerState>. If not yet changed, do that to match.
+// p2p.h uses int for PeerState::sock and for map keys; we cast to Sock
+// where needed on Windows to avoid narrowing and keep WSAPOLLFD happy.
 
 namespace {
 // === lightweight handshake/size gate ========================================
@@ -735,7 +735,7 @@ bool P2P::check_rate(PeerState& ps,
         std::unordered_map<Sock, std::unordered_map<std::string, std::pair<int64_t,uint32_t>>>>::value,
         "g_cmd_rl type changed");
 
-    auto& perPeer = g_cmd_rl[ps.sock];
+    auto& perPeer = g_cmd_rl[(Sock)ps.sock];
     auto& slot    = perPeer[k];
     int64_t&  win_start = slot.first;
     uint32_t& count     = slot.second;
@@ -948,8 +948,9 @@ bool P2P::start(uint16_t port){
     }
 #endif
 
-    srv_ = create_server(port);
-    if (srv_ == MIQ_INVALID_SOCK) { log_error("P2P: failed to create server"); return false; }
+    // NOTE: srv_ is an int in p2p.h; we cast to/from Sock where needed.
+    srv_ = (int)create_server(port);
+    if ((Sock)srv_ == MIQ_INVALID_SOCK) { log_error("P2P: failed to create server"); return false; }
     g_listen_port = port;
 
     g_last_progress_ms = now_ms();
@@ -1034,8 +1035,13 @@ bool P2P::start(uint16_t port){
 void P2P::stop(){
     if (!running_) return;
     running_ = false;
-    if (srv_ != MIQ_INVALID_SOCK) { CLOSESOCK(srv_); srv_ = MIQ_INVALID_SOCK; }
-    for (auto& kv : peers_) { if (kv.first != MIQ_INVALID_SOCK) { gate_on_close(kv.first); CLOSESOCK(kv.first); } }
+    if ((Sock)srv_ != MIQ_INVALID_SOCK) { CLOSESOCK((Sock)srv_); srv_ = (int)MIQ_INVALID_SOCK; }
+    for (auto& kv : peers_) {
+        if ((Sock)kv.first != MIQ_INVALID_SOCK) {
+            gate_on_close((Sock)kv.first);
+            CLOSESOCK((Sock)kv.first);
+        }
+    }
     peers_.clear();
     if (th_.joinable()) th_.join();
 #ifdef _WIN32
@@ -1154,7 +1160,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     g_seed_backoff.erase(host);
 
     PeerState ps;
-    ps.sock = s;
+    ps.sock = (int)s;
     ps.ip   = ipbuf[0] ? std::string(ipbuf) : std::string("unknown");
     ps.mis  = 0;
     ps.last_ms = now_ms();
@@ -1167,7 +1173,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     ps.version = 0;
     ps.features = 0;
     ps.whitelisted = false;
-    peers_[s] = ps;
+    peers_[(int)s] = ps;
 
     g_trickle_last_ms[s] = 0;
 
@@ -1181,7 +1187,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 #endif
     }
 
-    log_info("P2P: connected seed " + peers_[s].ip);
+    log_info("P2P: connected seed " + peers_[(int)s].ip);
 
     gate_on_connect(s);
     auto msg = encode_msg("version", {});
@@ -1220,16 +1226,16 @@ static bool violates_group_diversity(const std::unordered_map<int, miq::PeerStat
         const auto& ps = kv.second;
         uint32_t be_ip2 = 0;
         if (!parse_be_ipv4(ps.ip, be_ip2)) continue;
-        uint16_t g = v4_group16(be_ip2);
+        uint16_t g = (uint16_t(uint8_t(be_ip2>>24)) << 8) | uint16_t(uint8_t(be_ip2>>16));
         group_counts[g]++;
     }
 
-    uint16_t cg = v4_group16(candidate_be_ip);
+    uint16_t cg = (uint16_t(uint8_t(candidate_be_ip>>24)) << 8) | uint16_t(uint8_t(candidate_be_ip>>16));
     auto it = group_counts.find(cg);
     return (it != group_counts.end() && it->second >= MIQ_GROUP_OUTBOUND_MAX);
 }
 
-void P2P::handle_new_peer(Sock c, const std::string& ip){
+void P2P::handle_new_peer(int c, const std::string& ip){
     PeerState ps;
     ps.sock = c;
     ps.ip   = ip;
@@ -1246,7 +1252,7 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     ps.whitelisted = false;
     peers_[c] = ps;
 
-    g_trickle_last_ms[c] = 0;
+    g_trickle_last_ms[(Sock)c] = 0;
 
     uint32_t be_ip;
     if (parse_ipv4(ip, be_ip) && ipv4_is_public(be_ip)) {
@@ -1259,12 +1265,12 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
 
     log_info("P2P: inbound peer " + ip);
 
-    gate_on_connect(c);
+    gate_on_connect((Sock)c);
     auto msg = encode_msg("version", {});
 #ifdef _WIN32
-    send(c, (const char*)msg.data(), (int)msg.size(), 0);
+    send((Sock)c, (const char*)msg.data(), (int)msg.size(), 0);
 #else
-    send(c, msg.data(), msg.size(), 0);
+    send((Sock)c, msg.data(), msg.size(), 0);
 #endif
 }
 
@@ -1291,7 +1297,7 @@ static inline void trickle_enqueue(Sock sock, const std::vector<uint8_t>& txid){
 void P2P::broadcast_inv_tx(const std::vector<uint8_t>& txid){
     if (txid.size()!=32) return;
     for (auto& kv : peers_) {
-        trickle_enqueue(kv.first, txid);
+        trickle_enqueue((Sock)kv.first, txid);
     }
 }
 
@@ -1329,20 +1335,20 @@ void P2P::request_tx(PeerState& ps, const std::vector<uint8_t>& txid){
     if (ps.inflight_tx.size() >= caps_.max_txs) return;
     auto m = encode_msg("gettx", txid);
 #ifdef _WIN32
-    send(ps.sock, (const char*)m.data(), (int)m.size(), 0);
+    send((Sock)ps.sock, (const char*)m.data(), (int)m.size(), 0);
 #else
-    send(ps.sock, m.data(), m.size(), 0);
+    send((Sock)ps.sock, m.data(), m.size(), 0);
 #endif
     ps.inflight_tx.insert(hexkey(txid));
 }
 
-void P2P::send_tx(Sock sock, const std::vector<uint8_t>& raw){
+void P2P::send_tx(int sock, const std::vector<uint8_t>& raw){
     if (raw.empty()) return;
     auto m = encode_msg("tx", raw);
 #ifdef _WIN32
-    send(sock, (const char*)m.data(), (int)m.size(), 0);
+    send((Sock)sock, (const char*)m.data(), (int)m.size(), 0);
 #else
-    send(sock, m.data(), m.size(), 0);
+    send((Sock)sock, m.data(), m.size(), 0);
 #endif
 }
 
@@ -1357,9 +1363,9 @@ void P2P::request_block_index(PeerState& ps, uint64_t index){
     for (int i=0;i<8;i++) p[i] = (uint8_t)((index >> (8*i)) & 0xFF);
     auto msg = encode_msg("getbi", std::vector<uint8_t>(p, p+8));
 #ifdef _WIN32
-    send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
+    send((Sock)ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
 #else
-    send(ps.sock, msg.data(), msg.size(), 0);
+    send((Sock)ps.sock, msg.data(), msg.size(), 0);
 #endif
 }
 
@@ -1369,20 +1375,20 @@ void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     if (ps.inflight_blocks.size() >= caps_.max_blocks) return;
     auto msg = encode_msg("getb", h);
 #ifdef _WIN32
-    send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
+    send((Sock)ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
 #else
-    send(ps.sock, msg.data(), msg.size(), 0);
+    send((Sock)ps.sock, msg.data(), msg.size(), 0);
 #endif
     ps.inflight_blocks.insert(hexkey(h));
 }
 
-void P2P::send_block(Sock s, const std::vector<uint8_t>& raw){
+void P2P::send_block(int s, const std::vector<uint8_t>& raw){
     if (raw.empty()) return;
     auto msg = encode_msg("block", raw);
 #ifdef _WIN32
-    send(s, (const char*)msg.data(), (int)msg.size(), 0);
+    send((Sock)s, (const char*)msg.data(), (int)msg.size(), 0);
 #else
-    send(s, msg.data(), msg.size(), 0);
+    send((Sock)s, msg.data(), msg.size(), 0);
 #endif
 }
 
@@ -1422,9 +1428,9 @@ void P2P::maybe_send_getaddr(PeerState& ps){
     auto msg = encode_msg("getaddr", {});
     if (check_rate(ps, "get", 1.0, t)) {
 #ifdef _WIN32
-        send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
+        send((Sock)ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
 #else
-        send(ps.sock, msg.data(), msg.size(), 0);
+        send((Sock)ps.sock, msg.data(), msg.size(), 0);
 #endif
     }
 }
@@ -1442,7 +1448,8 @@ void P2P::send_addr_snapshot(PeerState& ps){
             auto cand = g_addrman.select_for_outbound(g_am_rng, /*prefer_tried=*/true);
             if (!cand) break;
             uint32_t be_ip;
-            if (!P2P::parse_ipv4(cand->host, be_ip) || !P2P::ipv4_is_public(be_ip)) continue;
+            if (!parse_ipv4(cand->host, be_ip) || !ipv4_is_public(be_ip)) continue;
+
             if (!emitted.insert(be_ip).second) continue;
 
             payload.push_back((uint8_t)(be_ip >> 24));
@@ -1465,9 +1472,9 @@ void P2P::send_addr_snapshot(PeerState& ps){
     }
     auto msg = encode_msg("addr", payload);
 #ifdef _WIN32
-    send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
+    send((Sock)ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
 #else
-    send(ps.sock, msg.data(), msg.size(), 0);
+    send((Sock)ps.sock, msg.data(), msg.size(), 0);
 #endif
 }
 void P2P::handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload){
@@ -1562,7 +1569,7 @@ void P2P::remove_orphan_by_hex(const std::string& child_hex){
     if (dit != orphan_order_.end()) orphan_order_.erase(dit);
 }
 
-void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
+void P2P::handle_incoming_block(int sock, const std::vector<uint8_t>& raw){
     if (raw.empty() || raw.size() > MIQ_FALLBACK_MAX_BLOCK_SZ) return;
 
     Block b;
@@ -1699,10 +1706,10 @@ void P2P::loop(){
 
                     Sock s = dial_be_ipv4(be_ip, g_listen_port);
                     if (s != MIQ_INVALID_SOCK) {
-                        PeerState ps; ps.sock = s; ps.ip = dotted; ps.mis=0; ps.last_ms=now_ms();
+                        PeerState ps; ps.sock = (int)s; ps.ip = dotted; ps.mis=0; ps.last_ms=now_ms();
                         ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
                         ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
-                        peers_[s] = ps;
+                        peers_[(int)s] = ps;
                         g_trickle_last_ms[s] = 0;
                         log_info("P2P: outbound (addrman) " + ps.ip);
                         gate_on_connect(s);
@@ -1743,7 +1750,7 @@ void P2P::loop(){
                             Sock s = dial_be_ipv4(pick, g_listen_port);
                             if (s != MIQ_INVALID_SOCK) {
                                 PeerState ps;
-                                ps.sock = s;
+                                ps.sock = (int)s;
                                 ps.ip   = be_ip_to_string(pick);
                                 ps.mis  = 0;
                                 ps.last_ms = now_ms();
@@ -1751,7 +1758,7 @@ void P2P::loop(){
                                 ps.tx_tokens  = MIQ_RATE_TX_BURST;
                                 ps.last_refill_ms = ps.last_ms;
                                 ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
-                                peers_[s] = ps;
+                                peers_[(int)s] = ps;
                                 g_trickle_last_ms[s] = 0;
 
                                 log_info("P2P: outbound to known " + ps.ip);
@@ -1786,10 +1793,10 @@ void P2P::loop(){
                             if (!connected) {
                                 Sock s = dial_be_ipv4(be_ip, g_listen_port);
                                 if (s != MIQ_INVALID_SOCK) {
-                                    PeerState ps; ps.sock=s; ps.ip=dotted; ps.mis=0; ps.last_ms=now_ms();
+                                    PeerState ps; ps.sock=(int)s; ps.ip=dotted; ps.mis=0; ps.last_ms=now_ms();
                                     ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
                                     ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
-                                    peers_[s]=ps;
+                                    peers_[(int)s]=ps;
                                     g_trickle_last_ms[s] = 0;
                                     log_info("P2P: feeler " + dotted);
                                     gate_on_connect(s);
@@ -1829,7 +1836,10 @@ void P2P::loop(){
                         check_rate(kv.second, "get", 1.0, now_ms())) {
                         kv.second.sent_getheaders = true;
 #ifdef _WIN32
-                        send(kv.first, (const char*)m.data(), (int)m.size(), 0);
+                        {
+                            Sock ss = (Sock)kv.first;
+                            send(ss, (const char*)m.data(), (int)m.size(), 0);
+                        }
 #else
                         send(kv.first, m.data(), m.size(), 0);
 #endif
@@ -1846,12 +1856,30 @@ void P2P::loop(){
         std::vector<PollFD> fds;
         std::vector<Sock>   peer_fd_order;
         size_t base = 0;
-        if (srv_ != MIQ_INVALID_SOCK) fds.push_back(PollFD{ srv_, (short)POLL_RD, 0 });
+        if ((Sock)srv_ != MIQ_INVALID_SOCK) {
+#ifdef _WIN32
+            WSAPOLLFD pf{};
+            pf.fd = (Sock)srv_;
+            pf.events = POLL_RD;
+            pf.revents = 0;
+            fds.push_back(pf);
+#else
+            fds.push_back(pollfd{ srv_, POLL_RD, 0 });
+#endif
+        }
         base = fds.size();
         for (auto& kv : peers_) {
-            Sock fd = kv.first;
+            Sock fd = (Sock)kv.first;
             peer_fd_order.push_back(fd);
-            fds.push_back(PollFD{ fd, (short)POLL_RD, 0 });
+#ifdef _WIN32
+            WSAPOLLFD pf{};
+            pf.fd = fd;
+            pf.events = POLL_RD;
+            pf.revents = 0;
+            fds.push_back(pf);
+#else
+            fds.push_back(pollfd{ (int)fd, POLL_RD, 0 });
+#endif
         }
 
 #ifdef _WIN32
@@ -1862,15 +1890,15 @@ void P2P::loop(){
         if (rc < 0) continue;
 
         // Accept new peers (with soft inbound rate cap)
-        if (srv_ != MIQ_INVALID_SOCK) {
-            if (fds[0].revents & POLL_RD) {
+        if ((Sock)srv_ != MIQ_INVALID_SOCK) {
+            if (!fds.empty() && (fds[0].revents & POLL_RD)) {
                 sockaddr_in ca{};
 #ifdef _WIN32
                 int clen = (int)sizeof(ca);
 #else
                 socklen_t clen = sizeof(ca);
 #endif
-                Sock c = accept(srv_, (sockaddr*)&ca, &clen);
+                Sock c = accept((Sock)srv_, (sockaddr*)&ca, &clen);
                 if (c != MIQ_INVALID_SOCK) {
                     if (is_self_endpoint(c, g_listen_port)) {
                         CLOSESOCK(c);
@@ -1894,7 +1922,7 @@ void P2P::loop(){
                             if (banned_.count(ipbuf) || is_ip_banned(ipbuf, now_ms())) {
                                 CLOSESOCK(c);
                             } else {
-                                handle_new_peer(c, ipbuf);
+                                handle_new_peer((int)c, ipbuf);
                             }
                         }
                     }
@@ -1908,7 +1936,7 @@ void P2P::loop(){
             if (base + i >= fds.size()) continue;
             Sock s = peer_fd_order[i];
 
-            auto it = peers_.find(s);
+            auto it = peers_.find((int)s);
             if (it == peers_.end()) continue;
 
             auto &ps = it->second;
@@ -2099,7 +2127,7 @@ void P2P::loop(){
                             Block b;
                             if (chain_.get_block_by_hash(m.payload, b)) {
                                 auto raw = ser_block(b);
-                                if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
+                                if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block((int)s, raw);
                             }
                         }
 
@@ -2110,7 +2138,7 @@ void P2P::loop(){
                             Block b;
                             if (chain_.get_block_by_index((size_t)idx64, b)) {
                                 auto raw = ser_block(b);
-                                if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
+                                if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block((int)s, raw);
                             }
                         }
 
@@ -2128,7 +2156,7 @@ void P2P::loop(){
                                 continue;
                             }
                             ps.inflight_blocks.erase(bh);
-                            handle_incoming_block(s, m.payload);
+                            handle_incoming_block((int)s, m.payload);
                         }
 
                     } else if (cmd == "invtx") {
@@ -2152,7 +2180,7 @@ void P2P::loop(){
                             auto itx = tx_store_.find(key);
                             if (itx != tx_store_.end()) {
                                 if (rate_consume_tx(ps, itx->second.size())) {
-                                    send_tx(s, itx->second);
+                                    send_tx((int)s, itx->second);
                                 }
                             }
                         }
@@ -2215,7 +2243,7 @@ void P2P::loop(){
 
                                     const std::vector<uint8_t> txidv = tx.txid();
                                     for (auto& kvp : peers_) {
-                                        Sock psock = kvp.first;
+                                        Sock psock = (Sock)kvp.first;
                                         uint64_t peer_min = peer_feefilter_kb(psock);
                                         if (peer_min && feerate_kb < peer_min) continue;
                                         trickle_enqueue(psock, txidv);
@@ -2375,7 +2403,7 @@ void P2P::loop(){
         for (Sock s : dead) {
             gate_on_close(s);
             CLOSESOCK(s);
-            peers_.erase(s);
+            peers_.erase((int)s);
             g_zero_hdr_batches.erase(s);
             g_preverack_counts.erase(s);
             g_trickle_last_ms.erase(s);
@@ -2394,7 +2422,10 @@ void P2P::loop(){
                 auto m = encode_msg("invb", h);
                 for (auto& kv : peers_) {
 #ifdef _WIN32
-                    send(kv.first, (const char*)m.data(), (int)m.size(), 0);
+                    {
+                        Sock ss = (Sock)kv.first;
+                        send(ss, (const char*)m.data(), (int)m.size(), 0);
+                    }
 #else
                     send(kv.first, m.data(), m.size(), 0);
 #endif
