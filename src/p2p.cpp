@@ -1199,8 +1199,10 @@ static std::mt19937& rng(){
     return gen;
 }
 
-static bool violates_group_diversity(const std::unordered_map<Sock, P2P::PeerState>& peers,
-                                     uint32_t candidate_be_ip){
+static bool violates_group_diversity(const std::unordered_map<int, miq::PeerState>& peers,
+                                     uint32_t candidate_be_ip)
+{
+    // Count per /16 among current peers; cap outbounds per group to reduce eclipse risk.
     std::unordered_map<uint16_t,int> group_counts;
 
     auto parse_be_ipv4 = [](const std::string& dotted, uint32_t& be_ip)->bool{
@@ -1210,7 +1212,7 @@ static bool violates_group_diversity(const std::unordered_map<Sock, P2P::PeerSta
     #else
         if (inet_pton(AF_INET, dotted.c_str(), &tmp.sin_addr) != 1) return false;
     #endif
-        be_ip = tmp.sin_addr.s_addr;
+        be_ip = tmp.sin_addr.s_addr; // network byte order
         return true;
     };
 
