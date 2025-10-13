@@ -343,26 +343,39 @@ static inline void rx_clear_start(Sock fd){
 }
 
 // --- small Windows-safe send/recv helpers -----------------------------------
+// Hardened: loop on partial sends
 static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
     if (!data || len == 0) return true;
+    size_t sent = 0;
+    while (sent < len) {
 #ifdef _WIN32
-    int n = send(s, reinterpret_cast<const char*>(data), (int)len, 0);
-    if (n == SOCKET_ERROR) {
-        int e = WSAGetLastError();
-        char buf[96]; sprintf_s(buf, "send() failed WSAE=%d", e);
-        miq::log_warn(std::string("P2P: ") + buf);
-        return false;
-    }
+        int n = send(s, reinterpret_cast<const char*>(data + sent), (int)std::min<size_t>(INT32_MAX, len - sent), 0);
+        if (n == SOCKET_ERROR) {
+            int e = WSAGetLastError();
+            if (e == WSAEWOULDBLOCK) { // spin briefly; sockets are blocking in our usage
+                continue;
+            }
+            char buf[96]; sprintf_s(buf, "send() failed WSAE=%d", e);
+            miq::log_warn(std::string("P2P: ") + buf);
+            return false;
+        }
+        if (n == 0) return false;
+        sent += (size_t)n;
 #else
-    ssize_t n = send(s, data, len, 0);
-    if (n < 0) {
-        miq::log_warn("P2P: send() failed");
-        return false;
-    }
+        ssize_t n = send(s, data + sent, len - sent, 0);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            miq::log_warn("P2P: send() failed");
+            return false;
+        }
+        if (n == 0) return false;
+        sent += (size_t)n;
 #endif
+    }
     return true;
 }
 static inline bool miq_send(Sock s, const std::vector<uint8_t>& v){
+    if (v.empty()) return true;
     return miq_send(s, v.data(), v.size());
 }
 static inline int miq_recv(Sock s, uint8_t* buf, size_t bufsz) {
@@ -450,7 +463,7 @@ static inline int64_t jitter_ms(int64_t max_jitter){
 }
 
 static inline void gate_on_connect(Sock fd){
-    PeerGate pg{}; // value-initialize to ensure clean defaults
+    PeerGate pg;
     pg.t_conn = Clock::now();
     pg.t_last = pg.t_conn;
     pg.is_loopback = false; // default; set after we learn the IP
@@ -472,6 +485,7 @@ static inline void gate_on_close(Sock fd){
     rx_clear_start(fd);
     g_zero_hdr_batches.erase(fd);
     g_preverack_counts.erase(fd);
+    g_cmd_rl.erase(fd); // NEW: clean up per-socket rate-limiter windows
 }
 static inline bool gate_on_bytes(Sock fd, size_t add){
     auto it = g_gate.find(fd);
@@ -1282,7 +1296,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 #endif
     g_seed_backoff.erase(host);
 
-    PeerState ps{};
+    PeerState ps;
     ps.sock = s;
     ps.ip   = ipbuf[0] ? std::string(ipbuf) : std::string("unknown");
     ps.mis  = 0;
@@ -1360,7 +1374,7 @@ static bool violates_group_diversity(const std::unordered_map<Sock, miq::PeerSta
 }
 
 void P2P::handle_new_peer(Sock c, const std::string& ip){
-    PeerState ps{};
+    PeerState ps;
     ps.sock = c;
     ps.ip   = ip;
     ps.mis  = 0;
@@ -1799,7 +1813,7 @@ void P2P::loop(){
 
                     Sock s = dial_be_ipv4(be_ip, g_listen_port);
                     if (s != MIQ_INVALID_SOCK) {
-                        PeerState ps{}; ps.sock = s; ps.ip = dotted; ps.mis=0; ps.last_ms=now_ms();
+                        PeerState ps; ps.sock = s; ps.ip = dotted; ps.mis=0; ps.last_ms=now_ms();
                         ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
                         ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
                         peers_[s] = ps;
@@ -1839,7 +1853,7 @@ void P2P::loop(){
                         if (!is_loopback_be(pick)) {
                             Sock s = dial_be_ipv4(pick, g_listen_port);
                             if (s != MIQ_INVALID_SOCK) {
-                                PeerState ps{};
+                                PeerState ps;
                                 ps.sock = s;
                                 ps.ip   = be_ip_to_string(pick);
                                 ps.mis  = 0;
@@ -1880,7 +1894,7 @@ void P2P::loop(){
                             if (!connected) {
                                 Sock s = dial_be_ipv4(be_ip, g_listen_port);
                                 if (s != MIQ_INVALID_SOCK) {
-                                    PeerState ps{}; ps.sock=s; ps.ip=dotted; ps.mis=0; ps.last_ms=now_ms();
+                                    PeerState ps; ps.sock=s; ps.ip=dotted; ps.mis=0; ps.last_ms=now_ms();
                                     ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
                                     ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
                                     peers_[s]=ps;
@@ -2048,12 +2062,14 @@ void P2P::loop(){
                 size_t off = 0;
                 miq::NetMsg m;
                 while (true) {
-                    size_t prev = off;
-                    if (!decode_msg(ps.rx, off, m)) break;
+                    size_t off_before = off;
+                    bool ok = decode_msg(ps.rx, off, m);
+                    if (!ok) break;
 
-                    // NICE-TO-HAVE: if a frame is accepted but off didn't advance by >= 24, log and break
-                    if (off - prev < 24) {
-                        log_warn("P2P: decode advanced <24; cmd=" + std::string(m.cmd, m.cmd + 12));
+                    // Nice-to-have guard: if a frame decodes but advances < 24 bytes, bail.
+                    if (off <= off_before || (off - off_before) < 24) {
+                        miq::log_warn("P2P: decoded frame advanced less than 24 bytes; dropping peer defensively");
+                        dead.push_back(s);
                         break;
                     }
 
@@ -2086,7 +2102,10 @@ void P2P::loop(){
                             ps.inv_win_start_ms = tnow;
                             ps.inv_in_window = 0;
                         }
-                        ps.inv_in_window += add;
+                        // clamp to avoid accidental wrap
+                        uint64_t next = (uint64_t)ps.inv_in_window + (uint64_t)add;
+                        if (next > (uint64_t)MIQ_P2P_INV_WINDOW_CAP + 1) next = (uint64_t)MIQ_P2P_INV_WINDOW_CAP + 1;
+                        ps.inv_in_window = (uint32_t)next;
                         if (ps.inv_in_window > MIQ_P2P_INV_WINDOW_CAP) {
                             if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "inv-window-overflow", tnow);
                             return false;
@@ -2472,6 +2491,7 @@ void P2P::loop(){
             g_zero_hdr_batches.erase(s);
             g_preverack_counts.erase(s);
             g_trickle_last_ms.erase(s);
+            g_cmd_rl.erase(s); // mirror cleanup in case gate_on_close wasn't hit
         }
 
         // trickle any queued invtx payloads (enqueued by broadcast_inv_tx)
