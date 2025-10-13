@@ -171,6 +171,12 @@ public:
                     uint32_t burst,
                     uint32_t window_ms);
 
+    // token-bucket by family (cost per event)
+    bool check_rate(PeerState& ps,
+                    const char* family,
+                    double cost,
+                    int64_t now_ms);
+
     bool start(uint16_t port);
     void stop();
 
@@ -296,6 +302,7 @@ private:
     void handle_new_peer(Sock c, const std::string& ip);
     void load_bans();
     void save_bans();
+        void bump_ban(PeerState& ps, const std::string& ip, const char* reason, int64_t now_ms);
 
     // sync & block serving
     void start_sync_with_peer(PeerState& ps);
