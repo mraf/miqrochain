@@ -80,32 +80,26 @@ static inline void wr32le(uint8_t* p, uint32_t v){
 static inline uint32_t dsha256_4(const uint8_t* data, size_t n) {
 #ifdef MIQ_HAVE_SHA256
     uint8_t h[32];
-
-    // First SHA256 (safe for n == 0, never call update(nullptr, 0))
     {
-        SHA256 a;
-        if (n != 0) {
-            a.update(data, n);
-        }
-        a.final(h);  // when no update was made, this is SHA256("")
-    }
+        SHA256 a; 
+        a.init();
+        if (n) a.update(data, n);
+        a.final(h);
 
-    // Second SHA256 over the first digest (always 32 bytes)
-    {
-        SHA256 b;
+        SHA256 b; 
+        b.init();
         b.update(h, 32);
         b.final(h);
     }
-
-    // First 4 bytes as little-endian uint32 (Bitcoin style)
+    // First 4 bytes as LE integer on the wire (same as Bitcoin)
     return (uint32_t(h[0])      )
          | (uint32_t(h[1]) <<  8)
          | (uint32_t(h[2]) << 16)
          | (uint32_t(h[3]) << 24);
 #else
-    // Fallback: deterministic but NOT cryptographic (kept for build-only scenarios)
+    // Fallback (should never happen)
     uint32_t x = 0;
-    for (size_t i = 0; i < n; i++) x = (x * 131u) + data[i];
+    for (size_t i=0;i<n;i++) x = (x * 131u) + data[i];
     return x;
 #endif
 }
