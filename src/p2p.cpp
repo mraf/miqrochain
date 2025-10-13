@@ -715,6 +715,45 @@ bool P2P::check_rate(PeerState& ps, const char* key) {
     return check_rate(ps, "misc", 1.0, now_ms());
 }
 
+// === Per-family token bucket (cost tokens per event) ========================
+bool P2P::check_rate(PeerState& ps, const char* family, double cost, int64_t now_ms)
+{
+    if (!family) family = "misc";
+    if (cost < 0) cost = 0;
+    const std::string fam(family);
+
+    // Look up per-family config: default if missing.
+    double per_sec = 10.0;
+    double burst   = 20.0;
+    auto it_cfg = rate_cfg_.find(fam);
+    if (it_cfg != rate_cfg_.end()) {
+        per_sec = it_cfg->second.per_sec;
+        burst   = it_cfg->second.burst;
+    }
+
+    // Refill and charge tokens.
+    auto& rc = ps.rate;
+    if (rc.last_ms == 0) rc.last_ms = now_ms;
+    const double elapsed = (now_ms - rc.last_ms) / 1000.0;
+    double tokens = rc.buckets[fam]; // 0 if missing
+
+    if (elapsed > 0) {
+        tokens = std::min(burst, tokens + per_sec * elapsed);
+    }
+    rc.last_ms = now_ms;
+
+    if (tokens + 1e-9 < cost) {
+        if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
+        rc.buckets[fam] = tokens;
+        return false;
+    }
+
+    tokens -= cost;
+    rc.buckets[fam] = tokens;
+    return true;
+}
+
+
 bool P2P::check_rate(PeerState& ps,
                      const char* family,
                      const char* name,
@@ -923,6 +962,26 @@ void P2P::save_bans(){
     std::ofstream f(datadir_ + "/bans.txt", std::ios::trunc);
     for (auto& ip : banned_) f << ip << "\n";
 }
+
+void P2P::bump_ban(PeerState& ps, const std::string& ip, const char* reason, int64_t now_ms)
+{
+    // Do not ban localhost or whitelisted peers.
+    if (is_loopback(ip) || is_whitelisted_ip(ip)) {
+        return;
+    }
+    // Timed ban record
+    timed_bans_[ip] = now_ms + default_ban_ms_;
+    banned_.insert(ip);
+
+    // Close socket to enforce the ban immediately.
+    Sock s = ps.sock;
+    if (s != MIQ_INVALID_SOCK) {
+        CLOSESOCK(s);
+        ps.sock = MIQ_INVALID_SOCK;
+    }
+    (void)reason; // keep signature for future logging without introducing deps here
+}
+
 
 bool P2P::start(uint16_t port){
 #ifndef _WIN32
