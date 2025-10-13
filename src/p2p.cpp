@@ -450,7 +450,7 @@ static inline int64_t jitter_ms(int64_t max_jitter){
 }
 
 static inline void gate_on_connect(Sock fd){
-    PeerGate pg;
+    PeerGate pg{}; // value-initialize to ensure clean defaults
     pg.t_conn = Clock::now();
     pg.t_last = pg.t_conn;
     pg.is_loopback = false; // default; set after we learn the IP
@@ -748,11 +748,6 @@ static std::string miq_miner_from_block(const miq::Block& b) {
     return miq_addr_from_pkh(cb.vout[0].pkh);
 }
 
-// Detect new-framed header at position (for short-advance guard)
-static inline bool looks_new_magic_at(const std::vector<uint8_t>& v, size_t pos){
-    return v.size() >= pos + 4 && std::memcmp(v.data() + pos, miq::MAGIC_BE, 4) == 0;
-}
-
 } // anon
 
 namespace miq {
@@ -1045,7 +1040,7 @@ void P2P::bump_ban(PeerState& ps, const std::string& ip, const char* reason, int
     if (s != MIQ_INVALID_SOCK) {
         P2P_TRACE(std::string("ban-close ip=") + ip + " reason=" + (reason?reason:""));
         CLOSESOCK(s);
-        ps.sock = MIQ_INVALID_SOCK; // mark invalid so guarded removal won't double-close
+        ps.sock = MIQ_INVALID_SOCK;
     }
     (void)reason;
 }
@@ -1167,9 +1162,7 @@ void P2P::stop(){
     for (auto& kv : peers_) {
         if (kv.first != MIQ_INVALID_SOCK) {
             gate_on_close(kv.first);
-            if (kv.second.sock != MIQ_INVALID_SOCK && kv.second.sock == kv.first) {
-                CLOSESOCK(kv.first);
-            }
+            CLOSESOCK(kv.first);
         }
     }
     peers_.clear();
@@ -1289,7 +1282,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 #endif
     g_seed_backoff.erase(host);
 
-    PeerState ps;
+    PeerState ps{};
     ps.sock = s;
     ps.ip   = ipbuf[0] ? std::string(ipbuf) : std::string("unknown");
     ps.mis  = 0;
@@ -1367,7 +1360,7 @@ static bool violates_group_diversity(const std::unordered_map<Sock, miq::PeerSta
 }
 
 void P2P::handle_new_peer(Sock c, const std::string& ip){
-    PeerState ps;
+    PeerState ps{};
     ps.sock = c;
     ps.ip   = ip;
     ps.mis  = 0;
@@ -1806,7 +1799,7 @@ void P2P::loop(){
 
                     Sock s = dial_be_ipv4(be_ip, g_listen_port);
                     if (s != MIQ_INVALID_SOCK) {
-                        PeerState ps; ps.sock = s; ps.ip = dotted; ps.mis=0; ps.last_ms=now_ms();
+                        PeerState ps{}; ps.sock = s; ps.ip = dotted; ps.mis=0; ps.last_ms=now_ms();
                         ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
                         ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
                         peers_[s] = ps;
@@ -1846,7 +1839,7 @@ void P2P::loop(){
                         if (!is_loopback_be(pick)) {
                             Sock s = dial_be_ipv4(pick, g_listen_port);
                             if (s != MIQ_INVALID_SOCK) {
-                                PeerState ps;
+                                PeerState ps{};
                                 ps.sock = s;
                                 ps.ip   = be_ip_to_string(pick);
                                 ps.mis  = 0;
@@ -1887,7 +1880,7 @@ void P2P::loop(){
                             if (!connected) {
                                 Sock s = dial_be_ipv4(be_ip, g_listen_port);
                                 if (s != MIQ_INVALID_SOCK) {
-                                    PeerState ps; ps.sock=s; ps.ip=dotted; ps.mis=0; ps.last_ms=now_ms();
+                                    PeerState ps{}; ps.sock=s; ps.ip=dotted; ps.mis=0; ps.last_ms=now_ms();
                                     ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
                                     ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
                                     peers_[s]=ps;
@@ -2054,14 +2047,15 @@ void P2P::loop(){
 
                 size_t off = 0;
                 miq::NetMsg m;
-                size_t prev_off = off;
-                while (decode_msg(ps.rx, off, m)) {
-                    // NICE-TO-HAVE: if new-framed, ensure we advanced at least header bytes (24)
-                    if (looks_new_magic_at(ps.rx, prev_off) && (off < prev_off + 24)) {
-                        log_warn("P2P: RX short-advance frame; aborting parse tick");
+                while (true) {
+                    size_t prev = off;
+                    if (!decode_msg(ps.rx, off, m)) break;
+
+                    // NICE-TO-HAVE: if a frame is accepted but off didn't advance by >= 24, log and break
+                    if (off - prev < 24) {
+                        log_warn("P2P: decode advanced <24; cmd=" + std::string(m.cmd, m.cmd + 12));
                         break;
                     }
-                    prev_off = off;
 
                     std::string cmd(m.cmd, m.cmd + 12);
                     size_t z = cmd.find('\0');
@@ -2472,14 +2466,9 @@ void P2P::loop(){
 
         // ---- Guarded removals (single, consistent path) --------------------
         for (Sock s : dead) {
-            auto it = peers_.find(s);
-            if (it != peers_.end()) {
-                gate_on_close(s);
-                if (it->second.sock != MIQ_INVALID_SOCK && it->second.sock == s) {
-                    CLOSESOCK(s);
-                }
-                peers_.erase(it);
-            }
+            gate_on_close(s);
+            CLOSESOCK(s);
+            peers_.erase(s);
             g_zero_hdr_batches.erase(s);
             g_preverack_counts.erase(s);
             g_trickle_last_ms.erase(s);
