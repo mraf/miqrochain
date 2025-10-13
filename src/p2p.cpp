@@ -283,6 +283,7 @@ struct PeerGate {
     bool got_version{false};
     bool sent_verack{false};
     bool got_verack{false};
+    bool is_loopback{false};   // NEW: mark if this fd belongs to 127.0.0.1 peer
     int  banscore{0};
     size_t rx_bytes{0};
     Clock::time_point t_conn{Clock::now()};
@@ -405,9 +406,16 @@ static inline void gate_on_connect(Sock fd){
     PeerGate pg;
     pg.t_conn = Clock::now();
     pg.t_last = pg.t_conn;
+    pg.is_loopback = false; // default; set after we learn the IP
     g_gate[fd] = pg;
     g_trickle_last_ms[fd] = 0;
 }
+// NEW: mark the fd as loopback once we know the peer's IP.
+static inline void gate_set_loopback(Sock fd, bool is_lb){
+    auto it = g_gate.find(fd);
+    if (it != g_gate.end()) it->second.is_loopback = is_lb;
+}
+
 static inline void gate_on_close(Sock fd){
     g_gate.erase(fd);
     g_trickle_q.erase(fd);
@@ -451,11 +459,16 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
             if (!g.got_version){
                 g.got_version = true;
                 should_send_verack = true;
+                // OPTIONAL wired: clear any early pre-verack counters once "version" arrives
+                g_preverack_counts.erase(fd);
             }
         } else if (cmd == "verack"){
             g.got_verack = true;
+            // OPTIONAL wired: also clear counters on "verack"
+            g_preverack_counts.erase(fd);
         } else {
             if (!g.got_version) {
+                // Safe pre-version commands are allowed; do not penalize.
                 if (miq_safe_preverack_cmd(cmd)) {
                     return false;
                 } else {
@@ -466,11 +479,14 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
             }
             if (!g.got_verack){
                 if (!miq_safe_preverack_cmd(cmd)) return false;
-                int &cnt = g_preverack_counts[fd];
-                if (++cnt > MIQ_PREVERACK_QUEUE_MAX) {
-                    g.banscore += 5;
-                    if (g.banscore >= MAX_BANSCORE) { close_code = 402; return true; }
-                    return false;
+                // Do NOT count safe pre-verack messages from local wallet (127.0.0.1).
+                if (!g.is_loopback) {
+                    int &cnt = g_preverack_counts[fd];
+                    if (++cnt > MIQ_PREVERACK_QUEUE_MAX) {
+                        g.banscore += 5;
+                        if (g.banscore >= MAX_BANSCORE) { close_code = 402; return true; }
+                        return false;
+                    }
                 }
             }
         }
@@ -1238,13 +1254,17 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     g_trickle_last_ms[s] = 0;
 
     uint32_t be_ip;
-    if (ipbuf[0] && parse_ipv4(ipbuf, be_ip) && ipv4_is_public(be_ip) && !is_self_be(be_ip)) {
+    if (ipbuf[0] && parse_ipv4(ps.ip, be_ip) && ipv4_is_public(be_ip) && !is_self_be(be_ip)) {
         addrv4_.insert(be_ip);
 #if MIQ_ENABLE_ADDRMAN
         miq::NetAddr na; na.host = ps.ip; na.port = port; na.tried = true; na.is_ipv6=false;
         g_addrman.mark_good(na);
         g_addrman.add_anchor(na);
 #endif
+        // Loopback false for public seeds
+        gate_set_loopback(s, is_loopback_be(be_ip));
+    } else if (ipbuf[0] && parse_ipv4(ps.ip, be_ip)) {
+        gate_set_loopback(s, is_loopback_be(be_ip));
     }
 
     log_info("P2P: connected seed " + peers_[s].ip);
@@ -1321,6 +1341,10 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
         miq::NetAddr na; na.host=ip; na.port=g_listen_port; na.is_ipv6=false; na.tried=false;
         g_addrman.add(na, /*from_dns=*/false);
     #endif
+    }
+    // mark loopback status early for pre-verack gating
+    if (parse_ipv4(ip, be_ip)) {
+        gate_set_loopback(c, is_loopback_be(be_ip));
     }
 
     log_info("P2P: inbound peer " + ip);
@@ -1773,6 +1797,8 @@ void P2P::loop(){
                         g_trickle_last_ms[s] = 0;
                         log_info("P2P: outbound (addrman) " + ps.ip);
                         gate_on_connect(s);
+                        // mark loopback flag (should be false here for public)
+                        gate_set_loopback(s, is_loopback_be(be_ip));
                         auto msg = encode_msg("version", {});
 #ifdef _WIN32
                         send(s, (const char*)msg.data(), (int)msg.size(), 0);
@@ -1823,6 +1849,7 @@ void P2P::loop(){
 
                                 log_info("P2P: outbound to known " + ps.ip);
                                 gate_on_connect(s);
+                                gate_set_loopback(s, is_loopback_be(pick));
                                 auto msg = encode_msg("version", {});
 #ifdef _WIN32
                                 send(s, (const char*)msg.data(), (int)msg.size(), 0);
@@ -1860,6 +1887,7 @@ void P2P::loop(){
                                     g_trickle_last_ms[s] = 0;
                                     log_info("P2P: feeler " + dotted);
                                     gate_on_connect(s);
+                                    gate_set_loopback(s, is_loopback_be(be_ip));
                                     auto msg = encode_msg("version", {});
 #ifdef _WIN32
                                     send(s, (const char*)msg.data(), (int)msg.size(), 0);
@@ -2410,7 +2438,7 @@ void P2P::loop(){
 #ifdef _WIN32
                                 send(s, (const char*)m2.data(), (int)m2.size(), 0);
 #else
-                                send(s, m2.data(), m2.size(), 0);
+                                send(s, m2.data(), m.size(), 0);
 #endif
                                 ps.inflight_hdr_batches++;
                             }
