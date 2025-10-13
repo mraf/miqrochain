@@ -52,6 +52,7 @@
 #include <type_traits>
 #include <utility>
 #include <cstdint>   // uint64_t
+#include <exception> // std::set_terminate
 
 #if defined(_WIN32)
   #include <io.h>
@@ -100,7 +101,7 @@ static std::string default_datadir() {
 }
 
 static inline void trim_inplace(std::string& s) {
-    auto notspace = [](int ch){ return !std::isspace(ch); };
+    auto notspace = [](unsigned char ch){ return !std::isspace(ch); };
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), notspace));
     s.erase(std::find_if(s.rbegin(), s.rend(), notspace).base(), s.end());
 }
@@ -150,12 +151,8 @@ static std::vector<Transaction> collect_mempool_for_block(Mempool& mp,
 static void fatal_terminate() noexcept {
     // DO NOT abort; keep the node alive if a worker thread dies.
     std::fputs("[FATAL] std::terminate() called from a background thread (suppressed to keep node alive)\n", stderr);
-    // best-effort sleep to avoid tight loop; the offending thread will end.
-#ifdef _WIN32
-    Sleep(10);
-#else
-    usleep(10 * 1000);
-#endif
+    // Yield briefly to avoid tight loops; portable.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
 // Miner worker extracted to a named function (no lambda captures)
@@ -165,11 +162,13 @@ static void miner_worker(Chain* chain,
                          P2P* p2p,
                          const std::vector<uint8_t> mine_pkh,
                          unsigned threads) {
-    // thread-local RNG for extraNonce
+    // thread-local RNG for extraNonce (portable, no self-address UB)
     std::random_device rd;
-    std::mt19937_64 gen(
-        (uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count())
-        ^ (uint64_t)rd() ^ (uint64_t)(uintptr_t)&gen));
+    const uint64_t seed =
+        uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count()) ^
+        uint64_t(rd()) ^
+        uint64_t(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    std::mt19937_64 gen(seed);
 
     const size_t kBlockMaxBytes = 900 * 1024;
 
