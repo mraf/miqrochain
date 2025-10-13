@@ -56,6 +56,13 @@
 #define MIQ_ADDRMAN_FILE "peers2.dat"
 #endif
 
+// ---- hard cap for wallet-side frame sizes (prevents OOM/DoS) ----------------
+#ifndef MAX_MSG_SIZE
+#define MIQ_LIGHT_MAX_MSG_SIZE (2u * 1024u * 1024u)  // 2 MiB fallback
+#else
+#define MIQ_LIGHT_MAX_MSG_SIZE (MAX_MSG_SIZE)
+#endif
+
 namespace miq {
 
 // ---- tiny env helpers --------------------------------------------------------
@@ -562,6 +569,9 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
         std::string cmd; uint32_t len=0, csum=0;
         if(!read_msg_header(cmd, len, csum, err)) return false;
 
+        // NEW: hard cap to avoid huge allocations/DoS
+        if (len > MIQ_LIGHT_MAX_MSG_SIZE) { err = "frame too large"; return false; }
+
         std::vector<uint8_t> payload(len);
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
 
@@ -711,6 +721,9 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
         std::string cmd; uint32_t len=0, csum=0;
         if(!read_msg_header(cmd, len, csum, err)) return false;
 
+        // NEW: cap again in this loop
+        if (len > MIQ_LIGHT_MAX_MSG_SIZE) { err = "frame too large"; return false; }
+
         std::vector<uint8_t> payload(len);
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
 
@@ -825,6 +838,9 @@ bool P2PLight::read_until_verack(std::string& err){
     for (int i=0;i<50;i++){
         std::string cmd; uint32_t len=0, csum=0;
         if(!read_msg_header(cmd, len, csum, err)) return false;
+
+        // NEW: cap to avoid allocating attacker-chosen size during handshake
+        if (len > MIQ_LIGHT_MAX_MSG_SIZE) { err = "frame too large"; return false; }
 
         std::vector<uint8_t> payload(len);
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
