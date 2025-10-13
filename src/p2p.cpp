@@ -29,6 +29,16 @@
 #include <signal.h>
 #endif
 
+// ----- lightweight trace toggle ------------------------------------------------
+#ifndef MIQ_P2P_TRACE
+#define MIQ_P2P_TRACE 1
+#endif
+#if MIQ_P2P_TRACE
+  #define P2P_TRACE(msg) do { log_info(std::string("[TRACE] ") + (msg)); } while(0)
+#else
+  #define P2P_TRACE(msg) do {} while(0)
+#endif
+
 #if !defined(MIQ_MAYBE_UNUSED)
   #if defined(__GNUC__) || defined(__clang__)
     #define MIQ_MAYBE_UNUSED __attribute__((unused))
@@ -283,7 +293,7 @@ struct PeerGate {
     bool got_version{false};
     bool sent_verack{false};
     bool got_verack{false};
-    bool is_loopback{false};   // NEW: mark if this fd belongs to 127.0.0.1 peer
+    bool is_loopback{false};   // mark if this fd belongs to 127.0.0.1 peer
     int  banscore{0};
     size_t rx_bytes{0};
     Clock::time_point t_conn{Clock::now()};
@@ -332,15 +342,52 @@ static inline void rx_clear_start(Sock fd){
     g_rx_started_ms.erase(fd);
 }
 
-// --- helper to send gettx using existing encode_msg/send path ----------
+// --- small Windows-safe send/recv helpers -----------------------------------
+static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
+    if (!data || len == 0) return true;
+#ifdef _WIN32
+    int n = send(s, reinterpret_cast<const char*>(data), (int)len, 0);
+    if (n == SOCKET_ERROR) {
+        int e = WSAGetLastError();
+        char buf[96]; sprintf_s(buf, "send() failed WSAE=%d", e);
+        log_warn(std::string("P2P: ") + buf);
+        return false;
+    }
+#else
+    ssize_t n = send(s, data, len, 0);
+    if (n < 0) {
+        log_warn("P2P: send() failed");
+        return false;
+    }
+#endif
+    return true;
+}
+static inline bool miq_send(Sock s, const std::vector<uint8_t>& v){
+    return miq_send(s, v.data(), v.size());
+}
+static inline int miq_recv(Sock s, uint8_t* buf, size_t bufsz) {
+#ifdef _WIN32
+    int n = recv(s, reinterpret_cast<char*>(buf), (int)bufsz, 0);
+    if (n == SOCKET_ERROR) {
+        int e = WSAGetLastError();
+        if (e == WSAEWOULDBLOCK) return 0;
+        char tmp[96]; sprintf_s(tmp, "recv() failed WSAE=%d", e);
+        log_warn(std::string("P2P: ") + tmp);
+        return -1;
+    }
+    return n;
+#else
+    ssize_t n = recv(s, buf, bufsz, 0);
+    if (n < 0) return -1;
+    return (int)n;
+#endif
+}
+
+// --- helper to send gettx using existing encode_msg path ----------
 static inline void send_gettx(Sock sock, const std::vector<uint8_t>& txid) {
     if (txid.size() != 32) return;
     auto m = miq::encode_msg("gettx", txid);
-#ifdef _WIN32
-    send(sock, (const char*)m.data(), (int)m.size(), 0);
-#else
-    send(sock, m.data(), m.size(), 0);
-#endif
+    (void)miq_send(sock, m);
 }
 
 static inline uint64_t env_u64(const char* name, uint64_t defv){
@@ -451,6 +498,7 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - g.t_conn).count();
     if (!g.got_verack && ms > HANDSHAKE_MS){
         close_code = 408;
+        P2P_TRACE("close fd=" + std::to_string((uintptr_t)fd) + " reason=handshake-timeout");
         return true;
     }
 
@@ -459,32 +507,29 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
             if (!g.got_version){
                 g.got_version = true;
                 should_send_verack = true;
-                // OPTIONAL wired: clear any early pre-verack counters once "version" arrives
                 g_preverack_counts.erase(fd);
             }
         } else if (cmd == "verack"){
             g.got_verack = true;
-            // OPTIONAL wired: also clear counters on "verack"
             g_preverack_counts.erase(fd);
         } else {
             if (!g.got_version) {
-                // Safe pre-version commands are allowed; do not penalize.
                 if (miq_safe_preverack_cmd(cmd)) {
                     return false;
                 } else {
                     g.banscore += 10;
-                    if (g.banscore >= MAX_BANSCORE) { close_code = 400; return true; }
+                    if (g.banscore >= MAX_BANSCORE) { close_code = 400; P2P_TRACE("close fd="+std::to_string((uintptr_t)fd)+" reason=pre-version-bad"); return true; }
                     return false;
                 }
             }
             if (!g.got_verack){
                 if (!miq_safe_preverack_cmd(cmd)) return false;
-                // Do NOT count safe pre-verack messages from local wallet (127.0.0.1).
+                // Do NOT count safe pre-verack from local wallet (127.0.0.1)
                 if (!g.is_loopback) {
                     int &cnt = g_preverack_counts[fd];
                     if (++cnt > MIQ_PREVERACK_QUEUE_MAX) {
                         g.banscore += 5;
-                        if (g.banscore >= MAX_BANSCORE) { close_code = 402; return true; }
+                        if (g.banscore >= MAX_BANSCORE) { close_code = 402; P2P_TRACE("close fd="+std::to_string((uintptr_t)fd)+" reason=pre-verack-overflow"); return true; }
                         return false;
                     }
                 }
@@ -492,7 +537,7 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
         }
     }
 
-    if (g.banscore >= MAX_BANSCORE){ close_code = 400; return true; }
+    if (g.banscore >= MAX_BANSCORE){ close_code = 400; P2P_TRACE("close fd="+std::to_string((uintptr_t)fd)+" reason=banscore"); return true; }
     return false;
 }
 
@@ -981,8 +1026,9 @@ void P2P::save_bans(){
 
 void P2P::bump_ban(PeerState& ps, const std::string& ip, const char* reason, int64_t now_ms)
 {
-    // Do not ban localhost or whitelisted peers.
+    // Do not ban localhost or whitelisted peers (never hairpin-ban loopback).
     if (is_loopback(ip) || is_whitelisted_ip(ip)) {
+        P2P_TRACE(std::string("skip-ban loopback/whitelist ip=") + ip + " reason=" + (reason?reason:""));
         return;
     }
     // Timed ban record
@@ -992,10 +1038,11 @@ void P2P::bump_ban(PeerState& ps, const std::string& ip, const char* reason, int
     // Close socket to enforce the ban immediately.
     Sock s = ps.sock;
     if (s != MIQ_INVALID_SOCK) {
+        P2P_TRACE(std::string("ban-close ip=") + ip + " reason=" + (reason?reason:""));
         CLOSESOCK(s);
         ps.sock = MIQ_INVALID_SOCK;
     }
-    (void)reason; // keep signature for future logging without introducing deps here
+    (void)reason;
 }
 
 
@@ -1020,7 +1067,7 @@ bool P2P::start(uint16_t port){
             log_info("P2P: addrman load: " + err);
         }
         g_last_addrman_save = now_ms();
-        g_next_feeler_ms = now_ms() + MIQ_FEELER_INTERVAL_MS;
+        g_next_feeler_ms    = now_ms() + MIQ_FEELER_INTERVAL_MS;
     }
 #endif
 
@@ -1261,21 +1308,18 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
         g_addrman.mark_good(na);
         g_addrman.add_anchor(na);
 #endif
-        // Loopback false for public seeds
-        gate_set_loopback(s, is_loopback_be(be_ip));
-    } else if (ipbuf[0] && parse_ipv4(ps.ip, be_ip)) {
-        gate_set_loopback(s, is_loopback_be(be_ip));
     }
 
     log_info("P2P: connected seed " + peers_[s].ip);
 
+    // Gate first, then mark loopback (so flag actually sticks)
     gate_on_connect(s);
+    if (ipbuf[0] && parse_ipv4(ps.ip, be_ip)) {
+        gate_set_loopback(s, is_loopback_be(be_ip));
+    }
+
     auto msg = encode_msg("version", {});
-#ifdef _WIN32
-    send(s, (const char*)msg.data(), (int)msg.size(), 0);
-#else
-    send(s, msg.data(), msg.size(), 0);
-#endif
+    (void)miq_send(s, msg);
 
     return true;
 }
@@ -1342,20 +1386,17 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
         g_addrman.add(na, /*from_dns=*/false);
     #endif
     }
-    // mark loopback status early for pre-verack gating
+
+    log_info("P2P: inbound peer " + ip);
+
+    // Gate first, then mark loopback (critical for localhost wallet)
+    gate_on_connect(c);
     if (parse_ipv4(ip, be_ip)) {
         gate_set_loopback(c, is_loopback_be(be_ip));
     }
 
-    log_info("P2P: inbound peer " + ip);
-
-    gate_on_connect(c);
     auto msg = encode_msg("version", {});
-#ifdef _WIN32
-    send(c, (const char*)msg.data(), (int)msg.size(), 0);
-#else
-    send(c, msg.data(), msg.size(), 0);
-#endif
+    (void)miq_send(c, msg);
 }
 
 void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
@@ -1401,11 +1442,7 @@ static void trickle_flush(){
         while (!q.empty() && n_send < MIQ_P2P_TRICKLE_BATCH) {
             const auto& txid = q.back();
             auto m = encode_msg("invtx", txid);
-#ifdef _WIN32
-            send(s, (const char*)m.data(), (int)m.size(), 0);
-#else
-            send(s, m.data(), m.size(), 0);
-#endif
+            (void)miq_send(s, m);
             q.pop_back();
             ++n_send;
         }
@@ -1418,22 +1455,14 @@ void P2P::request_tx(PeerState& ps, const std::vector<uint8_t>& txid){
     if (!check_rate(ps, "get", 1.0, now_ms())) return;
     if (ps.inflight_tx.size() >= caps_.max_txs) return;
     auto m = encode_msg("gettx", txid);
-#ifdef _WIN32
-    send(ps.sock, (const char*)m.data(), (int)m.size(), 0);
-#else
-    send(ps.sock, m.data(), m.size(), 0);
-#endif
+    (void)miq_send(ps.sock, m);
     ps.inflight_tx.insert(hexkey(txid));
 }
 
 void P2P::send_tx(Sock sock, const std::vector<uint8_t>& raw){
     if (raw.empty()) return;
     auto m = encode_msg("tx", raw);
-#ifdef _WIN32
-    send(sock, (const char*)m.data(), (int)m.size(), 0);
-#else
-    send(sock, m.data(), m.size(), 0);
-#endif
+    (void)miq_send(sock, m);
 }
 
 void P2P::start_sync_with_peer(PeerState& ps){
@@ -1446,11 +1475,7 @@ void P2P::request_block_index(PeerState& ps, uint64_t index){
     uint8_t p[8];
     for (int i=0;i<8;i++) p[i] = (uint8_t)((index >> (8*i)) & 0xFF);
     auto msg = encode_msg("getbi", std::vector<uint8_t>(p, p+8));
-#ifdef _WIN32
-    send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
-#else
-    send(ps.sock, msg.data(), msg.size(), 0);
-#endif
+    (void)miq_send(ps.sock, msg);
 }
 
 void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
@@ -1458,22 +1483,14 @@ void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     if (!check_rate(ps, "get", 1.0, now_ms())) return;
     if (ps.inflight_blocks.size() >= caps_.max_blocks) return;
     auto msg = encode_msg("getb", h);
-#ifdef _WIN32
-    send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
-#else
-    send(ps.sock, msg.data(), msg.size(), 0);
-#endif
+    (void)miq_send(ps.sock, msg);
     ps.inflight_blocks.insert(hexkey(h));
 }
 
 void P2P::send_block(Sock s, const std::vector<uint8_t>& raw){
     if (raw.empty()) return;
     auto msg = encode_msg("block", raw);
-#ifdef _WIN32
-    send(s, (const char*)msg.data(), (int)msg.size(), 0);
-#else
-    send(s, msg.data(), msg.size(), 0);
-#endif
+    (void)miq_send(s, msg);
 }
 
 // === rate-limit helpers ======================================================
@@ -1511,11 +1528,7 @@ void P2P::maybe_send_getaddr(PeerState& ps){
     ps.last_getaddr_ms = t;
     auto msg = encode_msg("getaddr", {});
     if (check_rate(ps, "get", 1.0, t)) {
-#ifdef _WIN32
-        send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
-#else
-        send(ps.sock, msg.data(), msg.size(), 0);
-#endif
+        (void)miq_send(ps.sock, msg);
     }
 }
 
@@ -1555,11 +1568,7 @@ void P2P::send_addr_snapshot(PeerState& ps){
         ++cnt;
     }
     auto msg = encode_msg("addr", payload);
-#ifdef _WIN32
-    send(ps.sock, (const char*)msg.data(), (int)msg.size(), 0);
-#else
-    send(ps.sock, msg.data(), msg.size(), 0);
-#endif
+    (void)miq_send(ps.sock, msg);
 }
 void P2P::handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload){
     int64_t t = now_ms();
@@ -1643,7 +1652,7 @@ void P2P::remove_orphan_by_hex(const std::string& child_hex){
     orphans_.erase(it);
 
     auto pit = orphan_children_.find(parent_hex);
-    if (pit != orphan_children_.end()){
+    if (pit != std::unordered_map<std::string,std::vector<std::string>>::value_type::second_type{}, pit != orphan_children_.end()){
         auto& vec = pit->second;
         vec.erase(std::remove(vec.begin(), vec.end(), child_hex), vec.end());
         if (vec.empty()) orphan_children_.erase(pit);
@@ -1797,14 +1806,9 @@ void P2P::loop(){
                         g_trickle_last_ms[s] = 0;
                         log_info("P2P: outbound (addrman) " + ps.ip);
                         gate_on_connect(s);
-                        // mark loopback flag (should be false here for public)
                         gate_set_loopback(s, is_loopback_be(be_ip));
                         auto msg = encode_msg("version", {});
-#ifdef _WIN32
-                        send(s, (const char*)msg.data(), (int)msg.size(), 0);
-#else
-                        send(s, msg.data(), msg.size(), 0);
-#endif
+                        (void)miq_send(s, msg);
                         dialed = true;
                     } else {
                         g_addrman.mark_attempt(*cand);
@@ -1851,11 +1855,7 @@ void P2P::loop(){
                                 gate_on_connect(s);
                                 gate_set_loopback(s, is_loopback_be(pick));
                                 auto msg = encode_msg("version", {});
-#ifdef _WIN32
-                                send(s, (const char*)msg.data(), (int)msg.size(), 0);
-#else
-                                send(s, msg.data(), msg.size(), 0);
-#endif
+                                (void)miq_send(s, msg);
                             }
                         }
                     }
@@ -1889,11 +1889,7 @@ void P2P::loop(){
                                     gate_on_connect(s);
                                     gate_set_loopback(s, is_loopback_be(be_ip));
                                     auto msg = encode_msg("version", {});
-#ifdef _WIN32
-                                    send(s, (const char*)msg.data(), (int)msg.size(), 0);
-#else
-                                    send(s, msg.data(), msg.size(), 0);
-#endif
+                                    (void)miq_send(s, msg);
                                 }
                             }
                         }
@@ -1923,11 +1919,7 @@ void P2P::loop(){
                         can_accept_hdr_batch(kv.second, now_ms()) &&
                         check_rate(kv.second, "get", 1.0, now_ms())) {
                         kv.second.sent_getheaders = true;
-#ifdef _WIN32
-                        send(kv.first, (const char*)m.data(), (int)m.size(), 0);
-#else
-                        send(kv.first, m.data(), m.size(), 0);
-#endif
+                        (void)miq_send(kv.first, m);
                         kv.second.inflight_hdr_batches++;
                         if (++probes >= 2) break;
                     }
@@ -1986,6 +1978,7 @@ void P2P::loop(){
                 Sock c = accept(srv_, (sockaddr*)&ca, &clen);
                 if (c != MIQ_INVALID_SOCK) {
                     if (is_self_endpoint(c, g_listen_port)) {
+                        P2P_TRACE("reject hairpin inbound");
                         CLOSESOCK(c);
                     } else {
                         int64_t tnow = now_ms();
@@ -1994,6 +1987,7 @@ void P2P::loop(){
                             inbound_accepts_in_window_ = 0;
                         }
                         if (inbound_accepts_in_window_ >= MIQ_P2P_NEW_INBOUND_CAP_PER_MIN) {
+                            P2P_TRACE("reject inbound: per-minute cap");
                             CLOSESOCK(c);
                         } else {
                             inbound_accepts_in_window_++;
@@ -2005,6 +1999,7 @@ void P2P::loop(){
                             inet_ntop(AF_INET, &ca.sin_addr, ipbuf, (socklen_t)sizeof(ipbuf));
 #endif
                             if (banned_.count(ipbuf) || is_ip_banned(ipbuf, now_ms())) {
+                                P2P_TRACE(std::string("reject inbound banned ip=") + ipbuf);
                                 CLOSESOCK(c);
                             } else {
                                 handle_new_peer(c, ipbuf);
@@ -2030,14 +2025,11 @@ void P2P::loop(){
 
             if (ready) {
                 uint8_t buf[65536];
-#ifdef _WIN32
-                int n = recv(s, (char*)buf, (int)sizeof(buf), 0);
-#else
-                ssize_t n = recv(s, (char*)buf, sizeof(buf), 0);
-#endif
-                if (n <= 0) { dead.push_back(s); continue; }
+                int n = miq_recv(s, buf, sizeof(buf));
+                if (n <= 0) { P2P_TRACE("close read<=0"); dead.push_back(s); continue; }
 
                 if (gate_on_bytes(s, (size_t)n)) {
+                    P2P_TRACE("close RX over MAX_MSG_BYTES");
                     dead.push_back(s);
                     continue;
                 }
@@ -2066,19 +2058,17 @@ void P2P::loop(){
                         if (bad) { ++ps.mis; continue; }
                     }
 
+                    P2P_TRACE("RX " + ps.ip + " cmd=" + cmd + " len=" + std::to_string(m.payload.size()));
+
                     bool send_verack = false; int close_code = 0;
                     if (gate_on_command(s, cmd, send_verack, close_code)) {
-                        if (close_code) { /* could log */ }
+                        if (close_code) { /* traced in gate_on_command */ }
                         dead.push_back(s);
                         break;
                     }
                     if (send_verack) {
                         auto verack = encode_msg("verack", {});
-#ifdef _WIN32
-                        send(s, (const char*)verack.data(), (int)verack.size(), 0);
-#else
-                        send(s, verack.data(), verack.size(), 0);
-#endif
+                        (void)miq_send(s, verack);
                     }
 
                     auto inv_tick = [&](unsigned add)->bool{
@@ -2150,11 +2140,7 @@ void P2P::loop(){
                             auto msg = encode_msg("getheaders", pl);
                             if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "get", 1.0, now_ms())) {
                                 ps.sent_getheaders = true;
-#ifdef _WIN32
-                                send(s, (const char*)msg.data(), (int)msg.size(), 0);
-#else
-                                send(s, msg.data(), msg.size(), 0);
-#endif
+                                (void)miq_send(s, msg);
                                 ps.inflight_hdr_batches++;
                             }
                         }
@@ -2175,20 +2161,12 @@ void P2P::loop(){
                             std::vector<uint8_t> pl(8);
                             for(int i=0;i<8;i++) pl[i] = (uint8_t)((mrf >> (8*i)) & 0xFF);
                             auto ff = encode_msg("feefilter", pl);
-#ifdef _WIN32
-                            send(s, (const char*)ff.data(), (int)ff.size(), 0);
-#else
-                            send(s, ff.data(), ff.size(), 0);
-#endif
+                            (void)miq_send(s, ff);
                         }
 
                     } else if (cmd == "ping") {
                         auto pong = encode_msg("pong", m.payload);
-#ifdef _WIN32
-                        send(s, (const char*)pong.data(), (int)pong.size(), 0);
-#else
-                        send(s, pong.data(), pong.size(), 0);
-#endif
+                        (void)miq_send(s, pong);
 
                     } else if (cmd == "pong") {
                         ps.awaiting_pong = false;
@@ -2370,11 +2348,7 @@ void P2P::loop(){
                         chain_.get_headers_from_locator(locator, 2000, hs);
                         auto out = build_headers_payload(hs);
                         auto msg = encode_msg("headers", out);
-#ifdef _WIN32
-                        send(s, (const char*)msg.data(), (int)msg.size(), 0);
-#else
-                        send(s, msg.data(), msg.size(), 0);
-#endif
+                        (void)miq_send(s, msg);
 
                     } else if (cmd == "headers") {
                         if (unsolicited_drop(ps, "headers", "")) {
@@ -2435,12 +2409,8 @@ void P2P::loop(){
                             auto m2  = encode_msg("getheaders", pl2);
                             if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "get", 1.0, now_ms())) {
                                  ps.sent_getheaders = true;
- #ifdef _WIN32
-                                send(s, (const char*)m2.data(), (int)m2.size(), 0);
-#else
-                                send(s, m2.data(), m2.size(), 0);
-#endif
-                                ps.inflight_hdr_batches++;
+                                 (void)miq_send(s, m2);
+                                 ps.inflight_hdr_batches++;
                             }
                         }
 #endif
@@ -2469,24 +2439,23 @@ void P2P::loop(){
 
             int64_t tnow = now_ms();
             if (!ps.verack_ok && (tnow - ps.last_ms) > MIQ_P2P_VERACK_TIMEOUT_MS) {
+                P2P_TRACE("close verack-timeout");
                 dead.push_back(s);
                 continue;
             }
             if (!ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PING_EVERY_MS) {
                 auto ping = encode_msg("ping", {});
-#ifdef _WIN32
-                send(s, (const char*)ping.data(), (int)ping.size(), 0);
-#else
-                send(s, ping.data(), ping.size(), 0);
-#endif
+                (void)miq_send(s, ping);
                 ps.last_ping_ms = tnow;
                 ps.awaiting_pong = true;
             } else if (ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PONG_TIMEOUT_MS) {
+                P2P_TRACE("close pong-timeout");
                 bump_ban(ps, ps.ip, "pong-timeout", now_ms());
                 dead.push_back(s);
             }
         }
 
+        // ---- Guarded removals (single, consistent path) --------------------
         for (Sock s : dead) {
             gate_on_close(s);
             CLOSESOCK(s);
@@ -2505,7 +2474,7 @@ void P2P::loop(){
             }
             if (!todos.empty()) {
                 for (const auto& txid : todos) {
-                    for (auto& kv : peers_) trickle_enqueue(kv.first, txid);
+                    for (auto& kv : peers_) trickle_enqueue(kvp.first, txid);
                 }
             }
         }
@@ -2523,11 +2492,7 @@ void P2P::loop(){
             for (const auto& h : todo) {
                 auto m = encode_msg("invb", h);
                 for (auto& kv : peers_) {
-#ifdef _WIN32
-                    send(kv.first, (const char*)m.data(), (int)m.size(), 0);
-#else
-                    send(kv.first, m.data(), m.size(), 0);
-#endif
+                    (void)miq_send(kv.first, m);
                 }
             }
         }
