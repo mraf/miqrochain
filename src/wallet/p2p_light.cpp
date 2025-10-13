@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <thread>   // pacing safeguard
 #include <sstream>
+#include <cstdlib>
 
 #ifndef _WIN32
   #include <signal.h>
@@ -33,6 +34,28 @@
   #pragma comment(lib, "ws2_32.lib")
 #endif
 
+// === Optional persisted addrman ==============================================
+#if defined(__has_include)
+#  if __has_include("addrman.h")
+#    include "addrman.h"
+#    ifndef MIQ_ENABLE_ADDRMAN
+#      define MIQ_ENABLE_ADDRMAN 1
+#    endif
+#  else
+#    ifndef MIQ_ENABLE_ADDRMAN
+#      define MIQ_ENABLE_ADDRMAN 0
+#    endif
+#  endif
+#else
+#  ifndef MIQ_ENABLE_ADDRMAN
+#    define MIQ_ENABLE_ADDRMAN 0
+#  endif
+#endif
+
+#ifndef MIQ_ADDRMAN_FILE
+#define MIQ_ADDRMAN_FILE "peers2.dat"
+#endif
+
 namespace miq {
 
 // ---- tiny env helpers --------------------------------------------------------
@@ -43,6 +66,10 @@ static bool env_truthy(const char* name){
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return (char)std::tolower(c); });
     return (s=="1"||s=="true"||s=="yes"||s=="on");
 }
+static std::string env_str(const char* name, const char* defv = ""){
+    const char* v = std::getenv(name);
+    return (v && *v) ? std::string(v) : std::string(defv);
+}
 
 // ---- network magic from chain constants --------------------------------------
 #ifndef MIQ_P2P_MAGIC
@@ -52,6 +79,12 @@ static constexpr uint32_t MIQ_P2P_MAGIC =
     (uint32_t(MAGIC_BE[2]) << 16) |
     (uint32_t(MAGIC_BE[3]) << 24);
 #endif
+
+// ---- time helper -------------------------------------------------------------
+static inline int64_t now_ms(){
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
 
 // ---- platform shims ----------------------------------------------------------
 #ifdef _WIN32
@@ -113,6 +146,10 @@ static std::vector<uint8_t> to_le32(const std::vector<uint8_t>& h){
 static uint32_t checksum4(const std::vector<uint8_t>& payload){
     auto d = dsha256(payload);
     return (uint32_t)d[0] | ((uint32_t)d[1]<<8) | ((uint32_t)d[2]<<16) | ((uint32_t)d[3]<<24);
+}
+static std::string default_port_str(const std::string& override_port){
+    if (!override_port.empty()) return override_port;
+    return std::to_string(P2P_PORT);
 }
 
 // ---- seed/candidate helpers --------------------------------------------------
@@ -189,11 +226,76 @@ static void collect_local_ipv4(std::vector<std::string>& out){
 #endif
 }
 
+// ---- AddrMan (optional) ------------------------------------------------------
+#if MIQ_ENABLE_ADDRMAN
+namespace {
+    static miq::AddrMan g_addrman;
+    static miq::FastRand g_am_rng{0xC0FFEEULL};
+    static std::string  g_addrman_path;
+    static int64_t      g_last_addrman_save_ms = 0;
+
+    static std::string wallet_datadir(){
+        std::string d = env_str("MIQ_WALLET_DATADIR");
+        if (!d.empty()) return d;
+        d = env_str("MIQ_DATADIR");
+        if (!d.empty()) return d;
+        return std::string(".");
+    }
+    static void addrman_load_once(){
+        if (!g_addrman_path.empty()) return; // already set up
+        g_addrman_path = wallet_datadir() + "/" + std::string(MIQ_ADDRMAN_FILE);
+        std::string err;
+        if (!g_addrman.load(g_addrman_path, err)) {
+            // silent; will be populated as we learn peers
+        }
+        g_last_addrman_save_ms = now_ms();
+    }
+    static void addrman_save_maybe(){
+        int64_t t = now_ms();
+        if (t - g_last_addrman_save_ms < 60000) return;
+        g_last_addrman_save_ms = t;
+        std::string err;
+        (void)g_addrman.save(g_addrman_path, err);
+    }
+    static void addrman_force_save(){
+        std::string err;
+        (void)g_addrman.save(g_addrman_path, err);
+        g_last_addrman_save_ms = now_ms();
+    }
+}
+#endif
+
 // ---- connection helper: try many hosts (IPv4 first), random order -----------
+static std::string peer_ip_string(int fd){
+    sockaddr_storage ss{};
+#ifdef _WIN32
+    int slen = (int)sizeof(ss);
+#else
+    socklen_t slen = sizeof(ss);
+#endif
+    if (getpeername(fd, (sockaddr*)&ss, &slen) != 0) return std::string();
+    char buf[128] = {0};
+    if (ss.ss_family == AF_INET) {
+#ifdef _WIN32
+        InetNtopA(AF_INET, &((sockaddr_in*)&ss)->sin_addr, buf, (int)sizeof(buf));
+#else
+        inet_ntop(AF_INET, &((sockaddr_in*)&ss)->sin_addr, buf, (socklen_t)sizeof(buf));
+#endif
+    } else if (ss.ss_family == AF_INET6) {
+#ifdef _WIN32
+        InetNtopA(AF_INET6, &((sockaddr_in6*)&ss)->sin6_addr, buf, (int)sizeof(buf));
+#else
+        inet_ntop(AF_INET6, &((sockaddr_in6*)&ss)->sin6_addr, buf, (socklen_t)sizeof(buf));
+#endif
+    }
+    return std::string(buf);
+}
+
 static int resolve_and_connect_best(const std::vector<std::string>& hosts,
                                     const std::string& port,
                                     int timeout_ms,
-                                    std::string& err)
+                                    std::string& err,
+                                    std::string* connected_host /*optional out*/)
 {
     if (hosts.empty()) { err = "no hosts"; return -1; }
 
@@ -232,6 +334,7 @@ static int resolve_and_connect_best(const std::vector<std::string>& hosts,
                 if (fd < 0) continue;
                 set_timeouts(fd, timeout_ms);
                 if (connect(fd, p->ai_addr, (int)p->ai_addrlen) == 0) {
+                    if (connected_host) *connected_host = host;
                     freeaddrinfo(res);
                     return fd;
                 }
@@ -251,12 +354,12 @@ static int resolve_and_connect_best(const std::vector<std::string>& hosts,
 }
 
 // ---- smart local fallback when remote seeds fail (hairpin-safe) --------------
-static int try_local_fallback(const std::string& port, int timeout_ms){
+static int try_local_fallback(const std::string& port, int timeout_ms, std::string* connected_host){
     // Loopback first (fast path if node is on the same box)
     {
         std::vector<std::string> loop = {"127.0.0.1", "::1", "localhost"};
         std::string e;
-        int fd = resolve_and_connect_best(loop, port, timeout_ms, e);
+        int fd = resolve_and_connect_best(loop, port, timeout_ms, e, connected_host);
         if (fd >= 0) return fd;
     }
     // Then any local interface IPv4s (e.g., 192.168.x.x)
@@ -264,7 +367,7 @@ static int try_local_fallback(const std::string& port, int timeout_ms){
     collect_local_ipv4(locals);
     if (!locals.empty()) {
         std::string e;
-        int fd = resolve_and_connect_best(locals, port, timeout_ms, e);
+        int fd = resolve_and_connect_best(locals, port, timeout_ms, e, connected_host);
         if (fd >= 0) return fd;
     }
     return -1;
@@ -285,25 +388,46 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
 
+#if MIQ_ENABLE_ADDRMAN
+    addrman_load_once();
+#endif
+
     // Build candidate list
     std::vector<std::string> candidates;
     if (!o_.host.empty()) {
         // Respect explicit host, including localhost if the user asked for it.
         candidates.push_back(strip_port_if_present(o_.host));
     } else {
-        // Use constants.h global seeds only (no localhost here).
-        gather_default_candidates(candidates);
+#if MIQ_ENABLE_ADDRMAN
+        // Ask addrman for some candidates first (prefer tried); then global defaults.
+        {
+            std::unordered_set<std::string> seen;
+            for (int attempts=0; attempts<12; ++attempts){
+                auto cand = g_addrman.select_for_outbound(g_am_rng, /*prefer_tried=*/true);
+                if (!cand) break;
+                std::string h = strip_port_if_present(cand->host);
+                if (seen.insert(h).second) candidates.push_back(h);
+            }
+        }
+#endif
+        // Use constants.h global seeds too (no localhost here).
+        std::vector<std::string> global;
+        gather_default_candidates(global);
+        // Prefer addrman candidates first, then add globals we don't have yet
+        std::unordered_set<std::string> have(candidates.begin(), candidates.end());
+        for (auto& g : global) if (have.insert(g).second) candidates.push_back(g);
     }
 
-    const std::string port = o_.port.empty() ? std::to_string(P2P_PORT) : o_.port;
+    const std::string port = default_port_str(o_.port);
 
-    // 1) Try public/DNS seeds first
-    sock_ = resolve_and_connect_best(candidates, port, o_.io_timeout_ms, err);
+    // 1) Try public/DNS/addrman seeds first
+    std::string used_host;
+    sock_ = resolve_and_connect_best(candidates, port, o_.io_timeout_ms, err, &used_host);
 
     // 2) Smart local fallback (handles NAT hairpin / loopback routers)
     if (sock_ < 0 && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
         std::string e2;
-        int fd_local = try_local_fallback(port, o_.io_timeout_ms);
+        int fd_local = try_local_fallback(port, o_.io_timeout_ms, &used_host);
         if (fd_local >= 0) {
             sock_ = fd_local;
             err.clear(); // connected via local fallback
@@ -311,6 +435,24 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     }
 
     if (sock_ < 0) return false;
+
+#if MIQ_ENABLE_ADDRMAN
+    // Mark connected peer as good/anchor (by real peer IP if available)
+    {
+        std::string ip = peer_ip_string(sock_);
+        if (ip.empty()) ip = used_host;
+        if (!ip.empty()) {
+            NetAddr na;
+            na.host = ip;
+            na.port = (uint16_t)std::stoi(port);
+            na.tried = true;
+            na.is_ipv6 = (ip.find(':') != std::string::npos);
+            g_addrman.mark_good(na);
+            g_addrman.add_anchor(na);
+            addrman_force_save();
+        }
+    }
+#endif
 
     if(!send_version(err))      { close(); return false; }
 
@@ -322,7 +464,7 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
 
     if(!read_until_verack(err)) { close(); return false; }
 
-    // Best-effort getaddr
+    // Best-effort getaddr (to grow addrman if enabled)
     { std::string e2; (void)send_getaddr(e2); }
 
     header_hashes_le_.clear();
@@ -344,6 +486,9 @@ void P2PLight::close(){
     if (sock_ >= 0){ closesock(sock_); sock_ = -1; }
 #ifdef _WIN32
     WSACleanup();
+#endif
+#if MIQ_ENABLE_ADDRMAN
+    addrman_force_save();
 #endif
 }
 
@@ -422,11 +567,52 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
 
         if(cmd == "ping"){
             std::string e; send_msg("pong", payload, e);
+#if MIQ_ENABLE_ADDRMAN
+            addrman_save_maybe();
+#endif
+            continue;
+        }
+
+        if(cmd == "addr"){
+#if MIQ_ENABLE_ADDRMAN
+            // payload: 4*N IPv4s (daemon compact form)
+            if (!payload.empty() && (payload.size() % 4) == 0){
+                size_t n = payload.size()/4;
+                int added = 0;
+                for(size_t i=0;i<n;i++){
+                    uint32_t be_ip =
+                        (uint32_t(payload[4*i+0])<<24) |
+                        (uint32_t(payload[4*i+1])<<16) |
+                        (uint32_t(payload[4*i+2])<<8 ) |
+                        (uint32_t(payload[4*i+3])<<0 );
+                    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = be_ip;
+                    char buf[64]={0};
+#ifdef _WIN32
+                    InetNtopA(AF_INET, &a.sin_addr, buf, (int)sizeof(buf));
+#else
+                    inet_ntop(AF_INET, &a.sin_addr, buf, (socklen_t)sizeof(buf));
+#endif
+                    if (buf[0]) {
+                        NetAddr na;
+                        na.host = buf;
+                        na.port = (uint16_t)std::stoi(default_port_str(o_.port));
+                        na.is_ipv6 = false;
+                        na.tried = false;
+                        g_addrman.add(na, /*from_dns=*/false);
+                        ++added;
+                    }
+                }
+                if (added) addrman_force_save();
+            }
+#endif
             continue;
         }
 
         if(cmd != "headers"){
-            // swallow unrelated messages (inv, addr, etc.)
+            // swallow unrelated messages (inv, getaddr reply seen above, etc.)
+#if MIQ_ENABLE_ADDRMAN
+            addrman_save_maybe();
+#endif
             continue;
         }
 
@@ -444,6 +630,9 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
                     out_hashes_le.push_back(std::move(hl));
                     pos += HBYTES;
                 }
+#if MIQ_ENABLE_ADDRMAN
+                addrman_save_maybe();
+#endif
                 return true;
             }
         }
@@ -468,7 +657,13 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
                         if(get_varint(payload.data()+pos, payload.size()-pos, tcnt, u2)) pos += u2;
                     }
                 }
-                if(ok){ out_hashes_le.swap(tmp); return true; }
+                if(ok){
+                    out_hashes_le.swap(tmp);
+#if MIQ_ENABLE_ADDRMAN
+                    addrman_save_maybe();
+#endif
+                    return true;
+                }
             }
         }
 
@@ -521,6 +716,42 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
 
         if(cmd=="ping"){
             std::string e; send_msg("pong", payload, e);
+#if MIQ_ENABLE_ADDRMAN
+            addrman_save_maybe();
+#endif
+            continue;
+        }
+        if(cmd=="addr"){
+#if MIQ_ENABLE_ADDRMAN
+            if (!payload.empty() && (payload.size() % 4) == 0){
+                size_t n = payload.size()/4;
+                int added = 0;
+                for(size_t i=0;i<n;i++){
+                    uint32_t be_ip =
+                        (uint32_t(payload[4*i+0])<<24) |
+                        (uint32_t(payload[4*i+1])<<16) |
+                        (uint32_t(payload[4*i+2])<<8 ) |
+                        (uint32_t(payload[4*i+3])<<0 );
+                    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = be_ip;
+                    char buf[64]={0};
+#ifdef _WIN32
+                    InetNtopA(AF_INET, &a.sin_addr, buf, (int)sizeof(buf));
+#else
+                    inet_ntop(AF_INET, &a.sin_addr, buf, (socklen_t)sizeof(buf));
+#endif
+                    if (buf[0]) {
+                        NetAddr na;
+                        na.host = buf;
+                        na.port = (uint16_t)std::stoi(default_port_str(o_.port));
+                        na.is_ipv6 = false;
+                        na.tried = false;
+                        g_addrman.add(na, /*from_dns=*/false);
+                        ++added;
+                    }
+                }
+                if (added) addrman_force_save();
+            }
+#endif
             continue;
         }
         if(cmd=="block"){
@@ -531,6 +762,9 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
             }
 
             raw_block = std::move(payload);
+#if MIQ_ENABLE_ADDRMAN
+            addrman_save_maybe();
+#endif
             return true;
         }
         // ignore others
@@ -549,7 +783,7 @@ bool P2PLight::send_version(std::string& err){
     // remote addr (ignored by most)
     const uint64_t srv_recv = 0;
     uint8_t ip_zero[16]{}; // ::0
-    const uint16_t port_recv = P2P_PORT;
+    const uint16_t port_recv = (uint16_t)std::stoi(default_port_str(o_.port));
 
     // local addr
     const uint64_t srv_from = 0;
@@ -597,6 +831,38 @@ bool P2PLight::read_until_verack(std::string& err){
 
         if(cmd=="verack") return true;
         if(cmd=="ping"){ std::string e; send_msg("pong", payload, e); }
+#if MIQ_ENABLE_ADDRMAN
+        if(cmd=="addr"){
+            if (!payload.empty() && (payload.size() % 4) == 0){
+                size_t n = payload.size()/4;
+                int added = 0;
+                for(size_t i=0;i<n;i++){
+                    uint32_t be_ip =
+                        (uint32_t(payload[4*i+0])<<24) |
+                        (uint32_t(payload[4*i+1])<<16) |
+                        (uint32_t(payload[4*i+2])<<8 ) |
+                        (uint32_t(payload[4*i+3])<<0 );
+                    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = be_ip;
+                    char buf[64]={0};
+#ifdef _WIN32
+                    InetNtopA(AF_INET, &a.sin_addr, buf, (int)sizeof(buf));
+#else
+                    inet_ntop(AF_INET, &a.sin_addr, buf, (socklen_t)sizeof(buf));
+#endif
+                    if (buf[0]) {
+                        NetAddr na;
+                        na.host = buf;
+                        na.port = (uint16_t)std::stoi(default_port_str(o_.port));
+                        na.is_ipv6 = false;
+                        na.tried = false;
+                        g_addrman.add(na, /*from_dns=*/false);
+                        ++added;
+                    }
+                }
+                if (added) addrman_force_save();
+            }
+        }
+#endif
         // ignore other msgs in handshake window
     }
     err = "no verack from peer";
