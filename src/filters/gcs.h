@@ -120,7 +120,8 @@ public:
         q = 0;
         for (;;) {
             uint32_t bit=0; if (!read_bit(bit)) return false;
-            if (bit == 0) return true; ++q;
+            if (bit == 0) { return true; }
+            ++q;
         }
     }
     inline bool read_bits_be(uint32_t nbits, uint64_t& value){
