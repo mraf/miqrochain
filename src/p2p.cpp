@@ -748,6 +748,11 @@ static std::string miq_miner_from_block(const miq::Block& b) {
     return miq_addr_from_pkh(cb.vout[0].pkh);
 }
 
+// Detect new-framed header at position (for short-advance guard)
+static inline bool looks_new_magic_at(const std::vector<uint8_t>& v, size_t pos){
+    return v.size() >= pos + 4 && std::memcmp(v.data() + pos, miq::MAGIC_BE, 4) == 0;
+}
+
 } // anon
 
 namespace miq {
@@ -1040,7 +1045,7 @@ void P2P::bump_ban(PeerState& ps, const std::string& ip, const char* reason, int
     if (s != MIQ_INVALID_SOCK) {
         P2P_TRACE(std::string("ban-close ip=") + ip + " reason=" + (reason?reason:""));
         CLOSESOCK(s);
-        ps.sock = MIQ_INVALID_SOCK;
+        ps.sock = MIQ_INVALID_SOCK; // mark invalid so guarded removal won't double-close
     }
     (void)reason;
 }
@@ -1162,7 +1167,9 @@ void P2P::stop(){
     for (auto& kv : peers_) {
         if (kv.first != MIQ_INVALID_SOCK) {
             gate_on_close(kv.first);
-            CLOSESOCK(kv.first);
+            if (kv.second.sock != MIQ_INVALID_SOCK && kv.second.sock == kv.first) {
+                CLOSESOCK(kv.first);
+            }
         }
     }
     peers_.clear();
@@ -2047,7 +2054,15 @@ void P2P::loop(){
 
                 size_t off = 0;
                 miq::NetMsg m;
+                size_t prev_off = off;
                 while (decode_msg(ps.rx, off, m)) {
+                    // NICE-TO-HAVE: if new-framed, ensure we advanced at least header bytes (24)
+                    if (looks_new_magic_at(ps.rx, prev_off) && (off < prev_off + 24)) {
+                        log_warn("P2P: RX short-advance frame; aborting parse tick");
+                        break;
+                    }
+                    prev_off = off;
+
                     std::string cmd(m.cmd, m.cmd + 12);
                     size_t z = cmd.find('\0');
                     if (z != std::string::npos) {
@@ -2457,9 +2472,14 @@ void P2P::loop(){
 
         // ---- Guarded removals (single, consistent path) --------------------
         for (Sock s : dead) {
-            gate_on_close(s);
-            CLOSESOCK(s);
-            peers_.erase(s);
+            auto it = peers_.find(s);
+            if (it != peers_.end()) {
+                gate_on_close(s);
+                if (it->second.sock != MIQ_INVALID_SOCK && it->second.sock == s) {
+                    CLOSESOCK(s);
+                }
+                peers_.erase(it);
+            }
             g_zero_hdr_batches.erase(s);
             g_preverack_counts.erase(s);
             g_trickle_last_ms.erase(s);
