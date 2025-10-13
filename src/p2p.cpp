@@ -34,7 +34,7 @@
 #define MIQ_P2P_TRACE 1
 #endif
 #if MIQ_P2P_TRACE
-  #define P2P_TRACE(msg) do { log_info(std::string("[TRACE] ") + (msg)); } while(0)
+  #define P2P_TRACE(msg) do { miq::log_info(std::string("[TRACE] ") + (msg)); } while(0)
 #else
   #define P2P_TRACE(msg) do {} while(0)
 #endif
@@ -350,13 +350,13 @@ static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
     if (n == SOCKET_ERROR) {
         int e = WSAGetLastError();
         char buf[96]; sprintf_s(buf, "send() failed WSAE=%d", e);
-        log_warn(std::string("P2P: ") + buf);
+        miq::log_warn(std::string("P2P: ") + buf);
         return false;
     }
 #else
     ssize_t n = send(s, data, len, 0);
     if (n < 0) {
-        log_warn("P2P: send() failed");
+        miq::log_warn("P2P: send() failed");
         return false;
     }
 #endif
@@ -372,7 +372,7 @@ static inline int miq_recv(Sock s, uint8_t* buf, size_t bufsz) {
         int e = WSAGetLastError();
         if (e == WSAEWOULDBLOCK) return 0;
         char tmp[96]; sprintf_s(tmp, "recv() failed WSAE=%d", e);
-        log_warn(std::string("P2P: ") + tmp);
+        miq::log_warn(std::string("P2P: ") + tmp);
         return -1;
     }
     return n;
@@ -1652,7 +1652,7 @@ void P2P::remove_orphan_by_hex(const std::string& child_hex){
     orphans_.erase(it);
 
     auto pit = orphan_children_.find(parent_hex);
-    if (pit != std::unordered_map<std::string,std::vector<std::string>>::value_type::second_type{}, pit != orphan_children_.end()){
+    if (pit != orphan_children_.end()){
         auto& vec = pit->second;
         vec.erase(std::remove(vec.begin(), vec.end(), child_hex), vec.end());
         if (vec.empty()) orphan_children_.erase(pit);
@@ -2474,7 +2474,7 @@ void P2P::loop(){
             }
             if (!todos.empty()) {
                 for (const auto& txid : todos) {
-                    for (auto& kv : peers_) trickle_enqueue(kvp.first, txid);
+                    for (auto& kv : peers_) trickle_enqueue(kv.first, txid);
                 }
             }
         }
