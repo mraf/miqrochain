@@ -169,7 +169,8 @@ static bool length_ok_for_command(const std::string& cmd, size_t n){
         if (n < 2) return false;
         if ((n - 2) % MIQ_HDR_WIRE_BYTES != 0) return false;
         size_t count = (n - 2) / MIQ_HDR_WIRE_BYTES;
-        if (count == 0 || count > MIQ_MAX_HEADERS_PER_MSG) return false;
+        // *** Allow empty batch (count==0) to indicate "no more" ***
+        if (count > MIQ_MAX_HEADERS_PER_MSG) return false;
         return true;
     }
 
