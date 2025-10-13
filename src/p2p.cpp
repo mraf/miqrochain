@@ -2432,6 +2432,7 @@ void P2P::loop(){
                             chain_.build_locator(locator2);
                             std::vector<uint8_t> stop2(32, 0);
                             auto pl2 = build_getheaders_payload(locator2, stop2);
+                            auto m2  = encode_msg("getheaders", pl2);
                             if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "get", 1.0, now_ms())) {
                                  ps.sent_getheaders = true;
  #ifdef _WIN32
