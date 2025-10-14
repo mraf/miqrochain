@@ -2398,7 +2398,7 @@ void P2P::loop(){
 
                     } else if (cmd == "headers") {
                         if (unsolicited_drop(ps, "headers", "")) {
-                            bump_ban(ps, ps.ip, "unsolicited-headers", now_ms());
+                            P2P_TRACE("drop unsolicited headers (no ban)");
                             continue;
                         }
                         std::vector<BlockHeader> hs;
