@@ -14,6 +14,15 @@
 #include <cstdlib>   // getenv, strtoull
 #include <thread>
 #include <chrono>
+#include <fstream>
+
+#if __has_include(<filesystem>)
+  #include <filesystem>
+  #define MIQ_HAVE_FS 1
+  namespace fs = std::filesystem;
+#else
+  #define MIQ_HAVE_FS 0
+#endif
 
 namespace miq {
 
@@ -21,12 +30,19 @@ namespace miq {
 #define COINBASE_MATURITY 100
 #endif
 
-// ---------- tiny helpers ----------
+// ----------------- tiny helpers -----------------
 static inline uint32_t rd_u32_le(const uint8_t* p){
     return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
 }
 static inline uint64_t rd_u64_le(const uint8_t* p){
     uint64_t v=0; for(int i=0;i<8;i++) v |= (uint64_t)p[i] << (8*i); return v;
+}
+static inline void wr_u32_le(std::vector<uint8_t>& b, uint32_t v){
+    b.push_back((uint8_t)(v>>0)); b.push_back((uint8_t)(v>>8));
+    b.push_back((uint8_t)(v>>16)); b.push_back((uint8_t)(v>>24));
+}
+static inline void wr_u64_le(std::vector<uint8_t>& b, uint64_t v){
+    for(int i=0;i<8;i++) b.push_back((uint8_t)(v>>(8*i)));
 }
 
 struct R {
@@ -74,7 +90,7 @@ struct VecHash {
     }
 };
 
-// Simple env reader for pacing knobs (with safe defaults)
+// env overrides for pacing knobs (safe defaults)
 static inline uint32_t env_u32(const char* name, uint32_t defv){
     const char* v = std::getenv(name);
     if(!v || !*v) return defv;
@@ -84,7 +100,7 @@ static inline uint32_t env_u32(const char* name, uint32_t defv){
     return defv;
 }
 
-// ---------- tx / block parsing ----------
+// ----------------- tx / block parsing -----------------
 
 struct TxParsed {
     std::vector<uint8_t> txid_le; // wire order (LE)
@@ -245,7 +261,116 @@ try_miq:
     }
 }
 
-// ---------- SPV main ----------
+// ----------------- tiny persistent cache -----------------
+
+struct CacheState { uint32_t scanned_upto = 0; };
+
+static inline std::string path_join(const std::string& dir, const char* fname){
+    if (dir.empty()) return std::string(fname);
+    char sep = '/';
+#if defined(_WIN32)
+    sep = '\\';
+#endif
+    if (dir.back() == '/' || dir.back() == '\\') return dir + fname;
+    return dir + sep + fname;
+}
+
+static inline uint32_t csum4(const std::vector<uint8_t>& v){
+    auto d = dsha256(v);
+    return (uint32_t)d[0] | ((uint32_t)d[1]<<8) | ((uint32_t)d[2]<<16) | ((uint32_t)d[3]<<24);
+}
+
+static bool load_state(const std::string& dir, CacheState& st){
+    std::string p = path_join(dir, "spv_state.dat");
+    std::ifstream f(p, std::ios::binary);
+    if(!f.good()) return false;
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(f)), {});
+    if(buf.size() < 8) return false;
+    const char magic[] = "MIQSPV1";
+    if(std::memcmp(buf.data(), magic, 7)!=0) return false;
+    if(buf.size() < 7 + 4 + 4) return false;
+    uint32_t height = rd_u32_le(buf.data()+7);
+    uint32_t want = rd_u32_le(buf.data()+7+4);
+    std::vector<uint8_t> body(buf.begin(), buf.begin()+7+4);
+    if(csum4(body) != want) return false;
+    st.scanned_upto = height;
+    return true;
+}
+static void save_state(const std::string& dir, const CacheState& st){
+#if MIQ_HAVE_FS
+    if(!dir.empty()){
+        std::error_code ec;
+        fs::create_directories(dir, ec); // best-effort
+    }
+#endif
+    std::vector<uint8_t> buf;
+    const char magic[] = "MIQSPV1";
+    buf.insert(buf.end(), magic, magic+7);
+    wr_u32_le(buf, st.scanned_upto);
+    uint32_t sum = csum4(buf);
+    wr_u32_le(buf, sum);
+    std::string p = path_join(dir, "spv_state.dat");
+    std::ofstream f(p, std::ios::binary|std::ios::trunc);
+    if(f.good()) f.write((const char*)buf.data(), (std::streamsize)buf.size());
+}
+
+static bool load_utxo_cache(const std::string& dir, std::vector<UtxoLite>& out){
+    out.clear();
+    std::string p = path_join(dir, "utxo_cache.dat");
+    std::ifstream f(p, std::ios::binary);
+    if(!f.good()) return false;
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(f)), {});
+    if(buf.size() < 8) return false;
+    const char magic[] = "MIQUTXO1";
+    if(std::memcmp(buf.data(), magic, 8)!=0) return false;
+    if(buf.size() < 8 + 4 + 4) return false;
+    uint32_t cnt = rd_u32_le(buf.data()+8);
+    size_t need = 8 + 4 + (size_t)cnt * (32+4+8+20+4+1) + 4;
+    if(buf.size() != need) return false;
+    uint32_t have = rd_u32_le(buf.data()+need-4);
+    std::vector<uint8_t> body(buf.begin(), buf.begin()+need-4);
+    if(csum4(body) != have) return false;
+
+    size_t pos = 8 + 4;
+    for(uint32_t i=0;i<cnt;i++){
+        UtxoLite u;
+        u.txid.assign(buf.begin()+pos, buf.begin()+pos+32); pos+=32;
+        u.vout = rd_u32_le(buf.data()+pos); pos+=4;
+        u.value = rd_u64_le(buf.data()+pos); pos+=8;
+        u.pkh.assign(buf.begin()+pos, buf.begin()+pos+20); pos+=20;
+        u.height = rd_u32_le(buf.data()+pos); pos+=4;
+        u.coinbase = buf[pos++] ? true : false;
+        out.push_back(std::move(u));
+    }
+    return true;
+}
+static void save_utxo_cache(const std::string& dir, const std::vector<UtxoLite>& v){
+#if MIQ_HAVE_FS
+    if(!dir.empty()){
+        std::error_code ec;
+        fs::create_directories(dir, ec); // best-effort
+    }
+#endif
+    std::vector<uint8_t> buf;
+    const char magic[] = "MIQUTXO1";
+    buf.insert(buf.end(), magic, magic+8);
+    wr_u32_le(buf, (uint32_t)v.size());
+    for(const auto& u : v){
+        buf.insert(buf.end(), u.txid.begin(), u.txid.end());          // 32
+        wr_u32_le(buf, u.vout);                                       // 4
+        wr_u64_le(buf, u.value);                                      // 8
+        buf.insert(buf.end(), u.pkh.begin(), u.pkh.end());             // 20
+        wr_u32_le(buf, u.height);                                     // 4
+        buf.push_back(u.coinbase ? 1 : 0);                             // 1
+    }
+    uint32_t sum = csum4(buf);
+    wr_u32_le(buf, sum);
+    std::string p = path_join(dir, "utxo_cache.dat");
+    std::ofstream f(p, std::ios::binary|std::ios::trunc);
+    if(f.good()) f.write((const char*)buf.data(), (std::streamsize)buf.size());
+}
+
+// ----------------- SPV main -----------------
 
 bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
                        const std::vector<std::vector<uint8_t>>& pkhs,
@@ -259,7 +384,7 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     P2POpts po;
     po.host = p2p_host;
     po.port = p2p_port;
-    po.user_agent = "/miqwallet-spv:0.3/";
+    po.user_agent = "/miqwallet-spv:0.4/";
     P2PLight p2p;
     if(!p2p.connect_and_handshake(po, err)) return false;
 
@@ -267,20 +392,40 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     uint32_t tip_height=0; std::vector<uint8_t> tip_hash_le;
     if(!p2p.get_best_header(tip_height, tip_hash_le, err)){ p2p.close(); return false; }
 
-    // 3) choose scan window (honor options; fallback to 8k)
-    const uint32_t recent_block_window = (opt.recent_block_window ? opt.recent_block_window : 8000);
-    uint32_t from_h = (tip_height > recent_block_window) ? (tip_height - recent_block_window) : 0;
+    // 3) decide start height from cache (or full/genesis on first run)
+    CacheState st{};
+    const bool have_state = load_state(opt.cache_dir, st);
+    uint32_t start_h = 0;
+    if(have_state){
+        if(st.scanned_upto < tip_height) start_h = st.scanned_upto + 1;
+        else start_h = tip_height; // nothing to do
+    } else {
+        // First ever run: if user provided a small window, use it; else go from genesis.
+        if(opt.recent_block_window > 0 && opt.recent_block_window < tip_height)
+            start_h = tip_height - opt.recent_block_window;
+        else
+            start_h = 0;
+    }
 
-    // 4) enumerate candidate blocks (no filters yet)
-    std::vector<std::pair<std::vector<uint8_t>, uint32_t>> blocks;
-    if(!p2p.match_recent_blocks(pkhs, from_h, tip_height, blocks, err)){ p2p.close(); return false; }
-
-    // 5) fast PKH lookup
-    std::unordered_set<std::vector<uint8_t>, VecHash> pkhset(pkhs.begin(), pkhs.end());
-
-    // 6) rolling UTXO view
+    // 4) load previous UTXO view if present (for incremental updates)
     std::vector<UtxoLite> view;
+    if(!have_state || !load_utxo_cache(opt.cache_dir, view)){
+        view.clear(); // no prior
+    }
+
+    // Build fast index
     std::unordered_map<std::string,size_t> idx;
+    idx.reserve(view.size()*2 + 16);
+    for(size_t i=0;i<view.size(); ++i){
+        idx[key_of(view[i].txid, view[i].vout)] = (uint32_t)i;
+    }
+
+    // 5) block enumeration for [start_h .. tip_height]
+    std::vector<std::pair<std::vector<uint8_t>, uint32_t>> blocks;
+    if(!p2p.match_recent_blocks(/*pkhs*/{}, start_h, tip_height, blocks, err)){ p2p.close(); return false; }
+
+    // 6) fast PKH lookup
+    std::unordered_set<std::vector<uint8_t>, VecHash> pkhset(pkhs.begin(), pkhs.end());
 
     auto add_out = [&](const std::vector<uint8_t>& txid_le, uint32_t vout,
                        uint64_t value, const std::vector<uint8_t>& pkh,
@@ -346,7 +491,12 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
 
     p2p.close();
 
-    // 8) post-filter: require ≥1 conf for all; coinbases need full maturity
+    // 8) save checkpoint at the tip we just synced to
+    CacheState newst; newst.scanned_upto = tip_height;
+    save_state(opt.cache_dir, newst);
+    save_utxo_cache(opt.cache_dir, view);
+
+    // 9) post-filter: require ≥1 conf for all; coinbases need full maturity
     std::vector<UtxoLite> finalv; finalv.reserve(view.size());
     for(const auto& u : view){
         uint32_t conf = (u.height <= tip_height) ? (tip_height - u.height + 1) : 0;
