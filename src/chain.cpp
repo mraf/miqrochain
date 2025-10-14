@@ -50,6 +50,52 @@
 #define MIQ_RULE_ENFORCE_LOW_S 1
 #endif
 
+// ======= Consensus activation height (grandfather existing chain) ===========
+#ifndef MIQ_RULES_ACTIVATE_AT
+// Set this at build time to your mainnet tip + 1 for zero-CLI releases.
+#define MIQ_RULES_ACTIVATE_AT 0
+#endif
+
+static uint64_t g_rules_activation_override = 0; // loaded from file if present
+
+static inline size_t env_szt(const char* name, size_t defv){
+    const char* v = std::getenv(name);
+    if(!v || !*v) return defv;
+    char* end=nullptr; long long x = std::strtoll(v, &end, 10);
+    if(end==v || x < 0) return defv;
+    return (size_t)x;
+}
+
+static uint64_t try_read_activation_file(const std::string& dir){
+#ifdef _WIN32
+    const char sep='\\';
+#else
+    const char sep='/';
+#endif
+    std::string path = dir;
+    if(!path.empty() && path.back()!=sep) path.push_back(sep);
+    path += "activation.height";
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return 0;
+    char buf[64] = {0};
+    (void)std::fread(buf, 1, sizeof(buf)-1, f);
+    std::fclose(f);
+    char* end=nullptr;
+    long long x = std::strtoll(buf, &end, 10);
+    if (end == buf || x < 0) return 0;
+    return (uint64_t)x;
+}
+
+static inline uint64_t rules_activation_height() {
+    if (g_rules_activation_override) return g_rules_activation_override;
+    if (const char* v = std::getenv("MIQ_RULES_ACTIVATE_AT"); v && *v) {
+        char* e = nullptr;
+        long long x = std::strtoll(v, &e, 10);
+        if (e != v && x >= 0) return (uint64_t)x;
+    }
+    return (uint64_t)MIQ_RULES_ACTIVATE_AT;
+}
+
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -91,13 +137,6 @@ static inline std::vector<uint8_t> header_hash_of(const BlockHeader& h) {
     return tmp.block_hash();
 }
 
-static inline size_t env_szt(const char* name, size_t defv){
-    const char* v = std::getenv(name);
-    if(!v || !*v) return defv;
-    char* end=nullptr; long long x = std::strtoll(v, &end, 10);
-    if(end==v || x < 0) return defv;
-    return (size_t)x;
-}
 static const size_t UNDO_WINDOW = env_szt("MIQ_UNDO_WINDOW", 2000); // keep last N blocks' undo
 
 static inline std::string hexstr(const std::vector<uint8_t>& v){
@@ -483,12 +522,16 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
 
     // Difficulty bits (epoch retarget; freeze inside the interval) on the same branch
     {
-        uint32_t expected = miq::epoch_next_bits(
-            window, BLOCK_TIME_SECS, GENESIS_BITS,
-            /*next_height=*/ parent_height + 1,
-            /*interval=*/ MIQ_RETARGET_INTERVAL
-        );
-        if (h.bits != expected) { err = "bad header bits"; return false; }
+        const uint64_t next_height = parent_height + 1;
+        const bool enforce = (next_height >= rules_activation_height());
+        if (enforce) {
+            uint32_t expected = miq::epoch_next_bits(
+                window, BLOCK_TIME_SECS, GENESIS_BITS,
+                /*next_height=*/ next_height,
+                /*interval=*/ MIQ_RETARGET_INTERVAL
+            );
+            if (h.bits != expected) { err = "bad header bits"; return false; }
+        }
     }
 
     // POW
@@ -736,6 +779,12 @@ bool Chain::open(const std::string& dir){
     ensure_dir_exists(undo_dir(datadir_));
     (void)load_state();
 
+    // Load optional activation override file (lets you ship exe + file, zero CLI)
+    {
+        uint64_t from_file = try_read_activation_file(datadir_);
+        if (from_file) g_rules_activation_override = from_file;
+    }
+
 #if MIQ_HAVE_GCS_FILTERS
     {
         // Filters live under <datadir>/filters
@@ -895,11 +944,11 @@ bool Chain::init_genesis(const Block& g){
     // Build & store genesis filter (best-effort)
     std::vector<uint8_t> fbytes;
     if (miq::gcs::build_block_filter(g, fbytes)) {
-        if (!g_filter_store.put(/*height=*/0, g.block_hash(), fbytes)) {
-            log_warn("FilterStore: put(genesis) failed");
-        }
+         if (!g_filter_store.put(/*height=*/0, g.block_hash(), fbytes)) {
+             log_warn("FilterStore: put(genesis) failed");
+         }
     } else {
-        log_warn("BlockFilter: build(genesis) failed");
+         log_warn("BlockFilter: build(genesis) failed");
     }
 #endif
 
@@ -951,8 +1000,10 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     if (std::any_of(cb.vin[0].prev.txid.begin(), cb.vin[0].prev.txid.end(), [](uint8_t v){ return v!=0; })) { err="bad coinbase prev"; return false; }
     if (cb.vin[0].prev.vout != 0) { err="bad coinbase vout"; return false; }
 
-    // === BIP30: reject if any txid in this block already has ANY unspent outputs ===
-    {
+    // === BIP30 (gated): reject if any txid already has ANY unspent outputs ===
+    const uint64_t new_height = tip_.height + 1;
+    const bool enforce = (new_height >= rules_activation_height());
+    if (enforce) {
         UTXOEntry dummy;
         for (const auto& tx : b.txs) {
             const auto id = tx.txid();
@@ -978,12 +1029,12 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         if (raw.size() > MIQ_FALLBACK_MAX_TX_SIZE) { err="tx too large"; return false; }
     }
 
-    // Difficulty bits (epoch retarget; freeze inside the interval)
-    {
+    // Difficulty bits equality (gated)
+    if (enforce) {
         auto last = last_headers(MIQ_RETARGET_INTERVAL);
         uint32_t expected = miq::epoch_next_bits(
             last, BLOCK_TIME_SECS, GENESIS_BITS,
-            /*next_height=*/ tip_.height + 1,
+            /*next_height=*/ new_height,
             /*interval=*/ MIQ_RETARGET_INTERVAL
         );
         if (b.header.bits != expected) { err = "bad bits"; return false; }
@@ -1037,8 +1088,9 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
             if(hash160(inx.pubkey)!=e.pkh){ err="pkh mismatch"; return false; }
             if(!crypto::ECDSA::verify(inx.pubkey, hash, inx.sig)){ err="bad signature"; return false; }
         #if MIQ_RULE_ENFORCE_LOW_S
-            // Consensus: reject non-low-S signatures in blocks
-            if (!is_low_s64(inx.sig)) { err="high-S signature"; return false; }
+            if (enforce) { // Low-S only after activation
+                if (!is_low_s64(inx.sig)) { err="high-S signature"; return false; }
+            }
         #endif
 
             if (!leq_max_money(e.value)) { err="utxo>MAX_MONEY"; return false; }
@@ -1065,8 +1117,8 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     if(cb_sum > sub + fees){ err="coinbase too high"; return false; }
     if(!leq_max_money(cb_sum)){ err="coinbase>MAX_MONEY"; return false; }
 
-    // *** NEW: Hard MAX_SUPPLY enforcement (subsidy-only against remaining supply) ***
-    {
+    // Hard MAX_SUPPLY (gated: subsidy-only against remaining supply)
+    if (enforce) {
         uint64_t coinbase_without_fees = (cb_sum > fees) ? (cb_sum - fees) : 0;
         if (WouldExceedMaxSupply((uint32_t)(tip_.height + 1), coinbase_without_fees)) {
             err = "exceeds max supply";
@@ -1208,8 +1260,6 @@ bool Chain::submit_block(const Block& b, std::string& err){
 
     if (have_block(b.block_hash())) return true;
 
-    // NOTE: additional MTP/future-time checks were already done in verify_block().
-
     // --- Collect undo BEFORE mutating UTXO ---
     std::vector<UndoIn> undo;
     undo.reserve(b.txs.size() * 2);
@@ -1229,8 +1279,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
     // Persist the block body (unchanged order wrt previous code)
     storage_.append_block(ser_block(b), b.block_hash());
 
-    // --- NEW ORDERING FOR CRASH-SAFETY ---
-    // Write & fsync the undo file for (height+1, block_hash) BEFORE mutating UTXO.
+    // --- Crash-safety: write undo BEFORE UTXO mutation ---
     const uint64_t new_height = tip_.height + 1;
     const auto     new_hash   = b.block_hash();
     if (!write_undo_file(datadir_, new_height, new_hash, undo)) {
@@ -1275,7 +1324,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
     tip_.time   = b.header.time;
     tip_.issued += cb_sum;
 
-    // Cache undo in RAM map (unchanged behavior)
+    // Cache undo in RAM map
     g_undo[hk(tip_.hash)] = std::move(undo);
 
     // Prune old undo if beyond window
@@ -1287,8 +1336,8 @@ bool Chain::submit_block(const Block& b, std::string& err){
         }
     }
 
-    // === Build & persist GCS block filter (best-effort; guarded) ===========
 #if MIQ_HAVE_GCS_FILTERS
+    // Build & persist GCS block filter (best-effort; guarded)
     {
         std::vector<uint8_t> fbytes;
         if (miq::gcs::build_block_filter(b, fbytes)) {
@@ -1302,7 +1351,6 @@ bool Chain::submit_block(const Block& b, std::string& err){
         }
     }
 #endif
-    // ======================================================================
 
     // Notify reorg manager
     miq::HeaderView hv;
