@@ -528,9 +528,9 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
         return true;
     }
 
-    // Start from genesis locator (daemon format): u8 count + hashes + stop(32x00)
+    // Start from "empty" locator (daemon format): u8 count + 32*count + 32 stop
     std::vector<std::vector<uint8_t>> locator;
-    locator.emplace_back(32, 0x00);
+    locator.emplace_back(32, 0x00); // one zero hash is a valid "start at genesis" hint
     std::vector<uint8_t> stop(32, 0x00);
 
     while(true){
@@ -563,23 +563,46 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
 }
 
 // Daemon getheaders: [u8 count][count*32 hashes][32 stop]
-bool P2PLight::request_headers_from_locator(const std::vector<std::vector<uint8_t>>& locator_hashes_le,
-                                            std::vector<uint8_t>& stop_le,
-                                            std::string& err)
+bool P2PLight::request_headers_from_locator(
+    const std::vector<std::vector<uint8_t>>& locator_hashes_le,
+    std::vector<uint8_t>& stop_le,
+    std::string& err)
 {
-    std::vector<uint8_t> p;
-    const uint8_t n = (uint8_t)std::min<size_t>(locator_hashes_le.size(), 32);
-    p.push_back(n);
-    for (size_t i=0;i<n;i++){
-        if(locator_hashes_le[i].size()!=32){ err="bad locator hash size"; return false; }
-        p.insert(p.end(), locator_hashes_le[i].begin(), locator_hashes_le[i].end());
+    // our node expects: [u8 count] [32*count hashes (LE)] [32 stop hash]
+    uint8_t n = (uint8_t)std::min<size_t>(locator_hashes_le.size(), 255);
+    if (n == 0) {
+        // if none provided, send a minimal one-zero-hash locator
+        n = 1;
     }
-    if(stop_le.size()!=32) stop_le.assign(32, 0x00);
-    p.insert(p.end(), stop_le.begin(), stop_le.end());
-    return send_msg("getheaders", p, err);
+
+    std::vector<uint8_t> payload;
+    payload.reserve(1 + 32 * n + 32);
+    payload.push_back(n);
+
+    if (locator_hashes_le.empty()) {
+        payload.insert(payload.end(), 32, 0x00);
+    } else {
+        for (size_t i = 0; i < n; ++i) {
+            const auto& h = locator_hashes_le[i];
+            if (h.size() != 32) { err = "bad locator hash size"; return false; }
+            payload.insert(payload.end(), h.begin(), h.end()); // LE on wire
+        }
+    }
+
+    // stop hash (32 bytes; zero means "no stop")
+    if (stop_le.size() != 32) {
+        stop_le.assign(32, 0x00);
+    }
+    payload.insert(payload.end(), stop_le.begin(), stop_le.end());
+
+    if (!send_msg("getheaders", payload, err)) return false;
+    return true;
 }
 
-// Accepts daemon-style headers (u16 + count*88 bytes) and Bitcoin-style (varint + 80 + varint txcount).
+// Read a batch of headers.
+// Primary shape (daemon): [u16_le count] [count * 80 bytes] (no txcount).
+// Also tolerant to: [u16_le count] [count * 88 bytes] (if peer pads per-header) and
+// Bitcoin-style: [varint count] [count * (80 + varint(0))].
 bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_le, std::string& err){
     out_hashes_le.clear();
     for(;;){
@@ -592,6 +615,7 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
         std::vector<uint8_t> payload(len);
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
 
+        // (optional) respond to ping during IBD
         if(cmd == "ping"){
             std::string e; send_msg("pong", payload, e);
 #if MIQ_ENABLE_ADDRMAN
@@ -640,39 +664,64 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
             continue;
         }
 
-        // Two supported shapes:
-
-        // (A) daemon compact headers: u16 count; count * {80 byte header, u8 txn_count(=0) + pad}
+        // --------- Parse primary daemon shape: u16 + 80*count ----------
         if (payload.size() >= 2) {
             uint16_t count = (uint16_t)payload[0] | ((uint16_t)payload[1]<<8);
-            if (2 + (size_t)count*88 == payload.size()) {
+
+            // exact no-more-headers sentinel: len==2, count==0
+            if (count == 0 && payload.size() == 2) {
+                return true; // empty batch => caller will stop
+            }
+
+            size_t need80 = 2u + (size_t)count * 80u;
+            if (payload.size() == need80) {
                 out_hashes_le.reserve(count);
                 const uint8_t* p = payload.data() + 2;
-                for (uint16_t i=0;i<count;i++){
+                for (uint16_t i=0; i<count; ++i){
+                    // Hash(header[0..79]), convert to LE for internal use
                     auto h = dsha256_bytes(p, 80);
+                    std::reverse(h.begin(), h.end());
                     out_hashes_le.push_back(std::move(h));
-                    p += 88;
+                    p += 80;
+                }
+                return true;
+            }
+
+            // tolerate 88-byte stride if the peer pads per header
+            size_t need88 = 2u + (size_t)count * 88u;
+            if (payload.size() == need88) {
+                out_hashes_le.reserve(count);
+                const uint8_t* p = payload.data() + 2;
+                for (uint16_t i=0; i<count; ++i){
+                    auto h = dsha256_bytes(p, 80);
+                    std::reverse(h.begin(), h.end());
+                    out_hashes_le.push_back(std::move(h));
+                    p += 88; // skip padded segment
                 }
                 return true;
             }
         }
 
-        // (B) Bitcoin headers: varint count; for each: 80 byte header + varint(0) for txn count
+        // --------- Fallback: Bitcoin style (varint count + 80 + varint(0)) ----------
         if (!payload.empty()){
             uint64_t count=0; size_t used=0;
             if (get_varint(payload.data(), payload.size(), count, used)){
-                size_t need = used + (size_t)count*(80 + 1); // each header + txcount=0 (varint)
-                if (payload.size() >= need){
+                // Very lenient calc: each entry is 80 + 1 (expect txcount=0 as single byte)
+                size_t need_min = used + (size_t)count * (80 + 1);
+                if (payload.size() >= need_min){
                     out_hashes_le.reserve((size_t)count);
                     const uint8_t* p = payload.data() + used;
+                    const uint8_t* end = payload.data() + payload.size();
                     for (uint64_t i=0;i<count;i++){
+                        if (p + 80 > end) break;
                         auto h = dsha256_bytes(p, 80);
+                        std::reverse(h.begin(), h.end());
                         out_hashes_le.push_back(std::move(h));
-                        // skip 80-byte header
                         p += 80;
-                        // skip varint (we expect 0x00)
-                        if (*p == 0x00) { p += 1; } else {
-                            uint64_t dummy=0; size_t u2=0; if(!get_varint(p, (payload.data()+payload.size())-p, dummy, u2)) break; p += u2;
+                        // skip txcount (we expect 0x00, but parse varint just in case)
+                        if (p < end) {
+                            if (*p == 0x00) { ++p; }
+                            else { uint64_t dummy=0; size_t u2=0; if(!get_varint(p, end - p, dummy, u2)) break; p += u2; }
                         }
                     }
                     return true;
