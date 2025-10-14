@@ -11,11 +11,15 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <cstdlib>   // strtoull
+#include <cstdlib>   // getenv, strtoull
 #include <thread>
 #include <chrono>
 
 namespace miq {
+
+#ifndef COINBASE_MATURITY
+#define COINBASE_MATURITY 100
+#endif
 
 // ---------- tiny helpers ----------
 static inline uint32_t rd_u32_le(const uint8_t* p){
@@ -187,7 +191,7 @@ static bool parse_tx_miq_blockwrapped(R& r, TxParsed& out){
 
     uint32_t lock_time=0; if(!tr.get(&lock_time,4)) return false;
 
-    // coinbase heuristic for MIQ: single input with zero prev hash (vout may be 0)
+    // coinbase heuristic for MIQ: single input with zero prev hash
     out.coinbase = false;
     if(in_count==1){
         const auto& in0 = out.vin[0];
@@ -309,7 +313,7 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
         }
     };
 
-    // 7) stream blocks, update view — **chunked + paced** to protect the node
+    // 7) stream blocks, update view — chunked + paced to protect the node
     const uint32_t MAX_PER_CHUNK = env_u32("MIQ_MAX_BLOCKS_PER_CHUNK", 64);
     const uint32_t SLEEP_MS      = env_u32("MIQ_SLEEP_BETWEEN_CHUNKS_MS", 50);
     uint32_t chunk_count = 0;
@@ -334,7 +338,6 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
             }
         }
 
-        // pacing: sleep a little every MAX_PER_CHUNK blocks to avoid bursts
         if(++chunk_count >= MAX_PER_CHUNK){
             std::this_thread::sleep_for(std::chrono::milliseconds(SLEEP_MS));
             chunk_count = 0;
@@ -354,6 +357,10 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
 
     out.swap(finalv);
     return true;
+}
+
+uint64_t spv_sum_value(const std::vector<UtxoLite>& v){
+    uint64_t s=0; for(const auto& u : v) s += u.value; return s;
 }
 
 }
