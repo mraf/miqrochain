@@ -538,11 +538,21 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
 
     header_index_.emplace(key, std::move(m));
 
-    if (best_header_key_.empty()) best_header_key_ = key;
-    else {
+    if (best_header_key_.empty()) {
+        best_header_key_ = key;
+    } else {
         const auto& cur = header_index_.at(best_header_key_);
         const auto& neu = header_index_.at(key);
-        if (neu.work_sum > cur.work_sum || (neu.work_sum == cur.work_sum && neu.height > cur.height)) {
+
+        auto eps = [](long double a, long double b){
+            long double scale = std::max<long double>(1.0L, std::max(std::fabsl(a), std::fabsl(b)));
+            return 1e-12L * scale;  // tight, deterministic epsilon
+        };
+        long double e = eps(neu.work_sum, cur.work_sum);
+        bool greater   = (neu.work_sum - cur.work_sum) >  e;
+        bool equalish  = std::fabsl(neu.work_sum - cur.work_sum) <= e;
+
+        if (greater || (equalish && neu.height > cur.height)) {
             best_header_key_ = key;
         }
     }
