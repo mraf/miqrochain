@@ -1,5 +1,5 @@
 #include "chain.h"
-#include <cmath>      // std::pow
+#include <cmath>      // std::pow, std::fabs
 #include <optional>
 #include "sha256.h"
 #include "mtp.h"
@@ -20,7 +20,7 @@
 #include <unordered_set>
 
 // === Added includes for security checks ===
-#include <algorithm>       // std::any_of, std::sort
+#include <algorithm>       // std::any_of, std::sort, std::max
 #include <chrono>          // future-time bound
 #include <cstring>         // std::memcmp, std::memset
 #include <type_traits>     // compile-time detection (SFINAE)
@@ -545,12 +545,12 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
         const auto& neu = header_index_.at(key);
 
         auto eps = [](long double a, long double b){
-            long double scale = std::max<long double>(1.0L, std::max(std::fabsl(a), std::fabsl(b)));
+            long double scale = std::max<long double>(1.0L, std::max(std::fabs(a), std::fabs(b)));
             return 1e-12L * scale;  // tight, deterministic epsilon
         };
         long double e = eps(neu.work_sum, cur.work_sum);
         bool greater   = (neu.work_sum - cur.work_sum) >  e;
-        bool equalish  = std::fabsl(neu.work_sum - cur.work_sum) <= e;
+        bool equalish  = std::fabs(neu.work_sum - cur.work_sum) <= e;
 
         if (greater || (equalish && neu.height > cur.height)) {
             best_header_key_ = key;
