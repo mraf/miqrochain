@@ -533,23 +533,51 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
     locator.emplace_back(32, 0x00);
     std::vector<uint8_t> stop(32, 0x00);
 
+    // Progress guards to stop "endless getheaders" loops
+    const size_t kMaxLoops = 2048;
+    size_t loops = 0;
+    std::vector<uint8_t> last_tail_hash; // last hash we asked with / saw
+
     while(true){
+        if (++loops > kMaxLoops) {
+            err = "headers sync aborted (too many rounds without convergence)";
+            return false;
+        }
+
         if(!request_headers_from_locator(locator, stop, err)) return false;
+
+        // small pacing to avoid hammering peers (helps interop with slow links)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
         std::vector<std::vector<uint8_t>> batch;
         if(!read_headers_batch(batch, err)) return false;
 
+        // If peer signals "no more" (count==0), we're at tip.
         if(batch.empty()){
-            // No more headers; at tip.
             break;
         }
 
-        // Append
-        for(auto& h : batch) header_hashes_le_.push_back(std::move(h));
+        // If peer repeated the same last hash as previous round, treat as tip (prevents endless churn)
+        if(!header_hashes_le_.empty() && !batch.empty()){
+            const auto& prev = header_hashes_le_.back();
+            const auto& now  = batch.back();
+            if (prev.size()==32 && now.size()==32 && std::equal(prev.begin(), prev.end(), now.begin())) {
+                // no progress -> stop here
+                break;
+            }
+        }
 
-        // New locator = last hash (simple)
+        // Append (dedupe within this batch as a courtesy)
+        for(auto& h : batch){
+            if(header_hashes_le_.empty() || !std::equal(header_hashes_le_.back().begin(), header_hashes_le_.back().end(), h.begin())){
+                header_hashes_le_.push_back(std::move(h));
+            }
+        }
+
+        // New locator = last hash (simple linear advance)
         locator.clear();
         locator.push_back(header_hashes_le_.back());
+        last_tail_hash = header_hashes_le_.back();
     }
 
     if(header_hashes_le_.empty()){
@@ -667,26 +695,29 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
         if (payload.size() >= 2) {
             uint16_t count = (uint16_t)payload[0] | ((uint16_t)payload[1]<<8);
 
+            // exact 2 + 80*N (legacy) support (some very old test peers)
             size_t need80 = 2 + (size_t)count * 80;
             if (payload.size() == need80) {
                 out_hashes_le.reserve(count);
                 const uint8_t* p = payload.data() + 2;
                 for (uint16_t i=0;i<count;i++){
-                    auto h = dsha256_bytes(p, 80);     // legacy 80-byte compact (if ever used)
+                    auto h = dsha256_bytes(p, 80);
                     out_hashes_le.push_back(std::move(h));
                     p += 80;
                 }
                 return true;
             }
 
+            // preferred 2 + 88*N (current daemon wire)
             size_t need88 = 2 + (size_t)count * 88;
             if (payload.size() == need88) {
                 out_hashes_le.reserve(count);
                 const uint8_t* p = payload.data() + 2;
                 for (uint16_t i=0;i<count;i++){
-                    auto h = dsha256_bytes(p, 88);     // **FIX** hash full 88-byte header
-                    out_hashes_le.push_back(std::move(h)); // keep LE
-                    p += 88; // skip padded segment
+                    // **IMPORTANT**: your node hashes the full 88 bytes (time i64 + nonce u64)
+                    auto h = dsha256_bytes(p, 88);
+                    out_hashes_le.push_back(std::move(h));
+                    p += 88;
                 }
                 return true;
             }
@@ -701,9 +732,8 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
                     out_hashes_le.reserve((size_t)count);
                     const uint8_t* p = payload.data() + used;
                     for (uint64_t i=0;i<count;i++){
-                        auto h = dsha256_bytes(p, 80);   // Bitcoin 80-byte header
-                        out_hashes_le.push_back(std::move(h)); // keep LE
-                        // skip 80-byte header
+                        auto h = dsha256_bytes(p, 80);
+                        out_hashes_le.push_back(std::move(h));
                         p += 80;
                         // skip varint (we expect 0x00)
                         if (*p == 0x00) { p += 1; } else {
