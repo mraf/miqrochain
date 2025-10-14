@@ -18,6 +18,7 @@
 #include "supply.h"        // MAX_SUPPLY helpers (GetBlockSubsidy, WouldExceedMaxSupply, CoinbaseWithinLimits)
 #include <sstream>
 #include <unordered_set>
+#include <array>
 
 // === Added includes for security checks ===
 #include <algorithm>       // std::any_of, std::sort, std::max
