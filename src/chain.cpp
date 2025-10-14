@@ -2,6 +2,7 @@
 #include <cmath>      // std::pow, std::fabs
 #include <optional>
 #include "sha256.h"
+#include "hex.h"
 #include "mtp.h"
 #include <deque>
 #include "reorg_manager.h"
@@ -715,7 +716,14 @@ bool Chain::get_hash_by_index(size_t idx, std::vector<uint8_t>& out) const{
 void Chain::build_locator(std::vector<std::vector<uint8_t>>& out) const{
     MIQ_CHAIN_GUARD();
     out.clear();
-    if (tip_.time == 0) return;
+
+    // New: if we have no blocks yet, start from genesis so peers respond.
+    if (tip_.time == 0) {
+        auto g = miq::from_hex_fixed<32>(GENESIS_HASH_HEX);
+        out.emplace_back(g.begin(), g.end());
+        return;
+    }
+
     uint64_t step = 1;
     uint64_t h = tip_.height;
     while (true){
