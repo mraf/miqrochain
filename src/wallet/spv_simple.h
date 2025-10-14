@@ -6,8 +6,8 @@
 namespace miq {
 
 struct UtxoLite {
-    std::vector<uint8_t> txid;   // 32
-    uint32_t vout;               // index
+    std::vector<uint8_t> txid;   // 32 (LE)
+    uint32_t vout;               // output index
     uint64_t value;              // in miqron
     std::vector<uint8_t> pkh;    // 20
     uint32_t height;             // block height (0 for mempool)
@@ -15,9 +15,9 @@ struct UtxoLite {
 };
 
 struct SpvOptions {
-    // how many most-recent blocks we scan when peer lacks filters
+    // How many most-recent blocks to scan when no filters exist.
     uint32_t recent_block_window = 8000;
-    // where to store a tiny on-disk cache per wallet
+    // Optional: where to store cache (unused in this implementation).
     std::string cache_dir; // e.g. "wallets/default"
 };
 
