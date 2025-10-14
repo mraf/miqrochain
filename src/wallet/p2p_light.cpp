@@ -13,6 +13,7 @@
 #include <thread>   // pacing safeguard
 #include <sstream>
 #include <cstdlib>
+#include <set>
 
 #if defined(__has_include)
 #  if __has_include("addrman.h")
@@ -124,12 +125,6 @@ static std::vector<uint8_t> dsha256_bytes(const uint8_t* data, size_t len){
     std::vector<uint8_t> v(data, data+len);
     return dsha256(v);
 }
-static std::vector<uint8_t> to_le32(const std::vector<uint8_t>& h){
-    std::vector<uint8_t> r(32,0);
-    if (h.size()>=32) std::copy(h.begin(), h.begin()+32, r.begin());
-    else std::copy(h.begin(), h.end(), r.begin());
-    return r;
-}
 static uint32_t checksum4(const std::vector<uint8_t>& payload){
     auto d = dsha256(payload);
     return (uint32_t)d[0] | ((uint32_t)d[1]<<8) | ((uint32_t)d[2]<<16) | ((uint32_t)d[3]<<24);
@@ -142,19 +137,8 @@ static std::string default_port_str(const std::string& port){
     return "9833";
 #endif
 }
-static std::string strip_port_if_present(const std::string& host){
-    auto pos = host.find(':');
-    if (pos == std::string::npos) return host;
-    return host.substr(0,pos);
-}
 
 // ---- DNS + connect -----------------------------------------------------------
-struct NetAddr {
-    std::string host;
-    uint16_t    port{0};
-    bool        is_ipv6{false};
-    bool        tried{false};
-};
 
 #if MIQ_ENABLE_ADDRMAN
 namespace {
@@ -194,7 +178,7 @@ namespace {
         addrman_save_maybe();
     }
 }
-#endif
+#endif // MIQ_ENABLE_ADDRMAN
 
 static std::string peer_ip_string(
 #ifdef _WIN32
@@ -233,6 +217,7 @@ static std::vector<std::string> gather_default_candidates(const std::string& cli
                                                           const std::string& cli_port)
 {
     std::vector<std::string> seeds;
+
     // user-provided host:port first (if any)
     if(!cli_host.empty()){
         if(!cli_port.empty()) seeds.push_back(cli_host + ":" + cli_port);
@@ -240,9 +225,19 @@ static std::vector<std::string> gather_default_candidates(const std::string& cli
     }
 
 #if MIQ_ENABLE_ADDRMAN
-    // addrman known peers
-    for (auto& na : g_addrman.snapshot()) {
+    // 1) anchors (sticky last-good peers)
+    for (const auto& na : g_addrman.get_anchors()) {
         if (!na.host.empty()) seeds.push_back(na.host + ":" + std::to_string(na.port));
+    }
+    // 2) try a few outbound selections to diversify
+    std::set<std::string> seen;
+    for (auto& s : seeds) seen.insert(s);
+    for (int i=0; i<8; ++i) {
+        auto pick = g_addrman.select_for_outbound(g_am_rng, /*prefer_tried=*/true);
+        if (!pick.has_value()) break;
+        const auto& na = *pick;
+        std::string hp = na.host + ":" + std::to_string(na.port);
+        if (seen.insert(hp).second) seeds.push_back(hp);
     }
 #endif
 
@@ -254,7 +249,6 @@ static std::vector<std::string> gather_default_candidates(const std::string& cli
 }
 
 static bool is_public_ipv4_literal(const std::string& s){
-    // naive parse
     unsigned a,b,c,d; char dot;
     std::istringstream ss(s);
     if(!(ss>>a>>dot>>b>>dot>>c>>dot>>d)) return false;
@@ -449,23 +443,17 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     sock_ = resolve_and_connect_best(candidates, port, o_.io_timeout_ms, err, &used_host);
 
     // 2) Smart local fallback
-    if (
 #ifdef _WIN32
-        sock_ == (uintptr_t)-1
-#else
-        sock_ < 0
-#endif
-        && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
+    if (sock_ == (uintptr_t)-1 && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
         auto fd_local = try_local_fallback(port, o_.io_timeout_ms, &used_host);
-#ifdef _WIN32
         if (fd_local != (uintptr_t)-1) { sock_ = fd_local; err.clear(); }
-#else
-        if (fd_local >= 0) { sock_ = fd_local; err.clear(); }
-#endif
     }
-#ifdef _WIN32
     if (sock_ == (uintptr_t)-1) return false;
 #else
+    if (sock_ < 0 && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
+        auto fd_local = try_local_fallback(port, o_.io_timeout_ms, &used_host);
+        if (fd_local >= 0) { sock_ = fd_local; err.clear(); }
+    }
     if (sock_ < 0) return false;
 #endif
 
@@ -926,7 +914,7 @@ bool P2PLight::send_msg(const char cmd12[12], const std::vector<uint8_t>& payloa
 #endif
 
     uint8_t header[24]{};
-    // magic (from constants.h must define miq::MAGIC)
+    // magic
     uint32_t m = miq::MAGIC;
     header[0]=uint8_t(m); header[1]=uint8_t(m>>8); header[2]=uint8_t(m>>16); header[3]=uint8_t(m>>24);
 
