@@ -914,9 +914,11 @@ bool P2PLight::send_msg(const char cmd12[12], const std::vector<uint8_t>& payloa
 #endif
 
     uint8_t header[24]{};
-    // magic
-    uint32_t m = miq::MAGIC;
-    header[0]=uint8_t(m); header[1]=uint8_t(m>>8); header[2]=uint8_t(m>>16); header[3]=uint8_t(m>>24);
+    // MAGIC: write canonical big-endian wire bytes
+    header[0] = miq::MAGIC_BE[0];
+    header[1] = miq::MAGIC_BE[1];
+    header[2] = miq::MAGIC_BE[2];
+    header[3] = miq::MAGIC_BE[3];
 
     // command (null-padded to 12)
     for (int i=0;i<12 && cmd12[i]; ++i) header[4+i] = (uint8_t)cmd12[i];
@@ -929,7 +931,6 @@ bool P2PLight::send_msg(const char cmd12[12], const std::vector<uint8_t>& payloa
     uint32_t c = checksum4(payload);
     header[20]=uint8_t(c); header[21]=uint8_t(c>>8); header[22]=uint8_t(c>>16); header[23]=uint8_t(c>>24);
 
-    std::string e;
 #ifdef _WIN32
     int n1 = send((SOCKET)sock_, (const char*)header, (int)sizeof(header), 0);
     if(n1 != (int)sizeof(header)) { err = "send failed"; return false; }
@@ -938,6 +939,7 @@ bool P2PLight::send_msg(const char cmd12[12], const std::vector<uint8_t>& payloa
         if(n2 != (int)L){ err = "send failed"; return false; }
     }
 #else
+    std::string e;
     if(!write_all(header, sizeof(header), e)) { err = e; return false; }
     if(L>0 && !write_all(payload.data(), L, e)) { err = e; return false; }
 #endif
