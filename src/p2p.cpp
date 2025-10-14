@@ -246,6 +246,11 @@
 #define MIQ_STRICT_HANDSHAKE 1
 #endif
 
+// ----- banscore (compile fix for mixed uses) --------------------------------
+#ifndef MIQ_P2P_MAX_BANSCORE
+#define MIQ_P2P_MAX_BANSCORE 100
+#endif
+
 // ===== Platform networking glue: socket/close/poll types ====================
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
@@ -305,7 +310,7 @@ static std::unordered_map<Sock, PeerGate> g_gate;
 
 // Tunables (local to this TU)
 static const size_t MAX_MSG_BYTES = 2 * 1024 * 1024; // 2 MiB per message (soft)
-static const int    MAX_BANSCORE  = 100;
+static const int    MAX_BANSCORE  = MIQ_P2P_MAX_BANSCORE;
 static const int    HANDSHAKE_MS  = 5000;
 
 // IBD phase logging flags
