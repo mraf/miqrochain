@@ -950,8 +950,8 @@ bool P2PLight::read_msg_header(std::string& cmd_out, uint32_t& len_out, uint32_t
     uint8_t h[24];
     if(!read_exact(h, 24, err)) return false;
 
-    uint32_t m = (uint32_t)h[0] | ((uint32_t)h[1]<<8) | ((uint32_t)h[2]<<16) | ((uint32_t)h[3]<<24);
-    if(m != miq::MAGIC){ err = "bad magic"; return false; }
+    // MAGIC: compare exactly to canonical big-endian wire bytes
+    if (std::memcmp(h, miq::MAGIC_BE, 4) != 0) { err = "bad magic"; return false; }
 
     char cmd[13]; std::memset(cmd, 0, sizeof(cmd));
     std::memcpy(cmd, h+4, 12);
@@ -959,7 +959,6 @@ bool P2PLight::read_msg_header(std::string& cmd_out, uint32_t& len_out, uint32_t
 
     len_out  = (uint32_t)h[16] | ((uint32_t)h[17]<<8) | ((uint32_t)h[18]<<16) | ((uint32_t)h[19]<<24);
     csum_out = (uint32_t)h[20] | ((uint32_t)h[21]<<8) | ((uint32_t)h[22]<<16) | ((uint32_t)h[23]<<24);
-    (void)csum_out; // not enforced here
     return true;
 }
 
