@@ -371,6 +371,9 @@ static miq::gcs::FilterStore g_filter_store;
 // === Local constants (non-breaking) ===
 static constexpr size_t MAX_BLOCK_SIZE_LOCAL = 1 * 1024 * 1024; // 1 MiB
 
+// === New: full headers cache for serving getheaders even with empty block store ===
+static std::unordered_map<std::string, BlockHeader> g_header_full; // key = hk(hash32)
+
 // --- Low-S helper (RAW-64 r||s) --------------------------------------------
 static inline bool is_low_s64(const std::vector<uint8_t>& sig64){
     if (sig64.size() != 64) return false;
@@ -560,7 +563,13 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
 
     const auto hh = header_hash_of(h);
     const auto key = hk(hh);
-    if (header_index_.find(key) != header_index_.end()) return true;
+
+    // If we already know this header, ensure we have the full header cached too.
+    auto itExisting = header_index_.find(key);
+    if (itExisting != header_index_.end()) {
+        g_header_full[key] = h;
+        return true;
+    }
 
     HeaderMeta m;
     m.hash   = hh;
@@ -582,6 +591,8 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     m.work_sum = parent_work + work_from_bits(h.bits);
 
     header_index_.emplace(key, std::move(m));
+    // Cache full header for serving to peers even without block bodies
+    g_header_full[key] = h;
 
     if (best_header_key_.empty()) {
         best_header_key_ = key;
@@ -737,14 +748,76 @@ void Chain::build_locator(std::vector<std::vector<uint8_t>>& out) const{
     }
 }
 
+// === Revised: serve headers to peers from in-memory header index (with fallback) ===
 bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& locators,
                                      size_t max,
                                      std::vector<BlockHeader>& out) const
 {
     MIQ_CHAIN_GUARD();
     out.clear();
+
+    // Build fast lookup set for locator hashes
     std::unordered_map<std::string, int> lset;
+    lset.reserve(locators.size());
     for (const auto& h : locators) lset[hk(h)] = 1;
+
+    // Preferred path: serve from header_index_ + g_header_full
+    if (!best_header_key_.empty()) {
+        const auto* cur = &header_index_.at(best_header_key_);
+
+        // Walk back from best known header until we hit any locator (or the root we know)
+        std::vector<std::vector<uint8_t>> back_hashes;
+        back_hashes.reserve(2048);
+        size_t meet_idx = (size_t)-1;
+        bool matched = false;
+
+        while (true) {
+            back_hashes.push_back(cur->hash);
+            if (lset.find(hk(cur->hash)) != lset.end()) {
+                meet_idx = back_hashes.size() - 1;
+                matched = true;
+                break;
+            }
+            auto itp = header_index_.find(hk(cur->prev));
+            if (itp == header_index_.end()) break;
+            cur = &itp->second;
+        }
+
+        // If we matched, stream headers AFTER the meeting header toward our tip (oldest->newest)
+        if (matched) {
+            for (size_t i = meet_idx; i-- > 0 && out.size() < max;) {
+                const auto& hh = back_hashes[i];
+                auto itH = g_header_full.find(hk(hh));
+                if (itH != g_header_full.end()) {
+                    out.push_back(itH->second);
+                } else {
+                    Block b;
+                    if (get_block_by_hash(hh, b)) out.push_back(b.header);
+                }
+            }
+            if (!out.empty()) return true;
+        }
+
+        // No match: still try to serve "from the oldest we encountered" forward
+        if (!back_hashes.empty()) {
+            for (size_t i = back_hashes.size(); i-- > 0 && out.size() < max;) {
+                const auto& hh = back_hashes[i];
+                auto itH = g_header_full.find(hk(hh));
+                if (itH != g_header_full.end()) {
+                    out.push_back(itH->second);
+                } else {
+                    Block b;
+                    if (get_block_by_hash(hh, b)) out.push_back(b.header);
+                }
+            }
+            if (!out.empty()) return true;
+        }
+        // Fall through to legacy path if the above produced nothing.
+    }
+
+    // Legacy fallback: serve from block store (original behavior)
+    std::unordered_map<std::string, int> lset2;
+    for (const auto& h : locators) lset2[hk(h)] = 1;
 
     uint64_t start_h = 0;
     bool found=false;
@@ -752,7 +825,7 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
         for (int64_t h=(int64_t)tip_.height; h>=0; --h){
             std::vector<uint8_t> hh;
             if (!get_hash_by_index((size_t)h, hh)) break;
-            if (lset.find(hk(hh)) != lset.end()){
+            if (lset2.find(hk(hh)) != lset2.end()){
                 start_h = (uint64_t)h;
                 found = true;
                 break;
@@ -948,6 +1021,9 @@ bool Chain::init_genesis(const Block& g){
     tip_ = Tip{0, g.block_hash(), g.header.bits, g.header.time, cb_sum};
     index_.reset(tip_.hash, tip_.time, tip_.bits);
     save_state();
+
+    // Cache the full genesis header for serving to peers
+    g_header_full[hk(g.block_hash())] = g.header;
 
 #if MIQ_HAVE_GCS_FILTERS
     // Build & store genesis filter (best-effort)
@@ -1256,7 +1332,8 @@ bool Chain::disconnect_tip_once(std::string& err){
     tip_.time   = prev.header.time;
     tip_.issued -= cb_sum;
 
-    if (it_ram != g_undo.end()) g_undo.erase(it_ram);
+    auto it_ram2 = g_undo.find(hk(cur.block_hash()));
+    if (it_ram2 != g_undo.end()) g_undo.erase(it_ram2);
     remove_undo_file(datadir_, (uint64_t)(tip_.height + 1), cur.block_hash());
 
     save_state();
@@ -1281,7 +1358,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
                 err = "missing utxo during undo-capture";
                 return false;
             }
-            undo.push_back(UndoIn{in.prev.txid, in.prev.vout, e});
+            undo.push_back(UndoIn{in.prev_txid, in.prev_vout, e});
         }
     }
 
@@ -1335,6 +1412,9 @@ bool Chain::submit_block(const Block& b, std::string& err){
 
     // Cache undo in RAM map
     g_undo[hk(tip_.hash)] = std::move(undo);
+
+    // Also cache the full header for serving to peers
+    g_header_full[hk(new_hash)] = b.header;
 
     // Prune old undo if beyond window
     if (tip_.height >= UNDO_WINDOW) {
