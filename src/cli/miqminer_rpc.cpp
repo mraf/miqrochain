@@ -1,27 +1,3 @@
-// src/cli/miqminer_rpc.cpp — Chronen Miner Edition (Professional RPC solo miner for Miqrochain)
-// Features:
-// - Default 6 threads (override with --threads)
-// - Clean, stable, *cyan* banner and UI with clear "CHRONEN MINER" labeling
-// - Smoothed hashrate (fast & slow EMA) + ASCII sparkline (no Unicode blocks)
-// - Exact-consensus mining via getminertemplate (use node-supplied bits)
-// - Clear outcomes: "[OK] YOU MINED IT" vs "[OTHER MINER]" (shows winner address)
-// - Proper MIQ formatting (e.g., 50.00 MIQ) with robust node-reported reward normalization
-// - Stale-template avoidance and safe submit/confirm loop
-// - Optional high priority & CPU pinning
-// - Best-effort: send a log line to the node console after accepted block
-//
-// Usage:
-//   miqminer_rpc [--rpc=host:port] [--token=...] [--threads=N]
-//                [--address=Base58P2PKH] [--no-ansi] [--priority=high|normal]
-//                [--affinity=on|off] [--smooth=SECONDS]
-//
-// Notes:
-//   - Token auto-loads from MIQ_RPC_TOKEN or datadir .cookie if not provided.
-//   - Default smoothing time-constant is 15s; adjust with --smooth.
-//   - ASCII-only UI: avoids mojibake on Windows terminals.
-//
-// (c) Miqrochain contributors
-
 #include "constants.h"
 #include "block.h"
 #include "tx.h"
