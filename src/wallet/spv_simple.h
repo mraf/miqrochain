@@ -15,9 +15,13 @@ struct UtxoLite {
 };
 
 struct SpvOptions {
-    // How many most-recent blocks to scan when no filters exist.
+    // How many most-recent blocks to scan when no cache exists.
+    // (Ignored once a cache exists; we resume from last scanned height.)
     uint32_t recent_block_window = 8000;
-    // Optional: where to store cache (unused in this implementation).
+
+    // Directory to persist a tiny SPV cache (checkpoint + UTXO set for this wallet).
+    // If empty, files are written into the current working directory.
+    // Cache files: <cache_dir>/spv_state.dat and <cache_dir>/utxo_cache.dat
     std::string cache_dir; // e.g. "wallets/default"
 };
 
