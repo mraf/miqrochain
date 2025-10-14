@@ -563,7 +563,6 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
 }
 
 // Daemon getheaders: [u8 count][count*32 hashes][32 stop]
-// inside P2PLight
 bool P2PLight::request_headers_from_locator(
     const std::vector<std::vector<uint8_t>>& locator_hashes_le,
     std::vector<uint8_t>& stop_le,
@@ -686,7 +685,7 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
                 const uint8_t* p = payload.data() + 2;
                 for (uint16_t i=0;i<count;i++){
                     auto h = dsha256_bytes(p, 88);     // **FIX** hash full 88-byte header
-                    out_hashes_le.push_back(std::move(h)); // **FIX** keep LE (do not reverse)
+                    out_hashes_le.push_back(std::move(h)); // keep LE
                     p += 88; // skip padded segment
                 }
                 return true;
@@ -703,7 +702,7 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
                     const uint8_t* p = payload.data() + used;
                     for (uint64_t i=0;i<count;i++){
                         auto h = dsha256_bytes(p, 80);   // Bitcoin 80-byte header
-                        out_hashes_le.push_back(std::move(h)); // **FIX** keep LE (do not reverse)
+                        out_hashes_le.push_back(std::move(h)); // keep LE
                         // skip 80-byte header
                         p += 80;
                         // skip varint (we expect 0x00)
