@@ -27,6 +27,7 @@
 #include <cstring>         // std::memcmp, std::memset
 #include <type_traits>     // compile-time detection (SFINAE)
 #include <mutex>           // locking
+#include <cctype>          // std::isxdigit, std::tolower
 
 // --- Optional GCS block filters (guarded; won’t break builds if not present) ---
 #ifndef __has_include
@@ -80,7 +81,7 @@ static uint64_t try_read_activation_file(const std::string& dir){
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return 0;
     char buf[64] = {0};
-    (void)std::fread(buf, 1, sizeof(buf)-1, f);
+    size_t r = std::fread(buf, 1, sizeof(buf)-1, f); (void)r;
     std::fclose(f);
     char* end=nullptr;
     long long x = std::strtoll(buf, &end, 10);
@@ -426,6 +427,28 @@ static inline int64_t median_time_of(const std::vector<std::pair<int64_t,uint32_
     return t[t.size()/2];
 }
 
+// --- Local helper: parse 64-hex into 32 bytes (big-endian) ------------------
+static bool parse_hex32(const char* hex, std::vector<uint8_t>& out) {
+    out.clear();
+    if (!hex) return false;
+    size_t len = std::strlen(hex);
+    if (len != 64) return false;
+    auto hv = [](char c)->int{
+        if (c>='0' && c<='9') return c-'0';
+        c = (char)std::tolower(static_cast<unsigned char>(c));
+        if (c>='a' && c<='f') return 10 + (c-'a');
+        return -1;
+    };
+    out.resize(32);
+    for (size_t i=0;i<32;++i){
+        int hi = hv(hex[2*i]);
+        int lo = hv(hex[2*i+1]);
+        if (hi<0 || lo<0) return false;
+        out[i] = (uint8_t)((hi<<4) | lo);
+    }
+    return true;
+}
+
 // ===========================================================================
 
 long double Chain::work_from_bits(uint32_t bits) {
@@ -728,10 +751,15 @@ void Chain::build_locator(std::vector<std::vector<uint8_t>>& out) const{
     MIQ_CHAIN_GUARD();
     out.clear();
 
-    // New: if we have no blocks yet, start from genesis so peers respond.
+    // If we have no blocks yet, start from genesis so peers respond.
     if (tip_.time == 0) {
-        auto g = miq::from_hex_fixed<32>(GENESIS_HASH_HEX);
-        out.emplace_back(g.begin(), g.end());
+        std::vector<uint8_t> g;
+        if (parse_hex32(GENESIS_HASH_HEX, g)) {
+            out.emplace_back(std::move(g));
+        } else {
+            // fallback: push 32 zeroes (won't match, but keeps protocol flow)
+            out.emplace_back(32, 0);
+        }
         return;
     }
 
@@ -1358,7 +1386,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
                 err = "missing utxo during undo-capture";
                 return false;
             }
-            undo.push_back(UndoIn{in.prev_txid, in.prev_vout, e});
+            undo.push_back(UndoIn{in.prev.txid, in.prev.vout, e});
         }
     }
 
