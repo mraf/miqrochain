@@ -15,13 +15,12 @@
 #include "hash160.h"
 #include "crypto/ecdsa_iface.h"
 #include "constants.h"     // BLOCK_TIME_SECS, GENESIS_BITS, etc.
-#include "difficulty.h"    // epoch_next_bits / lwma_next_bits
-#include "supply.h"        // MAX_SUPPLY helpers (GetBlockSubsidy, WouldExceedMaxSupply, CoinbaseWithinLimits)
+#include "difficulty.h"    // epoch_next_bits
+#include "supply.h"        // GetBlockSubsidy, WouldExceedMaxSupply
 #include <sstream>
 #include <unordered_set>
 #include <array>
 
-// === Added includes for security checks ===
 #include <algorithm>       // std::any_of, std::sort, std::max
 #include <chrono>          // future-time bound
 #include <cstring>         // std::memcmp, std::memset
@@ -29,15 +28,14 @@
 #include <mutex>           // locking
 #include <cctype>          // std::isxdigit, std::tolower
 
-// --- Optional GCS block filters (guarded; won’t break builds if not present) ---
 #ifndef __has_include
   #define __has_include(x) 0
 #endif
 
 #if __has_include("filters/bip158.h") && __has_include("filters/gcs.h") && __has_include("filters/filter_store.h")
   #define MIQ_HAVE_GCS_FILTERS 1
-  #include "filters/gcs.h"          // miq::gcs::build_block_filter(...)
-  #include "filters/filter_store.h" // class miq::gcs::FilterStore
+  #include "filters/gcs.h"
+  #include "filters/filter_store.h"
 #else
   #define MIQ_HAVE_GCS_FILTERS 0
 #endif
@@ -48,7 +46,6 @@
 #define MIQ_FALLBACK_MAX_TX_SIZE (MAX_TX_SIZE)
 #endif
 
-// Default ON: enforce Low-S in consensus (may be overridden in constants.h)
 #ifndef MIQ_RULE_ENFORCE_LOW_S
 #define MIQ_RULE_ENFORCE_LOW_S 1
 #endif
@@ -72,6 +69,65 @@
   #define miq_fileno fileno
 #endif
 
+// ---------- file-scope helpers (ensure declared before first use) ----------
+static inline size_t env_szt(const char* name, size_t defv){
+    const char* v = std::getenv(name);
+    if(!v || !*v) return defv;
+    char* end=nullptr; long long x = std::strtoll(v, &end, 10);
+    if(end==v || x < 0) return defv;
+    return (size_t)x;
+}
+
+// parse 64 hex chars into 32 bytes (big-endian nibble order)
+static bool parse_hex32(const char* hex, std::vector<uint8_t>& out) {
+    out.clear();
+    if (!hex) return false;
+    size_t len = std::strlen(hex);
+    if (len != 64) return false;
+    auto hv = [](char c)->int{
+        if (c>='0' && c<='9') return c-'0';
+        c = (char)std::tolower(static_cast<unsigned char>(c));
+        if (c>='a' && c<='f') return 10 + (c-'a');
+        return -1;
+    };
+    out.resize(32);
+    for (size_t i=0;i<32;++i){
+        int hi = hv(hex[2*i]);
+        int lo = hv(hex[2*i+1]);
+        if (hi<0 || lo<0) return false;
+        out[i] = (uint8_t)((hi<<4) | lo);
+    }
+    return true;
+}
+
+// === compact bits -> big-endian target, and hash <= target check ============
+static inline void bits_to_target_be(uint32_t bits, uint8_t out[32]) {
+    std::memset(out, 0, 32);
+    uint32_t exp = bits >> 24;
+    uint32_t mant = bits & 0x007fffff;
+    if (mant == 0) { return; } // invalid -> zero target (will fail compare)
+
+    if (exp <= 3) {
+        uint32_t mant2 = mant >> (8 * (3 - exp));
+        out[29] = uint8_t((mant2 >> 16) & 0xff);
+        out[30] = uint8_t((mant2 >> 8)  & 0xff);
+        out[31] = uint8_t((mant2 >> 0)  & 0xff);
+    } else {
+        int pos = int(32) - int(exp);
+        if (pos < 0) { out[0] = out[1] = out[2] = 0xff; return; }
+        if (pos > 29) pos = 29;
+        out[pos + 0] = uint8_t((mant >> 16) & 0xff);
+        out[pos + 1] = uint8_t((mant >> 8)  & 0xff);
+        out[pos + 2] = uint8_t((mant >> 0)  & 0xff);
+    }
+}
+static inline bool meets_target_be(const std::vector<uint8_t>& hash32, uint32_t bits) {
+    if (hash32.size() != 32) return false;
+    uint8_t target[32];
+    bits_to_target_be(bits, target);
+    return std::memcmp(hash32.data(), target, 32) <= 0; // hash <= target
+}
+
 namespace miq {
 
 // Reentrant guard (chain.h uses std::recursive_mutex)
@@ -94,7 +150,7 @@ static inline std::vector<uint8_t> header_hash_of(const BlockHeader& h) {
     return tmp.block_hash();
 }
 
-static const size_t UNDO_WINDOW = env_szt("MIQ_UNDO_WINDOW", 2000); // keep last N blocks' undo
+static const size_t UNDO_WINDOW = ::env_szt("MIQ_UNDO_WINDOW", 2000); // keep last N blocks' undo
 
 static inline std::string hexstr(const std::vector<uint8_t>& v){
     static const char* hexd="0123456789abcdef";
@@ -247,11 +303,9 @@ static void remove_undo_file(const std::string& base_dir,
     std::remove(path.c_str());
 }
 
-static inline bool env_truthy(const char* v){ return v && (*v=='1'||*v=='t'||*v=='T'||*v=='y'||*v=='Y'); }
-
 // Limits (override via env if you like)
-static const size_t ORPHAN_MAX_BLOCKS = env_szt("MIQ_ORPHAN_MAX_BLOCKS", 1024);        // 1k blocks
-static const size_t ORPHAN_MAX_BYTES  = env_szt("MIQ_ORPHAN_MAX_BYTES",  64ull<<20);   // 64 MiB
+static const size_t ORPHAN_MAX_BLOCKS = ::env_szt("MIQ_ORPHAN_MAX_BLOCKS", 1024);      // 1k blocks
+static const size_t ORPHAN_MAX_BYTES  = ::env_szt("MIQ_ORPHAN_MAX_BYTES",  64ull<<20); // 64 MiB
 
 struct OrphanRec {
     std::vector<uint8_t> raw;     // serialized block
@@ -299,7 +353,7 @@ static bool orphan_put(const std::vector<uint8_t>& hash32,
 static bool orphan_get(const std::vector<uint8_t>& hash32, std::vector<uint8_t>& out_raw){
     auto it = g_orphans.find(hk(hash32));
     if (it == g_orphans.end()) return false;
-    out_raw = it->second.raw; // copy out (cheap enough at this size)
+    out_raw = it->second.raw; // copy out
     return true;
 }
 
@@ -309,24 +363,21 @@ static void orphan_erase(const std::vector<uint8_t>& hash32){
     if (it == g_orphans.end()) return;
     g_orphan_bytes -= it->second.bytes;
     g_orphans.erase(it);
-    // note: we leave a stale key in g_orphan_order; harmless for pruning
 }
 
+// RAM undo cache
 static std::unordered_map<std::string, std::vector<UndoIn>> g_undo;
 
-// keep your other statics (e.g., the reorg manager) here too:
-
+// Reorg planner
 static miq::ReorgManager g_reorg;
 
-// === Optional global filter store (constructed at open())
 #if MIQ_HAVE_GCS_FILTERS
 static miq::gcs::FilterStore g_filter_store;
 #endif
 
-// === Local constants (non-breaking) ===
 static constexpr size_t MAX_BLOCK_SIZE_LOCAL = 1 * 1024 * 1024; // 1 MiB
 
-// === New: full headers cache for serving getheaders even with empty block store ===
+// Full headers cache for serving getheaders even with empty block store
 static std::unordered_map<std::string, BlockHeader> g_header_full; // key = hk(hash32)
 
 // --- Low-S helper (RAW-64 r||s) --------------------------------------------
@@ -344,34 +395,6 @@ static inline bool is_low_s64(const std::vector<uint8_t>& sig64){
     return true; // equal allowed
 }
 
-// === compact bits -> big-endian target, and hash <= target check ============
-static inline void bits_to_target_be(uint32_t bits, uint8_t out[32]) {
-    std::memset(out, 0, 32);
-    uint32_t exp = bits >> 24;
-    uint32_t mant = bits & 0x007fffff;
-    if (mant == 0) { return; } // invalid -> zero target (will fail compare)
-
-    if (exp <= 3) {
-        uint32_t mant2 = mant >> (8 * (3 - exp));
-        out[29] = uint8_t((mant2 >> 16) & 0xff);
-        out[30] = uint8_t((mant2 >> 8)  & 0xff);
-        out[31] = uint8_t((mant2 >> 0)  & 0xff);
-    } else {
-        int pos = int(32) - int(exp);
-        if (pos < 0) { out[0] = out[1] = out[2] = 0xff; return; }
-        if (pos > 29) pos = 29;
-        out[pos + 0] = uint8_t((mant >> 16) & 0xff);
-        out[pos + 1] = uint8_t((mant >> 8)  & 0xff);
-        out[pos + 2] = uint8_t((mant >> 0)  & 0xff);
-    }
-}
-static inline bool meets_target_be(const std::vector<uint8_t>& hash32, uint32_t bits) {
-    if (hash32.size() != 32) return false;
-    uint8_t target[32];
-    bits_to_target_be(bits, target);
-    return std::memcmp(hash32.data(), target, 32) <= 0; // hash <= target
-}
-
 // Small helper for median time
 static inline int64_t median_time_of(const std::vector<std::pair<int64_t,uint32_t>>& xs){
     if (xs.empty()) return 0;
@@ -379,28 +402,6 @@ static inline int64_t median_time_of(const std::vector<std::pair<int64_t,uint32_
     for (auto& p: xs) t.push_back(p.first);
     std::sort(t.begin(), t.end());
     return t[t.size()/2];
-}
-
-// --- Local helper: parse 64-hex into 32 bytes (big-endian) ------------------
-static bool parse_hex32(const char* hex, std::vector<uint8_t>& out) {
-    out.clear();
-    if (!hex) return false;
-    size_t len = std::strlen(hex);
-    if (len != 64) return false;
-    auto hv = [](char c)->int{
-        if (c>='0' && c<='9') return c-'0';
-        c = (char)std::tolower(static_cast<unsigned char>(c));
-        if (c>='a' && c<='f') return 10 + (c-'a');
-        return -1;
-    };
-    out.resize(32);
-    for (size_t i=0;i<32;++i){
-        int hi = hv(hex[2*i]);
-        int lo = hv(hex[2*i+1]);
-        if (hi<0 || lo<0) return false;
-        out[i] = (uint8_t)((hi<<4) | lo);
-    }
-    return true;
 }
 
 // ===========================================================================
@@ -440,7 +441,7 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         }
     }
 
-    // === MTP and expected bits computed on the header's own branch ===
+    // Determine MTP & window on the header's own branch
     uint64_t parent_height = 0;
     std::vector<std::pair<int64_t,uint32_t>> recent;   // for MTP (<=11)
     std::vector<std::pair<int64_t,uint32_t>> window;   // for difficulty (<=interval)
@@ -451,7 +452,8 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         parent_height = cur->height;
 
         // Collect up to 11 for MTP
-        recent.clear(); recent.reserve(11);
+        recent.clear();
+        recent.reserve(11);
         const auto* c = cur;
         while (c && recent.size() < 11) {
             recent.emplace_back(c->time, c->bits);
@@ -463,7 +465,8 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
             c = &ip->second;
         }
         // Collect up to interval for difficulty window
-        window.clear(); window.reserve(MIQ_RETARGET_INTERVAL);
+        window.clear();
+        window.reserve(MIQ_RETARGET_INTERVAL);
         c = cur;
         while (c && window.size() < MIQ_RETARGET_INTERVAL) {
             window.emplace_back(c->time, c->bits);
@@ -484,9 +487,9 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         }
     }
 
-    // MTP
+    // MTP (median over branch recent)
     int64_t mtp = median_time_of(recent);
-    if (mtp == 0) mtp = tip_.time;
+    if (mtp == 0) mtp = tip_.time; // conservative fallback
     if (h.time <= mtp) { err = "header time <= MTP"; return false; }
 
     // Future bound
@@ -494,7 +497,7 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         std::chrono::system_clock::now().time_since_epoch()).count();
     if (h.time > now + (int64_t)MAX_TIME_SKEW) { err="header time too far in future"; return false; }
 
-    // Difficulty bits (epoch retarget; freeze inside the interval) — ALWAYS enforce
+    // ALWAYS enforce difficulty bits on this branch (no activation gates)
     {
         const uint64_t next_height = parent_height + 1;
         uint32_t expected = miq::epoch_next_bits(
@@ -530,7 +533,7 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     const auto hh = header_hash_of(h);
     const auto key = hk(hh);
 
-    // If we already know this header, ensure we have the full header cached too.
+    // If we already know this header, ensure full header cached too.
     auto itExisting = header_index_.find(key);
     if (itExisting != header_index_.end()) {
         g_header_full[key] = h;
@@ -557,7 +560,6 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     m.work_sum = parent_work + work_from_bits(h.bits);
 
     header_index_.emplace(key, std::move(m));
-    // Cache full header for serving to peers even without block bodies
     g_header_full[key] = h;
 
     if (best_header_key_.empty()) {
@@ -568,7 +570,7 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
 
         auto eps = [](long double a, long double b){
             long double scale = std::max<long double>(1.0L, std::max(std::fabs(a), std::fabs(b)));
-            return 1e-12L * scale;  // tight, deterministic epsilon
+            return 1e-12L * scale;
         };
         long double e = eps(neu.work_sum, cur.work_sum);
         bool greater   = (neu.work_sum - cur.work_sum) >  e;
@@ -597,7 +599,6 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
 
     for (const auto& hh : down) {
         if (out.size() >= max) break;
-        // Use global orphan cache to avoid requesting blocks we already hold as orphans
         std::vector<uint8_t> tmp;
         bool have_orphan = orphan_get(hh, tmp);
         if (!have_block(hh) && !have_orphan) out.push_back(hh);
@@ -697,10 +698,9 @@ void Chain::build_locator(std::vector<std::vector<uint8_t>>& out) const{
     // If we have no blocks yet, start from genesis so peers respond.
     if (tip_.time == 0) {
         std::vector<uint8_t> g;
-        if (parse_hex32(GENESIS_HASH_HEX, g)) {
+        if (::parse_hex32(GENESIS_HASH_HEX, g)) {
             out.emplace_back(std::move(g));
         } else {
-            // fallback: push 32 zeroes (won't match, but keeps protocol flow)
             out.emplace_back(32, 0);
         }
         return;
@@ -719,7 +719,7 @@ void Chain::build_locator(std::vector<std::vector<uint8_t>>& out) const{
     }
 }
 
-// === Serve headers to peers from in-memory header index (with fallback) ===
+// Serve headers from in-memory header index (with fallback to block store)
 bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& locators,
                                      size_t max,
                                      std::vector<BlockHeader>& out) const
@@ -727,16 +727,13 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
     MIQ_CHAIN_GUARD();
     out.clear();
 
-    // Build fast lookup set for locator hashes
     std::unordered_map<std::string, int> lset;
     lset.reserve(locators.size());
     for (const auto& h : locators) lset[hk(h)] = 1;
 
-    // Preferred path: serve from header_index_ + g_header_full
     if (!best_header_key_.empty()) {
         const auto* cur = &header_index_.at(best_header_key_);
 
-        // Walk back from best known header until we hit any locator (or the root we know)
         std::vector<std::vector<uint8_t>> back_hashes;
         back_hashes.reserve(2048);
         size_t meet_idx = (size_t)-1;
@@ -754,7 +751,6 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
             cur = &itp->second;
         }
 
-        // If we matched, stream headers AFTER the meeting header toward our tip (oldest->newest)
         if (matched) {
             for (size_t i = meet_idx; i-- > 0 && out.size() < max;) {
                 const auto& hh = back_hashes[i];
@@ -769,7 +765,6 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
             if (!out.empty()) return true;
         }
 
-        // No match: still try to serve "from the oldest we encountered" forward
         if (!back_hashes.empty()) {
             for (size_t i = back_hashes.size(); i-- > 0 && out.size() < max;) {
                 const auto& hh = back_hashes[i];
@@ -783,10 +778,9 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
             }
             if (!out.empty()) return true;
         }
-        // Fall through to legacy path if the above produced nothing.
     }
 
-    // Legacy fallback: serve from block store (original behavior)
+    // Fallback: serve from block store
     std::unordered_map<std::string, int> lset2;
     for (const auto& h : locators) lset2[hk(h)] = 1;
 
@@ -867,7 +861,6 @@ bool Chain::accept_block_for_reorg(const Block& b, std::string& err){
 
     if (!meets_target_be(b.block_hash(), b.header.bits)) { err = "bad pow"; return false; }
 
-    // Explicitly use the file-scope orphan cache (stores parent, used by reorg planner)
     ::miq::orphan_put(b.block_hash(), b.header.prev_hash, std::move(raw));
 
     miq::HeaderView hv;
@@ -959,7 +952,6 @@ bool Chain::load_state(){
 }
 
 uint64_t Chain::subsidy_for_height(uint64_t h) const {
-    // pure, no lock needed; but keep consistency
     return GetBlockSubsidy(static_cast<uint32_t>(h));
 }
 
@@ -1050,7 +1042,7 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     if (std::any_of(cb.vin[0].prev.txid.begin(), cb.vin[0].prev.txid.end(), [](uint8_t v){ return v!=0; })) { err="bad coinbase prev"; return false; }
     if (cb.vin[0].prev.vout != 0) { err="bad coinbase vout"; return false; }
 
-    // === ALWAYS enforce BIP30: reject if any txid already has ANY unspent outputs
+    // === BIP30: reject if any txid already has ANY unspent outputs (ALWAYS on) ===
     {
         UTXOEntry dummy;
         for (const auto& tx : b.txs) {
@@ -1077,7 +1069,7 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         if (raw.size() > MIQ_FALLBACK_MAX_TX_SIZE) { err="tx too large"; return false; }
     }
 
-    // Difficulty bits equality — ALWAYS enforce
+    // Difficulty bits equality (ALWAYS on)
     {
         auto last = last_headers(MIQ_RETARGET_INTERVAL);
         uint32_t expected = miq::epoch_next_bits(
@@ -1163,7 +1155,7 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     if(cb_sum > sub + fees){ err="coinbase too high"; return false; }
     if(!leq_max_money(cb_sum)){ err="coinbase>MAX_MONEY"; return false; }
 
-    // Hard MAX_SUPPLY: ALWAYS enforce (subsidy-only against remaining supply)
+    // Hard MAX_SUPPLY: subsidy-only against remaining supply (ALWAYS on)
     {
         uint64_t coinbase_without_fees = (cb_sum > fees) ? (cb_sum - fees) : 0;
         if (WouldExceedMaxSupply((uint32_t)(tip_.height + 1), coinbase_without_fees)) {
@@ -1207,7 +1199,6 @@ static bool utxo_apply_ops(DB& db, const std::vector<UtxoOp>& ops, std::string& 
         }
         return true;
     } else {
-        // Fallback: immediate fsynced writes (existing behavior)
         for (const auto& op : ops) {
             if (op.is_add) {
                 if (!db.add(op.txid, op.vout, op.entry)) {
@@ -1278,8 +1269,7 @@ bool Chain::disconnect_tip_once(std::string& err){
     // Commit reversals atomically if backend supports it
     if (!utxo_apply_ops(utxo_, ops, err)) return false;
 
-    // NOTE: we do NOT remove filters here. On future re-connect at the same height,
-    // the new filter will overwrite the old entry via FilterStore::put().
+    // NOTE: we do NOT remove filters here. Re-connect overwrites the old entry.
 
     Block prev;
     if (!get_block_by_hash(cur.header.prev_hash, prev)) {
@@ -1323,7 +1313,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
         }
     }
 
-    // Persist the block body (unchanged order wrt previous code)
+    // Persist the block body
     storage_.append_block(ser_block(b), b.block_hash());
 
     // --- Crash-safety: write undo BEFORE UTXO mutation ---
@@ -1361,7 +1351,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
         cb_sum += cb.vout[i].value;
     }
 
-    // Apply all UTXO changes (atomically if supported)
+    // Apply all UTXO changes
     if (!utxo_apply_ops(utxo_, ops, err)) return false;
 
     // Advance tip (state)
@@ -1387,7 +1377,6 @@ bool Chain::submit_block(const Block& b, std::string& err){
     }
 
 #if MIQ_HAVE_GCS_FILTERS
-    // Build & persist GCS block filter (best-effort; guarded)
     {
         std::vector<uint8_t> fbytes;
         if (miq::gcs::build_block_filter(b, fbytes)) {
