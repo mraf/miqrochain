@@ -48,6 +48,18 @@
 #endif
 // ===========================================================================
 
+// ======= Consensus activation height (grandfather existing chain) ===========
+#ifndef MIQ_RULES_ACTIVATE_AT
+// Default: effectively "disabled" until you set TIP+1 at build time
+// or drop <datadir>/activation.height. This avoids forking past-mined blocks.
+#define MIQ_RULES_ACTIVATE_AT 0xFFFFFFFFFFFFFFFFULL
+#endif
+
+// Optional: keep low-S enforcement explicitly enabled (chain.cpp also defaults it)
+#ifndef MIQ_RULE_ENFORCE_LOW_S
+#define MIQ_RULE_ENFORCE_LOW_S 1
+#endif
+
 namespace miq {
 
 // ---------------------------------------------------------------------
@@ -143,4 +155,4 @@ static constexpr size_t MAX_MSG_SIZE   = 2 * 1024 * 1024; // 2 MiB
 // Optional: default RPC token (empty = no token unless MIQ_RPC_TOKEN env set)
 static constexpr const char* RPC_TOKEN_DEFAULT = "";
 
-} 
+}
