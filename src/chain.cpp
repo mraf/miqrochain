@@ -53,52 +53,6 @@
 #define MIQ_RULE_ENFORCE_LOW_S 1
 #endif
 
-// ======= Consensus activation height (grandfather existing chain) ===========
-#ifndef MIQ_RULES_ACTIVATE_AT
-// Set this at build time to your mainnet tip + 1 for zero-CLI releases.
-#define MIQ_RULES_ACTIVATE_AT 0
-#endif
-
-static uint64_t g_rules_activation_override = 0; // loaded from file if present
-
-static inline size_t env_szt(const char* name, size_t defv){
-    const char* v = std::getenv(name);
-    if(!v || !*v) return defv;
-    char* end=nullptr; long long x = std::strtoll(v, &end, 10);
-    if(end==v || x < 0) return defv;
-    return (size_t)x;
-}
-
-static uint64_t try_read_activation_file(const std::string& dir){
-#ifdef _WIN32
-    const char sep='\\';
-#else
-    const char sep='/';
-#endif
-    std::string path = dir;
-    if(!path.empty() && path.back()!=sep) path.push_back(sep);
-    path += "activation.height";
-    FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return 0;
-    char buf[64] = {0};
-    size_t r = std::fread(buf, 1, sizeof(buf)-1, f); (void)r;
-    std::fclose(f);
-    char* end=nullptr;
-    long long x = std::strtoll(buf, &end, 10);
-    if (end == buf || x < 0) return 0;
-    return (uint64_t)x;
-}
-
-static inline uint64_t rules_activation_height() {
-    if (g_rules_activation_override) return g_rules_activation_override;
-    if (const char* v = std::getenv("MIQ_RULES_ACTIVATE_AT"); v && *v) {
-        char* e = nullptr;
-        long long x = std::strtoll(v, &e, 10);
-        if (e != v && x >= 0) return (uint64_t)x;
-    }
-    return (uint64_t)MIQ_RULES_ACTIVATE_AT;
-}
-
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -486,49 +440,41 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         }
     }
 
-    // === MTP and expected bits computed on the header's own branch (fixes IBD stalls) ===
+    // === MTP and expected bits computed on the header's own branch ===
     uint64_t parent_height = 0;
     std::vector<std::pair<int64_t,uint32_t>> recent;   // for MTP (<=11)
     std::vector<std::pair<int64_t,uint32_t>> window;   // for difficulty (<=interval)
 
     auto itp = header_index_.find(hk(h.prev_hash));
     if (itp != header_index_.end()) {
-        // Walk ancestors from parent header in header_index_
         const auto* cur = &itp->second;
         parent_height = cur->height;
 
         // Collect up to 11 for MTP
-        {
-            recent.clear();
-            recent.reserve(11);
-            const auto* c = cur;
-            while (c && recent.size() < 11) {
-                recent.emplace_back(c->time, c->bits);
-                auto ip = header_index_.find(hk(c->prev));
-                if (ip == header_index_.end()) {
-                    if (c->prev == tip_.hash) recent.emplace_back(tip_.time, tip_.bits);
-                    break;
-                }
-                c = &ip->second;
+        recent.clear(); recent.reserve(11);
+        const auto* c = cur;
+        while (c && recent.size() < 11) {
+            recent.emplace_back(c->time, c->bits);
+            auto ip = header_index_.find(hk(c->prev));
+            if (ip == header_index_.end()) {
+                if (c->prev == tip_.hash) recent.emplace_back(tip_.time, tip_.bits);
+                break;
             }
+            c = &ip->second;
         }
         // Collect up to interval for difficulty window
-        {
-            window.clear();
-            window.reserve(MIQ_RETARGET_INTERVAL);
-            const auto* c = cur;
-            while (c && window.size() < MIQ_RETARGET_INTERVAL) {
-                window.emplace_back(c->time, c->bits);
-                auto ip = header_index_.find(hk(c->prev));
-                if (ip == header_index_.end()) {
-                    if (c->prev == tip_.hash) window.emplace_back(tip_.time, tip_.bits);
-                    break;
-                }
-                c = &ip->second;
+        window.clear(); window.reserve(MIQ_RETARGET_INTERVAL);
+        c = cur;
+        while (c && window.size() < MIQ_RETARGET_INTERVAL) {
+            window.emplace_back(c->time, c->bits);
+            auto ip = header_index_.find(hk(c->prev));
+            if (ip == header_index_.end()) {
+                if (c->prev == tip_.hash) window.emplace_back(tip_.time, tip_.bits);
+                break;
             }
+            c = &ip->second;
         }
     } else {
-        // Parent is the connected tip (or at least we only know the connected chain)
         parent_height = tip_.height;
         recent = last_headers(11);
         window = last_headers(MIQ_RETARGET_INTERVAL);
@@ -538,9 +484,9 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         }
     }
 
-    // MTP (median over branch recent)
+    // MTP
     int64_t mtp = median_time_of(recent);
-    if (mtp == 0) mtp = tip_.time; // conservative fallback
+    if (mtp == 0) mtp = tip_.time;
     if (h.time <= mtp) { err = "header time <= MTP"; return false; }
 
     // Future bound
@@ -548,18 +494,15 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         std::chrono::system_clock::now().time_since_epoch()).count();
     if (h.time > now + (int64_t)MAX_TIME_SKEW) { err="header time too far in future"; return false; }
 
-    // Difficulty bits (epoch retarget; freeze inside the interval) on the same branch
+    // Difficulty bits (epoch retarget; freeze inside the interval) — ALWAYS enforce
     {
         const uint64_t next_height = parent_height + 1;
-        const bool enforce = (next_height >= rules_activation_height());
-        if (enforce) {
-            uint32_t expected = miq::epoch_next_bits(
-                window, BLOCK_TIME_SECS, GENESIS_BITS,
-                /*next_height=*/ next_height,
-                /*interval=*/ MIQ_RETARGET_INTERVAL
-            );
-            if (h.bits != expected) { err = "bad header bits"; return false; }
-        }
+        uint32_t expected = miq::epoch_next_bits(
+            window, BLOCK_TIME_SECS, GENESIS_BITS,
+            /*next_height=*/ next_height,
+            /*interval=*/ MIQ_RETARGET_INTERVAL
+        );
+        if (h.bits != expected) { err = "bad header bits"; return false; }
     }
 
     // POW
@@ -776,7 +719,7 @@ void Chain::build_locator(std::vector<std::vector<uint8_t>>& out) const{
     }
 }
 
-// === Revised: serve headers to peers from in-memory header index (with fallback) ===
+// === Serve headers to peers from in-memory header index (with fallback) ===
 bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& locators,
                                      size_t max,
                                      std::vector<BlockHeader>& out) const
@@ -888,12 +831,6 @@ bool Chain::open(const std::string& dir){
     datadir_ = dir;
     ensure_dir_exists(undo_dir(datadir_));
     (void)load_state();
-
-    // Load optional activation override file (lets you ship exe + file, zero CLI)
-    {
-        uint64_t from_file = try_read_activation_file(datadir_);
-        if (from_file) g_rules_activation_override = from_file;
-    }
 
 #if MIQ_HAVE_GCS_FILTERS
     {
@@ -1113,10 +1050,8 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     if (std::any_of(cb.vin[0].prev.txid.begin(), cb.vin[0].prev.txid.end(), [](uint8_t v){ return v!=0; })) { err="bad coinbase prev"; return false; }
     if (cb.vin[0].prev.vout != 0) { err="bad coinbase vout"; return false; }
 
-    // === BIP30 (gated): reject if any txid already has ANY unspent outputs ===
-    const uint64_t new_height = tip_.height + 1;
-    const bool enforce = (new_height >= rules_activation_height());
-    if (enforce) {
+    // === ALWAYS enforce BIP30: reject if any txid already has ANY unspent outputs
+    {
         UTXOEntry dummy;
         for (const auto& tx : b.txs) {
             const auto id = tx.txid();
@@ -1142,12 +1077,12 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         if (raw.size() > MIQ_FALLBACK_MAX_TX_SIZE) { err="tx too large"; return false; }
     }
 
-    // Difficulty bits equality (gated)
-    if (enforce) {
+    // Difficulty bits equality — ALWAYS enforce
+    {
         auto last = last_headers(MIQ_RETARGET_INTERVAL);
         uint32_t expected = miq::epoch_next_bits(
             last, BLOCK_TIME_SECS, GENESIS_BITS,
-            /*next_height=*/ new_height,
+            /*next_height=*/ tip_.height + 1,
             /*interval=*/ MIQ_RETARGET_INTERVAL
         );
         if (b.header.bits != expected) { err = "bad bits"; return false; }
@@ -1201,9 +1136,7 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
             if(hash160(inx.pubkey)!=e.pkh){ err="pkh mismatch"; return false; }
             if(!crypto::ECDSA::verify(inx.pubkey, hash, inx.sig)){ err="bad signature"; return false; }
         #if MIQ_RULE_ENFORCE_LOW_S
-            if (enforce) { // Low-S only after activation
-                if (!is_low_s64(inx.sig)) { err="high-S signature"; return false; }
-            }
+            if (!is_low_s64(inx.sig)) { err="high-S signature"; return false; }
         #endif
 
             if (!leq_max_money(e.value)) { err="utxo>MAX_MONEY"; return false; }
@@ -1230,8 +1163,8 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     if(cb_sum > sub + fees){ err="coinbase too high"; return false; }
     if(!leq_max_money(cb_sum)){ err="coinbase>MAX_MONEY"; return false; }
 
-    // Hard MAX_SUPPLY (gated: subsidy-only against remaining supply)
-    if (enforce) {
+    // Hard MAX_SUPPLY: ALWAYS enforce (subsidy-only against remaining supply)
+    {
         uint64_t coinbase_without_fees = (cb_sum > fees) ? (cb_sum - fees) : 0;
         if (WouldExceedMaxSupply((uint32_t)(tip_.height + 1), coinbase_without_fees)) {
             err = "exceeds max supply";
