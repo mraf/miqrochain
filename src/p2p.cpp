@@ -2366,14 +2366,27 @@ void P2P::loop(){
 
 #if MIQ_ENABLE_HEADERS_FIRST
                     } else if (cmd == "getheaders") {
+                        // Parse incoming locator/stop
                         std::vector<std::vector<uint8_t>> locator;
                         std::vector<uint8_t> stop;
                         if (!parse_getheaders_payload(m.payload, locator, stop)) {
                             if (++ps.mis > 10) { dead.push_back(s); }
                             continue;
                         }
+
+                        // Try native orientation first (BE as our chain stores it).
                         std::vector<BlockHeader> hs;
                         chain_.get_headers_from_locator(locator, 2000, hs);
+
+                        // **Bulletproof fix**: if no progress, retry with each 32B hash reversed (LE<->BE)
+                        if (hs.empty() && !locator.empty()) {
+                            std::vector<std::vector<uint8_t>> loc_rev = locator;
+                            for (auto& h : loc_rev) std::reverse(h.begin(), h.end());
+                            std::vector<BlockHeader> hs2;
+                            chain_.get_headers_from_locator(loc_rev, 2000, hs2);
+                            if (!hs2.empty()) hs.swap(hs2);
+                        }
+
                         auto out = build_headers_payload(hs);
                         auto msg = encode_msg("headers", out);
                         (void)miq_send(s, msg);
