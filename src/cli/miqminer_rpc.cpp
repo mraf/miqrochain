@@ -67,8 +67,7 @@ static inline std::string C(const char* code){ return g_use_ansi ? std::string("
 static inline std::string R(){ return g_use_ansi ? std::string("\x1b[0m") : std::string(); }
 static inline const char* CLS(){ return g_use_ansi ? "\x1b[2J\x1b[H" : ""; }
 
-// Big ASCII banner — CYAN — clearly says "CHRONEN MINER"
-static const char* kChronenBanner[] = {
+// BIG ASCII banner (ASCII-only). Print it wrapped with C("36;1") for cyan bold.
 static const char* kChronenMinerBanner[] = {
 "   _____ _                      _                              __  __ _                         ",
 "  / ____| |                    | |                            |  \\/  (_)                        ",
@@ -76,17 +75,17 @@ static const char* kChronenMinerBanner[] = {
 " | |     | '_ \\ / _ \\| '_ \\/ __| |/ _ \\ / _` | '_ \\ / _ \\     | |\\/| | | '_ \\ / __/ _ \\         ",
 " | |____ | | | | (_) | | | \\__ \\ | (_) | (_| | | | |  __/     | |  | | | | | | (_|  __/         ",
 "  \\_____|_| |_|\\___/|_| |_|___/_|\\___/ \\__,_|_| |_|\\___|     |_|  |_|_|_| |_|\\___\\___|         ",
-"                                     CHRONEN  MINER                                          ",
+"                                                                                                ",
+"  __  __ _                                                                                      ",
+" |  \\/  (_)                                                                                     ",
+" | \\  / |_ _ __   ___ ___                                                                       ",
+" | |\\/| | | '_ \\ / __/ _ \\                                                                      ",
+" | |  | | | | | | (_|  __/                                                                      ",
+" |_|  |_|_|_| |_|\\___\\___|                                                                      ",
 };
 
 // ===== helpers ===============================================================
-#if defined(MIQ_COIN)
-static constexpr uint64_t kCOIN = MIQ_COIN;
-#elif defined(COIN)
-static constexpr uint64_t kCOIN = COIN;
-#else
-static constexpr uint64_t kCOIN = 100000000ULL; // 1 MIQ = 100,000,000 base units
-#endif
+static const uint64_t MIQ_COIN_UNITS = 100000000ULL; // 1 MIQ = 1e8 base units
 
 static inline void trim(std::string& s){
     size_t i=0,j=s.size();
@@ -252,7 +251,7 @@ static inline void store_u64_le(uint8_t* p, uint64_t x){
     p[6]=uint8_t((x>>48)&0xff); p[7]=uint8_t((x>>56)&0xff);
 }
 
-// ===== HTTP / JSON-RPC =======================================================
+// ===== minimal HTTP/JSON-RPC ================================================
 struct HttpResp { int code{0}; std::string body; };
 
 static bool http_post(const std::string& host, uint16_t port, const std::string& path,
@@ -364,7 +363,7 @@ static std::string rpc_build(const std::string& method, const std::string& param
     return o.str();
 }
 
-// ===== RPC wrappers & extras ================================================
+// ===== RPC wrappers ==========================================================
 struct TipInfo { uint64_t height{0}; std::string hash_hex; uint32_t bits{0}; int64_t time{0}; };
 
 static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::string& auth, TipInfo& out){
@@ -405,28 +404,13 @@ static bool rpc_getblock_header_time(const std::string& host, uint16_t port, con
     if(json_find_number(r.body, "time", t)) { out_time=t; return true; }
     return false;
 }
-
-// Best-effort log sender to node console; tries a few method names and ignores failures.
-static void rpc_send_log_best_effort(const std::string& host, uint16_t port, const std::string& auth, const std::string& msg){
-    static const char* methods[] = {"minerlog","log","print","debuglog"};
-    for(const char* m : methods){
-        std::ostringstream ps; ps << "[\""<< json_escape(msg) << "\"]";
-        HttpResp r;
-        if(http_post(host, port, "/", auth, rpc_build(m, "[\""+msg+"\"]"), r) && r.code==200){
-            // success or harmless ignore
-            break;
-        }
-    }
-}
-
-// "winner" info (who mined the last block)
 struct LastBlockInfo {
     uint64_t height{0};
     std::string hash_hex;
     uint64_t txs{0};
     std::string coinbase_txid_hex;
     std::vector<uint8_t> coinbase_pkh;
-    uint64_t reward_value{0}; // node-reported number (units ambiguous)
+    uint64_t reward_value{0}; // raw from node; units ambiguous
 };
 static bool rpc_getblock_overview(const std::string& host, uint16_t port, const std::string& auth,
                                   uint64_t height, LastBlockInfo& out)
@@ -450,14 +434,12 @@ static bool rpc_getcoinbaserecipient(const std::string& host, uint16_t port, con
     if(json_has_error(r.body)) return false;
     std::string pkh_hex, txid_hex; long long val=0;
     if(!json_find_string(r.body, "pkh", pkh_hex)) return false;
-    (void)json_find_number(r.body, "value", val); // might be missing or MIQ/base; normalized below
+    (void)json_find_number(r.body, "value", val);
     if(json_find_string(r.body, "txid", txid_hex)) io.coinbase_txid_hex = txid_hex;
     io.coinbase_pkh = from_hex_s(pkh_hex);
     io.reward_value = (uint64_t)((val<0)?0:val);
     return true;
 }
-
-// estimate network hash/s using spacing
 static double estimate_network_hashps(const std::string& host, uint16_t port, const std::string& auth, uint64_t tip_height, uint32_t bits){
     const int LOOKBACK = 64;
     if(tip_height <= 1) return 0.0;
@@ -478,8 +460,6 @@ static double estimate_network_hashps(const std::string& host, uint16_t port, co
     const double two32 = 4294967296.0;
     return D * (two32 / avg_spacing);
 }
-
-// submit helpers
 static bool rpc_submitblock_verbose(const std::string& host, uint16_t port, const std::string& auth,
                                     std::string& out_body, const std::string& method, const std::string& hexblk){
     std::ostringstream ps; ps << "[\"" << hexblk << "\"]";
@@ -502,8 +482,16 @@ static bool rpc_submitblock_any(const std::string& host, uint16_t port, const st
     if(!body.empty()) reject_body = body;
     return false;
 }
+// Optional: write a log line to node console (if your node implements this)
+static void rpc_minerlog_best_effort(const std::string& host, uint16_t port, const std::string& auth,
+                                     const std::string& msg){
+    std::ostringstream ps;
+    ps << "[\"" << msg << "\"]";
+    HttpResp r;
+    (void)http_post(host, port, "/", auth, rpc_build("minerlog", ps.str()), r);
+}
 
-// ===== template & tx pack ====================================================
+// ===== template & txs ========================================================
 struct MinerTemplate {
     uint64_t height{0};
     std::vector<uint8_t> prev_hash;
@@ -571,26 +559,6 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
     return true;
 }
 
-static bool pack_template(const MinerTemplate& tpl,
-                          size_t coinbase_bytes,
-                          std::vector<Transaction>& out_txs,
-                          uint64_t& out_fees,
-                          size_t& out_bytes)
-{
-    out_txs.clear(); out_fees=0; out_bytes=coinbase_bytes;
-    for(const auto& xt : tpl.txs){
-        std::vector<uint8_t> raw;
-        try{ raw = from_hex_s(xt.hex); }catch(...){ continue; }
-        Transaction t; if(!deser_tx(raw, t)) continue;
-        size_t sz = ser_tx(t).size();
-        if(out_bytes + sz > tpl.max_block_bytes) continue;
-        out_txs.push_back(std::move(t));
-        out_bytes += sz;
-        out_fees += xt.fee;
-    }
-    return true;
-}
-
 // ===== address helpers & MIQ formatting =====================================
 static bool parse_p2pkh(const std::string& addr, std::vector<uint8_t>& out_pkh){
     uint8_t ver=0; std::vector<uint8_t> payload;
@@ -604,40 +572,18 @@ static std::string pkh_to_address(const std::vector<uint8_t>& pkh){
     return miq::base58check_encode(miq::VERSION_P2PKH, pkh);
 }
 static std::string fmt_miq_amount(uint64_t base_units){
-    // Prefer 2 decimals if exact; otherwise show up to 8 (precise).
     std::ostringstream o;
-    if (base_units % (kCOIN/100) == 0){
-        o << (base_units / kCOIN) << '.'
-          << std::setw(2) << std::setfill('0') << ((base_units / (kCOIN/100)) % 100);
-    }else{
-        o << std::fixed << std::setprecision(8) << (double)base_units / (double)kCOIN;
+    // Prefer 2dp (aesthetic) when exact; else show up to 8dp
+    if (base_units % (MIQ_COIN_UNITS/100) == 0){
+        uint64_t whole = base_units / MIQ_COIN_UNITS;
+        uint64_t cents = (base_units / (MIQ_COIN_UNITS/100)) % 100;
+        o << whole << '.' << std::setw(2) << std::setfill('0') << cents;
+    } else {
+        o << std::fixed << std::setprecision(8)
+          << (double)base_units / (double)MIQ_COIN_UNITS;
     }
     o << " MIQ";
     return o.str();
-}
-
-// Normalize ambiguous node-reported reward against expected: choose the closer (base vs MIQ).
-static uint64_t normalize_reported_reward(uint64_t reported, uint64_t expected_base){
-    if(reported==0) return 0;
-    // candidate A: assume already base units
-    __uint128_t candA = reported;
-    // candidate B: assume reported is in MIQ → convert to base (check overflow)
-    __uint128_t candB = (__uint128_t)reported * (__uint128_t)kCOIN;
-
-    // Boundaries: clamp to uint64
-    auto clamp64 = []( __uint128_t v )->uint64_t{
-        return (v > (__uint128_t)std::numeric_limits<uint64_t>::max())
-               ? std::numeric_limits<uint64_t>::max()
-               : (uint64_t)v;
-    };
-    uint64_t a = clamp64(candA);
-    uint64_t b = clamp64(candB);
-
-    auto adiff = (a>expected_base)? (a-expected_base) : (expected_base-a);
-    auto bdiff = (b>expected_base)? (b-expected_base) : (expected_base-b);
-
-    // Choose whichever is closer to expected subsidy (works for 50, 25, etc.)
-    return (bdiff <= adiff) ? b : a;
 }
 
 // ===== coinbase/merkle =======================================================
@@ -720,7 +666,6 @@ static std::string fmt_hs(double v){
     std::ostringstream o; o<<std::fixed<<std::setprecision(2)<<v<<" "<<u[i]; return o.str();
 }
 static std::string spark_ascii(const std::vector<double>& xs){
-    // ASCII bars 0..7
     static const char bars[] = " .:-=+*#";
     if(xs.empty()) return "";
     double mn=xs[0], mx=xs[0];
@@ -751,9 +696,10 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
         std::ostringstream out;
         out << CLS();
 
-        // Banner (cyan)
+        // Brand banner (cyan)
         out << C("36;1");
-        for(const char* L: kChronenBanner) out << "  " << L << "\n";
+        const size_t kBannerN = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
+        for(size_t i=0;i<kBannerN;i++) out << "  " << kChronenMinerBanner[i] << "\n";
         out << R() << "\n";
 
         // Tip and candidate
@@ -800,12 +746,19 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
                 const std::string winner = pkh_to_address(lb.coinbase_pkh);
                 out << "                     paid to: " << winner
                     << "  (pkh=" << to_hex_s(lb.coinbase_pkh) << ")\n";
-                // Expected subsidy (consensus) and normalized node-reported value
+
+                // Expected vs node-reported (normalize unknown units)
                 uint64_t expected = GetBlockSubsidy((uint32_t)lb.height);
                 if(lb.reward_value){
-                    uint64_t normalized = normalize_reported_reward(lb.reward_value, expected);
+                    uint64_t as_base = lb.reward_value;
+                    uint64_t as_from_miq = (lb.reward_value > (UINT64_MAX/MIQ_COIN_UNITS)) ? UINT64_MAX
+                                           : lb.reward_value * MIQ_COIN_UNITS;
+                    uint64_t diff_base = (expected > as_base) ? (expected - as_base) : (as_base - expected);
+                    uint64_t diff_miq  = (expected > as_from_miq) ? (expected - as_from_miq) : (as_from_miq - expected);
+                    uint64_t chosen = (diff_miq < diff_base) ? as_from_miq : as_base;
+
                     out << "                     reward: expected " << fmt_miq_amount(expected)
-                        << "  |  node reported " << fmt_miq_amount(normalized) << "\n";
+                        << "  |  node reported " << fmt_miq_amount(chosen) << "\n";
                 }else{
                     out << "                     reward: expected " << fmt_miq_amount(expected) << "\n";
                 }
@@ -821,9 +774,9 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
         // Winner status
         if(ui->last_seen_height.load() == th){
             if(ui->last_tip_was_mine.load()){
-                out << "  " << C("32;1") << "[OK] YOU MINED THE LATEST BLOCK." << R() << "\n";
+                out << "  " << C("32;1") << "YOU MINED THE LATEST BLOCK." << R() << "\n";
             }else if(!ui->last_winner_addr.empty()){
-                out << "  " << C("31;1") << "[OTHER MINER] Latest block mined by: " << ui->last_winner_addr << R() << "\n";
+                out << "  " << C("31;1") << "Another miner won the latest block: " << ui->last_winner_addr << R() << "\n";
             }
         }
 
@@ -843,7 +796,7 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
             }
         }
 
-        // Decorative panel with "MINING IN PROGRESS" + "CHRONEN MINER" to the right (cyan)
+        // Decorative panel with MINING IN PROGRESS + Chronen label to the right
         out << "\n";
         static const char* box[8] = {
             "  ##############################   ##############################",
@@ -855,7 +808,7 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
             "  #                            #   #                            #",
             "  ##############################   ##############################",
         };
-        for(auto& L: box) out << C("36") << L << R() << "\n";
+        for(int i=0;i<8;i++) out << C("36") << box[i] << R() << "\n";
 
         out << "\n  Press Ctrl+C to quit.\n";
 
@@ -993,10 +946,31 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
     }
 }
 
+// ===== tx packer =============================================================
+static bool pack_template(const MinerTemplate& tpl,
+                          size_t coinbase_bytes,
+                          std::vector<Transaction>& out_txs,
+                          uint64_t& out_fees,
+                          size_t& out_bytes)
+{
+    out_txs.clear(); out_fees=0; out_bytes=coinbase_bytes;
+    for(const auto& xt : tpl.txs){
+        std::vector<uint8_t> raw;
+        try{ raw = from_hex_s(xt.hex); }catch(...){ continue; }
+        Transaction t; if(!deser_tx(raw, t)) continue;
+        size_t sz = ser_tx(t).size();
+        if(out_bytes + sz > tpl.max_block_bytes) continue;
+        out_txs.push_back(std::move(t));
+        out_bytes += sz;
+        out_fees += xt.fee;
+    }
+    return true;
+}
+
 // ===== usage =================================================================
 static void usage(){
     std::cout <<
-    "miqminer_rpc — Chronen Miner Edition (Professional MIQ RPC miner)\n"
+    "miqminer_rpc — Chronen Miner (Professional MIQ RPC miner)\n"
     "Usage:\n"
     "  miqminer_rpc [--rpc=host:port] [--token=TOKEN] [--threads=N]\n"
     "               [--address=Base58P2PKH] [--no-ansi]\n"
@@ -1005,7 +979,7 @@ static void usage(){
     "Notes:\n"
     "  - Token from --token, MIQ_RPC_TOKEN, or datadir/.cookie\n"
     "  - Default threads: 6 (override with --threads)\n"
-    "  - Default smoothing: 15s (use --smooth=30 for extra stability)\n";
+    "  - Default smoothing: ~15s (use --smooth=30 for extra stability)\n";
 }
 
 // ===== main ==================================================================
@@ -1020,7 +994,7 @@ int main(int argc, char** argv){
         std::string rpc_host = "127.0.0.1";
         uint16_t    rpc_port = (uint16_t)miq::RPC_PORT;
         std::string token;
-        unsigned threads = 6; // DEFAULT 6 THREADS
+        unsigned threads = 6; // Default: 6 threads
         std::string address_cli;
         bool pin_affinity = false;
         bool high_priority = false;
@@ -1129,7 +1103,7 @@ int main(int argc, char** argv){
         std::vector<ThreadCounter> thr_counts(threads);
         for(auto& c: thr_counts) c.hashes.store(0);
 
-        // metering thread (time-constant EMA: alpha = 1 - exp(-dt/τ))
+        // metering thread (EMA: alpha = 1 - exp(-dt/τ))
         std::thread meter([&](){
             using clock = std::chrono::steady_clock;
             auto last = clock::now();
@@ -1279,10 +1253,10 @@ int main(int argc, char** argv){
                         ui.last_tip_was_mine.store(true);
                         ui.last_winner_addr.clear();
 
-                        // Best-effort: send a node-console log
-                        std::ostringstream logm; logm << "[CHRONEN MINER] accepted block at height "
-                                                      << tpl.height << " hash=" << ui.last_found_block_hash;
-                        rpc_send_log_best_effort(rpc_host, rpc_port, token, logm.str());
+                        // Best-effort log to node console
+                        rpc_minerlog_best_effort(rpc_host, rpc_port, token,
+                            std::string("miner: accepted block at height ")
+                            + std::to_string(tpl.height) + " " + ui.last_found_block_hash);
                     }else{
                         ui.last_found_block_hash = miq::to_hex(found_block.block_hash());
                         std::ostringstream m; m << C("33;1") << "submit accepted (pending tip refresh) hash=" << ui.last_found_block_hash << R();
