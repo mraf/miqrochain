@@ -70,11 +70,11 @@ static inline const char* CLS(){ return g_use_ansi ? "\x1b[2J\x1b[H" : ""; }
 // BIG ASCII banner (cyan). This spells MiQ.
 static const char* kChronenMinerBanner[] = {
 "  __  __ _                                                                                      ",
-" |  \\/  |                                                                                    ",
-" | \\  / |                                                                       ",
-" | |\\/| |                                                                      ",
-" | |   | |                                                                     ",
-" |_|   |_|                                                                     ",
+" |  \\/  |                                                                                       ",
+" | \\  / |                                                                                       ",
+" | |\\/| |                                                                                       ",
+" | |   | |                                                                                      ",
+" |_|   |_|                                                                                      ",
 };
 
 // ===== helpers ===============================================================
@@ -718,82 +718,39 @@ static std::vector<uint8_t> merkle_from(const std::vector<Transaction>& txs){
 }
 
 // ===== UI/state ==============================================================
-// High-quality looping circle spinner (Unicode with ASCII fallback)
-static void spinner_circle_frame(int phase, std::array<std::string,5>& rows, bool ascii_fallback=false){
-    const int H=5, W=13; // nice ring in 5x13
-    std::array<std::string,5> g{
+// High-quality ASCII circular spinner (portable, no mojibake)
+static void spinner_circle_ascii(int phase, std::array<std::string,5>& rows){
+    const int W = 13;
+    rows = {
         std::string(W,' '),
         std::string(W,' '),
         std::string(W,' '),
         std::string(W,' '),
         std::string(W,' ')
     };
-    const char* dimU = "·";  // Unicode faint dot
-    const char* hiU  = "●";  // Unicode solid dot
-    char dimA = '.';
-    char hiA  = 'O';
-    // 8 ring positions around center (2D)
+
     struct P{ int r,c; };
+    // 8 ring positions around a 5x13 "circle"
     static const P pos[8] = {
-        {0,6}, // top
-        {1,9}, // up-right
-        {2,12},// right
-        {3,9}, // down-right
-        {4,6}, // bottom
-        {3,3}, // down-left
-        {2,0}, // left
-        {1,3}  // up-left
+        {0,6},  // top
+        {1,9},  // up-right
+        {2,12}, // right
+        {3,9},  // down-right
+        {4,6},  // bottom
+        {3,3},  // down-left
+        {2,0},  // left
+        {1,3}   // up-left
     };
-    // Place dim at all ring positions
-    for(int i=0;i<8;i++){
-        int r=pos[i].r, c=pos[i].c;
-        if(ascii_fallback){ g[r][c]=dimA; }
-        else{
-            // write UTF-8 one-byte? (●/· are 3-byte). We'll build via replace at c with single char cell approximation:
-            // To keep column counts stable, we store a single-byte placeholder and then post-replace; but console width varies.
-            // Simpler: embed directly since we're inside a centered field. We'll build per-row strings manually.
-        }
-    }
-    // Since UTF-8 glyphs are multi-byte, build rows explicitly with placeholders
-    if(!ascii_fallback){
-        // Start with spaces
-        rows = {
-            "             ",
-            "             ",
-            "             ",
-            "             ",
-            "             "
-        };
-        auto put = [&](int r,int c,const char* s){
-            // c is cell index (0..12), we map to char offset by counting cells with monospaced assumption
-            // Build using substrings since rows[r] is plain ASCII now; we replace 1 char with 3-byte glyph by inserting
-            std::string& line = rows[r];
-            // map: left part length c, we replace position with glyph; keep total visual width acceptable as we're centering
-            line.replace(c, 1, s);
-        };
-        // first set dims
-        for(int i=0;i<8;i++) put(pos[i].r,pos[i].c,dimU);
-        // highlight current
-        const P ph = pos[phase & 7];
-        put(ph.r, ph.c, hiU);
-        return;
-    }else{
-        // ASCII mode rows
-        rows = {
-            "             ",
-            "             ",
-            "             ",
-            "             ",
-            "             "
-        };
-        auto putA = [&](int r,int c,char ch){
-            rows[r][c]=ch;
-        };
-        for(int i=0;i<8;i++) putA(pos[i].r,pos[i].c,dimA);
-        const P ph = pos[phase & 7];
-        putA(ph.r,ph.c,hiA);
-        return;
-    }
+
+    // draw faint ring
+    for(int i=0;i<8;i++) rows[pos[i].r][pos[i].c] = '.';
+
+    // highlight current + trailing “fade” to suggest motion
+    int k  = phase & 7;
+    int k2 = (k + 7) & 7; // one step behind
+
+    rows[pos[k ].r][pos[k ].c] = 'o'; // head
+    rows[pos[k2].r][pos[k2].c] = '*'; // tail
 }
 
 struct CandidateStats {
@@ -1013,11 +970,9 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
         const double   hps   = ui->hps_smooth.load();
         const double   eta   = (hps > 0.0 && round_expect > done) ? (round_expect - done)/hps : std::numeric_limits<double>::infinity();
 
-        // Build multi-line circular spinner (independent of ETA)
-        std::array<std::string,5> spin_rows_ascii;
-        std::array<std::string,5> spin_rows_utf8;
-        spinner_circle_frame(spin_idx, spin_rows_ascii, /*ascii_fallback=*/true);
-        spinner_circle_frame(spin_idx, spin_rows_utf8,  /*ascii_fallback=*/false);
+        // Build multi-line ASCII circular spinner (independent of ETA)
+        std::array<std::string,5> spin_rows;
+        spinner_circle_ascii(spin_idx, spin_rows);
         ++spin_idx;
 
         // Compose panel lines (10 lines total for nicer layout)
@@ -1027,15 +982,11 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
         lines.push_back("  #"+center_fit("MINING IN PROGRESS", inner)+"#   #"+center_fit("CHRONEN  MINER", inner)+"#");
         lines.push_back("  #                            #   #                            #");
 
-        // choose utf8 spinner if ANSI/color on (good proxy), else ASCII
-        bool use_utf8 = true; // default to pretty spinner
-        // (If needed, you can flip this to false for strict-ASCII environments.)
-        const auto& S = use_utf8 ? spin_rows_utf8 : spin_rows_ascii;
         for(int r=0;r<5;r++){
-            lines.push_back("  #"+center_fit(S[r], inner)+"#   #"+center_fit("                    ", inner)+"#");
+            lines.push_back("  #"+center_fit(spin_rows[r], inner)+"#   #"+center_fit("                    ", inner)+"#");
         }
 
-        // ETA line (kept) — no progress percentage or bar
+        // ETA line (kept) — independent from loader animation
         std::string eta_line = std::string("   ETA ~ ") + fmt_eta(eta);
         lines.push_back("  #"+pad_fit(eta_line, inner)+"#   #"+center_fit("                    ", inner)+"#");
         lines.push_back("  ##############################   ##############################");
