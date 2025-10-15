@@ -79,6 +79,7 @@ static const char* kChronenMinerBanner[] = {
 
 // ===== helpers ===============================================================
 static const uint64_t MIQ_COIN_UNITS = 100000000ULL; // 1 MIQ = 1e8 base units
+static uint32_t kCoinbaseMaturity = 100; // adjust if your chain uses a different value
 
 static inline void trim(std::string& s){
     size_t i=0,j=s.size();
@@ -802,8 +803,16 @@ struct UIState {
     std::atomic<uint64_t> round_start_tries{0};
     std::atomic<double>   round_expected_hashes{0.0}; // D * 2^32 for current bits
 
-    // wallet totals
+    // wallet totals (authoritative if available)
     std::atomic<uint64_t> total_received_base{0};
+
+    // chain-scan fallback (index-free)
+    std::atomic<uint64_t> est_total_base{0};
+    std::atomic<uint64_t> est_matured_base{0};
+    std::atomic<uint64_t> est_scanned_height{0};
+    std::mutex            myblks_mtx;
+    std::set<uint64_t>    my_block_heights;               // heights we've recorded
+    std::vector<std::pair<uint64_t,uint64_t>> my_blocks;  // (height, reward_base)
 };
 
 static std::string fmt_hs(double v){
@@ -935,7 +944,22 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
             << "  " << C("2") << "(now " << fmt_hs(ui->hps_now.load()) << ")" << R() << "\n";
         out << "  " << C("1") << "network hashrate: " << R() << fmt_hs(ui->net_hashps.load()) << "\n";
         out << "  " << C("1") << "mined (session):  " << R() << ui->mined_blocks.load() << "\n";
-        out << "  " << C("1") << "paid to address:  " << R() << fmt_miq_amount(ui->total_received_base.load()) << "\n";
+
+        // Primary display: RPC wallet/index total if available
+        out << "  " << C("1") << "paid to address:  " << R()
+            << fmt_miq_amount(ui->total_received_base.load());
+        // Fallback: estimate from chain scan when RPC total is zero
+        {
+            uint64_t estTot = ui->est_total_base.load();
+            if (ui->total_received_base.load() == 0 && estTot > 0) {
+                out << "  " << C("2")
+                    << "  (est. " << fmt_miq_amount(estTot)
+                    << " | matured " << fmt_miq_amount(ui->est_matured_base.load())
+                    << ")"
+                    << R();
+            }
+        }
+        out << "\n";
 
         // Winner status
         if(ui->last_seen_height.load() == th){
@@ -1245,7 +1269,7 @@ int main(int argc, char** argv){
         std::thread ui_th([&](){ draw_ui_loop(addr, threads, &ui, &running); });
         ui_th.detach();
 
-        // watch tip + network hps + last block (also determines winner) + wallet total
+        // watch tip + network hps + last block (also determines winner) + wallet total + chain-scan fallback
         std::thread watch([&](){
             uint64_t last_seen_h = 0;
             int tick=0;
@@ -1277,9 +1301,59 @@ int main(int argc, char** argv){
                         }
                         last_seen_h = t.height;
                     }
+
+                    // ==== Chain-scan fallback (no wallet/index required) ====
+                    {
+                        const uint64_t tip = ui.tip_height.load();
+                        uint64_t next_h = ui.est_scanned_height.load();
+                        if (next_h == 0) next_h = 1; // start at height 1
+                        const uint64_t CHUNK = 128;  // scan up to 128 heights per pass
+                        uint64_t end_h = (tip > 0) ? std::min(tip, next_h + CHUNK - 1) : 0;
+
+                        if (end_h >= next_h) {
+                            std::vector<std::pair<uint64_t,uint64_t>> newly_mined; // (h, reward)
+                            newly_mined.reserve(CHUNK);
+
+                            for (uint64_t h = next_h; h <= end_h; ++h) {
+                                LastBlockInfo lb{};
+                                if (!rpc_getblock_overview(rpc_host, rpc_port, token, h, lb)) continue;
+                                (void)rpc_getcoinbaserecipient(rpc_host, rpc_port, token, h, lb);
+
+                                if (!lb.coinbase_pkh.empty() && lb.coinbase_pkh == ui.my_pkh) {
+                                    uint64_t expected = GetBlockSubsidy((uint32_t)h);
+                                    uint64_t reward_base = expected;
+                                    if (lb.reward_value) reward_base = normalize_to_expected(lb.reward_value, expected);
+                                    newly_mined.emplace_back(h, reward_base);
+                                }
+                            }
+
+                            if (!newly_mined.empty()) {
+                                std::lock_guard<std::mutex> lk(ui.myblks_mtx);
+                                for (auto& p : newly_mined) {
+                                    if (ui.my_block_heights.insert(p.first).second) {
+                                        ui.my_blocks.push_back(p);
+                                    }
+                                }
+                            }
+
+                            ui.est_scanned_height.store(end_h + 1);
+
+                            uint64_t est_total = 0, est_matured = 0;
+                            {
+                                std::lock_guard<std::mutex> lk(ui.myblks_mtx);
+                                for (const auto& pr : ui.my_blocks) {
+                                    est_total += pr.second;
+                                    if (pr.first + kCoinbaseMaturity <= tip) est_matured += pr.second;
+                                }
+                            }
+                            ui.est_total_base.store(est_total);
+                            ui.est_matured_base.store(est_matured);
+                        }
+                    }
+                    // =======================================================
                 }
 
-                // Every ~10s, refresh "paid to address"
+                // Every ~10s, refresh "paid to address" via RPC (authoritative if wallet/index supports it)
                 if((++tick % 10)==0){
                     uint64_t tot=0;
                     if(rpc_get_received_total_baseunits(rpc_host, rpc_port, token, pkh_to_address(ui.my_pkh), tot)){
