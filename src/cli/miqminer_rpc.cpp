@@ -69,13 +69,6 @@ static inline const char* CLS(){ return g_use_ansi ? "\x1b[2J\x1b[H" : ""; }
 
 // BIG ASCII banner (ASCII-only). Print it wrapped with C("36;1") for cyan bold.
 static const char* kChronenMinerBanner[] = {
-"   _____ _                      _                              __  __ _                         ",
-"  / ____| |                    | |                            |  \\/  (_)                        ",
-" | |     | |__   ___  _ __  ___| | ___   __ _ _ __   ___      | \\  / |_ _ __   ___ ___          ",
-" | |     | '_ \\ / _ \\| '_ \\/ __| |/ _ \\ / _` | '_ \\ / _ \\     | |\\/| | | '_ \\ / __/ _ \\         ",
-" | |____ | | | | (_) | | | \\__ \\ | (_) | (_| | | | |  __/     | |  | | | | | | (_|  __/         ",
-"  \\_____|_| |_|\\___/|_| |_|___/_|\\___/ \\__,_|_| |_|\\___|     |_|  |_|_|_| |_|\\___\\___|         ",
-"                                                                                                ",
 "  __  __ _                                                                                      ",
 " |  \\/  (_)                                                                                     ",
 " | \\  / |_ _ __   ___ ___                                                                       ",
@@ -658,6 +651,10 @@ struct UIState {
     // sparkline buffer
     std::mutex spark_mtx;
     std::vector<double> sparkline;
+
+    // progress (per-template "round")
+    std::atomic<uint64_t> round_start_tries{0};
+    std::atomic<double>   round_expected_hashes{0.0}; // D * 2^32 for current bits
 };
 
 static std::string fmt_hs(double v){
@@ -679,6 +676,44 @@ static std::string spark_ascii(const std::vector<double>& xs){
     }
     return s;
 }
+static inline std::string pad_fit(const std::string& s, size_t width){
+    if(s.size() >= width) return s.substr(0, width);
+    return s + std::string(width - s.size(), ' ');
+}
+static inline std::string center_fit(const std::string& s, size_t width){
+    if(s.size() >= width) return s.substr(0, width);
+    size_t left = (width - s.size())/2;
+    size_t right = width - s.size() - left;
+    return std::string(left,' ') + s + std::string(right,' ');
+}
+static std::string progress_bar_ascii(double ratio, int inner_width){
+    if(inner_width < 4) inner_width = 4;
+    int bar_width = inner_width - 2; // for [ ]
+    if(bar_width < 1) bar_width = 1;
+    if(ratio < 0.0) ratio = 0.0;
+    double r = ratio;
+    if(r > 1.0) r = 1.0;
+    int filled = (int)std::floor(r * bar_width);
+    if(filled > bar_width) filled = bar_width;
+    std::string bar = "[";
+    bar += std::string(filled, '#');
+    if(filled < bar_width) bar += ">";
+    if(filled+1 < bar_width) bar += std::string(bar_width - filled - 1, '.');
+    bar += "]";
+    return bar;
+}
+static std::string fmt_eta(double seconds){
+    if(!std::isfinite(seconds) || seconds <= 0) return std::string("--:--");
+    long long s = (long long)std::llround(seconds);
+    long long h = s / 3600; s %= 3600;
+    long long m = s / 60;   s %= 60;
+    std::ostringstream o;
+    if(h>0) o << h << ":" << std::setw(2) << std::setfill('0') << m
+              << ":" << std::setw(2) << std::setfill('0') << s;
+    else    o << std::setw(2) << std::setfill('0') << m
+              << ":" << std::setw(2) << std::setfill('0') << s;
+    return o.str();
+}
 
 // ===== UI draw loop ==========================================================
 static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui, const std::atomic<bool>* running){
@@ -691,6 +726,10 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
     using clock = std::chrono::steady_clock;
     const int FPS = 12;
     const auto frame_dt = std::chrono::milliseconds(1000/FPS);
+    const int inner = 28; // inner width of each cyan box
+
+    int spin_idx = 0;
+    const char sp[4] = {'|','/','-','\\'};
 
     while(running->load(std::memory_order_relaxed)){
         std::ostringstream out;
@@ -796,19 +835,43 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
             }
         }
 
-        // Decorative panel with MINING IN PROGRESS + Chronen label to the right
-        out << "\n";
-        static const char* box[8] = {
-            "  ##############################   ##############################",
-            "  #                            #   #                            #",
-            "  #      MINING IN PROGRESS    #   #      CHRONEN  MINER        #",
-            "  #                            #   #                            #",
-            "  #      ::::::::::::::::::    #   #      ::::::::::::::::::    #",
-            "  #                            #   #                            #",
-            "  #                            #   #                            #",
-            "  ##############################   ##############################",
-        };
-        for(int i=0;i<8;i++) out << C("36") << box[i] << R() << "\n";
+        // === Dual cyan panel with LIVE PROGRESS BAR on the left =================
+        // Progress model: hashes tried since template start vs expected hashes (D*2^32).
+        const uint64_t tries_now = ui->tries_total.load();
+        const uint64_t round_start = ui->round_start_tries.load();
+        const double   round_expect = ui->round_expected_hashes.load();
+        const double   done = (tries_now >= round_start) ? (double)(tries_now - round_start) : 0.0;
+        const double   ratio = (round_expect > 0.0) ? (done / round_expect) : 0.0;
+        const double   hps   = ui->hps_smooth.load();
+        const double   eta   = (hps > 0.0 && round_expect > done) ? (round_expect - done)/hps : std::numeric_limits<double>::infinity();
+
+        char spin = sp[spin_idx & 3];
+        ++spin_idx;
+
+        // Build 8 lines (each has left and right box segments)
+        std::string lines[8];
+        lines[0] = "  ##############################   ##############################";
+        lines[1] = "  #"+std::string(inner,' ')+"#   #"+std::string(inner,' ')+"#";
+        lines[2] = "  #"+center_fit("MINING IN PROGRESS", inner)+"#   #"+center_fit("CHRONEN  MINER", inner)+"#";
+
+        {
+            std::string bar = progress_bar_ascii(ratio, 24); // "[####....]"  (24 incl brackets)
+            std::string left = "  " + bar + "  " + spin;
+            lines[3] = "  #"+pad_fit(left, inner)+"#   #"+center_fit("::::::::::::::::::::", inner)+"#";
+        }
+        {
+            double pct = ratio * 100.0;
+            std::ostringstream pct_s;
+            if(pct < 100.0) pct_s<<std::fixed<<std::setprecision(1)<<pct<<"%";
+            else            pct_s<<"100%+";
+            std::string left = "   " + pct_s.str() + "  ETA ~ " + fmt_eta(eta);
+            lines[4] = "  #"+pad_fit(left, inner)+"#   #"+center_fit("::::::::::::::::::::", inner)+"#";
+        }
+        lines[5] = "  #"+std::string(inner,' ')+"#   #"+std::string(inner,' ')+"#";
+        lines[6] = "  #"+std::string(inner,' ')+"#   #"+std::string(inner,' ')+"#";
+        lines[7] = "  ##############################   ##############################";
+
+        for(int i=0;i<8;i++) out << C("36") << lines[i] << R() << "\n";
 
         out << "\n  Press Ctrl+C to quit.\n";
 
@@ -1177,6 +1240,10 @@ int main(int argc, char** argv){
                 ui.cand.fees = fees;
                 ui.cand.coinbase = GetBlockSubsidy((uint32_t)tpl.height) + fees;
             }
+
+            // reset progress round for this template
+            ui.round_start_tries.store(ui.tries_total.load());
+            ui.round_expected_hashes.store(difficulty_from_bits(tpl.bits) * 4294967296.0); // D * 2^32
 
             // header base
             BlockHeader hb;
