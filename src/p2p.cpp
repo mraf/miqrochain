@@ -1254,8 +1254,15 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 
     sockaddr_in a{}; int alen = (int)sizeof(a);
     char ipbuf[64] = {0};
-    if (getpeername(s, (sockaddr*)&a, &alen) == 0) InetNtopA(AF_INET, &a.sin_addr, ipbuf, (int)sizeof(ipbuf));
-    freeaddrinfo(res);
+      if (getpeername(s, (sockaddr*)&a, &alen) == 0) InetNtopA(AF_INET, &a.sin_addr, ipbuf, (int)sizeof(ipbuf));
+    // NEW: avoid hairpin outbound to our own external IP (Windows path)
+      if (is_self_endpoint(s, g_listen_port)) {
+        P2P_TRACE("reject hairpin outbound (seed)");
+        CLOSESOCK(s);
+        freeaddrinfo(res);
+        return false;
+    }
+      freeaddrinfo(res);
 #else
     addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
     addrinfo* res = nullptr;
@@ -1297,6 +1304,13 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     sockaddr_in a{}; socklen_t alen = static_cast<socklen_t>(sizeof(a));
     char ipbuf[64] = {0};
     if (getpeername(s, (sockaddr*)&a, &alen) == 0) inet_ntop(AF_INET, &a.sin_addr, ipbuf, (socklen_t)sizeof(ipbuf));
+    // NEW: avoid hairpin outbound to our own external IP (POSIX path)
+    if (is_self_endpoint(s, g_listen_port)) {
+        P2P_TRACE("reject hairpin outbound (seed)");
+        CLOSESOCK(s);
+        freeaddrinfo(res);
+        return false;
+    }
     freeaddrinfo(res);
 #endif
     g_seed_backoff.erase(host);
