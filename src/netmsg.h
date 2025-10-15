@@ -13,7 +13,7 @@
 // TEMP: while the network upgrades, send legacy frames by default.
 // Flip to 0 later to enforce the new header (magic+checksum) on the wire.
 #ifndef MIQ_WIRE_LEGACY_SEND
-#define MIQ_WIRE_LEGACY_SEND 0
+#define MIQ_WIRE_LEGACY_SEND 1
 #endif
 
 #ifndef MAX_MSG_SIZE
