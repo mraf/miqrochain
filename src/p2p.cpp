@@ -311,7 +311,7 @@ static std::unordered_map<Sock, PeerGate> g_gate;
 // Tunables (local to this TU)
 static const size_t MAX_MSG_BYTES = 2 * 1024 * 1024; // 2 MiB per message (soft)
 static const int    MAX_BANSCORE  = MIQ_P2P_MAX_BANSCORE;
-static const int    HANDSHAKE_MS  = 5000;
+static const int    HANDSHAKE_MS  = 10000;
 
 // IBD phase logging flags
 static bool g_logged_headers_started = false;
