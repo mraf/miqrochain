@@ -67,7 +67,7 @@ static inline std::string C(const char* code){ return g_use_ansi ? std::string("
 static inline std::string R(){ return g_use_ansi ? std::string("\x1b[0m") : std::string(); }
 static inline const char* CLS(){ return g_use_ansi ? "\x1b[2J\x1b[H" : ""; }
 
-// BIG ASCII banner (ASCII-only). Print it wrapped with C("36;1") for cyan bold.
+// BIG ASCII banner (cyan). This spells MiQ.
 static const char* kChronenMinerBanner[] = {
 "  __  __ _                                                                                      ",
 " |  \\/  (_)                                                                                     ",
@@ -484,6 +484,117 @@ static void rpc_minerlog_best_effort(const std::string& host, uint16_t port, con
     (void)http_post(host, port, "/", auth, rpc_build("minerlog", ps.str()), r);
 }
 
+// === Lifetime total received to address (best-effort) ========================
+static bool rpc_result_double(const std::string& host, uint16_t port, const std::string& auth,
+                              const std::string& method, const std::string& params, double& outd){
+    HttpResp r;
+    if(!http_post(host, port, "/", auth, rpc_build(method, params), r) || r.code!=200) return false;
+    if(json_has_error(r.body)) return false;
+    return json_find_double(r.body, "result", outd);
+}
+static bool rpc_result_u64_by_key(const std::string& host, uint16_t port, const std::string& auth,
+                                  const std::string& method, const std::string& params,
+                                  const std::string& key, uint64_t& outv){
+    HttpResp r;
+    if(!http_post(host, port, "/", auth, rpc_build(method, params), r) || r.code!=200) return false;
+    if(json_has_error(r.body)) return false;
+    long long v=0;
+    if(json_find_number(r.body, key, v)){ outv = (v<0?0:(uint64_t)v); return true; }
+    return false;
+}
+
+// choose a scaling of raw -> base units close to expected (handles 0.1×/1×/10× etc)
+static uint64_t normalize_to_expected(uint64_t raw, uint64_t expected){
+    if(raw==0 || expected==0) return raw;
+    const long double R = (long double)raw;
+    const long double E = (long double)expected;
+    const long double UNIT = (long double)MIQ_COIN_UNITS;
+
+    const long double muls[] = {
+        1.0L,
+        UNIT,              // coins -> base
+        UNIT/10.0L,        // deci-coin -> base (fixes 5 -> 50 case)
+        UNIT*10.0L,        // 10-coins -> base
+        10.0L, 100.0L,     // raw likely centi/milli base
+        0.1L, 0.01L
+    };
+    long double best_val = R;
+    long double best_err = fabsl(E - R);
+    for(long double m : muls){
+        long double v = R * m;
+        long double err = fabsl(E - v);
+        if(err < best_err){ best_err = err; best_val = v; }
+    }
+    if(best_val < 0) return 0;
+    long double mx = (long double)std::numeric_limits<uint64_t>::max();
+    if(best_val > mx) return std::numeric_limits<uint64_t>::max();
+    return (uint64_t) llround(best_val);
+}
+
+static bool rpc_get_received_total_baseunits(const std::string& host, uint16_t port, const std::string& auth,
+                                             const std::string& address, uint64_t& out_base)
+{
+    // 1) Core-like: getreceivedbyaddress returns coins (double)
+    {
+        double d=0.0;
+        std::ostringstream ps; ps << "[\"" << address << "\",0]";
+        if(rpc_result_double(host,port,auth,"getreceivedbyaddress",ps.str(),d)){
+            long double v = (long double)d * (long double)MIQ_COIN_UNITS;
+            if(v < 0) v = 0;
+            long double mx = (long double)std::numeric_limits<uint64_t>::max();
+            if(v > mx) v = mx;
+            out_base = (uint64_t) llround(v);
+            return true;
+        }
+    }
+    {
+        double d=0.0;
+        std::ostringstream ps; ps << "[\"" << address << "\"]";
+        if(rpc_result_double(host,port,auth,"getreceivedbyaddress",ps.str(),d)){
+            long double v = (long double)d * (long double)MIQ_COIN_UNITS;
+            if(v < 0) v = 0;
+            long double mx = (long double)std::numeric_limits<uint64_t>::max();
+            if(v > mx) v = mx;
+            out_base = (uint64_t) llround(v);
+            return true;
+        }
+    }
+    // 2) Address-index style: getaddressbalance {"addresses":[...]} -> "balance" (base units)
+    {
+        uint64_t bal=0;
+        std::ostringstream ps; ps << "[{\"addresses\":[\"" << address << "\"]}]";
+        if(rpc_result_u64_by_key(host,port,auth,"getaddressbalance",ps.str(),"balance",bal)){
+            out_base = bal; return true;
+        }
+    }
+    // 3) Fallbacks that sometimes return base units directly under "result"
+    {
+        double d=0.0; std::ostringstream ps; ps << "[\"" << address << "\"]";
+        if(rpc_result_double(host,port,auth,"getaddressreceived",ps.str(),d) ||
+           rpc_result_double(host,port,auth,"getaddrreceived",ps.str(),d)    ||
+           rpc_result_double(host,port,auth,"getreceived",ps.str(),d)        ||
+           rpc_result_double(host,port,auth,"getaddresstotalreceived",ps.str(),d))
+        {
+            if(d > 1e6) { // likely already in base units
+                long double v = d;
+                if(v < 0) v = 0;
+                long double mx = (long double)std::numeric_limits<uint64_t>::max();
+                if(v > mx) v = mx;
+                out_base = (uint64_t) llround(v);
+                return true;
+            } else {
+                long double v = (long double)d * (long double)MIQ_COIN_UNITS;
+                if(v < 0) v = 0;
+                long double mx = (long double)std::numeric_limits<uint64_t>::max();
+                if(v > mx) v = mx;
+                out_base = (uint64_t) llround(v);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 // ===== template & txs ========================================================
 struct MinerTemplate {
     uint64_t height{0};
@@ -566,7 +677,7 @@ static std::string pkh_to_address(const std::vector<uint8_t>& pkh){
 }
 static std::string fmt_miq_amount(uint64_t base_units){
     std::ostringstream o;
-    // Prefer 2dp (aesthetic) when exact; else show up to 8dp
+    // Prefer 2dp when exact; else up to 8dp
     if (base_units % (MIQ_COIN_UNITS/100) == 0){
         uint64_t whole = base_units / MIQ_COIN_UNITS;
         uint64_t cents = (base_units / (MIQ_COIN_UNITS/100)) % 100;
@@ -607,6 +718,84 @@ static std::vector<uint8_t> merkle_from(const std::vector<Transaction>& txs){
 }
 
 // ===== UI/state ==============================================================
+// High-quality looping circle spinner (Unicode with ASCII fallback)
+static void spinner_circle_frame(int phase, std::array<std::string,5>& rows, bool ascii_fallback=false){
+    const int H=5, W=13; // nice ring in 5x13
+    std::array<std::string,5> g{
+        std::string(W,' '),
+        std::string(W,' '),
+        std::string(W,' '),
+        std::string(W,' '),
+        std::string(W,' ')
+    };
+    const char* dimU = "·";  // Unicode faint dot
+    const char* hiU  = "●";  // Unicode solid dot
+    char dimA = '.';
+    char hiA  = 'O';
+    // 8 ring positions around center (2D)
+    struct P{ int r,c; };
+    static const P pos[8] = {
+        {0,6}, // top
+        {1,9}, // up-right
+        {2,12},// right
+        {3,9}, // down-right
+        {4,6}, // bottom
+        {3,3}, // down-left
+        {2,0}, // left
+        {1,3}  // up-left
+    };
+    // Place dim at all ring positions
+    for(int i=0;i<8;i++){
+        int r=pos[i].r, c=pos[i].c;
+        if(ascii_fallback){ g[r][c]=dimA; }
+        else{
+            // write UTF-8 one-byte? (●/· are 3-byte). We'll build via replace at c with single char cell approximation:
+            // To keep column counts stable, we store a single-byte placeholder and then post-replace; but console width varies.
+            // Simpler: embed directly since we're inside a centered field. We'll build per-row strings manually.
+        }
+    }
+    // Since UTF-8 glyphs are multi-byte, build rows explicitly with placeholders
+    if(!ascii_fallback){
+        // Start with spaces
+        rows = {
+            "             ",
+            "             ",
+            "             ",
+            "             ",
+            "             "
+        };
+        auto put = [&](int r,int c,const char* s){
+            // c is cell index (0..12), we map to char offset by counting cells with monospaced assumption
+            // Build using substrings since rows[r] is plain ASCII now; we replace 1 char with 3-byte glyph by inserting
+            std::string& line = rows[r];
+            // map: left part length c, we replace position with glyph; keep total visual width acceptable as we're centering
+            line.replace(c, 1, s);
+        };
+        // first set dims
+        for(int i=0;i<8;i++) put(pos[i].r,pos[i].c,dimU);
+        // highlight current
+        const P ph = pos[phase & 7];
+        put(ph.r, ph.c, hiU);
+        return;
+    }else{
+        // ASCII mode rows
+        rows = {
+            "             ",
+            "             ",
+            "             ",
+            "             ",
+            "             "
+        };
+        auto putA = [&](int r,int c,char ch){
+            rows[r][c]=ch;
+        };
+        for(int i=0;i<8;i++) putA(pos[i].r,pos[i].c,dimA);
+        const P ph = pos[phase & 7];
+        putA(ph.r,ph.c,hiA);
+        return;
+    }
+}
+
 struct CandidateStats {
     uint64_t height{0};
     std::string prev_hex;
@@ -655,6 +844,9 @@ struct UIState {
     // progress (per-template "round")
     std::atomic<uint64_t> round_start_tries{0};
     std::atomic<double>   round_expected_hashes{0.0}; // D * 2^32 for current bits
+
+    // wallet totals
+    std::atomic<uint64_t> total_received_base{0};
 };
 
 static std::string fmt_hs(double v){
@@ -686,22 +878,6 @@ static inline std::string center_fit(const std::string& s, size_t width){
     size_t right = width - s.size() - left;
     return std::string(left,' ') + s + std::string(right,' ');
 }
-static std::string progress_bar_ascii(double ratio, int inner_width){
-    if(inner_width < 4) inner_width = 4;
-    int bar_width = inner_width - 2; // for [ ]
-    if(bar_width < 1) bar_width = 1;
-    if(ratio < 0.0) ratio = 0.0;
-    double r = ratio;
-    if(r > 1.0) r = 1.0;
-    int filled = (int)std::floor(r * bar_width);
-    if(filled > bar_width) filled = bar_width;
-    std::string bar = "[";
-    bar += std::string(filled, '#');
-    if(filled < bar_width) bar += ">";
-    if(filled+1 < bar_width) bar += std::string(bar_width - filled - 1, '.');
-    bar += "]";
-    return bar;
-}
 static std::string fmt_eta(double seconds){
     if(!std::isfinite(seconds) || seconds <= 0) return std::string("--:--");
     long long s = (long long)std::llround(seconds);
@@ -729,13 +905,12 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
     const int inner = 28; // inner width of each cyan box
 
     int spin_idx = 0;
-    const char sp[4] = {'|','/','-','\\'};
 
     while(running->load(std::memory_order_relaxed)){
         std::ostringstream out;
         out << CLS();
 
-        // Brand banner (cyan)
+        // BIG cyan banner (MiQ)
         out << C("36;1");
         const size_t kBannerN = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
         for(size_t i=0;i<kBannerN;i++) out << "  " << kChronenMinerBanner[i] << "\n";
@@ -786,18 +961,12 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
                 out << "                     paid to: " << winner
                     << "  (pkh=" << to_hex_s(lb.coinbase_pkh) << ")\n";
 
-                // Expected vs node-reported (normalize unknown units)
+                // Expected vs node-reported (normalize strange units)
                 uint64_t expected = GetBlockSubsidy((uint32_t)lb.height);
                 if(lb.reward_value){
-                    uint64_t as_base = lb.reward_value;
-                    uint64_t as_from_miq = (lb.reward_value > (UINT64_MAX/MIQ_COIN_UNITS)) ? UINT64_MAX
-                                           : lb.reward_value * MIQ_COIN_UNITS;
-                    uint64_t diff_base = (expected > as_base) ? (expected - as_base) : (as_base - expected);
-                    uint64_t diff_miq  = (expected > as_from_miq) ? (expected - as_from_miq) : (as_from_miq - expected);
-                    uint64_t chosen = (diff_miq < diff_base) ? as_from_miq : as_base;
-
+                    uint64_t normalized = normalize_to_expected(lb.reward_value, expected);
                     out << "                     reward: expected " << fmt_miq_amount(expected)
-                        << "  |  node reported " << fmt_miq_amount(chosen) << "\n";
+                        << "  |  node reported " << fmt_miq_amount(normalized) << "\n";
                 }else{
                     out << "                     reward: expected " << fmt_miq_amount(expected) << "\n";
                 }
@@ -809,6 +978,7 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
             << "  " << C("2") << "(now " << fmt_hs(ui->hps_now.load()) << ")" << R() << "\n";
         out << "  " << C("1") << "network hashrate: " << R() << fmt_hs(ui->net_hashps.load()) << "\n";
         out << "  " << C("1") << "mined (session):  " << R() << ui->mined_blocks.load() << "\n";
+        out << "  " << C("1") << "paid to address:  " << R() << fmt_miq_amount(ui->total_received_base.load()) << "\n";
 
         // Winner status
         if(ui->last_seen_height.load() == th){
@@ -835,43 +1005,42 @@ static void draw_ui_loop(const std::string& addr, unsigned threads, UIState* ui,
             }
         }
 
-        // === Dual cyan panel with LIVE PROGRESS BAR on the left =================
-        // Progress model: hashes tried since template start vs expected hashes (D*2^32).
+        // === Dual cyan panel with LOOPING CIRCLE LOADER on the left ===========
         const uint64_t tries_now = ui->tries_total.load();
         const uint64_t round_start = ui->round_start_tries.load();
         const double   round_expect = ui->round_expected_hashes.load();
         const double   done = (tries_now >= round_start) ? (double)(tries_now - round_start) : 0.0;
-        const double   ratio = (round_expect > 0.0) ? (done / round_expect) : 0.0;
         const double   hps   = ui->hps_smooth.load();
         const double   eta   = (hps > 0.0 && round_expect > done) ? (round_expect - done)/hps : std::numeric_limits<double>::infinity();
 
-        char spin = sp[spin_idx & 3];
+        // Build multi-line circular spinner (independent of ETA)
+        std::array<std::string,5> spin_rows_ascii;
+        std::array<std::string,5> spin_rows_utf8;
+        spinner_circle_frame(spin_idx, spin_rows_ascii, /*ascii_fallback=*/true);
+        spinner_circle_frame(spin_idx, spin_rows_utf8,  /*ascii_fallback=*/false);
         ++spin_idx;
 
-        // Build 8 lines (each has left and right box segments)
-        std::string lines[8];
-        lines[0] = "  ##############################   ##############################";
-        lines[1] = "  #"+std::string(inner,' ')+"#   #"+std::string(inner,' ')+"#";
-        lines[2] = "  #"+center_fit("MINING IN PROGRESS", inner)+"#   #"+center_fit("CHRONEN  MINER", inner)+"#";
+        // Compose panel lines (10 lines total for nicer layout)
+        std::vector<std::string> lines;
+        lines.push_back("  ##############################   ##############################");
+        lines.push_back("  #                            #   #                            #");
+        lines.push_back("  #"+center_fit("MINING IN PROGRESS", inner)+"#   #"+center_fit("CHRONEN  MINER", inner)+"#");
+        lines.push_back("  #                            #   #                            #");
 
-        {
-            std::string bar = progress_bar_ascii(ratio, 24); // "[####....]"  (24 incl brackets)
-            std::string left = "  " + bar + "  " + spin;
-            lines[3] = "  #"+pad_fit(left, inner)+"#   #"+center_fit("::::::::::::::::::::", inner)+"#";
+        // choose utf8 spinner if ANSI/color on (good proxy), else ASCII
+        bool use_utf8 = true; // default to pretty spinner
+        // (If needed, you can flip this to false for strict-ASCII environments.)
+        const auto& S = use_utf8 ? spin_rows_utf8 : spin_rows_ascii;
+        for(int r=0;r<5;r++){
+            lines.push_back("  #"+center_fit(S[r], inner)+"#   #"+center_fit("                    ", inner)+"#");
         }
-        {
-            double pct = ratio * 100.0;
-            std::ostringstream pct_s;
-            if(pct < 100.0) pct_s<<std::fixed<<std::setprecision(1)<<pct<<"%";
-            else            pct_s<<"100%+";
-            std::string left = "   " + pct_s.str() + "  ETA ~ " + fmt_eta(eta);
-            lines[4] = "  #"+pad_fit(left, inner)+"#   #"+center_fit("::::::::::::::::::::", inner)+"#";
-        }
-        lines[5] = "  #"+std::string(inner,' ')+"#   #"+std::string(inner,' ')+"#";
-        lines[6] = "  #"+std::string(inner,' ')+"#   #"+std::string(inner,' ')+"#";
-        lines[7] = "  ##############################   ##############################";
 
-        for(int i=0;i<8;i++) out << C("36") << lines[i] << R() << "\n";
+        // ETA line (kept) — no progress percentage or bar
+        std::string eta_line = std::string("   ETA ~ ") + fmt_eta(eta);
+        lines.push_back("  #"+pad_fit(eta_line, inner)+"#   #"+center_fit("                    ", inner)+"#");
+        lines.push_back("  ##############################   ##############################");
+
+        for(const auto& L : lines) out << C("36") << L << R() << "\n";
 
         out << "\n  Press Ctrl+C to quit.\n";
 
@@ -1125,9 +1294,10 @@ int main(int argc, char** argv){
         std::thread ui_th([&](){ draw_ui_loop(addr, threads, &ui, &running); });
         ui_th.detach();
 
-        // watch tip + network hps + last block (also determines winner)
+        // watch tip + network hps + last block (also determines winner) + wallet total
         std::thread watch([&](){
             uint64_t last_seen_h = 0;
+            int tick=0;
             while(running.load()){
                 TipInfo t;
                 if(rpc_gettipinfo(rpc_host, rpc_port, token, t)){
@@ -1157,6 +1327,15 @@ int main(int argc, char** argv){
                         last_seen_h = t.height;
                     }
                 }
+
+                // Every ~10s, refresh "paid to address"
+                if((++tick % 10)==0){
+                    uint64_t tot=0;
+                    if(rpc_get_received_total_baseunits(rpc_host, rpc_port, token, pkh_to_address(ui.my_pkh), tot)){
+                        ui.total_received_base.store(tot);
+                    }
+                }
+
                 for(int i=0;i<10;i++) miq_sleep_ms(100); // ~1s
             }
         });
