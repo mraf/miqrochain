@@ -287,6 +287,148 @@
   #define CLOSESOCK(s) close(s)
 #endif
 
+// ----- IPv6/IPv4 literal + hostname resolver (drop-in, no new files) -------
+struct MiqEndpoint {
+    sockaddr_storage ss{};
+#ifdef _WIN32
+    int len = 0;
+#else
+    socklen_t len = 0;
+#endif
+};
+
+static inline std::string miq_trim(const std::string& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && (unsigned char)s[a] <= ' ') ++a;
+    while (b > a && (unsigned char)s[b-1] <= ' ') --b;
+    return s.substr(a, b - a);
+}
+
+// Parse host[:port], [v6]:port, [v6], v6, v4, hostname → (host,port)
+static bool miq_parse_host_port(const std::string& in_raw, std::string& host, uint16_t& port_out, uint16_t default_port) {
+    std::string in = miq_trim(in_raw);
+    host.clear(); port_out = default_port;
+    if (in.empty()) return false;
+
+    if (in.front() == '[') { // [v6] or [v6]:port
+        auto rb = in.find(']');
+        if (rb == std::string::npos) return false;
+        host = in.substr(1, rb - 1);
+        if (rb + 1 < in.size() && in[rb + 1] == ':') {
+            std::string p = in.substr(rb + 2);
+            if (!p.empty()) port_out = static_cast<uint16_t>(std::stoi(p));
+        }
+        return true;
+    }
+
+    // More than one ':' => bare IPv6 literal (no port)
+    size_t colons = std::count(in.begin(), in.end(), ':');
+    if (colons > 1) { host = in; return true; }
+
+    // hostname/v4 or host:port
+    auto pos = in.rfind(':');
+    if (pos != std::string::npos) {
+        host = in.substr(0, pos);
+        std::string p = in.substr(pos + 1);
+        if (!p.empty()) port_out = static_cast<uint16_t>(std::stoi(p));
+    } else {
+        host = in;
+    }
+    return true;
+}
+
+static bool miq_try_numeric_v6(const std::string& h, uint16_t port, MiqEndpoint& out) {
+    sockaddr_in6 a6{}; a6.sin6_family = AF_INET6; a6.sin6_port = htons(port);
+    if (inet_pton(AF_INET6, h.c_str(), &a6.sin6_addr) == 1) {
+        memcpy(&out.ss, &a6, sizeof(a6)); out.len =
+#ifdef _WIN32
+            (int)
+#endif
+            sizeof(a6);
+        return true;
+    }
+    return false;
+}
+static bool miq_try_numeric_v4(const std::string& h, uint16_t port, MiqEndpoint& out) {
+    sockaddr_in a4{}; a4.sin_family = AF_INET; a4.sin_port = htons(port);
+    if (inet_pton(AF_INET, h.c_str(), &a4.sin_addr) == 1) {
+        memcpy(&out.ss, &a4, sizeof(a4)); out.len =
+#ifdef _WIN32
+            (int)
+#endif
+            sizeof(a4);
+        return true;
+    }
+    return false;
+}
+
+static std::string miq_ntop_sockaddr(const sockaddr_storage& ss) {
+    char buf[128] = {0};
+    if (ss.ss_family == AF_INET6) {
+        const sockaddr_in6* a6 = reinterpret_cast<const sockaddr_in6*>(&ss);
+    #ifdef _WIN32
+        InetNtopA(AF_INET6, (void*)&a6->sin6_addr, buf, (int)sizeof(buf));
+    #else
+        inet_ntop(AF_INET6, (void*)&a6->sin6_addr, buf, (socklen_t)sizeof(buf));
+    #endif
+    } else if (ss.ss_family == AF_INET) {
+        const sockaddr_in* a4 = reinterpret_cast<const sockaddr_in*>(&ss);
+    #ifdef _WIN32
+        InetNtopA(AF_INET, (void*)&a4->sin_addr, buf, (int)sizeof(buf));
+    #else
+        inet_ntop(AF_INET, (void*)&a4->sin_addr, buf, (socklen_t)sizeof(buf));
+    #endif
+    }
+    return std::string(buf[0] ? buf : "unknown");
+}
+
+static bool miq_resolve_endpoints_from_string(const std::string& input, uint16_t default_port,
+                                              std::vector<MiqEndpoint>& out_eps)
+{
+    out_eps.clear();
+    std::string host; uint16_t port = default_port;
+    if (!miq_parse_host_port(input, host, port, default_port)) return false;
+
+    // Fast-path numeric literals
+    MiqEndpoint ep{};
+    if (miq_try_numeric_v6(host, port, ep)) { out_eps.push_back(ep); return true; }
+    if (miq_try_numeric_v4(host, port, ep)) { out_eps.push_back(ep); return true; }
+
+    // Hostname → both AAAA and A
+#ifdef _WIN32
+    ADDRINFOA hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_flags = AI_ADDRCONFIG;
+    PADDRINFOA res = nullptr;
+    int rc = getaddrinfo(host.c_str(), nullptr, &hints, &res);
+    if (rc != 0 || !res) return false;
+    for (auto p = res; p; p = p->ai_next) {
+        if (p->ai_family == AF_INET6 && p->ai_addrlen >= (int)sizeof(sockaddr_in6)) {
+            sockaddr_in6 a6{}; memcpy(&a6, p->ai_addr, sizeof(a6)); a6.sin6_port = htons(port);
+            MiqEndpoint ne{}; memcpy(&ne.ss, &a6, sizeof(a6)); ne.len = (int)sizeof(a6); out_eps.push_back(ne);
+        } else if (p->ai_family == AF_INET && p->ai_addrlen >= (int)sizeof(sockaddr_in)) {
+            sockaddr_in a4{}; memcpy(&a4, p->ai_addr, sizeof(a4)); a4.sin_port = htons(port);
+            MiqEndpoint ne{}; memcpy(&ne.ss, &a4, sizeof(a4)); ne.len = (int)sizeof(a4); out_eps.push_back(ne);
+        }
+    }
+    freeaddrinfo(res);
+#else
+    addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_flags = AI_ADDRCONFIG;
+    addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) return false;
+    for (addrinfo* p = res; p; p = p->ai_next) {
+        if (p->ai_family == AF_INET6 && p->ai_addrlen >= (socklen_t)sizeof(sockaddr_in6)) {
+            sockaddr_in6 a6{}; memcpy(&a6, p->ai_addr, sizeof(a6)); a6.sin6_port = htons(port);
+            MiqEndpoint ne{}; memcpy(&ne.ss, &a6, sizeof(a6)); ne.len = (socklen_t)sizeof(a6); out_eps.push_back(ne);
+        } else if (p->ai_family == AF_INET && p->ai_addrlen >= (socklen_t)sizeof(sockaddr_in)) {
+            sockaddr_in a4{}; memcpy(&a4, p->ai_addr, sizeof(a4)); a4.sin_port = htons(port);
+            MiqEndpoint ne{}; memcpy(&ne.ss, &a4, sizeof(a4)); ne.len = (socklen_t)sizeof(a4); out_eps.push_back(ne);
+        }
+    }
+    freeaddrinfo(res);
+#endif
+
+    return !out_eps.empty();
+}
+
 // p2p.h uses int for PeerState::sock and for map keys; we cast to Sock
 // where needed on Windows to avoid narrowing and keep WSAPOLLFD happy.
 
@@ -724,6 +866,12 @@ static Sock dial_be_ipv4(uint32_t be_ip, uint16_t port){
     return s;
 }
 
+// v6 loopback helper
+static inline bool is_loopback_v6(const in6_addr& a) {
+    static const uint8_t loop[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1}; // ::1
+    return std::memcmp(&a, loop, 16) == 0;
+}
+
 // Detect if an accepted fd is a clear self-hairpin (we dialed ourselves).
 static bool is_self_endpoint(Sock fd, uint16_t listen_port){
     sockaddr_storage peer{}, local{};
@@ -752,6 +900,16 @@ static bool is_self_endpoint(Sock fd, uint16_t listen_port){
             }
             return false;
         }
+    } else if (peer.ss_family == AF_INET6 && local.ss_family == AF_INET6) {
+        auto* p6 = (sockaddr_in6*)&peer;
+        auto* l6 = (sockaddr_in6*)&local;
+        if (is_loopback_v6(p6->sin6_addr)) return false; // allow ::1
+        // Conservative hairpin detect: same v6 address AND same port as our listener.
+        if (std::memcmp(&p6->sin6_addr, &l6->sin6_addr, sizeof(in6_addr)) == 0) {
+            if (ntohs(p6->sin6_port) == listen_port) {
+                return true;
+            }
+        }
     }
     return false;
 }
@@ -771,7 +929,6 @@ static std::string miq_miner_from_block(const miq::Block& b) {
 
 namespace miq {
 
-// === Legacy keyed helper (maps a few commands to families) ==================
 bool P2P::check_rate(PeerState& ps, const char* key) {
     if (!key) return true;
 
@@ -978,6 +1135,7 @@ namespace {
 }
 #endif
 
+// ---- server creation: IPv4 and IPv6 ----------------------------------------
 static Sock create_server(uint16_t port){
 #ifdef _WIN32
     Sock s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -989,6 +1147,23 @@ static Sock create_server(uint16_t port){
     int yes = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
     if (bind(s, (sockaddr*)&a, sizeof(a)) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
+    if (listen(s, SOMAXCONN) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
+    return s;
+}
+static Sock create_server_v6(uint16_t port){
+#ifdef _WIN32
+    Sock s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+#else
+    Sock s = socket(AF_INET6, SOCK_STREAM, 0);
+#endif
+    if (s == MIQ_INVALID_SOCK) return MIQ_INVALID_SOCK;
+    int yes = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+    // Prefer v6-only (we already have a v4 listener)
+    int v6only = 1;
+    setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&v6only, sizeof(v6only));
+    sockaddr_in6 a6{}; a6.sin6_family = AF_INET6; a6.sin6_addr = in6addr_any; a6.sin6_port = htons(port);
+    if (bind(s, (sockaddr*)&a6, sizeof(a6)) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
     if (listen(s, SOMAXCONN) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
     return s;
 }
@@ -1064,6 +1239,8 @@ void P2P::bump_ban(PeerState& ps, const std::string& ip, const char* reason, int
     (void)reason;
 }
 
+// Global IPv6 server socket for this TU (keeps p2p.h untouched)
+static Sock g_srv6_ = MIQ_INVALID_SOCK;
 
 bool P2P::start(uint16_t port){
 #ifndef _WIN32
@@ -1092,7 +1269,12 @@ bool P2P::start(uint16_t port){
 
     // NOTE: srv_ is Sock; Windows-safe
     srv_ = create_server(port);
-    if (srv_ == MIQ_INVALID_SOCK) { log_error("P2P: failed to create server"); return false; }
+    if (srv_ == MIQ_INVALID_SOCK) { log_error("P2P: failed to create IPv4 server"); return false; }
+    // New: IPv6 server as well
+    g_srv6_ = create_server_v6(port);
+    if (g_srv6_ == MIQ_INVALID_SOCK) {
+        log_warn("P2P: IPv6 server not created (continuing with IPv4 only)");
+    }
     g_listen_port = port;
 
     g_last_progress_ms = now_ms();
@@ -1178,6 +1360,7 @@ void P2P::stop(){
     if (!running_) return;
     running_ = false;
     if (srv_ != MIQ_INVALID_SOCK) { CLOSESOCK(srv_); srv_ = MIQ_INVALID_SOCK; }
+    if (g_srv6_ != MIQ_INVALID_SOCK) { CLOSESOCK(g_srv6_); g_srv6_ = MIQ_INVALID_SOCK; }
     for (auto& kv : peers_) {
         if (kv.first != MIQ_INVALID_SOCK) {
             gate_on_close(kv.first);
@@ -1203,6 +1386,7 @@ void P2P::stop(){
 
 // === outbound connect helpers ===============================================
 
+// REVISED: dual-stack + literal-safe resolver
 bool P2P::connect_seed(const std::string& host, uint16_t port){
     {
         int64_t now = now_ms();
@@ -1212,62 +1396,8 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
         }
     }
 
-#ifdef _WIN32
-    ADDRINFOA hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
-    PADDRINFOA res = nullptr;
-    char portstr[16]; sprintf_s(portstr, "%u", (unsigned)port);
-    int rc = getaddrinfo(host.c_str(), portstr, &hints, &res);
-    if (rc != 0 || !res) {
-        int64_t now = now_ms();
-        auto &st = g_seed_backoff[host];
-        int64_t cur = st.second > 0 ? st.second : seed_backoff_base_ms();
-        cur = std::min<int64_t>(cur * 2, seed_backoff_max_ms());
-        cur += jitter_ms(5000);
-        st = { now + cur, cur };
-        log_warn("P2P: DNS resolve failed: " + host + " (backoff " + std::to_string(cur) + "ms)");
-        return false;
-    }
-
-    Sock s = MIQ_INVALID_SOCK;
-    PADDRINFOA choice = nullptr;
-    for (auto p = res; p; p = p->ai_next) {
-        if (p->ai_family != AF_INET) continue;
-        auto sa = reinterpret_cast<sockaddr_in*>(p->ai_addr);
-        if (!sa) continue;
-        uint32_t be_ip = sa->sin_addr.s_addr;
-        if (is_loopback_be(be_ip) || is_self_be(be_ip)) continue;
-        Sock ts = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (ts == MIQ_INVALID_SOCK) continue;
-        if (connect(ts, p->ai_addr, (int)p->ai_addrlen) != 0) { CLOSESOCK(ts); continue; }
-        s = ts; choice = p; break;
-    }
-    if (s == MIQ_INVALID_SOCK) {
-        freeaddrinfo(res);
-        int64_t now = now_ms();
-        auto &st = g_seed_backoff[host];
-        int64_t cur = st.second > 0 ? st.second : seed_backoff_base_ms();
-        cur = std::min<int64_t>(cur * 2, seed_backoff_max_ms());
-        cur += jitter_ms(5000);
-        st = { now + cur, cur };
-        return false;
-    }
-
-    sockaddr_in a{}; int alen = (int)sizeof(a);
-    char ipbuf[64] = {0};
-      if (getpeername(s, (sockaddr*)&a, &alen) == 0) InetNtopA(AF_INET, &a.sin_addr, ipbuf, (int)sizeof(ipbuf));
-    // NEW: avoid hairpin outbound to our own external IP (Windows path)
-      if (is_self_endpoint(s, g_listen_port)) {
-        P2P_TRACE("reject hairpin outbound (seed)");
-        CLOSESOCK(s);
-        freeaddrinfo(res);
-        return false;
-    }
-      freeaddrinfo(res);
-#else
-    addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
-    addrinfo* res = nullptr;
-    char portstr[16]; snprintf(portstr, sizeof(portstr), "%u", (unsigned)port);
-    if (getaddrinfo(host.c_str(), portstr, &hints, &res) != 0 || !res) {
+    std::vector<MiqEndpoint> eps;
+    if (!miq_resolve_endpoints_from_string(host, port, eps)) {
         int64_t now = now_ms();
         auto &st = g_seed_backoff[host];
         int64_t cur = st.second > 0 ? st.second : seed_backoff_base_ms();
@@ -1279,45 +1409,58 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     }
 
     Sock s = MIQ_INVALID_SOCK;
-    for (auto p = res; p; p = p->ai_next) {
-        if (p->ai_family != AF_INET) continue;
-        auto sa = reinterpret_cast<sockaddr_in*>(p->ai_addr);
-        if (!sa) continue;
-        uint32_t be_ip = sa->sin_addr.s_addr;
-        if (is_loopback_be(be_ip) || is_self_be(be_ip)) continue;
-        Sock ts = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    std::string peer_ip = "unknown";
+
+    for (const auto& ne : eps) {
+        // Skip obvious self/hairpin for IPv4 candidates
+        if (ne.ss.ss_family == AF_INET) {
+            const sockaddr_in* a4 = reinterpret_cast<const sockaddr_in*>(&ne.ss);
+            uint32_t be_ip = a4->sin_addr.s_addr;
+            if (is_loopback_be(be_ip) || is_self_be(be_ip)) continue;
+            if (banned_.count(be_ip_to_string(be_ip))) continue;
+        }
+
+#ifdef _WIN32
+        Sock ts = socket(ne.ss.ss_family, SOCK_STREAM, IPPROTO_TCP);
+#else
+        Sock ts = socket(ne.ss.ss_family, SOCK_STREAM, 0);
+#endif
         if (ts == MIQ_INVALID_SOCK) continue;
-        if (connect(ts, p->ai_addr, p->ai_addrlen) != 0) { CLOSESOCK(ts); continue; }
-        s = ts; break;
+
+        if (connect(ts, (const sockaddr*)&ne.ss, ne.len) != 0) {
+            CLOSESOCK(ts);
+            continue;
+        }
+
+        // Connected
+        s = ts;
+        peer_ip = miq_ntop_sockaddr(ne.ss);
+
+        // Reject obvious hairpin on same port
+        if (is_self_endpoint(s, g_listen_port)) {
+            P2P_TRACE("reject hairpin outbound (seed)");
+            CLOSESOCK(s);
+            s = MIQ_INVALID_SOCK;
+            continue;
+        }
+        break;
     }
+
     if (s == MIQ_INVALID_SOCK) {
-        freeaddrinfo(res);
         int64_t now = now_ms();
         auto &st = g_seed_backoff[host];
         int64_t cur = st.second > 0 ? st.second : seed_backoff_base_ms();
         cur = std::min<int64_t>(cur * 2, seed_backoff_max_ms());
         cur += jitter_ms(5000);
         st = { now + cur, cur };
-        return false; 
-    }
-
-    sockaddr_in a{}; socklen_t alen = static_cast<socklen_t>(sizeof(a));
-    char ipbuf[64] = {0};
-    if (getpeername(s, (sockaddr*)&a, &alen) == 0) inet_ntop(AF_INET, &a.sin_addr, ipbuf, (socklen_t)sizeof(ipbuf));
-    // NEW: avoid hairpin outbound to our own external IP (POSIX path)
-    if (is_self_endpoint(s, g_listen_port)) {
-        P2P_TRACE("reject hairpin outbound (seed)");
-        CLOSESOCK(s);
-        freeaddrinfo(res);
         return false;
     }
-    freeaddrinfo(res);
-#endif
+
     g_seed_backoff.erase(host);
 
     PeerState ps;
     ps.sock = s;
-    ps.ip   = ipbuf[0] ? std::string(ipbuf) : std::string("unknown");
+    ps.ip   = peer_ip;
     ps.mis  = 0;
     ps.last_ms = now_ms();
     ps.blk_tokens = MIQ_RATE_BLOCK_BURST;
@@ -1334,7 +1477,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     g_trickle_last_ms[s] = 0;
 
     uint32_t be_ip;
-    if (ipbuf[0] && parse_ipv4(ps.ip, be_ip) && ipv4_is_public(be_ip) && !is_self_be(be_ip)) {
+    if (parse_ipv4(ps.ip, be_ip) && ipv4_is_public(be_ip) && !is_self_be(be_ip)) {
         addrv4_.insert(be_ip);
 #if MIQ_ENABLE_ADDRMAN
         miq::NetAddr na; na.host = ps.ip; na.port = port; na.tried = true; na.is_ipv6=false;
@@ -1347,7 +1490,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 
     // Gate first, then mark loopback (so flag actually sticks)
     gate_on_connect(s);
-    if (ipbuf[0] && parse_ipv4(ps.ip, be_ip)) {
+    if (parse_ipv4(ps.ip, be_ip)) {
         gate_set_loopback(s, is_loopback_be(be_ip));
     }
 
@@ -1965,18 +2108,28 @@ void P2P::loop(){
         // --- build pollfd list (SNAPSHOT of peers_) ---
         std::vector<PollFD> fds;
         std::vector<Sock>   peer_fd_order;
+        size_t srv_idx_v4 = (size_t)-1, srv_idx_v6 = (size_t)-1;
         size_t base = 0;
+
         if (srv_ != MIQ_INVALID_SOCK) {
 #ifdef _WIN32
-            WSAPOLLFD pf{};
-            pf.fd = srv_;
-            pf.events = POLL_RD;
-            pf.revents = 0;
+            WSAPOLLFD pf{}; pf.fd = srv_; pf.events = POLL_RD; pf.revents = 0;
             fds.push_back(pf);
 #else
             fds.push_back(pollfd{ (int)srv_, POLL_RD, 0 });
 #endif
+            srv_idx_v4 = fds.size() - 1;
         }
+        if (g_srv6_ != MIQ_INVALID_SOCK) {
+#ifdef _WIN32
+            WSAPOLLFD pf{}; pf.fd = g_srv6_; pf.events = POLL_RD; pf.revents = 0;
+            fds.push_back(pf);
+#else
+            fds.push_back(pollfd{ (int)g_srv6_, POLL_RD, 0 });
+#endif
+            srv_idx_v6 = fds.size() - 1;
+        }
+
         base = fds.size();
         for (auto& kv : peers_) {
             Sock fd = kv.first;
@@ -1999,44 +2152,85 @@ void P2P::loop(){
 #endif
         if (rc < 0) continue;
 
-        // Accept new peers (with soft inbound rate cap)
-        if (srv_ != MIQ_INVALID_SOCK) {
-            if (!fds.empty() && (fds[0].revents & POLL_RD)) {
-                sockaddr_in ca{};
+        // Accept new peers (with soft inbound rate cap) - IPv4
+        if (srv_ != MIQ_INVALID_SOCK && srv_idx_v4 < fds.size() && (fds[srv_idx_v4].revents & POLL_RD)) {
+            sockaddr_in ca{};
 #ifdef _WIN32
-                int clen = (int)sizeof(ca);
+            int clen = (int)sizeof(ca);
 #else
-                socklen_t clen = sizeof(ca);
+            socklen_t clen = sizeof(ca);
 #endif
-                Sock c = accept(srv_, (sockaddr*)&ca, &clen);
-                if (c != MIQ_INVALID_SOCK) {
-                    if (is_self_endpoint(c, g_listen_port)) {
-                        P2P_TRACE("reject hairpin inbound");
+            Sock c = accept(srv_, (sockaddr*)&ca, &clen);
+            if (c != MIQ_INVALID_SOCK) {
+                if (is_self_endpoint(c, g_listen_port)) {
+                    P2P_TRACE("reject hairpin inbound");
+                    CLOSESOCK(c);
+                } else {
+                    int64_t tnow = now_ms();
+                    if (tnow - inbound_win_start_ms_ > 60000) {
+                        inbound_win_start_ms_ = tnow;
+                        inbound_accepts_in_window_ = 0;
+                    }
+                    if (inbound_accepts_in_window_ >= MIQ_P2P_NEW_INBOUND_CAP_PER_MIN) {
+                        P2P_TRACE("reject inbound: per-minute cap");
                         CLOSESOCK(c);
                     } else {
-                        int64_t tnow = now_ms();
-                        if (tnow - inbound_win_start_ms_ > 60000) {
-                            inbound_win_start_ms_ = tnow;
-                            inbound_accepts_in_window_ = 0;
-                        }
-                        if (inbound_accepts_in_window_ >= MIQ_P2P_NEW_INBOUND_CAP_PER_MIN) {
-                            P2P_TRACE("reject inbound: per-minute cap");
+                        inbound_accepts_in_window_++;
+
+                        char ipbuf[64] = {0};
+#ifdef _WIN32
+                        InetNtopA(AF_INET, &ca.sin_addr, ipbuf, (int)sizeof(ipbuf));
+#else
+                        inet_ntop(AF_INET, &ca.sin_addr, ipbuf, (socklen_t)sizeof(ipbuf));
+#endif
+                        if (banned_.count(ipbuf) || is_ip_banned(ipbuf, now_ms())) {
+                            P2P_TRACE(std::string("reject inbound banned ip=") + ipbuf);
                             CLOSESOCK(c);
                         } else {
-                            inbound_accepts_in_window_++;
+                            handle_new_peer(c, ipbuf);
+                        }
+                    }
+                }
+            }
+        }
 
-                            char ipbuf[64] = {0};
+        // Accept new peers (with soft inbound rate cap) - IPv6
+        if (g_srv6_ != MIQ_INVALID_SOCK && srv_idx_v6 < fds.size() && (fds[srv_idx_v6].revents & POLL_RD)) {
+            sockaddr_in6 ca6{};
 #ifdef _WIN32
-                            InetNtopA(AF_INET, &ca.sin_addr, ipbuf, (int)sizeof(ipbuf));
+            int clen6 = (int)sizeof(ca6);
 #else
-                            inet_ntop(AF_INET, &ca.sin_addr, ipbuf, (socklen_t)sizeof(ipbuf));
+            socklen_t clen6 = sizeof(ca6);
 #endif
-                            if (banned_.count(ipbuf) || is_ip_banned(ipbuf, now_ms())) {
-                                P2P_TRACE(std::string("reject inbound banned ip=") + ipbuf);
-                                CLOSESOCK(c);
-                            } else {
-                                handle_new_peer(c, ipbuf);
-                            }
+            Sock c = accept(g_srv6_, (sockaddr*)&ca6, &clen6);
+            if (c != MIQ_INVALID_SOCK) {
+                if (is_self_endpoint(c, g_listen_port)) {
+                    P2P_TRACE("reject hairpin inbound v6");
+                    CLOSESOCK(c);
+                } else {
+                    int64_t tnow = now_ms();
+                    if (tnow - inbound_win_start_ms_ > 60000) {
+                        inbound_win_start_ms_ = tnow;
+                        inbound_accepts_in_window_ = 0;
+                    }
+                    if (inbound_accepts_in_window_ >= MIQ_P2P_NEW_INBOUND_CAP_PER_MIN) {
+                        P2P_TRACE("reject inbound v6: per-minute cap");
+                        CLOSESOCK(c);
+                    } else {
+                        inbound_accepts_in_window_++;
+
+                        char ipbuf[128] = {0};
+#ifdef _WIN32
+                        InetNtopA(AF_INET6, &ca6.sin6_addr, ipbuf, (int)sizeof(ipbuf));
+#else
+                        inet_ntop(AF_INET6, &ca6.sin6_addr, ipbuf, (socklen_t)sizeof(ipbuf));
+#endif
+                        std::string ip(ipbuf[0] ? ipbuf : "unknown");
+                        if (banned_.count(ip) || is_ip_banned(ip, now_ms())) {
+                            P2P_TRACE(std::string("reject inbound banned ip6=") + ip);
+                            CLOSESOCK(c);
+                        } else {
+                            handle_new_peer(c, ip);
                         }
                     }
                 }
