@@ -133,11 +133,10 @@ static constexpr const char* GENESIS_RAW_BLOCK_HEX =
 
 // ---------------------------------------------------------------------
 // Seeds (kept intact)
-static const std::string DNS_SEED = "62.38.73.147";
+static const std::string DNS_SEED = "miqrochain-seed.duckdns.org";
 
 // Multi-seed list (add-only). Your node can try these in order.
 static inline const char* const DNS_SEEDS[] = {
-    "s626853.name-servers.gr",
     "miqseed1.duckdns.org",
     "miqseed2.freeddns.org"
 };
