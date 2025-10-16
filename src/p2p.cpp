@@ -2279,9 +2279,10 @@ void P2P::loop(){
                     bool ok = decode_msg(ps.rx, off, m);
                     if (!ok) break;
 
-                    // Nice-to-have guard: if a frame decodes but advances < 24 bytes, bail.
-                    if (off <= off_before || (off - off_before) < 24) {
-                        miq::log_warn("P2P: decoded frame advanced less than 24 bytes; dropping peer defensively");
+                    // FIXED: only drop if decoder made no forward progress (0 bytes).
+                    size_t advanced = (off > off_before) ? (off - off_before) : 0;
+                    if (advanced == 0) {
+                        miq::log_warn("P2P: decoded frame made no progress; dropping peer defensively");
                         dead.push_back(s);
                         break;
                     }
