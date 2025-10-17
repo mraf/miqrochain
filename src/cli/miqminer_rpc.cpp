@@ -67,16 +67,36 @@
 #endif
 
 // -------- OpenCL (optional) --------------------------------------------------
-// Force-enable OpenCL unless explicitly turned off at compile time
+// Default-on, but disable gracefully if headers aren't present.
 #ifndef MIQ_ENABLE_OPENCL
 #define MIQ_ENABLE_OPENCL 1
 #endif
 
 #if defined(MIQ_ENABLE_OPENCL)
-  #if defined(__APPLE__)
-    #include <OpenCL/opencl.h>
+  #ifndef CL_TARGET_OPENCL_VERSION
+  #define CL_TARGET_OPENCL_VERSION 120
+  #endif
+
+  #if defined(__has_include)
+    #if defined(__APPLE__)
+      #if __has_include(<OpenCL/opencl.h>)
+        #include <OpenCL/opencl.h>
+      #else
+        #undef MIQ_ENABLE_OPENCL
+      #endif
+    #else
+      #if __has_include(<CL/cl.h>)
+        #include <CL/cl.h>
+      #else
+        #undef MIQ_ENABLE_OPENCL
+      #endif
+    #endif
   #else
-    #include <CL/cl.h>
+    #if defined(__APPLE__)
+      #include <OpenCL/opencl.h>
+    #else
+      #include <CL/cl.h>
+    #endif
   #endif
 #endif
 
@@ -103,7 +123,7 @@ static const char* kChronenMinerBanner[] = {
 "  __  __ _                                                                                      ",
 " |  \\/  |                                                                                       ",
 " | \\  / |                                                                                       ",
-" | |\\/| |                                                                                       ",
+" | |\\/| |                                                                                      ",
 " | |   | |                                                                                      ",
 " |_|   |_|                                                                                      ",
 };
@@ -803,7 +823,7 @@ static bool csprng_bytes(uint8_t* out, size_t n){
     return RAND_bytes(out, (int)n)==1;
 }
 static void ossl_sha256_once(const uint8_t* d, size_t n, uint8_t out[32]){
-    SHA256(d, n, out);
+    ::SHA256(d, n, out); // disambiguate from miq::SHA256
 }
 static bool make_mnemonic_words(size_t words, std::vector<std::string>& out_words, std::vector<uint8_t>& out_entropy){
     if(words!=12 && words!=24) return false;
@@ -908,8 +928,8 @@ static bool point_from_priv(const BIGNUM* k, std::vector<uint8_t>& out_compresse
     return true;
 }
 static void hash160(const uint8_t* data, size_t n, uint8_t out20[20]){
-    uint8_t tmp[32]; SHA256(data,n,tmp);
-    RIPEMD160(tmp,32,out20);
+    uint8_t tmp[32]; ::SHA256(data,n,tmp);
+    ::RIPEMD160(tmp,32,out20);
 }
 static bool xprv_from_seed(const std::vector<uint8_t>& seed, XPrv& out){
     uint8_t I[64]; unsigned int L=64;
@@ -1017,7 +1037,6 @@ static std::vector<uint8_t> merkle_from(const std::vector<Transaction>& txs){
 }
 
 // ===== UI/state ==============================================================
-// High-quality ASCII circular spinner (portable, no mojibake)
 static void spinner_circle_ascii(int phase, std::array<std::string,5>& rows){
     const int W = 13;
     rows = { std::string(W,' '), std::string(W,' '), std::string(W,' '),
@@ -2410,3 +2429,4 @@ int main(int argc, char** argv){
         return 1;
     }
 }
+
