@@ -1,14 +1,3 @@
-// ========================= miqminer_rpc.cpp (CPU + OpenCL GPU) =========================
-// Chronen Miner — RPC miner with start menu + loading circle, CPU mining + optional OpenCL GPU
-//
-// - Startup menu: big banner + spinning circle for 10s, then prompts for mining address (unless --address= given)
-// - CPU miner: unchanged fast path (double-SHA256 or MIQ salted PoW via salted_header_hash when MIQ_POW_SALT defined)
-// - GPU miner: OpenCL kernel that hashes (prefix[80] +/- salt) || nonce_le, SHA256d, compares to target
-// - Salt support on GPU: --salt-hex=... and --salt-pos=pre|post (pre = salt || prefix || nonce, post = prefix || salt || nonce)
-//   If your chain uses compile-time salt and salted_header_hash() in hasher.h, CPU is already correct.
-//   For GPU to match, pass the same salt & layout, or adapt the kernel/host prefix builder to your network's exact PoW.
-// =======================================================================================
-
 #include "constants.h"
 #include "block.h"
 #include "tx.h"
