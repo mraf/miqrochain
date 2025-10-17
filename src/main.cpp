@@ -224,9 +224,9 @@ public:
         if (hFile_ && hFile_ != INVALID_HANDLE_VALUE) {
             DWORD wrote = 0;
             WriteFile(hFile_, s.c_str(), (DWORD)s.size(), &wrote, nullptr);
-        } else if (hOut_ && hOut_ != INVALID_HANDLE_VALUE) {
+        } else {
             DWORD wrote = 0;
-            WriteConsoleA(hOut_, s.c_str(), (DWORD)s.size(), &wrote, nullptr);
+            WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE), s.c_str(), (DWORD)s.size(), &wrote, nullptr);
         }
 #else
         int fd = (fd_ >= 0) ? fd_ : STDOUT_FILENO;
@@ -236,16 +236,13 @@ public:
 private:
     void init(){
 #ifdef _WIN32
-        // Primary: CONOUT$ bypasses stdout redirection & our log capture pipes.
         hFile_ = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        hOut_  = GetStdHandle(STD_OUTPUT_HANDLE);
 #else
         fd_ = ::open("/dev/tty", O_WRONLY | O_CLOEXEC);
         if (fd_ < 0) fd_ = STDOUT_FILENO;
 #endif
     }
 #ifdef _WIN32
-    HANDLE hOut_{};
     HANDLE hFile_{};
 #else
     int fd_ = -1;
@@ -355,10 +352,9 @@ public:
     enum class NodeState { Starting, Syncing, Running };
 
     TUI(bool vt_ok) : vt_ok_(vt_ok) { init_step_order(); }
-    void set_enabled(bool on){ enabled_ = on && term::is_tty(); }
+    void set_enabled(bool on){ enabled_ = on; }
     void start() {
         if (!enabled_) return;
-        running_ = true;
         cw_.write_raw("Miqrochain UI initializing...\n");
         draw_once(true);
         if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H\x1b[?25l");
@@ -373,10 +369,9 @@ public:
     }
     ~TUI(){ stop(); }
 
-    // ---- Steps API (fixed order -> no duplicates) ----
     void mark_step_started(const std::string& title) {
         std::lock_guard<std::mutex> lk(mu_);
-        ensure_step(title); // keeps order
+        ensure_step(title);
     }
     void mark_step_ok(const std::string& title) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -400,7 +395,7 @@ private:
             "Open chain data",
             "Load & validate genesis",
             "Genesis OK",
-            "Reindex UTXO (full scan)", // optional
+            "Reindex UTXO (full scan)",
             "Initialize mempool & RPC gate",
             "Start P2P listener",
             "Connect seeds",
@@ -412,7 +407,7 @@ private:
     }
     void ensure_step(const std::string& title){
         for (auto& s : steps_) if (s.first == title) return;
-        steps_.push_back({title, false}); // safety, should not happen with fixed order
+        steps_.push_back({title, false});
     }
 
     static std::string bar(uint64_t cur, uint64_t tot, int width){
@@ -443,6 +438,7 @@ private:
 
     void loop(){
         using namespace std::chrono_literals;
+        running_ = true;
         while (running_) { draw_once(false); std::this_thread::sleep_for(120ms); ++tick_; }
     }
 
@@ -452,13 +448,11 @@ private:
         if (cols < 90) cols = 90;
         if (rows < 26) rows = 26;
 
-        // layout: reserve >= 36 columns for peers
         const int rightw = std::max(36, cols / 3);
-        const int leftw  = cols - rightw - 3; // " | "
+        const int leftw  = cols - rightw - 3;
 
         std::vector<std::string> left, right;
 
-        // Header + banner
         {
             std::ostringstream h;
             if (!gentle && vt_ok_) h << "\x1b[H\x1b[0J";
@@ -471,14 +465,9 @@ private:
             left.push_back("");
         }
 
-        // Node state line with animated dots
         {
             const char* label = "State: ";
-            const char* extra = "";
-            std::string dots;
-            int d = tick_ % 4; // 0..3
-            dots.assign(d, '.');
-
+            std::string dots; dots.assign(tick_ % 4, '.');
             std::ostringstream s;
             s << "  " << label;
             if (nstate_ == NodeState::Starting)     s << cWarn() << "starting" << reset() << dots;
@@ -488,22 +477,15 @@ private:
             left.push_back("");
         }
 
-        // Startup progress
         {
             left.push_back(std::string(cStep()) + "Startup" + reset());
-            // Count only steps that were actually touched (we pre-fill all; consider "started" if appeared in logs)
-            size_t total = 0, okc = 0;
-            for (auto& s : steps_) {
-                // show only until first not-started step after a started cluster
-                total++;
-                if (s.second) okc++;
-            }
+            size_t total = steps_.size(), okc = 0;
+            for (auto& s : steps_) if (s.second) ++okc;
             int bw = std::max(10, leftw - 20);
             std::ostringstream progress;
             progress << "  " << bar((uint64_t)okc, (uint64_t)std::max<size_t>(total,1), bw)
                      << "  " << okc << "/" << total << " completed";
             left.push_back(progress.str());
-            // Render each step
             for (auto& s : steps_) {
                 left.push_back(std::string("    ") + (s.second ? (std::string(cOK()) + "[OK]" + reset() + " ") :
                         (std::string(cDim()) + "[..]" + reset() + " ")) + s.first);
@@ -511,7 +493,6 @@ private:
             left.push_back("");
         }
 
-        // Node metrics
         {
             left.push_back(std::string(cStep()) + "Node status" + reset());
             uint64_t height = chain_ ? chain_->height() : 0;
@@ -534,7 +515,6 @@ private:
                << "   pings-waiting: " << awaiting_pongs;
             left.push_back(ns.str());
 
-            // last accepted block (parse logs)
             std::string lastBlk, lastIP;
             for (int i = (int)logs_.size()-1; i >= 0; --i) {
                 const auto& L = logs_[i].text;
@@ -561,7 +541,6 @@ private:
             left.push_back("");
         }
 
-        // Right column: peers
         if (p2p_) {
             right.push_back(std::string(cStep()) + "Peers" + reset());
             std::ostringstream hdr;
@@ -590,9 +569,10 @@ private:
             }
         }
 
-        // Compose two columns
         std::ostringstream out;
         size_t N = std::max(left.size(), right.size());
+        const int rightw = std::max(36, cols / 3);
+        const int leftw  = cols - rightw - 3;
         for (size_t i=0;i<N;i++){
             std::string l = (i<left.size())  ? left[i]  : "";
             std::string r = (i<right.size()) ? right[i] : "";
@@ -601,7 +581,6 @@ private:
             out << std::left << std::setw(leftw) << l << " | " << r << "\n";
         }
 
-        // Logs box
         out << std::string((size_t)cols, '-') << "\n";
         out << cStep() << "Logs" << reset() << "  " << cDim() << "(press Ctrl+C to exit)" << reset() << "\n";
         int header_rows = (int)N + 2;
@@ -795,7 +774,6 @@ static bool env_truthy(const char* name){
 
 // ---------- main -------------------------------------------------------------
 int main(int argc, char** argv){
-    // Console + signals
     std::ios::sync_with_stdio(false);
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
@@ -807,20 +785,29 @@ int main(int argc, char** argv){
     std::set_terminate(&fatal_terminate);
 
     bool vt_ok = true;
-    term::enable_vt(vt_ok); // enables color if supported
+    term::enable_vt(vt_ok);
 
-    // Start capturing logs EARLY so all log_* are visible in TUI Logs
-    LogCapture capture;
-    capture.start();
+    // Parse just --no-tui FIRST
+    bool disable_tui_flag = false;
+    for(int i=1;i<argc;i++){
+        if(std::string(argv[i]) == "--no-tui") { disable_tui_flag = true; break; }
+    }
 
-    // Avoid black screen
+    // IMPORTANT: decide TUI BEFORE any log-capture redirects
+    const bool want_tui = !disable_tui_flag && !env_truthy("MIQ_NO_TUI");
+    const bool console_is_tty = term::is_tty();
+    const bool can_tui  = want_tui && console_is_tty;
+
     ConsoleWriter cw;
     cw.write_raw("Starting miqrod... (press Ctrl+C to exit)\n");
 
-    bool disable_tui_flag = false;
-    for(int i=1;i<argc;i++) if(std::string(argv[i])=="--no-tui"){ disable_tui_flag=true; break; }
-    const bool want_tui = !disable_tui_flag && !env_truthy("MIQ_NO_TUI");
-    const bool can_tui  = want_tui && term::is_tty();
+    // Start capture ONLY when TUI is enabled; otherwise keep plain logs to console
+    LogCapture capture;
+    if (can_tui) {
+        capture.start();
+    } else {
+        std::fprintf(stderr, "[INFO] TUI disabled (plain logs).\n");
+    }
 
     TUI tui(vt_ok);
     tui.set_enabled(can_tui);
@@ -830,12 +817,10 @@ int main(int argc, char** argv){
         tui.set_banner("Preparing Miqrochain node...");
         tui.mark_step_ok("Parse CLI / environment");
         tui.set_node_state(TUI::NodeState::Starting);
-    } else {
-        std::fprintf(stderr, "[INFO] TUI disabled (plain logs).\n");
     }
 
     try {
-        // CLI parse
+        // ----- Parse CLI (full) ------------------------------------------
         Config cfg;
         std::string conf;
         bool genaddr=false, buildtx=false, mine_flag=false;
@@ -847,6 +832,7 @@ int main(int argc, char** argv){
             std::string a(argv[i]);
             if(a.rfind("--",0)==0 && !is_recognized_arg(a)){
                 std::fprintf(stderr, "Unknown option: %s\nUse --help to see supported options.\n", argv[i]);
+                if (can_tui) { capture.stop(); tui.stop(); }
                 return 2;
             }
         }
@@ -854,7 +840,7 @@ int main(int argc, char** argv){
             std::string a(argv[i]);
             if(a.rfind("--conf=",0)==0){ conf = a.substr(7);
             } else if(a.rfind("--datadir=",0)==0){ cfg.datadir = a.substr(10);
-            } else if(a=="--no-tui"){ /*handled*/ }
+            }
         }
         for(int i=1;i<argc;i++){
             std::string a(argv[i]);
@@ -869,129 +855,122 @@ int main(int argc, char** argv){
             } else if(a=="--reindex_utxo"){ flag_reindex_utxo = true;
             } else if(a=="--utxo_kv"){ flag_utxo_kv = true;
             } else if(a=="--mine"){ mine_flag = true;
-            } else if(a=="--help"){ print_usage(); capture.stop(); tui.stop(); return 0; }
+            } else if(a=="--help"){ print_usage(); if (can_tui){ capture.stop(); tui.stop(); } return 0; }
         }
 
-        // fast paths
+        // ===== FAST PATHS =================================================
         if(genaddr){
-            tui.stop();
+            if (can_tui) tui.stop();
             std::vector<uint8_t> priv;
-            if(!crypto::ECDSA::generate_priv(priv)){ std::fprintf(stderr, "keygen failed\n"); capture.stop(); return 1; }
+            if(!crypto::ECDSA::generate_priv(priv)){ std::fprintf(stderr, "keygen failed\n"); if (can_tui) capture.stop(); return 1; }
             std::vector<uint8_t> pub33;
-            if(!crypto::ECDSA::derive_pub(priv, pub33)){ std::fprintf(stderr, "derive_pub failed\n"); capture.stop(); return 1; }
+            if(!crypto::ECDSA::derive_pub(priv, pub33)){ std::fprintf(stderr, "derive_pub failed\n"); if (can_tui) capture.stop(); return 1; }
             auto pkh  = hash160(pub33);
             auto addr = base58check_encode(VERSION_P2PKH, pkh);
             std::cout << "priv_hex=" << to_hex(priv) << "\n"
                       << "pub_hex="  << to_hex(pub33) << "\n"
                       << "address="  << addr << "\n";
-            capture.stop();
+            if (can_tui) capture.stop();
             return 0;
         }
         if(buildtx){
-            tui.stop();
+            if (can_tui) tui.stop();
             std::vector<uint8_t> priv = miq::from_hex(privh);
             std::vector<uint8_t> pub33;
-            if(!crypto::ECDSA::derive_pub(priv, pub33)){ std::fprintf(stderr, "derive_pub failed\n"); capture.stop(); return 1; }
+            if(!crypto::ECDSA::derive_pub(priv, pub33)){ std::fprintf(stderr, "derive_pub failed\n"); if (can_tui) capture.stop(); return 1; }
             uint8_t ver=0; std::vector<uint8_t> to_payload;
-            if(!base58check_decode(toaddr, ver, to_payload) || to_payload.size()!=20){ std::fprintf(stderr, "bad to_address\n"); capture.stop(); return 1; }
+            if(!base58check_decode(toaddr, ver, to_payload) || to_payload.size()!=20){ std::fprintf(stderr, "bad to_address\n"); if (can_tui) capture.stop(); return 1; }
             Transaction tx; TxIn in; in.prev.txid = miq::from_hex(prevtxid_hex); in.prev.vout = vout; tx.vin.push_back(in);
             TxOut out; out.value = value; out.pkh = to_payload; tx.vout.push_back(out);
             auto h = dsha256(ser_tx(tx)); std::vector<uint8_t> sig64;
-            if(!crypto::ECDSA::sign(priv, h, sig64)){ std::fprintf(stderr, "sign failed\n"); capture.stop(); return 1; }
+            if(!crypto::ECDSA::sign(priv, h, sig64)){ std::fprintf(stderr, "sign failed\n"); if (can_tui) capture.stop(); return 1; }
             tx.vin[0].sig = sig64; tx.vin[0].pubkey = pub33;
             auto raw = ser_tx(tx); std::cout << "txhex=" << to_hex(raw) << "\n";
-            capture.stop();
+            if (can_tui) capture.stop();
             return 0;
         }
+        // =================================================================
 
-        // Config/datadir
-        if (tui.is_enabled()) tui.mark_step_started("Load config & choose datadir");
+        if (can_tui) tui.mark_step_started("Load config & choose datadir");
         if(!conf.empty()) load_config(conf, cfg);
         if(cfg.datadir.empty()) cfg.datadir = default_datadir();
         std::error_code ec;
         std::filesystem::create_directories(cfg.datadir, ec);
-        if (tui.is_enabled()) {
+        if (can_tui) {
             tui.mark_step_ok("Load config & choose datadir");
             tui.mark_step_ok("Config/datadir ready");
             tui.set_banner(std::string("Starting services...  Datadir: ") + cfg.datadir);
         }
 
-        // chain
-        if (tui.is_enabled()) tui.mark_step_started("Open chain data");
+        if (can_tui) tui.mark_step_started("Open chain data");
         Chain chain;
-        if(!chain.open(cfg.datadir)){ log_error("failed to open chain data"); capture.stop(); tui.stop(); return 1; }
-        if (tui.is_enabled()) tui.mark_step_ok("Open chain data");
+        if(!chain.open(cfg.datadir)){ log_error("failed to open chain data"); if (can_tui) { capture.stop(); tui.stop(); } return 1; }
+        if (can_tui) tui.mark_step_ok("Open chain data");
 
-        // genesis validate
-        if (tui.is_enabled()) tui.mark_step_started("Load & validate genesis");
+        if (can_tui) tui.mark_step_started("Load & validate genesis");
         {
             std::vector<uint8_t> raw;
             try { raw = miq::from_hex(GENESIS_RAW_BLOCK_HEX); }
-            catch (...) { log_error("GENESIS_RAW_BLOCK_HEX is not valid hex"); capture.stop(); tui.stop(); return 1; }
-            if (raw.empty()) { log_error("GENESIS_RAW_BLOCK_HEX is empty"); capture.stop(); tui.stop(); return 1; }
+            catch (...) { log_error("GENESIS_RAW_BLOCK_HEX is not valid hex"); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
+            if (raw.empty()) { log_error("GENESIS_RAW_BLOCK_HEX is empty"); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
             Block g;
-            if (!deser_block(raw, g)) { log_error("Failed to deserialize GENESIS_RAW_BLOCK_HEX"); capture.stop(); tui.stop(); return 1; }
+            if (!deser_block(raw, g)) { log_error("Failed to deserialize GENESIS_RAW_BLOCK_HEX"); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
             const std::string got_hash = to_hex(g.block_hash());
             const std::string want_hash= std::string(GENESIS_HASH_HEX);
-            if (got_hash != want_hash) { log_error(std::string("Genesis hash mismatch. got=")+got_hash+" want="+want_hash); capture.stop(); tui.stop(); return 1; }
+            if (got_hash != want_hash) { log_error(std::string("Genesis hash mismatch. got=")+got_hash+" want="+want_hash); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
             const std::string got_merkle = to_hex(g.header.merkle_root);
             const std::string want_merkle= std::string(GENESIS_MERKLE_HEX);
-            if (got_merkle != want_merkle) { log_error(std::string("Genesis merkle mismatch. got=")+got_merkle+" want="+want_merkle); capture.stop(); tui.stop(); return 1; }
-            if (!chain.init_genesis(g)) { log_error("genesis init failed"); capture.stop(); tui.stop(); return 1; }
+            if (got_merkle != want_merkle) { log_error(std::string("Genesis merkle mismatch. got=")+got_merkle+" want="+want_merkle); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
+            if (!chain.init_genesis(g)) { log_error("genesis init failed"); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
         }
-        if (tui.is_enabled()) { tui.mark_step_ok("Load & validate genesis"); tui.mark_step_ok("Genesis OK"); }
+        if (can_tui) { tui.mark_step_ok("Load & validate genesis"); tui.mark_step_ok("Genesis OK"); }
 
-        // optional reindex
         if (flag_utxo_kv) { log_info("Flag --utxo_kv set (runtime no-op; UTXO KV backend is compiled-in)."); }
         if (flag_reindex_utxo) {
-            if (tui.is_enabled()) tui.mark_step_started("Reindex UTXO (full scan)");
+            if (can_tui) tui.mark_step_started("Reindex UTXO (full scan)");
             log_info("ReindexUTXO: rebuilding chainstate from active chain...");
             UTXOKV utxo_kv; std::string err;
             if (!ReindexUTXO(chain, utxo_kv, /*compact_after=*/true, err)) {
                 log_error(std::string("ReindexUTXO failed: ") + (err.empty() ? "unknown error" : err));
-                capture.stop(); tui.stop(); return 1;
+                if (can_tui) { capture.stop(); tui.stop(); }
+                return 1;
             }
             log_info("ReindexUTXO: done");
-            if (tui.is_enabled()) tui.mark_step_ok("Reindex UTXO (full scan)");
+            if (can_tui) tui.mark_step_ok("Reindex UTXO (full scan)");
         }
 
-        // services
-        if (tui.is_enabled()) tui.mark_step_started("Initialize mempool & RPC gate");
+        if (can_tui) tui.mark_step_started("Initialize mempool & RPC gate");
         Mempool mempool; RpcService rpc(chain, mempool);
-        if (tui.is_enabled()) tui.mark_step_ok("Initialize mempool & RPC gate");
+        if (can_tui) tui.mark_step_ok("Initialize mempool & RPC gate");
 
         P2P p2p(chain);
         p2p.set_datadir(cfg.datadir);
         p2p.set_mempool(&mempool);
         rpc.set_p2p(&p2p);
-        if (tui.is_enabled()) tui.set_runtime_refs(&p2p, &chain);
+        if (can_tui) tui.set_runtime_refs(&p2p, &chain);
 
-        // p2p first
-        if (tui.is_enabled()) { tui.mark_step_started("Start P2P listener"); tui.set_node_state(TUI::NodeState::Starting); }
+        if (can_tui) { tui.mark_step_started("Start P2P listener"); tui.set_node_state(TUI::NodeState::Starting); }
         bool p2p_ok = false;
         if(!cfg.no_p2p){
             if(p2p.start(P2P_PORT)){
                 p2p_ok = true;
                 log_info("P2P listening on " + std::to_string(P2P_PORT));
-                if (tui.is_enabled()) tui.mark_step_ok("Start P2P listener");
-                if (tui.is_enabled()) tui.mark_step_started("Connect seeds");
+                if (can_tui) { tui.mark_step_ok("Start P2P listener"); tui.mark_step_started("Connect seeds"); }
                 p2p.connect_seed(DNS_SEED, P2P_PORT);
-                if (tui.is_enabled()) tui.mark_step_ok("Connect seeds");
+                if (can_tui) tui.mark_step_ok("Connect seeds");
             } else {
                 log_warn("P2P failed to start on port " + std::to_string(P2P_PORT));
             }
-        } else if (tui.is_enabled()) {
-            tui.mark_step_ok("Start P2P listener"); // treated as intentionally skipped/ok
+        } else if (can_tui) {
+            tui.mark_step_ok("Start P2P listener");
         }
 
-        // ibd monitor
-        if (tui.is_enabled()) tui.mark_step_started("Start IBD monitor");
+        if (can_tui) tui.mark_step_started("Start IBD monitor");
         start_ibd_monitor(&chain, &p2p);
-        if (tui.is_enabled()) tui.mark_step_ok("Start IBD monitor");
+        if (can_tui) tui.mark_step_ok("Start IBD monitor");
 
-        // rpc
         bool rpc_ok = false;
-        if (tui.is_enabled()) tui.mark_step_started("Start RPC server");
+        if (can_tui) tui.mark_step_started("Start RPC server");
         if(!cfg.no_rpc){
             miq::rpc_enable_auth_cookie(cfg.datadir);
 #ifdef _WIN32
@@ -1022,14 +1001,13 @@ int main(int argc, char** argv){
             rpc.start(RPC_PORT);
             rpc_ok = true;
             log_info("RPC listening on " + std::to_string(RPC_PORT));
-            if (tui.is_enabled()) { tui.mark_step_ok("Start RPC server"); tui.mark_step_ok("RPC ready"); }
-        } else if (tui.is_enabled()) {
+            if (can_tui) { tui.mark_step_ok("Start RPC server"); tui.mark_step_ok("RPC ready"); }
+        } else if (can_tui) {
             tui.mark_step_ok("Start RPC server");
             tui.mark_step_ok("RPC ready");
-            rpc_ok = true; // treat as intentional/ok for "running" state
+            rpc_ok = true;
         }
 
-        // miner
         unsigned threads = 0;
         if (mine_flag) {
             if (cfg.miner_threads) threads = cfg.miner_threads;
@@ -1073,16 +1051,13 @@ int main(int argc, char** argv){
 
         log_info(std::string(CHAIN_NAME) + " node running. RPC " + std::to_string(RPC_PORT) +
                  ", P2P " + std::to_string(P2P_PORT));
-        if (tui.is_enabled()) tui.set_banner("Miqrochain node running - syncing & serving peers...");
-
-        // Promote to "Running" state when core services are up.
-        if (tui.is_enabled()) {
+        if (can_tui) {
+            tui.set_banner("Miqrochain node running - syncing & serving peers...");
             if ((p2p_ok || cfg.no_p2p) && rpc_ok) tui.set_node_state(TUI::NodeState::Running);
             else tui.set_node_state(TUI::NodeState::Syncing);
         }
 
-        // main loop (TUI drains logs)
-        if (tui.is_enabled()) {
+        if (can_tui) {
             while(!g_shutdown_requested.load()){
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 std::deque<LogCapture::Line> lines;
@@ -1099,17 +1074,14 @@ int main(int argc, char** argv){
         try { rpc.stop(); } catch(...) {}
         try { p2p.stop(); } catch(...) {}
         log_info("Shutdown complete.");
-        capture.stop();
-        tui.stop();
+        if (can_tui) { capture.stop(); tui.stop(); }
         return 0;
 
     } catch(const std::exception& ex){
         std::fprintf(stderr, "[FATAL] %s\n", ex.what());
-        capture.stop();
         return 1;
     } catch(...){
         std::fprintf(stderr, "[FATAL] unknown exception\n");
-        capture.stop();
         return 1;
     }
 }
