@@ -29,6 +29,9 @@ option(MIQ_FETCH_LEVELDB     "Auto-fetch LevelDB if missing"                ON)
 option(MIQ_USE_LIBSECP "Use bitcoin-core/libsecp256k1 backend" ON)
 set(MIQ_LIBSECP_TAG "master" CACHE STRING "bitcoin-core/secp256k1 tag/commit")
 
+# ---- NEW: OpenCL / GPU toggle (default ON; silently disables if not found) ---
+option(MIQ_ENABLE_OPENCL "Build miners with OpenCL GPU support" ON)
+
 # ---------------- Warnings / Opt ----------------
 if(MSVC)
   add_compile_options(/O2 /Ot /Oi /GL /GF /Gy /Zc:inline)
@@ -108,6 +111,48 @@ if(MIQ_USE_LIBSECP)
     endif()
   endif()
   add_compile_definitions(MIQ_USE_LIBSECP256K1=1)
+endif()
+
+# ---------------- OpenCL detection (GPU) ----------------
+set(MIQ_HAVE_OPENCL 0)
+set(MIQ_OPENCL_NOTE "")
+if(MIQ_ENABLE_OPENCL)
+  # Try standard FindOpenCL first (provides OpenCL::OpenCL on modern CMake)
+  find_package(OpenCL QUIET)
+
+  # Fallback hints for Windows & CUDA Toolkit installs (like your v13.0 path)
+  if(NOT OpenCL_FOUND)
+    if(DEFINED ENV{CUDA_PATH})
+      set(_OPENCL_HINT_INC "$ENV{CUDA_PATH}/include")
+      set(_OPENCL_HINT_LIB "$ENV{CUDA_PATH}/lib/x64")
+    elseif(WIN32)
+      # Common default for CUDA 13.0 installer
+      set(_OPENCL_HINT_INC "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include")
+      set(_OPENCL_HINT_LIB "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/lib/x64")
+    endif()
+
+    find_path(OpenCL_INCLUDE_DIR CL/cl.h HINTS ${_OPENCL_HINT_INC})
+    find_library(OpenCL_LIBRARY NAMES OpenCL OpenCL.lib HINTS ${_OPENCL_HINT_LIB})
+
+    if(OpenCL_INCLUDE_DIR AND OpenCL_LIBRARY)
+      add_library(OpenCL::OpenCL UNKNOWN IMPORTED)
+      set_target_properties(OpenCL::OpenCL PROPERTIES
+        IMPORTED_LOCATION "${OpenCL_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${OpenCL_INCLUDE_DIR}")
+      set(OpenCL_FOUND TRUE)
+      set(MIQ_OPENCL_NOTE " (via CUDA Toolkit hints)")
+    endif()
+  endif()
+
+  if(OpenCL_FOUND)
+    set(MIQ_HAVE_OPENCL 1)
+    message(STATUS "OpenCL found${MIQ_OPENCL_NOTE}. GPU miner support ENABLED.")
+  else()
+    message(WARNING "OpenCL not found. GPU miner support will be DISABLED.\n"
+                    "Hint: pass -DOpenCL_INCLUDE_DIR=... -DOpenCL_LIBRARY=... or set CUDA_PATH.")
+  endif()
+else()
+  message(STATUS "MIQ_ENABLE_OPENCL=OFF. Building without GPU support.")
 endif()
 
 # ---------------- Core sources (shared, NO nat/tls here) ----------------
@@ -317,6 +362,11 @@ if(MIQ_MINER_SRC)
     target_link_libraries(miqminer PRIVATE ws2_32 bcrypt)
     target_compile_definitions(miqminer PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   endif()
+  # Enable GPU for standalone miner too (if it uses OpenCL blocks)
+  if(MIQ_HAVE_OPENCL)
+    target_compile_definitions(miqminer PRIVATE MIQ_ENABLE_OPENCL=1)
+    target_link_libraries(miqminer PRIVATE OpenCL::OpenCL)
+  endif()
   set_target_properties(miqminer PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
   message(STATUS "Building miner app from ${MIQ_MINER_SRC}")
 else()
@@ -342,6 +392,10 @@ if(MIQ_MINER_RPC_SRC)
   if(WIN32)
     target_link_libraries(miqminer_rpc PRIVATE ws2_32 bcrypt)
     target_compile_definitions(miqminer_rpc PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  if(MIQ_HAVE_OPENCL)
+    target_compile_definitions(miqminer_rpc PRIVATE MIQ_ENABLE_OPENCL=1)
+    target_link_libraries(miqminer_rpc PRIVATE OpenCL::OpenCL)
   endif()
   set_target_properties(miqminer_rpc PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
   message(STATUS "Building miner RPC app from ${MIQ_MINER_RPC_SRC}")
