@@ -1,10 +1,3 @@
-// Chronen Miner — FULL REVISED FILE
-// - Fix: 64-bit nonce handling on Windows/OpenCL (use cl_ulong everywhere)
-// - Safer defaults for laptop GPUs (WDDM/TDR-friendly)
-// - Better OpenCL error checks and readable error strings
-// - Keeps all previously wired features: seed gen + 5 addresses, interactive start,
-//   GPU default-on with OpenCL, live "next hash" preview, etc.
-
 #include "constants.h"
 #include "block.h"
 #include "tx.h"
