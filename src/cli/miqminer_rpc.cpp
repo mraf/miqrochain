@@ -1,3 +1,9 @@
+//
+// miqminer_rpc.cpp — Chronen Miner (CPU + OpenCL GPU)
+// - Includes mempool transactions via getblocktemplate
+// - Uses embedded BIP39 wordlist from ../bip39_words_en.h
+//
+
 #include "constants.h"
 #include "block.h"
 #include "tx.h"
@@ -91,7 +97,6 @@
     #endif
   #else
     #if defined(__APPLE__)
-      // (fix) typo was: #include <OpenCL/opencl.h)
       #include <OpenCL/opencl.h>
     #else
       #include <CL/cl.h>
@@ -284,6 +289,29 @@ static bool json_extract_top_string(const std::string& body, std::string& out){
         return true;
     }
     return false;
+}
+// parse hex string value into u32 (handles "key":"1d00ffff" or "key":486604799)
+static bool json_find_hex_or_number_u32(const std::string& json, const std::string& key, uint32_t& out){
+    std::string pat = "\"" + key + "\":";
+    size_t p = json.find(pat);
+    if(p==std::string::npos) return false;
+    p += pat.size();
+    while(p<json.size() && std::isspace((unsigned char)json[p])) ++p;
+    if(p>=json.size()) return false;
+    if(json[p]=='"'){
+        ++p;
+        size_t q=p;
+        while(q<json.size() && std::isxdigit((unsigned char)json[q])) ++q;
+        if(q==p) return false;
+        std::string hex = json.substr(p,q-p);
+        out = (uint32_t)strtoul(hex.c_str(), nullptr, 16);
+        return true;
+    }else{
+        long long v=0;
+        if(!json_find_number(json, key, v)) return false;
+        out = (uint32_t)v;
+        return true;
+    }
 }
 
 // ===== difficulty/target =====================================================
@@ -594,25 +622,187 @@ static void rpc_minerlog_best_effort(const std::string& host, uint16_t port, con
     (void)http_post(host, port, "/", auth, rpc_build("minerlog", ps.str()), r);
 }
 
-// === Lifetime total received to address (best-effort) ========================
-static bool rpc_result_double(const std::string& host, uint16_t port, const std::string& auth,
-                              const std::string& method, const std::string& params, double& outd){
-    HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build(method, params), r) || r.code!=200) return false;
-    if(json_has_error(r.body)) return false;
-    return json_find_double(r.body, "result", outd);
+// ===== address helpers & MIQ formatting =====================================
+static bool parse_p2pkh(const std::string& addr, std::vector<uint8_t>& out_pkh){
+    uint8_t ver=0; std::vector<uint8_t> payload;
+    if(!miq::base58check_decode(addr, ver, payload)) return false;
+    if(ver != miq::VERSION_P2PKH) return false;
+    if(payload.size() != 20) return false;
+    out_pkh = std::move(payload);
+    return true;
 }
-static bool rpc_result_u64_by_key(const std::string& host, uint16_t port, const std::string& auth,
-                                  const std::string& method, const std::string& params,
-                                  const std::string& key, uint64_t& outv){
-    HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build(method, params), r) || r.code!=200) return false;
-    if(json_has_error(r.body)) return false;
-    long long v=0;
-    if(json_find_number(r.body, key, v)){ outv = (v<0?0:(uint64_t)v); return true; }
-    return false;
+static std::string pkh_to_address(const std::vector<uint8_t>& pkh){
+    return miq::base58check_encode(miq::VERSION_P2PKH, pkh);
+}
+static std::string fmt_miq_amount(uint64_t base_units){
+    std::ostringstream o;
+    if (base_units % (MIQ_COIN_UNITS/100) == 0){
+        uint64_t whole = base_units / MIQ_COIN_UNITS;
+        uint64_t cents = (base_units / (MIQ_COIN_UNITS/100)) % 100;
+        o << whole << '.' << std::setw(2) << std::setfill('0') << cents;
+    } else {
+        o << std::fixed << std::setprecision(8)
+          << (double)base_units / (double)MIQ_COIN_UNITS;
+    }
+    o << " MIQ";
+    return o.str();
 }
 
+// ===== NEW: MinerTemplate types =============================================
+struct MinerTemplateTx {
+    std::string hex;   // raw tx hex (serialized)
+    uint64_t    fee{0};
+    size_t      size{0}; // bytes (estimate ok)
+};
+struct MinerTemplate {
+    uint64_t height{0};
+    uint32_t bits{miq::GENESIS_BITS};
+    int64_t  time{0};
+    size_t   max_block_bytes{1000000};
+    std::vector<uint8_t> prev_hash; // 32 bytes
+    std::vector<MinerTemplateTx> txs;
+};
+
+// very small helper to parse GBT "transactions":[{...}] list
+static void gbt_parse_transactions(const std::string& body, std::vector<MinerTemplateTx>& out){
+    out.clear();
+    const std::string key = "\"transactions\":";
+    size_t p = body.find(key);
+    if(p==std::string::npos) return;
+    p += key.size();
+    // find opening '['
+    p = body.find('[', p);
+    if(p==std::string::npos) return;
+    size_t end = body.find(']', p);
+    if(end==std::string::npos) end = body.size();
+
+    size_t cur = p;
+    while(true){
+        size_t obj_start = body.find('{', cur);
+        if(obj_start==std::string::npos || obj_start>=end) break;
+        size_t obj_end = body.find('}', obj_start);
+        if(obj_end==std::string::npos) break;
+
+        MinerTemplateTx xt{};
+        // find "data":"...."
+        {
+            size_t d = body.find("\"data\":", obj_start);
+            if(d!=std::string::npos && d<obj_end){
+                d = body.find('"', d+7);
+                if(d!=std::string::npos && d<obj_end){
+                    size_t q = body.find('"', d+1);
+                    if(q!=std::string::npos && q<=obj_end){
+                        xt.hex = body.substr(d+1, q-(d+1));
+                    }
+                }
+            }
+        }
+        // fee (number)
+        {
+            size_t f = body.find("\"fee\":", obj_start);
+            if(f!=std::string::npos && f<obj_end){
+                size_t s=f+6;
+                while(s<obj_end && std::isspace((unsigned char)body[s])) ++s;
+                size_t e=s;
+                while(e<obj_end && (std::isdigit((unsigned char)body[e]) || body[e]=='-' || body[e]=='+')) ++e;
+                if(e>s){
+                    long long v = std::strtoll(body.c_str()+s, nullptr, 10);
+                    if(v>0) xt.fee = (uint64_t)v;
+                }
+            }
+        }
+        // size or weight
+        {
+            size_t s = body.find("\"size\":", obj_start);
+            if(s!=std::string::npos && s<obj_end){
+                size_t a=s+7;
+                while(a<obj_end && std::isspace((unsigned char)body[a])) ++a;
+                size_t b=a;
+                while(b<obj_end && std::isdigit((unsigned char)body[b])) ++b;
+                if(b>a){
+                    long long v = std::strtoll(body.c_str()+a, nullptr, 10);
+                    if(v>0) xt.size = (size_t)v;
+                }
+            }
+            size_t w = body.find("\"weight\":", obj_start);
+            if(xt.size==0 && w!=std::string::npos && w<obj_end){
+                size_t a=w+9;
+                while(a<obj_end && std::isspace((unsigned char)body[a])) ++a;
+                size_t b=a;
+                while(b<obj_end && std::isdigit((unsigned char)body[b])) ++b;
+                if(b>a){
+                    long long v = std::strtoll(body.c_str()+a, nullptr, 10);
+                    if(v>0) xt.size = (size_t)((v+3)/4); // approximate
+                }
+            }
+        }
+        if(xt.size==0 && !xt.hex.empty()){
+            xt.size = xt.hex.size()/2;
+        }
+        if(!xt.hex.empty()){
+            out.push_back(std::move(xt));
+        }
+        cur = obj_end+1;
+    }
+}
+
+// Fetch miner template with mempool txs (GBT); fallback to tip-only template.
+static bool rpc_getminertemplate(const std::string& host, uint16_t port, const std::string& auth, MinerTemplate& out){
+    // Try getblocktemplate first (Bitcoin-like)
+    {
+        HttpResp r;
+        if(http_post(host, port, "/", auth, rpc_build("getblocktemplate","[{}]"), r) && r.code==200 && !json_has_error(r.body)){
+            uint32_t bits=0;
+            std::string prev;
+            long long height=0, curtime=0;
+            // keys in GBT: "bits" (hex string), "previousblockhash", "height", "curtime"
+            if(!json_find_hex_or_number_u32(r.body, "bits", bits)) bits = miq::GENESIS_BITS;
+            json_find_string(r.body, "previousblockhash", prev);
+            if(prev.empty()) json_find_string(r.body, "prevhash", prev);
+            (void)json_find_number(r.body, "height", height);
+            (void)json_find_number(r.body, "curtime", curtime);
+            if(!curtime) (void)json_find_number(r.body, "time", curtime);
+
+            out.bits   = sanitize_bits(bits);
+            out.height = (uint64_t)((height>0)?height:0);
+            out.time   = (int64_t)((curtime>0)?curtime:(long long)time(nullptr));
+            out.prev_hash = prev.empty()? std::vector<uint8_t>(32,0) : from_hex_s(prev);
+            out.txs.clear();
+            gbt_parse_transactions(r.body, out.txs);
+
+            // attempt size limit keys, else default 1MB
+            long long lim=0;
+            if(json_find_number(r.body, "sizelimit", lim) ||
+               json_find_number(r.body, "maxblocksize", lim) ||
+               json_find_number(r.body, "max_block_bytes", lim) ||
+               json_find_number(r.body, "max_block_size", lim))
+            {
+                if(lim>0) out.max_block_bytes = (size_t)lim;
+            } else {
+                out.max_block_bytes = 1000000;
+            }
+
+            // If height is absent, compute from tip + 1
+            if(out.height==0){
+                TipInfo t{};
+                if(rpc_gettipinfo(host,port,auth,t)) out.height = t.height + 1;
+            }
+            return true;
+        }
+    }
+    // Fallback: synthesize from tip (no mempool)
+    TipInfo t{};
+    if(!rpc_gettipinfo(host,port,auth,t)) return false;
+    out.height = t.height + 1;
+    out.bits   = t.bits ? t.bits : miq::GENESIS_BITS;
+    out.time   = std::max<int64_t>((int64_t)time(nullptr), t.time + 1);
+    out.prev_hash = from_hex_s(t.hash_hex);
+    out.max_block_bytes = 1000000;
+    out.txs.clear();
+    return true;
+}
+
+// ===== address/format helpers used later ====================================
 // choose a scaling of raw -> base units close to expected (handles 0.1×/1×/10× etc)
 static uint64_t normalize_to_expected(uint64_t raw, uint64_t expected){
     if(raw==0 || expected==0) return raw;
@@ -639,6 +829,24 @@ static uint64_t normalize_to_expected(uint64_t raw, uint64_t expected){
     long double mx = (long double)std::numeric_limits<uint64_t>::max();
     if(best_val > mx) return std::numeric_limits<uint64_t>::max();
     return (uint64_t) llround(best_val);
+}
+
+static bool rpc_result_double(const std::string& host, uint16_t port, const std::string& auth,
+                              const std::string& method, const std::string& params, double& outd){
+    HttpResp r;
+    if(!http_post(host, port, "/", auth, rpc_build(method, params), r) || r.code!=200) return false;
+    if(json_has_error(r.body)) return false;
+    return json_find_double(r.body, "result", outd);
+}
+static bool rpc_result_u64_by_key(const std::string& host, uint16_t port, const std::string& auth,
+                                  const std::string& method, const std::string& params,
+                                  const std::string& key, uint64_t& outv){
+    HttpResp r;
+    if(!http_post(host, port, "/", auth, rpc_build(method, params), r) || r.code!=200) return false;
+    if(json_has_error(r.body)) return false;
+    long long v=0;
+    if(json_find_number(r.body, key, v)){ outv = (v<0?0:(uint64_t)v); return true; }
+    return false;
 }
 
 static bool rpc_get_received_total_baseunits(const std::string& host, uint16_t port, const std::string& auth,
@@ -704,94 +912,26 @@ static bool rpc_get_received_total_baseunits(const std::string& host, uint16_t p
     return false;
 }
 
-// ===== address helpers & MIQ formatting =====================================
-static bool parse_p2pkh(const std::string& addr, std::vector<uint8_t>& out_pkh){
-    uint8_t ver=0; std::vector<uint8_t> payload;
-    if(!miq::base58check_decode(addr, ver, payload)) return false;
-    if(ver != miq::VERSION_P2PKH) return false;
-    if(payload.size() != 20) return false;
-    out_pkh = std::move(payload);
-    return true;
-}
-static std::string pkh_to_address(const std::vector<uint8_t>& pkh){
-    return miq::base58check_encode(miq::VERSION_P2PKH, pkh);
-}
-static std::string fmt_miq_amount(uint64_t base_units){
-    std::ostringstream o;
-    if (base_units % (MIQ_COIN_UNITS/100) == 0){
-        uint64_t whole = base_units / MIQ_COIN_UNITS;
-        uint64_t cents = (base_units / (MIQ_COIN_UNITS/100)) % 100;
-        o << whole << '.' << std::setw(2) << std::setfill('0') << cents;
-    } else {
-        o << std::fixed << std::setprecision(8)
-          << (double)base_units / (double)MIQ_COIN_UNITS;
-    }
-    o << " MIQ";
-    return o.str();
-}
-
-// ===== NEW: REAL BIP39 (wordlist, generate, validate) ========================
+// ===== NEW: REAL BIP39 using embedded header ================================
+// NOTE: this removes file dependencies completely.
+#include "../bip39_words_en.h"
 
 struct BIP39Wordlist {
     std::vector<std::string> words;                 // 2048 words
     std::unordered_map<std::string, uint16_t> idx;  // word -> index
 };
 
-static std::string path_join(const std::string& a, const std::string& b){
-#if defined(_WIN32)
-    const char sep='\\';
-#else
-    const char sep='/';
-#endif
-    if(a.empty()) return b;
-    if(a.back()==sep) return a + b;
-    return a + sep + b;
-}
-
-static std::vector<std::string> candidate_wordlist_paths(){
-    std::vector<std::string> v;
-    v.push_back("bip39_english.txt");
-    v.push_back(path_join("wordlists","english.txt"));
-    v.push_back(path_join("wordlists","bip39_english.txt"));
-
-#if defined(_WIN32)
-    char* app=nullptr; size_t len=0;
-    if (_dupenv_s(&app,&len,"APPDATA")==0 && app){
-        std::string base(app); free(app);
-        v.push_back(path_join(path_join(base, "Miqrochain"), "bip39_english.txt"));
-    }
-#else
-    const char* home = std::getenv("HOME");
-    if(home && *home){
-        v.push_back(path_join(path_join(home, ".miqrochain"), "bip39_english.txt"));
-        v.push_back(path_join(path_join(home, "Miqrochain"), "bip39_english.txt"));
-    }
-#endif
-    return v;
-}
-
 static bool load_bip39_wordlist(BIP39Wordlist& wl, std::string* used_path=nullptr){
+    (void)used_path;
     wl.words.clear(); wl.idx.clear();
-    for(const auto& p : candidate_wordlist_paths()){
-        std::ifstream f(p);
-        if(!f.good()) continue;
-        std::vector<std::string> lines;
-        std::string s;
-        while(std::getline(f,s)){
-            if(!s.empty() && (s.back()=='\r' || s.back()=='\n')) s.pop_back();
-            // lowercase normalize; English list is already ASCII lowercase.
-            for(char& c : s) c = (char)std::tolower((unsigned char)c);
-            trim(s);
-            if(!s.empty()) lines.push_back(s);
-        }
-        if(lines.size()==2048){
-            wl.words = std::move(lines);
-            for(uint16_t i=0;i<2048;i++) wl.idx[wl.words[i]] = i;
-            if(used_path) *used_path = p;
-            return true;
-        }
+    wl.words.reserve(2048);
+    for(size_t i=0;i<2048;i++){
+        wl.words.emplace_back(BIP39_EN_WORDS[i]);
     }
-    return false;
+    for(uint16_t i=0;i<2048;i++){
+        wl.idx[wl.words[i]] = i;
+    }
+    return wl.words.size()==2048;
 }
 
 static bool csprng_bytes(uint8_t* out, size_t n){
@@ -831,12 +971,11 @@ static std::vector<std::string> split_words(const std::string& s){
 }
 
 static bool make_mnemonic_words(size_t words, std::vector<std::string>& out_words, std::vector<uint8_t>& out_entropy){
-    // REAL BIP39 generator (English wordlist is required)
     if(words!=12 && words!=24) return false;
     BIP39Wordlist wl;
     std::string used;
     if(!load_bip39_wordlist(wl, &used)){
-        std::fprintf(stderr,"BIP39 wordlist not found (expected 2048 words). Place bip39_english.txt in working dir or ~/.miqrochain/.\n");
+        std::fprintf(stderr,"BIP39 wordlist (embedded) failed to load.\n");
         return false;
     }
 
@@ -891,7 +1030,7 @@ static bool validate_mnemonic_and_get_entropy(const std::string& phrase_in,
 {
     BIP39Wordlist wl;
     if(!load_bip39_wordlist(wl,nullptr)){
-        std::fprintf(stderr,"BIP39 wordlist not found for validation.\n");
+        std::fprintf(stderr,"BIP39 wordlist (embedded) not available.\n");
         return false;
     }
     std::string phrase = normalize_spaces_lower(phrase_in);
@@ -947,7 +1086,6 @@ static void mnemonic_to_seed_BIP39(const std::string& mnemonic,
                                    const std::string& passphrase,
                                    std::vector<uint8_t>& out)
 {
-    // NOTE: Full BIP39 specifies NFKD normalization; English list generally OK ASCII.
     const std::string salt = std::string("mnemonic") + passphrase;
     out.resize(64);
     PKCS5_PBKDF2_HMAC(mnemonic.c_str(), (int)mnemonic.size(),
@@ -1828,7 +1966,7 @@ static bool pack_template(const MinerTemplate& tpl,
         std::vector<uint8_t> raw;
         try{ raw = from_hex_s(xt.hex); }catch(...){ continue; }
         Transaction t; if(!deser_tx(raw, t)) continue;
-        size_t sz = ser_tx(t).size();
+        size_t sz = xt.size ? xt.size : ser_tx(t).size();
         if(out_bytes + sz > tpl.max_block_bytes) continue;
         out_txs.push_back(std::move(t));
         out_bytes += sz;
@@ -1855,7 +1993,7 @@ static void usage(){
     "  - Token from --token, MIQ_RPC_TOKEN, or datadir/.cookie\n"
     "  - Default threads: 6 (override with --threads)\n"
     "  - GPU requires build with -DMIQ_ENABLE_OPENCL and OpenCL runtime installed\n"
-    "  - BIP39 English wordlist file required at startup when generating/importing mnemonics.\n";
+    "  - BIP39 English wordlist is embedded (no files needed).\n";
 }
 
 // ===== NEW: interactive start menu (create/import wallet or start miner) =====
@@ -1896,7 +2034,7 @@ static bool interactive_start_menu(std::string& out_addr, uint32_t coin_type){
             std::vector<std::string> words_out;
             std::vector<uint8_t> entropy;
             if(!make_mnemonic_words((size_t)words, words_out, entropy)){
-                std::fprintf(stderr,"Failed to create %d-word mnemonic (wordlist missing?).\n", words);
+                std::fprintf(stderr,"Failed to create %d-word mnemonic.\n", words);
                 miq_sleep_ms(1200);
                 continue;
             }
@@ -2149,7 +2287,7 @@ int main(int argc, char** argv){
             std::vector<std::string> words;
             std::vector<uint8_t> entropy;
             if(!make_mnemonic_words((size_t)make_seed_words, words, entropy)){
-                std::fprintf(stderr,"Failed to create %d-word mnemonic (wordlist missing?).\n", make_seed_words);
+                std::fprintf(stderr,"Failed to create %d-word mnemonic.\n", make_seed_words);
                 return 2;
             }
             std::string mnemonic = mnemonic_join(words);
@@ -2578,7 +2716,7 @@ int main(int argc, char** argv){
 
         // ===== mining loop ===================================================
         while (true) {
-            // Fetch a fresh template
+            // Fetch a fresh template (includes mempool txs via GBT when available)
             MinerTemplate tpl;
             if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
                 std::fprintf(stderr, "getminertemplate failed, retrying...\n");
@@ -2745,7 +2883,7 @@ int main(int argc, char** argv){
                         ui.last_tip_was_mine.store(true);
                         ui.last_winner_addr.clear();
 
-                        // (fixed) pass token as the 3rd argument to match signature
+                        // 4-arg signature (host,port,token,msg)
                         rpc_minerlog_best_effort(
                             rpc_host, rpc_port, token,
                             std::string("miner: accepted block at height ")
