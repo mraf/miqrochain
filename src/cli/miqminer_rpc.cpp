@@ -1,9 +1,3 @@
-//
-// miqminer_rpc.cpp — Chronen Miner (CPU + OpenCL GPU)
-// - Includes mempool transactions via getblocktemplate
-// - Uses embedded BIP39 wordlist from ../bip39_words_en.h
-//
-
 #include "constants.h"
 #include "block.h"
 #include "tx.h"
