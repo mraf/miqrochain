@@ -43,6 +43,11 @@
 #define MIQ_LIGHT_MAX_MSG_SIZE (MAX_MSG_SIZE)
 #endif
 
+// extra safety: verify header checksums on receive
+#ifndef MIQ_LIGHT_VERIFY_CSUM
+#define MIQ_LIGHT_VERIFY_CSUM 1
+#endif
+
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
   #define WIN32_LEAN_AND_MEAN
@@ -536,7 +541,6 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
     // Progress guards to stop "endless getheaders" loops
     const size_t kMaxLoops = 2048;
     size_t loops = 0;
-    std::vector<uint8_t> last_tail_hash; // last hash we asked with / saw
 
     while(true){
         if (++loops > kMaxLoops) {
@@ -577,7 +581,6 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
         // New locator = last hash (simple linear advance)
         locator.clear();
         locator.push_back(header_hashes_le_.back());
-        last_tail_hash = header_hashes_le_.back();
     }
 
     if(header_hashes_le_.empty()){
@@ -640,6 +643,10 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
 
         std::vector<uint8_t> payload(len);
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
+
+#if MIQ_LIGHT_VERIFY_CSUM
+        if (checksum4(payload) != csum) { err = "bad checksum"; return false; }
+#endif
 
         if(cmd == "ping"){
             std::string e; send_msg("pong", payload, e);
@@ -799,6 +806,10 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
         std::vector<uint8_t> payload(len);
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
 
+#if MIQ_LIGHT_VERIFY_CSUM
+        if (checksum4(payload) != csum) { err = "bad checksum"; return false; }
+#endif
+
         if(cmd=="ping"){
             std::string e; send_msg("pong", payload, e);
 #if MIQ_ENABLE_ADDRMAN
@@ -916,6 +927,10 @@ bool P2PLight::read_until_verack(std::string& err){
         std::vector<uint8_t> payload(len);
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
 
+#if MIQ_LIGHT_VERIFY_CSUM
+        if (checksum4(payload) != csum) { err = "bad checksum"; return false; }
+#endif
+
         if(cmd=="verack") return true;
         if(cmd=="ping"){ std::string e; send_msg("pong", payload, e); }
 #if MIQ_ENABLE_ADDRMAN
@@ -996,18 +1011,9 @@ bool P2PLight::send_msg(const char cmd12[12], const std::vector<uint8_t>& payloa
     uint32_t c = checksum4(payload);
     header[20]=uint8_t(c); header[21]=uint8_t(c>>8); header[22]=uint8_t(c>>16); header[23]=uint8_t(c>>24);
 
-#ifdef _WIN32
-    int n1 = send((SOCKET)sock_, (const char*)header, (int)sizeof(header), 0);
-    if(n1 != (int)sizeof(header)) { err = "send failed"; return false; }
-    if(L>0){
-        int n2 = send((SOCKET)sock_, (const char*)payload.data(), (int)L, 0);
-        if(n2 != (int)L){ err = "send failed"; return false; }
-    }
-#else
-    std::string e;
-    if(!write_all(header, sizeof(header), e)) { err = e; return false; }
-    if(L>0 && !write_all(payload.data(), L, e)) { err = e; return false; }
-#endif
+    // robust send (loop on partial)
+    if(!write_all(header, sizeof(header), err)) return false;
+    if(L>0 && !write_all(payload.data(), L, err)) return false;
     return true;
 }
 
