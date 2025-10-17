@@ -1,5 +1,10 @@
 // src/main.cpp  — MIQ core entrypoint with robust Pro TUI (no extra files)
 
+// Ensure MSVC treats narrow string literals as UTF-8 (prevents mojibake like "ÔÇª")
+#ifdef _MSC_VER
+#pragma execution_character_set("utf-8")
+#endif
+
 // Prevent Windows headers from defining min/max macros that break std::min/std::max
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -430,7 +435,6 @@ private:
     }
 
     std::string hr(int w)  const { return unicode_ok_ ? repeat_unit("─", w) : repeat_unit("-", w); }
-    std::string sep_vert() const { return unicode_ok_ ? " │ " : " | "; }
     std::string ok_glyph() const { return unicode_ok_ ? "✔" : "OK"; }
     const char* spin_utf8(int idx) const {
         static const char* S[] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
@@ -596,8 +600,7 @@ private:
         out << hr(leftw + 3 + rightw) << "\n";
         out << "\x1b[38;5;39mLogs\x1b[0m  \x1b[38;5;244m(press Ctrl+C to exit)\x1b[0m\n";
         int header_rows = (int)N + 2;
-        int rows, cols; term::get_winsize(cols, rows);
-        int remain = rows - header_rows - 3;
+        int remain = rows - header_rows - 3;   // <— reuse existing rows/cols (fixes redefinition error)
         if (remain < 6) remain = 6;
         int start = (int)logs_.size() - remain;
         if (start < 0) start = 0;
@@ -640,7 +643,7 @@ static void fatal_terminate() noexcept {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
-// Miner worker
+// Miner worker (unchanged core)
 static void miner_worker(Chain* chain,
                          Mempool* mempool,
                          P2P* p2p,
@@ -825,7 +828,7 @@ int main(int argc, char** argv){
         tui.set_banner("Preparing Miqrochain node…");
         tui.set_loading_step("Parse CLI / environment", true);
     } else {
-        std::fprintf(stderr, "[INFO] TUI disabled (plain logs). Set a modern terminal or use PowerShell/Windows Terminal for UI.\n");
+        std::fprintf(stderr, "[INFO] TUI disabled (plain logs). Use Windows Terminal/PowerShell 7 for UI.\n");
     }
 
     try {
@@ -1118,12 +1121,10 @@ int main(int argc, char** argv){
                  ", P2P " + std::to_string(P2P_PORT));
         if(tui.is_enabled()) tui.set_banner("Miqrochain node running — syncing & serving peers…");
 
-        // ===== IMPORTANT FIX: start capturing logs only AFTER the first visible TUI frame
-        if (tui.is_enabled()) {
-            capture.start();
-        }
+        // Start capturing logs only AFTER the first visible TUI frame
+        if (tui.is_enabled()) capture.start();
 
-        // Main UI loop: drain logs into TUI or plain wait
+        // Main loop
         if (tui.is_enabled()) {
             while(!g_shutdown_requested.load()){
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
