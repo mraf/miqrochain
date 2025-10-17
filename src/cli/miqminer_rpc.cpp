@@ -1,8 +1,9 @@
-// === WIRED: Seed gen (12/24 words) + 5 MIQ addresses + uniqueness cache
-// === WIRED: GPU default-on (OpenCL) + clearer init
-// === WIRED: Live "next hash" preview in UI from real hashing stream
-// === NEW: Interactive start menu (Create 12/24, Import mnemonic, or use existing addr)
-// (All integrated into this single file without breaking existing logic.)
+// Chronen Miner — FULL REVISED FILE
+// - Fix: 64-bit nonce handling on Windows/OpenCL (use cl_ulong everywhere)
+// - Safer defaults for laptop GPUs (WDDM/TDR-friendly)
+// - Better OpenCL error checks and readable error strings
+// - Keeps all previously wired features: seed gen + 5 addresses, interactive start,
+//   GPU default-on with OpenCL, live "next hash" preview, etc.
 
 #include "constants.h"
 #include "block.h"
@@ -94,7 +95,7 @@
     #endif
   #else
     #if defined(__APPLE__)
-      #include <OpenCL/opencl.h>
+      #include <OpenCL/opencl.h)
     #else
       #include <CL/cl.h>
     #endif
@@ -1364,6 +1365,59 @@ __kernel void sha256d_scan(__constant u8* prefix,
 }
 )CLC";
 
+static const char* clerr(cl_int e){
+  switch(e){
+    case CL_SUCCESS: return "CL_SUCCESS";
+    case CL_DEVICE_NOT_FOUND: return "CL_DEVICE_NOT_FOUND";
+    case CL_DEVICE_NOT_AVAILABLE: return "CL_DEVICE_NOT_AVAILABLE";
+    case CL_COMPILER_NOT_AVAILABLE: return "CL_COMPILER_NOT_AVAILABLE";
+    case CL_MEM_OBJECT_ALLOCATION_FAILURE: return "CL_MEM_OBJECT_ALLOCATION_FAILURE";
+    case CL_OUT_OF_RESOURCES: return "CL_OUT_OF_RESOURCES";
+    case CL_OUT_OF_HOST_MEMORY: return "CL_OUT_OF_HOST_MEMORY";
+    case CL_PROFILING_INFO_NOT_AVAILABLE: return "CL_PROFILING_INFO_NOT_AVAILABLE";
+    case CL_MEM_COPY_OVERLAP: return "CL_MEM_COPY_OVERLAP";
+    case CL_IMAGE_FORMAT_MISMATCH: return "CL_IMAGE_FORMAT_MISMATCH";
+    case CL_IMAGE_FORMAT_NOT_SUPPORTED: return "CL_IMAGE_FORMAT_NOT_SUPPORTED";
+    case CL_BUILD_PROGRAM_FAILURE: return "CL_BUILD_PROGRAM_FAILURE";
+    case CL_MAP_FAILURE: return "CL_MAP_FAILURE";
+    case CL_INVALID_VALUE: return "CL_INVALID_VALUE";
+    case CL_INVALID_DEVICE_TYPE: return "CL_INVALID_DEVICE_TYPE";
+    case CL_INVALID_PLATFORM: return "CL_INVALID_PLATFORM";
+    case CL_INVALID_DEVICE: return "CL_INVALID_DEVICE";
+    case CL_INVALID_CONTEXT: return "CL_INVALID_CONTEXT";
+    case CL_INVALID_QUEUE_PROPERTIES: return "CL_INVALID_QUEUE_PROPERTIES";
+    case CL_INVALID_COMMAND_QUEUE: return "CL_INVALID_COMMAND_QUEUE";
+    case CL_INVALID_HOST_PTR: return "CL_INVALID_HOST_PTR";
+    case CL_INVALID_MEM_OBJECT: return "CL_INVALID_MEM_OBJECT";
+    case CL_INVALID_IMAGE_FORMAT_DESCRIPTOR: return "CL_INVALID_IMAGE_FORMAT_DESCRIPTOR";
+    case CL_INVALID_IMAGE_SIZE: return "CL_INVALID_IMAGE_SIZE";
+    case CL_INVALID_SAMPLER: return "CL_INVALID_SAMPLER";
+    case CL_INVALID_BINARY: return "CL_INVALID_BINARY";
+    case CL_INVALID_BUILD_OPTIONS: return "CL_INVALID_BUILD_OPTIONS";
+    case CL_INVALID_PROGRAM: return "CL_INVALID_PROGRAM";
+    case CL_INVALID_PROGRAM_EXECUTABLE: return "CL_INVALID_PROGRAM_EXECUTABLE";
+    case CL_INVALID_KERNEL_NAME: return "CL_INVALID_KERNEL_NAME";
+    case CL_INVALID_KERNEL_DEFINITION: return "CL_INVALID_KERNEL_DEFINITION";
+    case CL_INVALID_KERNEL: return "CL_INVALID_KERNEL";
+    case CL_INVALID_ARG_INDEX: return "CL_INVALID_ARG_INDEX";
+    case CL_INVALID_ARG_VALUE: return "CL_INVALID_ARG_VALUE";
+    case CL_INVALID_ARG_SIZE: return "CL_INVALID_ARG_SIZE";
+    case CL_INVALID_KERNEL_ARGS: return "CL_INVALID_KERNEL_ARGS";
+    case CL_INVALID_WORK_DIMENSION: return "CL_INVALID_WORK_DIMENSION";
+    case CL_INVALID_WORK_GROUP_SIZE: return "CL_INVALID_WORK_GROUP_SIZE";
+    case CL_INVALID_WORK_ITEM_SIZE: return "CL_INVALID_WORK_ITEM_SIZE";
+    case CL_INVALID_GLOBAL_OFFSET: return "CL_INVALID_GLOBAL_OFFSET";
+    case CL_INVALID_EVENT_WAIT_LIST: return "CL_INVALID_EVENT_WAIT_LIST";
+    case CL_INVALID_EVENT: return "CL_INVALID_EVENT";
+    case CL_INVALID_OPERATION: return "CL_INVALID_OPERATION";
+    case CL_INVALID_GL_OBJECT: return "CL_INVALID_GL_OBJECT";
+    case CL_INVALID_BUFFER_SIZE: return "CL_INVALID_BUFFER_SIZE";
+    case CL_INVALID_MIP_LEVEL: return "CL_INVALID_MIP_LEVEL";
+    case CL_INVALID_GLOBAL_WORK_SIZE: return "CL_INVALID_GLOBAL_WORK_SIZE";
+    default: return "CL_ERROR";
+  }
+}
+
 struct GpuMiner {
   cl_context       ctx = nullptr;
   cl_command_queue q   = nullptr; // OpenCL 1.2
@@ -1374,8 +1428,9 @@ struct GpuMiner {
 
   cl_mem buf_prefix=nullptr, buf_target=nullptr, buf_found=nullptr, buf_nonce=nullptr;
 
-  size_t  gws = 262144;
-  uint32_t npi = 2048;
+  // Safer defaults for laptops (reduce TDR risk)
+  size_t  gws = 131072;      // was 262144
+  uint32_t npi = 512;        // was 2048
   bool ready=false;
 
   double ema_now=0.0, ema_smooth=0.0;
@@ -1435,14 +1490,14 @@ struct GpuMiner {
     driver = buf;
 
     ctx = clCreateContext(nullptr, 1, &dev, nullptr, nullptr, &e);
-    if(!ctx || e){ if(err) *err="clCreateContext failed."; release_all(); return false; }
+    if(!ctx || e){ if(err) *err=std::string("clCreateContext failed: ")+clerr(e); release_all(); return false; }
     q = clCreateCommandQueue(ctx, dev, 0, &e);
-    if(!q || e){ if(err) *err="clCreateCommandQueue failed."; release_all(); return false; }
+    if(!q || e){ if(err) *err=std::string("clCreateCommandQueue failed: ")+clerr(e); release_all(); return false; }
 
     const char* src = kCLKernel;
     size_t srclen = std::strlen(src);
     prog = clCreateProgramWithSource(ctx, 1, &src, &srclen, &e);
-    if(!prog || e){ if(err) *err="clCreateProgramWithSource failed."; release_all(); return false; }
+    if(!prog || e){ if(err) *err=std::string("clCreateProgramWithSource failed: ")+clerr(e); release_all(); return false; }
     const char* opts = "-cl-std=CL1.2";
     e = clBuildProgram(prog, 1, &dev, opts, nullptr, nullptr);
     if(e!=CL_SUCCESS){
@@ -1454,7 +1509,11 @@ struct GpuMiner {
     }
 
     krn = clCreateKernel(prog, "sha256d_scan", &e);
-    if(!krn || e){ if(err) *err="clCreateKernel failed."; release_all(); return false; }
+    if(!krn || e){ if(err) *err=std::string("clCreateKernel failed: ")+clerr(e); release_all(); return false; }
+
+    // Compile-time sanity
+    static_assert(sizeof(cl_ulong)==8, "cl_ulong must be 8 bytes");
+    static_assert(sizeof(cl_uint)==4,  "cl_uint must be 4 bytes");
 
     ready=true;
     return true;
@@ -1467,26 +1526,26 @@ struct GpuMiner {
 
     buf_prefix = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                 prefix.size(), (void*)prefix.data(), &e);
-    if(!buf_prefix || e){ if(err) *err="clCreateBuffer(buf_prefix) failed."; release_buffers(); return false; }
+    if(!buf_prefix || e){ if(err) *err=std::string("clCreateBuffer(buf_prefix) failed: ")+clerr(e); release_buffers(); return false; }
 
     buf_target = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                 32, (void*)target_be, &e);
-    if(!buf_target || e){ if(err) *err="clCreateBuffer(buf_target) failed."; release_buffers(); return false; }
+    if(!buf_target || e){ if(err) *err=std::string("clCreateBuffer(buf_target) failed: ")+clerr(e); release_buffers(); return false; }
 
     int zero=0;
     buf_found = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
                                sizeof(int), &zero, &e);
-    if(!buf_found || e){ if(err) *err="clCreateBuffer(buf_found) failed."; release_buffers(); return false; }
+    if(!buf_found || e){ if(err) *err=std::string("clCreateBuffer(buf_found) failed: ")+clerr(e); release_buffers(); return false; }
 
-    unsigned long init_nonce=0;
+    cl_ulong init_nonce=0;
     buf_nonce = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY | CL_MEM_COPY_HOST_PTR,
-                               sizeof(unsigned long), &init_nonce, &e);
-    if(!buf_nonce || e){ if(err) *err="clCreateBuffer(buf_nonce) failed."; release_buffers(); return false; }
+                               sizeof(cl_ulong), &init_nonce, &e);
+    if(!buf_nonce || e){ if(err) *err=std::string("clCreateBuffer(buf_nonce) failed: ")+clerr(e); release_buffers(); return false; }
 
-    e = clSetKernelArg(krn, 0, sizeof(cl_mem), &buf_prefix); if(e){ if(err) *err="clSetArg0 failed."; return false; }
-    uint32_t prefix_len = (uint32_t)prefix.size();
-    e = clSetKernelArg(krn, 1, sizeof(uint32_t), &prefix_len); if(e){ if(err) *err="clSetArg1 failed."; return false; }
-    e = clSetKernelArg(krn, 2, sizeof(cl_mem), &buf_target); if(e){ if(err) *err="clSetArg2 failed."; return false; }
+    e = clSetKernelArg(krn, 0, sizeof(cl_mem), &buf_prefix); if(e){ if(err) *err=std::string("clSetArg0 failed: ")+clerr(e); return false; }
+    cl_uint prefix_len = (cl_uint)prefix.size();
+    e = clSetKernelArg(krn, 1, sizeof(cl_uint), &prefix_len); if(e){ if(err) *err=std::string("clSetArg1 failed: ")+clerr(e); return false; }
+    e = clSetKernelArg(krn, 2, sizeof(cl_mem), &buf_target); if(e){ if(err) *err=std::string("clSetArg2 failed: ")+clerr(e); return false; }
 
     return true;
   }
@@ -1495,25 +1554,31 @@ struct GpuMiner {
     if(!ready) return false;
     cl_int e;
 
-    e = clSetKernelArg(krn, 3, sizeof(unsigned long), &base_nonce); if(e) return false;
-    e = clSetKernelArg(krn, 4, sizeof(uint32_t), &npi_in); if(e) return false;
-    e = clSetKernelArg(krn, 5, sizeof(cl_mem), &buf_found); if(e) return false;
-    e = clSetKernelArg(krn, 6, sizeof(cl_mem), &buf_nonce); if(e) return false;
+    cl_ulong base_nonce_arg = (cl_ulong)base_nonce;
+    e = clSetKernelArg(krn, 3, sizeof(cl_ulong), &base_nonce_arg); if(e){ std::fprintf(stderr,"[GPU] SetArg3: %s\n", clerr(e)); return false; }
+
+    cl_uint npi_arg = (cl_uint)npi_in;
+    e = clSetKernelArg(krn, 4, sizeof(cl_uint), &npi_arg); if(e){ std::fprintf(stderr,"[GPU] SetArg4: %s\n", clerr(e)); return false; }
+
+    e = clSetKernelArg(krn, 5, sizeof(cl_mem), &buf_found); if(e){ std::fprintf(stderr,"[GPU] SetArg5: %s\n", clerr(e)); return false; }
+    e = clSetKernelArg(krn, 6, sizeof(cl_mem), &buf_nonce); if(e){ std::fprintf(stderr,"[GPU] SetArg6: %s\n", clerr(e)); return false; }
 
     size_t g = gws;
 
     auto t0 = std::chrono::steady_clock::now();
     e = clEnqueueNDRangeKernel(q, krn, 1, nullptr, &g, nullptr, 0, nullptr, nullptr);
-    if(e) return false;
+    if(e){ std::fprintf(stderr,"[GPU] Enqueue: %s\n", clerr(e)); return false; }
 
-    clFinish(q);
+    e = clFinish(q);
+    if(e){ std::fprintf(stderr,"[GPU] Finish: %s\n", clerr(e)); return false; }
+
     auto t1 = std::chrono::steady_clock::now();
     double dt = std::chrono::duration<double>(t1 - t0).count();
     if(dt <= 0.0) dt = 1e-6;
 
     int f=0;
     e = clEnqueueReadBuffer(q, buf_found, CL_TRUE, 0, sizeof(int), &f, 0, nullptr, nullptr);
-    if(e) return false;
+    if(e){ std::fprintf(stderr,"[GPU] Read found: %s\n", clerr(e)); return false; }
 
     double hashes = (double)g * (double)npi_in;
     double inst = hashes / dt;
@@ -1524,9 +1589,9 @@ struct GpuMiner {
     hps = ema_smooth;
 
     if(f){
-      unsigned long n=0;
-      e = clEnqueueReadBuffer(q, buf_nonce, CL_TRUE, 0, sizeof(unsigned long), &n, 0, nullptr, nullptr);
-      if(e) return false;
+      cl_ulong n=0;
+      e = clEnqueueReadBuffer(q, buf_nonce, CL_TRUE, 0, sizeof(cl_ulong), &n, 0, nullptr, nullptr);
+      if(e){ std::fprintf(stderr,"[GPU] Read nonce: %s\n", clerr(e)); return false; }
       out_nonce = (uint64_t)n;
       found = true;
       return true;
@@ -1918,8 +1983,8 @@ int main(int argc, char** argv){
         bool   gpu_enabled = true;
         int    gpu_platform_index = 0;
         int    gpu_device_index   = -1;
-        size_t gpu_gws = 262144;
-        uint32_t gpu_npi = 2048;
+        size_t gpu_gws = 131072;   // safer default
+        uint32_t gpu_npi = 512;    // safer default
 
         // Salt options (for GPU & optional CPU conformity when MIQ_POW_SALT is defined)
         std::vector<uint8_t> salt_bytes;
