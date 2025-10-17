@@ -1,6 +1,7 @@
 // === WIRED: Seed gen (12/24 words) + 5 MIQ addresses + uniqueness cache
 // === WIRED: GPU default-on (OpenCL) + clearer init
 // === WIRED: Live "next hash" preview in UI from real hashing stream
+// === NEW: Interactive start menu (Create 12/24, Import mnemonic, or use existing addr)
 // (All integrated into this single file without breaking existing logic.)
 
 #include "constants.h"
@@ -927,10 +928,25 @@ static bool point_from_priv(const BIGNUM* k, std::vector<uint8_t>& out_compresse
     out_compressed.assign(buf, buf+33);
     return true;
 }
+
+// UPDATED to use EVP (avoids OpenSSL 3.0 deprecation warning)
 static void hash160(const uint8_t* data, size_t n, uint8_t out20[20]){
-    uint8_t tmp[32]; ::SHA256(data,n,tmp);
-    ::RIPEMD160(tmp,32,out20);
+    unsigned int len = 0;
+    uint8_t sha[32];
+
+    EVP_MD_CTX* c1 = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(c1, EVP_sha256(), nullptr);
+    EVP_DigestUpdate(c1, data, n);
+    EVP_DigestFinal_ex(c1, sha, &len);
+    EVP_MD_CTX_free(c1);
+
+    EVP_MD_CTX* c2 = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(c2, EVP_ripemd160(), nullptr);
+    EVP_DigestUpdate(c2, sha, 32);
+    EVP_DigestFinal_ex(c2, out20, &len);
+    EVP_MD_CTX_free(c2);
 }
+
 static bool xprv_from_seed(const std::vector<uint8_t>& seed, XPrv& out){
     uint8_t I[64]; unsigned int L=64;
     HMAC(EVP_sha512(), "Bitcoin seed", 12, seed.data(), (int)seed.size(), I, &L);
@@ -1127,7 +1143,8 @@ static std::string spark_ascii(const std::vector<double>& xs){
     std::string s;
     for(double v: xs){
         int idx = (int)std::round( (v-mn)/span * 7.0 );
-        if(idx<0) idx=0; if(idx>7) idx=7;
+        if(idx<0) idx=0;
+        if(idx>7) idx=7;
         s.push_back(bars[idx]);
     }
     return s;
@@ -1708,6 +1725,177 @@ static void usage(){
     "  - GPU requires build with -DMIQ_ENABLE_OPENCL and OpenCL runtime installed\n";
 }
 
+// ===== NEW: interactive start menu (create/import wallet or start miner) =====
+static bool interactive_start_menu(std::string& out_addr, uint32_t coin_type){
+#if defined(_WIN32)
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h != INVALID_HANDLE_VALUE) { DWORD mode=0; if (GetConsoleMode(h,&mode)) SetConsoleMode(h, mode | 0x0004); }
+#endif
+    auto banner = [](){
+        std::ostringstream s;
+        s << CLS();
+        s << C("36;1");
+        const size_t N = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
+        for(size_t i=0;i<N;i++) s << "  " << kChronenMinerBanner[i] << "\n";
+        s << R() << "\n";
+        std::cout << s.str();
+    };
+
+    while(true){
+        banner();
+        std::cout
+            << "  " << C("36;1") << "CHRONEN MINER — START" << R() << "\n\n"
+            << "  1) Create NEW wallet (12 words)\n"
+            << "  2) Create NEW wallet (24 words)\n"
+            << "  3) Import mnemonic (12 or 24 words)\n"
+            << "  4) Start miner with existing address\n"
+            << "  q) Quit\n\n"
+            << "  Select an option: " << std::flush;
+
+        std::string choice;
+        if(!std::getline(std::cin, choice)) return false;
+        trim(choice);
+        if(choice=="q" || choice=="Q") return false;
+
+        if(choice=="1" || choice=="2"){
+            const int words = (choice=="1") ? 12 : 24;
+
+            // generate mnemonic + seed
+            std::vector<std::string> words_out;
+            std::vector<uint8_t> entropy;
+            if(!make_mnemonic_words((size_t)words, words_out, entropy)){
+                std::fprintf(stderr,"Failed to create %d-word mnemonic.\n", words);
+                miq_sleep_ms(1200);
+                continue;
+            }
+            std::string mnemonic = mnemonic_join(words_out);
+
+            banner();
+            std::cout << C("36;1") << "YOUR " << words << "-WORD MNEMONIC" << R() << "\n\n"
+                      << "  " << mnemonic << "\n\n"
+                      << C("33;1") << "Write these words down. "
+                      << "Anyone with this mnemonic can spend your MIQ." << R() << "\n\n";
+
+            // optional BIP39 passphrase
+            std::string passphrase;
+            std::cout << "  Optional BIP39 passphrase (ENTER to skip): " << std::flush;
+            std::getline(std::cin, passphrase);
+
+            // BIP39 seed
+            std::vector<uint8_t> seed64;
+            mnemonic_to_seed_BIP39(mnemonic, passphrase, seed64);
+
+            // derive 5 addresses
+            std::vector<std::string> addrs;
+            std::vector<std::vector<uint8_t>> pubs;
+            if(!derive_miq_addresses_from_seed(seed64, coin_type, 5, addrs, pubs)){
+                std::fprintf(stderr,"Failed to derive addresses.\n");
+                miq_sleep_ms(1200);
+                continue;
+            }
+
+            banner();
+            std::cout << C("36;1") << "FIRST 5 MIQ ADDRESSES (m/44'/"<< coin_type << "'/0'/0/i)" << R() << "\n";
+            for(size_t i=0;i<addrs.size();++i){
+                std::cout << "  ["<<i<<"] " << addrs[i] << "\n";
+            }
+            std::cout << "\n";
+
+            // choose one to mine to
+            std::cout << "  Choose address index 0-4 (ENTER = 0): " << std::flush;
+            std::string idxs; std::getline(std::cin, idxs); trim(idxs);
+            int idx = 0;
+            if(!idxs.empty()){
+                try { idx = std::stoi(idxs); } catch(...) { idx = 0; }
+            }
+            if(idx < 0) idx = 0;
+            if(idx > 4) idx = 4;
+
+            out_addr = addrs[(size_t)idx];
+
+            banner();
+            std::cout << C("33;1") << "Mining to: " << out_addr << R() << "\n\n"
+                      << C("2") << "(Tip: store your mnemonic safely. You can recreate these same 5 addresses any time.)" << R() << "\n\n";
+            miq_sleep_ms(1200);
+            return true;
+        }
+        else if(choice=="3"){
+            // Import mnemonic
+            banner();
+            std::cout << C("36;1") << "IMPORT MNEMONIC" << R() << "\n\n";
+            std::cout << "  Paste your 12 or 24 words:\n  > " << std::flush;
+
+            std::string mnemonic;
+            if(!std::getline(std::cin, mnemonic)) return false;
+            trim(mnemonic);
+            if(mnemonic.empty()){
+                std::fprintf(stderr,"No mnemonic provided.\n");
+                miq_sleep_ms(1200);
+                continue;
+            }
+            // optional passphrase
+            std::string passphrase;
+            std::cout << "\n  Optional BIP39 passphrase (ENTER to skip): " << std::flush;
+            std::getline(std::cin, passphrase);
+
+            // derive seed directly from the phrase (BIP39 PBKDF2)
+            std::vector<uint8_t> seed64;
+            mnemonic_to_seed_BIP39(mnemonic, passphrase, seed64);
+
+            // derive 5 addresses
+            std::vector<std::string> addrs;
+            std::vector<std::vector<uint8_t>> pubs;
+            if(!derive_miq_addresses_from_seed(seed64, coin_type, 5, addrs, pubs)){
+                std::fprintf(stderr,"Failed to derive addresses from mnemonic.\n");
+                miq_sleep_ms(1500);
+                continue;
+            }
+
+            banner();
+            std::cout << C("36;1") << "FIRST 5 MIQ ADDRESSES (m/44'/"<< coin_type << "'/0'/0/i)" << R() << "\n";
+            for(size_t i=0;i<addrs.size();++i){
+                std::cout << "  ["<<i<<"] " << addrs[i] << "\n";
+            }
+            std::cout << "\n";
+
+            std::cout << "  Choose address index 0-4 (ENTER = 0): " << std::flush;
+            std::string idxs; std::getline(std::cin, idxs); trim(idxs);
+            int idx = 0;
+            if(!idxs.empty()){
+                try { idx = std::stoi(idxs); } catch(...) { idx = 0; }
+            }
+            if(idx < 0) idx = 0;
+            if(idx > 4) idx = 4;
+
+            out_addr = addrs[(size_t)idx];
+
+            banner();
+            std::cout << C("33;1") << "Mining to: " << out_addr << R() << "\n\n";
+            miq_sleep_ms(1200);
+            return true;
+        }
+        else if(choice=="4"){
+            // start miner with existing address
+            banner();
+            std::cout << "  Enter P2PKH Base58 address to mine to: " << std::flush;
+            std::string addr; std::getline(std::cin, addr); trim(addr);
+
+            std::vector<uint8_t> pkh;
+            if(!parse_p2pkh(addr, pkh)){
+                std::fprintf(stderr,"Invalid address (expected Base58Check P2PKH, version 0x%02x)\n",(unsigned)miq::VERSION_P2PKH);
+                miq_sleep_ms(1500);
+                continue;
+            }
+            out_addr = addr;
+            return true;
+        }
+        else{
+            // invalid choice; loop
+            continue;
+        }
+    }
+}
+
 // ===== main ==================================================================
 int main(int argc, char** argv){
     try{
@@ -1817,7 +2005,7 @@ int main(int argc, char** argv){
         // Process priority
         set_process_priority(high_priority);
 
-        // NEW: optional seed generation & 5 addresses
+        // NEW: optional seed generation & 5 addresses via CLI flags (non-interactive)
         if(make_seed_words){
             std::vector<std::string> words;
             std::vector<uint8_t> entropy;
@@ -1851,13 +2039,23 @@ int main(int argc, char** argv){
             }
         }
 
-        // Interactive splash/menu + address input
+        // Decide payout address
         std::string addr = address_cli;
+
+        // If user didn’t pass --address or --make-seed flags, show the menu.
+        if(addr.empty() && make_seed_words == 0){
+            if(!interactive_start_menu(addr, bip44_coin_type)){
+                std::fprintf(stderr,"Aborted.\n");
+                return 0;
+            }
+        }
+
+        // If still empty here, fall back to quick prompt.
         if(addr.empty()){
             show_intro_and_get_address(addr);
             if(addr.empty()){ std::fprintf(stderr,"stdin closed\n"); return 1; }
         } else {
-            // If address provided, still print a quick banner so UX is consistent
+            // Show banner for consistency when starting directly with an address
             std::ostringstream s; s << CLS();
             s << C("36;1");
             const size_t N = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
@@ -2106,7 +2304,7 @@ int main(int argc, char** argv){
                     // fallback scan
                     {
                         const uint64_t tip = ui.tip_height.load();
-                        uint64_t next_h = ui.est_scanned_height.load();
+                        uint64_t next_h = ui.est_scanned_height.store ? ui.est_scanned_height.load() : 0;
                         if (next_h == 0) next_h = 1;
                         const uint64_t CHUNK = 128;
                         uint64_t end_h = (tip > 0) ? std::min(tip, next_h + CHUNK - 1) : 0;
@@ -2319,8 +2517,8 @@ int main(int argc, char** argv){
                                 std::fprintf(stderr,"[GPU] run_round failed.\n");
                                 break;
                             }
-                            ui.gpu_hps_now.store(gpu.ema_now);
-                            ui.gpu_hps_smooth.store(gpu.ema_smooth);
+                            g_ui->gpu_hps_now.store(gpu.ema_now);
+                            g_ui->gpu_hps_smooth.store(gpu.ema_smooth);
 
                             if(ok){
                                 found_block = b;
@@ -2429,4 +2627,3 @@ int main(int argc, char** argv){
         return 1;
     }
 }
-
