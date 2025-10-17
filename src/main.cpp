@@ -1,4 +1,4 @@
-// src/main.cpp  — MIQ core entrypoint with integrated pro TUI (no new files)
+// src/main.cpp  — MIQ core entrypoint with robust Pro TUI (no extra files)
 
 // Prevent Windows headers from defining min/max macros that break std::min/std::max
 #ifdef _WIN32
@@ -176,23 +176,7 @@ static inline bool is_tty() {
     return ::isatty(STDOUT_FILENO) == 1;
 #endif
 }
-static inline void enable_vt_utf8(bool& unicode_ok) {
-#ifdef _WIN32
-    unicode_ok = true;
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCP(CP_UTF8);
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut != INVALID_HANDLE_VALUE) {
-        DWORD mode = 0;
-        if (GetConsoleMode(hOut, &mode)) {
-            mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-            SetConsoleMode(hOut, mode);
-        }
-    }
-#else
-    (void)unicode_ok; unicode_ok = true;
-#endif
-}
+
 static inline void get_winsize(int& cols, int& rows) {
     cols = 100; rows = 34;
 #ifdef _WIN32
@@ -208,6 +192,25 @@ static inline void get_winsize(int& cols, int& rows) {
         if (ws.ws_col) cols = ws.ws_col;
         if (ws.ws_row) rows = ws.ws_row;
     }
+#endif
+}
+
+// Enable UTF-8 + VT; report vt_ok so we can hard-disable TUI if console can’t do ANSI.
+static inline void enable_utf8_and_vt(bool& unicode_ok, bool& vt_ok) {
+    unicode_ok = true; vt_ok = true;
+#ifdef _WIN32
+    unicode_ok = true;
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut == INVALID_HANDLE_VALUE) { vt_ok = false; return; }
+    DWORD mode = 0;
+    if (!GetConsoleMode(hOut, &mode)) { vt_ok = false; return; }
+    mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    if (!SetConsoleMode(hOut, mode)) { vt_ok = false; }
+#else
+    (void)unicode_ok; (void)vt_ok; // on POSIX, assume ANSI ok
+    unicode_ok = true; vt_ok = true;
 #endif
 }
 } // namespace term
@@ -229,7 +232,7 @@ public:
         std::wstring w((size_t)wlen, L'\0');
         MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], wlen);
         DWORD wrote = 0;
-        (void)WriteConsoleW(hOut_, w.c_str(), (DWORD)w.size(), &wrote, nullptr);
+        WriteConsoleW(hOut_, w.c_str(), (DWORD)w.size(), &wrote, nullptr);
 #else
         int fd = (fd_ >= 0) ? fd_ : STDOUT_FILENO;
         size_t off = 0;
@@ -356,21 +359,20 @@ private:
 // ---- TUI --------------------------------------------------------------------
 class TUI {
 public:
-    TUI() { term::enable_vt_utf8(unicode_ok_); }
-    void set_enabled(bool on){ enabled_ = on && term::is_tty(); }
+    TUI(bool vt_ok) : vt_ok_(vt_ok) {}
+    void set_enabled(bool on){ enabled_ = on && vt_ok_ && term::is_tty(); }
     void start() {
         if (!enabled_) return;
         running_ = true;
-        // clear and hide cursor; guarantee a first paint immediately
-        writer_.write_utf8("\x1b[?25l\x1b[2J\x1b[H");
-        draw_once(); // first frame to avoid a blank screen feel
+        writer_.write_utf8("\x1b[?25l\x1b[2J\x1b[H"); // hide cursor + clear
+        try { draw_once(); } catch(...) {}            // first frame to avoid blank
         thr_ = std::thread([this]{ loop(); });
     }
     void stop() {
         if (!enabled_) return;
         running_ = false;
         if (thr_.joinable()) thr_.join();
-        writer_.write_utf8("\x1b[?25h\x1b[0m\n");
+        writer_.write_utf8("\x1b[?25h\x1b[0m\n");     // restore cursor
     }
     ~TUI(){ stop(); }
 
@@ -393,6 +395,7 @@ public:
         banner_ = s;
     }
     void set_ports(uint16_t p2pport, uint16_t rpcport) { p2p_port_ = p2pport; rpc_port_ = rpcport; }
+    bool is_enabled() const { return enabled_; }
 
 private:
     static std::string repeat_unit(const char* unit, int w){
@@ -400,18 +403,20 @@ private:
         for (int i=0;i<w;i++) s += unit;
         return s;
     }
-    static std::string trim_width(const std::string& s, int w){
-        if ((int)s.size() <= w) return s;
-        if (w <= 1) return s.substr(0, std::max(0,w));
-        return s.substr(0, (size_t)w-1) + (char)0xE2, s; // never used (kept to satisfy compiler); real ellipsis below
-    }
     std::string ellipsis() const { return unicode_ok_ ? "…" : "..."; }
+
+    // Safe fit with ellipsis (no char narrowing)
+    static std::string fit(const std::string& s, int w, bool unicode_ok){
+        if (w <= 0) return std::string();
+        if ((int)s.size() <= w) return s;
+        if (w == 1) return unicode_ok ? "…" : ".";
+        return s.substr(0, (size_t)w-1) + (unicode_ok ? "…" : ".");
+    }
 
     std::string hr(int w)  const { return unicode_ok_ ? repeat_unit("─", w) : repeat_unit("-", w); }
     std::string sep_vert() const { return unicode_ok_ ? " │ " : " | "; }
     std::string ok_glyph() const { return unicode_ok_ ? "✔" : "OK"; }
 
-    // spinner as UTF-8 strings (no narrowing)
     const char* spin_utf8(int idx) const {
         static const char* S[] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
         return S[idx % 10];
@@ -436,7 +441,7 @@ private:
     void loop(){
         using namespace std::chrono_literals;
         while (running_) {
-            draw_once();
+            try { draw_once(); } catch(...) {}
             ++spin_idx_;
             std::this_thread::sleep_for(120ms);
         }
@@ -448,9 +453,8 @@ private:
         if (cols < 88) cols = 88;
         if (rows < 24) rows = 24;
 
-        const int gutter = 3;
-        const int leftw  = std::max(42, (int)(cols * 0.54));
-        const int rightw = cols - leftw - (int)sep_vert().size();
+        const int leftw  = std::max(46, (int)(cols * 0.56));
+        const int rightw = cols - leftw - 3; // " │ "
 
         std::vector<std::string> left, right;
 
@@ -470,11 +474,11 @@ private:
         {
             left.push_back("\x1b[38;5;39mStartup\x1b[0m");
             int okc = 0; for (auto& s : steps_) if (s.second) ++okc;
-            left.push_back("  " + bar(okc, (uint64_t)std::max<size_t>(steps_.size(),1), std::max(10, leftw-12))
+            int bw = std::max(10, leftw - 14);
+            left.push_back("  " + bar(okc, (uint64_t)std::max<size_t>(steps_.size(),1), bw)
                                + "  " + std::to_string(okc) + "/" + std::to_string(steps_.size()) + " completed");
             for (auto& s : steps_) {
-                const char* sp = spinner();
-                std::string mark = s.second ? ("\x1b[32m" + ok_glyph() + "\x1b[0m ") : (std::string("\x1b[90m") + sp + "\x1b[0m ");
+                std::string mark = s.second ? ("\x1b[32m" + ok_glyph() + "\x1b[0m ") : (std::string("\x1b[90m") + spinner() + "\x1b[0m ");
                 left.push_back("    " + mark + s.first);
             }
             left.push_back("");
@@ -503,7 +507,7 @@ private:
                << "   pings-waiting: " << awaiting_pongs;
             left.push_back(ns.str());
 
-            // Last accepted block from logs
+            // Last accepted block (from logs)
             std::string lastBlk, lastIP;
             for (int i = (int)logs_.size()-1; i >= 0; --i) {
                 const auto& L = logs_[i].text;
@@ -540,7 +544,7 @@ private:
             right.push_back(hdr.str());
 
             auto v = p2p_->snapshot_peers();
-            size_t show = std::min(v.size(), (size_t)std::max(6, rightw/16));
+            size_t show = std::min(v.size(), (size_t)12);
             for (size_t i=0;i<show; ++i) {
                 const auto& s = v[i];
                 std::ostringstream ln;
@@ -566,10 +570,10 @@ private:
         for (size_t i=0;i<N;i++){
             std::string l = (i<left.size())  ? left[i]  : "";
             std::string r = (i<right.size()) ? right[i] : "";
-            if ((int)l.size() > leftw)  l = l.substr(0, (size_t)leftw-1) + ellipsis();
-            if ((int)r.size() > rightw) r = r.substr(0, (size_t)rightw-1) + ellipsis();
+            if ((int)l.size() > leftw)  l = fit(l, leftw, unicode_ok_);
+            if ((int)r.size() > rightw) r = fit(r, rightw, unicode_ok_);
             out << std::left << std::setw(leftw) << l
-                << sep_vert()
+                << (unicode_ok_ ? " │ " : " | ")
                 << r << "\n";
         }
 
@@ -598,6 +602,7 @@ private:
 
 private:
     bool enabled_{true};
+    bool vt_ok_{true};
     std::atomic<bool> running_{false};
     std::thread thr_;
     std::mutex mu_;
@@ -781,25 +786,24 @@ int main(int argc, char** argv){
     std::signal(SIGTERM, handle_signal);
     std::set_terminate(&fatal_terminate);
 
-    bool unicode_ok = true;
-    term::enable_vt_utf8(unicode_ok);
+    bool unicode_ok = true, vt_ok = true;
+    term::enable_utf8_and_vt(unicode_ok, vt_ok);
 
     bool disable_tui_flag = false;
     for(int i=1;i<argc;i++){
         if(std::string(argv[i]) == "--no-tui") { disable_tui_flag = true; break; }
     }
-    bool tui_enabled = !disable_tui_flag && !env_truthy("MIQ_NO_TUI");
+    const bool want_tui = !disable_tui_flag && !env_truthy("MIQ_NO_TUI");
+    const bool can_tui  = want_tui && term::is_tty() && vt_ok;
 
-    LogCapture capture;   // captures stdout+stderr only when UI is active on a TTY
-    if (tui_enabled && term::is_tty()) {
-        capture.start();
-    }
+    LogCapture capture;
+    if (can_tui) { capture.start(); }
 
-    TUI tui;              // pretty console UI
-    tui.set_enabled(tui_enabled && term::is_tty());
+    TUI tui(vt_ok);
+    tui.set_enabled(can_tui);
     tui.set_ports(P2P_PORT, RPC_PORT);
     tui.start();
-    if (tui_enabled && term::is_tty()) {
+    if (can_tui) {
         tui.set_banner("Preparing Miqrochain node…");
         tui.set_loading_step("Parse CLI / environment", true);
     }
@@ -924,29 +928,29 @@ int main(int argc, char** argv){
         }
         // =================================================================
 
-        if (tui_enabled && term::is_tty()) tui.set_loading_step("Load config & choose datadir");
+        if (can_tui) tui.set_loading_step("Load config & choose datadir");
         if(!conf.empty()){
             load_config(conf, cfg);
         }
         if(cfg.datadir.empty()) cfg.datadir = default_datadir();
         std::error_code ec;
         std::filesystem::create_directories(cfg.datadir, ec); // best-effort
-        if (tui_enabled && term::is_tty()) tui.set_loading_step("Config/datadir ready", true);
+        if (can_tui) tui.set_loading_step("Config/datadir ready", true);
 
-        if (tui_enabled && term::is_tty()) tui.set_banner(std::string("Starting services…  Datadir: ") + cfg.datadir);
+        if (can_tui) tui.set_banner(std::string("Starting services…  Datadir: ") + cfg.datadir);
 
         // Core: open chain
-        if (tui_enabled && term::is_tty()) tui.set_loading_step("Open chain data");
+        if (can_tui) tui.set_loading_step("Open chain data");
         Chain chain;
         if(!chain.open(cfg.datadir)){
             log_error("failed to open chain data");
             capture.stop(); tui.stop();
             return 1;
         }
-        if (tui_enabled && term::is_tty()) tui.set_loading_step("Open chain data", true);
+        if (can_tui) tui.set_loading_step("Open chain data", true);
 
         // Genesis from constants
-        if (tui_enabled && term::is_tty()) tui.set_loading_step("Load & validate genesis");
+        if (can_tui) tui.set_loading_step("Load & validate genesis");
         {
             std::vector<uint8_t> raw;
             try { raw = miq::from_hex(GENESIS_RAW_BLOCK_HEX); }
@@ -966,12 +970,12 @@ int main(int argc, char** argv){
 
             if (!chain.init_genesis(g)) { log_error("genesis init failed"); capture.stop(); tui.stop(); return 1; }
         }
-        if (tui_enabled && term::is_tty()) tui.set_loading_step("Genesis OK", true);
+        if (can_tui) tui.set_loading_step("Genesis OK", true);
 
         // Optional UTXO reindex
         if (flag_utxo_kv) { log_info("Flag --utxo_kv set (runtime no-op; UTXO KV backend is compiled-in)."); }
         if (flag_reindex_utxo) {
-            if (tui_enabled && term::is_tty()) tui.set_loading_step("Reindex UTXO (full scan)");
+            if (can_tui) tui.set_loading_step("Reindex UTXO (full scan)");
             log_info("ReindexUTXO: rebuilding chainstate from active chain...");
             UTXOKV utxo_kv;
             std::string err;
@@ -981,46 +985,46 @@ int main(int argc, char** argv){
                 return 1;
             }
             log_info("ReindexUTXO: done");
-            if (tui_enabled && term::is_tty()) tui.set_loading_step("Reindex UTXO (full scan)", true);
+            if (can_tui) tui.set_loading_step("Reindex UTXO (full scan)", true);
         }
 
         // Services
-        if (tui_enabled && term::is_tty()) tui.set_loading_step("Initialize mempool & RPC gate");
+        if (can_tui) tui.set_loading_step("Initialize mempool & RPC gate");
         Mempool mempool;
         RpcService rpc(chain, mempool);
-        if (tui_enabled && term::is_tty()) tui.set_loading_step("Initialize mempool & RPC gate", true);
+        if (can_tui) tui.set_loading_step("Initialize mempool & RPC gate", true);
 
         P2P p2p(chain);
         p2p.set_datadir(cfg.datadir);
         p2p.set_mempool(&mempool);
         rpc.set_p2p(&p2p);
 
-        if (tui_enabled && term::is_tty()) tui.set_runtime_refs(&p2p, &chain);
+        if (can_tui) tui.set_runtime_refs(&p2p, &chain);
 
         // Start P2P first
-        if (tui_enabled && term::is_tty()) tui.set_loading_step("Start P2P listener");
+        if (can_tui) tui.set_loading_step("Start P2P listener");
         if(!cfg.no_p2p){
             if(p2p.start(P2P_PORT)){
                 log_info("P2P listening on " + std::to_string(P2P_PORT));
-                if (tui_enabled && term::is_tty()) tui.set_loading_step("P2P listener", true);
-                if (tui_enabled && term::is_tty()) tui.set_loading_step("Connect seeds & open UPnP");
+                if (can_tui) tui.set_loading_step("P2P listener", true);
+                if (can_tui) tui.set_loading_step("Connect seeds & open UPnP");
                 p2p.connect_seed(DNS_SEED, P2P_PORT);
-                if (tui_enabled && term::is_tty()) tui.set_loading_step("Seed dialing scheduled", true);
+                if (can_tui) tui.set_loading_step("Seed dialing scheduled", true);
             } else {
                 log_warn("P2P failed to start on port " + std::to_string(P2P_PORT));
-                if (tui_enabled && term::is_tty()) tui.set_loading_step("P2P listener failed", true);
+                if (can_tui) tui.set_loading_step("P2P listener failed", true);
             }
         } else {
-            if (tui_enabled && term::is_tty()) tui.set_loading_step("P2P disabled by config", true);
+            if (can_tui) tui.set_loading_step("P2P disabled by config", true);
         }
 
         // IBD monitor
-        if (tui_enabled && term::is_tty()) tui.set_loading_step("Start IBD monitor");
+        if (can_tui) tui.set_loading_step("Start IBD monitor");
         start_ibd_monitor(&chain, &p2p);
-        if (tui_enabled && term::is_tty()) tui.set_loading_step("IBD monitor", true);
+        if (can_tui) tui.set_loading_step("IBD monitor", true);
 
         // RPC
-        if (tui_enabled && term::is_tty()) tui.set_loading_step("Start RPC server");
+        if (can_tui) tui.set_loading_step("Start RPC server");
         if(!cfg.no_rpc){
             miq::rpc_enable_auth_cookie(cfg.datadir);
 #ifdef _WIN32
@@ -1050,9 +1054,9 @@ int main(int argc, char** argv){
             }
             rpc.start(RPC_PORT);
             log_info("RPC listening on " + std::to_string(RPC_PORT));
-            if (tui_enabled && term::is_tty()) tui.set_loading_step("RPC ready", true);
+            if (can_tui) tui.set_loading_step("RPC ready", true);
         } else {
-            if (tui_enabled && term::is_tty()) tui.set_loading_step("RPC disabled by config", true);
+            if (can_tui) tui.set_loading_step("RPC disabled by config", true);
         }
 
         // Miner
@@ -1099,10 +1103,10 @@ int main(int argc, char** argv){
 
         log_info(std::string(CHAIN_NAME) + " node running. RPC " + std::to_string(RPC_PORT) +
                  ", P2P " + std::to_string(P2P_PORT));
-        if (tui_enabled && term::is_tty()) tui.set_banner("Miqrochain node running — syncing & serving peers…");
+        if (can_tui) tui.set_banner("Miqrochain node running — syncing & serving peers…");
 
-        // Main UI loop: drain logs into TUI
-        if (tui_enabled && term::is_tty()) {
+        // Main UI loop: drain logs into TUI or plain wait
+        if (can_tui) {
             while(!g_shutdown_requested.load()){
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 std::deque<LogCapture::Line> lines;
@@ -1110,6 +1114,7 @@ int main(int argc, char** argv){
                 tui.feed_logs(lines);
             }
         } else {
+            // Fallback: plain logs only (no screen control)
             while(!g_shutdown_requested.load()){
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
