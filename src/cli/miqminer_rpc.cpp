@@ -98,16 +98,6 @@
   #endif
 #endif
 
-// -------- OpenSSL (for HD wallet: RNG, HMAC, PBKDF2, SHA256/RIPEMD, EC) -----
-#include <openssl/rand.h>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
-#include <openssl/sha.h>
-#include <openssl/ripemd.h>
-#include <openssl/ec.h>
-#include <openssl/obj_mac.h>
-#include <openssl/bn.h>
-
 using namespace miq;
 
 // ===== brand & color =========================================================
@@ -167,65 +157,6 @@ static bool read_all_file(const std::string& path, std::string& out){
 }
 static std::string to_hex_s(const std::vector<uint8_t>& v){ return miq::to_hex(v); }
 static std::vector<uint8_t> from_hex_s(const std::string& h){ return miq::from_hex(h); }
-
-// ===== NEW: seed uniqueness cache helpers ===================================
-static std::string homedir_path(){
-#if defined(_WIN32)
-    char* v=nullptr; size_t len=0;
-    if (_dupenv_s(&v,&len,"APPDATA")==0 && v && len){
-        std::string p(v); free(v);
-        return p;
-    }
-    return ".";
-#elif defined(__APPLE__)
-    const char* home = std::getenv("HOME");
-    return (home && *home) ? std::string(home) : std::string(".");
-#else
-    const char* home = std::getenv("HOME");
-    return (home && *home) ? std::string(home) : std::string(".");
-#endif
-}
-static std::string seeds_seen_path(){
-#if defined(_WIN32)
-    return homedir_path() + "\\Miqrochain\\seeds_seen.bin";
-#elif defined(__APPLE__)
-    return homedir_path() + "/Library/Application Support/Miqrochain/seeds_seen.bin";
-#else
-    return homedir_path() + "/.miqrochain/seeds_seen.bin";
-#endif
-}
-static std::string parent_dir_of(const std::string& p){
-    size_t s = p.find_last_of("/\\");
-    if(s==std::string::npos) return std::string();
-    return p.substr(0,s);
-}
-static void ensure_dir_simple(const std::string& dir){
-    if(dir.empty()) return;
-#if defined(_WIN32)
-    _mkdir(dir.c_str());
-#else
-    mkdir(dir.c_str(), 0700);
-#endif
-}
-static bool seen_seed_hash(const uint8_t h[32]){
-    std::string path = seeds_seen_path();
-    FILE* f = fopen(path.c_str(),"rb");
-    if(!f) return false;
-    uint8_t buf[32];
-    while(fread(buf,1,32,f)==32){
-        if(std::memcmp(buf,h,32)==0){ fclose(f); return true; }
-    }
-    fclose(f);
-    return false;
-}
-static void append_seen_seed_hash(const uint8_t h[32]){
-    std::string path = seeds_seen_path();
-    ensure_dir_simple(parent_dir_of(path));
-    FILE* f = fopen(path.c_str(),"ab");
-    if(!f) return;
-    fwrite(h,1,32,f);
-    fclose(f);
-}
 
 // ===== JSON helpers ==========================================================
 static inline bool json_has_error(const std::string& json){
@@ -906,327 +837,6 @@ static bool rpc_get_received_total_baseunits(const std::string& host, uint16_t p
     return false;
 }
 
-// ===== NEW: REAL BIP39 using embedded header ================================
-// NOTE: this removes file dependencies completely.
-#include "../bip39_words_en.h"
-
-struct BIP39Wordlist {
-    std::vector<std::string> words;                 // 2048 words
-    std::unordered_map<std::string, uint16_t> idx;  // word -> index
-};
-
-static bool load_bip39_wordlist(BIP39Wordlist& wl, std::string* used_path=nullptr){
-    (void)used_path;
-    wl.words.clear(); wl.idx.clear();
-    wl.words.reserve(2048);
-    for(size_t i=0;i<2048;i++){
-        wl.words.emplace_back(BIP39_EN_WORDS[i]);
-    }
-    for(uint16_t i=0;i<2048;i++){
-        wl.idx[wl.words[i]] = i;
-    }
-    return wl.words.size()==2048;
-}
-
-static bool csprng_bytes(uint8_t* out, size_t n){
-    return RAND_bytes(out, (int)n)==1;
-}
-static void ossl_sha256_once(const uint8_t* d, size_t n, uint8_t out[32]){
-    ::SHA256(d, n, out);
-}
-
-static std::string mnemonic_join(const std::vector<std::string>& ws){
-    std::ostringstream o;
-    for(size_t i=0;i<ws.size();++i){ if(i) o << ' '; o << ws[i]; }
-    return o.str();
-}
-static std::string normalize_spaces_lower(const std::string& in){
-    std::ostringstream o;
-    bool inword=false;
-    for(char ch : in){
-        unsigned char c=(unsigned char)ch;
-        if(std::isspace(c)){
-            if(inword){ o << ' '; inword=false; }
-        }else{
-            o << (char)std::tolower(c);
-            inword=true;
-        }
-    }
-    std::string s=o.str();
-    if(!s.empty() && s.back()==' ') s.pop_back();
-    return s;
-}
-static std::vector<std::string> split_words(const std::string& s){
-    std::vector<std::string> v;
-    std::istringstream is(s);
-    std::string w;
-    while(is>>w) v.push_back(w);
-    return v;
-}
-
-static bool make_mnemonic_words(size_t words, std::vector<std::string>& out_words, std::vector<uint8_t>& out_entropy){
-    if(words!=12 && words!=24) return false;
-    BIP39Wordlist wl;
-    std::string used;
-    if(!load_bip39_wordlist(wl, &used)){
-        std::fprintf(stderr,"BIP39 wordlist (embedded) failed to load.\n");
-        return false;
-    }
-
-    const size_t ENT = (words==12)? 16 : 32; // bytes
-    std::vector<uint8_t> ent(ENT);
-
-    // Avoid duplicates via on-disk hash list (best effort)
-    for(int tries=0; tries<8; ++tries){
-        if(!csprng_bytes(ent.data(), ent.size())) continue;
-        uint64_t t = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        for(size_t i=0;i<sizeof(t) && i<ent.size();++i) ent[i]^=((uint8_t*)&t)[i];
-#if !defined(_WIN32)
-        uint32_t pid = (uint32_t)getpid();
-#else
-        uint32_t pid = (uint32_t)GetCurrentProcessId();
-#endif
-        for(size_t i=0;i<sizeof(pid) && i<ent.size();++i) ent[ent.size()-1-i]^=((uint8_t*)&pid)[i];
-
-        uint8_t h[32]; ossl_sha256_once(ent.data(), ent.size(), h);
-        if(!seen_seed_hash(h)){ append_seen_seed_hash(h); break; }
-        if(tries==7){ append_seen_seed_hash(h); }
-    }
-
-    // Calculate checksum bits: CS = ENT/4 bits from SHA256(ent)
-    uint8_t h[32]; ossl_sha256_once(ent.data(), ent.size(), h);
-    const size_t ENTbits = ENT*8;       // 128 or 256
-    const size_t CSbits  = ENTbits/32;  // 4 or 8
-    const size_t TOTbits = ENTbits + CSbits;
-    const size_t NWORDS  = TOTbits / 11;
-
-    // pack entropy+checksum into bit vector
-    std::vector<int> bits; bits.reserve(TOTbits);
-    for(size_t i=0;i<ENT;i++)
-        for(int b=7;b>=0;--b) bits.push_back( (ent[i]>>b)&1 );
-    for(size_t b=0;b<CSbits;b++)
-        bits.push_back( (h[0] >> (7 - (int)b)) & 1 );
-
-    // 11-bit groups -> word indices
-    out_words.clear(); out_words.reserve(NWORDS);
-    for(size_t i=0;i<NWORDS;i++){
-        uint16_t idx=0;
-        for(int j=0;j<11;j++) idx = (uint16_t)((idx<<1) | bits[i*11 + j]);
-        idx &= 2047;
-        out_words.push_back(wl.words[idx]);
-    }
-    out_entropy = std::move(ent);
-    return true;
-}
-
-static bool validate_mnemonic_and_get_entropy(const std::string& phrase_in,
-                                              std::vector<uint8_t>& out_entropy)
-{
-    BIP39Wordlist wl;
-    if(!load_bip39_wordlist(wl,nullptr)){
-        std::fprintf(stderr,"BIP39 wordlist (embedded) not available.\n");
-        return false;
-    }
-    std::string phrase = normalize_spaces_lower(phrase_in);
-    auto ws = split_words(phrase);
-    if(ws.size()!=12 && ws.size()!=24){
-        std::fprintf(stderr,"Mnemonic must have 12 or 24 words.\n");
-        return false;
-    }
-
-    // Map words to 11-bit indexes
-    std::vector<uint16_t> idxs; idxs.reserve(ws.size());
-    for(const auto& w : ws){
-        auto it = wl.idx.find(w);
-        if(it==wl.idx.end()){
-            std::fprintf(stderr,"Unknown mnemonic word: '%s'\n", w.c_str());
-            return false;
-        }
-        idxs.push_back(it->second);
-    }
-
-    // Reconstruct bits
-    const size_t NWORDS = idxs.size();
-    const size_t TOTbits = NWORDS * 11;
-    const size_t ENTbits = (NWORDS==12) ? 128 : 256;
-    const size_t CSbits  = TOTbits - ENTbits;
-
-    std::vector<int> bits; bits.reserve(TOTbits);
-    for(uint16_t idx : idxs){
-        for(int j=10;j>=0;--j) bits.push_back( (idx>>j)&1 );
-    }
-
-    // Extract entropy bytes
-    out_entropy.assign(ENTbits/8, 0);
-    for(size_t i=0;i<ENTbits;i++){
-        size_t byte=i/8, bit=7-(i%8);
-        out_entropy[byte] |= (bits[i]? (1u<<bit) : 0);
-    }
-
-    // Compute checksum of entropy and compare
-    uint8_t h[32]; ossl_sha256_once(out_entropy.data(), out_entropy.size(), h);
-    for(size_t b=0;b<CSbits;b++){
-        int want = (h[0] >> (7 - (int)b)) & 1;
-        int got  = bits[ENTbits + b];
-        if(want != got){
-            std::fprintf(stderr,"Mnemonic checksum mismatch (word %zu).\n", (ENTbits + b)/11 + 1);
-            return false;
-        }
-    }
-    return true;
-}
-
-static void mnemonic_to_seed_BIP39(const std::string& mnemonic,
-                                   const std::string& passphrase,
-                                   std::vector<uint8_t>& out)
-{
-    const std::string salt = std::string("mnemonic") + passphrase;
-    out.resize(64);
-    PKCS5_PBKDF2_HMAC(mnemonic.c_str(), (int)mnemonic.size(),
-                      (const unsigned char*)salt.data(), (int)salt.size(),
-                      2048, EVP_sha512(), (int)out.size(), out.data());
-}
-
-// ===== NEW: BIP32 (OpenSSL) to derive 5 MIQ addresses ======================
-struct XPrv {
-    BIGNUM* k;
-    uint8_t chain[32];
-    uint8_t depth;
-    uint32_t child;
-    uint8_t parent_fpr[4];
-    XPrv(): k(BN_new()){ std::memset(chain,0,32); depth=0; child=0; std::memset(parent_fpr,0,4); }
-    ~XPrv(){ if(k) BN_free(k); }
-    XPrv(const XPrv&)=delete; XPrv& operator=(const XPrv&)=delete;
-};
-static EC_GROUP* secp_group(){
-    static EC_GROUP* g = EC_GROUP_new_by_curve_name(NID_secp256k1);
-    return g;
-}
-static const BIGNUM* secp_n(){
-    static BIGNUM* n = nullptr;
-    if(!n){
-        n = BN_new();
-        BN_hex2bn(&n, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
-    }
-    return n;
-}
-static void ser32(uint32_t x, uint8_t out[4]){
-    out[0]=(uint8_t)(x>>24); out[1]=(uint8_t)(x>>16); out[2]=(uint8_t)(x>>8); out[3]=(uint8_t)(x);
-}
-static void ser256(const BIGNUM* bn, uint8_t out[32]){
-    std::memset(out,0,32);
-    BN_bn2binpad(bn, out, 32);
-}
-static bool point_from_priv(const BIGNUM* k, std::vector<uint8_t>& out_compressed){
-    EC_POINT* P = EC_POINT_new(secp_group());
-    if(!P) return false;
-    BN_CTX* ctx = BN_CTX_new();
-    bool ok = (EC_POINT_mul(secp_group(), P, k, nullptr, nullptr, ctx)==1);
-    if(!ok){ BN_CTX_free(ctx); EC_POINT_free(P); return false; }
-    uint8_t buf[33];
-    size_t len = EC_POINT_point2oct(secp_group(), P, POINT_CONVERSION_COMPRESSED, buf, sizeof(buf), ctx);
-    BN_CTX_free(ctx); EC_POINT_free(P);
-    if(len!=33) return false;
-    out_compressed.assign(buf, buf+33);
-    return true;
-}
-
-// UPDATED to use EVP (avoids OpenSSL 3.0 deprecation warning)
-static void hash160(const uint8_t* data, size_t n, uint8_t out20[20]){
-    unsigned int len = 0;
-    uint8_t sha[32];
-
-    EVP_MD_CTX* c1 = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(c1, EVP_sha256(), nullptr);
-    EVP_DigestUpdate(c1, data, n);
-    EVP_DigestFinal_ex(c1, sha, &len);
-    EVP_MD_CTX_free(c1);
-
-    EVP_MD_CTX* c2 = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(c2, EVP_ripemd160(), nullptr);
-    EVP_DigestUpdate(c2, sha, 32);
-    EVP_DigestFinal_ex(c2, out20, &len);
-    EVP_MD_CTX_free(c2);
-}
-
-static bool xprv_from_seed(const std::vector<uint8_t>& seed, XPrv& out){
-    uint8_t I[64]; unsigned int L=64;
-    HMAC(EVP_sha512(), "Bitcoin seed", 12, seed.data(), (int)seed.size(), I, &L);
-    if(L!=64) return false;
-    BIGNUM* Il = BN_bin2bn(I, 32, nullptr);
-    if(BN_is_zero(Il) || BN_cmp(Il, secp_n())>=0){ BN_free(Il); return false; }
-    BN_copy(out.k, Il);
-    std::memcpy(out.chain, I+32, 32);
-    out.depth = 0; out.child=0; std::memset(out.parent_fpr,0,4);
-    BN_free(Il);
-    return true;
-}
-static void fingerprint_from_pub(const std::vector<uint8_t>& pub, uint8_t fpr[4]){
-    uint8_t h20[20]; hash160(pub.data(), pub.size(), h20);
-    std::memcpy(fpr, h20, 4);
-}
-static bool xprv_ckd(XPrv& child, const XPrv& parent, uint32_t index, bool hardened){
-    uint8_t data[1+32+4]; size_t dlen=0;
-    std::vector<uint8_t> P;
-    uint32_t idx = index;
-    if(hardened){
-        data[0]=0x00;
-        ser256(parent.k, data+1);
-        dlen=33;
-        idx |= 0x80000000u;
-    }else{
-        if(!point_from_priv(parent.k, P)) return false;
-        if(P.size()!=33) return false;
-        std::memcpy(data, P.data(), 33); dlen=33;
-    }
-    ser32(idx, data+dlen); dlen+=4;
-
-    uint8_t I[64]; unsigned int L=64;
-    HMAC(EVP_sha512(), parent.chain, 32, data, (int)dlen, I, &L);
-    if(L!=64) return false;
-
-    BN_CTX* ctx = BN_CTX_new();
-    BIGNUM* Il = BN_bin2bn(I, 32, nullptr);
-    if(BN_is_zero(Il) || BN_cmp(Il, secp_n())>=0){ BN_free(Il); BN_CTX_free(ctx); return false; }
-
-    BN_copy(child.k, Il);
-    BN_mod_add(child.k, child.k, parent.k, secp_n(), ctx);
-    std::memcpy(child.chain, I+32, 32);
-    child.depth = parent.depth + 1;
-    child.child = idx;
-
-    if(P.empty()) point_from_priv(parent.k, P);
-    fingerprint_from_pub(P, child.parent_fpr);
-
-    BN_free(Il);
-    BN_CTX_free(ctx);
-    return true;
-}
-static bool derive_miq_addresses_from_seed(const std::vector<uint8_t>& seed,
-                                           uint32_t coin_type,
-                                           size_t how_many,
-                                           std::vector<std::string>& out_addrs,
-                                           std::vector<std::vector<uint8_t>>& out_pubkeys33)
-{
-    XPrv m; if(!xprv_from_seed(seed, m)) return false;
-    XPrv m44; if(!xprv_ckd(m44, m, 44, true)) return false;
-    XPrv m44c; if(!xprv_ckd(m44c, m44, coin_type, true)) return false;
-    XPrv acct; if(!xprv_ckd(acct, m44c, 0, true)) return false;
-    XPrv ext;  if(!xprv_ckd(ext, acct, 0, false)) return false;
-
-    out_addrs.clear(); out_pubkeys33.clear();
-    for(size_t i=0;i<how_many;i++){
-        XPrv ch; if(!xprv_ckd(ch, ext, (uint32_t)i, false)) return false;
-        std::vector<uint8_t> pub;
-        if(!point_from_priv(ch.k, pub)) return false;
-        uint8_t h20[20]; hash160(pub.data(), pub.size(), h20);
-        std::vector<uint8_t> pkh(h20, h20+20);
-        out_addrs.push_back(miq::base58check_encode(miq::VERSION_P2PKH, pkh));
-        out_pubkeys33.push_back(std::move(pub));
-    }
-    return true;
-}
-
 // ===== coinbase/merkle =======================================================
 static Transaction make_coinbase(uint64_t height, uint64_t fees, const std::vector<uint8_t>& pkh){
     Transaction cbt;
@@ -1374,7 +984,7 @@ static std::string fmt_eta(double seconds){
     return o.str();
 }
 
-// ===== Intro splash (10s) + address prompt ==================================
+// ===== Intro splash (5s) + address prompt ===================================
 static void show_intro_and_get_address(std::string& out_addr){
 #if defined(_WIN32)
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -1383,7 +993,7 @@ static void show_intro_and_get_address(std::string& out_addr){
     using clock = std::chrono::steady_clock;
     auto t0 = clock::now();
     int spin = 0;
-    while(std::chrono::duration<double>(clock::now()-t0).count() < 10.0){
+    while(std::chrono::duration<double>(clock::now()-t0).count() < 5.0){
         std::ostringstream s;
         s << CLS();
         s << C("36;1");
@@ -1395,7 +1005,7 @@ static void show_intro_and_get_address(std::string& out_addr){
         spinner_circle_ascii(spin++, rows);
         s << "  " << C("36;1") << center_fit("CHRONEN MINER", 60) << R() << "\n\n";
         for(auto& r: rows) s << "      " << C("36") << r << R() << "\n";
-        s << "\n  " << C("2") << "loading components... starting in a moment" << R() << "\n";
+        s << "\n  " << C("33;1") << "LOADING DEPENDENCIES" << R() << "\n";
         std::cout << s.str() << std::flush;
         miq_sleep_ms(1000/12);
     }
@@ -1981,190 +1591,10 @@ static void usage(){
     "               [--gpu=on|off] [--gpu-platform=IDX] [--gpu-device=IDX]\n"
     "               [--gws=GLOBAL_WORK_SIZE] [--gnpi=NONCES_PER_ITEM]\n"
     "               [--salt-hex=HEXBYTES] [--salt-pos=pre|post]\n"
-    "               [--make-seed=12|24] [--seed-pass=PHRASE]\n"
-    "               [--mine-to-first=on|off] [--coin-type=N]\n"
     "Notes:\n"
     "  - Token from --token, MIQ_RPC_TOKEN, or datadir/.cookie\n"
     "  - Default threads: 6 (override with --threads)\n"
-    "  - GPU requires build with -DMIQ_ENABLE_OPENCL and OpenCL runtime installed\n"
-    "  - BIP39 English wordlist is embedded (no files needed).\n";
-}
-
-// ===== NEW: interactive start menu (create/import wallet or start miner) =====
-static bool interactive_start_menu(std::string& out_addr, uint32_t coin_type){
-#if defined(_WIN32)
-    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (h != INVALID_HANDLE_VALUE) { DWORD mode=0; if (GetConsoleMode(h,&mode)) SetConsoleMode(h, mode | 0x0004); }
-#endif
-    auto banner = [](){
-        std::ostringstream s;
-        s << CLS();
-        s << C("36;1");
-        const size_t N = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
-        for(size_t i=0;i<N;i++) s << "  " << kChronenMinerBanner[i] << "\n";
-        s << R() << "\n";
-        std::cout << s.str();
-    };
-
-    while(true){
-        banner();
-        std::cout
-            << "  " << C("36;1") << "CHRONEN MINER — START" << R() << "\n\n"
-            << "  1) Create NEW wallet (12 words, BIP39 English)\n"
-            << "  2) Create NEW wallet (24 words, BIP39 English)\n"
-            << "  3) Import mnemonic (12 or 24 words, BIP39 English)\n"
-            << "  4) Start miner with existing address\n"
-            << "  q) Quit\n\n"
-            << "  Select an option: " << std::flush;
-
-        std::string choice;
-        if(!std::getline(std::cin, choice)) return false;
-        trim(choice);
-        if(choice=="q" || choice=="Q") return false;
-
-        if(choice=="1" || choice=="2"){
-            const int words = (choice=="1") ? 12 : 24;
-
-            std::vector<std::string> words_out;
-            std::vector<uint8_t> entropy;
-            if(!make_mnemonic_words((size_t)words, words_out, entropy)){
-                std::fprintf(stderr,"Failed to create %d-word mnemonic.\n", words);
-                miq_sleep_ms(1200);
-                continue;
-            }
-            std::string mnemonic = mnemonic_join(words_out);
-
-            banner();
-            std::cout << C("36;1") << "YOUR " << words << "-WORD MNEMONIC (BIP39 ENGLISH)" << R() << "\n\n"
-                      << "  " << mnemonic << "\n\n"
-                      << C("33;1") << "Write these words down. "
-                      << "Anyone with this mnemonic can spend your MIQ." << R() << "\n\n";
-
-            // optional BIP39 passphrase
-            std::string passphrase;
-            std::cout << "  Optional BIP39 passphrase (ENTER to skip): " << std::flush;
-            std::getline(std::cin, passphrase);
-
-            // BIP39 seed
-            std::vector<uint8_t> seed64;
-            mnemonic_to_seed_BIP39(mnemonic, passphrase, seed64);
-
-            // derive 5 addresses
-            std::vector<std::string> addrs;
-            std::vector<std::vector<uint8_t>> pubs;
-            if(!derive_miq_addresses_from_seed(seed64, coin_type, 5, addrs, pubs)){
-                std::fprintf(stderr,"Failed to derive addresses.\n");
-                miq_sleep_ms(1200);
-                continue;
-            }
-
-            banner();
-            std::cout << C("36;1") << "FIRST 5 MIQ ADDRESSES (m/44'/"<< coin_type << "'/0'/0/i)" << R() << "\n";
-            for(size_t i=0;i<addrs.size();++i){
-                std::cout << "  ["<<i<<"] " << addrs[i] << "\n";
-            }
-            std::cout << "\n";
-
-            // choose one to mine to
-            std::cout << "  Choose address index 0-4 (ENTER = 0): " << std::flush;
-            std::string idxs; std::getline(std::cin, idxs); trim(idxs);
-            int idx = 0;
-            if(!idxs.empty()){
-                try { idx = std::stoi(idxs); } catch(...) { idx = 0; }
-            }
-            if(idx < 0) idx = 0;
-            if(idx > 4) idx = 4;
-
-            out_addr = addrs[(size_t)idx];
-
-            banner();
-            std::cout << C("33;1") << "Mining to: " << out_addr << R() << "\n\n"
-                      << C("2") << "(Tip: store your mnemonic safely. You can recreate these same 5 addresses any time.)" << R() << "\n\n";
-            miq_sleep_ms(1200);
-            return true;
-        }
-        else if(choice=="3"){
-            banner();
-            std::cout << C("36;1") << "IMPORT MNEMONIC (BIP39 ENGLISH)" << R() << "\n\n";
-            std::cout << "  Paste your 12 or 24 words:\n  > " << std::flush;
-
-            std::string mnemonic_in;
-            if(!std::getline(std::cin, mnemonic_in)) return false;
-            trim(mnemonic_in);
-            if(mnemonic_in.empty()){
-                std::fprintf(stderr,"No mnemonic provided.\n");
-                miq_sleep_ms(1200);
-                continue;
-            }
-            // validate checksum, produce entropy (for sanity)
-            std::vector<uint8_t> entropy;
-            if(!validate_mnemonic_and_get_entropy(mnemonic_in, entropy)){
-                miq_sleep_ms(1500);
-                continue;
-            }
-
-            // optional passphrase
-            std::string passphrase;
-            std::cout << "\n  Optional BIP39 passphrase (ENTER to skip): " << std::flush;
-            std::getline(std::cin, passphrase);
-
-            // derive seed directly from the phrase (BIP39 PBKDF2)
-            const std::string mnemonic_norm = normalize_spaces_lower(mnemonic_in);
-            std::vector<uint8_t> seed64;
-            mnemonic_to_seed_BIP39(mnemonic_norm, passphrase, seed64);
-
-            // derive 5 addresses
-            std::vector<std::string> addrs;
-            std::vector<std::vector<uint8_t>> pubs;
-            if(!derive_miq_addresses_from_seed(seed64, coin_type, 5, addrs, pubs)){
-                std::fprintf(stderr,"Failed to derive addresses from mnemonic.\n");
-                miq_sleep_ms(1500);
-                continue;
-            }
-
-            banner();
-            std::cout << C("36;1") << "FIRST 5 MIQ ADDRESSES (m/44'/"<< coin_type << "'/0'/0/i)" << R() << "\n";
-            for(size_t i=0;i<addrs.size();++i){
-                std::cout << "  ["<<i<<"] " << addrs[i] << "\n";
-            }
-            std::cout << "\n";
-
-            std::cout << "  Choose address index 0-4 (ENTER = 0): " << std::flush;
-            std::string idxs; std::getline(std::cin, idxs); trim(idxs);
-            int idx = 0;
-            if(!idxs.empty()){
-                try { idx = std::stoi(idxs); } catch(...) { idx = 0; }
-            }
-            if(idx < 0) idx = 0;
-            if(idx > 4) idx = 4;
-
-            out_addr = addrs[(size_t)idx];
-
-            banner();
-            std::cout << C("33;1") << "Mining to: " << out_addr << R() << "\n\n";
-            miq_sleep_ms(1200);
-            return true;
-        }
-        else if(choice=="4"){
-            // start miner with existing address
-            banner();
-            std::cout << "  Enter P2PKH Base58 address to mine to: " << std::flush;
-            std::string addr; std::getline(std::cin, addr); trim(addr);
-
-            std::vector<uint8_t> pkh;
-            if(!parse_p2pkh(addr, pkh)){
-                std::fprintf(stderr,"Invalid address (expected Base58Check P2PKH, version 0x%02x)\n",(unsigned)miq::VERSION_P2PKH);
-                miq_sleep_ms(1500);
-                continue;
-            }
-            out_addr = addr;
-            return true;
-        }
-        else{
-            // invalid choice; loop
-            continue;
-        }
-    }
+    "  - GPU requires build with -DMIQ_ENABLE_OPENCL and OpenCL runtime installed\n";
 }
 
 // ===== main ==================================================================
@@ -2195,12 +1625,6 @@ int main(int argc, char** argv){
         // Salt options (for GPU & optional CPU conformity when MIQ_POW_SALT is defined)
         std::vector<uint8_t> salt_bytes;
         SaltPos salt_pos = SaltPos::NONE;
-
-        // NEW: seed/hd-wallet options
-        int make_seed_words = 0;            // 0=no, 12 or 24
-        std::string seed_passphrase;        // optional
-        bool mine_to_first = false;
-        uint32_t bip44_coin_type = 0;       // default coin type
 
         for(int i=1;i<argc;i++){
             std::string a(argv[i]);
@@ -2249,17 +1673,6 @@ int main(int argc, char** argv){
                 if(p=="pre") salt_pos = SaltPos::PRE;
                 else if(p=="post") salt_pos = SaltPos::POST;
                 else salt_pos = SaltPos::NONE;
-            } else if(a.rfind("--make-seed=",0)==0){
-                int w = std::stoi(a.substr(12));
-                make_seed_words = (w==12 || w==24) ? w : 0;
-            } else if(a.rfind("--seed-pass=",0)==0){
-                seed_passphrase = a.substr(12);
-            } else if(a.rfind("--mine-to-first=",0)==0){
-                std::string p = a.substr(16);
-                std::transform(p.begin(),p.end(),p.begin(),::tolower);
-                mine_to_first = (p=="on"||p=="true"||p=="1");
-            } else if(a.rfind("--coin-type=",0)==0){
-                bip44_coin_type = (uint32_t)std::stoul(a.substr(12));
             } else {
                 std::fprintf(stderr,"Unknown arg: %s\n", argv[i]); return 2;
             }
@@ -2276,52 +1689,10 @@ int main(int argc, char** argv){
         // Process priority
         set_process_priority(high_priority);
 
-        // NEW: optional seed generation & 5 addresses via CLI flags (non-interactive)
-        if(make_seed_words){
-            std::vector<std::string> words;
-            std::vector<uint8_t> entropy;
-            if(!make_mnemonic_words((size_t)make_seed_words, words, entropy)){
-                std::fprintf(stderr,"Failed to create %d-word mnemonic.\n", make_seed_words);
-                return 2;
-            }
-            std::string mnemonic = mnemonic_join(words);
-
-            std::vector<uint8_t> seed64;
-            mnemonic_to_seed_BIP39(mnemonic, seed_passphrase, seed64);
-
-            std::vector<std::string> addrs;
-            std::vector<std::vector<uint8_t>> pubs;
-            if(!derive_miq_addresses_from_seed(seed64, bip44_coin_type, 5, addrs, pubs)){
-                std::fprintf(stderr,"Failed to derive addresses from seed.\n");
-                return 2;
-            }
-
-            std::cout << "\n" << C("36;1") << "NEW " << make_seed_words << "-WORD MNEMONIC (BIP39 ENGLISH)" << R() << "\n";
-            std::cout << "  " << mnemonic << "\n\n";
-            std::cout << C("36;1") << "FIRST 5 MIQ ADDRESSES (m/44'/"<< bip44_coin_type << "'/0'/0/i):" << R() << "\n";
-            for(size_t i=0;i<addrs.size();++i){
-                std::cout << "  ["<<i<<"] " << addrs[i] << "\n";
-            }
-            std::cout << "\n" << C("2") << "Store these words safely. Anyone with this mnemonic can spend your MIQ." << R() << "\n\n";
-
-            if(mine_to_first || address_cli.empty()){
-                address_cli = addrs[0];
-                std::cout << C("33;1") << "Mining to first derived address: " << address_cli << R() << "\n\n";
-            }
-        }
-
         // Decide payout address
         std::string addr = address_cli;
 
-        // If user didn’t pass --address or --make-seed flags, show the menu.
-        if(addr.empty() && make_seed_words == 0){
-            if(!interactive_start_menu(addr, bip44_coin_type)){
-                std::fprintf(stderr,"Aborted.\n");
-                return 0;
-            }
-        }
-
-        // If still empty here, fall back to quick prompt.
+        // If user didn’t pass --address, show the 5s loading screen then prompt.
         if(addr.empty()){
             show_intro_and_get_address(addr);
             if(addr.empty()){ std::fprintf(stderr,"stdin closed\n"); return 1; }
@@ -2344,7 +1715,7 @@ int main(int argc, char** argv){
         // GPU init (optional)
         GpuMiner gpu;
         UIState ui;
-        g_ui = &ui; // NEW: allow workers to publish next-hash previews
+        g_ui = &ui; // allow workers to publish next-hash previews
         ui.my_pkh = pkh;
         std::atomic<bool> running{true};
 
@@ -2416,7 +1787,7 @@ int main(int argc, char** argv){
                             << "  fees=" << fmt_miq_amount(ui.cand.fees) << "\n";
                         out << "                     coinbase=" << C("32;1") << fmt_miq_amount(ui.cand.coinbase) << R() << "\n";
 
-                        // NEW: live next-hash preview
+                        // live next-hash preview
                         std::string nxh;
                         {
                             std::lock_guard<std::mutex> lk2(ui.next_hash_mtx);
@@ -2523,13 +1894,13 @@ int main(int argc, char** argv){
                 std::vector<std::string> lines;
                 lines.push_back("  ##############################   ##############################");
                 lines.push_back("  #                            #   #                            #");
-                lines.push_back("  #"+center_fit("MINING IN PROGRESS", inner)+"#   #"+center_fit("CHRONEN  MINER", inner)+"#");
+                lines.push_back("  #"+center_fit("MINING IN PROGRESS", 28)+"#   #"+center_fit("CHRONEN  MINER", 28)+"#");
                 lines.push_back("  #                            #   #                            #");
                 for(int r=0;r<5;r++){
-                    lines.push_back("  #"+center_fit(spin_rows[r], inner)+"#   #"+center_fit("                    ", inner)+"#");
+                    lines.push_back("  #"+center_fit(spin_rows[r], 28)+"#   #"+center_fit("                    ", 28)+"#");
                 }
                 std::string eta_line = std::string("   ETA ~ ") + fmt_eta(eta);
-                lines.push_back("  #"+pad_fit(eta_line, inner)+"#   #"+center_fit("                    ", inner)+"#");
+                lines.push_back("  #"+pad_fit(eta_line, 28)+"#   #"+center_fit("                    ", 28)+"#");
                 lines.push_back("  ##############################   ##############################");
                 for(const auto& L : lines) out << C("36") << L << R() << "\n";
 
@@ -2572,7 +1943,7 @@ int main(int argc, char** argv){
                         last_seen_h = t.height;
                     }
 
-                    // fallback scan (fixed: no atomic.store() in initializer)
+                    // fallback scan
                     {
                         const uint64_t tip = ui.tip_height.load();
 
