@@ -200,6 +200,7 @@
 #endif
 
 #ifndef MIQ_P2P_GETADDR_INTERVAL_MS
+#define MIQ_P2P_P2P_GETADDR_INTERVAL_MS_SHADOW 120000
 #define MIQ_P2P_GETADDR_INTERVAL_MS 120000
 #endif
 #if MIQ_FILTER_PROFILE_STRICT
@@ -658,9 +659,14 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - g.t_conn).count();
     if (!g.got_verack && ms > HANDSHAKE_MS){
-        close_code = 408;
-        P2P_TRACE("close fd=" + std::to_string((uintptr_t)fd) + " reason=handshake-timeout");
-        return true;
+        // Loopback is lenient: extend instead of closing
+        if (g.is_loopback) {
+            g.t_conn = Clock::now();
+        } else {
+            close_code = 408;
+            P2P_TRACE("close fd=" + std::to_string((uintptr_t)fd) + " reason=handshake-timeout");
+            return true;
+        }
     }
 
     if (!cmd.empty()){
@@ -923,6 +929,37 @@ static std::string miq_miner_from_block(const miq::Block& b) {
     const miq::Transaction& cb = b.txs[0];
     if (cb.vout.empty()) return "(unknown)";
     return miq_addr_from_pkh(cb.vout[0].pkh);
+}
+
+// --- NEW: version payload helper (send a real version+services) -------------
+static inline uint32_t miq_local_proto_version() {
+#if defined(MIQ_PROTOCOL_VERSION)
+    return (uint32_t)MIQ_PROTOCOL_VERSION;
+#elif defined(PROTOCOL_VERSION)
+    return (uint32_t)PROTOCOL_VERSION;
+#else
+    return 1u;
+#endif
+}
+static inline void miq_put_u32le(std::vector<uint8_t>& v, uint32_t x){
+    v.push_back((uint8_t)((x>>0)&0xff));
+    v.push_back((uint8_t)((x>>8)&0xff));
+    v.push_back((uint8_t)((x>>16)&0xff));
+    v.push_back((uint8_t)((x>>24)&0xff));
+}
+static inline void miq_put_u64le(std::vector<uint8_t>& v, uint64_t x){
+    for (int i=0;i<8;i++) v.push_back((uint8_t)((x>>(8*i))&0xff));
+}
+static inline std::vector<uint8_t> miq_build_version_payload() {
+    std::vector<uint8_t> v; v.reserve(12);
+    miq_put_u32le(v, miq_local_proto_version());
+    uint64_t svc = 0;
+#if MIQ_ENABLE_HEADERS_FIRST
+    svc |= (1ull<<0);   // headers-first
+#endif
+    svc |= (1ull<<1);   // tx relay supported
+    miq_put_u64le(v, svc);
+    return v;
 }
 
 } // anon
@@ -1494,7 +1531,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
         gate_set_loopback(s, is_loopback_be(be_ip));
     }
 
-    auto msg = encode_msg("version", {});
+    auto msg = encode_msg("version", miq_build_version_payload());
     (void)miq_send(s, msg);
 
     return true;
@@ -1571,7 +1608,7 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
         gate_set_loopback(c, is_loopback_be(be_ip));
     }
 
-    auto msg = encode_msg("version", {});
+    auto msg = encode_msg("version", miq_build_version_payload());
     (void)miq_send(c, msg);
 }
 
@@ -1617,7 +1654,7 @@ static void trickle_flush(){
         size_t n_send = 0;
         while (!q.empty() && n_send < MIQ_P2P_TRICKLE_BATCH) {
             const auto& txid = q.back();
-            auto m = encode_msg("invtx", txid);
+            auto m = miq::encode_msg("invtx", txid);
             (void)miq_send(s, m);
             q.pop_back();
             ++n_send;
@@ -1983,7 +2020,7 @@ void P2P::loop(){
                         log_info("P2P: outbound (addrman) " + ps.ip);
                         gate_on_connect(s);
                         gate_set_loopback(s, is_loopback_be(be_ip));
-                        auto msg = encode_msg("version", {});
+                        auto msg = encode_msg("version", miq_build_version_payload());
                         (void)miq_send(s, msg);
                         dialed = true;
                     } else {
@@ -2030,7 +2067,7 @@ void P2P::loop(){
                                 log_info("P2P: outbound to known " + ps.ip);
                                 gate_on_connect(s);
                                 gate_set_loopback(s, is_loopback_be(pick));
-                                auto msg = encode_msg("version", {});
+                                auto msg = encode_msg("version", miq_build_version_payload());
                                 (void)miq_send(s, msg);
                             }
                         }
@@ -2064,7 +2101,7 @@ void P2P::loop(){
                                     log_info("P2P: feeler " + dotted);
                                     gate_on_connect(s);
                                     gate_set_loopback(s, is_loopback_be(be_ip));
-                                    auto msg = encode_msg("version", {});
+                                    auto msg = encode_msg("version", miq_build_version_payload());
                                     (void)miq_send(s, msg);
                                 }
                             }
@@ -2693,20 +2730,40 @@ void P2P::loop(){
             }
 
             int64_t tnow = now_ms();
+
+            // Loopback leniency + defer pings until after verack
+            bool is_lb = false;
+            auto itg = g_gate.find(s);
+            if (itg != g_gate.end()) is_lb = itg->second.is_loopback;
+
             if (!ps.verack_ok && (tnow - ps.last_ms) > MIQ_P2P_VERACK_TIMEOUT_MS) {
-                P2P_TRACE("close verack-timeout");
-                dead.push_back(s);
-                continue;
+                if (is_lb) {
+                    // extend the timer for localhost tools/wallets
+                    ps.last_ms = tnow;
+                } else {
+                    P2P_TRACE("close verack-timeout");
+                    dead.push_back(s);
+                    continue;
+                }
             }
-            if (!ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PING_EVERY_MS) {
-                auto ping = encode_msg("ping", {});
-                (void)miq_send(s, ping);
-                ps.last_ping_ms = tnow;
-                ps.awaiting_pong = true;
-            } else if (ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PONG_TIMEOUT_MS) {
-                P2P_TRACE("close pong-timeout");
-                bump_ban(ps, ps.ip, "pong-timeout", now_ms());
-                dead.push_back(s);
+
+            if (ps.verack_ok) {
+                if (!ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PING_EVERY_MS) {
+                    auto ping = encode_msg("ping", {});
+                    (void)miq_send(s, ping);
+                    ps.last_ping_ms = tnow;
+                    ps.awaiting_pong = true;
+                } else if (ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PONG_TIMEOUT_MS) {
+                    if (!is_lb) {
+                        P2P_TRACE("close pong-timeout");
+                        bump_ban(ps, ps.ip, "pong-timeout", now_ms());
+                        dead.push_back(s);
+                    } else {
+                        // loopback: clear awaiting state but keep the socket
+                        ps.awaiting_pong = false;
+                        ps.last_ping_ms = tnow;
+                    }
+                }
             }
         }
 
