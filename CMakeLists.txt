@@ -14,7 +14,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 find_package(PkgConfig QUIET)
-find_package(OpenSSL REQUIRED)      # Provides OpenSSL::Crypto and OpenSSL::SSL
+find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
 # ---------------- Options ----------------
@@ -29,7 +29,7 @@ option(MIQ_FETCH_LEVELDB     "Auto-fetch LevelDB if missing"                ON)
 option(MIQ_USE_LIBSECP "Use bitcoin-core/libsecp256k1 backend" ON)
 set(MIQ_LIBSECP_TAG "master" CACHE STRING "bitcoin-core/secp256k1 tag/commit")
 
-# ---- NEW: OpenCL / GPU toggle (default ON; silently disables if not found) ---
+# NEW: GPU switch (auto-disables if headers/libs missing)
 option(MIQ_ENABLE_OPENCL "Build miners with OpenCL GPU support" ON)
 
 # ---------------- Warnings / Opt ----------------
@@ -114,26 +114,24 @@ if(MIQ_USE_LIBSECP)
 endif()
 
 # ---------------- OpenCL detection (GPU) ----------------
+# We require BOTH headers and library; otherwise we don't define MIQ_ENABLE_OPENCL for targets.
 set(MIQ_HAVE_OPENCL 0)
 set(MIQ_OPENCL_NOTE "")
+
 if(MIQ_ENABLE_OPENCL)
-  # Try standard FindOpenCL first (provides OpenCL::OpenCL on modern CMake)
   find_package(OpenCL QUIET)
 
-  # Fallback hints for Windows & CUDA Toolkit installs (like your v13.0 path)
+  # Fallback to CUDA Toolkit hints on Windows
   if(NOT OpenCL_FOUND)
     if(DEFINED ENV{CUDA_PATH})
       set(_OPENCL_HINT_INC "$ENV{CUDA_PATH}/include")
       set(_OPENCL_HINT_LIB "$ENV{CUDA_PATH}/lib/x64")
     elseif(WIN32)
-      # Common default for CUDA 13.0 installer
       set(_OPENCL_HINT_INC "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include")
       set(_OPENCL_HINT_LIB "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/lib/x64")
     endif()
-
     find_path(OpenCL_INCLUDE_DIR CL/cl.h HINTS ${_OPENCL_HINT_INC})
     find_library(OpenCL_LIBRARY NAMES OpenCL OpenCL.lib HINTS ${_OPENCL_HINT_LIB})
-
     if(OpenCL_INCLUDE_DIR AND OpenCL_LIBRARY)
       add_library(OpenCL::OpenCL UNKNOWN IMPORTED)
       set_target_properties(OpenCL::OpenCL PROPERTIES
@@ -144,20 +142,34 @@ if(MIQ_ENABLE_OPENCL)
     endif()
   endif()
 
+  # Verify headers actually compile; if not, disable.
   if(OpenCL_FOUND)
-    set(MIQ_HAVE_OPENCL 1)
-    message(STATUS "OpenCL found${MIQ_OPENCL_NOTE}. GPU miner support ENABLED.")
+    include(CheckCXXSourceCompiles)
+    # Try both header paths in one test.
+    set(CMAKE_REQUIRED_INCLUDES "${OpenCL_INCLUDE_DIRS};${OpenCL_INCLUDE_DIR}")
+    set(CMAKE_REQUIRED_LIBRARIES "${OpenCL_LIBRARIES};${OpenCL_LIBRARY}")
+    check_cxx_source_compiles("
+      #if defined(__APPLE__)
+      # include <OpenCL/opencl.h>
+      #else
+      # include <CL/cl.h>
+      #endif
+      int main(){ return 0; }
+    " MIQ__OPENCL_OK)
+    if(MIQ__OPENCL_OK)
+      set(MIQ_HAVE_OPENCL 1)
+      message(STATUS \"OpenCL found${MIQ_OPENCL_NOTE}. GPU miner support ENABLED.\")
+    else()
+      message(WARNING \"OpenCL library detected but headers not usable. GPU miner support DISABLED.\")
+    endif()
   else()
-    message(WARNING "OpenCL not found. GPU miner support will be DISABLED.\n"
-                    "Hint: pass -DOpenCL_INCLUDE_DIR=... -DOpenCL_LIBRARY=... or set CUDA_PATH.")
+    message(STATUS \"OpenCL not found. GPU miner support DISABLED (CPU path only).\")
   endif()
 else()
-  message(STATUS "MIQ_ENABLE_OPENCL=OFF. Building without GPU support.")
+  message(STATUS \"MIQ_ENABLE_OPENCL=OFF. Building without GPU support.\")
 endif()
 
-# ---------------- Core sources (shared, NO nat/tls here) ----------------
-# nat.cpp is per-target (daemon UPnP vs wallet stub)
-# tls_proxy.* is daemon-only (kept out of the core to avoid SSL deps in the wallet)
+# ---------------- Core sources (shared) ----------------
 set(MIQ_CORE_SOURCES_NO_NAT
     src/hd_wallet.cpp
     src/hd_wallet.h
@@ -280,7 +292,7 @@ endif()
 add_executable(miqrod
   src/main.cpp
   src/nat.cpp
-  src/tls_proxy.h src/tls_proxy.cpp   # TLS is daemon-only
+  src/tls_proxy.h src/tls_proxy.cpp
 )
 target_link_libraries(miqrod PRIVATE miqcore OpenSSL::SSL)
 
@@ -290,11 +302,9 @@ if(_HAVE_MINIUPNPC)
     target_include_directories(miqrod PRIVATE ${_MINIUPNPC_INC})
   endif()
   if(_MINIUPNPC_LIBS)
-    target_link_libraries(miqrod PRIVATE ${_MINIUPNPC_LIBS})
+    target_link_libraries(miqrod PRIVATE ${(_MINIUPNPC_LIBS)})
   endif()
-  message(STATUS "UPnP enabled for daemon (miniupnpc detected)")
 else()
-  # IMPORTANT: do NOT define MIQ_ENABLE_UPNP at all here. Leave it undefined.
   message(STATUS "UPnP disabled for daemon (miniupnpc not found)")
 endif()
 
@@ -304,7 +314,6 @@ if(WIN32)
 endif()
 
 # ---------------- Wallet CLI ----------------
-# Pull in P2P-light implementation if present (any of the common locations).
 set(MIQ_P2P_LIGHT_SRC "")
 foreach(cand IN ITEMS
         src/p2p_light.cpp
@@ -317,22 +326,20 @@ endforeach()
 
 add_executable(miqwallet
   src/cli/miqwallet.cpp
-  src/nat.cpp              # compiled without MIQ_ENABLE_UPNP for wallet (stub path)
+  src/nat.cpp
   ${MIQ_P2P_LIGHT_SRC}
   src/wallet/spv_simple.cpp
 )
 target_include_directories(miqwallet PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(miqwallet PRIVATE miqcore)   # no OpenSSL::SSL here
+target_link_libraries(miqwallet PRIVATE miqcore)
 if(WIN32)
   target_link_libraries(miqwallet PRIVATE ws2_32 bcrypt)
-  target_compile_definitions(miqwallet PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_definitions(miqwallet PRIVATE WIN32_LEAN_AND_MEAN NOMINMX)
 endif()
 set_target_properties(miqwallet PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
 
 # ---------------- Key tool ----------------
-add_executable(miq-keygen
-    src/tools/miq_keygen.cpp
-)
+add_executable(miq-keygen src/tools/miq_keygen.cpp)
 target_include_directories(miq-keygen PRIVATE src)
 target_link_libraries(miq-keygen PRIVATE miqcore)
 if(WIN32)
@@ -340,7 +347,6 @@ if(WIN32)
 endif()
 
 # ---------------- Miner app (stand-alone) ----------------
-# Auto-detect the app source file so you can place it where you like.
 set(MIQ_MINER_SRC "")
 foreach(cand IN ITEMS
         src/tools/miqminer.cpp
@@ -357,12 +363,11 @@ endforeach()
 if(MIQ_MINER_SRC)
   add_executable(miqminer ${MIQ_MINER_SRC})
   target_include_directories(miqminer PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(miqminer PRIVATE miqcore)  # uses miner.cpp/hasher.cpp from core
+  target_link_libraries(miqminer PRIVATE miqcore)
   if(WIN32)
     target_link_libraries(miqminer PRIVATE ws2_32 bcrypt)
     target_compile_definitions(miqminer PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   endif()
-  # Enable GPU for standalone miner too (if it uses OpenCL blocks)
   if(MIQ_HAVE_OPENCL)
     target_compile_definitions(miqminer PRIVATE MIQ_ENABLE_OPENCL=1)
     target_link_libraries(miqminer PRIVATE OpenCL::OpenCL)
@@ -406,7 +411,6 @@ endif()
 # ---------------- Tests (optional) ----------------
 if(MIQ_BUILD_TESTS)
   enable_testing()
-
   add_executable(test_crypto tests/test_crypto.cpp)
   target_include_directories(test_crypto PRIVATE src)
   target_link_libraries(test_crypto PRIVATE miqcore)
