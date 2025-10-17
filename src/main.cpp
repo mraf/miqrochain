@@ -448,6 +448,7 @@ private:
         if (cols < 90) cols = 90;
         if (rows < 26) rows = 26;
 
+        // Define once; reuse later (fix redefinition errors)
         const int rightw = std::max(36, cols / 3);
         const int leftw  = cols - rightw - 3;
 
@@ -571,8 +572,6 @@ private:
 
         std::ostringstream out;
         size_t N = std::max(left.size(), right.size());
-        const int rightw = std::max(36, cols / 3);
-        const int leftw  = cols - rightw - 3;
         for (size_t i=0;i<N;i++){
             std::string l = (i<left.size())  ? left[i]  : "";
             std::string r = (i<right.size()) ? right[i] : "";
