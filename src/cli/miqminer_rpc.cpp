@@ -1,6 +1,3 @@
-// miqminer_rpc_bip39.cpp  — Chronen Miner (CPU + optional OpenCL GPU) with REAL BIP39 mnemonics
-// Replaces pseudo-mnemonic generator with BIP39 English wordlist (12/24 words), checksum + validation.
-
 #include "constants.h"
 #include "block.h"
 #include "tx.h"
@@ -42,9 +39,10 @@
   #ifndef NOMINMAX
   #define NOMINMAX 1
   #endif
-  #include <windows.h>
+  // Winsock must be included BEFORE windows.h to avoid winsock.h conflicts.
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #include <windows.h>
   #include <direct.h>
   #pragma comment(lib, "Ws2_32.lib")
   using socklen_t = int;
@@ -93,7 +91,8 @@
     #endif
   #else
     #if defined(__APPLE__)
-      #include <OpenCL/opencl.h)
+      // (fix) typo was: #include <OpenCL/opencl.h)
+      #include <OpenCL/opencl.h>
     #else
       #include <CL/cl.h>
     #endif
@@ -1278,9 +1277,6 @@ enum class SaltPos { NONE=0, PRE=1, POST=2 };
 
 #if defined(MIQ_ENABLE_OPENCL)
 
-// (OpenCL kernel & GPU miner class unchanged – omitted here for brevity in this comment,
-// but included fully in your build; keep as in your original file.)
-
 // ----------------- START OpenCL kernel string --------------------------------
 static const char* kCLKernel = R"CLC(
 typedef unsigned int  u32;
@@ -2444,12 +2440,13 @@ int main(int argc, char** argv){
                         last_seen_h = t.height;
                     }
 
-                    // fallback scan
+                    // fallback scan (fixed: no atomic.store() in initializer)
                     {
                         const uint64_t tip = ui.tip_height.load();
-                        uint64_t next_h = ui.est_scanned_height.store(0), dummy=0;
-                        next_h = ui.est_scanned_height.load();
+
+                        uint64_t next_h = ui.est_scanned_height.load();
                         if (next_h == 0) next_h = 1;
+
                         const uint64_t CHUNK = 128;
                         uint64_t end_h = (tip > 0) ? std::min(tip, next_h + CHUNK - 1) : 0;
 
@@ -2580,229 +2577,199 @@ int main(int argc, char** argv){
         };
 
         // ===== mining loop ===================================================
-        // ===== mining loop ===================================================
-while (true) {
-    // Fetch a fresh template
-    MinerTemplate tpl;
-    if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
-        std::fprintf(stderr, "getminertemplate failed, retrying...\n");
-        miq_sleep_ms(1000);
-        continue;
-    }
-
-    // Build coinbase and pack txs
-    Transaction dummy_cb = make_coinbase(tpl.height, 0, pkh);
-    size_t coinbase_sz = ser_tx(dummy_cb).size();
-
-    std::vector<Transaction> txs;
-    uint64_t fees = 0;
-    size_t used_bytes = 0;
-    pack_template(tpl, coinbase_sz, txs, fees, used_bytes);
-
-    Transaction cb = make_coinbase(tpl.height, fees, pkh);
-    std::vector<Transaction> txs_inc;
-    txs_inc.reserve(1 + txs.size());
-    txs_inc.push_back(cb);
-    for (auto &t : txs) txs_inc.push_back(std::move(t));
-
-    // Publish candidate stats to UI
-    {
-        std::lock_guard<std::mutex> lk(ui.mtx);
-        ui.cand.height = tpl.height;
-        ui.cand.prev_hex = to_hex_s(tpl.prev_hash);
-        ui.cand.bits = tpl.bits;
-        ui.cand.time = tpl.time;
-        ui.cand.txs = txs_inc.size();
-        ui.cand.size_bytes = used_bytes + ser_tx(cb).size();
-        ui.cand.fees = fees;
-        ui.cand.coinbase = GetBlockSubsidy((uint32_t)tpl.height) + fees;
-    }
-
-    // Reset round stats/ETA
-    ui.round_start_tries.store(ui.tries_total.load());
-    ui.round_expected_hashes.store(difficulty_from_bits(tpl.bits) * 4294967296.0);
-
-    // Header base
-    BlockHeader hb;
-    hb.version = 1;
-    hb.prev_hash = tpl.prev_hash;
-    hb.time = std::max<int64_t>((int64_t)time(nullptr), tpl.time);
-    hb.bits = tpl.bits;
-    hb.nonce = 0;
-
-    Block b;
-    b.header = hb;
-    b.txs = txs_inc;
-    b.header.merkle_root = merkle_from(b.txs);
-
-    // CPU mining threads
-    std::atomic<bool> found{false};
-    std::vector<std::thread> thv;
-    Block found_block;
-
-    for (unsigned tid = 0; tid < threads; ++tid) {
-        thv.emplace_back(
-            mine_worker_optimized, hb, txs_inc, hb.bits,
-            &found, &thr_counts[tid], pin_affinity, tid, threads, &found_block
-        );
-    }
-
-    // Prepare GPU job (optional)
-    uint8_t target_be[32];
-    bits_to_target_be(sanitize_bits(hb.bits), target_be);
-    auto build_header_prefix80 = [](const BlockHeader &H, const std::vector<uint8_t> &merkle) {
-        std::vector<uint8_t> p;
-        p.reserve(80);
-        put_u32_le(p, H.version);
-        p.insert(p.end(), H.prev_hash.begin(), H.prev_hash.end());
-        p.insert(p.end(), merkle.begin(), merkle.end());
-        put_u64_le(p, (uint64_t)H.time);
-        put_u32_le(p, H.bits);
-        return p;
-    };
-    auto make_gpu_prefix = [&](const std::vector<uint8_t> &prefix80) {
-        std::vector<uint8_t> out;
-        if (salt_pos == SaltPos::PRE && !salt_bytes.empty()) {
-            out.reserve(salt_bytes.size() + prefix80.size());
-            out.insert(out.end(), salt_bytes.begin(), salt_bytes.end());
-            out.insert(out.end(), prefix80.begin(), prefix80.end());
-        } else if (salt_pos == SaltPos::POST && !salt_bytes.empty()) {
-            out.reserve(prefix80.size() + salt_bytes.size());
-            out.insert(out.end(), prefix80.begin(), prefix80.end());
-            out.insert(out.end(), salt_bytes.begin(), salt_bytes.end());
-        } else {
-            out = prefix80;
-        }
-        return out;
-    };
-
-    std::thread gpu_th;
-#if defined(MIQ_ENABLE_OPENCL)
-    if (gpu_enabled) {
-        std::string gerr;
-        std::vector<uint8_t> prefix80 = build_header_prefix80(b.header, b.header.merkle_root);
-        std::vector<uint8_t> gpuprefix = make_gpu_prefix(prefix80);
-        if (!gpu.set_job(gpuprefix, target_be, &gerr)) {
-            std::fprintf(stderr, "[GPU] job set failed: %s\n", gerr.c_str());
-        } else {
-            gpu_th = std::thread([&](){
-                uint64_t base_nonce =
-                    (static_cast<uint64_t>(time(nullptr)) << 32) ^ 0x9e3779b97f4a7c15ull ^ 0xa5a5a5a5ULL;
-                while (!found.load(std::memory_order_relaxed)) {
-                    uint64_t n = 0; bool ok = false; double ghps = 0.0;
-                    if (!gpu.run_round(base_nonce, gpu_npi, n, ok, ghps, 0.25, 2.0)) {
-                        std::fprintf(stderr, "[GPU] run_round failed.\n");
-                        break;
-                    }
-                    g_ui->gpu_hps_now.store(gpu.ema_now);
-                    g_ui->gpu_hps_smooth.store(gpu.ema_smooth);
-
-                    if (ok) {
-                        found_block = b;
-                        found_block.header.nonce = n;
-                        found.store(true);
-                        break;
-                    }
-                    base_nonce += (uint64_t)gpu.gws * (uint64_t)gpu_npi;
-                }
-            });
-        }
-    }
-#endif
-
-    // Wait for CPU workers
-    for (auto &th : thv) th.join();
-
-    // Stop GPU worker if running
-#if defined(MIQ_ENABLE_OPENCL)
-    if (gpu_th.joinable()) {
-        found.store(true);
-        gpu_th.join();
-    }
-#endif
-
-    // Check staleness against current tip (uses tpl safely here)
-    TipInfo tip_now{};
-    if (rpc_gettipinfo(rpc_host, rpc_port, token, tip_now)) {
-        if (from_hex_s(tip_now.hash_hex) != tpl.prev_hash) {
-            std::lock_guard<std::mutex> lk(ui.mtx);
-            ui.last_submit_msg = std::string("submit skipped: template stale (chain advanced)");
-            ui.last_submit_when = std::chrono::steady_clock::now();
-            continue;
-        }
-    }
-
-    // Verify found header meets target (paranoia)
-    auto hchk = found_block.block_hash();
-    if (!meets_target_be_raw(hchk.data(), hb.bits)) {
-        std::lock_guard<std::mutex> lk(ui.mtx);
-        ui.last_submit_msg = "internal: solved header doesn't meet target (skipping)";
-        ui.last_submit_when = std::chrono::steady_clock::now();
-        continue;
-    }
-
-    // Submit the block
-    auto raw = miq::ser_block(found_block);
-    std::string hexblk = miq::to_hex(raw);
-
-    std::string ok_body, err_body;
-    bool ok = rpc_submitblock_any(rpc_host, rpc_port, token, ok_body, err_body, hexblk);
-
-    if (ok) {
-        // Try to confirm acceptance at exact height/hash
-        bool confirmed = false;
-        for (int i = 0; i < 40; ++i) {
-            TipInfo t2{};
-            if (rpc_gettipinfo(rpc_host, rpc_port, token, t2)) {
-                if (t2.height == tpl.height &&
-                    t2.hash_hex == miq::to_hex(found_block.block_hash())) {
-                    confirmed = true;
-                    break;
-                }
+        while (true) {
+            // Fetch a fresh template
+            MinerTemplate tpl;
+            if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
+                std::fprintf(stderr, "getminertemplate failed, retrying...\n");
+                miq_sleep_ms(1000);
+                continue;
             }
-            miq_sleep_ms(100);
-        }
 
-        {
-            std::lock_guard<std::mutex> lk(ui.mtx);
-            ui.last_found_block_hash = miq::to_hex(found_block.block_hash());
-            if (confirmed) {
-                ui.mined_blocks.fetch_add(1);
-                std::ostringstream m; m << C("32;1") << "submit accepted @ height=" << tpl.height
-                                        << " hash=" << ui.last_found_block_hash << R();
-                ui.last_submit_msg = m.str();
-                ui.last_tip_was_mine.store(true);
-                ui.last_winner_addr.clear();
+            // Build coinbase and pack txs
+            Transaction dummy_cb = make_coinbase(tpl.height, 0, pkh);
+            size_t coinbase_sz = ser_tx(dummy_cb).size();
 
-                // FIX: pass token as the 3rd argument
-                rpc_minerlog_best_effort(
-                    rpc_host, rpc_port, token,
-                    std::string("miner: accepted block at height ")
-                    + std::to_string(tpl.height) + " " + ui.last_found_block_hash
+            std::vector<Transaction> txs;
+            uint64_t fees = 0;
+            size_t used_bytes = 0;
+            pack_template(tpl, coinbase_sz, txs, fees, used_bytes);
+
+            Transaction cb = make_coinbase(tpl.height, fees, pkh);
+            std::vector<Transaction> txs_inc;
+            txs_inc.reserve(1 + txs.size());
+            txs_inc.push_back(cb);
+            for (auto &t : txs) txs_inc.push_back(std::move(t));
+
+            // Publish candidate stats to UI
+            {
+                std::lock_guard<std::mutex> lk(ui.mtx);
+                ui.cand.height = tpl.height;
+                ui.cand.prev_hex = to_hex_s(tpl.prev_hash);
+                ui.cand.bits = tpl.bits;
+                ui.cand.time = tpl.time;
+                ui.cand.txs = txs_inc.size();
+                ui.cand.size_bytes = used_bytes + ser_tx(cb).size();
+                ui.cand.fees = fees;
+                ui.cand.coinbase = GetBlockSubsidy((uint32_t)tpl.height) + fees;
+            }
+
+            // Reset round stats/ETA
+            ui.round_start_tries.store(ui.tries_total.load());
+            ui.round_expected_hashes.store(difficulty_from_bits(tpl.bits) * 4294967296.0);
+
+            // Header base
+            BlockHeader hb;
+            hb.version = 1;
+            hb.prev_hash = tpl.prev_hash;
+            hb.time = std::max<int64_t>((int64_t)time(nullptr), tpl.time);
+            hb.bits = tpl.bits;
+            hb.nonce = 0;
+
+            Block b;
+            b.header = hb;
+            b.txs = txs_inc;
+            b.header.merkle_root = merkle_from(b.txs);
+
+            // CPU mining threads
+            std::atomic<bool> found{false};
+            std::vector<std::thread> thv;
+            Block found_block;
+
+            for (unsigned tid = 0; tid < threads; ++tid) {
+                thv.emplace_back(
+                    mine_worker_optimized, hb, txs_inc, hb.bits,
+                    &found, &thr_counts[tid], pin_affinity, tid, threads, &found_block
                 );
-            } else {
-                std::ostringstream m; m << C("33;1")
-                                        << "submit accepted (pending tip refresh) hash="
-                                        << ui.last_found_block_hash << R();
-                ui.last_submit_msg = m.str();
             }
-            ui.last_submit_when = std::chrono::steady_clock::now();
+
+            // Prepare GPU job (optional)
+            uint8_t target_be[32];
+            bits_to_target_be(sanitize_bits(hb.bits), target_be);
+
+            std::thread gpu_th;
+        #if defined(MIQ_ENABLE_OPENCL)
+            if (gpu_enabled) {
+                std::string gerr;
+                std::vector<uint8_t> prefix80 = build_header_prefix80(b.header, b.header.merkle_root);
+                std::vector<uint8_t> gpuprefix = make_gpu_prefix(prefix80);
+                if (!gpu.set_job(gpuprefix, target_be, &gerr)) {
+                    std::fprintf(stderr, "[GPU] job set failed: %s\n", gerr.c_str());
+                } else {
+                    gpu_th = std::thread([&](){
+                        uint64_t base_nonce =
+                            (static_cast<uint64_t>(time(nullptr)) << 32) ^ 0x9e3779b97f4a7c15ull ^ 0xa5a5a5a5ULL;
+                        while (!found.load(std::memory_order_relaxed)) {
+                            uint64_t n = 0; bool ok = false; double ghps = 0.0;
+                            if (!gpu.run_round(base_nonce, gpu_npi, n, ok, ghps, 0.25, 2.0)) {
+                                std::fprintf(stderr, "[GPU] run_round failed.\n");
+                                break;
+                            }
+                            g_ui->gpu_hps_now.store(gpu.ema_now);
+                            g_ui->gpu_hps_smooth.store(gpu.ema_smooth);
+
+                            if (ok) {
+                                found_block = b;
+                                found_block.header.nonce = n;
+                                found.store(true);
+                                break;
+                            }
+                            base_nonce += (uint64_t)gpu.gws * (uint64_t)gpu_npi;
+                        }
+                    });
+                }
+            }
+        #endif
+
+            // Wait for CPU workers
+            for (auto &th : thv) th.join();
+
+            // Stop GPU worker if running
+        #if defined(MIQ_ENABLE_OPENCL)
+            if (gpu_th.joinable()) {
+                found.store(true);
+                gpu_th.join();
+            }
+        #endif
+
+            // Check staleness against current tip (uses tpl safely here)
+            TipInfo tip_now{};
+            if (rpc_gettipinfo(rpc_host, rpc_port, token, tip_now)) {
+                if (from_hex_s(tip_now.hash_hex) != tpl.prev_hash) {
+                    std::lock_guard<std::mutex> lk(ui.mtx);
+                    ui.last_submit_msg = std::string("submit skipped: template stale (chain advanced)");
+                    ui.last_submit_when = std::chrono::steady_clock::now();
+                    continue;
+                }
+            }
+
+            // Verify found header meets target (paranoia)
+            auto hchk = found_block.block_hash();
+            if (!meets_target_be_raw(hchk.data(), hb.bits)) {
+                std::lock_guard<std::mutex> lk(ui.mtx);
+                ui.last_submit_msg = "internal: solved header doesn't meet target (skipping)";
+                ui.last_submit_when = std::chrono::steady_clock::now();
+                continue;
+            }
+
+            // Submit the block
+            auto raw = miq::ser_block(found_block);
+            std::string hexblk = miq::to_hex(raw);
+
+            std::string ok_body, err_body;
+            bool ok = rpc_submitblock_any(rpc_host, rpc_port, token, ok_body, err_body, hexblk);
+
+            if (ok) {
+                // Try to confirm acceptance at exact height/hash
+                bool confirmed = false;
+                for (int i = 0; i < 40; ++i) {
+                    TipInfo t2{};
+                    if (rpc_gettipinfo(rpc_host, rpc_port, token, t2)) {
+                        if (t2.height == tpl.height &&
+                            t2.hash_hex == miq::to_hex(found_block.block_hash())) {
+                            confirmed = true;
+                            break;
+                        }
+                    }
+                    miq_sleep_ms(100);
+                }
+
+                {
+                    std::lock_guard<std::mutex> lk(ui.mtx);
+                    ui.last_found_block_hash = miq::to_hex(found_block.block_hash());
+                    if (confirmed) {
+                        ui.mined_blocks.fetch_add(1);
+                        std::ostringstream m; m << C("32;1") << "submit accepted @ height=" << tpl.height
+                                                << " hash=" << ui.last_found_block_hash << R();
+                        ui.last_submit_msg = m.str();
+                        ui.last_tip_was_mine.store(true);
+                        ui.last_winner_addr.clear();
+
+                        // (fixed) pass token as the 3rd argument to match signature
+                        rpc_minerlog_best_effort(
+                            rpc_host, rpc_port, token,
+                            std::string("miner: accepted block at height ")
+                            + std::to_string(tpl.height) + " " + ui.last_found_block_hash
+                        );
+                    } else {
+                        std::ostringstream m; m << C("33;1")
+                                                << "submit accepted (pending tip refresh) hash="
+                                                << ui.last_found_block_hash << R();
+                        ui.last_submit_msg = m.str();
+                    }
+                    ui.last_submit_when = std::chrono::steady_clock::now();
+                }
+            } else {
+                std::lock_guard<std::mutex> lk(ui.mtx);
+                std::ostringstream m; m << C("31;1") << "submit REJECTED / RPC failed" << R();
+                if (!err_body.empty()) {
+                    std::string msg;
+                    if (json_find_string(err_body, "error", msg)) m << ": " << msg;
+                }
+                ui.last_submit_msg = m.str();
+                ui.last_submit_when = std::chrono::steady_clock::now();
+            }
         }
-    } else {
-        std::lock_guard<std::mutex> lk(ui.mtx);
-        std::ostringstream m; m << C("31;1") << "submit REJECTED / RPC failed" << R();
-        if (!err_body.empty()) {
-            std::string msg;
-            if (json_find_string(err_body, "error", msg)) m << ": " << msg;
-        }
-        ui.last_submit_msg = m.str();
-        ui.last_submit_when = std::chrono::steady_clock::now();
-    }
-}
-
-
-
-      
 
     } catch(const std::exception& ex){
         std::fprintf(stderr,"[FATAL] %s\n", ex.what());
