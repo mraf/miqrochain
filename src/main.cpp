@@ -58,6 +58,13 @@
 #include <sstream>
 #include <iomanip>
 
+#ifndef MIQ_VERSION_MAJOR
+#define MIQ_VERSION_MAJOR 0
+#endif
+#ifndef MIQ_VERSION_MINOR
+#define MIQ_VERSION_MINOR 1
+#endif
+
 #if defined(_WIN32)
   #include <io.h>
   #include <windows.h>
@@ -270,17 +277,18 @@ private:
             ssize_t n = ::read(readfd, tmp, sizeof(tmp));
             if (n <= 0) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); continue; }
 #endif
-            for (ssize_t i=0; i<n; ++i) {
-                char c = tmp[i];
-                if (c == '\r') continue;
-                if (c == '\n') {
-                    std::lock_guard<std::mutex> lk(mu_);
-                    pending_.push_back(buf);
-                    buf.clear();
-                } else {
-                    buf.push_back(c);
-                }
-            }
+            int nn = (int)n;
+		for (int i=0; i<nn; ++i) {
+    		char c = tmp[i];
+    		if (c == '\r') continue;
+    		if (c == '\n') {
+        		std::lock_guard<std::mutex> lk(mu_);
+        		pending_.push_back(buf);
+        		buf.clear();
+    		    } else {
+        	        buf.push_back(c);
+    		}
+	    }	
         }
     }
 
