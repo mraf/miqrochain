@@ -169,7 +169,7 @@ static bool is_public_ipv6_literal(const std::string& host){
 #else
     if (inet_pton(AF_INET6, host.c_str(), &a6.sin6_addr) != 1) return false;
 #endif
-    const uint8_t* b = (const uint8_t*)&a6.sin6_addr;
+    const uint8_t* b = (const uint8_t*)&a6->sin6_addr;
     // ::1 loopback
     bool loop = true; for (int i=0;i<15;i++){ if (b[i]!=0) { loop=false; break; } }
     if (loop && b[15]==1) return false;
