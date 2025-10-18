@@ -104,7 +104,6 @@
   #include <sys/types.h>
   #include <sys/stat.h>
   #include <signal.h>   // <-- needed for kill()
-  #include <sys/file.h>
   #define MIQ_ISATTY() (::isatty(fileno(stdin)) != 0)
 #endif
 
@@ -148,11 +147,7 @@ static std::atomic<bool>    reload_requested{false};   // SIGHUP / hotkey 'r'
 static std::string          lockfile_path;
 static std::string          pidfile_path;
 #ifdef _WIN32
-static HANDLE               lockfile_handle{nullptr};  // keep open to hold lockfile (legacy)
-static HANDLE               instance_mutex{nullptr};   // named OS mutex to hard-enforce singleton
-static bool                 instance_mutex_owned{false};
-#else
-static int                  lock_fd{-1};              // POSIX lock fd (fcntl)
+static HANDLE               lockfile_handle{nullptr};  // keep open to hold lock
 #endif
 static std::string          telemetry_path;
 static std::atomic<bool>    telemetry_enabled{false};
@@ -170,10 +165,6 @@ static std::atomic<bool>    tui_toggle_wave{false};
 static std::atomic<bool>    tui_toggle_layout_lock{false};
 static std::atomic<bool>    tui_toggle_units{false};
 static std::atomic<bool>    tui_toggle_contrast{false};
-
-// Lock sentry: keeps PID/lock alive even if files get deleted externally
-static std::atomic<bool>    lock_sentry_run{false};
-static std::thread          lock_sentry_thr;
 }
 
 // time helpers
@@ -428,23 +419,7 @@ static bool write_text_atomic(const std::string& path, const std::string& body){
     return !ec;
 }
 
-// Small helpers for hashing & Windows wide strings (for named mutex)
-static uint64_t fnv1a64(const std::string& s){
-    uint64_t h = 1469598103934665603ull;
-    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
-    return h;
-}
-#ifdef _WIN32
-static std::wstring utf8_to_wide(const std::string& s){
-    if (s.empty()) return std::wstring();
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    std::wstring w; w.resize((size_t)n);
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
-    return w;
-}
-#endif
-
-// --- Lock helpers (polished & with OS-level hard single-instance + fallback) ---
+// --- Lock helpers (polished & with fallback) ---------------------------------
 static int read_pidfile_int(const std::string& pidfile) {
     std::vector<uint8_t> buf;
     if (!read_file_all(pidfile, buf)) return -1;
@@ -485,73 +460,16 @@ static bool remove_stale_lock(const std::string& lock, const std::string& pidfil
     return true; // best-effort
 }
 
-// Start a sentry that keeps the lock & pid fresh (recreates if deleted)
-static void start_lock_sentry(const std::string& datadir){
-    using namespace std::chrono_literals;
-    global::lock_sentry_run.store(true);
-    const std::string lock = p_join(datadir, ".lock");
-    const std::string pid  = p_join(datadir, "miqrod.pid");
-#ifdef _WIN32
-    const int pidnum = (int)GetCurrentProcessId();
-#else
-    const int pidnum = (int)getpid();
-#endif
-    global::lock_sentry_thr = std::thread([lock, pid, pidnum]{
-        while (global::lock_sentry_run.load()){
-            // Refresh PID file (only if it changed/missing)
-            std::vector<uint8_t> buf;
-            bool need_write = true;
-            if (read_file_all(pid, buf)){
-                std::string s(buf.begin(), buf.end());
-                trim_inplace(s);
-                if (s == std::to_string(pidnum)) need_write = false;
-            }
-            if (need_write) write_text_atomic(pid, std::to_string(pidnum) + "\n");
-
-#ifndef _WIN32
-            // POSIX: ensure lockfile exists and we hold a write lock on it
-            std::error_code ec;
-            if (!std::filesystem::exists(lock, ec)){
-                int fd = ::open(lock.c_str(), O_CREAT | O_RDWR, 0644);
-                if (fd >= 0){
-                    struct flock fl{};
-                    fl.l_type   = F_WRLCK;
-                    fl.l_whence = SEEK_SET;
-                    fl.l_start  = 0;
-                    fl.l_len    = 0; // whole file
-                    if (fcntl(fd, F_SETLK, &fl) == 0){
-                        // swap our fd
-                        if (global::lock_fd >= 0) ::close(global::lock_fd);
-                        global::lock_fd = fd;
-                    } else {
-                        ::close(fd);
-                    }
-                }
-            }
-#endif
-            std::this_thread::sleep_for(1s);
-        }
-    });
-}
-static void stop_lock_sentry(){
-    global::lock_sentry_run.store(false);
-    if (global::lock_sentry_thr.joinable()) global::lock_sentry_thr.join();
-}
-
-// Acquire datadir lock with stale-detection, OS mutex/fcntl, retries, and optional "steal"
-//
+// Acquire datadir lock with stale-detection, retries, and optional "steal"
 // Fallback knobs (env):
 //  - MIQ_LOCK_RETRIES: number of retry cycles (default 2)
 //  - MIQ_LOCK_WAIT_MS: wait per retry (default 250ms)
-//  - MIQ_STEAL_LOCK=1: forcibly remove existing legacy lock files (if safe)
-//
+//  - MIQ_STEAL_LOCK=1: if set, remove existing lock even if a process appears alive
 static bool acquire_datadir_lock(const std::string& datadir){
     std::error_code ec;
     std::filesystem::create_directories(datadir, ec);
     std::string lock = p_join(datadir, ".lock");
     std::string pid  = p_join(datadir, "miqrod.pid");
-    global::lockfile_path = lock;
-    global::pidfile_path  = pid;
 
     int retries = 2;
     int wait_ms = 250;
@@ -568,91 +486,34 @@ static bool acquire_datadir_lock(const std::string& datadir){
         steal = (*s && *s!='0');
     }
 
+    auto try_once = [&](bool log_on_fail)->bool{
 #ifdef _WIN32
-    // 1) Hard single-instance: named mutex in the Global namespace (unique per datadir)
-    const uint64_t h = fnv1a64(datadir);
-    std::ostringstream os; os << "Global\\miqrod-" << std::hex << h;
-    std::wstring wname = utf8_to_wide(os.str());
-    HANDLE m = CreateMutexW(nullptr, FALSE, wname.c_str());
-    if (!m){
-        log_error("CreateMutexW failed; cannot ensure single-instance.");
-        return false;
-    }
-    DWORD wait = WaitForSingleObject(m, 0);
-    if (wait == WAIT_TIMEOUT){
-        // Another instance is alive. Diagnose using pidfile (legacy path) for better logs.
-        const int other_pid = read_pidfile_int(pid);
-        if (other_pid > 0) {
-            log_error(std::string("Another instance is running (pid=") + std::to_string(other_pid) + ").");
-        } else {
-            log_error("Another instance is running (mutex locked).");
+        HANDLE h = CreateFileA(lock.c_str(),
+                               GENERIC_READ | GENERIC_WRITE,
+                               0,           // no sharing
+                               NULL,
+                               CREATE_NEW,  // fail if exists
+                               FILE_ATTRIBUTE_NORMAL,
+                               NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            if (log_on_fail) log_error("Lock exists; another instance may be running.");
+            return false;
         }
-        CloseHandle(m);
-        return false;
-    }
-    // If we get WAIT_OBJECT_0 or WAIT_ABANDONED, we own it now.
-    global::instance_mutex       = m;
-    global::instance_mutex_owned = true;
-
-    // 2) Legacy lockfile create (best-effort; not authoritative on Windows)
-    auto try_file_lock = [&]()->bool{
-        HANDLE hlf = CreateFileA(lock.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hlf == INVALID_HANDLE_VALUE) return false;
-        global::lockfile_handle = hlf;
+        global::lockfile_handle = h;
+#else
+        int fd = ::open(lock.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+        if (fd < 0) {
+            if (log_on_fail) log_error("Lock exists; another instance may be running.");
+            return false;
+        }
+        ::close(fd);
+#endif
         return true;
     };
 
-    if (!try_file_lock()){
-        // Diagnose & stale cleanup on Windows (legacy path)
-        const int other_pid = read_pidfile_int(pid);
-        const bool alive = process_alive(other_pid);
-        if (!alive){
-            log_warn("Stale legacy lockfile detected — removing and retrying…");
-            remove_stale_lock(lock, pid);
-            if (!try_file_lock()){
-                if (steal){
-                    log_warn("MIQ_STEAL_LOCK set — force-removing legacy lockfile again.");
-                    remove_stale_lock(lock, pid);
-                    if (!try_file_lock()){
-                        log_error("Failed to acquire legacy lockfile after forced removal.");
-                        return false;
-                    }
-                } else {
-                    log_error("Could not acquire legacy lockfile (non-fatal with mutex in place).");
-                }
-            }
-        } else {
-            log_warn("Legacy lockfile is present and owner appears alive.");
-        }
-    }
-
-#else
-    // POSIX path:
-    // 1) Create/open lockfile
-    int fd = ::open(lock.c_str(), O_CREAT | O_RDWR, 0644);
-    if (fd < 0){
-        log_error("Cannot open lockfile for locking.");
-        return false;
-    }
-
-    // 2) Take an advisory write lock with fcntl()
-    auto try_lock = [&](bool log_on_fail)->bool{
-        struct flock fl{};
-        fl.l_type   = F_WRLCK;
-        fl.l_whence = SEEK_SET;
-        fl.l_start  = 0;
-        fl.l_len    = 0; // whole file
-        if (fcntl(fd, F_SETLK, &fl) == 0){
-            global::lock_fd = fd;
-            return true;
-        } else {
-            if (log_on_fail) log_error("Lock is busy; another instance may be running.");
-            return false;
-        }
-    };
-
-    if (!try_lock(false)){
-        // Diagnose via pidfile (legacy)
+    // First attempt
+    if (!try_once(false)) {
+        // Diagnose
         const int other_pid = read_pidfile_int(pid);
         const bool alive = process_alive(other_pid);
         std::string diag = "Another instance appears to be running";
@@ -660,74 +521,50 @@ static bool acquire_datadir_lock(const std::string& datadir){
         if (!alive && other_pid > 0) diag += " — but it looks stale";
         log_warn(diag + ".");
 
-        // If stale, remove legacy files and retry fcntl()
-        if (!alive){
-            log_warn("Stale lock detected — removing legacy files and retrying fcntl lock…");
+        // If stale (pid absent or not alive) — clean up and retry
+        if (!alive) {
+            log_warn("Stale lock detected — removing and retrying…");
             remove_stale_lock(lock, pid);
-            // Need to reopen because path may have been deleted
-            ::close(fd);
-            fd = ::open(lock.c_str(), O_CREAT | O_RDWR, 0644);
-            if (fd >= 0 && try_lock(false)) goto POSIX_LOCK_OK;
+            if (try_once(false)) goto LOCK_OK;
         }
 
-        // Retry loop in case of race
+        // Retry loop (in case of race)
         for (int i=0; i<retries && !global::shutdown_requested.load(); ++i){
             std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-            if (try_lock(i+1==retries)) goto POSIX_LOCK_OK;
+            if (try_once(i+1==retries)) goto LOCK_OK;
         }
 
-        if (steal){
-            log_warn("MIQ_STEAL_LOCK set — attempting to steal by removing legacy files and retrying lock.");
+        // Optional fallback: steal lock if explicitly requested
+        if (steal) {
+            log_warn("MIQ_STEAL_LOCK set — forcibly removing existing lock.");
             remove_stale_lock(lock, pid);
-            ::close(fd);
-            fd = ::open(lock.c_str(), O_CREAT | O_RDWR, 0644);
-            if (fd >= 0 && try_lock(true)) goto POSIX_LOCK_OK;
+            if (!try_once(true)) {
+                log_error("Failed to acquire lock even after forced removal.");
+                return false;
+            }
+        } else {
+            log_error("Another instance appears to be running (lock exists). Set MIQ_STEAL_LOCK=1 to override.");
+            return false;
         }
-
-        log_error("Could not acquire lock (fcntl).");
-        if (fd >= 0) ::close(fd);
-        return false;
     }
 
-POSIX_LOCK_OK:
-    // keep fd open in global::lock_fd
-    (void)0;
-#endif
-
-    // Write PID file
+LOCK_OK:
 #ifdef _WIN32
     const int pidnum = (int)GetCurrentProcessId();
 #else
     const int pidnum = (int)getpid();
 #endif
     write_text_atomic(pid, std::to_string(pidnum) + "\n");
-
-    // Start lock sentry to keep files present and re-lock if needed
-    start_lock_sentry(datadir);
+    global::lockfile_path = lock;
+    global::pidfile_path  = pid;
     return true;
 }
-
 static void release_datadir_lock(){
-    // Stop sentry first (so it doesn't recreate files while we're trying to remove them)
-    stop_lock_sentry();
-
     std::error_code ec;
 #ifdef _WIN32
     if (global::lockfile_handle) {
         CloseHandle(global::lockfile_handle);
         global::lockfile_handle = nullptr;
-    }
-    if (global::instance_mutex){
-        if (global::instance_mutex_owned) ReleaseMutex(global::instance_mutex);
-        CloseHandle(global::instance_mutex);
-        global::instance_mutex = nullptr;
-        global::instance_mutex_owned = false;
-    }
-#else
-    if (global::lock_fd >= 0){
-        // Release advisory lock by closing FD
-        ::close(global::lock_fd);
-        global::lock_fd = -1;
     }
 #endif
     if (!global::pidfile_path.empty()) std::filesystem::remove(global::pidfile_path, ec);
@@ -1377,7 +1214,7 @@ public:
     void mark_step_fail(const std::string& title){ std::lock_guard<std::mutex> lk(mu_); ensure_step(title); failures_.insert(title); }
 
     // runtime refs
-    void set_runtime_refs(P2P* p2p, Chain* chain, Mempool* mempool) { p2p_ = p2p; chain_ = chain; mempool_ = mempool; }
+    void set_runtime_refs(P2P* p2p_ptr, Chain* chain_ptr, Mempool* mempool_ptr) { p2p_ = p2p_ptr; chain_ = chain_ptr; mempool_ = mempool_ptr; }
     void set_ports(uint16_t p2pport, uint16_t rpcport) { p2p_port_ = p2pport; rpc_port_ = rpcport; }
     void set_node_state(NodeState st){ std::lock_guard<std::mutex> lk(mu_); nstate_ = st; }
     void set_datadir(const std::string& d){ std::lock_guard<std::mutex> lk(mu_); datadir_ = d; }
@@ -1580,25 +1417,25 @@ private:
     }
 
     std::vector<std::string> render_table(const std::vector<std::string>& header,
-                                          const std::vector<std::vector<std::string>>& rows,
-                                          const std::vector<ColSpec>& cols,
+                                          const std::vector<std::vector<std::string>>& rows_in,
+                                          const std::vector<ColSpec>& colspec,
                                           int width, bool zebra=false){
         const int w = std::max(8, width);
         std::vector<std::string> out;
         const int inner = show_borders_ ? (w-2) : w;
-        int sumw=0; for (auto& c: cols) sumw += c.w;
-        const int gaps = (int)cols.size()-1;
+        int sumw=0; for (auto& c: colspec) sumw += c.w;
+        const int gaps = (int)colspec.size()-1;
         const int padExtra = std::max(0, inner - sumw - gaps);
-        std::vector<int> cw; cw.reserve(cols.size());
-        for (size_t i=0;i<cols.size();++i){
-            const int add = (i+1==cols.size())? padExtra : 0;
-            cw.push_back(cols[i].w + add);
+        std::vector<int> cw; cw.reserve(colspec.size());
+        for (size_t i=0;i<colspec.size();++i){
+            const int add = (i+1==colspec.size())? padExtra : 0;
+            cw.push_back(colspec[i].w + add);
         }
         auto line_from_cells = [&](const std::vector<std::string>& cells)->std::string{
             std::ostringstream o;
             if (show_borders_) o << u8"│";
             for (size_t i=0;i<cells.size() && i<cw.size(); ++i){
-                const bool right = cols[i].right;
+                const bool right = colspec[i].right;
                 const std::string& cell = cells[i];
                 std::string t = truncate_to_width(cell, cw[i]);
                 const int pad = cw[i] - (int)display_width(t);
@@ -1624,8 +1461,8 @@ private:
             if (show_borders_) u<<u8"│";
             out.push_back(pad_right_ansi(u.str(), w));
         }
-        for (size_t r=0; r<rows.size(); ++r){
-            std::string ln = line_from_cells(rows[r]);
+        for (size_t r=0; r<rows_in.size(); ++r){
+            std::string ln = line_from_cells(rows_in[r]);
             if (zebra && (r%2)==1) ln = std::string(C_dim()) + ln + C_reset();
             out.push_back(ln);
         }
@@ -1744,10 +1581,10 @@ private:
 
     void snapshot_to_disk(){
         if (datadir_.empty()) return;
-        int cols, rows; term::get_winsize(cols, rows);
+        int scols, srows; term::get_winsize(scols, srows);
         std::ostringstream out;
         out << "MIQROCHAIN Ultra TUI snapshot ("<< now_s() <<")\n";
-        out << "Screen: " << cols << "x" << rows << "\n\n";
+        out << "Screen: " << scols << "x" << srows << "\n\n";
         out << "[System]\n";
         out << "uptime=" << uptime_s_ << "s  rss=" << get_rss_bytes() << " bytes\n";
         out << "[Chain]\n";
@@ -1773,21 +1610,21 @@ private:
     // ── One frame render ─────────────────────────────────────────────────────
     void draw_once(bool first){
         std::lock_guard<std::mutex> lk(mu_);
-        int cols, rows; term::get_winsize(cols, rows);
+        int cols_term, rows_term; term::get_winsize(cols_term, rows_term);
         if (layout_locked_) {
-            if (locked_cols_ == 0) { locked_cols_ = cols; locked_rows_ = rows; }
-            cols = locked_cols_; rows = locked_rows_;
+            if (locked_cols_ == 0) { locked_cols_ = cols_term; locked_rows_ = rows_term; }
+            cols_term = locked_cols_; rows_term = locked_rows_;
         } else {
             locked_cols_ = locked_rows_ = 0;
         }
         // normalize minimums + symmetry
-        if (cols < 116) cols = 116;
-        if (rows < 36) rows = 36;
-        if (cols & 1) ++cols;
+        if (cols_term < 116) cols_term = 116;
+        if (rows_term < 36) rows_term = 36;
+        if (cols_term & 1) ++cols_term;
 
         const int gutter = 1;
-        const int rightw = compact_ ? std::max(46, cols/3) : std::max(54, cols / 3);
-        const int leftw  = cols - rightw - gutter;
+        const int rightw = compact_ ? std::max(46, cols_term/3) : std::max(54, cols_term / 3);
+        const int leftw  = cols_term - rightw - gutter;
 
         std::vector<std::string> left, right;
 
@@ -1910,13 +1747,13 @@ private:
                 top.push_back(std::string("trend: ") + spark_ascii(net_spark_));
             }
             auto head = std::vector<std::string>{"Hgt","Txs","Fees","Hash","Miner"};
-            std::vector<ColSpec> colspec = { {8,true},{6,true},{10,true},{12,false},{20,false} };
-            std::vector<std::vector<std::string>> rowsv;
+            std::vector<ColSpec> colspec_chain = { {8,true},{6,true},{10,true},{12,false},{20,false} };
+            std::vector<std::vector<std::string>> rows_chain;
             const size_t N = recent_blocks_.size();
             const size_t show = std::min<size_t>(compact_?6:8, N);
             for (size_t i=0;i<show;i++){
                 const auto& b = recent_blocks_[N-1-i];
-                rowsv.push_back({
+                rows_chain.push_back({
                     std::to_string(b.height),
                     b.tx_count ? std::to_string(b.tx_count) : std::string("?"),
                     b.fees_known ? commas_u64(b.fees) : std::string("?"),
@@ -1927,7 +1764,7 @@ private:
             auto chain_box = render_box("Chain", top, leftw);
             left.insert(left.end(), chain_box.begin(), chain_box.end());
             if (show > 0){
-                auto tbl = render_table(head, rowsv, colspec, leftw, /*zebra=*/true);
+                auto tbl = render_table(head, rows_chain, colspec_chain, leftw, /*zebra=*/true);
                 left.insert(left.end(), tbl.begin(), tbl.end());
             }
         }
@@ -1960,13 +1797,13 @@ private:
 
             // Table
             std::vector<std::string> head = {"IP","ok","last(ms)","rx","inflight"};
-            std::vector<ColSpec> cols = { {18,false},{4,false},{9,true},{7,true},{8,true} };
-            std::vector<std::vector<std::string>> rows;
+            std::vector<ColSpec> colspec_peers = { {18,false},{4,false},{9,true},{7,true},{8,true} };
+            std::vector<std::vector<std::string>> rows_peers;
             const size_t showp = std::min(peers.size(), (size_t)(compact_?6:8));
             for (size_t i=0;i<showp; ++i) {
                 const auto& s = peers[i];
                 std::string ip = s.ip; if ((int)display_width(ip) > 18) ip = pad_right_ansi(ip.substr(0,15) + "...", 18);
-                rows.push_back({
+                rows_peers.push_back({
                     ip,
                     s.verack_ok ? (std::string(C_ok()) + "ok" + C_reset()) : (std::string(C_warn()) + ".." + C_reset()),
                     std::to_string((uint64_t)s.last_seen_ms),
@@ -1974,7 +1811,7 @@ private:
                     std::to_string((uint64_t)s.inflight)
                 });
             }
-            auto tbl = render_table(head, rows, cols, rightw, /*zebra=*/true);
+            auto tbl = render_table(head, rows_peers, colspec_peers, rightw, /*zebra=*/true);
             right.insert(right.end(), tbl.begin(), tbl.end());
         }
 
@@ -2029,11 +1866,11 @@ private:
             size_t window=0;
             auto top = top_miners(compact_?4:8, window);
             std::vector<std::string> head = {"addr(short)","blocks","share"};
-            std::vector<ColSpec> cols = { {18,false},{7,true},{7,true} };
-            std::vector<std::vector<std::string>> rows;
+            std::vector<ColSpec> colspec_miners = { {18,false},{7,true},{7,true} };
+            std::vector<std::vector<std::string>> rows_miners;
             for (auto& [addr, cnt] : top){
                 const double pct = window? (100.0 * (double)cnt / (double)window) : 0.0;
-                rows.push_back({
+                rows_miners.push_back({
                     fit(addr, 18),
                     std::to_string(cnt),
                     fmt_pct(pct, 2)
@@ -2048,8 +1885,8 @@ private:
             }
             auto hdr = render_box("Miners (observed)", info, rightw);
             right.insert(right.end(), hdr.begin(), hdr.end());
-            if (!rows.empty()){
-                auto tbl = render_table(head, rows, cols, rightw, /*zebra=*/true);
+            if (!rows_miners.empty()){
+                auto tbl = render_table(head, rows_miners, colspec_miners, rightw, /*zebra=*/true);
                 right.insert(right.end(), tbl.begin(), tbl.end());
             }
         }
@@ -2089,25 +1926,25 @@ private:
         }
 
         // Footer + logs/help
-        out << pad_right_ansi(repeat_u8(u8"─", cols), cols) << "\n";
+        out << pad_right_ansi(repeat_u8(u8"─", cols_term), cols_term) << "\n";
         if (show_help_) {
             std::string help = std::string(C_bold()) + "Help" + C_reset() + "  "
                 "q=quit  t=theme  h=contrast  p=pause logs  r=reload config  s=snapshot  v=verbose  "
                 "?=help  c=compact  g=glow  b=borders  w=wave  l=lock layout  u=units";
-            out << pad_right_ansi(help, cols) << "\n";
+            out << pad_right_ansi(help, cols_term) << "\n";
         } else if (nstate_ == NodeState::Quitting){
             std::string s1 = std::string(C_bold()) + "Shutting down" + C_reset() + "  " + C_dim() + "(Ctrl+C again = force)" + C_reset();
-            out << pad_right_ansi(s1, cols) << "\n";
+            out << pad_right_ansi(s1, cols_term) << "\n";
             const std::string phase = shutdown_phase_.empty() ? u8"initiating…" : shutdown_phase_;
-            out << pad_right_ansi(std::string("  phase: ") + phase, cols) << "\n";
+            out << pad_right_ansi(std::string("  phase: ") + phase, cols_term) << "\n";
         } else {
             std::string h = std::string(C_bold()) + "Logs" + C_reset() + "  " + C_dim() + "(q,t,h,p,r,s,v,?,c,g,b,w,l,u)" + C_reset();
-            out << pad_right_ansi(h, cols) << "\n";
+            out << pad_right_ansi(h, cols_term) << "\n";
         }
 
         // logs (timestamped, ANSI-aware)
         const int header_rows = (int)N + 2;
-        int remain = rows - header_rows - 3;
+        int remain = rows_term - header_rows - 3;
         if (remain < 8) remain = 8;
         int start = (int)logs_.size() - remain;
         if (start < 0) start = 0;
@@ -2117,11 +1954,11 @@ private:
             std::ostringstream pref; pref<<std::fixed<<std::setprecision(3)<<std::setw(8)<<dt<<"s ";
             const std::string txt = pref.str() + line.txt;
             switch(line.level){
-                case 2: out << pad_right_ansi(std::string(C_err())  + txt + C_reset(), cols) << "\n"; break;
-                case 1: out << pad_right_ansi(std::string(C_warn()) + txt + C_reset(), cols) << "\n"; break;
-                case 3: out << pad_right_ansi(std::string(C_dim())  + txt + C_reset(), cols) << "\n"; break;
-                case 4: out << pad_right_ansi(std::string(C_ok())   + txt + C_reset(), cols) << "\n"; break;
-                default: out << pad_right_ansi(txt, cols) << "\n"; break;
+                case 2: out << pad_right_ansi(std::string(C_err())  + txt + C_reset(), cols_term) << "\n"; break;
+                case 1: out << pad_right_ansi(std::string(C_warn()) + txt + C_reset(), cols_term) << "\n"; break;
+                case 3: out << pad_right_ansi(std::string(C_dim())  + txt + C_reset(), cols_term) << "\n"; break;
+                case 4: out << pad_right_ansi(std::string(C_ok())   + txt + C_reset(), cols_term) << "\n"; break;
+                default: out << pad_right_ansi(txt, cols_term) << "\n"; break;
             }
         }
         const int printed = (int)logs_.size() - start;
@@ -2145,8 +1982,8 @@ private:
     std::string datadir_;
     uint16_t p2p_port_{P2P_PORT};
     uint16_t rpc_port_{RPC_PORT};
-    P2P*   p2p   {nullptr};
-    Chain* chain {nullptr};
+    P2P*   p2p_   {nullptr};
+    Chain* chain_ {nullptr};
     Mempool* mempool_{nullptr};
     ConsoleWriter cw_;
     int  tick_{0};
@@ -2396,8 +2233,6 @@ int main(int argc, char** argv){
     std::signal(SIGHUP,  sighup_handler);
 #else
     SetConsoleCtrlHandler(win_ctrl_handler, TRUE);
-    // If we crash/hang, ask Windows to auto-restart us (no arguments)
-    RegisterApplicationRestart(L"", 0);
 #endif
     std::set_terminate(&fatal_terminate);
 
@@ -2510,13 +2345,10 @@ int main(int argc, char** argv){
         if(cfg.datadir.empty()) cfg.datadir = default_datadir();
         std::error_code ec;
         std::filesystem::create_directories(cfg.datadir, ec);
-
-        // Acquire robust single-instance lock (+ legacy files) — bulletproof
         if(!acquire_datadir_lock(cfg.datadir)){
             if (can_tui) { capture.stop(); tui.stop(); }
             return 11;
         }
-
         // telemetry & status file paths
         global::telemetry_path = p_join(cfg.datadir, "telemetry.ndjson");
         global::telemetry_enabled.store(telemetry_flag);
