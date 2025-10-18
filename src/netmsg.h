@@ -6,14 +6,14 @@
 
 #ifdef __has_include
 #  if __has_include("constants.h")
-#    include "constants.h"
+#    include "constants.h"   // for MAGIC_BE (wire magic) if present
 #  endif
 #endif
 
-// TEMP: while the network upgrades, send legacy frames by default.
-// Flip to 0 later to enforce the new header (magic+checksum) on the wire.
+// Prefer modern framed messages on the wire by default.
+// Set to 1 only if you MUST speak legacy to very old peers.
 #ifndef MIQ_WIRE_LEGACY_SEND
-#define MIQ_WIRE_LEGACY_SEND 1
+#define MIQ_WIRE_LEGACY_SEND 0
 #endif
 
 #ifndef MAX_MSG_SIZE
@@ -30,7 +30,7 @@ struct NetMsg {
     std::vector<uint8_t> payload;
 };
 
-// Implemented in netmsg.cpp
+// Implemented in netmsg.cpp (if you use it in the node).
 // If MIQ_WIRE_LEGACY_SEND==0, encodes NEW:
 //   [ magic(4) | cmd(12) | len(4-le) | checksum(4) | payload ]
 // If MIQ_WIRE_LEGACY_SEND==1, encodes LEGACY:
@@ -38,15 +38,14 @@ struct NetMsg {
 std::vector<uint8_t> encode_msg(const std::string& cmd,
                                 const std::vector<uint8_t>& payload);
 
-// Convenience inline so calls like encode_msg("version", {}) work without
-// needing a separate TU definition (avoids LNK/ODR issues).
+// Convenience inline overload
 inline std::vector<uint8_t> encode_msg(const char* cmd,
                                        const std::vector<uint8_t>& payload) {
     return encode_msg(cmd ? std::string(cmd) : std::string(), payload);
 }
 
 // Decode one full message starting at/after 'off' inside 'buf'.
-// Accepts BOTH new framed messages (with magic+checksum) and the legacy format
+// Accepts BOTH modern frames (with magic+checksum) and the legacy format
 // (no magic/checksum) for backward compatibility.
 // On success: fills 'out', advances 'off' to first byte after the message, and returns true.
 // On need-more-bytes: returns false without changing 'off'.
