@@ -680,10 +680,13 @@ std::string RpcService::handle(const std::string& body){
         if(method=="gettipinfo"){
             auto tip = chain_.tip();
             std::map<std::string,JNode> o;
-            JNode h;  h.v  = (double)tip.height;               o["height"] = h;
-            JNode b;  b.v  = (double)tip.bits;                 o["bits"]   = b;
-            JNode t;  t.v  = (double)tip.time;                 o["time"]   = t;
-            JNode hh; hh.v = std::string(to_hex(tip.hash));    o["hash"]   = hh;
+            o["height"] = jnum((double)tip.height);
+            // Harden: canonical hex bits + numeric mirror
+            char bhex[9]; std::snprintf(bhex, sizeof(bhex), "%08x", tip.bits);
+            o["bits"]     = jstr(std::string(bhex));   // canonical
+            o["bits_u32"] = jnum((double)tip.bits);    // mirror (legacy)
+            o["time"]     = jnum((double)tip.time);
+            o["hash"]     = jstr(to_hex(tip.hash));
             JNode out; out.v = o; return json_dump(out);
         }
 
@@ -775,9 +778,17 @@ std::string RpcService::handle(const std::string& body){
             std::map<std::string, JNode> o;
             o["version"]        = jnum(1.0);
             o["prev_hash"]      = jstr(to_hex(tip.hash));
-            o["bits"]           = jnum((double)next_bits);           // *** miners MUST use this ***
-            o["tip_bits"]       = jnum((double)tip.bits);            // for display/diagnostics
-            o["mintime"]        = jnum((double)mintime);             // *** enforce time >= mintime ***
+
+            // Harden: canonical hex bits + numeric mirrors for both next and tip bits
+            char nb[9], tb[9];
+            std::snprintf(nb, sizeof(nb), "%08x", next_bits);
+            std::snprintf(tb, sizeof(tb), "%08x", tip.bits);
+            o["bits"]           = jstr(std::string(nb));           // canonical for miners
+            o["bits_u32"]       = jnum((double)next_bits);         // mirror (legacy)
+            o["tip_bits"]       = jstr(std::string(tb));           // diagnostics (canonical)
+            o["tip_bits_u32"]   = jnum((double)tip.bits);          // diagnostics mirror
+
+            o["mintime"]        = jnum((double)mintime);           // *** enforce time >= mintime ***
             o["time"]           = jnum((double)std::max<int64_t>(static_cast<int64_t>(time(nullptr)), mintime));
             o["height"]         = jnum((double)(tip.height + 1));
             o["coinbase_pkh"]   = jstr(to_hex(pkh));
