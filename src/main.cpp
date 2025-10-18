@@ -1835,7 +1835,7 @@ private:
                 top.push_back(std::string("trend: ") + spark_ascii(net_spark_));
             }
             auto head = std::vector<std::string>{"Hgt","Txs","Fees","Hash","Miner"};
-            std::vector<ColSpec> colspec_chain = { {8,true},{6,true},{10,true},{12,false},{20,false} };
+            std::vector<term::ColSpec> colspec_chain = { {8,true},{6,true},{10,true},{12,false},{20,false} };
             std::vector<std::vector<std::string>> rows_chain;
             const size_t N = recent_blocks_.size();
             const size_t show = std::min<size_t>(compact_?6:8, N);
@@ -1885,7 +1885,7 @@ private:
 
             // Table
             std::vector<std::string> head = {"IP","ok","last(ms)","rx","inflight"};
-            std::vector<ColSpec> colspec_peers = { {18,false},{4,false},{9,true},{7,true},{8,true} };
+            std::vector<term::ColSpec> colspec_peers = { {18,false},{4,false},{9,true},{7,true},{8,true} };
             std::vector<std::vector<std::string>> rows_peers;
             const size_t showp = std::min(peers.size(), (size_t)(compact_?6:8));
             for (size_t i=0;i<showp; ++i) {
@@ -1954,7 +1954,7 @@ private:
             size_t window=0;
             auto top = top_miners(compact_?4:8, window);
             std::vector<std::string> head = {"addr(short)","blocks","share"};
-            std::vector<ColSpec> colspec_miners = { {18,false},{7,true},{7,true} };
+            std::vector<term::ColSpec> colspec_miners = { {18,false},{7,true},{7,true} };
             std::vector<std::vector<std::string>> rows_miners;
             for (auto& [addr, cnt] : top){
                 const double pct = window? (100.0 * (double)cnt / (double)window) : 0.0;
