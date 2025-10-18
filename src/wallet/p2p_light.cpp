@@ -43,7 +43,7 @@
 #define MIQ_LIGHT_MAX_MSG_SIZE (MAX_MSG_SIZE)
 #endif
 
-// extra safety: verify header checksums on receive
+// extra safety: verify header checksums on receive (when present)
 #ifndef MIQ_LIGHT_VERIFY_CSUM
 #define MIQ_LIGHT_VERIFY_CSUM 1
 #endif
@@ -84,6 +84,8 @@
 #endif
 
 namespace miq {
+
+static constexpr uint32_t CSUM_NONE = 0xFFFFFFFFu; // sentinel: legacy header (no checksum)
 
 // tiny env helpers
 static bool env_truthy(const char* name){
@@ -475,7 +477,7 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     }
 #endif
 
-    // Version/verack handshake (with fallback)
+    // Version/verack handshake (with tolerance + fallback)
     if(!send_version(err))      { close(); return false; }
 
     if (o_.send_verack) {
@@ -484,7 +486,7 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     }
 
     if(!read_until_verack(err)) {
-        // Fallback path: some nodes accept empty "version" first; try once.
+        // Fallback path: try once with an empty "version" for quirky peers.
         std::vector<uint8_t> empty;
         std::string e2;
         (void)send_msg("version", empty, e2);
@@ -566,7 +568,6 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
             const auto& prev = header_hashes_le_.back();
             const auto& now  = batch.back();
             if (prev.size()==32 && now.size()==32 && std::equal(prev.begin(), prev.end(), now.begin())) {
-                // no progress -> stop here
                 break;
             }
         }
@@ -602,7 +603,6 @@ bool P2PLight::request_headers_from_locator(
     // our node expects: [u8 count] [32*count hashes (LE)] [32 stop hash]
     uint8_t n = (uint8_t)std::min<size_t>(locator_hashes_le.size(), 255);
     if (n == 0) {
-        // if none provided, send just the all-zero genesis stop as a locator of size 1
         n = 1;
     }
 
@@ -611,7 +611,6 @@ bool P2PLight::request_headers_from_locator(
     payload.push_back(n);
 
     if (locator_hashes_le.empty()) {
-        // push one zero hash as a minimal locator
         payload.insert(payload.end(), 32, 0x00);
     } else {
         for (size_t i = 0; i < n; ++i) {
@@ -621,7 +620,6 @@ bool P2PLight::request_headers_from_locator(
         }
     }
 
-    // stop hash (32 bytes; zero means "no stop")
     if (stop_le.size() != 32) {
         stop_le.assign(32, 0x00);
     }
@@ -635,17 +633,18 @@ bool P2PLight::request_headers_from_locator(
 bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_le, std::string& err){
     out_hashes_le.clear();
     for(;;){
-        std::string cmd; uint32_t len=0, csum=0;
+        std::string cmd; uint32_t len=0, csum=CSUM_NONE;
         if(!read_msg_header(cmd, len, csum, err)) return false;
 
-        // hard cap to avoid huge allocations/DoS
         if (len > MIQ_LIGHT_MAX_MSG_SIZE) { err = "frame too large"; return false; }
 
         std::vector<uint8_t> payload(len);
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
 
 #if MIQ_LIGHT_VERIFY_CSUM
-        if (checksum4(payload) != csum) { err = "bad checksum"; return false; }
+        if (csum != CSUM_NONE) {
+            if (checksum4(payload) != csum) { err = "bad checksum"; return false; }
+        }
 #endif
 
         if(cmd == "ping"){
@@ -658,7 +657,6 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
 
         if(cmd == "addr"){
 #if MIQ_ENABLE_ADDRMAN
-            // payload: 4*N IPv4s (daemon compact form)
             if (!payload.empty() && (payload.size() % 4) == 0){
                 size_t n = payload.size()/4;
                 int added = 0;
@@ -692,7 +690,6 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
         }
 
         if(cmd != "headers"){
-            // unrelated message during headers phase; ignore
             continue;
         }
 
@@ -702,7 +699,7 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
         if (payload.size() >= 2) {
             uint16_t count = (uint16_t)payload[0] | ((uint16_t)payload[1]<<8);
 
-            // exact 2 + 80*N (legacy) support (some very old test peers)
+            // exact 2 + 80*N (legacy) support
             size_t need80 = 2 + (size_t)count * 80;
             if (payload.size() == need80) {
                 out_hashes_le.reserve(count);
@@ -721,7 +718,6 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
                 out_hashes_le.reserve(count);
                 const uint8_t* p = payload.data() + 2;
                 for (uint16_t i=0;i<count;i++){
-                    // **IMPORTANT**: your node hashes the full 88 bytes (time i64 + nonce u64)
                     auto h = dsha256_bytes(p, 88);
                     out_hashes_le.push_back(std::move(h));
                     p += 88;
@@ -730,11 +726,11 @@ bool P2PLight::read_headers_batch(std::vector<std::vector<uint8_t>>& out_hashes_
             }
         }
 
-        // (B) Bitcoin headers: varint count; for each: 80 byte header + varint(0) for txn count
+        // (B) Bitcoin headers: varint count; for each: 80 byte header + varint(0)
         if (!payload.empty()){
             uint64_t count=0; size_t used=0;
             if (get_varint(payload.data(), payload.size(), count, used)){
-                size_t need = used + (size_t)count*(80 + 1); // each header + txcount=0 (varint)
+                size_t need = used + (size_t)count*(80 + 1); // each header + txcount=0
                 if (payload.size() >= need){
                     out_hashes_le.reserve((size_t)count);
                     const uint8_t* p = payload.data() + used;
@@ -797,17 +793,18 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
 
     // read messages until we get "block"
     for(;;){
-        std::string cmd; uint32_t len=0, csum=0;
+        std::string cmd; uint32_t len=0, csum=CSUM_NONE;
         if(!read_msg_header(cmd, len, csum, err)) return false;
 
-        // cap again in this loop
         if (len > MIQ_LIGHT_MAX_MSG_SIZE) { err = "frame too large"; return false; }
 
         std::vector<uint8_t> payload(len);
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
 
 #if MIQ_LIGHT_VERIFY_CSUM
-        if (checksum4(payload) != csum) { err = "bad checksum"; return false; }
+        if (csum != CSUM_NONE) {
+            if (checksum4(payload) != csum) { err = "bad checksum"; return false; }
+        }
 #endif
 
         if(cmd=="ping"){
@@ -851,7 +848,6 @@ bool P2PLight::get_block_by_hash(const std::vector<uint8_t>& hash_le,
             continue;
         }
         if(cmd=="block"){
-            // pacing: avoid tight loops when peers stream responses quickly
             static uint32_t s_cnt = 0;
             if((++s_cnt % 64) == 0){
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -918,17 +914,18 @@ bool P2PLight::send_version(std::string& err){
 bool P2PLight::read_until_verack(std::string& err){
     // Read a few messages, stop when we see verack.
     for (int i=0;i<50;i++){
-        std::string cmd; uint32_t len=0, csum=0;
+        std::string cmd; uint32_t len=0, csum=CSUM_NONE;
         if(!read_msg_header(cmd, len, csum, err)) return false;
 
-        // cap to avoid allocating attacker-chosen size during handshake
         if (len > MIQ_LIGHT_MAX_MSG_SIZE) { err = "frame too large"; return false; }
 
         std::vector<uint8_t> payload(len);
         if(len>0 && !read_exact(payload.data(), len, err)) return false;
 
 #if MIQ_LIGHT_VERIFY_CSUM
-        if (checksum4(payload) != csum) { err = "bad checksum"; return false; }
+        if (csum != CSUM_NONE) {
+            if (checksum4(payload) != csum) { err = "bad checksum"; return false; }
+        }
 #endif
 
         if(cmd=="verack") return true;
@@ -986,6 +983,8 @@ bool P2PLight::send_getaddr(std::string& err){
     return send_msg("getaddr", empty, err);
 }
 
+// ----- Wire I/O (send/recv): tolerate legacy, prefer modern on send -----------
+
 bool P2PLight::send_msg(const char cmd12[12], const std::vector<uint8_t>& payload, std::string& err){
 #ifdef _WIN32
     if (sock_ == (uintptr_t)-1) { err = "not connected"; return false; }
@@ -993,6 +992,20 @@ bool P2PLight::send_msg(const char cmd12[12], const std::vector<uint8_t>& payloa
     if (sock_ < 0) { err = "not connected"; return false; }
 #endif
 
+#if MIQ_WIRE_LEGACY_SEND
+    // LEGACY: [ cmd(12) | len(4 le) | payload ]
+    uint8_t hdr[16]{};
+    // command (null-padded to 12)
+    for (int i=0;i<12 && cmd12[i]; ++i) hdr[i] = (uint8_t)cmd12[i];
+    // length
+    uint32_t L = (uint32_t)payload.size();
+    hdr[12]=uint8_t(L); hdr[13]=uint8_t(L>>8); hdr[14]=uint8_t(L>>16); hdr[15]=uint8_t(L>>24);
+
+    if(!write_all(hdr, sizeof(hdr), err)) return false;
+    if(L>0 && !write_all(payload.data(), L, err)) return false;
+    return true;
+#else
+    // MODERN: [ magic(4) | cmd(12) | len(4 le) | checksum(4) | payload ]
     uint8_t header[24]{};
     // MAGIC: write canonical big-endian wire bytes
     header[0] = miq::MAGIC_BE[0];
@@ -1011,26 +1024,52 @@ bool P2PLight::send_msg(const char cmd12[12], const std::vector<uint8_t>& payloa
     uint32_t c = checksum4(payload);
     header[20]=uint8_t(c); header[21]=uint8_t(c>>8); header[22]=uint8_t(c>>16); header[23]=uint8_t(c>>24);
 
-    // robust send (loop on partial)
     if(!write_all(header, sizeof(header), err)) return false;
     if(L>0 && !write_all(payload.data(), L, err)) return false;
     return true;
+#endif
 }
 
+// Accept BOTH modern (MAGIC+cmd+len+csum) and legacy (cmd+len) headers.
+// On legacy, csum_out is set to CSUM_NONE to signal "no checksum present".
 bool P2PLight::read_msg_header(std::string& cmd_out, uint32_t& len_out, uint32_t& csum_out, std::string& err){
-    uint8_t h[24];
-    if(!read_exact(h, 24, err)) return false;
+    // Peek first 4 bytes to check magic or start of legacy cmd.
+    uint8_t pfx[4];
+    if(!read_exact(pfx, 4, err)) return false;
 
-    // MAGIC: compare exactly to canonical big-endian wire bytes
-    if (std::memcmp(h, miq::MAGIC_BE, 4) != 0) { err = "bad magic"; return false; }
+    auto read_u32_le = [](const uint8_t* b)->uint32_t {
+        return (uint32_t)b[0] | ((uint32_t)b[1]<<8) | ((uint32_t)b[2]<<16) | ((uint32_t)b[3]<<24);
+    };
 
-    char cmd[13]; std::memset(cmd, 0, sizeof(cmd));
-    std::memcpy(cmd, h+4, 12);
-    cmd_out = std::string(cmd);
+    if (std::memcmp(pfx, miq::MAGIC_BE, 4) == 0) {
+        // MODERN: read the rest (cmd[12] + len[4] + csum[4])
+        uint8_t rest[20];
+        if (!read_exact(rest, 20, err)) return false;
 
-    len_out  = (uint32_t)h[16] | ((uint32_t)h[17]<<8) | ((uint32_t)h[18]<<16) | ((uint32_t)h[19]<<24);
-    csum_out = (uint32_t)h[20] | ((uint32_t)h[21]<<8) | ((uint32_t)h[22]<<16) | ((uint32_t)h[23]<<24);
-    return true;
+        char cmd[13]; std::memset(cmd, 0, sizeof(cmd));
+        std::memcpy(cmd, rest, 12);
+        cmd_out = std::string(cmd);
+
+        len_out  = read_u32_le(rest + 12);
+        csum_out = read_u32_le(rest + 16);
+        return true;
+    } else {
+        // LEGACY: we already consumed 4 bytes of the 12-byte cmd.
+        uint8_t rest[12];
+        if (!read_exact(rest, 12, err)) return false;
+
+        uint8_t cmd12[12]{};
+        std::memcpy(cmd12, pfx, 4);
+        std::memcpy(cmd12 + 4, rest, 8);
+
+        char cmd[13]; std::memset(cmd, 0, sizeof(cmd));
+        std::memcpy(cmd, cmd12, 12);
+        cmd_out = std::string(cmd);
+
+        len_out  = read_u32_le(rest + 8);
+        csum_out = CSUM_NONE; // no checksum field in legacy header
+        return true;
+    }
 }
 
 bool P2PLight::read_exact(void* buf, size_t len, std::string& err){
