@@ -1,6 +1,6 @@
 // src/main.cpp — MIQ core entrypoint with ultra-dynamic Pro TUI (single file, no deps)
 // Hardened startup, auto-UTXO reindex, professional logs, miner health badges,
-// smooth 120Hz animations (VT-aware), Windows-friendly.
+// smooth 120Hz animations (VT-aware), Windows-friendly, safe X-close shutdown.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Build-time UTF-8 hints for MSVC
@@ -77,7 +77,7 @@
 #define MIQ_VERSION_MAJOR 0
 #endif
 #ifndef MIQ_VERSION_MINOR
-#define MIQ_VERSION_MINOR 3
+#define MIQ_VERSION_MINOR 4
 #endif
 #ifndef MIQ_VERSION_PATCH
 #define MIQ_VERSION_PATCH 0
@@ -117,21 +117,43 @@ using namespace miq;
 // ║                          Global shutdown & helpers                        ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 static std::atomic<bool> g_shutdown_requested{false};
+static std::atomic<bool> g_shutdown_initiated{false};
+static std::atomic<uint64_t> g_last_signal_ms{0};
+
 static inline uint64_t now_ms(){
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+static void request_shutdown(const char* why){
+    bool first = !g_shutdown_initiated.exchange(true);
+    g_shutdown_requested.store(true);
+    if (first) {
+        log_warn(std::string("Shutdown requested: ") + (why ? why : "signal"));
+    } else {
+        // Double-tap within 2 seconds: force exit
+        uint64_t t = now_ms(), last = g_last_signal_ms.load();
+        if (last && (t - last) < 2000) {
+            log_error("Forced immediate termination (double signal).");
+#ifdef _WIN32
+            TerminateProcess(GetCurrentProcess(), 1);
+#else
+            _exit(1);
+#endif
+        }
+    }
+    g_last_signal_ms.store(now_ms());
+}
+
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║                          Miner stats (for TUI)                            ║
-// ╚═══════════════════════════════════════════════════════════════════════════╝
 struct MinerStats {
     std::atomic<bool> active{false};
     std::atomic<unsigned> threads{0};
     std::atomic<uint64_t> accepted{0};
     std::atomic<uint64_t> rejected{0};
-    std::atomic<uint64_t> last_height_ok{0}; // last height we mined & accepted
-    std::atomic<uint64_t> last_height_rx{0}; // last network accept observed
+    std::atomic<uint64_t> last_height_ok{0};
+    std::atomic<uint64_t> last_height_rx{0};
     std::chrono::steady_clock::time_point start{};
     std::atomic<double>   hps{0.0};
 } g_miner_stats;
@@ -148,8 +170,8 @@ struct BlockSummary {
 };
 struct Telemetry {
     std::mutex mu;
-    std::deque<BlockSummary> new_blocks;      // fifo of new accepted blocks
-    std::deque<std::string>  new_txids;       // fifo of txids from accepted blocks
+    std::deque<BlockSummary> new_blocks;
+    std::deque<std::string>  new_txids;
     void push_block(const BlockSummary& b) {
         std::lock_guard<std::mutex> lk(mu);
         new_blocks.push_back(b);
@@ -170,6 +192,50 @@ struct Telemetry {
         new_txids.clear();
     }
 } g_telemetry;
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                   Optional external miner heartbeat watch                 ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+struct ExtMinerWatch {
+    std::atomic<bool> alive{false};
+    std::atomic<bool> running{false};
+    std::thread thr;
+    std::string path;
+
+    static std::string default_path(const std::string& datadir){
+#ifdef _WIN32
+        return datadir + "\\miner.heartbeat";
+#else
+        return datadir + "/miner.heartbeat";
+#endif
+    }
+    void start(const std::string& datadir){
+        const char* p = std::getenv("MIQ_MINER_HEARTBEAT");
+        path = p && *p ? std::string(p) : default_path(datadir);
+        running.store(true);
+        thr = std::thread([this]{
+            using namespace std::chrono_literals;
+            while(running.load()){
+                std::error_code ec;
+                auto ft = std::filesystem::last_write_time(path, ec);
+                bool ok = false;
+                if (!ec){
+                    auto now = std::filesystem::file_time_type::clock::now();
+                    auto diff = now - ft;
+                    auto secs = std::chrono::duration_cast<std::chrono::seconds>(diff).count();
+                    ok = (secs >= 0 && secs <= 15);
+                }
+                alive.store(ok);
+                std::this_thread::sleep_for(1s);
+            }
+        });
+    }
+    void stop(){
+        running.store(false);
+        if (thr.joinable()) thr.join();
+        alive.store(false);
+    }
+} g_extminer;
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║                         Default data-dir resolution                        ║
@@ -212,7 +278,21 @@ static bool read_file_all(const std::string& path, std::vector<uint8_t>& out){
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-static void handle_signal(int){ g_shutdown_requested.store(true); }
+// ║                        Signal / Console control hooks                      ║
+static void handle_signal_posix(int){ request_shutdown("signal"); }
+
+#ifdef _WIN32
+static BOOL WINAPI win_ctrl_handler(DWORD evt){
+    switch(evt){
+        case CTRL_C_EVENT:        request_shutdown("CTRL_C_EVENT");        return TRUE;
+        case CTRL_BREAK_EVENT:    request_shutdown("CTRL_BREAK_EVENT");    return TRUE;
+        case CTRL_CLOSE_EVENT:    request_shutdown("CTRL_CLOSE_EVENT");    return TRUE; // X button
+        case CTRL_LOGOFF_EVENT:   request_shutdown("CTRL_LOGOFF_EVENT");   return TRUE;
+        case CTRL_SHUTDOWN_EVENT: request_shutdown("CTRL_SHUTDOWN_EVENT"); return TRUE;
+        default: return FALSE;
+    }
+}
+#endif
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║                           Reindex helper (guarded)                         ║
@@ -233,8 +313,6 @@ static bool ensure_utxo_fully_indexed(Chain& chain, const std::string& datadir, 
     bool need = force || !dir_exists_nonempty(chainstate_dir);
 
     if(!need){
-        // Optional deep check: if tip looks higher than KV might contain, we still reindex.
-        // (Without UTXOKV query APIs, we conservatively skip; ReindexUTXO() itself validates completeness.)
         log_info("UTXO chainstate seems present; quick-skip deep probe.");
     } else {
         log_warn("UTXO chainstate missing/stale — reindex required.");
@@ -254,7 +332,6 @@ static bool ensure_utxo_fully_indexed(Chain& chain, const std::string& datadir, 
     }
     log_info(std::string("ReindexUTXO: complete in ") + std::to_string((t1 - t0)/1000.0) + "s");
 
-    // Minimal post-check: after a successful run, utxo must exist.
     if(!dir_exists_nonempty(chainstate_dir)){
         log_error("ReindexUTXO claimed success but chainstate is empty — refusing to continue.");
         return false;
@@ -292,6 +369,9 @@ static inline void get_winsize(int& cols, int& rows) {
 static inline void enable_vt(bool& vt_ok) {
     vt_ok = true;
 #ifdef _WIN32
+    // Harden against popup fault boxes
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOALIGNMENTFAULTEXCEPT);
+    // Try to enable VT
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     if (hOut == INVALID_HANDLE_VALUE) { vt_ok = false; return; }
     DWORD mode = 0;
@@ -457,7 +537,6 @@ static inline std::string bar(int width, double frac, bool vt_ok){
     std::ostringstream o;
     o << '[';
     if(vt_ok){
-        // gradient 36->34->32
         for(int i=0;i<width-2;i++){
             bool on = i < full;
             int hue = 36 - (i*4)/(width?width:1); if (hue < 32) hue = 32;
@@ -509,7 +588,7 @@ static std::string spark_ascii(const std::vector<double>& xs){
 // ║                         Pro TUI (two-column, animated)                    ║
 class TUI {
 public:
-    enum class NodeState { Starting, Syncing, Running, Degraded };
+    enum class NodeState { Starting, Syncing, Running, Degraded, Quitting };
 
     TUI(bool vt_ok) : vt_ok_(vt_ok) { init_step_order(); }
     void set_enabled(bool on){ enabled_ = on; }
@@ -560,6 +639,10 @@ public:
     bool is_enabled() const { return enabled_; }
 
     void set_startup_eta(double secs){ std::lock_guard<std::mutex> lk(mu_); eta_secs_ = secs; }
+    void set_shutdown_phase(const std::string& phase, bool ok){
+        std::lock_guard<std::mutex> lk(mu_);
+        shutdown_phase_ = phase; shutdown_ok_ = ok ? 1 : 0;
+    }
 
 private:
     struct StyledLine { std::string txt; int level; }; // 0=info 1=warn 2=err 3=trace 4=ok
@@ -606,7 +689,6 @@ private:
     const char* C_err()   const { return vt_ok_ ? "\x1b[31m" : ""; }
     const char* C_dim()   const { return vt_ok_ ? "\x1b[90m" : ""; }
     const char* C_head()  const { return vt_ok_ ? "\x1b[35m" : ""; }
-    const char* C_step()  const { return vt_ok_ ? "\x1b[34m" : ""; }
     const char* C_ok()    const { return vt_ok_ ? "\x1b[32m" : ""; }
     const char* C_bold()  const { return vt_ok_ ? "\x1b[1m"  : ""; }
 
@@ -624,10 +706,8 @@ private:
         auto last_hs_time = clock::now();
         while (running_) {
             draw_once(false);
-            // 120 Hz animation for smoother waves
-            std::this_thread::sleep_for(8ms);
+            std::this_thread::sleep_for(8ms); // ~120Hz
             ++tick_;
-            // sample miner h/s gently to build sparkline
             if((clock::now()-last_hs_time) > 250ms){
                 last_hs_time = clock::now();
                 std::lock_guard<std::mutex> lk(mu_);
@@ -637,7 +717,6 @@ private:
         }
     }
 
-    // Display “100% RUNNING” badge when: node running & (P2P ok || no-p2p) & RPC up & miner active with threads
     bool miner_running_badge() const {
         const bool miner_on = g_miner_stats.active.load() && g_miner_stats.threads.load() > 0;
         const bool node_run = (nstate_ == NodeState::Running);
@@ -663,14 +742,12 @@ private:
               << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
               << "  •  Chain: " << CHAIN_NAME
               << "  •  P2P " << p2p_port_ << "  •  RPC " << rpc_port_ << C_reset();
-
             left.push_back(h.str());
             left.push_back("");
             if(!banner_.empty()){
                 left.push_back(std::string("  ") + C_info() + banner_ + C_reset());
                 left.push_back("");
             }
-            // Eye-candy top wave
             left.push_back(std::string("  ") + wave_line(leftw-2, tick_, vt_ok_));
             left.push_back("");
         }
@@ -684,6 +761,7 @@ private:
                 case NodeState::Syncing:  s << C_warn() << "syncing"  << C_reset(); break;
                 case NodeState::Running:  s << C_ok()   << "running"  << C_reset(); break;
                 case NodeState::Degraded: s << C_err()  << "degraded" << C_reset(); break;
+                case NodeState::Quitting: s << C_warn() << "shutting down" << C_reset(); break;
             }
             if (miner_running_badge()){
                 s << "   " << C_bold() << C_ok() << "⛏  100% RUNNING" << C_reset();
@@ -692,7 +770,7 @@ private:
             left.push_back("");
         }
 
-        // Startup steps (animated progress)
+        // Startup steps
         {
             left.push_back(std::string(C_bold()) + "Startup" + C_reset());
             size_t total = steps_.size(), okc = 0;
@@ -711,24 +789,21 @@ private:
                 bool failed = failures_.count(s.first) > 0;
                 std::ostringstream ln;
                 ln << "    ";
-                if (ok)      ln << C_ok()  << "[OK] "     << C_reset();
-                else if (failed) ln << C_err() << "[FAIL] "   << C_reset();
-                else         ln << C_dim() << "[..] "     << C_reset();
+                if (ok)      ln << C_ok()  << "[OK] "   << C_reset();
+                else if (failed) ln << C_err() << "[FAIL] " << C_reset();
+                else         ln << C_dim() << "[..] "   << C_reset();
                 ln << s.first;
                 left.push_back(ln.str());
             }
             left.push_back("");
         }
 
-        // Node status (chain + p2p)
+        // Node status
         {
             left.push_back(std::string(C_bold()) + "Node status" + C_reset());
             uint64_t height = chain_ ? chain_->height() : 0;
             std::string tip_hex;
-            if (chain_) {
-                auto t = chain_->tip();
-                tip_hex = to_hex(t.hash);
-            }
+            if (chain_) { auto t = chain_->tip(); tip_hex = to_hex(t.hash); }
             size_t peers  = 0, inflight_tx = 0, rxbuf_sum = 0, awaiting_pongs = 0;
             if (p2p_) {
                 auto v = p2p_->snapshot_peers(); peers = v.size();
@@ -762,7 +837,7 @@ private:
             left.push_back("");
         }
 
-        // Right: peers / miner / sparkline / recent txids
+        // Right: peers / miner / sparkline / external miner / recent txids
         if (p2p_) {
             right.push_back(std::string(C_bold()) + "Peers" + C_reset());
             std::ostringstream hdr;
@@ -788,7 +863,6 @@ private:
             right.push_back("");
         }
 
-        // Miner panel + sparkline
         {
             right.push_back(std::string(C_bold()) + "Miner" + C_reset());
             bool active = g_miner_stats.active.load();
@@ -802,16 +876,14 @@ private:
                << "   threads: " << thr;
             right.push_back(m1.str());
 
-            std::ostringstream m2;
-            m2 << "  accepted: " << ok << "   rejected: " << rej;
-            right.push_back(m2.str());
-
+            std::ostringstream m2; m2 << "  accepted: " << ok << "   rejected: " << rej; right.push_back(m2.str());
             right.push_back(std::string("  hashrate: ") + fmt_hs(hps));
             right.push_back(std::string("  trend:    ") + spark_ascii(spark_));
+            // External miner presence (heartbeat file)
+            right.push_back(std::string("  external: ") + (g_extminer.alive.load() ? (std::string(C_ok()) + "connected" + C_reset()) : (std::string(C_dim()) + "—" + C_reset())));
             right.push_back("");
         }
 
-        // Recent TXIDs
         {
             right.push_back(std::string(C_bold()) + "Recent TXIDs (verified)" + C_reset());
             if (recent_txids_.empty()) right.push_back("  (no txids yet)");
@@ -833,9 +905,15 @@ private:
             out << std::left << std::setw(leftw) << l << " | " << r << "\n";
         }
 
-        // Footer + logs
+        // Footer + logs / shutdown progress
         out << std::string((size_t)cols, '-') << "\n";
-        out << C_bold() << "Logs" << C_reset() << "  " << C_dim() << "(Ctrl+C to exit)" << C_reset() << "\n";
+        if (nstate_ == NodeState::Quitting){
+            out << C_bold() << "Shutting down" << C_reset() << "  " << C_dim() << "(Ctrl+C again = force)" << C_reset() << "\n";
+            std::string phase = shutdown_phase_.empty() ? "initiating…" : shutdown_phase_;
+            out << "  phase: " << phase << "\n";
+        } else {
+            out << C_bold() << "Logs" << C_reset() << "  " << C_dim() << "(Ctrl+C to exit)" << C_reset() << "\n";
+        }
         int header_rows = (int)N + 2;
         int remain = rows - header_rows - 3;
         if (remain < 8) remain = 8;
@@ -879,6 +957,8 @@ private:
     std::unordered_set<std::string> recent_txid_set_;
     std::vector<double> spark_;
     double eta_secs_{0.0};
+    std::string shutdown_phase_;
+    int shutdown_ok_{0};
 };
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -912,7 +992,7 @@ static void miner_worker(Chain* chain,
 
     const size_t kBlockMaxBytes = 900 * 1024;
 
-    // Simple h/s meter (based on attempts in mine_block)
+    // Simple h/s meter
     std::atomic<uint64_t> last_tries{0};
     std::thread meter([&](){
         using namespace std::chrono_literals;
@@ -933,13 +1013,10 @@ static void miner_worker(Chain* chain,
     while (!g_shutdown_requested.load()) {
         try {
             auto t = chain->tip();
-            // Build coinbase
-            Transaction cbt;
-            TxIn cin; cin.prev.txid = std::vector<uint8_t>(32, 0); cin.prev.vout = 0;
+            // coinbase
+            Transaction cbt; TxIn cin; cin.prev.txid = std::vector<uint8_t>(32, 0); cin.prev.vout = 0;
             cbt.vin.push_back(cin);
-
-            TxOut cbout;
-            cbout.value = chain->subsidy_for_height(t.height + 1);
+            TxOut cbout; cbout.value = chain->subsidy_for_height(t.height + 1);
             if (mine_pkh.size() != 20) {
                 log_error(std::string("miner assign pkh fatal: pkh size != 20 (got ")
                           + std::to_string(mine_pkh.size()) + ")");
@@ -951,9 +1028,8 @@ static void miner_worker(Chain* chain,
             cbt.vout.push_back(cbout);
             cbt.lock_time = static_cast<uint32_t>(t.height + 1);
 
-            // Tag
-            const uint32_t ch   = static_cast<uint32_t>(t.height + 1);
-            const uint32_t now  = static_cast<uint32_t>(time(nullptr));
+            const uint32_t ch = static_cast<uint32_t>(t.height + 1);
+            const uint32_t now = static_cast<uint32_t>(time(nullptr));
             const uint64_t extraNonce = gen();
             std::vector<uint8_t> tag; tag.reserve(1+4+4+8);
             tag.push_back(0x01);
@@ -964,40 +1040,36 @@ static void miner_worker(Chain* chain,
             for (int i=0;i<8;i++) tag.push_back(uint8_t((extraNonce >> (8*i)) & 0xff));
             cbt.vin[0].sig = std::move(tag);
 
-            // Pick mempool
+            // pack txs
             std::vector<Transaction> txs;
             try {
-                txs = [&](){
-                    const size_t coinbase_sz = ser_tx(cbt).size();
-                    const size_t budget = (kBlockMaxBytes > coinbase_sz) ? (kBlockMaxBytes - coinbase_sz) : 0;
-                    auto cands = mempool->collect(100000);
-                    std::vector<Transaction> kept; kept.reserve(cands.size());
-                    size_t used = 0;
-                    for (auto& tx : cands) {
-                        size_t sz = ser_tx(tx).size();
-                        if (used + sz > budget) continue;
-                        kept.push_back(std::move(tx));
-                        used += sz;
-                        if (used >= budget) break;
-                    }
-                    return kept;
-                }();
+                const size_t coinbase_sz = ser_tx(cbt).size();
+                const size_t budget = (kBlockMaxBytes > coinbase_sz) ? (kBlockMaxBytes - coinbase_sz) : 0;
+                auto cands = mempool->collect(100000);
+                size_t used=0;
+                for (auto& tx : cands) {
+                    size_t sz = ser_tx(tx).size();
+                    if (used + sz > budget) continue;
+                    txs.emplace_back(std::move(tx));
+                    used += sz;
+                    if (used >= budget) break;
+                }
             } catch(...) { txs.clear(); }
 
-            // Solve
+            // mine
             Block b;
             try {
                 auto last = chain->last_headers(MIQ_RETARGET_INTERVAL);
                 uint32_t nb = miq::epoch_next_bits(
                     last, BLOCK_TIME_SECS, GENESIS_BITS,
                     /*next_height=*/ t.height + 1, /*interval=*/ MIQ_RETARGET_INTERVAL);
-                b = miq::mine_block_ex(t.hash, nb, cbt, txs, threads, &last_tries); // mine_block_ex: same as mine_block but reports tries into last_tries
+                b = miq::mine_block_ex(t.hash, nb, cbt, txs, threads, &last_tries);
             } catch (...) {
                 log_error("miner mine_block fatal");
                 continue;
             }
 
-            // Submit
+            // submit
             try {
                 std::string err;
                 if (chain->submit_block(b, err)) {
@@ -1014,7 +1086,6 @@ static void miner_worker(Chain* chain,
                     g_miner_stats.last_height_ok.store(t.height + 1);
                     g_miner_stats.last_height_rx.store(t.height + 1);
 
-                    // Telemetry
                     BlockSummary bs;
                     bs.height    = t.height + 1;
                     bs.hash_hex  = to_hex(b.block_hash());
@@ -1035,9 +1106,6 @@ static void miner_worker(Chain* chain,
                              + ", coinbase_txid=" + cb_txid_hex
                              + ", txs=" + std::to_string(std::max(0, noncb))
                              + (bs.fees_known ? (", fees=" + std::to_string(bs.fees)) : ""));
-                    if (!g_shutdown_requested.load() && p2p) {
-                        p2p->announce_block_async(b.block_hash());
-                    }
                 } else {
                     g_miner_stats.rejected.fetch_add(1);
                     log_warn(std::string("mined block rejected: ") + err);
@@ -1067,9 +1135,10 @@ static void print_usage(){
       << "  --mine                                       run built-in miner (interactive address prompt)\n"
       << "\n"
       << "Env:\n"
-      << "  MIQ_NO_TUI=1        disables the TUI; plain logs\n"
-      << "  MIQ_MINER_THREADS   overrides miner thread count\n"
-      << "  MIQ_RPC_TOKEN       if set, HTTP gate token (synced to .cookie on start)\n";
+      << "  MIQ_NO_TUI=1               disables the TUI; plain logs\n"
+      << "  MIQ_MINER_THREADS          overrides miner thread count\n"
+      << "  MIQ_RPC_TOKEN              if set, HTTP gate token (synced to .cookie on start)\n"
+      << "  MIQ_MINER_HEARTBEAT        path to heartbeat file for external miner presence\n";
 }
 static bool is_recognized_arg(const std::string& s){
     if(s.rfind("--conf=",0)==0) return true;
@@ -1095,11 +1164,17 @@ int main(int argc, char** argv){
     std::ios::sync_with_stdio(false);
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
+
 #ifndef _WIN32
     std::signal(SIGPIPE, SIG_IGN);
+    std::signal(SIGINT,  handle_signal_posix);
+    std::signal(SIGTERM, handle_signal_posix);
+    std::signal(SIGHUP,  handle_signal_posix);
+    std::signal(SIGQUIT, handle_signal_posix);
+    std::signal(SIGABRT, handle_signal_posix);
+#else
+    SetConsoleCtrlHandler(win_ctrl_handler, TRUE);
 #endif
-    std::signal(SIGINT,  handle_signal);
-    std::signal(SIGTERM, handle_signal);
     std::set_terminate(&fatal_terminate);
 
     bool vt_ok = true;
@@ -1115,7 +1190,7 @@ int main(int argc, char** argv){
     const bool can_tui  = want_tui && console_is_tty;
 
     ConsoleWriter cw;
-    cw.write_raw("Starting miqrod…  (Ctrl+C to exit)\n");
+    cw.write_raw("Starting miqrod…  (Ctrl+C to exit; Ctrl+C twice = force)\n");
 
     LogCapture capture;
     if (can_tui) capture.start();
@@ -1132,7 +1207,7 @@ int main(int argc, char** argv){
     }
 
     try {
-        // ── CLI parse (fail early on unknown switches)
+        // ── CLI parse
         Config cfg;
         std::string conf;
         bool genaddr=false, buildtx=false, mine_flag=false, flag_reindex_utxo=false;
@@ -1237,7 +1312,7 @@ int main(int argc, char** argv){
         }
         if (can_tui) { tui.mark_step_ok("Load & validate genesis"); tui.mark_step_ok("Genesis OK"); }
 
-        // UTXO reindex: auto when missing AND for --reindex_utxo
+        // UTXO reindex (auto or forced)
         if (can_tui) tui.mark_step_started("Reindex UTXO (full scan)");
         if (!ensure_utxo_fully_indexed(chain, cfg.datadir, flag_reindex_utxo)){
             if (can_tui) tui.mark_step_fail("Reindex UTXO (full scan)");
@@ -1257,6 +1332,9 @@ int main(int argc, char** argv){
         p2p.set_mempool(&mempool);
         rpc.set_p2p(&p2p);
         if (can_tui) tui.set_runtime_refs(&p2p, &chain);
+
+        // External miner heartbeat watch (optional)
+        g_extminer.start(cfg.datadir);
 
         bool p2p_ok = false;
         if (can_tui) { tui.mark_step_started("Start P2P listener"); tui.set_node_state(TUI::NodeState::Starting); }
@@ -1318,7 +1396,7 @@ int main(int argc, char** argv){
             rpc_ok = true;
         }
 
-        // Optional built-in miner (with address prompt)
+        // Optional built-in miner
         unsigned thr_count = 0;
         if (mine_flag) {
             if (cfg.miner_threads) thr_count = cfg.miner_threads;
@@ -1368,7 +1446,7 @@ int main(int argc, char** argv){
             else tui.set_node_state(TUI::NodeState::Syncing);
         }
 
-        // TUI main feed loop
+        // Main loop (feed UI and watch for shutdown request)
         uint64_t last_tip_height_seen = 0;
         if (can_tui) {
             while(!g_shutdown_requested.load()){
@@ -1377,8 +1455,7 @@ int main(int argc, char** argv){
                 capture.drain(lines);
                 tui.feed_logs(lines);
 
-                uint64_t h = 0;
-                if (Chain* c = &chain) h = c->height();
+                uint64_t h = chain.height();
                 if (h > last_tip_height_seen){
                     g_miner_stats.last_height_rx.store(h);
                     last_tip_height_seen = h;
@@ -1390,11 +1467,39 @@ int main(int argc, char** argv){
             }
         }
 
+        // Orchestrated shutdown with TUI feedback
+        if (can_tui) {
+            tui.set_node_state(TUI::NodeState::Quitting);
+            tui.set_banner("Shutting down safely…");
+        }
         log_info("Shutdown requested — stopping services…");
-        try { rpc.stop(); } catch(...) {}
-        try { p2p.stop(); } catch(...) {}
+
+        try {
+            if (can_tui) tui.set_shutdown_phase("Stopping RPC…", false);
+            rpc.stop();
+            if (can_tui) tui.set_shutdown_phase("Stopping RPC…", true);
+        } catch(...) { log_warn("RPC stop threw"); }
+
+        try {
+            if (can_tui) tui.set_shutdown_phase("Stopping P2P…", false);
+            p2p.stop();
+            if (can_tui) tui.set_shutdown_phase("Stopping P2P…", true);
+        } catch(...) { log_warn("P2P stop threw"); }
+
+        try {
+            if (can_tui) tui.set_shutdown_phase("Stopping miner watch…", false);
+            g_extminer.stop();
+            if (can_tui) tui.set_shutdown_phase("Stopping miner watch…", true);
+        } catch(...) { log_warn("Miner watch stop threw"); }
+
+        // Allow UI to render final frames
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
         log_info("Shutdown complete.");
-        if (can_tui) { capture.stop(); tui.stop(); }
+        if (can_tui) {
+            capture.stop();
+            tui.stop();
+        }
         return 0;
 
     } catch(const std::exception& ex){
