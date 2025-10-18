@@ -1,3 +1,4 @@
+// chain.cpp — revised
 #include "chain.h"
 #include <cmath>      // std::pow, std::fabs
 #include <optional>
@@ -21,7 +22,7 @@
 #include <unordered_set>
 #include <array>
 
-#include <algorithm>       // std::any_of, std::sort, std::max
+#include <algorithm>       // std::any_of, std::sort, std::max, std::reverse
 #include <chrono>          // future-time bound
 #include <cstring>         // std::memcmp, std::memset
 #include <type_traits>     // compile-time detection (SFINAE)
@@ -484,6 +485,13 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         if (h.prev_hash != tip_.hash && !have_block(h.prev_hash)) {
             err = "unknown parent header";
             return false;
+        }
+    }
+
+    // --- FIX: ensure difficulty window is chronological oldest->newest ---
+    if (!window.empty()) {
+        if (window.size() >= 2 && window.front().first > window.back().first) {
+            std::reverse(window.begin(), window.end());
         }
     }
 
