@@ -147,21 +147,23 @@ static void save_pending(const std::string& wdir, const std::set<OutpointKey>& s
 #endif
 
 static bool is_public_ipv4_literal(const std::string& host){
-    sockaddr_in a{}; 
+    sockaddr_in a{};
 #ifdef _WIN32
     if (InetPtonA(AF_INET, host.c_str(), &a.sin_addr) != 1) return false;
 #else
     if (inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) return false;
 #endif
-    uint32_t be = a.sin_addr.s_addr;
-    uint8_t A = uint8_t(be>>24), B = uint8_t(be>>16);
+    // Inspect raw octets in network order (safer than shifting a network-order u32)
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(&a.sin_addr);
+    const uint8_t A = b[0], B = b[1];
     if (A==127) return false;                 // loopback
     if (A==10)  return false;                 // 10/8
     if (A==192 && B==168) return false;       // 192.168/16
-    if (A==172 && ((uint8_t(be>>20)&0x0F)>=1 && (uint8_t(be>>20)&0x0F)<=15)) return false; // 172.16/12
+    if (A==172 && B>=16 && B<=31) return false; // 172.16/12
     if (A==0 || A>=224) return false;         // invalid/multicast/etc
     return true;
 }
+
 static bool is_public_ipv6_literal(const std::string& host){
     sockaddr_in6 a6{};
 #ifdef _WIN32
@@ -169,7 +171,8 @@ static bool is_public_ipv6_literal(const std::string& host){
 #else
     if (inet_pton(AF_INET6, host.c_str(), &a6.sin6_addr) != 1) return false;
 #endif
-    const uint8_t* b = (const uint8_t*)&a6->sin6_addr;
+    // FIX: a6 is not a pointer — use a6.sin6_addr (not a6->sin6_addr)
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(&a6.sin6_addr);
     // ::1 loopback
     bool loop = true; for (int i=0;i<15;i++){ if (b[i]!=0) { loop=false; break; } }
     if (loop && b[15]==1) return false;
@@ -200,12 +203,12 @@ static bool resolves_to_public_ip(const std::string& host, const std::string& po
         if (!sa) return true;
         if (sa->sa_family == AF_INET){
             const sockaddr_in* a = (const sockaddr_in*)sa;
-            uint32_t be = a->sin_addr.s_addr;
-            uint8_t A = uint8_t(be>>24), B = uint8_t(be>>16);
+            const uint8_t* b = (const uint8_t*)&a->sin_addr;
+            const uint8_t A=b[0], B=b[1];
             if (A==127) return true;
             if (A==10)  return true;
             if (A==192 && B==168) return true;
-            if (A==172 && ((uint8_t(be>>20)&0x0F)>=1 && (uint8_t(be>>20)&0x0F)<=15)) return true;
+            if (A==172 && B>=16 && B<=31) return true;
             if (A==0 || A>=224) return true;
             return false;
         }
