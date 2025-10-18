@@ -1,26 +1,11 @@
-// miqrod_ultra.cpp — Ultra-hardened, symmetric, polished TUI + robust cross-platform runtime
-// Drop-in replacement for your existing miqrod main file.
-// Goals:
-//   • Pixel-perfect, symmetric, collision-free TUI with strict layout grid
-//   • UTF-8 correctness (does not split code points; safe truncation/ellipsis)
-//   • More color themes + high-contrast mode + glow/gradient bars
-//   • Consistent box sizes and spacing; zebra tables; no category mixing
-//   • Clean, portable build on GCC/Clang/MSVC (no warnings with common flags)
-//   • Safer shutdown, better signal handling, and resilient I/O paths
-//
-// Build assumptions: MIQ public headers available in include path.
-//   - constants.h, config.h, log.h, chain.h, mempool.h, rpc.h, p2p.h, tx.h, serialize.h,
-//     base58check.h, hash160.h, crypto/ecdsa_iface.h, difficulty.h, miner.h, sha256.h,
-//     hex.h, tls_proxy.h, ibd_monitor.h, utxo_kv.h, reindex_utxo.h
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MSVC portability flags
 #ifdef _MSC_VER
   #pragma execution_character_set("utf-8")
-  #define _CRT_SECURE_NO_WARNINGS
-  #pragma warning(disable: 4996) // POSIX names (guarded below)
-  #pragma warning(disable: 26495) // uninited member (false positives on atomics/pods)
-  #pragma warning(disable: 26451) // arithmetic overflow in generated code (false pos)
+  #ifndef _CRT_SECURE_NO_WARNINGS
+  #define _CRT_SECURE_NO_WARNINGS 1
+  #endif
+  #pragma warning(disable: 4996)   // POSIX names (guarded below)
+  #pragma warning(disable: 26495)  // uninited member (false positives on atomics/pods)
+  #pragma warning(disable: 26451)  // arithmetic overflow in generated code (false pos)
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -59,7 +44,7 @@
 #include "reindex_utxo.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STL
+/* STL */ 
 #include <thread>
 #include <cctype>
 #include <fstream>
@@ -826,7 +811,7 @@ static std::string truncate_to_width(const std::string& s, int width){
             while (pos>0 && ((unsigned char)noansi[pos] & 0xC0) == 0x80) --pos;
             noansi.erase(pos);
         }
-        out = noansi + "…";
+        out = noansi + u8"…";
     }
     return out;
 }
@@ -837,6 +822,15 @@ static std::string pad_right_ansi(const std::string& s, int width){
     return t;
 }
 static inline std::string short_hex(const std::string& h, size_t n=12){ return h.size()>n ? h.substr(0,n) : h; }
+
+// UTF-8 repeater for border segments
+static std::string repeat_u8(const char* s, int n){
+    if (n <= 0) return {};
+    std::string out;
+    out.reserve(std::max(0, n) * 3);
+    for (int i = 0; i < n; ++i) out += s;
+    return out;
+}
 
 // — Visual elements —
 static inline std::string bar(int width, double frac, bool vt_ok, int hue_a=36, int hue_b=32, bool glow=false){
@@ -850,8 +844,8 @@ static inline std::string bar(int width, double frac, bool vt_ok, int hue_a=36, 
         for(int i=0;i<width-2;i++){
             const bool on = i < full;
             const int hue = glow ? 35 + (i%2) : (hue_a - (i*(hue_a-hue_b))/std::max(1,width-2));
-            if (on) o << "\x1b["<<hue<<"m" << "█" << "\x1b[0m";
-            else    o << "\x1b[90m" << "·" << "\x1b[0m";
+            if (on) o << "\x1b["<<hue<<"m" << u8"█" << "\x1b[0m";
+            else    o << "\x1b[90m" << u8"·" << "\x1b[0m";
         }
     }else{
         for(int i=0;i<width-2;i++) o << (i<full ? '#' : ' ');
@@ -860,8 +854,8 @@ static inline std::string bar(int width, double frac, bool vt_ok, int hue_a=36, 
     return o.str();
 }
 static std::string wave_line(int width, int tick, bool vt_ok, int hue_a=36, int hue_b=32){
-    static const char* blocks = " ▁▂▃▄▅▆▇█";
-    const int N = (int)std::strlen(blocks)-1;
+    static const char* blocks[] = { " ", u8"▁", u8"▂", u8"▃", u8"▄", u8"▅", u8"▆", u8"▇", u8"█" };
+    const int N = 8;
     if(width < 4) width = 4;
     std::ostringstream o;
     for(int i=0;i<width;i++){
@@ -879,8 +873,11 @@ static std::string wave_line(int width, int tick, bool vt_ok, int hue_a=36, int 
     return o.str();
 }
 static std::string spinner(int tick){
-    static const char* s = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
-    return std::string(1, s[tick % 10]);
+    static const char* frames[] = {
+        u8"⠋", u8"⠙", u8"⠹", u8"⠸", u8"⠼",
+        u8"⠴", u8"⠦", u8"⠧", u8"⠇", u8"⠏"
+    };
+    return std::string(frames[tick % 10]);
 }
 static std::string spark_ascii(const std::vector<double>& xs){
     static const char bars[] = " .:-=+*#%@";
@@ -1238,17 +1235,17 @@ private:
         const int capw = (int)display_width(cap);
         const int left = (w-2 - capw)/2;
         const int right = (w-2) - capw - left;
-        std::string top = "┌";
-        top.append(std::max(0,left), '─');
+        std::string top = u8"┌";
+        top += repeat_u8(u8"─", std::max(0,left));
         top += cap;
-        top.append(std::max(0,right), '─');
-        top += "┐";
+        top += repeat_u8(u8"─", std::max(0,right));
+        top += u8"┐";
         out.push_back(pad_right_ansi(top, w));
         for (auto& l : body){
             std::string inner = pad_right_ansi(l, w-2);
-            out.push_back("│" + inner + "│");
+            out.push_back(std::string(u8"│") + inner + u8"│");
         }
-        std::string bot = "└"; bot.append(w-2, '─'); bot += "┘";
+        std::string bot = u8"└"; bot += repeat_u8(u8"─", w-2); bot += u8"┘";
         out.push_back(pad_right_ansi(bot, w));
         return out;
     }
@@ -1270,7 +1267,7 @@ private:
         }
         auto line_from_cells = [&](const std::vector<std::string>& cells)->std::string{
             std::ostringstream o;
-            if (show_borders_) o << "│";
+            if (show_borders_) o << u8"│";
             for (size_t i=0;i<cells.size() && i<cw.size(); ++i){
                 const bool right = cols[i].right;
                 const std::string& cell = cells[i];
@@ -1280,22 +1277,22 @@ private:
                 else       o << t << std::string((size_t)pad, ' ');
                 if (i+1 < cells.size()) o << " ";
             }
-            if (show_borders_) o << "│";
+            if (show_borders_) o << u8"│";
             return pad_right_ansi(o.str(), w);
         };
         if (show_borders_){
-            std::string top = "┌"; top.append((size_t)inner, '─'); top += "┐";
+            std::string top = u8"┌"; top += repeat_u8(u8"─", inner); top += u8"┐";
             out.push_back(pad_right_ansi(top, w));
         }
         out.push_back(line_from_cells(header));
         {
             std::ostringstream u;
-            if (show_borders_) u<<"│";
+            if (show_borders_) u<<u8"│";
             for (size_t i=0;i<cw.size();++i){
-                u<<std::string((size_t)cw[i], '─');
+                u<<repeat_u8(u8"─", cw[i]);
                 if (i+1<cw.size()) u<<" ";
             }
-            if (show_borders_) u<<"│";
+            if (show_borders_) u<<u8"│";
             out.push_back(pad_right_ansi(u.str(), w));
         }
         for (size_t r=0; r<rows.size(); ++r){
@@ -1304,7 +1301,7 @@ private:
             out.push_back(ln);
         }
         if (show_borders_){
-            std::string bot = "└"; bot.append((size_t)inner, '─'); bot += "┘";
+            std::string bot = u8"└"; bot += repeat_u8(u8"─", inner); bot += u8"┘";
             out.push_back(pad_right_ansi(bot, w));
         }
         return out;
@@ -1520,7 +1517,7 @@ private:
                 case NodeState::Quitting: s << C_warn() << "shutting down" << C_reset(); break;
             }
             if (miner_running_badge()){
-                s << "   " << C_bold() << C_ok() << "⛏ RUNNING" << C_reset();
+                s << "   " << C_bold() << C_ok() << u8"⛏ RUNNING" << C_reset();
             }
             body.push_back(s.str());
             auto b = render_box("Node", body, leftw);
@@ -1681,7 +1678,7 @@ private:
                 std::ostringstream m1;
                 m1 << "status: " << (active ? (std::string(C_ok()) + "running" + C_reset()) : (std::string(C_dim()) + "idle" + C_reset()))
                    << "   threads: " << thr
-                   << "   ext: " << (g_extminer.alive.load() ? (std::string(C_ok()) + "alive" + C_reset()) : (std::string(C_dim()) + "—" + C_reset()));
+                   << "   ext: " << (g_extminer.alive.load() ? (std::string(C_ok()) + "alive" + C_reset()) : (std::string(C_dim()) + u8"—" + C_reset()));
                 body.push_back(m1.str());
                 std::ostringstream m2; m2 << "accepted: " << commas_u64(ok) << "   rejected: " << commas_u64(rej); body.push_back(m2.str());
                 body.push_back(std::string("miner hashrate: ") + (long_units_? fmt_hs_full(hps) : fmt_hs_compact(hps)));
@@ -1692,7 +1689,7 @@ private:
                                           << "   your share: " << fmt_pct(share, 3);
                 body.push_back(m3.str());
                 const double ettf_s = (hps > 0.0) ? (double)(tip_diff * 4294967296.0L) / hps : 0.0;
-                body.push_back(std::string("ETTF (your rig): ") + (hps>0.0 ? fmt_duration(ettf_s) : std::string("—")));
+                body.push_back(std::string("ETTF (your rig): ") + (hps>0.0 ? fmt_duration(ettf_s) : std::string(u8"—")));
             }
             auto b = render_box("Mining", body, rightw);
             right.insert(right.end(), b.begin(), b.end());
@@ -1763,7 +1760,7 @@ private:
         }
 
         // Footer + logs/help
-        out << pad_right_ansi(std::string((size_t)cols, '─'), cols) << "\n";
+        out << pad_right_ansi(repeat_u8(u8"─", cols), cols) << "\n";
         if (show_help_) {
             std::string help = std::string(C_bold()) + "Help" + C_reset() + "  "
                 "q=quit  t=theme  h=contrast  p=pause logs  r=reload config  s=snapshot  v=verbose  "
@@ -1772,7 +1769,7 @@ private:
         } else if (nstate_ == NodeState::Quitting){
             std::string s1 = std::string(C_bold()) + "Shutting down" + C_reset() + "  " + C_dim() + "(Ctrl+C again = force)" + C_reset();
             out << pad_right_ansi(s1, cols) << "\n";
-            const std::string phase = shutdown_phase_.empty() ? "initiating…" : shutdown_phase_;
+            const std::string phase = shutdown_phase_.empty() ? u8"initiating…" : shutdown_phase_;
             out << pad_right_ansi(std::string("  phase: ") + phase, cols) << "\n";
         } else {
             std::string h = std::string(C_bold()) + "Logs" + C_reset() + "  " + C_dim() + "(q,t,h,p,r,s,v,?,c,g,b,w,l,u)" + C_reset();
@@ -2086,7 +2083,7 @@ int main(int argc, char** argv){
     const bool can_tui  = want_tui && console_is_tty;
 
     ConsoleWriter cw;
-    cw.write_raw("Starting miqrod…  (Ctrl+C to exit; Ctrl+C twice = force)\n");
+    cw.write_raw(u8"Starting miqrod…  (Ctrl+C to exit; Ctrl+C twice = force)\n");
 
     LogCapture capture;
     if (can_tui) capture.start();
@@ -2342,7 +2339,7 @@ int main(int argc, char** argv){
         log_info(std::string(CHAIN_NAME) + " node running. RPC " + std::to_string(RPC_PORT) +
                  ", P2P " + std::to_string(P2P_PORT));
         if (can_tui) {
-            tui.set_banner("Miqrochain node running — syncing & serving peers…");
+            tui.set_banner(u8"Miqrochain node running — syncing & serving peers…");
             if ((p2p_ok || cfg.no_p2p) && rpc_ok) tui.set_node_state(TUI::NodeState::Running);
             else tui.set_node_state(TUI::NodeState::Syncing);
         }
