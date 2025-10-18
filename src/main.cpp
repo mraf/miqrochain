@@ -1,4 +1,4 @@
-// src/main.cpp — MIQ core entrypoint with robust ASCII Pro TUI (single file, no extra deps)
+// src/main.cpp — MIQ core entrypoint with ultra-dynamic Pro TUI (single file, no deps)
 
 #ifdef _MSC_VER
 #pragma execution_character_set("utf-8")
@@ -57,12 +57,13 @@
 #include <sstream>
 #include <iomanip>
 #include <limits>
+#include <unordered_set>
 
 #ifndef MIQ_VERSION_MAJOR
 #define MIQ_VERSION_MAJOR 0
 #endif
 #ifndef MIQ_VERSION_MINOR
-#define MIQ_VERSION_MINOR 1
+#define MIQ_VERSION_MINOR 2
 #endif
 
 #if defined(_WIN32)
@@ -106,6 +107,41 @@ struct MinerStats {
     std::atomic<uint64_t> last_height_rx{0}; // any miner
     std::chrono::steady_clock::time_point start{};
 } g_miner_stats;
+
+// ========= accepted-block telemetry (shared across threads) ==================
+struct BlockSummary {
+    uint64_t height{0};
+    std::string hash_hex;
+    uint32_t tx_count{0};
+    uint64_t fees{0};           // in atomic units
+    bool     fees_known{false};
+    std::string miner;          // base58 (if known)
+};
+
+struct Telemetry {
+    std::mutex mu;
+    std::deque<BlockSummary> new_blocks;      // fifo of new accepted blocks
+    std::deque<std::string>  new_txids;       // fifo of txids from accepted blocks (non-coinbase)
+    void push_block(const BlockSummary& b) {
+        std::lock_guard<std::mutex> lk(mu);
+        new_blocks.push_back(b);
+        while (new_blocks.size() > 128) new_blocks.pop_front();
+    }
+    void push_txids(const std::vector<std::string>& v) {
+        std::lock_guard<std::mutex> lk(mu);
+        for (auto& t : v) {
+            new_txids.push_back(t);
+            while (new_txids.size() > 64) new_txids.pop_front();
+        }
+    }
+    void drain(std::vector<BlockSummary>& out_blocks, std::vector<std::string>& out_txids) {
+        std::lock_guard<std::mutex> lk(mu);
+        out_blocks.assign(new_blocks.begin(), new_blocks.end());
+        out_txids.assign(new_txids.begin(), new_txids.end());
+        new_blocks.clear();
+        new_txids.clear();
+    }
+} g_telemetry;
 
 // ---------- default per-user datadir -----------------------------------------
 static std::string default_datadir() {
@@ -187,7 +223,7 @@ static inline bool is_tty() {
 #endif
 }
 static inline void get_winsize(int& cols, int& rows) {
-    cols = 110; rows = 36;
+    cols = 116; rows = 38;
 #ifdef _WIN32
     CONSOLE_SCREEN_BUFFER_INFO info;
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -357,7 +393,18 @@ private:
     std::deque<Line> lines_;
 };
 
-// ---- Pro TUI (ASCII-only visuals; ANSI colors when VT is OK) ----------------
+// ---------- utility ----------------------------------------------------------
+static uint64_t sum_coinbase_outputs(const Block& b) {
+    if (b.txs.empty()) return 0;
+    uint64_t s = 0;
+    for (const auto& o : b.txs[0].vout) s += o.value;
+    return s;
+}
+static std::string short_hex(const std::string& h, size_t n=12) {
+    return h.size()>n ? h.substr(0,n) : h;
+}
+
+// ---- Pro TUI ---------------------------------------------------------------
 class TUI {
 public:
     enum class NodeState { Starting, Syncing, Running };
@@ -378,32 +425,39 @@ public:
     }
     ~TUI(){ stop(); }
 
-    void mark_step_started(const std::string& title) {
-        std::lock_guard<std::mutex> lk(mu_);
-        ensure_step(title);
-    }
-    void mark_step_ok(const std::string& title) {
-        std::lock_guard<std::mutex> lk(mu_);
-        ensure_step(title);
-        for (auto& s : steps_) if (s.first == title) { s.second = true; break; }
-    }
+    void mark_step_started(const std::string& title) { std::lock_guard<std::mutex> lk(mu_); ensure_step(title); }
+    void mark_step_ok(const std::string& title) { std::lock_guard<std::mutex> lk(mu_); ensure_step(title); for (auto& s : steps_) if (s.first == title) { s.second = true; break; } }
 
     void set_runtime_refs(P2P* p2p, Chain* chain) { p2p_ = p2p; chain_ = chain; }
     void feed_logs(const std::deque<LogCapture::Line>& lines) {
+        // Merge logs + telemetry without blocking draw for long
         std::lock_guard<std::mutex> lk(mu_);
         logs_ = lines;
-        // lightweight event extraction (any miner accept & our miner accept)
+
+        // Drain cross-thread telemetry
+        std::vector<BlockSummary> nb; std::vector<std::string> ntx;
+        g_telemetry.drain(nb, ntx);
+        for (auto& b : nb) {
+            // dedupe by height/hash
+            if (recent_blocks_.empty() || recent_blocks_.back().height != b.height || recent_blocks_.back().hash_hex != b.hash_hex) {
+                recent_blocks_.push_back(b);
+                while (recent_blocks_.size() > 64) recent_blocks_.pop_front();
+            }
+        }
+        for (auto& t : ntx) {
+            if (recent_txid_set_.insert(t).second) {
+                recent_txids_.push_back(t);
+                while (recent_txids_.size() > 10) { recent_txid_set_.erase(recent_txids_.front()); recent_txids_.pop_front(); }
+            }
+        }
+
+        // lightweight event extraction (parse any generic accept logs to augment feed)
         for (int i=(int)logs_.size()-1; i>=0; --i){
-            const auto& L = logs_[i].text;
-            if (L.find("accepted block") != std::string::npos || L.find("mined block accepted") != std::string::npos){
-                last_accept_line_ = L;
-                // try to extract height
-                auto hpos = L.find("height=");
-                if (hpos != std::string::npos){
-                    size_t k=hpos+7, j=k;
-                    while (j<L.size() && std::isdigit((unsigned char)L[j])) ++j;
-                    last_accept_height_ = L.substr(k, j-k);
-                }
+            BlockSummary p; if (parse_accept_line(logs_[i].text, p)) {
+                // avoid flooding with the same line
+                if (recent_blocks_.empty() || recent_blocks_.back().height != p.height)
+                    recent_blocks_.push_back(p);
+                while (recent_blocks_.size() > 64) recent_blocks_.pop_front();
                 break;
             }
         }
@@ -441,7 +495,7 @@ private:
         if (tot == 0) tot = 1;
         double frac = (double)cur / (double)tot;
         if (frac < 0) frac = 0;
-        if (frac > 1) frac = 1; // (fixed misleading-indentation warning)
+        if (frac > 1) frac = 1; // avoid misleading-indentation
         int filled = (int)(frac * width + 0.5);
         if (filled > width) filled = width;
         std::string out = "[";
@@ -466,24 +520,44 @@ private:
     const char* cRun()   const { return vt_ok_ ? "\x1b[32m" : ""; }
     const char* cPanel() const { return vt_ok_ ? "\x1b[1;37m" : ""; }
 
+    // parse generic "accepted block" log lines if they include tokens
+    static bool parse_accept_line(const std::string& L, BlockSummary& out){
+        if (L.find("accepted block") == std::string::npos && L.find("mined block accepted") == std::string::npos) return false;
+        auto grab = [&](const char* key)->std::string{
+            auto p = L.find(key); if (p==std::string::npos) return std::string();
+            p += std::strlen(key); size_t j = p;
+            while (j<L.size() && !std::isspace((unsigned char)L[j]) && L[j]!=',' ) ++j;
+            return L.substr(p, j-p);
+        };
+        std::string h = grab("height=");
+        if (!h.empty()) out.height = (uint64_t)std::strtoull(h.c_str(), nullptr, 10);
+        out.hash_hex = grab("hash="); // only if your logs print it
+        std::string txc = grab("txs=");
+        if (!txc.empty()) out.tx_count = (uint32_t)std::strtoul(txc.c_str(), nullptr, 10);
+        std::string fees = grab("fees=");
+        if (!fees.empty()) { out.fees = (uint64_t)std::strtoull(fees.c_str(), nullptr, 10); out.fees_known = true; }
+        std::string miner = grab("miner=");
+        if (!miner.empty()) out.miner = miner;
+        return out.height>0;
+    }
+
     void loop(){
         using namespace std::chrono_literals;
         running_ = true;
-        while (running_) { draw_once(false); std::this_thread::sleep_for(120ms); ++tick_; }
-    }
-
-    static std::string short_hash(const std::string& hex, size_t n=10){
-        if (hex.size() <= n) return hex;
-        return hex.substr(0,n);
+        while (running_) {
+            draw_once(false);
+            std::this_thread::sleep_for(120ms);
+            ++tick_;
+        }
     }
 
     void draw_once(bool gentle){
         std::lock_guard<std::mutex> lk(mu_);
         int cols, rows; term::get_winsize(cols, rows);
-        if (cols < 96) cols = 96;
-        if (rows < 30) rows = 30;
+        if (cols < 100) cols = 100;
+        if (rows < 32) rows = 32;
 
-        const int rightw = std::max(40, cols / 3);
+        const int rightw = std::max(44, cols / 3);
         const int leftw  = cols - rightw - 3;
 
         std::vector<std::string> left, right;
@@ -553,7 +627,7 @@ private:
 
             std::ostringstream ns1;
             ns1 << "  height: " << height
-                << "   tip: " << short_hash(tip_hex, 12)
+                << "   tip: " << short_hex(tip_hex, 12)
                 << "   peers: " << peers;
             left.push_back(ns1.str());
 
@@ -562,16 +636,47 @@ private:
                 << "   rx-buf: " << rxbuf_sum
                 << "   pings-waiting: " << awaiting_pongs;
             left.push_back(ns2.str());
-
-            // Last accepted block (any miner)
-            if (!last_accept_line_.empty()) {
-                left.push_back(std::string("  ") + cOK() + "Last accepted block" + reset() +
-                               (last_accept_height_.empty() ? "" : (": height " + last_accept_height_)));
-            }
             left.push_back("");
         }
 
-        // Right panel: peers + miner panel
+        // Blocks feed (every accepted block)
+        {
+            left.push_back(std::string(cPanel()) + "Blocks (recent accepts)" + reset());
+            // show last up to 10
+            size_t N = recent_blocks_.size();
+            size_t show = std::min<size_t>(10, N);
+            for (size_t i=0;i<show;i++){
+                const auto& b = recent_blocks_[N-1-i];
+                std::ostringstream ln;
+                ln << "  h=" << b.height
+                   << "  txs=" << (b.tx_count ? std::to_string(b.tx_count) : std::string("?"))
+                   << "  fees=" << (b.fees_known ? std::to_string(b.fees) : std::string("?"))
+                   << "  hash=" << short_hex(b.hash_hex.empty() ? std::string("(?)") : b.hash_hex, 12);
+                if (!b.miner.empty()) ln << "  miner=" << b.miner;
+                left.push_back(ln.str());
+            }
+            if (N==0) left.push_back("  (no blocks seen yet)");
+            left.push_back("");
+        }
+
+        // Last 3 blocks digest
+        {
+            left.push_back(std::string(cPanel()) + "Last 3 blocks" + reset());
+            size_t N = recent_blocks_.size();
+            for (size_t i=0;i<3 && i<N;i++){
+                const auto& b = recent_blocks_[N-1-i];
+                std::ostringstream ln;
+                ln << "  #" << b.height
+                   << " | txs: " << (b.tx_count ? std::to_string(b.tx_count) : std::string("?"))
+                   << " | fees: " << (b.fees_known ? std::to_string(b.fees) : std::string("?"))
+                   << " | " << short_hex(b.hash_hex.empty()?std::string("(?)"):b.hash_hex, 12);
+                left.push_back(ln.str());
+            }
+            if (N==0) left.push_back("  (waiting for blocks)");
+            left.push_back("");
+        }
+
+        // Right panel: peers + miner + recent txids
         if (p2p_) {
             right.push_back(std::string(cPanel()) + "Peers" + reset());
             std::ostringstream hdr;
@@ -582,7 +687,7 @@ private:
             right.push_back(hdr.str());
 
             auto v = p2p_->snapshot_peers();
-            size_t show = std::min(v.size(), (size_t)std::max(6, (int)((rows-16))));
+            size_t show = std::min(v.size(), (size_t)8);
             for (size_t i=0;i<show; ++i) {
                 const auto& s = v[i];
                 std::string ip = s.ip; if ((int)ip.size() > 16) ip = ip.substr(0,13) + "...";
@@ -601,7 +706,7 @@ private:
             right.push_back("");
         }
 
-        // Miner panel (built-in miner visibility)
+        // Miner panel
         {
             right.push_back(std::string(cPanel()) + "Miner" + reset());
             bool active = g_miner_stats.active.load();
@@ -618,16 +723,20 @@ private:
             m2 << "  accepted: " << ok << "   rejected: " << rej;
             right.push_back(m2.str());
 
-            // surface most recent success heights (ours & network)
             uint64_t last_ok = g_miner_stats.last_height_ok.load();
             uint64_t last_rx = g_miner_stats.last_height_rx.load();
-            if (last_ok) {
-                std::ostringstream m3; m3 << "  last (us): height " << last_ok;
-                right.push_back(m3.str());
-            }
-            if (last_rx) {
-                std::ostringstream m4; m4 << "  last (net): height " << last_rx;
-                right.push_back(m4.str());
+            if (last_ok) right.push_back(std::string("  last (us): height ") + std::to_string(last_ok));
+            if (last_rx) right.push_back(std::string("  last (net): height ") + std::to_string(last_rx));
+            right.push_back("");
+        }
+
+        // Recent TXIDs (verified)
+        {
+            right.push_back(std::string(cPanel()) + "Recent TXIDs (verified)" + reset());
+            if (recent_txids_.empty()) right.push_back("  (no txids yet)");
+            size_t n = std::min<size_t>(recent_txids_.size(), 10);
+            for (size_t i=0;i<n;i++){
+                right.push_back(std::string("  ") + short_hex(recent_txids_[recent_txids_.size()-1-i], 16));
             }
             right.push_back("");
         }
@@ -675,8 +784,6 @@ private:
     std::vector<std::pair<std::string,bool>> steps_;
     std::deque<LogCapture::Line> logs_;
     std::string banner_;
-    std::string last_accept_line_;
-    std::string last_accept_height_;
     uint16_t p2p_port_{P2P_PORT};
     uint16_t rpc_port_{RPC_PORT};
     P2P*   p2p_   {nullptr};
@@ -684,6 +791,11 @@ private:
     ConsoleWriter cw_;
     int  tick_{0};
     NodeState nstate_{NodeState::Starting};
+
+    // new: block feed + verified txids (unique)
+    std::deque<BlockSummary> recent_blocks_;
+    std::deque<std::string>  recent_txids_;
+    std::unordered_set<std::string> recent_txid_set_;
 };
 
 // ---------- fatal terminate hook --------------------------------------------
@@ -785,10 +897,28 @@ static void miner_worker(Chain* chain,
                     g_miner_stats.accepted.fetch_add(1);
                     g_miner_stats.last_height_ok.store(t.height + 1);
                     g_miner_stats.last_height_rx.store(t.height + 1);
-                    log_info("mined block accepted, height=" + std::to_string(t.height + 1)
+
+                    // Telemetry: full block summary + txids (verified)
+                    BlockSummary bs;
+                    bs.height    = t.height + 1;
+                    bs.hash_hex  = to_hex(b.block_hash());
+                    bs.tx_count  = (uint32_t)b.txs.size();
+                    uint64_t coinbase_total = sum_coinbase_outputs(b);
+                    uint64_t subsidy = chain->subsidy_for_height(bs.height);
+                    if (coinbase_total >= subsidy) { bs.fees = coinbase_total - subsidy; bs.fees_known = true; }
+                    bs.miner = miner_addr;
+                    g_telemetry.push_block(bs);
+                    if (noncb > 0) {
+                        std::vector<std::string> txids; txids.reserve((size_t)noncb);
+                        for (size_t i=1;i<b.txs.size();++i) txids.push_back(to_hex(b.txs[i].txid()));
+                        g_telemetry.push_txids(txids);
+                    }
+
+                    log_info("mined block accepted, height=" + std::to_string(bs.height)
                              + ", miner=" + miner_addr
                              + ", coinbase_txid=" + cb_txid_hex
-                             + ", txs=" + std::to_string(std::max(0, noncb)));
+                             + ", txs=" + std::to_string(std::max(0, noncb))
+                             + (bs.fees_known ? (", fees=" + std::to_string(bs.fees)) : ""));
                     if (!g_shutdown_requested.load() && p2p) {
                         p2p->announce_block_async(b.block_hash());
                     }
@@ -846,6 +976,18 @@ static bool env_truthy(const char* name){
     return true;
 }
 
+// small timer for reindex visibility
+struct ScopedTimer {
+    const char* label;
+    std::chrono::steady_clock::time_point t0;
+    explicit ScopedTimer(const char* l):label(l),t0(std::chrono::steady_clock::now()){}
+    ~ScopedTimer(){
+        using namespace std::chrono;
+        auto ms = duration_cast<milliseconds>(steady_clock::now()-t0).count();
+        log_info(std::string(label) + " took " + std::to_string(ms) + " ms");
+    }
+};
+
 // ---------- main -------------------------------------------------------------
 int main(int argc, char** argv){
     std::ios::sync_with_stdio(false);
@@ -877,11 +1019,8 @@ int main(int argc, char** argv){
 
     // Start capture ONLY when TUI is enabled; otherwise keep plain logs to console
     LogCapture capture;
-    if (can_tui) {
-        capture.start();
-    } else {
-        std::fprintf(stderr, "[INFO] TUI disabled (plain logs).\n");
-    }
+    if (can_tui) capture.start();
+    else std::fprintf(stderr, "[INFO] TUI disabled (plain logs).\n");
 
     TUI tui(vt_ok);
     tui.set_enabled(can_tui);
@@ -1000,18 +1139,33 @@ int main(int argc, char** argv){
         if (can_tui) { tui.mark_step_ok("Load & validate genesis"); tui.mark_step_ok("Genesis OK"); }
 
         if (flag_utxo_kv) { log_info("Flag --utxo_kv set (runtime no-op; UTXO KV backend is compiled-in)."); }
+
+        // ===== Reindex UTXO (full scan) visibility & correctness =========
         if (flag_reindex_utxo) {
             if (can_tui) tui.mark_step_started("Reindex UTXO (full scan)");
-            log_info("ReindexUTXO: rebuilding chainstate from active chain...");
-            UTXOKV utxo_kv; std::string err;
-            if (!ReindexUTXO(chain, utxo_kv, /*compact_after=*/true, err)) {
-                log_error(std::string("ReindexUTXO failed: ") + (err.empty() ? "unknown error" : err));
-                if (can_tui) { capture.stop(); tui.stop(); }
-                return 1;
+            const uint64_t target_h = chain.height();
+            log_info(std::string("ReindexUTXO: starting full scan up to height ") + std::to_string(target_h));
+            {
+                ScopedTimer tmr("ReindexUTXO");
+                UTXOKV utxo_kv;
+                // If your UTXOKV requires opening a directory, uncomment and adjust:
+                // std::string err_open;
+                // if (!utxo_kv.open(cfg.datadir + "/chainstate", /*create=*/true, err_open)) {
+                //     log_error("UTXOKV open failed: " + err_open);
+                //     if (can_tui) { capture.stop(); tui.stop(); }
+                //     return 1;
+                // }
+                std::string err;
+                if (!ReindexUTXO(chain, utxo_kv, /*compact_after=*/true, err)) {
+                    log_error(std::string("ReindexUTXO failed: ") + (err.empty() ? "unknown error" : err));
+                    if (can_tui) { capture.stop(); tui.stop(); }
+                    return 1;
+                }
             }
             log_info("ReindexUTXO: done");
             if (can_tui) tui.mark_step_ok("Reindex UTXO (full scan)");
         }
+        // =================================================================
 
         if (can_tui) tui.mark_step_started("Initialize mempool & RPC gate");
         Mempool mempool; RpcService rpc(chain, mempool);
@@ -1082,9 +1236,6 @@ int main(int argc, char** argv){
             rpc_ok = true;
         }
 
-        // surface accepted blocks coming from the network (not just our miner)
-        // by watching chain tip in the main loop below; update g_miner_stats.last_height_rx
-
         // Optional built-in miner
         unsigned threads = 0;
         if (mine_flag) {
@@ -1135,7 +1286,7 @@ int main(int argc, char** argv){
             else tui.set_node_state(TUI::NodeState::Syncing);
         }
 
-        // main loop: feed logs & track network accept events by tip height drift
+        // main loop: feed logs, track network accept events by tip height changes
         uint64_t last_tip_height_seen = 0;
         if (can_tui) {
             while(!g_shutdown_requested.load()){
@@ -1144,7 +1295,6 @@ int main(int argc, char** argv){
                 capture.drain(lines);
                 tui.feed_logs(lines);
 
-                // update "any miner accepted" by watching chain height advance
                 uint64_t h = 0;
                 if (Chain* c = &chain) h = c->height();
                 if (h > last_tip_height_seen){
