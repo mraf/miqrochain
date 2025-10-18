@@ -715,7 +715,7 @@ static void miq_parse_template_txs(const std::string& body, std::vector<MinerTem
                 size_t s=f+6;
                 while(s<obj_end && std::isspace((unsigned char)body[s])) ++s;
                 size_t e=s;
-                while(e<obj_end && (std::isdigit((unsigned char)body[e]) || body[e]=='-' || body[e]=='+')) ++e;
+                while(e<obj_end && (std::isdigit((unsigned char)body[e]) || body[e]=='-' || body[e]=='+' )) ++e;
                 if(e>s){
                     long long v = std::strtoll(body.c_str()+s, nullptr, 10);
                     if(v>0) xt.fee = (uint64_t)v;
@@ -2001,7 +2001,7 @@ int main(int argc, char** argv){
                 const double   round_expect = ui.round_expected_hashes.load();
                 const double   done = (tries_now >= round_start) ? (double)(tries_now - round_start) : 0.0;
                 const double   hps   = std::max(1e-9, ui.hps_smooth.load()+ui.gpu_hps_smooth.load());
-                const double   eta   = (hps > 0.0 && round_expect > done) ? (round_expect - done)/hps : std::numeric_limits<double>::infinity();
+                const double   eta   = (hps > 0.0 && round_expect > done) ? (round_expect - done)/hps : std::limits<double>::infinity();
 
                 std::vector<std::string> lines;
                 lines.push_back("  ##############################   ##############################");
@@ -2059,8 +2059,8 @@ int main(int argc, char** argv){
                     {
                         const uint64_t tip = ui.tip_height.load();
 
-                        uint64_t next_h = ui.est_scanned_height.store(0), dummy=0;
-                        next_h = ui.est_scanned_height.load();
+                        // *** FIXED: read the next height with .load(), not .store() ***
+                        uint64_t next_h = ui.est_scanned_height.load();
                         if (next_h == 0) next_h = 1;
 
                         const uint64_t CHUNK = 128;
