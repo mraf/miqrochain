@@ -1,6 +1,9 @@
-// src/main.cpp — MIQ core entrypoint with hardened Pro TUI 2.0
+// src/main.cpp — MIQ core entrypoint with hardened Pro TUI 2.1
 // Stable release: defensive startup/shutdown, datadir locks, PID file,
 // realistic network hashrate estimation, polished widgets, and safe fallbacks.
+// Adds: precise difficulty/target math (via ldexp), miner share %, distinct
+// miners observed (coinbase recipients) over recent blocks, sorted peer table,
+// and subtle UX refinements. All metrics are computed from local state only.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MSVC niceties
@@ -648,6 +651,15 @@ static inline std::string fmt_bytes(uint64_t v){
     while (x>=1024.0 && i<4){ x/=1024.0; ++i; }
     std::ostringstream o; o<<std::fixed<<std::setprecision(x<10?2:(x<100?1:0))<<x<<" "<<u[i]; return o.str();
 }
+static inline std::string fmt_diff(long double d){
+    if (d < 0) d = 0;
+    long double x = d;
+    const char* u[] = {"", "k", "M", "G", "T", "P", "E"};
+    int i=0;
+    while (x >= 1000.0L && i < 6){ x /= 1000.0L; ++i; }
+    std::ostringstream o; o<<std::fixed<<std::setprecision(x<10?2:(x<100?1:0))<<(double)x<<u[i];
+    return o.str();
+}
 
 static inline std::string bar(int width, double frac, bool vt_ok, int hue_a=36, int hue_b=32){
     if (width < 6) width = 6;
@@ -802,8 +814,8 @@ static long double compact_to_target_ld(uint32_t bits){
     uint32_t mant = bits & 0x007fffff;
     long double m = (long double)mant;
     int shift = (int)exp - 3;
-    long double target = m * std::powl(2.0L, (long double)8*shift);
-    return target;
+    // Precise and portable: ldexp(x,k) = x * 2^k
+    return std::ldexp(m, 8 * shift);
 }
 static long double difficulty_from_bits(uint32_t bits){
     // Relative to "difficulty 1" at GENESIS_BITS (like Bitcoin)
@@ -837,7 +849,7 @@ static double estimate_network_hashrate(Chain* chain){
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-/*                                Pro TUI 2.0                                  */
+/*                                Pro TUI 2.1                                  */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 class TUI {
 public:
@@ -847,7 +859,7 @@ public:
     void set_enabled(bool on){ enabled_ = on; }
     void start() {
         if (!enabled_) return;
-        if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H\x1b[?25l");
+        if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H]\x1b[?25l");
         draw_once(true);
         key_thr_ = std::thread([this]{ key_loop(); });
         thr_     = std::thread([this]{ loop(); });
@@ -969,6 +981,18 @@ private:
         return s.substr(0, (size_t)w-3) + "...";
     }
 
+    // recent miner identities (coinbase recipients) over last K blocks in memory
+    size_t distinct_miners_recent(size_t window) const {
+        std::unordered_set<std::string> uniq;
+        size_t n = recent_blocks_.size();
+        size_t start = (n > window) ? (n - window) : 0;
+        for (size_t i = start; i < n; ++i) {
+            const auto& b = recent_blocks_[i];
+            if (!b.miner.empty()) uniq.insert(b.miner);
+        }
+        return uniq.size();
+    }
+
     void key_loop(){
         key_running_ = true;
 #ifdef _WIN32
@@ -1081,7 +1105,7 @@ private:
         int cols, rows; term::get_winsize(cols, rows);
         if (cols < 114) cols = 114;
         if (rows < 34) rows = 34;
-        const int rightw = std::max(46, cols / 3);
+        const int rightw = std::max(50, cols / 3);
         const int leftw  = cols - rightw - 3;
 
         std::vector<std::string> left, right;
@@ -1178,9 +1202,17 @@ private:
             left.push_back(std::string(C_bold()) + "Chain" + C_reset());
             uint64_t height = chain_ ? chain_->height() : 0;
             std::string tip_hex;
-            if (chain_) { auto t = chain_->tip(); tip_hex = to_hex(t.hash); }
+            long double tip_diff = 0.0L;
+            if (chain_) {
+                auto t = chain_->tip();
+                tip_hex = to_hex(t.hash);
+                tip_diff = difficulty_from_bits(hdr_bits(t));
+            }
             left.push_back(std::string("  height: ") + std::to_string(height)
                           + "   tip: " + short_hex(tip_hex, 12));
+            left.push_back(std::string("  difficulty: ") + fmt_diff(tip_diff)
+                          + "   net hashrate: " + fmt_hs(net_hashrate_));
+            left.push_back(std::string("  trend:      ") + spark_ascii(net_spark_));
             // recent blocks
             size_t N = recent_blocks_.size();
             size_t show = std::min<size_t>(8, N);
@@ -1203,6 +1235,15 @@ private:
         if (p2p_) {
             right.push_back(std::string(C_bold()) + "Network" + C_reset());
             auto peers = p2p_->snapshot_peers();
+
+            // Sort peers: verack_ok first, lowest latency, lowest rxbuf, lowest inflight
+            std::stable_sort(peers.begin(), peers.end(), [](const auto& a, const auto& b){
+                if (a.verack_ok != b.verack_ok) return a.verack_ok > b.verack_ok;
+                if (a.last_seen_ms != b.last_seen_ms) return a.last_seen_ms < b.last_seen_ms;
+                if (a.rx_buf != b.rx_buf) return a.rx_buf < b.rx_buf;
+                return a.inflight < b.inflight;
+            });
+
             size_t peers_n = peers.size();
             size_t inflight_tx = 0, rxbuf_sum = 0, awaiting_pongs = 0, verack_ok = 0;
             for (auto& s : peers) { inflight_tx += (size_t)s.inflight; rxbuf_sum += (size_t)s.rx_buf; if (s.awaiting_pong) ++awaiting_pongs; if (s.verack_ok) ++verack_ok; }
@@ -1213,27 +1254,25 @@ private:
                             + "   pings-waiting: " + std::to_string(awaiting_pongs));
             // show top peers table
             std::ostringstream hdr;
-            hdr << "    " << std::left << std::setw(16) << "IP"
-                << "  v/ok  " << std::setw(8) << "last(ms)"
-                << "  " << std::setw(6) << "rx"
-                << "  " << std::setw(8) << "inflight";
+            hdr << "    " << std::left << std::setw(18) << "IP"
+                << " " << std::setw(5) << "ok"
+                << " " << std::setw(8) << "last(ms)"
+                << " " << std::setw(7) << "rx"
+                << " " << std::setw(8) << "inflight";
             right.push_back(hdr.str());
             size_t show = std::min(peers.size(), (size_t)8);
             for (size_t i=0;i<show; ++i) {
                 const auto& s = peers[i];
-                std::string ip = s.ip; if ((int)ip.size() > 16) ip = ip.substr(0,13) + "...";
+                std::string ip = s.ip; if ((int)ip.size() > 18) ip = ip.substr(0,15) + "...";
                 std::ostringstream ln;
-                ln << "    " << std::left << std::setw(16) << ip
-                   << "  " << (s.verack_ok ? (std::string(C_ok()) + "ok" + C_reset()) : (std::string(C_warn()) + ".." + C_reset())) << "    "
-                   << std::right << std::setw(8) << (uint64_t)s.last_seen_ms
-                   << "  " << std::setw(6) << (uint64_t)s.rx_buf
-                   << "  " << std::setw(8) << (uint64_t)s.inflight;
+                ln << "    " << std::left << std::setw(18) << ip
+                   << " " << std::setw(5) << (s.verack_ok ? (std::string(C_ok()) + "ok" + C_reset()) : (std::string(C_warn()) + ".." + C_reset()))
+                   << " " << std::right << std::setw(8) << (uint64_t)s.last_seen_ms
+                   << " " << std::setw(7) << (uint64_t)s.rx_buf
+                   << " " << std::setw(8) << (uint64_t)s.inflight;
                 right.push_back(ln.str());
             }
             if (peers.size() > show) right.push_back(std::string("    ... +") + std::to_string(peers.size()-show) + " more");
-            // network hashrate
-            right.push_back(std::string("  net hashrate: ") + fmt_hs(net_hashrate_));
-            right.push_back(std::string("  trend:        ") + spark_ascii(net_spark_));
             right.push_back("");
         }
 
@@ -1264,6 +1303,18 @@ private:
             std::ostringstream m2; m2 << "  accepted: " << ok << "   rejected: " << rej; right.push_back(m2.str());
             right.push_back(std::string("  miner hashrate: ") + fmt_hs(hps));
             right.push_back(std::string("  miner trend:    ") + spark_ascii(spark_hs_));
+            // network & share
+            double share = (net_hashrate_ > 0.0) ? (hps / net_hashrate_) * 100.0 : 0.0;
+            if (share < 0.0) share = 0.0;
+            if (share > 100.0) share = 100.0;
+            std::ostringstream m3; m3 << "  network (est):  " << fmt_hs(net_hashrate_)
+                                      << "   your share: " << std::fixed << std::setprecision(3) << share << "%";
+            right.push_back(m3.str());
+            // observed miners (distinct coinbase recipients) over recent window
+            size_t miners_obs = distinct_miners_recent(64);
+            std::ostringstream m4; m4 << "  miners observed (last 64 blks): " << miners_obs;
+            right.push_back(m4.str());
+            right.push_back(std::string("  ") + C_dim() + "* count = distinct coinbase recipients seen by this node" + C_reset());
             right.push_back("");
         }
 
@@ -1861,7 +1912,7 @@ int main(int argc, char** argv){
         uint64_t last_tip_height_seen = chain.height();
         uint64_t last_tip_change_ms   = now_ms();
         uint64_t last_peer_warn_ms    = 0;
-        uint64_t start_of_run_ms      = now_ms(); // <-- fixes previous undefined var
+        uint64_t start_of_run_ms      = now_ms();
 
         // main loop
         while(!global::shutdown_requested.load()){
