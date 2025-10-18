@@ -111,10 +111,12 @@ struct TxParsed {
     std::vector<Out> vout;
 };
 
+// --- Bitcoin-like (fallback only; MIQ path is primary) ---
 static bool parse_tx_bitcoin(R& r, TxParsed& out){
     size_t start = r.tell();
     uint32_t version=0; if(!r.get(&version,4)) return false;
 
+    // (No segwit support; not needed for MIQ. Keep it minimal.)
     uint64_t in_count=0; if(!get_varint(r, in_count)) return false;
     out.vin.clear(); out.vin.reserve((size_t)in_count);
     for(uint64_t i=0;i<in_count;i++){
@@ -163,10 +165,13 @@ static bool parse_tx_bitcoin(R& r, TxParsed& out){
     return true;
 }
 
-// MIQ-compact tx (prefixed by u32 size)
+// --- MIQ compact (primary) ---
 static bool parse_tx_miq_blockwrapped(R& r, TxParsed& out){
     if(!r.need(4)) return false;
     uint32_t tx_size = rd_u32_le(r.p + r.pos); r.pos += 4;
+
+    const uint32_t MAX_TX_SIZE = env_u32("MIQ_MAX_TX_SIZE", 900u*1024u); // align with node hint
+    if (tx_size == 0 || tx_size > MAX_TX_SIZE) return false;
     if(!r.need(tx_size)) return false;
 
     size_t start = r.tell();
@@ -223,37 +228,47 @@ static bool parse_tx_miq_blockwrapped(R& r, TxParsed& out){
     return true;
 }
 
+// Try MIQ block first (our chain), then conservative Bitcoin as a fallback
 static bool parse_block_collect(const std::vector<uint8_t>& raw,
                                 std::vector<TxParsed>& out_txs)
 {
     out_txs.clear();
 
-    // Try Bitcoin-like block first
+    // --- MIQ compact (primary) ---
     {
         R r(raw);
-        if(!r.need(80)) goto try_miq;
+        if(!r.need(80)) return false;
         r.skip(80);
-        uint64_t txcnt=0; if(!get_varint(r, txcnt)) goto try_miq;
-        std::vector<TxParsed> txs; txs.reserve((size_t)txcnt);
-        for(uint64_t i=0;i<txcnt;i++){
-            TxParsed t; if(!parse_tx_bitcoin(r, t)) goto try_miq;
+
+        if(!r.need(4)) return false;
+        uint32_t txcnt = rd_u32_le(r.p + r.pos); r.pos += 4;
+
+        const uint32_t MAX_TXS = env_u32("MIQ_MAX_TXS_PER_BLOCK", 10000);
+        if (txcnt > MAX_TXS) return false;
+
+        std::vector<TxParsed> txs; txs.reserve(txcnt);
+        for(uint32_t i=0;i<txcnt;i++){
+            TxParsed t; if(!parse_tx_miq_blockwrapped(r, t)) { txs.clear(); goto try_bitcoin; }
             txs.push_back(std::move(t));
         }
         out_txs.swap(txs);
         return true;
     }
 
-try_miq:
-    // MIQ-compact
+try_bitcoin:
+    // --- Bitcoin-like (fallback only) ---
     {
         R r2(raw);
         if(!r2.need(80)) return false;
         r2.skip(80);
-        if(!r2.need(4)) return false;
-        uint32_t txcnt = rd_u32_le(r2.p + r2.pos); r2.pos += 4;
-        std::vector<TxParsed> txs; txs.reserve(txcnt);
-        for(uint32_t i=0;i<txcnt;i++){
-            TxParsed t; if(!parse_tx_miq_blockwrapped(r2, t)) return false;
+        uint64_t txcnt=0; if(!get_varint(r2, txcnt)) return false;
+
+        const uint64_t MAX_TXS_BTC = env_u32("MIQ_MAX_TXS_PER_BLOCK_BTC", 5000);
+        if(txcnt > MAX_TXS_BTC) return false;
+
+        std::vector<TxParsed> txs; txs.reserve((size_t)txcnt);
+        for(uint64_t i=0;i<txcnt;i++){
+            TxParsed t; if(!parse_tx_bitcoin(r2, t)) return false;
             txs.push_back(std::move(t));
         }
         out_txs.swap(txs);
@@ -384,7 +399,7 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     P2POpts po;
     po.host = p2p_host;
     po.port = p2p_port;
-    po.user_agent = "/miqwallet-spv:0.4/";
+    po.user_agent = "/miqwallet-spv:0.5/"; // bumped ua
     P2PLight p2p;
     if(!p2p.connect_and_handshake(po, err)) return false;
 
@@ -422,7 +437,8 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
 
     // 5) block enumeration for [start_h .. tip_height]
     std::vector<std::pair<std::vector<uint8_t>, uint32_t>> blocks;
-    if(!p2p.match_recent_blocks(/*pkhs*/{}, start_h, tip_height, blocks, err)){ p2p.close(); return false; }
+    // IMPORTANT: ask peer to pre-filter using our PKHs
+    if(!p2p.match_recent_blocks(pkhs, start_h, tip_height, blocks, err)){ p2p.close(); return false; }
 
     // 6) fast PKH lookup
     std::unordered_set<std::vector<uint8_t>, VecHash> pkhset(pkhs.begin(), pkhs.end());
