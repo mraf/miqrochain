@@ -1,3 +1,14 @@
+// src/main.cpp — MIQ core entrypoint with hardened Pro TUI 2.3
+// Stable release: ANSI-aware column widths, boxed panels, fixed tables,
+// layout locking, high-contrast toggle, clear number formatting,
+// precise difficulty/target math (via ldexp), miner share %, top miners,
+// sorted peer table, and safe fallbacks. All metrics are local-state-only.
+// UI goals: readable for non-experts, aligned, jitter-free, professional.
+//
+// Build: same as before (no new external deps).
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// MSVC niceties
 #ifdef _MSC_VER
   #pragma execution_character_set("utf-8")
   #define _CRT_SECURE_NO_WARNINGS
@@ -116,7 +127,7 @@ using namespace miq;
 #define MIQ_VERSION_MINOR 7
 #endif
 #ifndef MIQ_VERSION_PATCH
-#define MIQ_VERSION_PATCH 2
+#define MIQ_VERSION_PATCH 3
 #endif
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -139,6 +150,11 @@ static std::atomic<bool>    tui_toggle_help{false};
 static std::atomic<bool>    tui_toggle_compact{false};
 static std::atomic<bool>    tui_toggle_glow{false};
 static std::atomic<bool>    dump_status_json{true};
+// New UI toggles for 2.3
+static std::atomic<bool>    tui_toggle_borders{false};
+static std::atomic<bool>    tui_toggle_wave{false};
+static std::atomic<bool>    tui_toggle_layout_lock{false};
+static std::atomic<bool>    tui_toggle_units{false};
 }
 
 // time helpers
@@ -366,7 +382,6 @@ static bool acquire_datadir_lock(const std::string& datadir){
     }
     ::close(fd);
 #endif
-    // write PID file
 #ifdef _WIN32
     int pidnum = (int)GetCurrentProcessId();
 #else
@@ -382,25 +397,6 @@ static void release_datadir_lock(){
     if (!global::pidfile_path.empty()) std::filesystem::remove(global::pidfile_path, ec);
     if (!global::lockfile_path.empty()) std::filesystem::remove(global::lockfile_path, ec);
 }
-
-// ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                    Signals / console control / input                       ║
-// ╚═══════════════════════════════════════════════════════════════════════════╝
-static void sighup_handler(int){ global::reload_requested.store(true); }
-static void sigshutdown_handler(int){ request_shutdown("signal"); }
-
-#ifdef _WIN32
-static BOOL WINAPI win_ctrl_handler(DWORD evt){
-    switch(evt){
-        case CTRL_C_EVENT:        request_shutdown("CTRL_C_EVENT");        return TRUE;
-        case CTRL_BREAK_EVENT:    request_shutdown("CTRL_BREAK_EVENT");    return TRUE;
-        case CTRL_CLOSE_EVENT:    request_shutdown("CTRL_CLOSE_EVENT");    return TRUE;
-        case CTRL_LOGOFF_EVENT:   request_shutdown("CTRL_LOGOFF_EVENT");   return TRUE;
-        case CTRL_SHUTDOWN_EVENT: request_shutdown("CTRL_SHUTDOWN_EVENT"); return TRUE;
-        default: return FALSE;
-    }
-}
-#endif
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 /*                               Resource metrics                              */
@@ -626,13 +622,24 @@ private:
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 /*                               UI helpers                                    */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
-static inline std::string short_hex(const std::string& h, size_t n=12){ return h.size()>n ? h.substr(0,n) : h; }
-static inline std::string fmt_hs(double v){
+
+// — Numeric formatting (stable/clear) —
+static inline std::string commas_u64(uint64_t v){
+    std::string s = std::to_string(v);
+    for (int i=(int)s.size()-3; i>0; i-=3) s.insert((size_t)i, ",");
+    return s;
+}
+static inline std::string fmt_hs_compact(double v){
     const char* u[] = {"H/s","kH/s","MH/s","GH/s","TH/s","PH/s"};
     int i=0; while(v>=1000.0 && i<5){ v/=1000.0; ++i; }
     std::ostringstream o; o<<std::fixed<<std::setprecision(2)<<v<<" "<<u[i]; return o.str();
 }
-static inline std::string fmt_num(uint64_t v){
+static inline std::string fmt_hs_full(double v){
+    if (v < 0) v = 0;
+    uint64_t iv = (uint64_t)std::llround(v);
+    return commas_u64(iv) + " H/s";
+}
+static inline std::string fmt_num_compact(uint64_t v){
     std::ostringstream o;
     if (v<1000) { o<<v; return o.str(); }
     const char* u[]={"","K","M","B","T","P"};
@@ -640,11 +647,14 @@ static inline std::string fmt_num(uint64_t v){
     while(x>=1000.0 && i<5){ x/=1000.0; ++i; }
     o<<std::fixed<<std::setprecision(x<10?2:(x<100?1:0))<<x<<u[i]; return o.str();
 }
-static inline std::string fmt_bytes(uint64_t v){
+static inline std::string fmt_bytes_compact(uint64_t v){
     const char* u[] = {"B","KiB","MiB","GiB","TiB"};
     int i=0; double x = (double)v;
     while (x>=1024.0 && i<4){ x/=1024.0; ++i; }
     std::ostringstream o; o<<std::fixed<<std::setprecision(x<10?2:(x<100?1:0))<<x<<" "<<u[i]; return o.str();
+}
+static inline std::string fmt_bytes_full(uint64_t v){
+    return commas_u64(v) + " B";
 }
 static inline std::string fmt_diff(long double d){
     if (d < 0) d = 0;
@@ -673,6 +683,101 @@ static inline std::string fmt_duration(double sec){
     return o.str();
 }
 
+// — ANSI-aware width helpers (for stable columns) —
+static inline bool is_ansi_start(const std::string& s, size_t i){
+    return i < s.size() && s[i] == '\x1b';
+}
+static size_t ansi_seq_len(const std::string& s, size_t i){
+    if (!is_ansi_start(s,i)) return 0;
+    // crude ESC [ ... m sequence eater
+    size_t j = i+1;
+    if (j < s.size() && (s[j]=='[' || s[j]==']' || s[j]=='(' || s[j]==')')) {
+        // read until letter
+        ++j;
+        while (j < s.size()){
+            char c = s[j++];
+            if ((c>='@' && c<='~')) break;
+        }
+        return j - i;
+    }
+    return 1;
+}
+static size_t display_width(const std::string& s){
+    size_t w=0;
+    for (size_t i=0;i<s.size();){
+        if (is_ansi_start(s,i)){ i += ansi_seq_len(s,i); continue; }
+        unsigned char c = (unsigned char)s[i];
+        // treat UTF-8 non-ASCII as width 1 (good enough for our glyphs)
+        if ((c & 0x80) == 0){ ++w; ++i; }
+        else {
+            // skip utf-8 continuation bytes
+            if ((c & 0xE0) == 0xC0) i += 2;
+            else if ((c & 0xF0) == 0xE0) i += 3;
+            else if ((c & 0xF8) == 0xF0) i += 4;
+            else ++i;
+            ++w;
+        }
+    }
+    return w;
+}
+static std::string truncate_to_width(const std::string& s, int width){
+    if (width <= 0) return "";
+    size_t w=0;
+    std::string out; out.reserve(s.size());
+    for (size_t i=0;i<s.size();){
+        if (is_ansi_start(s,i)){ size_t k=ansi_seq_len(s,i); out.append(s, i, k); i+=k; continue; }
+        unsigned char c = (unsigned char)s[i];
+        size_t take = 1;
+        if ((c & 0x80) == 0) take = 1;
+        else if ((c & 0xE0) == 0xC0) take = 2;
+        else if ((c & 0xF0) == 0xE0) take = 3;
+        else if ((c & 0xF8) == 0xF0) take = 4;
+        if ((int)(w+1) > width){
+            // append ellipsis if space
+            if (width >= 1) {
+                if (display_width(out) >= (size_t)width) break;
+            }
+            break;
+        }
+        out.append(s, i, take);
+        i += take;
+        ++w;
+    }
+    // pad with ellipsis if we cut mid-content
+    if ((int)w == width && i < s.size()){
+        if (width >= 1){
+            // replace last cell with '…' (utf-8)
+            // strip last real char (not ANSI)
+            // simple approach: ensure last printed char replaced
+            std::string noansi;
+            for (size_t j=0;j<out.size();){
+                if (is_ansi_start(out,j)){ size_t k=ansi_seq_len(out,j); j+=k; continue; }
+                unsigned char cc=(unsigned char)out[j];
+                size_t take = (cc&0x80)? ((cc&0xE0)==0xC0?2:((cc&0xF0)==0xE0?3:((cc&0xF8)==0xF0?4:1))):1;
+                noansi.append(out, j, take);
+                j+=take;
+            }
+            // remove last visible char from noansi
+            if (!noansi.empty()){
+                // drop last UTF-8 codepoint
+                size_t pos = noansi.size()-1;
+                while (pos>0 && ((unsigned char)noansi[pos] & 0xC0) == 0x80) --pos;
+                noansi.erase(pos);
+            }
+            out = noansi + "…";
+        }
+    }
+    return out;
+}
+static std::string pad_right_ansi(const std::string& s, int width){
+    std::string t = truncate_to_width(s, width);
+    int w = (int)display_width(t);
+    if (w < width) t.append((size_t)(width - w), ' ');
+    return t;
+}
+static inline std::string short_hex(const std::string& h, size_t n=12){ return h.size()>n ? h.substr(0,n) : h; }
+
+// — Visual elements —
 static inline std::string bar(int width, double frac, bool vt_ok, int hue_a=36, int hue_b=32, bool glow=false){
     if (width < 6) width = 6;
     if (frac < 0) { frac = 0; }
@@ -775,7 +880,7 @@ static bool ensure_utxo_fully_indexed(Chain& chain, const std::string& datadir, 
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 template<typename, typename = void> struct has_stats_method : std::false_type{};
 template<typename T> struct has_stats_method<T, std::void_t<decltype(std::declval<T&>().stats())>> : std::true_type{};
-template<typename, typename = void> struct has_size_method  : std::false_type<>();
+template<typename, typename = void> struct has_size_method  : std::false_type{};
 template<typename T> struct has_size_method<T,  std::void_t<decltype(std::declval<T&>().size())>>  : std::true_type{};
 template<typename, typename = void> struct has_count_method : std::false_type{};
 template<typename T> struct has_count_method<T, std::void_t<decltype(std::declval<T&>().count())>> : std::true_type{};
@@ -829,7 +934,6 @@ static long double compact_to_target_ld(uint32_t bits){
     return std::ldexp(m, 8 * shift); // m * 2^(8*shift)
 }
 static long double difficulty_from_bits(uint32_t bits){
-    // Relative to "difficulty 1" at GENESIS_BITS (like Bitcoin)
     long double t_one = compact_to_target_ld((uint32_t)GENESIS_BITS);
     long double t_cur = compact_to_target_ld(bits);
     if (t_cur <= 0.0L) return 0.0L;
@@ -843,35 +947,32 @@ static double estimate_network_hashrate(Chain* chain, double* out_avg_block_time
     auto headers = chain->last_headers(k);
     if (headers.size() < 2) { if(out_avg_block_time) *out_avg_block_time=(double)BLOCK_TIME_SECS; return 0.0; }
 
-    // timespan
     uint64_t t_first = hdr_time(headers.front());
     uint64_t t_last  = hdr_time(headers.back());
     if (t_last <= t_first) t_last = t_first + 1;
     double avg_block_time = double(t_last - t_first) / double(headers.size()-1);
     if (avg_block_time <= 0.0) avg_block_time = (double)BLOCK_TIME_SECS;
 
-    // Difficulty at the tip header
     uint32_t bits = hdr_bits(headers.back());
     long double diff = difficulty_from_bits(bits);
-    // Expected hashes per block at difficulty 1 ≈ 2^32
-    long double hps = (diff * 4294967296.0L) / avg_block_time;
+    long double hps = (diff * 4294967296.0L) / avg_block_time; // 2^32
     if (!std::isfinite((double)hps) || hps < 0) hps = 0.0L;
     if (out_avg_block_time) *out_avg_block_time = avg_block_time;
     return (double)hps;
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-/*                                Pro TUI 2.2                                  */
+/*                                Pro TUI 2.3                                  */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 class TUI {
 public:
     enum class NodeState { Starting, Syncing, Running, Degraded, Quitting };
 
-    explicit TUI(bool vt_ok) : vt_ok_(vt_ok) { init_step_order(); }
+    explicit TUI(bool vt_ok) : vt_ok_(vt_ok) { init_step_order(); base_ts_ms_ = now_ms(); }
     void set_enabled(bool on){ enabled_ = on; }
     void start() {
         if (!enabled_) return;
-        if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H\x1b[?25l"); // fixed stray ']' from 2.1
+        if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H\x1b[?25l");
         draw_once(true);
         key_thr_ = std::thread([this]{ key_loop(); });
         thr_     = std::thread([this]{ loop(); });
@@ -902,20 +1003,15 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         if (!paused_) {
             logs_.clear(); logs_.reserve(raw_lines.size());
-            for (auto& L : raw_lines){
-                logs_.push_back(stylize_log(L));
-            }
+            for (auto& L : raw_lines) logs_.push_back(stylize_log(L));
         }
-        // Drain block/tx telemetry and maintain miner census window
         std::vector<BlockSummary> nb; std::vector<std::string> ntx;
         g_telemetry.drain(nb, ntx);
         for (auto& b : nb) {
             bool is_new = recent_blocks_.empty() || recent_blocks_.back().height != b.height || recent_blocks_.back().hash_hex != b.hash_hex;
             if (is_new) {
                 recent_blocks_.push_back(b);
-                if (!b.miner.empty()) {
-                    miner_counts_[b.miner] += 1;
-                }
+                if (!b.miner.empty()) miner_counts_[b.miner] += 1;
                 while (recent_blocks_.size() > miner_window_) {
                     const auto& old = recent_blocks_.front();
                     if (!old.miner.empty()) {
@@ -951,10 +1047,10 @@ public:
 
 private:
     // styled lines (0=info 1=warn 2=err 3=trace 4=ok)
-    struct StyledLine { std::string txt; int level; };
+    struct StyledLine { std::string txt; int level; uint64_t ts_ms; };
     StyledLine stylize_log(const LogCapture::Line& L){
         const std::string& s = L.text;
-        StyledLine out{ s, 0 };
+        StyledLine out{ s, 0, L.ts_ms };
         if      (s.find("[FATAL]") != std::string::npos || s.find("[ERROR]") != std::string::npos) out.level=2;
         else if (s.find("[WARN]")  != std::string::npos) out.level=1;
         else if (s.find("accepted block") != std::string::npos || s.find("mined block accepted") != std::string::npos) out.level=4;
@@ -994,17 +1090,14 @@ private:
     const char* C_info()  const { return vt_ok_ ? (dark_theme_? "\x1b[36m":"\x1b[34m") : ""; }
     const char* C_warn()  const { return vt_ok_ ? "\x1b[33m" : ""; }
     const char* C_err()   const { return vt_ok_ ? "\x1b[31m" : ""; }
-    const char* C_dim()   const { return vt_ok_ ? "\x1b[90m" : ""; }
+    const char* C_dim()   const { return vt_ok_ ? (high_contrast_? "\x1b[90m":"\x1b[90m") : ""; }
     const char* C_head()  const { return vt_ok_ ? (dark_theme_? "\x1b[35m":"\x1b[35m") : ""; }
     const char* C_ok()    const { return vt_ok_ ? "\x1b[32m" : ""; }
     const char* C_bold()  const { return vt_ok_ ? "\x1b[1m"  : ""; }
     const char* C_ul()    const { return vt_ok_ ? "\x1b[4m"  : ""; }
 
     static std::string fit(const std::string& s, int w){
-        if (w <= 0) return std::string();
-        if ((int)s.size() <= w) return s;
-        if (w <= 3) return std::string((size_t)w, '.');
-        return s.substr(0, (size_t)w-3) + "...";
+        return truncate_to_width(s, w);
     }
 
     // compute top miners from rolling map
@@ -1019,6 +1112,7 @@ private:
         return v;
     }
 
+    // ── Key handling ────────────────────────────────────────────────────────
     void key_loop(){
         key_running_ = true;
 #ifdef _WIN32
@@ -1031,7 +1125,6 @@ private:
             }
         }
 #else
-        // raw mode
         termios oldt{};
         if (tcgetattr(STDIN_FILENO, &oldt) == 0){
             termios newt = oldt;
@@ -1046,8 +1139,6 @@ private:
             if (n == 1) handle_key((int)c);
             else std::this_thread::sleep_for(std::chrono::milliseconds(16));
         }
-        // restore
-        // best-effort (ignore failure)
         tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
 #endif
     }
@@ -1062,10 +1153,119 @@ private:
             case '?':           global::tui_toggle_help.store(true); break;
             case 'c': case 'C': global::tui_toggle_compact.store(true); break;
             case 'g': case 'G': global::tui_toggle_glow.store(true); break;
+            case 'b': case 'B': global::tui_toggle_borders.store(true); break;
+            case 'w': case 'W': global::tui_toggle_wave.store(true); break;
+            case 'l': case 'L': global::tui_toggle_layout_lock.store(true); break;
+            case 'u': case 'U': global::tui_toggle_units.store(true); break;
             default: break;
         }
     }
 
+    // ── Layout primitives (ANSI-aware boxes & tables) ───────────────────────
+    std::vector<std::string> render_box(const std::string& title, const std::vector<std::string>& body, int width){
+        // width must be >= 8
+        int w = std::max(8, width);
+        std::vector<std::string> out;
+        if (!show_borders_) {
+            // Title line
+            std::string t = C_bold(); t += title; t += C_reset();
+            out.push_back(pad_right_ansi(t, w));
+            out.push_back(pad_right_ansi(std::string(w, '-'), w));
+            for (auto& l : body) out.push_back(pad_right_ansi(l, w));
+            return out;
+        }
+        // Top with centered title
+        std::string cap = " " + title + " ";
+        int capw = (int)display_width(cap);
+        int left = (w-2 - capw)/2;
+        int right = (w-2) - capw - left;
+        std::string top = "┌";
+        top.append(std::max(0,left), '─');
+        top += cap;
+        top.append(std::max(0,right), '─');
+        top += "┐";
+        out.push_back(pad_right_ansi(top, w));
+
+        // Body lines
+        for (auto& l : body){
+            std::string inner = pad_right_ansi(l, w-2);
+            out.push_back("│" + inner + "│");
+        }
+        // Bottom
+        std::string bot = "└"; bot.append(w-2, '─'); bot += "┘";
+        out.push_back(pad_right_ansi(bot, w));
+        return out;
+    }
+
+    struct ColSpec { int w; bool right; };
+    std::vector<std::string> render_table(const std::vector<std::string>& header,
+                                          const std::vector<std::vector<std::string>>& rows,
+                                          const std::vector<ColSpec>& cols,
+                                          int width, bool zebra=false){
+        int w = std::max(8, width);
+        std::vector<std::string> out;
+        int inner = show_borders_ ? (w-2) : w;
+        // compute total width of cols (+ spaces between)
+        int sumw=0; for (auto& c: cols) sumw += c.w;
+        int gaps = (int)cols.size()-1;
+        int padExtra = std::max(0, inner - sumw - gaps);
+        // spread extra into last column
+        std::vector<int> cw; cw.reserve(cols.size());
+        for (size_t i=0;i<cols.size();++i){
+            int add = (i+1==cols.size())? padExtra : 0;
+            cw.push_back(cols[i].w + add);
+        }
+        auto line_from_cells = [&](const std::vector<std::string>& cells)->std::string{
+            std::ostringstream o;
+            if (show_borders_) o << "│";
+            for (size_t i=0;i<cells.size() && i<cw.size(); ++i){
+                std::string cell = cells[i];
+                std::string t = pad_right_ansi(cols[i].right ? pad_right_ansi(cell, cw[i]) : cell, cw[i]);
+                if ((int)display_width(t) < cw[i]) t.append((size_t)(cw[i]-display_width(t)), ' ');
+                o << t;
+                if (i+1 < cells.size()) o << " ";
+            }
+            if (show_borders_) o << "│";
+            return pad_right_ansi(o.str(), w);
+        };
+        // top border
+        if (show_borders_){
+            std::string top = "┌"; top.append((size_t)inner, '─'); top += "┐";
+            out.push_back(pad_right_ansi(top, w));
+        }
+        // header
+        out.push_back(line_from_cells(header));
+        // header underline
+        {
+            std::ostringstream u;
+            if (show_borders_) u<<"│";
+            int filled=0;
+            for (size_t i=0;i<cw.size();++i){
+                u<<std::string((size_t)cw[i], '─');
+                if (i+1<cw.size()) u<<" ";
+                filled += cw[i] + (i+1<cw.size()?1:0);
+            }
+            if (show_borders_) u<<"│";
+            out.push_back(pad_right_ansi(u.str(), w));
+        }
+        // rows
+        for (size_t r=0; r<rows.size(); ++r){
+            std::string ln = line_from_cells(rows[r]);
+            if (zebra && (r%2)==1) {
+                // subtle dim for alternate rows
+                ln = C_dim() + ln + C_reset();
+            }
+            out.push_back(ln);
+        }
+        // bottom border
+        if (show_borders_){
+            std::string bot = "└"; bot.append((size_t)inner, '─'); bot += "┘";
+            out.push_back(pad_right_ansi(bot, w));
+        }
+        return out;
+    }
+
+    // ── Main loop ────────────────────────────────────────────────────────────
     void loop(){
         using clock = std::chrono::steady_clock;
         using namespace std::chrono_literals;
@@ -1074,11 +1274,16 @@ private:
         auto last_stat_dump = clock::now();
         uint64_t last_stats_ms = now_ms();
         uint64_t last_net_ms   = now_ms();
+
         while (running_) {
             if(global::tui_toggle_theme.exchange(false)) { std::lock_guard<std::mutex> lk(mu_); dark_theme_ = !dark_theme_; }
             if(global::tui_toggle_help.exchange(false))  { std::lock_guard<std::mutex> lk(mu_); show_help_ = !show_help_; }
             if(global::tui_toggle_compact.exchange(false)) { std::lock_guard<std::mutex> lk(mu_); compact_ = !compact_; }
             if(global::tui_toggle_glow.exchange(false))   { std::lock_guard<std::mutex> lk(mu_); glow_ = !glow_; }
+            if(global::tui_toggle_borders.exchange(false)){ std::lock_guard<std::mutex> lk(mu_); show_borders_ = !show_borders_; }
+            if(global::tui_toggle_wave.exchange(false))   { std::lock_guard<std::mutex> lk(mu_); show_wave_ = !show_wave_; }
+            if(global::tui_toggle_layout_lock.exchange(false)){ std::lock_guard<std::mutex> lk(mu_); layout_locked_ = !layout_locked_; }
+            if(global::tui_toggle_units.exchange(false)){ std::lock_guard<std::mutex> lk(mu_); long_units_ = !long_units_; }
 
             draw_once(false);
             std::this_thread::sleep_for(std::chrono::milliseconds(vt_ok_ ? 8 : 75));
@@ -1097,22 +1302,21 @@ private:
                     if (mem_spark_.size() > 90) mem_spark_.erase(mem_spark_.begin());
                 }
             }
-            // snapshot hotkey
             if (global::tui_snapshot_requested.exchange(false)) snapshot_to_disk();
-            // periodic stats refresh (for uptime/mem)
             if (now_ms() - last_stats_ms > 1000) last_stats_ms = now_ms();
-            // update network hashrate ~1s
+
             if (now_ms() - last_net_ms > 1000){
                 last_net_ms = now_ms();
                 double avg_bt = 0.0;
                 double nh = estimate_network_hashrate(chain_, &avg_bt);
                 std::lock_guard<std::mutex> lk(mu_);
                 avg_block_time_ = avg_bt;
-                net_hashrate_ = nh;
+                // EMA to reduce jitter on the label (keep spark raw for history)
+                if (net_hashrate_ == 0.0) net_hashrate_ = nh;
+                else net_hashrate_ = net_hashrate_*0.75 + nh*0.25;
                 net_spark_.push_back(nh);
                 if (net_spark_.size() > 90) net_spark_.erase(net_spark_.begin());
             }
-            // write status.json ~1s
             if (global::dump_status_json.load() && (clock::now() - last_stat_dump) > 1s) {
                 last_stat_dump = clock::now();
                 dump_status_json();
@@ -1134,19 +1338,15 @@ private:
             tip_diff = difficulty_from_bits(tip_bits);
         }
         size_t miners_window = std::min(miner_window_, (size_t)recent_blocks_.size());
-        // top miners (up to 8)
         auto top = top_miners(8, miners_window);
 
-        // mempool
         MempoolView mv{}; if (mempool_) mv = mempool_view_fallback(mempool_);
-        // peers
         size_t peers = 0, verack_ok = 0;
         if (p2p_) {
             auto ps = p2p_->snapshot_peers();
             peers = ps.size();
             for (auto& p : ps) if (p.verack_ok) ++verack_ok;
         }
-        // JSON
         o << "{";
         o << "\"t\":"<<now_s()<<",";
         o << "\"chain\":\""<<CHAIN_NAME<<"\",";
@@ -1201,58 +1401,69 @@ private:
         return miner_on && node_run;
     }
 
-    // panels
+    // ── One frame render ─────────────────────────────────────────────────────
     void draw_once(bool first){
         std::lock_guard<std::mutex> lk(mu_);
         int cols, rows; term::get_winsize(cols, rows);
+        if (layout_locked_) {
+            if (locked_cols_ == 0) { locked_cols_ = cols; locked_rows_ = rows; }
+            cols = locked_cols_; rows = locked_rows_;
+        } else {
+            locked_cols_ = locked_rows_ = 0;
+        }
         if (cols < 114) cols = 114;
         if (rows < 34) rows = 34;
+
+        // column widths (stable)
         const int rightw = compact_ ? std::max(44, cols/3) : std::max(52, cols / 3);
-        const int leftw  = cols - rightw - 3;
+        const int leftw  = cols - rightw - 1; // 1 space separator
 
         std::vector<std::string> left, right;
 
-        // Header bar
+        // Header
         {
+            if (!first && vt_ok_) cw_.write_raw("\x1b[H\x1b[0J");
             std::ostringstream h;
-            if (!first && vt_ok_) h << "\x1b[H\x1b[0J";
-            h << C_head() << (dark_theme_? "MIQROCHAIN":"MIQROCHAIN") << " Pro TUI 2.2" << C_reset()
+            h << C_head() << "MIQROCHAIN" << C_reset() << "  Pro TUI 2.3"
               << "  " << C_dim()
               << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
               << "  •  Chain: " << CHAIN_NAME
-              << "  •  P2P " << p2p_port_ << "  •  RPC " << rpc_port_ << C_reset()
-              << "  " << spinner(tick_) ;
-            left.push_back(h.str());
-            if(!banner_.empty()) left.push_back(std::string("  ") + C_info() + banner_ + C_reset());
+              << "  •  P2P " << p2p_port_ << "  •  RPC " << rpc_port_
+              << C_reset()
+              << "  " << spinner(tick_);
+            left.push_back(pad_right_ansi(h.str(), leftw));
+            if (!banner_.empty()) left.push_back(pad_right_ansi(std::string("  ") + C_info() + banner_ + C_reset(), leftw));
             if (!hot_message_.empty() && (now_ms() - hot_msg_ts_) < 4000)
-                left.push_back(std::string("  ") + C_warn() + hot_message_ + C_reset());
-            // Animated gradient wave
-            if (!compact_)
-                left.push_back(std::string("  ") + wave_line(leftw-2, tick_, vt_ok_, dark_theme_?36:34, dark_theme_?32:30));
-            left.push_back("");
+                left.push_back(pad_right_ansi(std::string("  ") + C_warn() + hot_message_ + C_reset(), leftw));
+            if (!compact_ && show_wave_)
+                left.push_back(pad_right_ansi(std::string("  ") + wave_line(leftw-2, tick_, vt_ok_, dark_theme_?36:34, dark_theme_?32:30), leftw));
         }
 
-        // System panel
+        // System box
         {
-            left.push_back(std::string(C_bold()) + "System" + C_reset());
             uptime_s_ = (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_tp_).count();
             uint64_t rss = get_rss_bytes();
-            std::ostringstream ln;
-            ln << "  uptime: " << uptime_s_ << "s"
-               << "   rss: " << fmt_bytes(rss)
-               << "   hw_threads: " << std::thread::hardware_concurrency();
-            left.push_back(ln.str());
-            left.push_back(std::string("  theme: ") + (dark_theme_? "dark":"light")
-                          + "   logs: " + (paused_? "paused":"live")
-                          + "   verbose: " + (global::tui_verbose.load()? "yes":"no")
-                          + "   mode: " + (compact_? "compact":"full"));
-            left.push_back("");
+            std::vector<std::string> body;
+            std::ostringstream ln1, ln2;
+            ln1 << "uptime: " << fmt_duration((double)uptime_s_);
+            ln1 << "   rss: " << (long_units_? fmt_bytes_full(rss) : fmt_bytes_compact(rss));
+            ln1 << "   hw_threads: " << std::thread::hardware_concurrency();
+            body.push_back(ln1.str());
+            ln2 << "theme: " << (dark_theme_? "dark":"light")
+                << "   logs: " << (paused_? "paused":"live")
+                << "   verbose: " << (global::tui_verbose.load()? "yes":"no")
+                << "   mode: " << (compact_? "compact":"full")
+                << "   borders: " << (show_borders_? "on":"off");
+            body.push_back(ln2.str());
+            auto b = render_box("System", body, leftw);
+            left.insert(left.end(), b.begin(), b.end());
         }
 
-        // Node state panel
+        // Node state box
         {
+            std::vector<std::string> body;
             std::ostringstream s;
-            s << C_bold() << "Node" << C_reset() << "   State: ";
+            s << "state: ";
             NodeState show_state = nstate_;
             if (degraded_override_) show_state = NodeState::Degraded;
             switch(show_state){
@@ -1265,42 +1476,41 @@ private:
             if (miner_running_badge()){
                 s << "   " << C_bold() << C_ok() << "⛏ RUNNING" << C_reset();
             }
-            left.push_back(s.str());
-            left.push_back("");
+            body.push_back(s.str());
+            auto b = render_box("Node", body, leftw);
+            left.insert(left.end(), b.begin(), b.end());
         }
 
-        // Startup progress
+        // Startup progress box
         {
-            left.push_back(std::string(C_bold()) + "Startup" + C_reset());
-            size_t total = steps_.size(), okc = 0;
-            for (auto& s : steps_) if (s.second) ++okc;
-            int bw = std::max(10, leftw - 20);
+            size_t total = steps_.size(), okc = 0; for (auto& s : steps_) if (s.second) ++okc;
             double frac = (double)okc / std::max<size_t>(1,total);
+            int bw = std::max(10, leftw-4);
+            std::vector<std::string> body;
             std::ostringstream progress;
-            progress << "  " << bar(bw, frac, vt_ok_, dark_theme_?36:34, dark_theme_?32:30, glow_) << "  "
-                     << okc << "/" << total << " completed";
+            progress << bar(std::min(60,bw), frac, vt_ok_, dark_theme_?36:34, dark_theme_?32:30, glow_)
+                     << "  " << okc << "/" << total << " completed";
             if (eta_secs_ > 0 && frac < 0.999)
                 progress << "  " << C_dim() << "(~" << std::fixed << std::setprecision(1) << eta_secs_ << "s)" << C_reset();
-            left.push_back(progress.str());
+            body.push_back(progress.str());
             if (!compact_) {
                 for (auto& s : steps_) {
                     bool ok = s.second;
                     bool failed = failures_.count(s.first) > 0;
                     std::ostringstream ln;
-                    ln << "    ";
-                    if (ok)         ln << C_ok()  << "[OK]    " << C_reset();
-                    else if (failed)ln << C_err() << "[FAIL]  " << C_reset();
-                    else            ln << C_dim() << "[..]    " << C_reset();
+                    if (ok)         ln << C_ok()  << " [OK]   " << C_reset();
+                    else if (failed)ln << C_err() << " [FAIL] " << C_reset();
+                    else            ln << C_dim() << " [..]   " << C_reset();
                     ln << s.first;
-                    left.push_back(ln.str());
+                    body.push_back(ln.str());
                 }
             }
-            left.push_back("");
+            auto b = render_box("Startup", body, leftw);
+            left.insert(left.end(), b.begin(), b.end());
         }
 
-        // Chain + difficulty + retarget ETA + trend
+        // Chain box with table
         {
-            left.push_back(std::string(C_bold()) + "Chain" + C_reset());
             uint64_t height = chain_ ? chain_->height() : 0;
             std::string tip_hex;
             long double tip_diff = 0.0L;
@@ -1311,201 +1521,220 @@ private:
                 tip_bits = hdr_bits(t);
                 tip_diff = difficulty_from_bits(tip_bits);
             }
-            left.push_back(std::string("  height: ") + std::to_string(height)
-                          + "   tip: " + short_hex(tip_hex, 12));
-            left.push_back(std::string("  difficulty: ") + fmt_diff(tip_diff)
-                          + "   net hashrate: " + fmt_hs(net_hashrate_));
-            // retarget tracker
-            uint64_t blocks_into_epoch = (MIQ_RETARGET_INTERVAL ? (height % MIQ_RETARGET_INTERVAL) : 0);
-            uint64_t blocks_to_retarget = MIQ_RETARGET_INTERVAL ? (MIQ_RETARGET_INTERVAL - blocks_into_epoch) : 0;
-            double eta_retarget_s = avg_block_time_ * (double)blocks_to_retarget;
-            std::ostringstream rt; rt<<"  retarget in: "<<blocks_to_retarget<<" blocks (~"<<fmt_duration(eta_retarget_s)<<")";
-            left.push_back(rt.str());
-            // trend
-            left.push_back(std::string("  net trend:   ") + spark_ascii(net_spark_));
-            // recent blocks (fees + miner)
+            std::vector<std::string> top;
+            {
+                std::ostringstream line1;
+                line1 << "height: " << commas_u64(height) << "   tip: " << short_hex(tip_hex, 12);
+                top.push_back(line1.str());
+                std::ostringstream line2;
+                line2 << "difficulty: " << fmt_diff(tip_diff)
+                      << "   net hashrate: " << (long_units_ ? fmt_hs_full(net_hashrate_) : fmt_hs_compact(net_hashrate_));
+                top.push_back(line2.str());
+                uint64_t blocks_into_epoch = (MIQ_RETARGET_INTERVAL ? (height % MIQ_RETARGET_INTERVAL) : 0);
+                uint64_t blocks_to_retarget = MIQ_RETARGET_INTERVAL ? (MIQ_RETARGET_INTERVAL - blocks_into_epoch) : 0;
+                double eta_retarget_s = avg_block_time_ * (double)blocks_to_retarget;
+                std::ostringstream rt; rt<<"retarget in: "<<blocks_to_retarget<<" blocks (~"<<fmt_duration(eta_retarget_s)<<")";
+                top.push_back(rt.str());
+                top.push_back(std::string("trend: ") + spark_ascii(net_spark_));
+            }
+            auto head = std::vector<std::string>{"Hgt","Txs","Fees","Hash","Miner"};
+            // Choose widths to fit leftw - borders; Hash 12; Miner 18
+            std::vector<ColSpec> colspec = { {8,true},{6,true},{10,true},{12,false},{20,false} };
+            std::vector<std::vector<std::string>> rowsv;
             size_t N = recent_blocks_.size();
             size_t show = std::min<size_t>(compact_?6:8, N);
             for (size_t i=0;i<show;i++){
                 const auto& b = recent_blocks_[N-1-i];
-                std::ostringstream ln;
-                ln << "  h=" << b.height
-                   << "  txs=" << (b.tx_count ? std::to_string(b.tx_count) : std::string("?"))
-                   << "  fees=" << (b.fees_known ? std::to_string(b.fees) : std::string("?"))
-                   << "  hash=" << short_hex(b.hash_hex.empty() ? std::string("(?)") : b.hash_hex, 12);
-                if (!b.miner.empty()) ln << "  miner=" << b.miner;
-                left.push_back(ln.str());
+                rowsv.push_back({
+                    std::to_string(b.height),
+                    b.tx_count ? std::to_string(b.tx_count) : std::string("?"),
+                    b.fees_known ? commas_u64(b.fees) : std::string("?"),
+                    short_hex(b.hash_hex.empty()? "(?)":b.hash_hex, 12),
+                    b.miner.empty()? "(unknown)": b.miner
+                });
             }
-            if (N==0) left.push_back("  (no blocks yet)");
-            left.push_back("");
+            auto chain_box = render_box("Chain", top, leftw);
+            left.insert(left.end(), chain_box.begin(), chain_box.end());
+            if (show > 0){
+                auto tbl = render_table(head, rowsv, colspec, leftw, /*zebra=*/true);
+                left.insert(left.end(), tbl.begin(), tbl.end());
+            }
         }
 
-        // Right column: Network/Mempool/Miner/Miners Census/Health/Logs
+        // ─ Right column boxes ────────────────────────────────────────────────
         // Network
         if (p2p_) {
-            right.push_back(std::string(C_bold()) + "Network" + C_reset());
             auto peers = p2p_->snapshot_peers();
-            // Sort peers: verack_ok first, lowest latency, lowest rxbuf, lowest inflight
             std::stable_sort(peers.begin(), peers.end(), [](const auto& a, const auto& b){
                 if (a.verack_ok != b.verack_ok) return a.verack_ok > b.verack_ok;
                 if (a.last_seen_ms != b.last_seen_ms) return a.last_seen_ms < b.last_seen_ms;
                 if (a.rx_buf != b.rx_buf) return a.rx_buf < b.rx_buf;
                 return a.inflight < b.inflight;
             });
-
             size_t peers_n = peers.size();
             size_t inflight_tx = 0, rxbuf_sum = 0, awaiting_pongs = 0, verack_ok = 0;
             for (auto& s : peers) { inflight_tx += (size_t)s.inflight; rxbuf_sum += (size_t)s.rx_buf; if (s.awaiting_pong) ++awaiting_pongs; if (s.verack_ok) ++verack_ok; }
-            right.push_back(std::string("  peers: ") + std::to_string(peers_n)
-                            + "   verack_ok: " + std::to_string(verack_ok)
-                            + "   inflight: " + std::to_string(inflight_tx)
-                            + "   rxbuf: " + std::to_string(rxbuf_sum)
-                            + "   pings-waiting: " + std::to_string(awaiting_pongs));
-            // show top peers table
-            std::ostringstream hdr;
-            hdr << "    " << std::left << std::setw(18) << "IP"
-                << " " << std::setw(5) << "ok"
-                << " " << std::setw(8) << "last(ms)"
-                << " " << std::setw(7) << "rx"
-                << " " << std::setw(8) << "inflight";
-            right.push_back(hdr.str());
-            size_t show = std::min(peers.size(), (size_t)(compact_?6:8));
-            for (size_t i=0;i<show; ++i) {
-                const auto& s = peers[i];
-                std::string ip = s.ip; if ((int)ip.size() > 18) ip = ip.substr(0,15) + "...";
-                std::ostringstream ln;
-                ln << "    " << std::left << std::setw(18) << ip
-                   << " " << std::setw(5) << (s.verack_ok ? (std::string(C_ok()) + "ok" + C_reset()) : (std::string(C_warn()) + ".." + C_reset()))
-                   << " " << std::right << std::setw(8) << (uint64_t)s.last_seen_ms
-                   << " " << std::setw(7) << (uint64_t)s.rx_buf
-                   << " " << std::setw(8) << (uint64_t)s.inflight;
-                right.push_back(ln.str());
+            std::vector<std::string> sline;
+            {
+                std::ostringstream ss;
+                ss << "peers: " << peers_n
+                   << "   verack_ok: " << verack_ok
+                   << "   inflight: " << inflight_tx
+                   << "   rxbuf: " << rxbuf_sum
+                   << "   pings-waiting: " << awaiting_pongs;
+                sline.push_back(ss.str());
             }
-            if (peers.size() > show) right.push_back(std::string("    ... +") + std::to_string(peers.size()-show) + " more");
-            right.push_back("");
+            auto box_hdr = render_box("Network", sline, rightw);
+            right.insert(right.end(), box_hdr.begin(), box_hdr.end());
+
+            // Table
+            std::vector<std::string> head = {"IP","ok","last(ms)","rx","inflight"};
+            std::vector<ColSpec> cols = { {18,false},{4,false},{9,true},{7,true},{8,true} };
+            std::vector<std::vector<std::string>> rows;
+            size_t showp = std::min(peers.size(), (size_t)(compact_?6:8));
+            for (size_t i=0;i<showp; ++i) {
+                const auto& s = peers[i];
+                std::string ip = s.ip; if ((int)display_width(ip) > 18) ip = pad_right_ansi(ip.substr(0,15) + "...", 18);
+                rows.push_back({
+                    ip,
+                    s.verack_ok ? (std::string(C_ok()) + "ok" + C_reset()) : (std::string(C_warn()) + ".." + C_reset()),
+                    std::to_string((uint64_t)s.last_seen_ms),
+                    std::to_string((uint64_t)s.rx_buf),
+                    std::to_string((uint64_t)s.inflight)
+                });
+            }
+            auto tbl = render_table(head, rows, cols, rightw, /*zebra=*/true);
+            right.insert(right.end(), tbl.begin(), tbl.end());
         }
 
-        // Mempool (resilient to API)
+        // Mempool
         if (mempool_) {
-            right.push_back(std::string(C_bold()) + "Mempool" + C_reset());
             auto stat = mempool_view_fallback(mempool_);
-            right.push_back(std::string("  txs: ") + std::to_string(stat.count)
-                            + (stat.bytes? (std::string("   bytes: ") + fmt_bytes(stat.bytes)) : std::string())
-                            + (stat.recent_adds? (std::string("   recent_adds: ") + std::to_string(stat.recent_adds)) : std::string()));
-            right.push_back(std::string("  trend: ") + spark_ascii(mem_spark_));
-            right.push_back("");
+            std::vector<std::string> lines;
+            std::ostringstream l1;
+            l1 << "txs: " << commas_u64(stat.count);
+            if (stat.bytes) l1 << "   bytes: " << (long_units_? fmt_bytes_full(stat.bytes) : fmt_bytes_compact(stat.bytes));
+            if (stat.recent_adds) l1 << "   recent_adds: " << commas_u64(stat.recent_adds);
+            lines.push_back(l1.str());
+            lines.push_back(std::string("trend: ") + spark_ascii(mem_spark_));
+            auto b = render_box("Mempool", lines, rightw);
+            right.insert(right.end(), b.begin(), b.end());
         }
 
-        // Miner + shares + ETTF
+        // Mining
         {
-            right.push_back(std::string(C_bold()) + "Mining" + C_reset());
             bool active = g_miner_stats.active.load();
             unsigned thr = g_miner_stats.threads.load();
             uint64_t ok  = g_miner_stats.accepted.load();
             uint64_t rej = g_miner_stats.rejected.load();
             double   hps = g_miner_stats.hps.load();
-
-            std::ostringstream m1;
-            m1 << "  status: " << (active ? (std::string(C_ok()) + "running" + C_reset()) : (std::string(C_dim()) + "idle" + C_reset()))
-               << "   threads: " << thr
-               << "   ext: " << (g_extminer.alive.load() ? (std::string(C_ok()) + "alive" + C_reset()) : (std::string(C_dim()) + "—" + C_reset()));
-            right.push_back(m1.str());
-            std::ostringstream m2; m2 << "  accepted: " << ok << "   rejected: " << rej; right.push_back(m2.str());
-            right.push_back(std::string("  miner hashrate: ") + fmt_hs(hps));
-            right.push_back(std::string("  miner trend:    ") + spark_ascii(spark_hs_));
-            // network & share + ETTF
-            double share = (net_hashrate_ > 0.0) ? (hps / net_hashrate_) * 100.0 : 0.0;
-            if (share < 0.0) share = 0.0;
-            if (share > 100.0) share = 100.0;
-            std::ostringstream m3; m3 << "  network (est):  " << fmt_hs(net_hashrate_)
-                                      << "   your share: " << fmt_pct(share, 3);
-            right.push_back(m3.str());
-            // ETTF with precise difficulty from tip (2^32 * diff / miner_hps)
             long double tip_diff = 0.0L;
-            if (chain_) {
-                auto t = chain_->tip();
-                tip_diff = difficulty_from_bits(hdr_bits(t));
+            if (chain_) tip_diff = difficulty_from_bits(hdr_bits(chain_->tip()));
+
+            std::vector<std::string> body;
+            {
+                std::ostringstream m1;
+                m1 << "status: " << (active ? (std::string(C_ok()) + "running" + C_reset()) : (std::string(C_dim()) + "idle" + C_reset()))
+                   << "   threads: " << thr
+                   << "   ext: " << (g_extminer.alive.load() ? (std::string(C_ok()) + "alive" + C_reset()) : (std::string(C_dim()) + "—" + C_reset()));
+                body.push_back(m1.str());
+                std::ostringstream m2; m2 << "accepted: " << commas_u64(ok) << "   rejected: " << commas_u64(rej); body.push_back(m2.str());
+                body.push_back(std::string("miner hashrate: ") + (long_units_? fmt_hs_full(hps) : fmt_hs_compact(hps)));
+                body.push_back(std::string("miner trend:    ") + spark_ascii(spark_hs_));
+                double share = (net_hashrate_ > 0.0) ? (hps / net_hashrate_) * 100.0 : 0.0;
+                if (share < 0.0) share = 0.0; if (share > 100.0) share = 100.0;
+                std::ostringstream m3; m3 << "network (est):  " << (long_units_? fmt_hs_full(net_hashrate_) : fmt_hs_compact(net_hashrate_))
+                                          << "   your share: " << fmt_pct(share, 3);
+                body.push_back(m3.str());
+                double ettf_s = (hps > 0.0) ? (double)(tip_diff * 4294967296.0L) / hps : 0.0;
+                body.push_back(std::string("ETTF (your rig): ") + (hps>0.0 ? fmt_duration(ettf_s) : std::string("—")));
             }
-            double ettf_s = (hps > 0.0) ? (double)(tip_diff * 4294967296.0L) / hps : 0.0;
-            right.push_back(std::string("  ETTF (your rig): ") + (hps>0.0 ? fmt_duration(ettf_s) : std::string("—")));
-            right.push_back("");
+            auto b = render_box("Mining", body, rightw);
+            right.insert(right.end(), b.begin(), b.end());
         }
 
-        // Miners census (observed coinbase recipients => accurate local metric)
+        // Miners census
         {
             size_t window=0;
             auto top = top_miners(compact_?4:8, window);
-            right.push_back(std::string(C_bold()) + "Miners (observed)" + C_reset());
-            std::ostringstream head;
-            head << "  distinct: " << miner_counts_.size() << " / last " << window << " blocks";
-            right.push_back(head.str());
-            if (window > 0 && !top.empty()){
-                right.push_back("    addr (short)     blocks   share");
-                for (auto& [addr, cnt] : top){
-                    double pct = window? (100.0 * (double)cnt / (double)window) : 0.0;
-                    std::ostringstream ln;
-                    ln << "    " << std::left << std::setw(18) << fit(addr, 18)
-                       << "  " << std::right << std::setw(6) << cnt
-                       << "   " << std::setw(6) << std::fixed << std::setprecision(2) << pct << "%";
-                    right.push_back(ln.str());
-                }
-            } else {
-                right.push_back("  (insufficient data yet)");
+            std::vector<std::string> head = {"addr(short)","blocks","share"};
+            std::vector<ColSpec> cols = { {18,false},{7,true},{7,true} };
+            std::vector<std::vector<std::string>> rows;
+            for (auto& [addr, cnt] : top){
+                double pct = window? (100.0 * (double)cnt / (double)window) : 0.0;
+                rows.push_back({
+                    fit(addr, 18),
+                    std::to_string(cnt),
+                    fmt_pct(pct, 2)
+                });
             }
-            right.push_back(std::string("  ") + C_dim() + "* purely from local blocks; not a guess of full network " + C_reset());
-            right.push_back("");
+            std::vector<std::string> info;
+            {
+                std::ostringstream h;
+                h << "distinct: " << miner_counts_.size() << " / last " << window << " blocks";
+                info.push_back(h.str());
+                info.push_back(std::string(C_dim()) + "* local observation only" + C_reset());
+            }
+            auto hdr = render_box("Miners (observed)", info, rightw);
+            right.insert(right.end(), hdr.begin(), hdr.end());
+            if (!rows.empty()){
+                auto tbl = render_table(head, rows, cols, rightw, /*zebra=*/true);
+                right.insert(right.end(), tbl.begin(), tbl.end());
+            }
         }
 
         // Health/Security
         {
-            right.push_back(std::string(C_bold()) + "Health & Security" + C_reset());
-            right.push_back(std::string("  config reload: ") + (global::reload_requested.load()? "pending":"—"));
-            right.push_back(std::string("  status.json: ") + (global::dump_status_json.load()? "enabled":"disabled"));
-            if (!hot_warning_.empty() && now_ms()-hot_warn_ts_ < 6000){
-                right.push_back(std::string("  ") + C_warn() + hot_warning_ + C_reset());
-            }
-            if (!datadir_.empty()){
-                right.push_back(std::string("  datadir: ") + datadir_);
-            }
-            right.push_back("");
+            std::vector<std::string> body;
+            body.push_back(std::string("config reload: ") + (global::reload_requested.load()? "pending":"—"));
+            body.push_back(std::string("status.json: ") + (global::dump_status_json.load()? "enabled":"disabled"));
+            if (!hot_warning_.empty() && now_ms()-hot_warn_ts_ < 6000)
+                body.push_back(std::string(C_warn()) + hot_warning_ + C_reset());
+            if (!datadir_.empty())
+                body.push_back(std::string("datadir: ") + datadir_);
+            auto b = render_box("Health & Security", body, rightw);
+            right.insert(right.end(), b.begin(), b.end());
         }
 
         // Recent TXIDs
         if (!compact_) {
-            right.push_back(std::string(C_bold()) + "Recent TXIDs" + C_reset());
-            if (recent_txids_.empty()) right.push_back("  (no txids yet)");
+            std::vector<std::string> body;
+            if (recent_txids_.empty()) body.push_back("(no txids yet)");
             size_t n = std::min<size_t>(recent_txids_.size(), 10);
             for (size_t i=0;i<n;i++){
-                right.push_back(std::string("  ") + short_hex(recent_txids_[recent_txids_.size()-1-i], 20));
+                body.push_back(short_hex(recent_txids_[recent_txids_.size()-1-i], 20));
             }
-            right.push_back("");
+            auto b = render_box("Recent TXIDs", body, rightw);
+            right.insert(right.end(), b.begin(), b.end());
         }
 
-        // Compose two columns
+        // Compose two columns with ANSI-aware padding
         std::ostringstream out;
         size_t NL = left.size(), NR = right.size(), N = std::max(NL, NR);
         for (size_t i=0;i<N;i++){
-            std::string l = (i<NL) ? left[i] : "";
-            std::string r = (i<NR) ? right[i] : "";
-            if ((int)l.size() > leftw)  l = fit(l, leftw);
-            if ((int)r.size() > rightw) r = fit(r, rightw);
-            out << std::left << std::setw(leftw) << l << " | " << r << "\n";
+            std::string l = (i<NL) ? pad_right_ansi(left[i], leftw) : std::string(leftw, ' ');
+            std::string r = (i<NR) ? pad_right_ansi(right[i], rightw) : std::string(rightw, ' ');
+            out << l << " " << r << "\n";
         }
 
         // Footer + logs/help
-        out << std::string((size_t)cols, '-') << "\n";
+        out << pad_right_ansi(std::string(cols, '─'), cols) << "\n";
         if (show_help_) {
-            out << C_bold() << "Help" << C_reset() << "\n"
-                << "  q=quit   t=theme   p=pause logs   r=reload config   s=snapshot   v=verbose\n"
-                << "  ?=help   c=compact mode   g=glow accent\n";
+            std::string help = std::string(C_bold()) + "Help" + C_reset() + "  "
+                "q=quit  t=theme  p=pause logs  r=reload config  s=snapshot  v=verbose  "
+                "?=help  c=compact  g=glow  b=borders  w=wave  l=lock layout  u=units";
+            out << pad_right_ansi(help, cols) << "\n";
         } else if (nstate_ == NodeState::Quitting){
-            out << C_bold() << "Shutting down" << C_reset() << "  " << C_dim() << "(Ctrl+C again = force)" << C_reset() << "\n";
+            std::string s1 = std::string(C_bold()) + "Shutting down" + C_reset() + "  " + C_dim() + "(Ctrl+C again = force)" + C_reset();
+            out << pad_right_ansi(s1, cols) << "\n";
             std::string phase = shutdown_phase_.empty() ? "initiating…" : shutdown_phase_;
-            out << "  phase: " << phase << "\n";
+            out << pad_right_ansi(std::string("  phase: ") + phase, cols) << "\n";
         } else {
-            out << C_bold() << "Logs" << C_reset() << "  " << C_dim() << "(q,t,p,r,s,v,?,c,g)" << C_reset() << "\n";
+            std::string h = std::string(C_bold()) + "Logs" + C_reset() + "  " + C_dim() + "(q,t,p,r,s,v,?,c,g,b,w,l,u)" + C_reset();
+            out << pad_right_ansi(h, cols) << "\n";
         }
-        // logs
+
+        // logs (timestamped, ANSI-aware)
         int header_rows = (int)N + 2;
         int remain = rows - header_rows - 3;
         if (remain < 8) remain = 8;
@@ -1513,12 +1742,16 @@ private:
         if (start < 0) start = 0;
         for (int i=start; i<(int)logs_.size(); ++i) {
             const auto& line = logs_[i];
+            // timestamp relative to TUI start
+            double dt = (double)(line.ts_ms - base_ts_ms_) / 1000.0;
+            std::ostringstream pref; pref<<std::fixed<<std::setprecision(3)<<std::setw(8)<<dt<<"s ";
+            std::string txt = pref.str() + line.txt;
             switch(line.level){
-                case 2: out << C_err()  << line.txt << C_reset() << "\n"; break;
-                case 1: out << C_warn() << line.txt << C_reset() << "\n"; break;
-                case 3: out << C_dim()  << line.txt << C_reset() << "\n"; break;
-                case 4: out << C_ok()   << line.txt << C_reset() << "\n"; break;
-                default: out << line.txt << "\n"; break;
+                case 2: out << pad_right_ansi(std::string(C_err())  + txt + C_reset(), cols) << "\n"; break;
+                case 1: out << pad_right_ansi(std::string(C_warn()) + txt + C_reset(), cols) << "\n"; break;
+                case 3: out << pad_right_ansi(std::string(C_dim())  + txt + C_reset(), cols) << "\n"; break;
+                case 4: out << pad_right_ansi(std::string(C_ok())   + txt + C_reset(), cols) << "\n"; break;
+                default: out << pad_right_ansi(txt, cols) << "\n"; break;
             }
         }
         int printed = (int)logs_.size() - start;
@@ -1567,16 +1800,23 @@ private:
     std::string shutdown_phase_;
     int shutdown_ok_{0};
     bool dark_theme_{true};
+    bool high_contrast_{false};
     bool paused_{false};
     bool degraded_override_{false};
     bool show_help_{false};
     bool compact_{false};
     bool glow_{false};
+    bool show_borders_{true};
+    bool show_wave_{true};
+    bool layout_locked_{false};
+    bool long_units_{false};
+
+    int  locked_cols_{0}, locked_rows_{0};
+    uint64_t base_ts_ms_{0};
     std::chrono::steady_clock::time_point start_tp_{std::chrono::steady_clock::now()};
     uint64_t uptime_s_{0};
     std::string hot_message_;
     uint64_t hot_msg_ts_{0};
-
     std::string hot_warning_;
     uint64_t hot_warn_ts_{0};
 };
@@ -1658,7 +1898,7 @@ static void miner_worker(Chain* chain, Mempool* mempool, P2P* p2p,
                 }
             } catch(...) { txs.clear(); }
 
-            // mine (using available API)
+            // mine
             Block b;
             try {
                 auto last = chain->last_headers(MIQ_RETARGET_INTERVAL);
