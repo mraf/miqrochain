@@ -44,6 +44,13 @@
   #include <sys/stat.h>
   #include <unistd.h>
 #else
+  // Prevent <windows.h> from defining min/max macros that break std::min/std::max
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
+  #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN
+  #endif
   #include <windows.h>
   #include <direct.h>
 #endif
@@ -771,7 +778,7 @@ std::string RpcService::handle(const std::string& body){
             o["bits"]           = jnum((double)next_bits);           // *** miners MUST use this ***
             o["tip_bits"]       = jnum((double)tip.bits);            // for display/diagnostics
             o["mintime"]        = jnum((double)mintime);             // *** enforce time >= mintime ***
-            o["time"]           = jnum((double)std::max<int64_t>((int64_t)time(nullptr), mintime));
+            o["time"]           = jnum((double)std::max<int64_t>(static_cast<int64_t>(time(nullptr)), mintime));
             o["height"]         = jnum((double)(tip.height + 1));
             o["coinbase_pkh"]   = jstr(to_hex(pkh));
             o["max_block_bytes"]= jnum((double)(900 * 1024)); // HINT for miners
@@ -912,7 +919,7 @@ std::string RpcService::handle(const std::string& body){
             if(!deser_tx(raw, tx)) return err("bad tx");
 
             auto tip = chain_.tip(); std::string e;
-            if(mempool_.accept(tx, chain_.utxo(), (size_t)tip.height, e)){
+            if(mempool_.accept(tx, chain_.utxo(), static_cast<uint32_t>(tip.height), e)){
                 JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
             } else {
                 return err(e);
@@ -1510,7 +1517,7 @@ std::string RpcService::handle(const std::string& body){
             }
 
             auto tip = chain_.tip(); std::string e;
-            if(mempool_.accept(tx, chain_.utxo(), (size_t)tip.height, e)){
+            if(mempool_.accept(tx, chain_.utxo(), static_cast<uint32_t>(tip.height), e)){
                 if (used_change) {
                     HdAccountMeta newm = w.meta();
                     newm.next_change = meta.next_change + 1;
@@ -1552,8 +1559,8 @@ std::string RpcService::handle(const std::string& body){
             t["hash"]      = jstr(to_hex(tip.hash));
             t["branchlen"] = jnum(0.0);
             t["status"]    = jstr("active");
-            JNode obj; obj.v = t;
-            std::vector<JNode> arr; arr.push_back(obj);
+            JNode tipnode; tipnode.v = t;              // renamed to avoid shadowing 'obj'
+            std::vector<JNode> arr; arr.push_back(tipnode);
             JNode out; out.v = arr; return json_dump(out);
         }
 
