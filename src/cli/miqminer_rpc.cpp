@@ -2059,7 +2059,8 @@ int main(int argc, char** argv){
                     {
                         const uint64_t tip = ui.tip_height.load();
 
-                        uint64_t next_h = ui.est_scanned_height.load();
+                        uint64_t next_h = ui.est_scanned_height.store(0), dummy=0;
+                        next_h = ui.est_scanned_height.load();
                         if (next_h == 0) next_h = 1;
 
                         const uint64_t CHUNK = 128;
