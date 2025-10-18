@@ -92,6 +92,12 @@
   #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
   #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
   #endif
+  #ifndef DISABLE_NEWLINE_AUTO_RETURN
+  #define DISABLE_NEWLINE_AUTO_RETURN        0x0008
+  #endif
+  #ifndef ENABLE_VIRTUAL_TERMINAL_INPUT
+  #define ENABLE_VIRTUAL_TERMINAL_INPUT      0x0200
+  #endif
   #ifdef _MSC_VER
     #pragma comment(lib, "Psapi.lib")
   #endif
@@ -603,9 +609,49 @@ static uint64_t get_rss_bytes(){
 /*                              Terminal utils                                 */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 namespace term {
+#ifdef _WIN32
+// Ensure we have a console and rebind process standard handles to it.
+// This lets us enable VT even when started from GUI or with redirected CRT.
+static void ensure_console_bound() {
+    // Try to attach to the parent console; if that fails, allocate a new one.
+    if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+        AllocConsole();
+    }
+
+    // Set UTF-8 I/O code pages early for proper box/emoji rendering.
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+
+    // Rebind STDOUT/STDERR/STDIN to real console handles (best-effort).
+    HANDLE hOut = CreateFileW(L"CONOUT$", GENERIC_READ|GENERIC_WRITE,
+                              FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hOut != INVALID_HANDLE_VALUE) {
+        SetStdHandle(STD_OUTPUT_HANDLE, hOut);
+        SetStdHandle(STD_ERROR_HANDLE,  hOut);
+    }
+    HANDLE hIn = CreateFileW(L"CONIN$", GENERIC_READ|GENERIC_WRITE,
+                             FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hIn != INVALID_HANDLE_VALUE) {
+        SetStdHandle(STD_INPUT_HANDLE, hIn);
+    }
+
+    // Hint downstream apps
+#ifdef _MSC_VER
+    _putenv_s("TERM", "xterm-256color");
+#else
+    setenv("TERM", "xterm-256color", 1);
+#endif
+}
+#endif
+
 static inline bool is_tty() {
 #ifdef _WIN32
-    return _isatty(_fileno(stdout)) != 0;
+    DWORD mode = 0;
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    // Treat as TTY only if we can query console mode on the Windows handle.
+    return (hOut && hOut != INVALID_HANDLE_VALUE && GetConsoleMode(hOut, &mode));
 #else
     return ::isatty(STDOUT_FILENO) == 1;
 #endif
@@ -632,25 +678,62 @@ static inline void get_winsize(int& cols, int& rows) {
 static inline void enable_vt(bool& vt_ok, bool prefer_utf8=true) {
     vt_ok = true;
 #ifdef _WIN32
+    // Harden startup: always ensure we have a console bound before checking TTY.
+    ensure_console_bound();
+
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOALIGNMENTFAULTEXCEPT);
     if (prefer_utf8) {
         // Best-effort: prefer UTF-8 so box drawing/emoji render properly
         SetConsoleOutputCP(65001);
         SetConsoleCP(65001);
     }
-    // Try to enable VT on both stdout and stderr
-    DWORD mode = 0;
+
+    auto set_out_mode = [&](HANDLE h) {
+        if (!h || h == INVALID_HANDLE_VALUE) return false;
+        DWORD mode = 0;
+        if (!GetConsoleMode(h, &mode)) return false;
+        mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        mode |= DISABLE_NEWLINE_AUTO_RETURN;    // keeps box-drawing tidy
+        // Keep existing processed/wrap flags; Windows terminals usually set them already.
+        return SetConsoleMode(h, mode) != 0;
+    };
+    auto set_in_mode = [&](HANDLE h) {
+        if (!h || h == INVALID_HANDLE_VALUE) return false;
+        DWORD mode = 0;
+        if (!GetConsoleMode(h, &mode)) return false;
+        mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+        return SetConsoleMode(h, mode) != 0;
+    };
+
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut == INVALID_HANDLE_VALUE || !GetConsoleMode(hOut, &mode)) { vt_ok = false; }
-    else {
-        mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-        if (!SetConsoleMode(hOut, mode)) vt_ok = false;
-    }
     HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
-    if (hErr != INVALID_HANDLE_VALUE && GetConsoleMode(hErr, &mode)) {
-        mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-        SetConsoleMode(hErr, mode); // best-effort
+    HANDLE hIn  = GetStdHandle(STD_INPUT_HANDLE);
+
+    bool okOut = set_out_mode(hOut);
+    bool okErr = set_out_mode(hErr);
+    bool okIn  = set_in_mode(hIn);
+
+    // If any failed, try to (re)open CONOUT$/CONIN$ directly and retry once.
+    if (!okOut || !okErr || !okIn) {
+        HANDLE hNewOut = CreateFileW(L"CONOUT$", GENERIC_READ|GENERIC_WRITE,
+                                     FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
+                                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        HANDLE hNewIn  = CreateFileW(L"CONIN$",  GENERIC_READ|GENERIC_WRITE,
+                                     FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
+                                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hNewOut && hNewOut != INVALID_HANDLE_VALUE) {
+            SetStdHandle(STD_OUTPUT_HANDLE, hNewOut);
+            SetStdHandle(STD_ERROR_HANDLE,  hNewOut);
+            okOut = set_out_mode(hNewOut);
+            okErr = set_out_mode(hNewOut);
+        }
+        if (hNewIn && hNewIn != INVALID_HANDLE_VALUE) {
+            SetStdHandle(STD_INPUT_HANDLE, hNewIn);
+            okIn = set_in_mode(hNewIn);
+        }
     }
+
+    vt_ok = okOut && okErr;  // input VT is optional for rendering
 #else
     (void)prefer_utf8;
 #endif
@@ -709,10 +792,15 @@ private:
         hOut_ = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD m=0;
         is_console_ = (hOut_ && hOut_ != INVALID_HANDLE_VALUE && GetConsoleMode(hOut_, &m));
-        if (!hOut_ || hOut_ == INVALID_HANDLE_VALUE) {
-            hOut_ = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-            opened_conout_ = true;
-            if (hOut_ && hOut_ != INVALID_HANDLE_VALUE && GetConsoleMode(hOut_, &m)) is_console_ = true;
+        if (!is_console_) {
+            // Try to bind to a console explicitly (pairs with term::ensure_console_bound()).
+            HANDLE hNew = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE|FILE_SHARE_READ,
+                                      NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hNew && hNew != INVALID_HANDLE_VALUE) {
+                hOut_ = hNew;
+                opened_conout_ = true;
+                if (GetConsoleMode(hOut_, &m)) is_console_ = true;
+            }
         }
 #else
         fd_ = ::open("/dev/tty", O_WRONLY | O_CLOEXEC);
@@ -2194,7 +2282,7 @@ static void print_usage(){
       << "  MIQ_RPC_TOKEN              if set, HTTP gate token (synced to .cookie on start)\n"
       << "  MIQ_MINER_HEARTBEAT        path to heartbeat file for external miner presence\n"
       << "  MIQ_LOCK_RETRIES           retries when lock is busy (default 2)\n"
-      << "  MIQ_LOCK_WAIT_MS           ms to wait between lock retries (default 250)\n"
+      << "  MIQ_LOCK_WAIT_MS           ms to wait between lock retries (default 250ms)\n"
       << "  MIQ_STEAL_LOCK=1           forcibly remove existing lock as a fallback option\n";
 }
 static bool is_recognized_arg(const std::string& s){
@@ -2237,7 +2325,7 @@ int main(int argc, char** argv){
     std::set_terminate(&fatal_terminate);
 
     bool vt_ok = true;
-    term::enable_vt(vt_ok);
+    term::enable_vt(vt_ok); // <-- VT robustly enabled/console ensured before any TUI decisions
 
     // Discover TUI intent early (so we capture logs only if using TUI)
     bool disable_tui_flag = false;
