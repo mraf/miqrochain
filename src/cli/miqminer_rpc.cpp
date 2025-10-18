@@ -1,3 +1,4 @@
+// src/cli/miqminer_rpc.cpp
 #include "constants.h"
 #include "block.h"
 #include "tx.h"
@@ -149,7 +150,8 @@ static std::string default_cookie_path(){
 static bool read_all_file(const std::string& path, std::string& out){
     FILE* f = fopen(path.c_str(),"rb");
     if(!f) return false;
-    std::string s; char buf[4096];
+    std::string s; s.reserve(256);
+    char buf[4096];
     while(true){ size_t n=fread(buf,1,sizeof(buf),f); if(!n) break; s.append(buf,n); }
     fclose(f);
     while(!s.empty() && (s.back()=='\r'||s.back()=='\n'||s.back()==' '||s.back()=='\t')) s.pop_back();
@@ -171,6 +173,7 @@ static bool json_find_string(const std::string& json, const std::string& key, st
     if(p==std::string::npos) return false;
     p += pat.size();
     while(p<json.size() && std::isspace((unsigned char)json[p])) ++p;
+    // accept either  "value"  or  value (we only handle strings here)
     if(p>=json.size() || json[p]!='"') return false;
     ++p;
     size_t q = p;
@@ -583,6 +586,7 @@ struct MinerTemplate {
     uint64_t height{0};
     uint32_t bits{miq::GENESIS_BITS};
     int64_t  time{0};
+    int64_t  mintime{0};            // NEW: from node (MTP+1)
     size_t   max_block_bytes{1000000};
     std::vector<uint8_t> prev_hash; // 32 bytes
     std::vector<MinerTemplateTx> txs;
@@ -609,7 +613,7 @@ static void gbt_parse_transactions(const std::string& body, std::vector<MinerTem
         if(obj_end==std::string::npos) break;
 
         MinerTemplateTx xt{};
-        // find "data":"...."
+        // "data":"...."
         {
             size_t d = body.find("\"data\":", obj_start);
             if(d!=std::string::npos && d<obj_end){
@@ -622,7 +626,7 @@ static void gbt_parse_transactions(const std::string& body, std::vector<MinerTem
                 }
             }
         }
-        // fee (number)
+        // fee
         {
             size_t f = body.find("\"fee\":", obj_start);
             if(f!=std::string::npos && f<obj_end){
@@ -671,16 +675,114 @@ static void gbt_parse_transactions(const std::string& body, std::vector<MinerTem
     }
 }
 
-// Fetch miner template with mempool txs (GBT); fallback to tip-only template.
+// Parse Miqrochain "getminertemplate" -> txs[{hex,fee,vsize}], bits, prev_hash, height, time, mintime, max_block_bytes
+static void miq_parse_template_txs(const std::string& body, std::vector<MinerTemplateTx>& out){
+    out.clear();
+    const std::string key = "\"txs\":";
+    size_t p = body.find(key);
+    if(p==std::string::npos) return;
+    p += key.size();
+    p = body.find('[', p);
+    if(p==std::string::npos) return;
+    size_t end = body.find(']', p);
+    if(end==std::string::npos) end = body.size();
+
+    size_t cur = p;
+    while(true){
+        size_t obj_start = body.find('{', cur);
+        if(obj_start==std::string::npos || obj_start>=end) break;
+        size_t obj_end = body.find('}', obj_start);
+        if(obj_end==std::string::npos) break;
+
+        MinerTemplateTx xt{};
+        // hex
+        {
+            size_t h = body.find("\"hex\":", obj_start);
+            if(h!=std::string::npos && h<obj_end){
+                h = body.find('"', h+6);
+                if(h!=std::string::npos && h<obj_end){
+                    size_t q = body.find('"', h+1);
+                    if(q!=std::string::npos && q<=obj_end){
+                        xt.hex = body.substr(h+1, q-(h+1));
+                    }
+                }
+            }
+        }
+        // fee
+        {
+            size_t f = body.find("\"fee\":", obj_start);
+            if(f!=std::string::npos && f<obj_end){
+                size_t s=f+6;
+                while(s<obj_end && std::isspace((unsigned char)body[s])) ++s;
+                size_t e=s;
+                while(e<obj_end && (std::isdigit((unsigned char)body[e]) || body[e]=='-' || body[e]=='+')) ++e;
+                if(e>s){
+                    long long v = std::strtoll(body.c_str()+s, nullptr, 10);
+                    if(v>0) xt.fee = (uint64_t)v;
+                }
+            }
+        }
+        // vsize (optional)
+        {
+            size_t s = body.find("\"vsize\":", obj_start);
+            if(s!=std::string::npos && s<obj_end){
+                size_t a=s+8;
+                while(a<obj_end && std::isspace((unsigned char)body[a])) ++a;
+                size_t b=a;
+                while(b<obj_end && std::isdigit((unsigned char)body[b])) ++b;
+                if(b>a){
+                    long long v = std::strtoll(body.c_str()+a, nullptr, 10);
+                    if(v>0) xt.size = (size_t)v;
+                }
+            }
+        }
+        if(xt.size==0 && !xt.hex.empty()) xt.size = xt.hex.size()/2;
+        if(!xt.hex.empty()) out.push_back(std::move(xt));
+        cur = obj_end+1;
+    }
+}
+
+// Fetch miner template with Miqrochain "getminertemplate"; fallback to GBT; then tip-only.
 static bool rpc_getminertemplate(const std::string& host, uint16_t port, const std::string& auth, MinerTemplate& out){
-    // Try getblocktemplate first (Bitcoin-like)
+    // 0) Miqrochain-native
+    {
+        HttpResp r;
+        if(http_post(host, port, "/", auth, rpc_build("getminertemplate","[]"), r) && r.code==200 && !json_has_error(r.body)){
+            uint32_t bits=0;
+            std::string prev;
+            long long height=0, curtime=0, mintime=0, mbs=0;
+
+            (void)json_find_hex_or_number_u32(r.body, "bits", bits);
+            json_find_string(r.body, "prev_hash", prev);
+            (void)json_find_number(r.body, "height", height);
+            (void)json_find_number(r.body, "time",   curtime);
+            (void)json_find_number(r.body, "mintime", mintime);
+            (void)json_find_number(r.body, "max_block_bytes", mbs);
+
+            out.bits   = sanitize_bits(bits ? bits : miq::GENESIS_BITS);
+            out.height = (uint64_t)((height>0)?height:0);
+            out.time   = (int64_t)((curtime>0)?curtime:(long long)time(nullptr));
+            out.mintime= (int64_t)((mintime>0)?mintime:0);
+            out.prev_hash = prev.empty()? std::vector<uint8_t>(32,0) : from_hex_s(prev);
+            out.txs.clear();
+            miq_parse_template_txs(r.body, out.txs);
+            out.max_block_bytes = (mbs>0)? (size_t)mbs : 900*1024;
+
+            if(out.height==0){
+                TipInfo t{};
+                if(rpc_gettipinfo(host,port,auth,t)) out.height = t.height + 1;
+            }
+            if(out.time < out.mintime) out.time = out.mintime;
+            return true;
+        }
+    }
+    // 1) Bitcoin-like GBT
     {
         HttpResp r;
         if(http_post(host, port, "/", auth, rpc_build("getblocktemplate","[{}]"), r) && r.code==200 && !json_has_error(r.body)){
             uint32_t bits=0;
             std::string prev;
             long long height=0, curtime=0;
-            // keys in GBT: "bits" (hex string), "previousblockhash", "height", "curtime"
             if(!json_find_hex_or_number_u32(r.body, "bits", bits)) bits = miq::GENESIS_BITS;
             json_find_string(r.body, "previousblockhash", prev);
             if(prev.empty()) json_find_string(r.body, "prevhash", prev);
@@ -691,11 +793,11 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
             out.bits   = sanitize_bits(bits);
             out.height = (uint64_t)((height>0)?height:0);
             out.time   = (int64_t)((curtime>0)?curtime:(long long)time(nullptr));
+            out.mintime= 0;
             out.prev_hash = prev.empty()? std::vector<uint8_t>(32,0) : from_hex_s(prev);
             out.txs.clear();
             gbt_parse_transactions(r.body, out.txs);
 
-            // attempt size limit keys, else default 1MB
             long long lim=0;
             if(json_find_number(r.body, "sizelimit", lim) ||
                json_find_number(r.body, "maxblocksize", lim) ||
@@ -703,11 +805,11 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
                json_find_number(r.body, "max_block_size", lim))
             {
                 if(lim>0) out.max_block_bytes = (size_t)lim;
+                else out.max_block_bytes = 1000000;
             } else {
                 out.max_block_bytes = 1000000;
             }
 
-            // If height is absent, compute from tip + 1
             if(out.height==0){
                 TipInfo t{};
                 if(rpc_gettipinfo(host,port,auth,t)) out.height = t.height + 1;
@@ -715,19 +817,20 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
             return true;
         }
     }
-    // Fallback: synthesize from tip (no mempool)
+    // 2) Fallback: synthesize from tip (no mempool)
     TipInfo t{};
     if(!rpc_gettipinfo(host,port,auth,t)) return false;
     out.height = t.height + 1;
     out.bits   = t.bits ? t.bits : miq::GENESIS_BITS;
     out.time   = std::max<int64_t>((int64_t)time(nullptr), t.time + 1);
+    out.mintime= 0;
     out.prev_hash = from_hex_s(t.hash_hex);
     out.max_block_bytes = 1000000;
     out.txs.clear();
     return true;
 }
 
-// ===== address/format helpers used later ====================================
+// ===== address/format helpers used later =====================================
 // choose a scaling of raw -> base units close to expected (handles 0.1×/1×/10× etc)
 static uint64_t normalize_to_expected(uint64_t raw, uint64_t expected){
     if(raw==0 || expected==0) return raw;
@@ -1616,11 +1719,19 @@ int main(int argc, char** argv){
         double smooth_seconds = 15.0;
 
         // GPU options (auto-enable; disable with --gpu=off)
+#if defined(MIQ_ENABLE_OPENCL)
         bool   gpu_enabled = true;
         int    gpu_platform_index = 0;
         int    gpu_device_index   = -1;
         size_t gpu_gws = 131072;   // safer default
         uint32_t gpu_npi = 512;    // safer default
+#else
+        [[maybe_unused]] bool   gpu_enabled = false; // no OpenCL compiled in
+        [[maybe_unused]] int    gpu_platform_index = 0;
+        [[maybe_unused]] int    gpu_device_index   = -1;
+        [[maybe_unused]] size_t gpu_gws = 0;
+        [[maybe_unused]] uint32_t gpu_npi = 0;
+#endif
 
         // Salt options (for GPU & optional CPU conformity when MIQ_POW_SALT is defined)
         std::vector<uint8_t> salt_bytes;
@@ -1652,6 +1763,7 @@ int main(int argc, char** argv){
                 pin_affinity = (p=="on"||p=="true"||p=="1");
             } else if(a.rfind("--smooth=",0)==0){
                 smooth_seconds = std::max(1.0, std::stod(a.substr(9)));
+#if defined(MIQ_ENABLE_OPENCL)
             } else if(a.rfind("--gpu=",0)==0){
                 std::string p = a.substr(6);
                 std::transform(p.begin(),p.end(),p.begin(),::tolower);
@@ -1664,6 +1776,7 @@ int main(int argc, char** argv){
                 gpu_gws = (size_t) std::stoull(a.substr(6));
             } else if(a.rfind("--gnpi=",0)==0){
                 gpu_npi = (uint32_t) std::stoul(a.substr(7));
+#endif
             } else if(a.rfind("--salt-hex=",0)==0){
                 std::string hx = a.substr(11);
                 try { salt_bytes = from_hex_s(hx); } catch(...) { std::fprintf(stderr,"Bad --salt-hex\n"); return 2; }
@@ -1748,7 +1861,6 @@ int main(int argc, char** argv){
             using clock = std::chrono::steady_clock;
             const int FPS = 12;
             const auto frame_dt = std::chrono::milliseconds(1000/FPS);
-            const int inner = 28;
             int spin_idx = 0;
             while(running.load(std::memory_order_relaxed)){
                 std::ostringstream out;
@@ -2052,6 +2164,8 @@ int main(int argc, char** argv){
         });
         meter.detach();
 
+#if defined(MIQ_ENABLE_OPENCL)
+        // Helpers used only when GPU is compiled in
         auto build_header_prefix80 = [](const BlockHeader& H, const std::vector<uint8_t>& merkle)->std::vector<uint8_t>{
             std::vector<uint8_t> p;
             p.reserve(80);
@@ -2062,7 +2176,6 @@ int main(int argc, char** argv){
             put_u32_le(p, H.bits);
             return p; // 80 bytes
         };
-
         auto make_gpu_prefix = [&](const std::vector<uint8_t>& prefix80)->std::vector<uint8_t>{
             std::vector<uint8_t> out;
             if(salt_pos == SaltPos::PRE && !salt_bytes.empty()){
@@ -2078,10 +2191,11 @@ int main(int argc, char** argv){
             }
             return out; // kernel appends nonce LE + padding
         };
+#endif
 
         // ===== mining loop ===================================================
         while (true) {
-            // Fetch a fresh template (includes mempool txs via GBT when available)
+            // Fetch a fresh template (prefers Miqrochain getminertemplate; falls back gracefully)
             MinerTemplate tpl;
             if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
                 std::fprintf(stderr, "getminertemplate failed, retrying...\n");
@@ -2125,7 +2239,10 @@ int main(int argc, char** argv){
             BlockHeader hb;
             hb.version = 1;
             hb.prev_hash = tpl.prev_hash;
-            hb.time = std::max<int64_t>((int64_t)time(nullptr), tpl.time);
+
+            // Honor node-provided time lower bound (mintime)
+            int64_t now = (int64_t)time(nullptr);
+            hb.time = std::max<int64_t>(now, std::max<int64_t>(tpl.time, tpl.mintime));
             hb.bits = tpl.bits;
             hb.nonce = 0;
 
@@ -2151,7 +2268,7 @@ int main(int argc, char** argv){
             bits_to_target_be(sanitize_bits(hb.bits), target_be);
 
             std::thread gpu_th;
-        #if defined(MIQ_ENABLE_OPENCL)
+#if defined(MIQ_ENABLE_OPENCL)
             if (gpu_enabled) {
                 std::string gerr;
                 std::vector<uint8_t> prefix80 = build_header_prefix80(b.header, b.header.merkle_root);
@@ -2182,18 +2299,18 @@ int main(int argc, char** argv){
                     });
                 }
             }
-        #endif
+#endif
 
             // Wait for CPU workers
             for (auto &th : thv) th.join();
 
             // Stop GPU worker if running
-        #if defined(MIQ_ENABLE_OPENCL)
+#if defined(MIQ_ENABLE_OPENCL)
             if (gpu_th.joinable()) {
                 found.store(true);
                 gpu_th.join();
             }
-        #endif
+#endif
 
             // Check staleness against current tip (uses tpl safely here)
             TipInfo tip_now{};
