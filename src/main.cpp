@@ -104,6 +104,7 @@
   #include <sys/types.h>
   #include <sys/stat.h>
   #include <signal.h>   // <-- needed for kill()
+  #include <sys/file.h>
   #define MIQ_ISATTY() (::isatty(fileno(stdin)) != 0)
 #endif
 
@@ -147,7 +148,11 @@ static std::atomic<bool>    reload_requested{false};   // SIGHUP / hotkey 'r'
 static std::string          lockfile_path;
 static std::string          pidfile_path;
 #ifdef _WIN32
-static HANDLE               lockfile_handle{nullptr};  // keep open to hold lock
+static HANDLE               lockfile_handle{nullptr};  // keep open to hold lockfile (legacy)
+static HANDLE               instance_mutex{nullptr};   // named OS mutex to hard-enforce singleton
+static bool                 instance_mutex_owned{false};
+#else
+static int                  lock_fd{-1};              // POSIX lock fd (fcntl)
 #endif
 static std::string          telemetry_path;
 static std::atomic<bool>    telemetry_enabled{false};
@@ -165,6 +170,10 @@ static std::atomic<bool>    tui_toggle_wave{false};
 static std::atomic<bool>    tui_toggle_layout_lock{false};
 static std::atomic<bool>    tui_toggle_units{false};
 static std::atomic<bool>    tui_toggle_contrast{false};
+
+// Lock sentry: keeps PID/lock alive even if files get deleted externally
+static std::atomic<bool>    lock_sentry_run{false};
+static std::thread          lock_sentry_thr;
 }
 
 // time helpers
@@ -419,7 +428,23 @@ static bool write_text_atomic(const std::string& path, const std::string& body){
     return !ec;
 }
 
-// --- Lock helpers (polished & with fallback) ---------------------------------
+// Small helpers for hashing & Windows wide strings (for named mutex)
+static uint64_t fnv1a64(const std::string& s){
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+#ifdef _WIN32
+static std::wstring utf8_to_wide(const std::string& s){
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w; w.resize((size_t)n);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+#endif
+
+// --- Lock helpers (polished & with OS-level hard single-instance + fallback) ---
 static int read_pidfile_int(const std::string& pidfile) {
     std::vector<uint8_t> buf;
     if (!read_file_all(pidfile, buf)) return -1;
@@ -460,16 +485,73 @@ static bool remove_stale_lock(const std::string& lock, const std::string& pidfil
     return true; // best-effort
 }
 
-// Acquire datadir lock with stale-detection, retries, and optional "steal"
+// Start a sentry that keeps the lock & pid fresh (recreates if deleted)
+static void start_lock_sentry(const std::string& datadir){
+    using namespace std::chrono_literals;
+    global::lock_sentry_run.store(true);
+    const std::string lock = p_join(datadir, ".lock");
+    const std::string pid  = p_join(datadir, "miqrod.pid");
+#ifdef _WIN32
+    const int pidnum = (int)GetCurrentProcessId();
+#else
+    const int pidnum = (int)getpid();
+#endif
+    global::lock_sentry_thr = std::thread([lock, pid, pidnum]{
+        while (global::lock_sentry_run.load()){
+            // Refresh PID file (only if it changed/missing)
+            std::vector<uint8_t> buf;
+            bool need_write = true;
+            if (read_file_all(pid, buf)){
+                std::string s(buf.begin(), buf.end());
+                trim_inplace(s);
+                if (s == std::to_string(pidnum)) need_write = false;
+            }
+            if (need_write) write_text_atomic(pid, std::to_string(pidnum) + "\n");
+
+#ifndef _WIN32
+            // POSIX: ensure lockfile exists and we hold a write lock on it
+            std::error_code ec;
+            if (!std::filesystem::exists(lock, ec)){
+                int fd = ::open(lock.c_str(), O_CREAT | O_RDWR, 0644);
+                if (fd >= 0){
+                    struct flock fl{};
+                    fl.l_type   = F_WRLCK;
+                    fl.l_whence = SEEK_SET;
+                    fl.l_start  = 0;
+                    fl.l_len    = 0; // whole file
+                    if (fcntl(fd, F_SETLK, &fl) == 0){
+                        // swap our fd
+                        if (global::lock_fd >= 0) ::close(global::lock_fd);
+                        global::lock_fd = fd;
+                    } else {
+                        ::close(fd);
+                    }
+                }
+            }
+#endif
+            std::this_thread::sleep_for(1s);
+        }
+    });
+}
+static void stop_lock_sentry(){
+    global::lock_sentry_run.store(false);
+    if (global::lock_sentry_thr.joinable()) global::lock_sentry_thr.join();
+}
+
+// Acquire datadir lock with stale-detection, OS mutex/fcntl, retries, and optional "steal"
+//
 // Fallback knobs (env):
 //  - MIQ_LOCK_RETRIES: number of retry cycles (default 2)
 //  - MIQ_LOCK_WAIT_MS: wait per retry (default 250ms)
-//  - MIQ_STEAL_LOCK=1: if set, remove existing lock even if a process appears alive
+//  - MIQ_STEAL_LOCK=1: forcibly remove existing legacy lock files (if safe)
+//
 static bool acquire_datadir_lock(const std::string& datadir){
     std::error_code ec;
     std::filesystem::create_directories(datadir, ec);
     std::string lock = p_join(datadir, ".lock");
     std::string pid  = p_join(datadir, "miqrod.pid");
+    global::lockfile_path = lock;
+    global::pidfile_path  = pid;
 
     int retries = 2;
     int wait_ms = 250;
@@ -486,34 +568,91 @@ static bool acquire_datadir_lock(const std::string& datadir){
         steal = (*s && *s!='0');
     }
 
-    auto try_once = [&](bool log_on_fail)->bool{
 #ifdef _WIN32
-        HANDLE h = CreateFileA(lock.c_str(),
-                               GENERIC_READ | GENERIC_WRITE,
-                               0,           // no sharing
-                               NULL,
-                               CREATE_NEW,  // fail if exists
-                               FILE_ATTRIBUTE_NORMAL,
-                               NULL);
-        if (h == INVALID_HANDLE_VALUE) {
-            if (log_on_fail) log_error("Lock exists; another instance may be running.");
-            return false;
+    // 1) Hard single-instance: named mutex in the Global namespace (unique per datadir)
+    const uint64_t h = fnv1a64(datadir);
+    std::ostringstream os; os << "Global\\miqrod-" << std::hex << h;
+    std::wstring wname = utf8_to_wide(os.str());
+    HANDLE m = CreateMutexW(nullptr, FALSE, wname.c_str());
+    if (!m){
+        log_error("CreateMutexW failed; cannot ensure single-instance.");
+        return false;
+    }
+    DWORD wait = WaitForSingleObject(m, 0);
+    if (wait == WAIT_TIMEOUT){
+        // Another instance is alive. Diagnose using pidfile (legacy path) for better logs.
+        const int other_pid = read_pidfile_int(pid);
+        if (other_pid > 0) {
+            log_error(std::string("Another instance is running (pid=") + std::to_string(other_pid) + ").");
+        } else {
+            log_error("Another instance is running (mutex locked).");
         }
-        global::lockfile_handle = h;
-#else
-        int fd = ::open(lock.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
-        if (fd < 0) {
-            if (log_on_fail) log_error("Lock exists; another instance may be running.");
-            return false;
-        }
-        ::close(fd);
-#endif
+        CloseHandle(m);
+        return false;
+    }
+    // If we get WAIT_OBJECT_0 or WAIT_ABANDONED, we own it now.
+    global::instance_mutex       = m;
+    global::instance_mutex_owned = true;
+
+    // 2) Legacy lockfile create (best-effort; not authoritative on Windows)
+    auto try_file_lock = [&]()->bool{
+        HANDLE hlf = CreateFileA(lock.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hlf == INVALID_HANDLE_VALUE) return false;
+        global::lockfile_handle = hlf;
         return true;
     };
 
-    // First attempt
-    if (!try_once(false)) {
-        // Diagnose
+    if (!try_file_lock()){
+        // Diagnose & stale cleanup on Windows (legacy path)
+        const int other_pid = read_pidfile_int(pid);
+        const bool alive = process_alive(other_pid);
+        if (!alive){
+            log_warn("Stale legacy lockfile detected — removing and retrying…");
+            remove_stale_lock(lock, pid);
+            if (!try_file_lock()){
+                if (steal){
+                    log_warn("MIQ_STEAL_LOCK set — force-removing legacy lockfile again.");
+                    remove_stale_lock(lock, pid);
+                    if (!try_file_lock()){
+                        log_error("Failed to acquire legacy lockfile after forced removal.");
+                        return false;
+                    }
+                } else {
+                    log_error("Could not acquire legacy lockfile (non-fatal with mutex in place).");
+                }
+            }
+        } else {
+            log_warn("Legacy lockfile is present and owner appears alive.");
+        }
+    }
+
+#else
+    // POSIX path:
+    // 1) Create/open lockfile
+    int fd = ::open(lock.c_str(), O_CREAT | O_RDWR, 0644);
+    if (fd < 0){
+        log_error("Cannot open lockfile for locking.");
+        return false;
+    }
+
+    // 2) Take an advisory write lock with fcntl()
+    auto try_lock = [&](bool log_on_fail)->bool{
+        struct flock fl{};
+        fl.l_type   = F_WRLCK;
+        fl.l_whence = SEEK_SET;
+        fl.l_start  = 0;
+        fl.l_len    = 0; // whole file
+        if (fcntl(fd, F_SETLK, &fl) == 0){
+            global::lock_fd = fd;
+            return true;
+        } else {
+            if (log_on_fail) log_error("Lock is busy; another instance may be running.");
+            return false;
+        }
+    };
+
+    if (!try_lock(false)){
+        // Diagnose via pidfile (legacy)
         const int other_pid = read_pidfile_int(pid);
         const bool alive = process_alive(other_pid);
         std::string diag = "Another instance appears to be running";
@@ -521,50 +660,74 @@ static bool acquire_datadir_lock(const std::string& datadir){
         if (!alive && other_pid > 0) diag += " — but it looks stale";
         log_warn(diag + ".");
 
-        // If stale (pid absent or not alive) — clean up and retry
-        if (!alive) {
-            log_warn("Stale lock detected — removing and retrying…");
+        // If stale, remove legacy files and retry fcntl()
+        if (!alive){
+            log_warn("Stale lock detected — removing legacy files and retrying fcntl lock…");
             remove_stale_lock(lock, pid);
-            if (try_once(false)) goto LOCK_OK;
+            // Need to reopen because path may have been deleted
+            ::close(fd);
+            fd = ::open(lock.c_str(), O_CREAT | O_RDWR, 0644);
+            if (fd >= 0 && try_lock(false)) goto POSIX_LOCK_OK;
         }
 
-        // Retry loop (in case of race)
+        // Retry loop in case of race
         for (int i=0; i<retries && !global::shutdown_requested.load(); ++i){
             std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-            if (try_once(i+1==retries)) goto LOCK_OK;
+            if (try_lock(i+1==retries)) goto POSIX_LOCK_OK;
         }
 
-        // Optional fallback: steal lock if explicitly requested
-        if (steal) {
-            log_warn("MIQ_STEAL_LOCK set — forcibly removing existing lock.");
+        if (steal){
+            log_warn("MIQ_STEAL_LOCK set — attempting to steal by removing legacy files and retrying lock.");
             remove_stale_lock(lock, pid);
-            if (!try_once(true)) {
-                log_error("Failed to acquire lock even after forced removal.");
-                return false;
-            }
-        } else {
-            log_error("Another instance appears to be running (lock exists). Set MIQ_STEAL_LOCK=1 to override.");
-            return false;
+            ::close(fd);
+            fd = ::open(lock.c_str(), O_CREAT | O_RDWR, 0644);
+            if (fd >= 0 && try_lock(true)) goto POSIX_LOCK_OK;
         }
+
+        log_error("Could not acquire lock (fcntl).");
+        if (fd >= 0) ::close(fd);
+        return false;
     }
 
-LOCK_OK:
+POSIX_LOCK_OK:
+    // keep fd open in global::lock_fd
+    (void)0;
+#endif
+
+    // Write PID file
 #ifdef _WIN32
     const int pidnum = (int)GetCurrentProcessId();
 #else
     const int pidnum = (int)getpid();
 #endif
     write_text_atomic(pid, std::to_string(pidnum) + "\n");
-    global::lockfile_path = lock;
-    global::pidfile_path  = pid;
+
+    // Start lock sentry to keep files present and re-lock if needed
+    start_lock_sentry(datadir);
     return true;
 }
+
 static void release_datadir_lock(){
+    // Stop sentry first (so it doesn't recreate files while we're trying to remove them)
+    stop_lock_sentry();
+
     std::error_code ec;
 #ifdef _WIN32
     if (global::lockfile_handle) {
         CloseHandle(global::lockfile_handle);
         global::lockfile_handle = nullptr;
+    }
+    if (global::instance_mutex){
+        if (global::instance_mutex_owned) ReleaseMutex(global::instance_mutex);
+        CloseHandle(global::instance_mutex);
+        global::instance_mutex = nullptr;
+        global::instance_mutex_owned = false;
+    }
+#else
+    if (global::lock_fd >= 0){
+        // Release advisory lock by closing FD
+        ::close(global::lock_fd);
+        global::lock_fd = -1;
     }
 #endif
     if (!global::pidfile_path.empty()) std::filesystem::remove(global::pidfile_path, ec);
@@ -1982,8 +2145,8 @@ private:
     std::string datadir_;
     uint16_t p2p_port_{P2P_PORT};
     uint16_t rpc_port_{RPC_PORT};
-    P2P*   p2p_   {nullptr};
-    Chain* chain_ {nullptr};
+    P2P*   p2p   {nullptr};
+    Chain* chain {nullptr};
     Mempool* mempool_{nullptr};
     ConsoleWriter cw_;
     int  tick_{0};
@@ -2233,6 +2396,8 @@ int main(int argc, char** argv){
     std::signal(SIGHUP,  sighup_handler);
 #else
     SetConsoleCtrlHandler(win_ctrl_handler, TRUE);
+    // If we crash/hang, ask Windows to auto-restart us (no arguments)
+    RegisterApplicationRestart(L"", 0);
 #endif
     std::set_terminate(&fatal_terminate);
 
@@ -2345,10 +2510,13 @@ int main(int argc, char** argv){
         if(cfg.datadir.empty()) cfg.datadir = default_datadir();
         std::error_code ec;
         std::filesystem::create_directories(cfg.datadir, ec);
+
+        // Acquire robust single-instance lock (+ legacy files) — bulletproof
         if(!acquire_datadir_lock(cfg.datadir)){
             if (can_tui) { capture.stop(); tui.stop(); }
             return 11;
         }
+
         // telemetry & status file paths
         global::telemetry_path = p_join(cfg.datadir, "telemetry.ndjson");
         global::telemetry_enabled.store(telemetry_flag);
