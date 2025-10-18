@@ -2001,7 +2001,7 @@ int main(int argc, char** argv){
                 const double   round_expect = ui.round_expected_hashes.load();
                 const double   done = (tries_now >= round_start) ? (double)(tries_now - round_start) : 0.0;
                 const double   hps   = std::max(1e-9, ui.hps_smooth.load()+ui.gpu_hps_smooth.load());
-                const double   eta   = (hps > 0.0 && round_expect > done) ? (round_expect - done)/hps : std::limits<double>::infinity();
+                const double   eta   = (hps > 0.0 && round_expect > done) ? (round_expect - done)/hps : std::numeric_limits<double>::infinity();
 
                 std::vector<std::string> lines;
                 lines.push_back("  ##############################   ##############################");
