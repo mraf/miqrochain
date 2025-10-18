@@ -1,17 +1,13 @@
-// src/main.cpp — MIQ core entrypoint with hardened Pro TUI 2.3
-// Stable release: ANSI-aware column widths, boxed panels, fixed tables,
-// layout locking, high-contrast toggle, clear number formatting,
-// precise difficulty/target math (via ldexp), miner share %, top miners,
-// sorted peer table, and safe fallbacks. All metrics are local-state-only.
-// UI goals: readable for non-experts, aligned, jitter-free, professional.
-//
-// Build: same as before (no new external deps).
-//
+// miqrod_revised.cpp — Hardened, symmetric, polished TUI + robust cross-platform runtime
+// Build note: this file assumes the MIQ public headers exist in your project include path.
+
 // ─────────────────────────────────────────────────────────────────────────────
-// MSVC niceties
+// MSVC portability flags
 #ifdef _MSC_VER
   #pragma execution_character_set("utf-8")
   #define _CRT_SECURE_NO_WARNINGS
+  // Keep warnings low-noise for typical STL / POSIX shims
+  #pragma warning(disable: 4996) // POSIX names (setenv/_putenv_s guarded below)
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -107,6 +103,11 @@
   #define MIQ_ISATTY() (::isatty(fileno(stdin)) != 0)
 #endif
 
+#if defined(__APPLE__)
+  #include <mach/mach.h>
+  #include <mach/task_info.h>
+#endif
+
 #ifdef _WIN32
   #ifdef min
     #undef min
@@ -127,11 +128,12 @@ using namespace miq;
 #define MIQ_VERSION_MINOR 7
 #endif
 #ifndef MIQ_VERSION_PATCH
-#define MIQ_VERSION_PATCH 3
+#define MIQ_VERSION_PATCH 4   // Hardened TUI + cross-platform fixes
 #endif
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║                         Global state & helpers                            ║
+/*  Safer shutdown, lock & telemetry flags.                                    */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 namespace global {
 static std::atomic<bool>    shutdown_requested{false};
@@ -140,6 +142,9 @@ static std::atomic<uint64_t>last_signal_ms{0};
 static std::atomic<bool>    reload_requested{false};   // SIGHUP / hotkey 'r'
 static std::string          lockfile_path;
 static std::string          pidfile_path;
+#ifdef _WIN32
+static HANDLE               lockfile_handle{nullptr};  // keep open to hold lock
+#endif
 static std::string          telemetry_path;
 static std::atomic<bool>    telemetry_enabled{false};
 static std::atomic<bool>    tui_snapshot_requested{false};
@@ -150,7 +155,7 @@ static std::atomic<bool>    tui_toggle_help{false};
 static std::atomic<bool>    tui_toggle_compact{false};
 static std::atomic<bool>    tui_toggle_glow{false};
 static std::atomic<bool>    dump_status_json{true};
-// New UI toggles for 2.3
+// New UI toggles
 static std::atomic<bool>    tui_toggle_borders{false};
 static std::atomic<bool>    tui_toggle_wave{false};
 static std::atomic<bool>    tui_toggle_layout_lock{false};
@@ -160,7 +165,7 @@ static std::atomic<bool>    tui_toggle_units{false};
 // time helpers
 static inline uint64_t now_ms() {
     using namespace std::chrono;
-    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 static inline uint64_t now_s() {
     return (uint64_t)std::time(nullptr);
@@ -187,6 +192,35 @@ static void request_shutdown(const char* why){
     }
     global::last_signal_ms.store(now_ms());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Signal/console control handlers (cross-platform, warning-clean)
+#ifndef _WIN32
+static void sigshutdown_handler(int sig){
+    (void)sig;
+    request_shutdown("signal");
+}
+static void sighup_handler(int sig){
+    (void)sig;
+    global::reload_requested.store(true);
+    global::last_signal_ms.store(now_ms());
+}
+#else
+static BOOL WINAPI win_ctrl_handler(DWORD type){
+    switch(type){
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+            request_shutdown("console");
+            return TRUE;
+        case CTRL_LOGOFF_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            request_shutdown("system");
+            return TRUE;
+        default: return FALSE;
+    }
+}
+#endif
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║                              Miner stats                                   ║
@@ -367,13 +401,19 @@ static bool acquire_datadir_lock(const std::string& datadir){
     std::string lock = p_join(datadir, ".lock");
     std::string pid  = p_join(datadir, "miqrod.pid");
 #ifdef _WIN32
-    HANDLE h = CreateFileA(lock.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW,
-                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    // Keep handle open to hold the lock; no DELETE_ON_CLOSE, we remove explicitly.
+    HANDLE h = CreateFileA(lock.c_str(),
+                           GENERIC_READ | GENERIC_WRITE,
+                           0,           // no sharing
+                           NULL,
+                           CREATE_NEW,  // fail if exists
+                           FILE_ATTRIBUTE_NORMAL,
+                           NULL);
     if (h == INVALID_HANDLE_VALUE) {
         log_error("Another instance appears to be running (lock exists).");
         return false;
     }
-    CloseHandle(h);
+    global::lockfile_handle = h;
 #else
     int fd = ::open(lock.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
     if (fd < 0) {
@@ -394,6 +434,12 @@ static bool acquire_datadir_lock(const std::string& datadir){
 }
 static void release_datadir_lock(){
     std::error_code ec;
+#ifdef _WIN32
+    if (global::lockfile_handle) {
+        CloseHandle(global::lockfile_handle);
+        global::lockfile_handle = nullptr;
+    }
+#endif
     if (!global::pidfile_path.empty()) std::filesystem::remove(global::pidfile_path, ec);
     if (!global::lockfile_path.empty()) std::filesystem::remove(global::lockfile_path, ec);
 }
@@ -409,12 +455,19 @@ static uint64_t get_rss_bytes(){
     }
     return 0;
 #elif defined(__APPLE__)
-    std::ifstream f("/proc/self/statm"); uint64_t rss_pages=0, x=0;
-    if (f >> x >> rss_pages){ long p = sysconf(_SC_PAGESIZE); return (uint64_t)rss_pages * (uint64_t)p; }
+    task_basic_info_data_t tinfo{};
+    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&tinfo, &count) == KERN_SUCCESS) {
+        return (uint64_t)tinfo.resident_size;
+    }
     return 0;
 #else
-    std::ifstream f("/proc/self/statm"); uint64_t rss_pages=0, x=0;
-    if (f >> x >> rss_pages){ long p = sysconf(_SC_PAGESIZE); return (uint64_t)rss_pages * (uint64_t)p; }
+    std::ifstream f("/proc/self/statm");
+    uint64_t rss_pages=0, x=0;
+    if (f >> x >> rss_pages){
+        long p = sysconf(_SC_PAGESIZE);
+        if (p > 0) return (uint64_t)rss_pages * (uint64_t)p;
+    }
     return 0;
 #endif
 }
@@ -568,7 +621,6 @@ public:
     }
 private:
     static std::string sanitize_line(const std::string& s){
-        // redact obvious secrets
         auto red = s;
         auto scrub = [&](const char* key){
             size_t pos = 0;
@@ -623,7 +675,7 @@ private:
 /*                               UI helpers                                    */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 
-// — Numeric formatting (stable/clear) —
+// — Numeric formatting —
 static inline std::string commas_u64(uint64_t v){
     std::string s = std::to_string(v);
     for (int i=(int)s.size()-3; i>0; i-=3) s.insert((size_t)i, ",");
@@ -689,10 +741,8 @@ static inline bool is_ansi_start(const std::string& s, size_t i){
 }
 static size_t ansi_seq_len(const std::string& s, size_t i){
     if (!is_ansi_start(s,i)) return 0;
-    // crude ESC [ ... m sequence eater
     size_t j = i+1;
     if (j < s.size() && (s[j]=='[' || s[j]==']' || s[j]=='(' || s[j]==')')) {
-        // read until letter
         ++j;
         while (j < s.size()){
             char c = s[j++];
@@ -707,10 +757,8 @@ static size_t display_width(const std::string& s){
     for (size_t i=0;i<s.size();){
         if (is_ansi_start(s,i)){ i += ansi_seq_len(s,i); continue; }
         unsigned char c = (unsigned char)s[i];
-        // treat UTF-8 non-ASCII as width 1 (good enough for our glyphs)
         if ((c & 0x80) == 0){ ++w; ++i; }
         else {
-            // skip utf-8 continuation bytes
             if ((c & 0xE0) == 0xC0) i += 2;
             else if ((c & 0xF0) == 0xE0) i += 3;
             else if ((c & 0xF8) == 0xF0) i += 4;
@@ -722,9 +770,9 @@ static size_t display_width(const std::string& s){
 }
 static std::string truncate_to_width(const std::string& s, int width){
     if (width <= 0) return "";
-    size_t w=0;
+    size_t w=0; size_t i=0;
     std::string out; out.reserve(s.size());
-    for (size_t i=0;i<s.size();){
+    while (i<s.size()){
         if (is_ansi_start(s,i)){ size_t k=ansi_seq_len(s,i); out.append(s, i, k); i+=k; continue; }
         unsigned char c = (unsigned char)s[i];
         size_t take = 1;
@@ -732,40 +780,28 @@ static std::string truncate_to_width(const std::string& s, int width){
         else if ((c & 0xE0) == 0xC0) take = 2;
         else if ((c & 0xF0) == 0xE0) take = 3;
         else if ((c & 0xF8) == 0xF0) take = 4;
-        if ((int)(w+1) > width){
-            // append ellipsis if space
-            if (width >= 1) {
-                if (display_width(out) >= (size_t)width) break;
-            }
-            break;
-        }
+        if ((int)(w+1) > width) break;
         out.append(s, i, take);
         i += take;
         ++w;
     }
-    // pad with ellipsis if we cut mid-content
     if ((int)w == width && i < s.size()){
-        if (width >= 1){
-            // replace last cell with '…' (utf-8)
-            // strip last real char (not ANSI)
-            // simple approach: ensure last printed char replaced
-            std::string noansi;
-            for (size_t j=0;j<out.size();){
-                if (is_ansi_start(out,j)){ size_t k=ansi_seq_len(out,j); j+=k; continue; }
-                unsigned char cc=(unsigned char)out[j];
-                size_t take = (cc&0x80)? ((cc&0xE0)==0xC0?2:((cc&0xF0)==0xE0?3:((cc&0xF8)==0xF0?4:1))):1;
-                noansi.append(out, j, take);
-                j+=take;
-            }
-            // remove last visible char from noansi
-            if (!noansi.empty()){
-                // drop last UTF-8 codepoint
-                size_t pos = noansi.size()-1;
-                while (pos>0 && ((unsigned char)noansi[pos] & 0xC0) == 0x80) --pos;
-                noansi.erase(pos);
-            }
-            out = noansi + "…";
+        // Replace last visible char with UTF-8 ellipsis
+        // Strip ANSI to find the last codepoint boundary
+        std::string noansi;
+        for (size_t j=0;j<out.size();){
+            if (is_ansi_start(out,j)){ size_t k=ansi_seq_len(out,j); j+=k; continue; }
+            unsigned char cc=(unsigned char)out[j];
+            size_t take = (cc&0x80)? ((cc&0xE0)==0xC0?2:((cc&0xF0)==0xE0?3:((cc&0xF8)==0xF0?4:1))):1;
+            noansi.append(out, j, take);
+            j+=take;
         }
+        if (!noansi.empty()){
+            size_t pos = noansi.size()-1;
+            while (pos>0 && ((unsigned char)noansi[pos] & 0xC0) == 0x80) --pos;
+            noansi.erase(pos);
+        }
+        out = noansi + "…";
     }
     return out;
 }
@@ -1090,11 +1126,10 @@ private:
     const char* C_info()  const { return vt_ok_ ? (dark_theme_? "\x1b[36m":"\x1b[34m") : ""; }
     const char* C_warn()  const { return vt_ok_ ? "\x1b[33m" : ""; }
     const char* C_err()   const { return vt_ok_ ? "\x1b[31m" : ""; }
-    const char* C_dim()   const { return vt_ok_ ? (high_contrast_? "\x1b[90m":"\x1b[90m") : ""; }
-    const char* C_head()  const { return vt_ok_ ? (dark_theme_? "\x1b[35m":"\x1b[35m") : ""; }
+    const char* C_dim()   const { return vt_ok_ ? "\x1b[90m" : ""; }
+    const char* C_head()  const { return vt_ok_ ? "\x1b[35m" : ""; }
     const char* C_ok()    const { return vt_ok_ ? "\x1b[32m" : ""; }
     const char* C_bold()  const { return vt_ok_ ? "\x1b[1m"  : ""; }
-    const char* C_ul()    const { return vt_ok_ ? "\x1b[4m"  : ""; }
 
     static std::string fit(const std::string& s, int w){
         return truncate_to_width(s, w);
@@ -1126,8 +1161,10 @@ private:
         }
 #else
         termios oldt{};
-        if (tcgetattr(STDIN_FILENO, &oldt) == 0){
-            termios newt = oldt;
+        bool term_ok = (tcgetattr(STDIN_FILENO, &oldt) == 0);
+        termios newt{};
+        if (term_ok){
+            newt = oldt;
             newt.c_lflag &= ~(ICANON | ECHO);
             newt.c_cc[VMIN]  = 0;
             newt.c_cc[VTIME] = 0;
@@ -1139,7 +1176,7 @@ private:
             if (n == 1) handle_key((int)c);
             else std::this_thread::sleep_for(std::chrono::milliseconds(16));
         }
-        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+        if (term_ok) tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
 #endif
     }
     void handle_key(int c){
@@ -1162,19 +1199,18 @@ private:
     }
 
     // ── Layout primitives (ANSI-aware boxes & tables) ───────────────────────
+    struct ColSpec { int w; bool right; };
+
     std::vector<std::string> render_box(const std::string& title, const std::vector<std::string>& body, int width){
-        // width must be >= 8
         int w = std::max(8, width);
         std::vector<std::string> out;
         if (!show_borders_) {
-            // Title line
-            std::string t = C_bold(); t += title; t += C_reset();
+            std::string t = std::string(C_bold()) + title + C_reset();
             out.push_back(pad_right_ansi(t, w));
             out.push_back(pad_right_ansi(std::string(w, '-'), w));
             for (auto& l : body) out.push_back(pad_right_ansi(l, w));
             return out;
         }
-        // Top with centered title
         std::string cap = " " + title + " ";
         int capw = (int)display_width(cap);
         int left = (w-2 - capw)/2;
@@ -1185,19 +1221,15 @@ private:
         top.append(std::max(0,right), '─');
         top += "┐";
         out.push_back(pad_right_ansi(top, w));
-
-        // Body lines
         for (auto& l : body){
             std::string inner = pad_right_ansi(l, w-2);
             out.push_back("│" + inner + "│");
         }
-        // Bottom
         std::string bot = "└"; bot.append(w-2, '─'); bot += "┘";
         out.push_back(pad_right_ansi(bot, w));
         return out;
     }
 
-    struct ColSpec { int w; bool right; };
     std::vector<std::string> render_table(const std::vector<std::string>& header,
                                           const std::vector<std::vector<std::string>>& rows,
                                           const std::vector<ColSpec>& cols,
@@ -1205,11 +1237,9 @@ private:
         int w = std::max(8, width);
         std::vector<std::string> out;
         int inner = show_borders_ ? (w-2) : w;
-        // compute total width of cols (+ spaces between)
         int sumw=0; for (auto& c: cols) sumw += c.w;
         int gaps = (int)cols.size()-1;
         int padExtra = std::max(0, inner - sumw - gaps);
-        // spread extra into last column
         std::vector<int> cw; cw.reserve(cols.size());
         for (size_t i=0;i<cols.size();++i){
             int add = (i+1==cols.size())? padExtra : 0;
@@ -1219,45 +1249,38 @@ private:
             std::ostringstream o;
             if (show_borders_) o << "│";
             for (size_t i=0;i<cells.size() && i<cw.size(); ++i){
+                const bool right = cols[i].right;
                 std::string cell = cells[i];
-                std::string t = pad_right_ansi(cols[i].right ? pad_right_ansi(cell, cw[i]) : cell, cw[i]);
-                if ((int)display_width(t) < cw[i]) t.append((size_t)(cw[i]-display_width(t)), ' ');
-                o << t;
+                std::string t = truncate_to_width(cell, cw[i]);
+                int pad = cw[i] - (int)display_width(t);
+                if (pad < 0) pad = 0;
+                if (right) o << std::string(pad, ' ') << t;
+                else       o << t << std::string(pad, ' ');
                 if (i+1 < cells.size()) o << " ";
             }
             if (show_borders_) o << "│";
             return pad_right_ansi(o.str(), w);
         };
-        // top border
         if (show_borders_){
             std::string top = "┌"; top.append((size_t)inner, '─'); top += "┐";
             out.push_back(pad_right_ansi(top, w));
         }
-        // header
         out.push_back(line_from_cells(header));
-        // header underline
         {
             std::ostringstream u;
             if (show_borders_) u<<"│";
-            int filled=0;
             for (size_t i=0;i<cw.size();++i){
                 u<<std::string((size_t)cw[i], '─');
                 if (i+1<cw.size()) u<<" ";
-                filled += cw[i] + (i+1<cw.size()?1:0);
             }
             if (show_borders_) u<<"│";
             out.push_back(pad_right_ansi(u.str(), w));
         }
-        // rows
         for (size_t r=0; r<rows.size(); ++r){
             std::string ln = line_from_cells(rows[r]);
-            if (zebra && (r%2)==1) {
-                // subtle dim for alternate rows
-                ln = C_dim() + ln + C_reset();
-            }
+            if (zebra && (r%2)==1) ln = std::string(C_dim()) + ln + C_reset();
             out.push_back(ln);
         }
-        // bottom border
         if (show_borders_){
             std::string bot = "└"; bot.append((size_t)inner, '─'); bot += "┘";
             out.push_back(pad_right_ansi(bot, w));
@@ -1292,10 +1315,8 @@ private:
             if((clock::now()-last_hs_time) > 250ms){
                 last_hs_time = clock::now();
                 std::lock_guard<std::mutex> lk(mu_);
-                // miner hashrate spark
                 spark_hs_.push_back(g_miner_stats.hps.load());
                 if(spark_hs_.size() > 90) spark_hs_.erase(spark_hs_.begin());
-                // mempool spark
                 if (mempool_) {
                     auto v = mempool_view_fallback(mempool_);
                     mem_spark_.push_back((double)v.count);
@@ -1311,7 +1332,6 @@ private:
                 double nh = estimate_network_hashrate(chain_, &avg_bt);
                 std::lock_guard<std::mutex> lk(mu_);
                 avg_block_time_ = avg_bt;
-                // EMA to reduce jitter on the label (keep spark raw for history)
                 if (net_hashrate_ == 0.0) net_hashrate_ = nh;
                 else net_hashrate_ = net_hashrate_*0.75 + nh*0.25;
                 net_spark_.push_back(nh);
@@ -1414,7 +1434,6 @@ private:
         if (cols < 114) cols = 114;
         if (rows < 34) rows = 34;
 
-        // column widths (stable)
         const int rightw = compact_ ? std::max(44, cols/3) : std::max(52, cols / 3);
         const int leftw  = cols - rightw - 1; // 1 space separator
 
@@ -1509,7 +1528,7 @@ private:
             left.insert(left.end(), b.begin(), b.end());
         }
 
-        // Chain box with table
+        // Chain status + recent blocks table
         {
             uint64_t height = chain_ ? chain_->height() : 0;
             std::string tip_hex;
@@ -1538,7 +1557,6 @@ private:
                 top.push_back(std::string("trend: ") + spark_ascii(net_spark_));
             }
             auto head = std::vector<std::string>{"Hgt","Txs","Fees","Hash","Miner"};
-            // Choose widths to fit leftw - borders; Hash 12; Miner 18
             std::vector<ColSpec> colspec = { {8,true},{6,true},{10,true},{12,false},{20,false} };
             std::vector<std::vector<std::string>> rowsv;
             size_t N = recent_blocks_.size();
@@ -1742,7 +1760,6 @@ private:
         if (start < 0) start = 0;
         for (int i=start; i<(int)logs_.size(); ++i) {
             const auto& line = logs_[i];
-            // timestamp relative to TUI start
             double dt = (double)(line.ts_ms - base_ts_ms_) / 1000.0;
             std::ostringstream pref; pref<<std::fixed<<std::setprecision(3)<<std::setw(8)<<dt<<"s ";
             std::string txt = pref.str() + line.txt;
@@ -1871,14 +1888,14 @@ static void miner_worker(Chain* chain, Mempool* mempool, P2P* p2p,
             cbt.lock_time = static_cast<uint32_t>(t.height + 1);
 
             const uint32_t ch = static_cast<uint32_t>(t.height + 1);
-            const uint32_t now = static_cast<uint32_t>(time(nullptr));
+            const uint32_t nowt = static_cast<uint32_t>(time(nullptr));
             const uint64_t extraNonce = gen();
             std::vector<uint8_t> tag; tag.reserve(1+4+4+8);
             tag.push_back(0x01);
             tag.push_back(uint8_t(ch      & 0xff)); tag.push_back(uint8_t((ch>>8) & 0xff));
             tag.push_back(uint8_t((ch>>16)& 0xff)); tag.push_back(uint8_t((ch>>24)& 0xff));
-            tag.push_back(uint8_t(now      & 0xff)); tag.push_back(uint8_t((now>>8) & 0xff));
-            tag.push_back(uint8_t((now>>16)& 0xff)); tag.push_back(uint8_t((now>>24)& 0xff));
+            tag.push_back(uint8_t(nowt      & 0xff)); tag.push_back(uint8_t((nowt>>8) & 0xff));
+            tag.push_back(uint8_t((nowt>>16)& 0xff)); tag.push_back(uint8_t((nowt>>24)& 0xff));
             for (int i=0;i<8;i++) tag.push_back(uint8_t((extraNonce >> (8*i)) & 0xff));
             cbt.vin[0].sig = std::move(tag);
 
@@ -2380,7 +2397,6 @@ int main(int argc, char** argv){
             if (can_tui) tui.set_shutdown_phase("Stopping miner watch…", true);
         } catch(...) { log_warn("Miner watch stop threw"); }
 
-        // Allow UI to render final frames
         std::this_thread::sleep_for(std::chrono::milliseconds(140));
 
         log_info("Shutdown complete.");
