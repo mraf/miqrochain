@@ -44,7 +44,7 @@
 #include "reindex_utxo.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
-/* STL */ 
+/* STL */
 #include <thread>
 #include <cctype>
 #include <fstream>
@@ -777,11 +777,11 @@ public:
         }
 #else
         int fd = (fd_ >= 0) ? fd_ : STDOUT_FILENO;
-        size_t off = 0; 
-        while (off < s.size()) { 
-            ssize_t n = ::write(fd, s.data()+off, s.size()-off); 
-            if (n<=0) break; 
-            off += (size_t)n; 
+        size_t off = 0;
+        while (off < s.size()) {
+            ssize_t n = ::write(fd, s.data()+off, s.size()-off);
+            if (n<=0) break;
+            off += (size_t)n;
         }
 #endif
     }
@@ -976,7 +976,12 @@ static inline std::string fmt_diff(long double d){
     return o.str();
 }
 static inline std::string fmt_pct(double x, int p=2){
-    if (x < 0) x = 0; if (x > 100) x = 100;
+    if (x < 0) {
+        x = 0;
+    }
+    if (x > 100) {
+        x = 100;
+    }
     std::ostringstream o; o<<std::fixed<<std::setprecision(p)<<x<<'%'; return o.str();
 }
 static inline std::string fmt_duration(double sec){
@@ -1110,7 +1115,12 @@ static std::string wave_line(int width, int tick, bool vt_ok, int hue_a=36, int 
         const double x = (i + tick*0.72) * 0.21;
         const double y = 0.5 + 0.5*std::sin(x) * std::cos((tick+i)*0.075);
         int idx = (int)std::round(y * N);
-        if(idx<0) idx=0; if(idx>N) idx=N;
+        if(idx<0) {
+            idx=0;
+        }
+        if(idx>N) {
+            idx=N;
+        }
         if(vt_ok){
             const int hue = hue_a - (i*(hue_a-hue_b))/std::max(1,width);
             o << "\x1b["<<hue<<"m" << blocks[idx] << "\x1b[0m";
@@ -1125,9 +1135,7 @@ static std::string spinner(int tick){
         u8"⠋", u8"⠙", u8"⠹", u8"⠸", u8"⠼",
         u8"⠴", u8"⠦", u8"⠧", u8"⠇", u8"⠏"
     };
-    static const char* frames_ascii[] = {"-", "\\", "|", "/"};
 #ifdef _WIN32
-    // On Windows we always write via UTF-16 to console; keep UTF-8 frames.
     return std::string(frames_utf8[tick % 10]);
 #else
     return std::string(frames_utf8[tick % 10]);
@@ -1143,7 +1151,12 @@ static std::string spark_ascii(const std::vector<double>& xs){
     s.reserve(xs.size());
     for(double v: xs){
         int idx = (int)std::round( (v-mn)/span * 9.0 );
-        if (idx < 0) idx = 0; if (idx > 9) idx = 9;
+        if (idx < 0) {
+            idx = 0;
+        }
+        if (idx > 9) {
+            idx = 9;
+        }
         s.push_back(bars[idx]);
     }
     return s;
@@ -1835,7 +1848,7 @@ private:
                 top.push_back(std::string("trend: ") + spark_ascii(net_spark_));
             }
             auto head = std::vector<std::string>{"Hgt","Txs","Fees","Hash","Miner"};
-            std::vector<term::ColSpec> colspec_chain = { {8,true},{6,true},{10,true},{12,false},{20,false} };
+            std::vector<ColSpec> colspec_chain = { {8,true},{6,true},{10,true},{12,false},{20,false} };
             std::vector<std::vector<std::string>> rows_chain;
             const size_t N = recent_blocks_.size();
             const size_t show = std::min<size_t>(compact_?6:8, N);
@@ -1885,7 +1898,7 @@ private:
 
             // Table
             std::vector<std::string> head = {"IP","ok","last(ms)","rx","inflight"};
-            std::vector<term::ColSpec> colspec_peers = { {18,false},{4,false},{9,true},{7,true},{8,true} };
+            std::vector<ColSpec> colspec_peers = { {18,false},{4,false},{9,true},{7,true},{8,true} };
             std::vector<std::vector<std::string>> rows_peers;
             const size_t showp = std::min(peers.size(), (size_t)(compact_?6:8));
             for (size_t i=0;i<showp; ++i) {
@@ -1938,7 +1951,12 @@ private:
                 body.push_back(std::string("miner hashrate: ") + (long_units_? fmt_hs_full(hps) : fmt_hs_compact(hps)));
                 body.push_back(std::string("miner trend:    ") + spark_ascii(spark_hs_));
                 double share = (net_hashrate_ > 0.0) ? (hps / net_hashrate_) * 100.0 : 0.0;
-                if (share < 0.0) share = 0.0; if (share > 100.0) share = 100.0;
+                if (share < 0.0) {
+                    share = 0.0;
+                }
+                if (share > 100.0) {
+                    share = 100.0;
+                }
                 std::ostringstream m3; m3 << "network (est):  " << (long_units_? fmt_hs_full(net_hashrate_) : fmt_hs_compact(net_hashrate_))
                                           << "   your share: " << fmt_pct(share, 3);
                 body.push_back(m3.str());
@@ -1954,7 +1972,7 @@ private:
             size_t window=0;
             auto top = top_miners(compact_?4:8, window);
             std::vector<std::string> head = {"addr(short)","blocks","share"};
-            std::vector<term::ColSpec> colspec_miners = { {18,false},{7,true},{7,true} };
+            std::vector<ColSpec> colspec_miners = { {18,false},{7,true},{7,true} };
             std::vector<std::vector<std::string>> rows_miners;
             for (auto& [addr, cnt] : top){
                 const double pct = window? (100.0 * (double)cnt / (double)window) : 0.0;
