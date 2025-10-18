@@ -1061,7 +1061,7 @@ static std::string truncate_to_width(const std::string& s, int width){
         ++w;
     }
     if ((int)w == width && i < s.size()){
-        // strip last glyph and append ellipsis
+        // strip last glyph and append ASCII ellipsis to avoid mojibake
         std::string noansi;
         for (size_t j=0;j<out.size();){
             if (is_ansi_start(out,j)){ size_t k=ansi_seq_len(out,j); j+=k; continue; }
@@ -1075,7 +1075,7 @@ static std::string truncate_to_width(const std::string& s, int width){
             while (pos>0 && ((unsigned char)noansi[pos] & 0xC0) == 0x80) --pos;
             noansi.erase(pos);
         }
-        out = noansi + u8"…";
+        out = noansi + "...";
     }
     return out;
 }
@@ -1385,6 +1385,9 @@ public:
     void set_hot_warning(const std::string& w){ std::lock_guard<std::mutex> lk(mu_); hot_warning_ = w; hot_warn_ts_ = now_ms(); }
 
 private:
+    // small helper to pick unicode/ASCII safely
+    std::string U(const char* uni, const char* ascii) const { return unicode_ok_ ? std::string(uni) : std::string(ascii); }
+
     // styled lines (0=info 1=warn 2=err 3=trace 4=ok)
     struct StyledLine { std::string txt; int level; uint64_t ts_ms; };
     StyledLine stylize_log(const LogCapture::Line& L){
@@ -1762,8 +1765,8 @@ private:
             h << C_head() << "MIQROCHAIN" << C_reset() << "  Ultra TUI 3.0"
               << "  " << C_dim()
               << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
-              << "  •  Chain: " << CHAIN_NAME
-              << "  •  P2P " << p2p_port_ << "  •  RPC " << rpc_port_
+              << "  " << U("•", "*") << "  Chain: " << CHAIN_NAME
+              << "  " << "P2P " << p2p_port_ << "  RPC " << rpc_port_
               << C_reset()
               << "  " << spinner(unicode_ok_, tick_);
             left.push_back(pad_right_ansi(h.str(), leftw));
@@ -1811,7 +1814,7 @@ private:
                 case NodeState::Quitting: s << C_warn() << "shutting down" << C_reset(); break;
             }
             if (miner_running_badge()){
-                s << "   " << C_bold() << C_ok() << u8"⛏ RUNNING" << C_reset();
+                s << "   " << C_bold() << C_ok() << (unicode_ok_ ? u8"⛏ RUNNING" : "[MINER RUNNING]") << C_reset();
             }
             body.push_back(s.str());
             auto b = render_box("Node", body, leftw);
@@ -1973,7 +1976,7 @@ private:
                 std::ostringstream m1;
                 m1 << "status: " << (active ? (std::string(C_ok()) + "running" + C_reset()) : (std::string(C_dim()) + "idle" + C_reset()))
                    << "   threads: " << thr
-                   << "   ext: " << (g_extminer.alive.load() ? (std::string(C_ok()) + "alive" + C_reset()) : (std::string(C_dim()) + u8"—" + C_reset()));
+                   << "   ext: " << (g_extminer.alive.load() ? (std::string(C_ok()) + "alive" + C_reset()) : (std::string(C_dim()) + (unicode_ok_? "—":"-") + C_reset()));
                 body.push_back(m1.str());
                 std::ostringstream m2; m2 << "accepted: " << commas_u64(ok) << "   rejected: " << commas_u64(rej); body.push_back(m2.str());
                 body.push_back(std::string("miner hashrate: ") + (long_units_? fmt_hs_full(hps) : fmt_hs_compact(hps)));
@@ -1989,7 +1992,7 @@ private:
                                           << "   your share: " << fmt_pct(share, 3);
                 body.push_back(m3.str());
                 const double ettf_s = (hps > 0.0) ? (double)(tip_diff * 4294967296.0L) / hps : 0.0;
-                body.push_back(std::string("ETTF (your rig): ") + (hps>0.0 ? fmt_duration(ettf_s) : std::string(u8"—")));
+                body.push_back(std::string("ETTF (your rig): ") + (hps>0.0 ? fmt_duration(ettf_s) : std::string(unicode_ok_? "—":"-")));
             }
             auto b = render_box("Mining", body, rightw);
             right.insert(right.end(), b.begin(), b.end());
@@ -2028,7 +2031,7 @@ private:
         // Health/Security
         {
             std::vector<std::string> body;
-            body.push_back(std::string("config reload: ") + (global::reload_requested.load()? "pending":"—"));
+            body.push_back(std::string("config reload: ") + (global::reload_requested.load()? "pending":U("—","-")));
             body.push_back(std::string("status.json: ") + (global::dump_status_json.load()? "enabled":"disabled"));
             if (!hot_warning_.empty() && now_ms()-hot_warn_ts_ < 6000)
                 body.push_back(std::string(C_warn()) + hot_warning_ + C_reset());
@@ -2069,7 +2072,7 @@ private:
         } else if (nstate_ == NodeState::Quitting){
             std::string s1 = std::string(C_bold()) + "Shutting down" + C_reset() + "  " + C_dim() + "(Ctrl+C again = force)" + C_reset();
             out << pad_right_ansi(s1, cols_term) << "\n";
-            const std::string phase = shutdown_phase_.empty() ? u8"initiating…" : shutdown_phase_;
+            const std::string phase = shutdown_phase_.empty() ? "initiating..." : shutdown_phase_;
             out << pad_right_ansi(std::string("  phase: ") + phase, cols_term) << "\n";
         } else {
             std::string h = std::string(C_bold()) + "Logs" + C_reset() + "  " + C_dim() + "(q,t,h,p,r,s,v,?,c,g,b,w,l,u,x)" + C_reset();
@@ -2649,7 +2652,7 @@ int main(int argc, char** argv){
         log_info(std::string(CHAIN_NAME) + " node running. RPC " + std::to_string(RPC_PORT) +
                  ", P2P " + std::to_string(P2P_PORT));
         if (can_tui) {
-            tui.set_banner(u8"Miqrochain node running — syncing & serving peers…");
+            tui.set_banner("Miqrochain node running — syncing & serving peers…");
             if ((p2p_ok || cfg.no_p2p) && rpc_ok) tui.set_node_state(TUI::NodeState::Running);
             else tui.set_node_state(TUI::NodeState::Syncing);
         }
