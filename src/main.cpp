@@ -1,4 +1,4 @@
-// src/main.cpp — MIQ core entrypoint with robust ASCII Pro TUI (no extra files)
+// src/main.cpp — MIQ core entrypoint with robust ASCII Pro TUI (single file, no extra deps)
 
 #ifdef _MSC_VER
 #pragma execution_character_set("utf-8")
@@ -26,10 +26,8 @@
 #include "miner.h"
 #include "sha256.h"
 #include "hex.h"
-
 #include "tls_proxy.h"
 #include "ibd_monitor.h"
-
 #include "utxo_kv.h"
 #include "reindex_utxo.h"
 
@@ -58,6 +56,7 @@
 #include <mutex>
 #include <sstream>
 #include <iomanip>
+#include <limits>
 
 #ifndef MIQ_VERSION_MAJOR
 #define MIQ_VERSION_MAJOR 0
@@ -94,7 +93,19 @@
 
 using namespace miq;
 
+// ========= global shutdown ===================================================
 static std::atomic<bool> g_shutdown_requested{false};
+
+// ========= miner stats (for TUI surface) ====================================
+struct MinerStats {
+    std::atomic<bool> active{false};
+    std::atomic<unsigned> threads{0};
+    std::atomic<uint64_t> accepted{0};
+    std::atomic<uint64_t> rejected{0};
+    std::atomic<uint64_t> last_height_ok{0};
+    std::atomic<uint64_t> last_height_rx{0}; // any miner
+    std::chrono::steady_clock::time_point start{};
+} g_miner_stats;
 
 // ---------- default per-user datadir -----------------------------------------
 static std::string default_datadir() {
@@ -176,7 +187,7 @@ static inline bool is_tty() {
 #endif
 }
 static inline void get_winsize(int& cols, int& rows) {
-    cols = 100; rows = 34;
+    cols = 110; rows = 36;
 #ifdef _WIN32
     CONSOLE_SCREEN_BUFFER_INFO info;
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -299,7 +310,7 @@ public:
     }
     ~LogCapture(){ stop(); }
 
-    void drain(std::deque<Line>& into, size_t max_keep=1200) {
+    void drain(std::deque<Line>& into, size_t max_keep=1500) {
         std::lock_guard<std::mutex> lk(mu_);
         for (auto& s : pending_) {
             lines_.push_back({s});
@@ -327,7 +338,7 @@ private:
                 if (c == '\r') continue;
                 if (c == '\n') {
                     std::lock_guard<std::mutex> lk(mu_);
-                    pending_.push_back(buf);
+                    if (!buf.empty()) pending_.push_back(buf);
                     buf.clear();
                 } else {
                     buf.push_back(c);
@@ -355,10 +366,8 @@ public:
     void set_enabled(bool on){ enabled_ = on; }
     void start() {
         if (!enabled_) return;
-        cw_.write_raw("Miqrochain UI initializing...\n");
-        draw_once(true);
         if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H\x1b[?25l");
-        draw_once(false);
+        draw_once(true);
         thr_ = std::thread([this]{ loop(); });
     }
     void stop() {
@@ -380,7 +389,25 @@ public:
     }
 
     void set_runtime_refs(P2P* p2p, Chain* chain) { p2p_ = p2p; chain_ = chain; }
-    void feed_logs(const std::deque<LogCapture::Line>& lines) { std::lock_guard<std::mutex> lk(mu_); logs_ = lines; }
+    void feed_logs(const std::deque<LogCapture::Line>& lines) {
+        std::lock_guard<std::mutex> lk(mu_);
+        logs_ = lines;
+        // lightweight event extraction (any miner accept & our miner accept)
+        for (int i=(int)logs_.size()-1; i>=0; --i){
+            const auto& L = logs_[i].text;
+            if (L.find("accepted block") != std::string::npos || L.find("mined block accepted") != std::string::npos){
+                last_accept_line_ = L;
+                // try to extract height
+                auto hpos = L.find("height=");
+                if (hpos != std::string::npos){
+                    size_t k=hpos+7, j=k;
+                    while (j<L.size() && std::isdigit((unsigned char)L[j])) ++j;
+                    last_accept_height_ = L.substr(k, j-k);
+                }
+                break;
+            }
+        }
+    }
     void set_banner(const std::string& s){ std::lock_guard<std::mutex> lk(mu_); banner_ = s; }
     void set_ports(uint16_t p2pport, uint16_t rpcport) { p2p_port_ = p2pport; rpc_port_ = rpcport; }
     void set_node_state(NodeState st){ std::lock_guard<std::mutex> lk(mu_); nstate_ = st; }
@@ -413,8 +440,10 @@ private:
     static std::string bar(uint64_t cur, uint64_t tot, int width){
         if (tot == 0) tot = 1;
         double frac = (double)cur / (double)tot;
-        if (frac < 0) frac = 0; if (frac > 1) frac = 1;
-        int filled = (int)(frac * width);
+        if (frac < 0) frac = 0;
+        if (frac > 1) frac = 1; // (fixed misleading-indentation warning)
+        int filled = (int)(frac * width + 0.5);
+        if (filled > width) filled = width;
         std::string out = "[";
         for (int i=0;i<width;i++) out.push_back(i < filled ? '=' : ' ');
         out.push_back(']');
@@ -435,6 +464,7 @@ private:
     const char* cStep()  const { return vt_ok_ ? "\x1b[34m" : ""; }
     const char* cOK()    const { return vt_ok_ ? "\x1b[32m" : ""; }
     const char* cRun()   const { return vt_ok_ ? "\x1b[32m" : ""; }
+    const char* cPanel() const { return vt_ok_ ? "\x1b[1;37m" : ""; }
 
     void loop(){
         using namespace std::chrono_literals;
@@ -442,18 +472,23 @@ private:
         while (running_) { draw_once(false); std::this_thread::sleep_for(120ms); ++tick_; }
     }
 
+    static std::string short_hash(const std::string& hex, size_t n=10){
+        if (hex.size() <= n) return hex;
+        return hex.substr(0,n);
+    }
+
     void draw_once(bool gentle){
         std::lock_guard<std::mutex> lk(mu_);
         int cols, rows; term::get_winsize(cols, rows);
-        if (cols < 90) cols = 90;
-        if (rows < 26) rows = 26;
+        if (cols < 96) cols = 96;
+        if (rows < 30) rows = 30;
 
-        // Define once; reuse later (fix redefinition errors)
-        const int rightw = std::max(36, cols / 3);
+        const int rightw = std::max(40, cols / 3);
         const int leftw  = cols - rightw - 3;
 
         std::vector<std::string> left, right;
 
+        // Header
         {
             std::ostringstream h;
             if (!gentle && vt_ok_) h << "\x1b[H\x1b[0J";
@@ -466,11 +501,11 @@ private:
             left.push_back("");
         }
 
+        // Node state line
         {
-            const char* label = "State: ";
             std::string dots; dots.assign(tick_ % 4, '.');
             std::ostringstream s;
-            s << "  " << label;
+            s << "  State: ";
             if (nstate_ == NodeState::Starting)     s << cWarn() << "starting" << reset() << dots;
             else if (nstate_ == NodeState::Syncing) s << cWarn() << "syncing"  << reset() << dots;
             else                                    s << cRun()  << "node running" << reset() << dots;
@@ -478,8 +513,9 @@ private:
             left.push_back("");
         }
 
+        // Startup progress
         {
-            left.push_back(std::string(cStep()) + "Startup" + reset());
+            left.push_back(std::string(cPanel()) + "Startup" + reset());
             size_t total = steps_.size(), okc = 0;
             for (auto& s : steps_) if (s.second) ++okc;
             int bw = std::max(10, leftw - 20);
@@ -494,11 +530,17 @@ private:
             left.push_back("");
         }
 
+        // Node status (chain + p2p snapshot)
         {
-            left.push_back(std::string(cStep()) + "Node status" + reset());
+            left.push_back(std::string(cPanel()) + "Node status" + reset());
             uint64_t height = chain_ ? chain_->height() : 0;
-            size_t   peers  = 0, inflight_tx = 0, rxbuf_sum = 0, awaiting_pongs = 0;
+            std::string tip_hex;
+            if (chain_) {
+                auto t = chain_->tip();
+                tip_hex = to_hex(t.hash);
+            }
 
+            size_t peers  = 0, inflight_tx = 0, rxbuf_sum = 0, awaiting_pongs = 0;
             if (p2p_) {
                 auto v = p2p_->snapshot_peers();
                 peers = v.size();
@@ -508,42 +550,30 @@ private:
                     if (s.awaiting_pong) ++awaiting_pongs;
                 }
             }
-            std::ostringstream ns;
-            ns << "  height: " << height
-               << "   peers: " << peers
-               << "   inflight tx: " << inflight_tx
-               << "   rx-buf: " << rxbuf_sum
-               << "   pings-waiting: " << awaiting_pongs;
-            left.push_back(ns.str());
 
-            std::string lastBlk, lastIP;
-            for (int i = (int)logs_.size()-1; i >= 0; --i) {
-                const auto& L = logs_[i].text;
-                if (L.find("accepted block") != std::string::npos) {
-                    auto hpos = L.find("height=");
-                    if (hpos != std::string::npos) {
-                        size_t k = hpos + 7, j = k;
-                        while (j < L.size() && std::isdigit((unsigned char)L[j])) ++j;
-                        lastBlk = L.substr(k, j-k);
-                    }
-                    auto fpos = L.find("from=");
-                    if (fpos != std::string::npos) {
-                        size_t k = fpos + 5, j = k;
-                        while (j < L.size() && !std::isspace((unsigned char)L[j])) ++j;
-                        lastIP = L.substr(k, j-k);
-                    }
-                    break;
-                }
-            }
-            if (!lastBlk.empty()) {
+            std::ostringstream ns1;
+            ns1 << "  height: " << height
+                << "   tip: " << short_hash(tip_hex, 12)
+                << "   peers: " << peers;
+            left.push_back(ns1.str());
+
+            std::ostringstream ns2;
+            ns2 << "  inflight tx: " << inflight_tx
+                << "   rx-buf: " << rxbuf_sum
+                << "   pings-waiting: " << awaiting_pongs;
+            left.push_back(ns2.str());
+
+            // Last accepted block (any miner)
+            if (!last_accept_line_.empty()) {
                 left.push_back(std::string("  ") + cOK() + "Last accepted block" + reset() +
-                               ": height " + lastBlk + (lastIP.empty() ? "" : ("  from " + lastIP)));
+                               (last_accept_height_.empty() ? "" : (": height " + last_accept_height_)));
             }
             left.push_back("");
         }
 
+        // Right panel: peers + miner panel
         if (p2p_) {
-            right.push_back(std::string(cStep()) + "Peers" + reset());
+            right.push_back(std::string(cPanel()) + "Peers" + reset());
             std::ostringstream hdr;
             hdr << "  " << std::left << std::setw(16) << "IP"
                 << "  verack  " << std::setw(8) << "last(ms)"
@@ -552,7 +582,7 @@ private:
             right.push_back(hdr.str());
 
             auto v = p2p_->snapshot_peers();
-            size_t show = std::min(v.size(), (size_t)std::max(6, (int)((rows-12))));
+            size_t show = std::min(v.size(), (size_t)std::max(6, (int)((rows-16))));
             for (size_t i=0;i<show; ++i) {
                 const auto& s = v[i];
                 std::string ip = s.ip; if ((int)ip.size() > 16) ip = ip.substr(0,13) + "...";
@@ -568,8 +598,41 @@ private:
                 std::ostringstream more; more << "  ... +" << (v.size() - show) << " more";
                 right.push_back(more.str());
             }
+            right.push_back("");
         }
 
+        // Miner panel (built-in miner visibility)
+        {
+            right.push_back(std::string(cPanel()) + "Miner" + reset());
+            bool active = g_miner_stats.active.load();
+            unsigned thr = g_miner_stats.threads.load();
+            uint64_t ok  = g_miner_stats.accepted.load();
+            uint64_t rej = g_miner_stats.rejected.load();
+
+            std::ostringstream m1;
+            m1 << "  status: " << (active ? (std::string(cOK()) + "running" + reset()) : (std::string(cDim()) + "idle" + reset()))
+               << "   threads: " << thr;
+            right.push_back(m1.str());
+
+            std::ostringstream m2;
+            m2 << "  accepted: " << ok << "   rejected: " << rej;
+            right.push_back(m2.str());
+
+            // surface most recent success heights (ours & network)
+            uint64_t last_ok = g_miner_stats.last_height_ok.load();
+            uint64_t last_rx = g_miner_stats.last_height_rx.load();
+            if (last_ok) {
+                std::ostringstream m3; m3 << "  last (us): height " << last_ok;
+                right.push_back(m3.str());
+            }
+            if (last_rx) {
+                std::ostringstream m4; m4 << "  last (net): height " << last_rx;
+                right.push_back(m4.str());
+            }
+            right.push_back("");
+        }
+
+        // Compose two columns
         std::ostringstream out;
         size_t N = std::max(left.size(), right.size());
         for (size_t i=0;i<N;i++){
@@ -580,11 +643,12 @@ private:
             out << std::left << std::setw(leftw) << l << " | " << r << "\n";
         }
 
+        // Footer + logs
         out << std::string((size_t)cols, '-') << "\n";
-        out << cStep() << "Logs" << reset() << "  " << cDim() << "(press Ctrl+C to exit)" << reset() << "\n";
+        out << cPanel() << "Logs" << reset() << "  " << cDim() << "(Ctrl+C to exit)" << reset() << "\n";
         int header_rows = (int)N + 2;
         int remain = rows - header_rows - 3;
-        if (remain < 6) remain = 6;
+        if (remain < 8) remain = 8;
         int start = (int)logs_.size() - remain;
         if (start < 0) start = 0;
         for (int i=start; i<(int)logs_.size(); ++i) {
@@ -592,8 +656,9 @@ private:
             if      (line.find("[ERROR]") != std::string::npos) out << cErr()  << line << reset() << "\n";
             else if (line.find("[WARN]")  != std::string::npos) out << cWarn() << line << reset() << "\n";
             else if (line.find("[TRACE]") != std::string::npos) out << cDim()  << line << reset() << "\n";
-            else if (line.find("[INFO]")  != std::string::npos) out << cInfo() << line << reset() << "\n";
-            else                                                out << line << "\n";
+            else if (line.find("mined block accepted") != std::string::npos) out << cOK() << line << reset() << "\n";
+            else if (line.find("accepted block") != std::string::npos) out << cOK() << line << reset() << "\n";
+            else out << line << "\n";
         }
         int printed = (int)logs_.size() - start;
         for (int i=printed; i<remain; ++i) out << "\n";
@@ -610,6 +675,8 @@ private:
     std::vector<std::pair<std::string,bool>> steps_;
     std::deque<LogCapture::Line> logs_;
     std::string banner_;
+    std::string last_accept_line_;
+    std::string last_accept_height_;
     uint16_t p2p_port_{P2P_PORT};
     uint16_t rpc_port_{RPC_PORT};
     P2P*   p2p_   {nullptr};
@@ -631,6 +698,10 @@ static void miner_worker(Chain* chain,
                          P2P* p2p,
                          const std::vector<uint8_t> mine_pkh,
                          unsigned threads) {
+    g_miner_stats.active.store(true);
+    g_miner_stats.threads.store(threads);
+    g_miner_stats.start = std::chrono::steady_clock::now();
+
     std::random_device rd;
     const uint64_t seed =
         uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count()) ^
@@ -711,6 +782,9 @@ static void miner_worker(Chain* chain,
                         }
                     }
                     int noncb = (int)b.txs.size() - 1;
+                    g_miner_stats.accepted.fetch_add(1);
+                    g_miner_stats.last_height_ok.store(t.height + 1);
+                    g_miner_stats.last_height_rx.store(t.height + 1);
                     log_info("mined block accepted, height=" + std::to_string(t.height + 1)
                              + ", miner=" + miner_addr
                              + ", coinbase_txid=" + cb_txid_hex
@@ -719,6 +793,7 @@ static void miner_worker(Chain* chain,
                         p2p->announce_block_async(b.block_hash());
                     }
                 } else {
+                    g_miner_stats.rejected.fetch_add(1);
                     log_warn(std::string("mined block rejected: ") + err);
                 }
             } catch (...) {
@@ -916,11 +991,11 @@ int main(int argc, char** argv){
             if (!deser_block(raw, g)) { log_error("Failed to deserialize GENESIS_RAW_BLOCK_HEX"); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
             const std::string got_hash = to_hex(g.block_hash());
             const std::string want_hash= std::string(GENESIS_HASH_HEX);
-            if (got_hash != want_hash) { log_error(std::string("Genesis hash mismatch. got=")+got_hash+" want="+want_hash); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
             const std::string got_merkle = to_hex(g.header.merkle_root);
             const std::string want_merkle= std::string(GENESIS_MERKLE_HEX);
-            if (got_merkle != want_merkle) { log_error(std::string("Genesis merkle mismatch. got=")+got_merkle+" want="+want_merkle); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
-            if (!chain.init_genesis(g)) { log_error("genesis init failed"); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
+            if (got_hash != want_hash)    { log_error(std::string("Genesis hash mismatch. got=")+got_hash+" want="+want_hash); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
+            if (got_merkle != want_merkle){ log_error(std::string("Genesis merkle mismatch. got=")+got_merkle+" want="+want_merkle); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
+            if (!chain.init_genesis(g))   { log_error("genesis init failed"); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
         }
         if (can_tui) { tui.mark_step_ok("Load & validate genesis"); tui.mark_step_ok("Genesis OK"); }
 
@@ -1007,6 +1082,10 @@ int main(int argc, char** argv){
             rpc_ok = true;
         }
 
+        // surface accepted blocks coming from the network (not just our miner)
+        // by watching chain tip in the main loop below; update g_miner_stats.last_height_rx
+
+        // Optional built-in miner
         unsigned threads = 0;
         if (mine_flag) {
             if (cfg.miner_threads) threads = cfg.miner_threads;
@@ -1056,12 +1135,22 @@ int main(int argc, char** argv){
             else tui.set_node_state(TUI::NodeState::Syncing);
         }
 
+        // main loop: feed logs & track network accept events by tip height drift
+        uint64_t last_tip_height_seen = 0;
         if (can_tui) {
             while(!g_shutdown_requested.load()){
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 std::deque<LogCapture::Line> lines;
                 capture.drain(lines);
                 tui.feed_logs(lines);
+
+                // update "any miner accepted" by watching chain height advance
+                uint64_t h = 0;
+                if (Chain* c = &chain) h = c->height();
+                if (h > last_tip_height_seen){
+                    g_miner_stats.last_height_rx.store(h);
+                    last_tip_height_seen = h;
+                }
             }
         } else {
             while(!g_shutdown_requested.load()){
