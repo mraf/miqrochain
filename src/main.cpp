@@ -609,6 +609,23 @@ static uint64_t get_rss_bytes(){
 /*                              Terminal utils                                 */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 namespace term {
+
+#ifdef _WIN32
+static inline bool is_handle_console(HANDLE h) {
+    DWORD m = 0;
+    return (h && h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &m));
+}
+static inline bool is_conpty_like() {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD type = GetFileType(hOut);
+    const bool pipe = (type == FILE_TYPE_PIPE);
+    const bool hinted = (std::getenv("WT_SESSION") || std::getenv("ConEmuANSI") ||
+                         std::getenv("TERMINUS_SUBPROC") || std::getenv("MSYS") ||
+                         std::getenv("MSYSTEM"));
+    return pipe && hinted;
+}
+#endif
+
 #ifdef _WIN32
 // Ensure we have a console and rebind process standard handles to it.
 // This lets us enable VT even when started from GUI or with redirected CRT.
@@ -650,7 +667,6 @@ static inline bool is_tty() {
 #ifdef _WIN32
     DWORD mode = 0;
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    // Treat as TTY only if we can query console mode on the Windows handle.
     return (hOut && hOut != INVALID_HANDLE_VALUE && GetConsoleMode(hOut, &mode));
 #else
     return ::isatty(STDOUT_FILENO) == 1;
@@ -675,69 +691,68 @@ static inline void get_winsize(int& cols, int& rows) {
     // snap to even to preserve symmetry
     if (cols & 1) ++cols;
 }
-static inline void enable_vt(bool& vt_ok, bool prefer_utf8=true) {
-    vt_ok = true;
+
+// Returns (vt_ok, u8_ok).
+// - vt_ok : terminal understands VT sequences
+// - u8_ok : Unicode glyphs safe (true under ConPTY/Windows Terminal or real console with UTF-8)
+static inline std::pair<bool,bool> enable_vt_and_probe_u8(bool prefer_utf8=true) {
+    bool vt_ok = true, u8_ok = true;
 #ifdef _WIN32
-    // Harden startup: always ensure we have a console bound before checking TTY.
     ensure_console_bound();
 
-    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOALIGNMENTFAULTEXCEPT);
     if (prefer_utf8) {
-        // Best-effort: prefer UTF-8 so box drawing/emoji render properly
         SetConsoleOutputCP(65001);
         SetConsoleCP(65001);
     }
 
-    auto set_out_mode = [&](HANDLE h) {
-        if (!h || h == INVALID_HANDLE_VALUE) return false;
-        DWORD mode = 0;
-        if (!GetConsoleMode(h, &mode)) return false;
-        mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-        mode |= DISABLE_NEWLINE_AUTO_RETURN;    // keeps box-drawing tidy
-        // Keep existing processed/wrap flags; Windows terminals usually set them already.
-        return SetConsoleMode(h, mode) != 0;
+    auto set_out_mode = [](HANDLE h){
+        if (!h || h==INVALID_HANDLE_VALUE) return false;
+        DWORD m=0; if (!GetConsoleMode(h, &m)) return false;
+        m |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        m |= DISABLE_NEWLINE_AUTO_RETURN;
+        return SetConsoleMode(h, m) != 0;
     };
-    auto set_in_mode = [&](HANDLE h) {
-        if (!h || h == INVALID_HANDLE_VALUE) return false;
-        DWORD mode = 0;
-        if (!GetConsoleMode(h, &mode)) return false;
-        mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
-        return SetConsoleMode(h, mode) != 0;
+    auto set_in_mode = [](HANDLE h){
+        if (!h || h==INVALID_HANDLE_VALUE) return false;
+        DWORD m=0; if (!GetConsoleMode(h, &m)) return false;
+        m |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+        return SetConsoleMode(h, m) != 0;
     };
 
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
     HANDLE hIn  = GetStdHandle(STD_INPUT_HANDLE);
 
-    bool okOut = set_out_mode(hOut);
-    bool okErr = set_out_mode(hErr);
-    bool okIn  = set_in_mode(hIn);
+    const bool console_out = is_handle_console(hOut);
+    const bool console_err = is_handle_console(hErr);
+    const bool conpty      = is_conpty_like();
 
-    // If any failed, try to (re)open CONOUT$/CONIN$ directly and retry once.
-    if (!okOut || !okErr || !okIn) {
-        HANDLE hNewOut = CreateFileW(L"CONOUT$", GENERIC_READ|GENERIC_WRITE,
-                                     FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
-                                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        HANDLE hNewIn  = CreateFileW(L"CONIN$",  GENERIC_READ|GENERIC_WRITE,
-                                     FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
-                                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hNewOut && hNewOut != INVALID_HANDLE_VALUE) {
-            SetStdHandle(STD_OUTPUT_HANDLE, hNewOut);
-            SetStdHandle(STD_ERROR_HANDLE,  hNewOut);
-            okOut = set_out_mode(hNewOut);
-            okErr = set_out_mode(hNewOut);
-        }
-        if (hNewIn && hNewIn != INVALID_HANDLE_VALUE) {
-            SetStdHandle(STD_INPUT_HANDLE, hNewIn);
-            okIn = set_in_mode(hNewIn);
-        }
-    }
+    bool okOut = console_out ? set_out_mode(hOut) : true; // VT not settable on pipes
+    bool okErr = console_err ? set_out_mode(hErr) : true;
+    bool okIn  = is_handle_console(hIn) ? set_in_mode(hIn) : true;
 
-    vt_ok = okOut && okErr;  // input VT is optional for rendering
+    vt_ok = okOut && okErr && okIn;
+
+    UINT cp = GetConsoleOutputCP();
+    const bool forced_ascii = (std::getenv("MIQ_FORCE_ASCII") && *std::getenv("MIQ_FORCE_ASCII")!='0');
+    const bool forced_utf8  = (std::getenv("MIQ_FORCE_UTF8")  && *std::getenv("MIQ_FORCE_UTF8")!='0');
+
+    if (forced_ascii) u8_ok = false;
+    else if (forced_utf8) u8_ok = true;
+    else if (conpty) u8_ok = true;
+    else u8_ok = (console_out && cp == 65001);
 #else
     (void)prefer_utf8;
 #endif
+    return {vt_ok, u8_ok};
 }
+
+// Legacy helper retained for non-Windows usage sites (no change in behavior elsewhere).
+static inline void enable_vt(bool& vt_ok, bool prefer_utf8=true){
+    auto r = enable_vt_and_probe_u8(prefer_utf8);
+    vt_ok = r.first; (void)r;
+}
+
 } // namespace term
 
 // Console writer avoids recursion with log capture
@@ -758,20 +773,19 @@ public:
         // If this is a real console, use UTF-16 + WriteConsoleW to avoid mojibake forever.
         if (is_console_) {
             if (s.empty()) return;
-            int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), (int)s.size(), nullptr, 0);
+            int needed = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
             if (needed <= 0) {
-                // Fallback: best-effort narrow (shouldn't happen)
                 DWORD wrote = 0;
                 WriteFile(hOut_, s.c_str(), (DWORD)s.size(), &wrote, nullptr);
                 return;
             }
             std::wstring ws;
             ws.resize((size_t)needed);
-            MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), (int)s.size(), &ws[0], needed);
+            MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &ws[0], needed);
             DWORD wroteW = 0;
             WriteConsoleW(hOut_, ws.c_str(), (DWORD)ws.size(), &wroteW, nullptr);
         } else {
-            // Redirected: write raw UTF-8 bytes
+            // Redirected/ConPTY pipe: write raw UTF-8 bytes
             DWORD wrote = 0;
             WriteFile(hOut_, s.c_str(), (DWORD)s.size(), &wrote, nullptr);
         }
@@ -788,12 +802,10 @@ public:
 private:
     void init(){
 #ifdef _WIN32
-        // Prefer the real stdout handle. If missing (rare), open CONOUT$.
         hOut_ = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD m=0;
         is_console_ = (hOut_ && hOut_ != INVALID_HANDLE_VALUE && GetConsoleMode(hOut_, &m));
         if (!is_console_) {
-            // Try to bind to a console explicitly (pairs with term::ensure_console_bound()).
             HANDLE hNew = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE|FILE_SHARE_READ,
                                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hNew && hNew != INVALID_HANDLE_VALUE) {
@@ -1085,14 +1097,14 @@ static std::string repeat_u8(const char* s, int n){
 }
 
 // — Visual elements —
-static inline std::string bar(int width, double frac, bool vt_ok, int hue_a=36, int hue_b=32, bool glow=false){
+static inline std::string bar(int width, double frac, bool fancy, int hue_a=36, int hue_b=32, bool glow=false){
     if (width < 6) width = 6;
     if (frac < 0) { frac = 0; }
     if (frac > 1) { frac = 1; }
     const int full = (int)((width-2)*frac + 0.5);
     std::ostringstream o;
     o << '[';
-    if(vt_ok){
+    if(fancy){
         for(int i=0;i<width-2;i++){
             const bool on = i < full;
             const int hue = glow ? 35 + (i%2) : (hue_a - (i*(hue_a-hue_b))/std::max(1,width-2));
@@ -1105,7 +1117,7 @@ static inline std::string bar(int width, double frac, bool vt_ok, int hue_a=36, 
     o << ']';
     return o.str();
 }
-static std::string wave_line(int width, int tick, bool vt_ok, int hue_a=36, int hue_b=32){
+static std::string wave_line(int width, int tick, bool fancy, int hue_a=36, int hue_b=32){
     static const char* blocks[] = { " ", u8"▁", u8"▂", u8"▃", u8"▄", u8"▅", u8"▆", u8"▇", u8"█" };
     const int N = 8;
     const char* ascii[] = { " ", ".", ".", "-", "-", "=", "=", "#", "#" };
@@ -1121,7 +1133,7 @@ static std::string wave_line(int width, int tick, bool vt_ok, int hue_a=36, int 
         if(idx>N) {
             idx=N;
         }
-        if(vt_ok){
+        if(fancy){
             const int hue = hue_a - (i*(hue_a-hue_b))/std::max(1,width);
             o << "\x1b["<<hue<<"m" << blocks[idx] << "\x1b[0m";
         }else{
@@ -1130,16 +1142,17 @@ static std::string wave_line(int width, int tick, bool vt_ok, int hue_a=36, int 
     }
     return o.str();
 }
-static std::string spinner(int tick){
-    static const char* frames_utf8[] = {
-        u8"⠋", u8"⠙", u8"⠹", u8"⠸", u8"⠼",
-        u8"⠴", u8"⠦", u8"⠧", u8"⠇", u8"⠏"
-    };
-#ifdef _WIN32
-    return std::string(frames_utf8[tick % 10]);
-#else
-    return std::string(frames_utf8[tick % 10]);
-#endif
+static std::string spinner(bool unicode_ok, int tick){
+    if (unicode_ok) {
+        static const char* frames_utf8[] = {
+            u8"⠋", u8"⠙", u8"⠹", u8"⠸", u8"⠼",
+            u8"⠴", u8"⠦", u8"⠧", u8"⠇", u8"⠏"
+        };
+        return std::string(frames_utf8[tick % 10]);
+    } else {
+        static const char* frames_ascii[] = { "-", "\\", "|", "/" };
+        return std::string(frames_ascii[tick % 4]);
+    }
 }
 static std::string spark_ascii(const std::vector<double>& xs){
     static const char bars[] = " .:-=+*%@#";
@@ -1290,7 +1303,11 @@ class TUI {
 public:
     enum class NodeState { Starting, Syncing, Running, Degraded, Quitting };
 
-    explicit TUI(bool vt_ok) : vt_ok_(vt_ok) { init_step_order(); base_ts_ms_ = now_ms(); }
+    explicit TUI(bool vt_ok, bool unicode_ok)
+        : vt_ok_(vt_ok), unicode_ok_(unicode_ok) {
+        init_step_order(); base_ts_ms_ = now_ms();
+        if (!unicode_ok_) { show_borders_ = false; show_wave_ = false; glow_ = false; }
+    }
     void set_enabled(bool on){ enabled_ = on; }
     void start() {
         if (!enabled_) return;
@@ -1481,6 +1498,7 @@ private:
             case 'l': case 'L': global::tui_toggle_layout_lock.store(true); break;
             case 'u': case 'U': global::tui_toggle_units.store(true); break;
             case 'h': case 'H': global::tui_toggle_contrast.store(true); break;
+            case 'x': case 'X': { std::lock_guard<std::mutex> lk(mu_); unicode_ok_ = !unicode_ok_; if (!unicode_ok_) { show_borders_=false; show_wave_=false; glow_=false; } } break;
             default: break;
         }
     }
@@ -1492,6 +1510,14 @@ private:
         const int w = std::max(8, width);
         std::vector<std::string> out;
         if (!show_borders_) {
+            std::string t = std::string(C_bold()) + title + C_reset();
+            out.push_back(pad_right_ansi(t, w));
+            out.push_back(pad_right_ansi(std::string(w, '-'), w));
+            for (auto& l : body) out.push_back(pad_right_ansi(l, w));
+            return out;
+        }
+        if (!unicode_ok_) {
+            // if borders asked but unicode not ok, degrade to ASCII layout header
             std::string t = std::string(C_bold()) + title + C_reset();
             out.push_back(pad_right_ansi(t, w));
             out.push_back(pad_right_ansi(std::string(w, '-'), w));
@@ -1523,7 +1549,7 @@ private:
                                           int width, bool zebra=false){
         const int w = std::max(8, width);
         std::vector<std::string> out;
-        const int inner = show_borders_ ? (w-2) : w;
+        const int inner = (show_borders_ && unicode_ok_) ? (w-2) : w;
         int sumw=0; for (auto& c: colspec) sumw += c.w;
         const int gaps = (int)colspec.size()-1;
         const int padExtra = std::max(0, inner - sumw - gaps);
@@ -1534,7 +1560,7 @@ private:
         }
         auto line_from_cells = [&](const std::vector<std::string>& cells)->std::string{
             std::ostringstream o;
-            if (show_borders_) o << u8"│";
+            if (show_borders_ && unicode_ok_) o << u8"│";
             for (size_t i=0;i<cells.size() && i<cw.size(); ++i){
                 const bool right = colspec[i].right;
                 const std::string& cell = cells[i];
@@ -1544,22 +1570,22 @@ private:
                 else       o << t << std::string((size_t)pad, ' ');
                 if (i+1 < cells.size()) o << " ";
             }
-            if (show_borders_) o << u8"│";
+            if (show_borders_ && unicode_ok_) o << u8"│";
             return pad_right_ansi(o.str(), w);
         };
-        if (show_borders_){
+        if (show_borders_ && unicode_ok_){
             std::string top = u8"┌"; top += repeat_u8(u8"─", inner); top += u8"┐";
             out.push_back(pad_right_ansi(top, w));
         }
         out.push_back(line_from_cells(header));
         {
             std::ostringstream u;
-            if (show_borders_) u<<u8"│";
+            if (show_borders_ && unicode_ok_) u<<u8"│";
             for (size_t i=0;i<cw.size();++i){
-                u<<repeat_u8(u8"─", cw[i]);
+                u<<repeat_u8(unicode_ok_?u8"─":"-", cw[i]);
                 if (i+1<cw.size()) u<<" ";
             }
-            if (show_borders_) u<<u8"│";
+            if (show_borders_ && unicode_ok_) u<<u8"│";
             out.push_back(pad_right_ansi(u.str(), w));
         }
         for (size_t r=0; r<rows_in.size(); ++r){
@@ -1567,7 +1593,7 @@ private:
             if (zebra && (r%2)==1) ln = std::string(C_dim()) + ln + C_reset();
             out.push_back(ln);
         }
-        if (show_borders_){
+        if (show_borders_ && unicode_ok_){
             std::string bot = u8"└"; bot += repeat_u8(u8"─", inner); bot += u8"┘";
             out.push_back(pad_right_ansi(bot, w));
         }
@@ -1739,13 +1765,13 @@ private:
               << "  •  Chain: " << CHAIN_NAME
               << "  •  P2P " << p2p_port_ << "  •  RPC " << rpc_port_
               << C_reset()
-              << "  " << spinner(tick_);
+              << "  " << spinner(unicode_ok_, tick_);
             left.push_back(pad_right_ansi(h.str(), leftw));
             if (!banner_.empty()) left.push_back(pad_right_ansi(std::string("  ") + C_info() + banner_ + C_reset(), leftw));
             if (!hot_message_.empty() && (now_ms() - hot_msg_ts_) < 4000)
                 left.push_back(pad_right_ansi(std::string("  ") + C_warn() + hot_message_ + C_reset(), leftw));
             if (!compact_ && show_wave_)
-                left.push_back(pad_right_ansi(std::string("  ") + wave_line(leftw-2, tick_, vt_ok_, dark_theme_?36:34, dark_theme_?32:30), leftw));
+                left.push_back(pad_right_ansi(std::string("  ") + wave_line(leftw-2, tick_, (vt_ok_ && unicode_ok_), dark_theme_?36:34, dark_theme_?32:30), leftw));
         }
 
         // System box
@@ -1763,7 +1789,8 @@ private:
                 << "   logs: " << (paused_? "paused":"live")
                 << "   verbose: " << (global::tui_verbose.load()? "yes":"no")
                 << "   mode: " << (compact_? "compact":"full")
-                << "   borders: " << (show_borders_? "on":"off");
+                << "   borders: " << (show_borders_? "on":"off")
+                << "   unicode: " << (unicode_ok_? "on":"off");
             body.push_back(ln2.str());
             auto b = render_box("System", body, leftw);
             left.insert(left.end(), b.begin(), b.end());
@@ -1798,7 +1825,8 @@ private:
             const int bw = std::max(10, leftw-4);
             std::vector<std::string> body;
             std::ostringstream progress;
-            progress << bar(std::min(60,bw), frac, vt_ok_, dark_theme_?36:34, dark_theme_?32:30, glow_)
+            const bool fancy = vt_ok_ && unicode_ok_;
+            progress << bar(std::min(60,bw), frac, fancy, dark_theme_?36:34, dark_theme_?32:30, glow_)
                      << "  " << okc << "/" << total << " completed";
             if (eta_secs_ > 0 && frac < 0.999)
                 progress << "  " << C_dim() << "(~" << std::fixed << std::setprecision(1) << eta_secs_ << "s)" << C_reset();
@@ -2032,11 +2060,11 @@ private:
         }
 
         // Footer + logs/help
-        out << pad_right_ansi(repeat_u8(u8"─", cols_term), cols_term) << "\n";
+        out << pad_right_ansi((unicode_ok_?repeat_u8(u8"─", cols_term):std::string((size_t)cols_term,'-')), cols_term) << "\n";
         if (show_help_) {
             std::string help = std::string(C_bold()) + "Help" + C_reset() + "  "
                 "q=quit  t=theme  h=contrast  p=pause logs  r=reload config  s=snapshot  v=verbose  "
-                "?=help  c=compact  g=glow  b=borders  w=wave  l=lock layout  u=units";
+                "?=help  c=compact  g=glow  b=borders  w=wave  l=lock layout  u=units  x=unicode on/off";
             out << pad_right_ansi(help, cols_term) << "\n";
         } else if (nstate_ == NodeState::Quitting){
             std::string s1 = std::string(C_bold()) + "Shutting down" + C_reset() + "  " + C_dim() + "(Ctrl+C again = force)" + C_reset();
@@ -2044,7 +2072,7 @@ private:
             const std::string phase = shutdown_phase_.empty() ? u8"initiating…" : shutdown_phase_;
             out << pad_right_ansi(std::string("  phase: ") + phase, cols_term) << "\n";
         } else {
-            std::string h = std::string(C_bold()) + "Logs" + C_reset() + "  " + C_dim() + "(q,t,h,p,r,s,v,?,c,g,b,w,l,u)" + C_reset();
+            std::string h = std::string(C_bold()) + "Logs" + C_reset() + "  " + C_dim() + "(q,t,h,p,r,s,v,?,c,g,b,w,l,u,x)" + C_reset();
             out << pad_right_ansi(h, cols_term) << "\n";
         }
 
@@ -2075,6 +2103,7 @@ private:
 private:
     bool enabled_{true};
     bool vt_ok_{true};
+    bool unicode_ok_{true};
     std::atomic<bool> running_{false};
     std::atomic<bool> key_running_{false};
     std::thread thr_, key_thr_;
@@ -2301,7 +2330,9 @@ static void print_usage(){
       << "  MIQ_MINER_HEARTBEAT        path to heartbeat file for external miner presence\n"
       << "  MIQ_LOCK_RETRIES           retries when lock is busy (default 2)\n"
       << "  MIQ_LOCK_WAIT_MS           ms to wait between lock retries (default 250ms)\n"
-      << "  MIQ_STEAL_LOCK=1           forcibly remove existing lock as a fallback option\n";
+      << "  MIQ_STEAL_LOCK=1           forcibly remove existing lock as a fallback option\n"
+      << "  MIQ_FORCE_UTF8=1           force Unicode UI even under pipes\n"
+      << "  MIQ_FORCE_ASCII=1          force ASCII UI (no box drawing)\n";
 }
 static bool is_recognized_arg(const std::string& s){
     if(s.rfind("--conf=",0)==0) return true;
@@ -2343,7 +2374,11 @@ int main(int argc, char** argv){
     std::set_terminate(&fatal_terminate);
 
     bool vt_ok = true;
-    term::enable_vt(vt_ok); // <-- VT robustly enabled/console ensured before any TUI decisions
+    bool u8_ok = true;
+    {
+        auto r = term::enable_vt_and_probe_u8(true); // robust VT + Unicode/ConPTY probe
+        vt_ok = r.first; u8_ok = r.second;
+    }
 
     // Discover TUI intent early (so we capture logs only if using TUI)
     bool disable_tui_flag = false;
@@ -2364,7 +2399,7 @@ int main(int argc, char** argv){
     if (can_tui) capture.start();
     else std::fprintf(stderr, "[INFO] TUI disabled (plain logs).\n");
 
-    TUI tui(vt_ok);
+    TUI tui(vt_ok, u8_ok);
     tui.set_enabled(can_tui);
     tui.set_ports(P2P_PORT, RPC_PORT);
 
