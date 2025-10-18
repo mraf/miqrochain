@@ -36,6 +36,9 @@
 #include <fstream>
 #include <random>
 #include <cerrno>
+#include <cstdio>   // std::snprintf
+#include <cstdint>
+#include <limits>
 
 #ifndef _WIN32
   #include <sys/stat.h>
@@ -1077,7 +1080,7 @@ std::string RpcService::handle(const std::string& body){
         // --- walletinfo ---
         if (method == "walletinfo") {
             std::string wdir = default_wallet_file();
-            if(!wdir empty()){
+            if(!wdir.empty()){
                 size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
             } else {
                 wdir = "wallets/default";
@@ -1362,7 +1365,7 @@ std::string RpcService::handle(const std::string& body){
             std::vector<OwnedUtxo> spendables;  // filtered mature funds
 
             uint64_t total_balance = 0, spendable_balance = 0, locked_balance = 0;
-            uint64_t soonest_mature_h = UINT64_MAX;
+            uint64_t soonest_mature_h = std::numeric_limits<uint64_t>::max();
 
             auto maybe_push = [&](uint32_t chain, uint32_t limit){
                 for (uint32_t i = 0; i < limit + 1; ++i) { // include current "next" (fresh)
@@ -1404,7 +1407,7 @@ std::string RpcService::handle(const std::string& body){
             if (owned_all.empty()) return err("no funds");
 
             if (spendables.empty()) {
-                if (locked_balance > 0 && soonest_mature_h != UINT64_MAX) {
+                if (locked_balance > 0 && soonest_mature_h != std::numeric_limits<uint64_t>::max()) {
                     char buf[160];
                     std::snprintf(buf, sizeof(buf),
                                   "no spendable utxos: %llu locked until height %llu",
