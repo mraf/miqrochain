@@ -383,47 +383,170 @@ static inline std::string p_join(const std::string& a, const std::string& b){
 #endif
 }
 
+// Robust atomic text write with cross-platform rename fallback.
 static bool write_text_atomic(const std::string& path, const std::string& body){
     std::error_code ec;
     auto dir = std::filesystem::path(path).parent_path();
     if(!dir.empty()) std::filesystem::create_directories(dir, ec);
     std::string tmp = path + ".tmp";
-    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-    if(!f) return false;
-    f.write(body.data(), (std::streamsize)body.size());
-    f.flush();
-    f.close();
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if(!f) return false;
+        f.write(body.data(), (std::streamsize)body.size());
+        f.flush();
+        if(!f) return false;
+    }
+    // First try a normal rename
     std::filesystem::rename(tmp, path, ec);
+#ifdef _WIN32
+    if (ec) {
+        // Windows cannot replace an existing file atomically with std::filesystem::rename (pre-C++20).
+        std::filesystem::remove(path, ec);
+        ec.clear();
+        std::filesystem::rename(tmp, path, ec);
+    }
+#endif
+    if (ec) {
+        // Last-resort: copy then remove tmp
+        std::filesystem::copy_file(tmp, path, std::filesystem::copy_options::overwrite_existing, ec);
+        std::filesystem::remove(tmp, ec);
+    } else {
+        // Best effort: ensure tmp is gone
+        std::filesystem::remove(tmp, ec);
+    }
     return !ec;
 }
 
-// Lock file (exclusive). Writes PID. Returns true if acquired.
+// --- Lock helpers (polished & with fallback) ---------------------------------
+static int read_pidfile_int(const std::string& pidfile) {
+    std::vector<uint8_t> buf;
+    if (!read_file_all(pidfile, buf)) return -1;
+    std::string s(buf.begin(), buf.end());
+    trim_inplace(s);
+    if (s.empty()) return -1;
+    try {
+        long long v = std::stoll(s);
+        if (v <= 0 || v > 0x7fffffffLL) return -1;
+        return (int)v;
+    } catch (...) {
+        return -1;
+    }
+}
+
+static bool process_alive(int pid){
+    if (pid <= 0) return false;
+#ifdef _WIN32
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+    if (!h) return false;
+    DWORD code = 0;
+    BOOL ok = GetExitCodeProcess(h, &code);
+    CloseHandle(h);
+    return ok && code == STILL_ACTIVE;
+#else
+    // kill(pid, 0) does not send a signal but errors if the process doesn't exist
+    int r = kill(pid, 0);
+    if (r == 0) return true;
+    if (errno == EPERM) return true; // exists but not permitted
+    return false;
+#endif
+}
+
+static bool remove_stale_lock(const std::string& lock, const std::string& pidfile){
+    std::error_code ec;
+    std::filesystem::remove(lock, ec);
+    std::filesystem::remove(pidfile, ec);
+    return true; // best-effort
+}
+
+// Acquire datadir lock with stale-detection, retries, and optional "steal"
+// Fallback knobs (env):
+//  - MIQ_LOCK_RETRIES: number of retry cycles (default 2)
+//  - MIQ_LOCK_WAIT_MS: wait per retry (default 250ms)
+//  - MIQ_STEAL_LOCK=1: if set, remove existing lock even if a process appears alive
 static bool acquire_datadir_lock(const std::string& datadir){
     std::error_code ec;
     std::filesystem::create_directories(datadir, ec);
     std::string lock = p_join(datadir, ".lock");
     std::string pid  = p_join(datadir, "miqrod.pid");
+
+    int retries = 2;
+    int wait_ms = 250;
+    bool steal  = false;
+    if (const char* s = std::getenv("MIQ_LOCK_RETRIES")) {
+        char* e=nullptr; long v = std::strtol(s, &e, 10);
+        if (e!=s && v>=0 && v<1000) retries = (int)v;
+    }
+    if (const char* s = std::getenv("MIQ_LOCK_WAIT_MS")) {
+        char* e=nullptr; long v = std::strtol(s, &e, 10);
+        if (e!=s && v>=0 && v<60000) wait_ms = (int)v;
+    }
+    if (const char* s = std::getenv("MIQ_STEAL_LOCK")) {
+        steal = (*s && *s!='0');
+    }
+
+    auto try_once = [&](bool log_on_fail)->bool{
 #ifdef _WIN32
-    HANDLE h = CreateFileA(lock.c_str(),
-                           GENERIC_READ | GENERIC_WRITE,
-                           0,           // no sharing
-                           NULL,
-                           CREATE_NEW,  // fail if exists
-                           FILE_ATTRIBUTE_NORMAL,
-                           NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        log_error("Another instance appears to be running (lock exists).");
-        return false;
-    }
-    global::lockfile_handle = h;
+        HANDLE h = CreateFileA(lock.c_str(),
+                               GENERIC_READ | GENERIC_WRITE,
+                               0,           // no sharing
+                               NULL,
+                               CREATE_NEW,  // fail if exists
+                               FILE_ATTRIBUTE_NORMAL,
+                               NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            if (log_on_fail) log_error("Lock exists; another instance may be running.");
+            return false;
+        }
+        global::lockfile_handle = h;
 #else
-    int fd = ::open(lock.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
-    if (fd < 0) {
-        log_error("Another instance appears to be running (lock exists).");
-        return false;
-    }
-    ::close(fd);
+        int fd = ::open(lock.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+        if (fd < 0) {
+            if (log_on_fail) log_error("Lock exists; another instance may be running.");
+            return false;
+        }
+        ::close(fd);
 #endif
+        return true;
+    };
+
+    // First attempt
+    if (!try_once(false)) {
+        // Diagnose
+        const int other_pid = read_pidfile_int(pid);
+        const bool alive = process_alive(other_pid);
+        std::string diag = "Another instance appears to be running";
+        if (other_pid > 0) diag += std::string(" (pid=") + std::to_string(other_pid) + ")";
+        if (!alive && other_pid > 0) diag += " — but it looks stale";
+        log_warn(diag + ".");
+
+        // If stale (pid absent or not alive) — clean up and retry
+        if (!alive) {
+            log_warn("Stale lock detected — removing and retrying…");
+            remove_stale_lock(lock, pid);
+            if (try_once(false)) goto LOCK_OK;
+        }
+
+        // Retry loop (in case of race)
+        for (int i=0; i<retries && !global::shutdown_requested.load(); ++i){
+            std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+            if (try_once(i+1==retries)) goto LOCK_OK;
+        }
+
+        // Optional fallback: steal lock if explicitly requested
+        if (steal) {
+            log_warn("MIQ_STEAL_LOCK set — forcibly removing existing lock.");
+            remove_stale_lock(lock, pid);
+            if (!try_once(true)) {
+                log_error("Failed to acquire lock even after forced removal.");
+                return false;
+            }
+        } else {
+            log_error("Another instance appears to be running (lock exists). Set MIQ_STEAL_LOCK=1 to override.");
+            return false;
+        }
+    }
+
+LOCK_OK:
 #ifdef _WIN32
     const int pidnum = (int)GetCurrentProcessId();
 #else
@@ -463,7 +586,7 @@ static uint64_t get_rss_bytes(){
         return (uint64_t)tinfo.resident_size;
     }
     return 0;
-#else
+else
     std::ifstream f("/proc/self/statm");
     uint64_t rss_pages=0, x=0;
     if (f >> x >> rss_pages){
@@ -2026,7 +2149,10 @@ static void print_usage(){
       << "  MIQ_NO_TUI=1               disables the TUI; plain logs\n"
       << "  MIQ_MINER_THREADS          overrides miner thread count\n"
       << "  MIQ_RPC_TOKEN              if set, HTTP gate token (synced to .cookie on start)\n"
-      << "  MIQ_MINER_HEARTBEAT        path to heartbeat file for external miner presence\n";
+      << "  MIQ_MINER_HEARTBEAT        path to heartbeat file for external miner presence\n"
+      << "  MIQ_LOCK_RETRIES           retries when lock is busy (default 2)\n"
+      << "  MIQ_LOCK_WAIT_MS           ms to wait between lock retries (default 250)\n"
+      << "  MIQ_STEAL_LOCK=1           forcibly remove existing lock as a fallback option\n";
 }
 static bool is_recognized_arg(const std::string& s){
     if(s.rfind("--conf=",0)==0) return true;
