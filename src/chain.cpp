@@ -1,4 +1,4 @@
-// chain.cpp — revised
+// chain.cpp
 #include "chain.h"
 #include <cmath>      // std::pow, std::fabs
 #include <optional>
@@ -990,7 +990,7 @@ bool Chain::init_genesis(const Block& g){
     // Cache the full genesis header for serving to peers
     g_header_full[hk(g.block_hash())] = g.header;
 
-#if MIQ_HAVE_GCS_FILTERS
+    #if MIQ_HAVE_GCS_FILTERS
     // Build & store genesis filter (best-effort)
     std::vector<uint8_t> fbytes;
     if (miq::gcs::build_block_filter(g, fbytes)) {
@@ -1000,7 +1000,7 @@ bool Chain::init_genesis(const Block& g){
     } else {
          log_warn("BlockFilter: build(genesis) failed");
     }
-#endif
+    #endif
 
     return true;
 }
@@ -1077,15 +1077,46 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         if (raw.size() > MIQ_FALLBACK_MAX_TX_SIZE) { err="tx too large"; return false; }
     }
 
-    // Difficulty bits equality (ALWAYS on)
+    // Difficulty bits equality (ALWAYS on), computed on the parent header's branch window
     {
-        auto last = last_headers(MIQ_RETARGET_INTERVAL);
-        uint32_t expected = miq::epoch_next_bits(
-            last, BLOCK_TIME_SECS, GENESIS_BITS,
-            /*next_height=*/ tip_.height + 1,
-            /*interval=*/ MIQ_RETARGET_INTERVAL
-        );
-        if (b.header.bits != expected) { err = "bad bits"; return false; }
+        std::vector<std::pair<int64_t,uint32_t>> window;
+        window.reserve(MIQ_RETARGET_INTERVAL);
+
+        const HeaderMeta* cur = nullptr;
+        auto itp = header_index_.find(hk(b.header.prev_hash));
+        if (itp != header_index_.end()) {
+            cur = &itp->second;
+            while (cur && window.size() < MIQ_RETARGET_INTERVAL) {
+                window.emplace_back(cur->time, cur->bits);
+                auto ip = header_index_.find(hk(cur->prev));
+                if (ip == header_index_.end()) {
+                    if (cur->prev == tip_.hash) {
+                        window.emplace_back(tip_.time, tip_.bits);
+                    }
+                    break;
+                }
+                cur = &ip->second;
+            }
+            if (!window.empty() && window.front().first > window.back().first) {
+                std::reverse(window.begin(), window.end());
+            }
+            uint64_t next_h = itp->second.height + 1;
+            uint32_t expected = miq::epoch_next_bits(
+                window, BLOCK_TIME_SECS, GENESIS_BITS,
+                /*next_height=*/ next_h,
+                /*interval=*/ MIQ_RETARGET_INTERVAL
+            );
+            if (b.header.bits != expected) { err = "bad bits"; return false; }
+        } else {
+            // Conservative fallback (shouldn't happen since prev==tip): use last_headers()
+            auto last = last_headers(MIQ_RETARGET_INTERVAL);
+            uint32_t expected = miq::epoch_next_bits(
+                last, BLOCK_TIME_SECS, GENESIS_BITS,
+                /*next_height=*/ tip_.height + 1,
+                /*interval=*/ MIQ_RETARGET_INTERVAL
+            );
+            if (b.header.bits != expected) { err = "bad bits"; return false; }
+        }
     }
 
     // POW
@@ -1384,7 +1415,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
         }
     }
 
-#if MIQ_HAVE_GCS_FILTERS
+    #if MIQ_HAVE_GCS_FILTERS
     {
         std::vector<uint8_t> fbytes;
         if (miq::gcs::build_block_filter(b, fbytes)) {
@@ -1397,7 +1428,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
                      " hash=" + hexstr(new_hash));
         }
     }
-#endif
+    #endif
 
     // Notify reorg manager
     miq::HeaderView hv;
