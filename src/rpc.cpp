@@ -749,12 +749,26 @@ std::string RpcService::handle(const std::string& body){
                 );
             } catch(...) {}
 
+            // --- NEW: compute MTP (median of last 11 header times) and expose mintime ---
+            int64_t mtp = tip.time;
+            try {
+                auto hdrs = chain_.last_headers(11);
+                if (!hdrs.empty()) {
+                    std::vector<int64_t> ts; ts.reserve(hdrs.size());
+                    for (auto& p : hdrs) ts.push_back(p.first);
+                    std::sort(ts.begin(), ts.end());
+                    mtp = ts[ts.size()/2];
+                }
+            } catch(...) {}
+            const int64_t mintime = mtp + 1;
+
             std::map<std::string, JNode> o;
             o["version"]        = jnum(1.0);
             o["prev_hash"]      = jstr(to_hex(tip.hash));
             o["bits"]           = jnum((double)next_bits);           // *** miners MUST use this ***
             o["tip_bits"]       = jnum((double)tip.bits);            // for display/diagnostics
-            o["time"]           = jnum((double)std::max<int64_t>((int64_t)time(nullptr), tip.time + 1));
+            o["mintime"]        = jnum((double)mintime);             // *** enforce time >= mintime ***
+            o["time"]           = jnum((double)std::max<int64_t>((int64_t)time(nullptr), mintime));
             o["height"]         = jnum((double)(tip.height + 1));
             o["coinbase_pkh"]   = jstr(to_hex(pkh));
             o["max_block_bytes"]= jnum((double)(900 * 1024)); // HINT for miners
@@ -1063,7 +1077,7 @@ std::string RpcService::handle(const std::string& body){
         // --- walletinfo ---
         if (method == "walletinfo") {
             std::string wdir = default_wallet_file();
-            if(!wdir.empty()){
+            if(!wdir empty()){
                 size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
             } else {
                 wdir = "wallets/default";
