@@ -79,6 +79,7 @@
 #include <array>
 #include <optional>
 #include <cmath>
+#include <cerrno>  // for errno
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OS headers (guarded)
@@ -586,7 +587,7 @@ static uint64_t get_rss_bytes(){
         return (uint64_t)tinfo.resident_size;
     }
     return 0;
-else
+#else
     std::ifstream f("/proc/self/statm");
     uint64_t rss_pages=0, x=0;
     if (f >> x >> rss_pages){
@@ -636,15 +637,19 @@ static inline void enable_vt(bool& vt_ok, bool prefer_utf8=true) {
         SetConsoleOutputCP(65001);
         SetConsoleCP(65001);
     }
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut == INVALID_HANDLE_VALUE) { vt_ok = false; return; }
+    // Try to enable VT on both stdout and stderr
     DWORD mode = 0;
-    if (!GetConsoleMode(hOut, &mode)) { vt_ok = false; return; }
-    mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    if (!SetConsoleMode(hOut, mode)) { vt_ok = false; return; }
-    DWORD mode_after = 0;
-    if (!GetConsoleMode(hOut, &mode_after)) { vt_ok = false; return; }
-    if ((mode_after & ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0) vt_ok = false;
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut == INVALID_HANDLE_VALUE || !GetConsoleMode(hOut, &mode)) { vt_ok = false; }
+    else {
+        mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        if (!SetConsoleMode(hOut, mode)) vt_ok = false;
+    }
+    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
+    if (hErr != INVALID_HANDLE_VALUE && GetConsoleMode(hErr, &mode)) {
+        mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        SetConsoleMode(hErr, mode); // best-effort
+    }
 #else
     (void)prefer_utf8;
 #endif
@@ -657,36 +662,66 @@ public:
     ConsoleWriter(){ init(); }
     ~ConsoleWriter(){
 #ifdef _WIN32
-        if (hFile_ && hFile_ != INVALID_HANDLE_VALUE) CloseHandle(hFile_);
+        if (opened_conout_ && hOut_ && hOut_ != INVALID_HANDLE_VALUE) CloseHandle(hOut_);
 #else
         if (fd_ >= 0 && fd_ != STDOUT_FILENO) ::close(fd_);
 #endif
     }
     void write_raw(const std::string& s){
 #ifdef _WIN32
-        if (hFile_ && hFile_ != INVALID_HANDLE_VALUE) {
-            DWORD wrote = 0;
-            WriteFile(hFile_, s.c_str(), (DWORD)s.size(), &wrote, nullptr);
+        if (!hOut_ || hOut_ == INVALID_HANDLE_VALUE) return;
+
+        // If this is a real console, use UTF-16 + WriteConsoleW to avoid mojibake forever.
+        if (is_console_) {
+            if (s.empty()) return;
+            int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), (int)s.size(), nullptr, 0);
+            if (needed <= 0) {
+                // Fallback: best-effort narrow (shouldn't happen)
+                DWORD wrote = 0;
+                WriteFile(hOut_, s.c_str(), (DWORD)s.size(), &wrote, nullptr);
+                return;
+            }
+            std::wstring ws;
+            ws.resize((size_t)needed);
+            MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), (int)s.size(), &ws[0], needed);
+            DWORD wroteW = 0;
+            WriteConsoleW(hOut_, ws.c_str(), (DWORD)ws.size(), &wroteW, nullptr);
         } else {
+            // Redirected: write raw UTF-8 bytes
             DWORD wrote = 0;
-            WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE), s.c_str(), (DWORD)s.size(), &wrote, nullptr);
+            WriteFile(hOut_, s.c_str(), (DWORD)s.size(), &wrote, nullptr);
         }
 #else
         int fd = (fd_ >= 0) ? fd_ : STDOUT_FILENO;
-        size_t off = 0; while (off < s.size()) { ssize_t n = ::write(fd, s.data()+off, s.size()-off); if (n<=0) break; off += (size_t)n; }
+        size_t off = 0; 
+        while (off < s.size()) { 
+            ssize_t n = ::write(fd, s.data()+off, s.size()-off); 
+            if (n<=0) break; 
+            off += (size_t)n; 
+        }
 #endif
     }
 private:
     void init(){
 #ifdef _WIN32
-        hFile_ = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        // Prefer the real stdout handle. If missing (rare), open CONOUT$.
+        hOut_ = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD m=0;
+        is_console_ = (hOut_ && hOut_ != INVALID_HANDLE_VALUE && GetConsoleMode(hOut_, &m));
+        if (!hOut_ || hOut_ == INVALID_HANDLE_VALUE) {
+            hOut_ = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            opened_conout_ = true;
+            if (hOut_ && hOut_ != INVALID_HANDLE_VALUE && GetConsoleMode(hOut_, &m)) is_console_ = true;
+        }
 #else
         fd_ = ::open("/dev/tty", O_WRONLY | O_CLOEXEC);
         if (fd_ < 0) fd_ = STDOUT_FILENO;
 #endif
     }
 #ifdef _WIN32
-    HANDLE hFile_{}; // NOLINT
+    HANDLE hOut_{nullptr};
+    bool   is_console_{false};
+    bool   opened_conout_{false};
 #else
     int fd_ = -1;
 #endif
@@ -979,6 +1014,7 @@ static inline std::string bar(int width, double frac, bool vt_ok, int hue_a=36, 
 static std::string wave_line(int width, int tick, bool vt_ok, int hue_a=36, int hue_b=32){
     static const char* blocks[] = { " ", u8"▁", u8"▂", u8"▃", u8"▄", u8"▅", u8"▆", u8"▇", u8"█" };
     const int N = 8;
+    const char* ascii[] = { " ", ".", ".", "-", "-", "=", "=", "#", "#" };
     if(width < 4) width = 4;
     std::ostringstream o;
     for(int i=0;i<width;i++){
@@ -990,20 +1026,26 @@ static std::string wave_line(int width, int tick, bool vt_ok, int hue_a=36, int 
             const int hue = hue_a - (i*(hue_a-hue_b))/std::max(1,width);
             o << "\x1b["<<hue<<"m" << blocks[idx] << "\x1b[0m";
         }else{
-            o << blocks[idx];
+            o << ascii[idx];
         }
     }
     return o.str();
 }
 static std::string spinner(int tick){
-    static const char* frames[] = {
+    static const char* frames_utf8[] = {
         u8"⠋", u8"⠙", u8"⠹", u8"⠸", u8"⠼",
         u8"⠴", u8"⠦", u8"⠧", u8"⠇", u8"⠏"
     };
-    return std::string(frames[tick % 10]);
+    static const char* frames_ascii[] = {"-", "\\", "|", "/"};
+#ifdef _WIN32
+    // On Windows we always write via UTF-16 to console; keep UTF-8 frames.
+    return std::string(frames_utf8[tick % 10]);
+#else
+    return std::string(frames_utf8[tick % 10]);
+#endif
 }
 static std::string spark_ascii(const std::vector<double>& xs){
-    static const char bars[] = " .:-=+*#%@";
+    static const char bars[] = " .:-=+*%@#";
     if(xs.empty()) return "";
     double mn=xs[0], mx=xs[0];
     for(double v: xs){ mn = std::min(mn,v); mx = std::max(mx,v); }
