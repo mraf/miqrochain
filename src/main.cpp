@@ -103,6 +103,7 @@
   #include <fcntl.h>
   #include <sys/types.h>
   #include <sys/stat.h>
+  #include <signal.h>   // <-- needed for kill()
   #define MIQ_ISATTY() (::isatty(fileno(stdin)) != 0)
 #endif
 
