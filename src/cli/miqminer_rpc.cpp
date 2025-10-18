@@ -136,8 +136,9 @@ static std::string default_cookie_path(){
     }
     return "C:\\Miqrochain\\.cookie";
 #elif defined(__APPLE__)
+    // Match node's default (~/.miqrochain/.cookie) for consistency.
     const char* home = std::getenv("HOME");
-    if(home && *home) return std::string(home) + "/Library/Application Support/Miqrochain/.cookie";
+    if(home && *home) return std::string(home) + "/.miqrochain/.cookie";
     return "./.cookie";
 #else
     const char* xdg = std::getenv("XDG_DATA_HOME");
@@ -633,7 +634,7 @@ static void gbt_parse_transactions(const std::string& body, std::vector<MinerTem
                 size_t s=f+6;
                 while(s<obj_end && std::isspace((unsigned char)body[s])) ++s;
                 size_t e=s;
-                while(e<obj_end && (std::isdigit((unsigned char)body[e]) || body[e]=='-' || body[e]=='+')) ++e;
+                while(e<obj_end && (std::isdigit((unsigned char)body[e]) || body[e]=='-' || body[e]=='+' )) ++e;
                 if(e>s){
                     long long v = std::strtoll(body.c_str()+s, nullptr, 10);
                     if(v>0) xt.fee = (uint64_t)v;
