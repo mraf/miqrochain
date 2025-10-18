@@ -1,3 +1,9 @@
+// src/main.cpp — MIQ core entrypoint with hardened Pro TUI 2.0
+// Stable release: defensive startup/shutdown, datadir locks, PID file,
+// realistic network hashrate estimation, polished widgets, and safe fallbacks.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MSVC niceties
 #ifdef _MSC_VER
   #pragma execution_character_set("utf-8")
   #define _CRT_SECURE_NO_WARNINGS
@@ -66,9 +72,10 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <map>
-#include <set>   // fix for std::set
+#include <set>
 #include <array>
 #include <optional>
+#include <cmath>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OS headers (guarded)
@@ -112,7 +119,7 @@ using namespace miq;
 #define MIQ_VERSION_MAJOR 0
 #endif
 #ifndef MIQ_VERSION_MINOR
-#define MIQ_VERSION_MINOR 6
+#define MIQ_VERSION_MINOR 7
 #endif
 #ifndef MIQ_VERSION_PATCH
 #define MIQ_VERSION_PATCH 0
@@ -398,7 +405,7 @@ static BOOL WINAPI win_ctrl_handler(DWORD evt){
 #endif
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                           Resource metrics                                 ║
+/*                               Resource metrics                              */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 static uint64_t get_rss_bytes(){
 #if defined(_WIN32)
@@ -408,7 +415,6 @@ static uint64_t get_rss_bytes(){
     }
     return 0;
 #elif defined(__APPLE__)
-    // Keep simple: read from /proc/self if available (on some macs, it isn't)
     std::ifstream f("/proc/self/statm"); uint64_t rss_pages=0, x=0;
     if (f >> x >> rss_pages){ long p = sysconf(_SC_PAGESIZE); return (uint64_t)rss_pages * (uint64_t)p; }
     return 0;
@@ -420,7 +426,7 @@ static uint64_t get_rss_bytes(){
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                              Terminal utils                                ║
+/*                              Terminal utils                                 */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 namespace term {
 static inline bool is_tty() {
@@ -506,7 +512,7 @@ private:
 };
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                               Log capture                                  ║
+/*                                 Log capture                                 */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 class LogCapture {
 public:
@@ -620,7 +626,7 @@ private:
 };
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                               UI helpers                                  ║
+/*                               UI helpers                                    */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 static inline std::string short_hex(const std::string& h, size_t n=12){ return h.size()>n ? h.substr(0,n) : h; }
 static inline std::string fmt_hs(double v){
@@ -698,14 +704,140 @@ static std::string spark_ascii(const std::vector<double>& xs){
     std::string s;
     for(double v: xs){
         int idx = (int)std::round( (v-mn)/span * 9.0 );
-        if(idx<0) idx=0; if(idx>9) idx=9;
+        if (idx < 0) { idx = 0; }
+        if (idx > 9) { idx = 9; }
         s.push_back(bars[idx]);
     }
     return s;
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                                Pro TUI 2.0                                 ║
+// ║                   UTXO chainstate presence + full reindex                 ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+static bool dir_exists_nonempty(const std::string& path){
+    std::error_code ec; if(!std::filesystem::exists(path, ec)) return false;
+    for (auto it = std::filesystem::directory_iterator(path, ec);
+         it != std::filesystem::directory_iterator(); ++it) return true;
+    return false;
+}
+static bool ensure_utxo_fully_indexed(Chain& chain, const std::string& datadir, bool force){
+    const std::string chainstate_dir = p_join(datadir, "chainstate");
+    bool need = force || !dir_exists_nonempty(chainstate_dir);
+    if(!need){
+        log_info("UTXO chainstate seems present; quick-skip deep probe.");
+        return true;
+    }
+    log_warn("UTXO chainstate missing/stale — reindex required.");
+    UTXOKV utxo_kv;
+    std::string err;
+    log_info("ReindexUTXO: starting full scan...");
+    const auto t0 = now_ms();
+    const bool ok = ReindexUTXO(chain, utxo_kv, /*compact_after=*/true, err);
+    const auto t1 = now_ms();
+    if(!ok){
+        log_error(std::string("ReindexUTXO failed: ") + (err.empty()?"unknown":err));
+        return false;
+    }
+    log_info(std::string("ReindexUTXO: complete in ") + std::to_string((t1 - t0)/1000.0) + "s");
+    if(!dir_exists_nonempty(chainstate_dir)){
+        log_error("ReindexUTXO claimed success but chainstate is empty — refusing to continue.");
+        return false;
+    }
+    return true;
+}
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                    Traits: mempool & header safe accessors                ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+template<typename, typename = void> struct has_stats_method : std::false_type{};
+template<typename T> struct has_stats_method<T, std::void_t<decltype(std::declval<T&>().stats())>> : std::true_type{};
+template<typename, typename = void> struct has_size_method  : std::false_type{};
+template<typename T> struct has_size_method<T,  std::void_t<decltype(std::declval<T&>().size())>>  : std::true_type{};
+template<typename, typename = void> struct has_count_method : std::false_type{};
+template<typename T> struct has_count_method<T, std::void_t<decltype(std::declval<T&>().count())>> : std::true_type{};
+
+struct MempoolView { uint64_t count=0, bytes=0, recent_adds=0; };
+template<typename MP>
+static MempoolView mempool_view_fallback(MP* mp){
+    MempoolView v{};
+    if (!mp) return v;
+    if constexpr (has_stats_method<MP>::value) {
+        auto s = mp->stats(); // must have count/bytes/recent_adds or compatible fields
+        v.count = (uint64_t)s.count;
+        v.bytes = (uint64_t)s.bytes;
+        v.recent_adds = (uint64_t)s.recent_adds;
+    } else if constexpr (has_size_method<MP>::value) {
+        v.count = (uint64_t)mp->size();
+    } else if constexpr (has_count_method<MP>::value) {
+        v.count = (uint64_t)mp->count();
+    }
+    return v;
+}
+
+template<typename, typename = void> struct has_time_field : std::false_type{};
+template<typename H> struct has_time_field<H, std::void_t<decltype(std::declval<H>().time)>> : std::true_type{};
+template<typename, typename = void> struct has_timestamp_field : std::false_type{};
+template<typename H> struct has_timestamp_field<H, std::void_t<decltype(std::declval<H>().timestamp)>> : std::true_type{};
+template<typename, typename = void> struct has_bits_field : std::false_type{};
+template<typename H> struct has_bits_field<H, std::void_t<decltype(std::declval<H>().bits)>> : std::true_type{};
+template<typename, typename = void> struct has_nBits_field : std::false_type{};
+template<typename H> struct has_nBits_field<H, std::void_t<decltype(std::declval<H>().nBits)>> : std::true_type{};
+
+template<typename H>
+static uint64_t hdr_time(const H& h){
+    if constexpr (has_time_field<H>::value) return (uint64_t)h.time;
+    if constexpr (has_timestamp_field<H>::value) return (uint64_t)h.timestamp;
+    return 0;
+}
+template<typename H>
+static uint32_t hdr_bits(const H& h){
+    if constexpr (has_bits_field<H>::value) return (uint32_t)h.bits;
+    if constexpr (has_nBits_field<H>::value) return (uint32_t)h.nBits;
+    return (uint32_t)GENESIS_BITS;
+}
+
+// Difficulty helpers: compact bits → target (long double), then difficulty ratio
+static long double compact_to_target_ld(uint32_t bits){
+    uint32_t exp = bits >> 24;
+    uint32_t mant = bits & 0x007fffff;
+    long double m = (long double)mant;
+    int shift = (int)exp - 3;
+    long double target = m * std::powl(2.0L, (long double)8*shift);
+    return target;
+}
+static long double difficulty_from_bits(uint32_t bits){
+    // Relative to "difficulty 1" at GENESIS_BITS (like Bitcoin)
+    long double t_one = compact_to_target_ld((uint32_t)GENESIS_BITS);
+    long double t_cur = compact_to_target_ld(bits);
+    if (t_cur <= 0.0L) return 0.0L;
+    return t_one / t_cur;
+}
+
+// Estimate network hashrate from recent headers
+static double estimate_network_hashrate(Chain* chain){
+    if (!chain) return 0.0;
+    const unsigned k = (unsigned)std::max<int>(MIQ_RETARGET_INTERVAL, 32);
+    auto headers = chain->last_headers(k);
+    if (headers.size() < 2) return 0.0;
+
+    // timespan
+    uint64_t t_first = hdr_time(headers.front());
+    uint64_t t_last  = hdr_time(headers.back());
+    if (t_last <= t_first) t_last = t_first + 1;
+    double avg_block_time = double(t_last - t_first) / double(headers.size()-1);
+    if (avg_block_time <= 0.0) avg_block_time = (double)BLOCK_TIME_SECS;
+
+    // Difficulty at the tip header
+    uint32_t bits = hdr_bits(headers.back());
+    long double diff = difficulty_from_bits(bits);
+    // Expected hashes per block at difficulty 1 ≈ 2^32
+    long double hps = (diff * 4294967296.0L) / avg_block_time;
+    if (!std::isfinite((double)hps) || hps < 0) return 0.0;
+    return (double)hps;
+}
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+/*                                Pro TUI 2.0                                  */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 class TUI {
 public:
@@ -865,7 +997,8 @@ private:
             else std::this_thread::sleep_for(std::chrono::milliseconds(16));
         }
         // restore
-        if (tcsetattr(STDIN_FILENO, TCSANOW, &oldt) != 0) { /*ignore*/ }
+        // best-effort (ignore failure)
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
 #endif
     }
     void handle_key(int c){
@@ -886,6 +1019,7 @@ private:
         running_ = true;
         auto last_hs_time = clock::now();
         uint64_t last_stats_ms = now_ms();
+        uint64_t last_net_ms   = now_ms();
         while (running_) {
             if(global::tui_toggle_theme.exchange(false)) { std::lock_guard<std::mutex> lk(mu_); dark_theme_ = !dark_theme_; }
             draw_once(false);
@@ -897,10 +1031,19 @@ private:
                 spark_hs_.push_back(g_miner_stats.hps.load());
                 if(spark_hs_.size() > 90) spark_hs_.erase(spark_hs_.begin());
             }
-            // debounce snapshot
+            // snapshot hotkey
             if (global::tui_snapshot_requested.exchange(false)) snapshot_to_disk();
             // periodic stats refresh (for uptime/mem)
             if (now_ms() - last_stats_ms > 1000) last_stats_ms = now_ms();
+            // update network hashrate ~1s
+            if (now_ms() - last_net_ms > 1000){
+                last_net_ms = now_ms();
+                double nh = estimate_network_hashrate(chain_);
+                std::lock_guard<std::mutex> lk(mu_);
+                net_hashrate_ = nh;
+                net_spark_.push_back(nh);
+                if (net_spark_.size() > 90) net_spark_.erase(net_spark_.begin());
+            }
         }
     }
 
@@ -910,15 +1053,12 @@ private:
         std::ostringstream out;
         out << "MIQROCHAIN TUI snapshot ("<< now_s() <<")\n";
         out << "Screen: " << cols << "x" << rows << "\n\n";
-        // dump latest two columns plainly
-        // left
         out << "[System]\n";
         out << "uptime=" << uptime_s_ << "s  rss=" << get_rss_bytes() << " bytes\n";
         out << "[Chain]\n";
         out << "height=" << (chain_?chain_->height():0) << "\n";
         out << "[Peers]\n";
         if (p2p_){ out << "peers=" << p2p_->snapshot_peers().size() << "\n"; }
-        // logs tail
         out << "\n[Logs tail]\n";
         int take = 60;
         int start = (int)logs_.size() - take; if (start < 0) start = 0;
@@ -1071,6 +1211,7 @@ private:
                             + "   inflight: " + std::to_string(inflight_tx)
                             + "   rxbuf: " + std::to_string(rxbuf_sum)
                             + "   pings-waiting: " + std::to_string(awaiting_pongs));
+            // show top peers table
             std::ostringstream hdr;
             hdr << "    " << std::left << std::setw(16) << "IP"
                 << "  v/ok  " << std::setw(8) << "last(ms)"
@@ -1090,16 +1231,19 @@ private:
                 right.push_back(ln.str());
             }
             if (peers.size() > show) right.push_back(std::string("    ... +") + std::to_string(peers.size()-show) + " more");
+            // network hashrate
+            right.push_back(std::string("  net hashrate: ") + fmt_hs(net_hashrate_));
+            right.push_back(std::string("  trend:        ") + spark_ascii(net_spark_));
             right.push_back("");
         }
 
-        // Mempool
+        // Mempool (resilient to API)
         if (mempool_) {
             right.push_back(std::string(C_bold()) + "Mempool" + C_reset());
-            auto stat = mempool_->stats();
+            auto stat = mempool_view_fallback(mempool_);
             right.push_back(std::string("  txs: ") + std::to_string(stat.count)
-                            + "   bytes: " + fmt_bytes(stat.bytes)
-                            + "   recent_adds: " + std::to_string(stat.recent_adds));
+                            + (stat.bytes? (std::string("   bytes: ") + fmt_bytes(stat.bytes)) : std::string())
+                            + (stat.recent_adds? (std::string("   recent_adds: ") + std::to_string(stat.recent_adds)) : std::string()));
             right.push_back("");
         }
 
@@ -1118,8 +1262,8 @@ private:
                << "   ext: " << (g_extminer.alive.load() ? (std::string(C_ok()) + "alive" + C_reset()) : (std::string(C_dim()) + "—" + C_reset()));
             right.push_back(m1.str());
             std::ostringstream m2; m2 << "  accepted: " << ok << "   rejected: " << rej; right.push_back(m2.str());
-            right.push_back(std::string("  hashrate: ") + fmt_hs(hps));
-            right.push_back(std::string("  trend:    ") + spark_ascii(spark_hs_));
+            right.push_back(std::string("  miner hashrate: ") + fmt_hs(hps));
+            right.push_back(std::string("  miner trend:    ") + spark_ascii(spark_hs_));
             right.push_back("");
         }
 
@@ -1127,11 +1271,9 @@ private:
         {
             right.push_back(std::string(C_bold()) + "Health & Security" + C_reset());
             right.push_back(std::string("  config reload: ") + (global::reload_requested.load()? "pending":"—"));
-            // transient warning display (hot warning)
             if (!hot_warning_.empty() && now_ms()-hot_warn_ts_ < 6000){
                 right.push_back(std::string("  ") + C_warn() + hot_warning_ + C_reset());
             }
-            // simple hints
             if (!datadir_.empty()){
                 right.push_back(std::string("  datadir: ") + datadir_);
             }
@@ -1216,6 +1358,8 @@ private:
     std::deque<std::string>  recent_txids_;
     std::unordered_set<std::string> recent_txid_set_;
     std::vector<double> spark_hs_;
+    std::vector<double> net_spark_;
+    double net_hashrate_{0.0};
     double eta_secs_{0.0};
     std::string shutdown_phase_;
     int shutdown_ok_{0};
@@ -1232,7 +1376,7 @@ private:
 };
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                          Fatal terminate hook                              ║
+/*                          Fatal terminate hook                                */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 static void fatal_terminate() noexcept {
     std::fputs("[FATAL] std::terminate() called (background) — suppressing abort, initiating shutdown\n", stderr);
@@ -1241,7 +1385,7 @@ static void fatal_terminate() noexcept {
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                               Miner worker                                 ║
+/*                               Miner worker                                   */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 static uint64_t sum_coinbase_outputs(const Block& b) {
     if (b.txs.empty()) return 0;
@@ -1377,7 +1521,7 @@ static void miner_worker(Chain* chain, Mempool* mempool, P2P* p2p,
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                                     CLI                                    ║
+/*                                     CLI                                     */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 static void print_usage(){
     std::cout
@@ -1417,7 +1561,7 @@ static bool is_recognized_arg(const std::string& s){
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                                     main                                   ║
+/*                                     main                                    */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 int main(int argc, char** argv){
     std::ios::sync_with_stdio(false);
@@ -1715,8 +1859,9 @@ int main(int argc, char** argv){
 
         // Health heuristics
         uint64_t last_tip_height_seen = chain.height();
-        uint64_t last_tip_change_ms = now_ms();
-        uint64_t last_peer_warn_ms = 0;
+        uint64_t last_tip_change_ms   = now_ms();
+        uint64_t last_peer_warn_ms    = 0;
+        uint64_t start_of_run_ms      = now_ms(); // <-- fixes previous undefined var
 
         // main loop
         while(!global::shutdown_requested.load()){
@@ -1745,7 +1890,7 @@ int main(int argc, char** argv){
             }
             // degraded: stuck tip > 10 min
             if (now_ms() - last_tip_change_ms > 10*60*1000) degraded = true;
-            // degraded: external miner required but not alive (heuristic only)
+            // degraded: external miner heartbeat requested but dead (heuristic)
             if (mine_flag == false && std::getenv("MIQ_MINER_HEARTBEAT") && !g_extminer.alive.load()) degraded = true;
 
             if (can_tui) tui.set_health_degraded(degraded);
@@ -1810,5 +1955,3 @@ int main(int argc, char** argv){
         return 13;
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
