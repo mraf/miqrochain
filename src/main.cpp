@@ -1,12 +1,3 @@
-// src/main.cpp — MIQ core entrypoint with hardened Pro TUI 2.1
-// Stable release: defensive startup/shutdown, datadir locks, PID file,
-// realistic network hashrate estimation, polished widgets, and safe fallbacks.
-// Adds: precise difficulty/target math (via ldexp), miner share %, distinct
-// miners observed (coinbase recipients) over recent blocks, sorted peer table,
-// and subtle UX refinements. All metrics are computed from local state only.
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MSVC niceties
 #ifdef _MSC_VER
   #pragma execution_character_set("utf-8")
   #define _CRT_SECURE_NO_WARNINGS
@@ -125,7 +116,7 @@ using namespace miq;
 #define MIQ_VERSION_MINOR 7
 #endif
 #ifndef MIQ_VERSION_PATCH
-#define MIQ_VERSION_PATCH 0
+#define MIQ_VERSION_PATCH 2
 #endif
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -144,6 +135,10 @@ static std::atomic<bool>    tui_snapshot_requested{false};
 static std::atomic<bool>    tui_toggle_theme{false};
 static std::atomic<bool>    tui_pause_logs{false};
 static std::atomic<bool>    tui_verbose{false};
+static std::atomic<bool>    tui_toggle_help{false};
+static std::atomic<bool>    tui_toggle_compact{false};
+static std::atomic<bool>    tui_toggle_glow{false};
+static std::atomic<bool>    dump_status_json{true};
 }
 
 // time helpers
@@ -209,13 +204,13 @@ struct Telemetry {
     void push_block(const BlockSummary& b) {
         std::lock_guard<std::mutex> lk(mu);
         new_blocks.push_back(b);
-        while (new_blocks.size() > 256) new_blocks.pop_front();
+        while (new_blocks.size() > 512) new_blocks.pop_front();
     }
     void push_txids(const std::vector<std::string>& v) {
         std::lock_guard<std::mutex> lk(mu);
         for (auto& t : v) {
             new_txids.push_back(t);
-            while (new_txids.size() > 128) new_txids.pop_front();
+            while (new_txids.size() > 256) new_txids.pop_front();
         }
     }
     void drain(std::vector<BlockSummary>& out_blocks, std::vector<std::string>& out_txids) {
@@ -660,8 +655,25 @@ static inline std::string fmt_diff(long double d){
     std::ostringstream o; o<<std::fixed<<std::setprecision(x<10?2:(x<100?1:0))<<(double)x<<u[i];
     return o.str();
 }
+static inline std::string fmt_pct(double x, int p=2){
+    if (x < 0) x = 0; if (x > 100) x = 100;
+    std::ostringstream o; o<<std::fixed<<std::setprecision(p)<<x<<'%'; return o.str();
+}
+static inline std::string fmt_duration(double sec){
+    if (sec < 0) sec = 0;
+    uint64_t s = (uint64_t)(sec + 0.5);
+    uint64_t d = s / 86400; s %= 86400;
+    uint64_t h = s / 3600;  s %= 3600;
+    uint64_t m = s / 60;    s %= 60;
+    std::ostringstream o;
+    if (d) o<<d<<"d"<<std::setw(2)<<std::setfill('0')<<h<<"h";
+    else if (h) o<<h<<"h"<<std::setw(2)<<std::setfill('0')<<m<<"m";
+    else if (m) o<<m<<"m"<<std::setw(2)<<std::setfill('0')<<s<<"s";
+    else o<<s<<"s";
+    return o.str();
+}
 
-static inline std::string bar(int width, double frac, bool vt_ok, int hue_a=36, int hue_b=32){
+static inline std::string bar(int width, double frac, bool vt_ok, int hue_a=36, int hue_b=32, bool glow=false){
     if (width < 6) width = 6;
     if (frac < 0) { frac = 0; }
     if (frac > 1) { frac = 1; }
@@ -671,7 +683,7 @@ static inline std::string bar(int width, double frac, bool vt_ok, int hue_a=36, 
     if(vt_ok){
         for(int i=0;i<width-2;i++){
             bool on = i < full;
-            int hue = hue_a - (i*(hue_a-hue_b))/std::max(1,width-2);
+            int hue = glow ? 35 + (i%2) : hue_a - (i*(hue_a-hue_b))/std::max(1,width-2);
             if (hue < 30) hue = 30;
             if (on) o << "\x1b["<<hue<<"m" << "█" << "\x1b[0m";
             else    o << "\x1b[90m" << "·" << "\x1b[0m";
@@ -763,7 +775,7 @@ static bool ensure_utxo_fully_indexed(Chain& chain, const std::string& datadir, 
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 template<typename, typename = void> struct has_stats_method : std::false_type{};
 template<typename T> struct has_stats_method<T, std::void_t<decltype(std::declval<T&>().stats())>> : std::true_type{};
-template<typename, typename = void> struct has_size_method  : std::false_type{};
+template<typename, typename = void> struct has_size_method  : std::false_type<>();
 template<typename T> struct has_size_method<T,  std::void_t<decltype(std::declval<T&>().size())>>  : std::true_type{};
 template<typename, typename = void> struct has_count_method : std::false_type{};
 template<typename T> struct has_count_method<T, std::void_t<decltype(std::declval<T&>().count())>> : std::true_type{};
@@ -814,8 +826,7 @@ static long double compact_to_target_ld(uint32_t bits){
     uint32_t mant = bits & 0x007fffff;
     long double m = (long double)mant;
     int shift = (int)exp - 3;
-    // Precise and portable: ldexp(x,k) = x * 2^k
-    return std::ldexp(m, 8 * shift);
+    return std::ldexp(m, 8 * shift); // m * 2^(8*shift)
 }
 static long double difficulty_from_bits(uint32_t bits){
     // Relative to "difficulty 1" at GENESIS_BITS (like Bitcoin)
@@ -826,11 +837,11 @@ static long double difficulty_from_bits(uint32_t bits){
 }
 
 // Estimate network hashrate from recent headers
-static double estimate_network_hashrate(Chain* chain){
-    if (!chain) return 0.0;
+static double estimate_network_hashrate(Chain* chain, double* out_avg_block_time=nullptr){
+    if (!chain) { if(out_avg_block_time) *out_avg_block_time = (double)BLOCK_TIME_SECS; return 0.0; }
     const unsigned k = (unsigned)std::max<int>(MIQ_RETARGET_INTERVAL, 32);
     auto headers = chain->last_headers(k);
-    if (headers.size() < 2) return 0.0;
+    if (headers.size() < 2) { if(out_avg_block_time) *out_avg_block_time=(double)BLOCK_TIME_SECS; return 0.0; }
 
     // timespan
     uint64_t t_first = hdr_time(headers.front());
@@ -844,12 +855,13 @@ static double estimate_network_hashrate(Chain* chain){
     long double diff = difficulty_from_bits(bits);
     // Expected hashes per block at difficulty 1 ≈ 2^32
     long double hps = (diff * 4294967296.0L) / avg_block_time;
-    if (!std::isfinite((double)hps) || hps < 0) return 0.0;
+    if (!std::isfinite((double)hps) || hps < 0) hps = 0.0L;
+    if (out_avg_block_time) *out_avg_block_time = avg_block_time;
     return (double)hps;
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-/*                                Pro TUI 2.1                                  */
+/*                                Pro TUI 2.2                                  */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 class TUI {
 public:
@@ -859,7 +871,7 @@ public:
     void set_enabled(bool on){ enabled_ = on; }
     void start() {
         if (!enabled_) return;
-        if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H]\x1b[?25l");
+        if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H\x1b[?25l"); // fixed stray ']' from 2.1
         draw_once(true);
         key_thr_ = std::thread([this]{ key_loop(); });
         thr_     = std::thread([this]{ loop(); });
@@ -885,7 +897,7 @@ public:
     void set_node_state(NodeState st){ std::lock_guard<std::mutex> lk(mu_); nstate_ = st; }
     void set_datadir(const std::string& d){ std::lock_guard<std::mutex> lk(mu_); datadir_ = d; }
 
-    // logs in
+    // logs + telemetry in
     void feed_logs(const std::deque<LogCapture::Line>& raw_lines) {
         std::lock_guard<std::mutex> lk(mu_);
         if (!paused_) {
@@ -894,14 +906,27 @@ public:
                 logs_.push_back(stylize_log(L));
             }
         }
-        // Drain block/tx telemetry
+        // Drain block/tx telemetry and maintain miner census window
         std::vector<BlockSummary> nb; std::vector<std::string> ntx;
         g_telemetry.drain(nb, ntx);
         for (auto& b : nb) {
-            if (recent_blocks_.empty() || recent_blocks_.back().height != b.height || recent_blocks_.back().hash_hex != b.hash_hex) {
+            bool is_new = recent_blocks_.empty() || recent_blocks_.back().height != b.height || recent_blocks_.back().hash_hex != b.hash_hex;
+            if (is_new) {
                 recent_blocks_.push_back(b);
+                if (!b.miner.empty()) {
+                    miner_counts_[b.miner] += 1;
+                }
+                while (recent_blocks_.size() > miner_window_) {
+                    const auto& old = recent_blocks_.front();
+                    if (!old.miner.empty()) {
+                        auto it = miner_counts_.find(old.miner);
+                        if (it != miner_counts_.end() && it->second > 0) {
+                            if (--(it->second) == 0) miner_counts_.erase(it);
+                        }
+                    }
+                    recent_blocks_.pop_front();
+                }
                 telemetry_flush_disk(b);
-                while (recent_blocks_.size() > 64) recent_blocks_.pop_front();
             }
         }
         for (auto& t : ntx) {
@@ -973,6 +998,7 @@ private:
     const char* C_head()  const { return vt_ok_ ? (dark_theme_? "\x1b[35m":"\x1b[35m") : ""; }
     const char* C_ok()    const { return vt_ok_ ? "\x1b[32m" : ""; }
     const char* C_bold()  const { return vt_ok_ ? "\x1b[1m"  : ""; }
+    const char* C_ul()    const { return vt_ok_ ? "\x1b[4m"  : ""; }
 
     static std::string fit(const std::string& s, int w){
         if (w <= 0) return std::string();
@@ -981,16 +1007,16 @@ private:
         return s.substr(0, (size_t)w-3) + "...";
     }
 
-    // recent miner identities (coinbase recipients) over last K blocks in memory
-    size_t distinct_miners_recent(size_t window) const {
-        std::unordered_set<std::string> uniq;
-        size_t n = recent_blocks_.size();
-        size_t start = (n > window) ? (n - window) : 0;
-        for (size_t i = start; i < n; ++i) {
-            const auto& b = recent_blocks_[i];
-            if (!b.miner.empty()) uniq.insert(b.miner);
-        }
-        return uniq.size();
+    // compute top miners from rolling map
+    std::vector<std::pair<std::string, size_t>> top_miners(size_t topN, size_t& window) const {
+        window = std::min(miner_window_, (size_t)recent_blocks_.size());
+        std::vector<std::pair<std::string, size_t>> v(miner_counts_.begin(), miner_counts_.end());
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b){
+            if (a.second != b.second) return a.second > b.second;
+            return a.first < b.first;
+        });
+        if (v.size() > topN) v.resize(topN);
+        return v;
     }
 
     void key_loop(){
@@ -1033,6 +1059,9 @@ private:
             case 's': case 'S': global::tui_snapshot_requested.store(true); break;
             case 'v': case 'V': global::tui_verbose.store(!global::tui_verbose.load()); break;
             case 'r': case 'R': global::reload_requested.store(true); break;
+            case '?':           global::tui_toggle_help.store(true); break;
+            case 'c': case 'C': global::tui_toggle_compact.store(true); break;
+            case 'g': case 'G': global::tui_toggle_glow.store(true); break;
             default: break;
         }
     }
@@ -1042,18 +1071,31 @@ private:
         using namespace std::chrono_literals;
         running_ = true;
         auto last_hs_time = clock::now();
+        auto last_stat_dump = clock::now();
         uint64_t last_stats_ms = now_ms();
         uint64_t last_net_ms   = now_ms();
         while (running_) {
             if(global::tui_toggle_theme.exchange(false)) { std::lock_guard<std::mutex> lk(mu_); dark_theme_ = !dark_theme_; }
+            if(global::tui_toggle_help.exchange(false))  { std::lock_guard<std::mutex> lk(mu_); show_help_ = !show_help_; }
+            if(global::tui_toggle_compact.exchange(false)) { std::lock_guard<std::mutex> lk(mu_); compact_ = !compact_; }
+            if(global::tui_toggle_glow.exchange(false))   { std::lock_guard<std::mutex> lk(mu_); glow_ = !glow_; }
+
             draw_once(false);
-            std::this_thread::sleep_for(std::chrono::milliseconds(vt_ok_ ? 8 : 75)); // adaptive
+            std::this_thread::sleep_for(std::chrono::milliseconds(vt_ok_ ? 8 : 75));
             ++tick_;
+
             if((clock::now()-last_hs_time) > 250ms){
                 last_hs_time = clock::now();
                 std::lock_guard<std::mutex> lk(mu_);
+                // miner hashrate spark
                 spark_hs_.push_back(g_miner_stats.hps.load());
                 if(spark_hs_.size() > 90) spark_hs_.erase(spark_hs_.begin());
+                // mempool spark
+                if (mempool_) {
+                    auto v = mempool_view_fallback(mempool_);
+                    mem_spark_.push_back((double)v.count);
+                    if (mem_spark_.size() > 90) mem_spark_.erase(mem_spark_.begin());
+                }
             }
             // snapshot hotkey
             if (global::tui_snapshot_requested.exchange(false)) snapshot_to_disk();
@@ -1062,13 +1104,73 @@ private:
             // update network hashrate ~1s
             if (now_ms() - last_net_ms > 1000){
                 last_net_ms = now_ms();
-                double nh = estimate_network_hashrate(chain_);
+                double avg_bt = 0.0;
+                double nh = estimate_network_hashrate(chain_, &avg_bt);
                 std::lock_guard<std::mutex> lk(mu_);
+                avg_block_time_ = avg_bt;
                 net_hashrate_ = nh;
                 net_spark_.push_back(nh);
                 if (net_spark_.size() > 90) net_spark_.erase(net_spark_.begin());
             }
+            // write status.json ~1s
+            if (global::dump_status_json.load() && (clock::now() - last_stat_dump) > 1s) {
+                last_stat_dump = clock::now();
+                dump_status_json();
+            }
         }
+    }
+
+    void dump_status_json(){
+        if (datadir_.empty()) return;
+        std::ostringstream o;
+        uint64_t height = chain_ ? chain_->height() : 0;
+        std::string tip_hex;
+        long double tip_diff = 0.0L;
+        uint32_t tip_bits = (uint32_t)GENESIS_BITS;
+        if (chain_) {
+            auto t = chain_->tip();
+            tip_hex = to_hex(t.hash);
+            tip_bits = hdr_bits(t);
+            tip_diff = difficulty_from_bits(tip_bits);
+        }
+        size_t miners_window = std::min(miner_window_, (size_t)recent_blocks_.size());
+        // top miners (up to 8)
+        auto top = top_miners(8, miners_window);
+
+        // mempool
+        MempoolView mv{}; if (mempool_) mv = mempool_view_fallback(mempool_);
+        // peers
+        size_t peers = 0, verack_ok = 0;
+        if (p2p_) {
+            auto ps = p2p_->snapshot_peers();
+            peers = ps.size();
+            for (auto& p : ps) if (p.verack_ok) ++verack_ok;
+        }
+        // JSON
+        o << "{";
+        o << "\"t\":"<<now_s()<<",";
+        o << "\"chain\":\""<<CHAIN_NAME<<"\",";
+        o << "\"height\":"<<height<<",";
+        o << "\"tip\":\""<<tip_hex<<"\",";
+        o << "\"bits\":"<<tip_bits<<",";
+        o << "\"difficulty\":"<<(double)tip_diff<<",";
+        o << "\"avg_block_time\":"<<avg_block_time_<<",";
+        o << "\"net_hashrate\":"<<net_hashrate_<<",";
+        o << "\"miner_hps\":"<<g_miner_stats.hps.load()<<",";
+        o << "\"miner_threads\":"<<g_miner_stats.threads.load()<<",";
+        o << "\"mempool_txs\":"<<mv.count<<",";
+        o << "\"peers\":"<<peers<<",";
+        o << "\"verack_ok\":"<<verack_ok<<",";
+        o << "\"miners_observed\":"<<miner_counts_.size()<<",";
+        o << "\"top_miners\":[";
+        for (size_t i=0;i<top.size();++i){
+            if (i) o<<",";
+            const auto& [addr,cnt] = top[i];
+            o<<"{\"addr\":\""<<addr<<"\",\"blocks\":"<<cnt<<"}";
+        }
+        o << "]";
+        o << "}\n";
+        write_text_atomic(p_join(datadir_, "status.json"), o.str());
     }
 
     void snapshot_to_disk(){
@@ -1105,7 +1207,7 @@ private:
         int cols, rows; term::get_winsize(cols, rows);
         if (cols < 114) cols = 114;
         if (rows < 34) rows = 34;
-        const int rightw = std::max(50, cols / 3);
+        const int rightw = compact_ ? std::max(44, cols/3) : std::max(52, cols / 3);
         const int leftw  = cols - rightw - 3;
 
         std::vector<std::string> left, right;
@@ -1114,22 +1216,19 @@ private:
         {
             std::ostringstream h;
             if (!first && vt_ok_) h << "\x1b[H\x1b[0J";
-            h << C_head() << (dark_theme_? "MIQROCHAIN":"MIQROCHAIN") << C_reset()
+            h << C_head() << (dark_theme_? "MIQROCHAIN":"MIQROCHAIN") << " Pro TUI 2.2" << C_reset()
               << "  " << C_dim()
               << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
               << "  •  Chain: " << CHAIN_NAME
               << "  •  P2P " << p2p_port_ << "  •  RPC " << rpc_port_ << C_reset()
               << "  " << spinner(tick_) ;
             left.push_back(h.str());
-            left.push_back("");
-            if(!banner_.empty()){
-                left.push_back(std::string("  ") + C_info() + banner_ + C_reset());
-            }
-            if (!hot_message_.empty() && (now_ms() - hot_msg_ts_) < 4000){
+            if(!banner_.empty()) left.push_back(std::string("  ") + C_info() + banner_ + C_reset());
+            if (!hot_message_.empty() && (now_ms() - hot_msg_ts_) < 4000)
                 left.push_back(std::string("  ") + C_warn() + hot_message_ + C_reset());
-            }
             // Animated gradient wave
-            left.push_back(std::string("  ") + wave_line(leftw-2, tick_, vt_ok_, dark_theme_?36:34, dark_theme_?32:30));
+            if (!compact_)
+                left.push_back(std::string("  ") + wave_line(leftw-2, tick_, vt_ok_, dark_theme_?36:34, dark_theme_?32:30));
             left.push_back("");
         }
 
@@ -1141,11 +1240,12 @@ private:
             std::ostringstream ln;
             ln << "  uptime: " << uptime_s_ << "s"
                << "   rss: " << fmt_bytes(rss)
-               << "   threads: " << std::thread::hardware_concurrency();
+               << "   hw_threads: " << std::thread::hardware_concurrency();
             left.push_back(ln.str());
             left.push_back(std::string("  theme: ") + (dark_theme_? "dark":"light")
                           + "   logs: " + (paused_? "paused":"live")
-                          + "   verbose: " + (global::tui_verbose.load()? "yes":"no"));
+                          + "   verbose: " + (global::tui_verbose.load()? "yes":"no")
+                          + "   mode: " + (compact_? "compact":"full"));
             left.push_back("");
         }
 
@@ -1177,45 +1277,55 @@ private:
             int bw = std::max(10, leftw - 20);
             double frac = (double)okc / std::max<size_t>(1,total);
             std::ostringstream progress;
-            progress << "  " << bar(bw, frac, vt_ok_, dark_theme_?36:34, dark_theme_?32:30) << "  "
+            progress << "  " << bar(bw, frac, vt_ok_, dark_theme_?36:34, dark_theme_?32:30, glow_) << "  "
                      << okc << "/" << total << " completed";
-            if (eta_secs_ > 0 && frac < 0.999){
+            if (eta_secs_ > 0 && frac < 0.999)
                 progress << "  " << C_dim() << "(~" << std::fixed << std::setprecision(1) << eta_secs_ << "s)" << C_reset();
-            }
             left.push_back(progress.str());
-            for (auto& s : steps_) {
-                bool ok = s.second;
-                bool failed = failures_.count(s.first) > 0;
-                std::ostringstream ln;
-                ln << "    ";
-                if (ok)         ln << C_ok()  << "[OK]    " << C_reset();
-                else if (failed)ln << C_err() << "[FAIL]  " << C_reset();
-                else            ln << C_dim() << "[..]    " << C_reset();
-                ln << s.first;
-                left.push_back(ln.str());
+            if (!compact_) {
+                for (auto& s : steps_) {
+                    bool ok = s.second;
+                    bool failed = failures_.count(s.first) > 0;
+                    std::ostringstream ln;
+                    ln << "    ";
+                    if (ok)         ln << C_ok()  << "[OK]    " << C_reset();
+                    else if (failed)ln << C_err() << "[FAIL]  " << C_reset();
+                    else            ln << C_dim() << "[..]    " << C_reset();
+                    ln << s.first;
+                    left.push_back(ln.str());
+                }
             }
             left.push_back("");
         }
 
-        // Chain status
+        // Chain + difficulty + retarget ETA + trend
         {
             left.push_back(std::string(C_bold()) + "Chain" + C_reset());
             uint64_t height = chain_ ? chain_->height() : 0;
             std::string tip_hex;
             long double tip_diff = 0.0L;
+            uint32_t tip_bits = (uint32_t)GENESIS_BITS;
             if (chain_) {
                 auto t = chain_->tip();
                 tip_hex = to_hex(t.hash);
-                tip_diff = difficulty_from_bits(hdr_bits(t));
+                tip_bits = hdr_bits(t);
+                tip_diff = difficulty_from_bits(tip_bits);
             }
             left.push_back(std::string("  height: ") + std::to_string(height)
                           + "   tip: " + short_hex(tip_hex, 12));
             left.push_back(std::string("  difficulty: ") + fmt_diff(tip_diff)
                           + "   net hashrate: " + fmt_hs(net_hashrate_));
-            left.push_back(std::string("  trend:      ") + spark_ascii(net_spark_));
-            // recent blocks
+            // retarget tracker
+            uint64_t blocks_into_epoch = (MIQ_RETARGET_INTERVAL ? (height % MIQ_RETARGET_INTERVAL) : 0);
+            uint64_t blocks_to_retarget = MIQ_RETARGET_INTERVAL ? (MIQ_RETARGET_INTERVAL - blocks_into_epoch) : 0;
+            double eta_retarget_s = avg_block_time_ * (double)blocks_to_retarget;
+            std::ostringstream rt; rt<<"  retarget in: "<<blocks_to_retarget<<" blocks (~"<<fmt_duration(eta_retarget_s)<<")";
+            left.push_back(rt.str());
+            // trend
+            left.push_back(std::string("  net trend:   ") + spark_ascii(net_spark_));
+            // recent blocks (fees + miner)
             size_t N = recent_blocks_.size();
-            size_t show = std::min<size_t>(8, N);
+            size_t show = std::min<size_t>(compact_?6:8, N);
             for (size_t i=0;i<show;i++){
                 const auto& b = recent_blocks_[N-1-i];
                 std::ostringstream ln;
@@ -1230,12 +1340,11 @@ private:
             left.push_back("");
         }
 
-        // Right column: Network/Mempool/Miner/Health/Logs
+        // Right column: Network/Mempool/Miner/Miners Census/Health/Logs
         // Network
         if (p2p_) {
             right.push_back(std::string(C_bold()) + "Network" + C_reset());
             auto peers = p2p_->snapshot_peers();
-
             // Sort peers: verack_ok first, lowest latency, lowest rxbuf, lowest inflight
             std::stable_sort(peers.begin(), peers.end(), [](const auto& a, const auto& b){
                 if (a.verack_ok != b.verack_ok) return a.verack_ok > b.verack_ok;
@@ -1260,7 +1369,7 @@ private:
                 << " " << std::setw(7) << "rx"
                 << " " << std::setw(8) << "inflight";
             right.push_back(hdr.str());
-            size_t show = std::min(peers.size(), (size_t)8);
+            size_t show = std::min(peers.size(), (size_t)(compact_?6:8));
             for (size_t i=0;i<show; ++i) {
                 const auto& s = peers[i];
                 std::string ip = s.ip; if ((int)ip.size() > 18) ip = ip.substr(0,15) + "...";
@@ -1283,10 +1392,11 @@ private:
             right.push_back(std::string("  txs: ") + std::to_string(stat.count)
                             + (stat.bytes? (std::string("   bytes: ") + fmt_bytes(stat.bytes)) : std::string())
                             + (stat.recent_adds? (std::string("   recent_adds: ") + std::to_string(stat.recent_adds)) : std::string()));
+            right.push_back(std::string("  trend: ") + spark_ascii(mem_spark_));
             right.push_back("");
         }
 
-        // Miner
+        // Miner + shares + ETTF
         {
             right.push_back(std::string(C_bold()) + "Mining" + C_reset());
             bool active = g_miner_stats.active.load();
@@ -1303,18 +1413,46 @@ private:
             std::ostringstream m2; m2 << "  accepted: " << ok << "   rejected: " << rej; right.push_back(m2.str());
             right.push_back(std::string("  miner hashrate: ") + fmt_hs(hps));
             right.push_back(std::string("  miner trend:    ") + spark_ascii(spark_hs_));
-            // network & share
+            // network & share + ETTF
             double share = (net_hashrate_ > 0.0) ? (hps / net_hashrate_) * 100.0 : 0.0;
             if (share < 0.0) share = 0.0;
             if (share > 100.0) share = 100.0;
             std::ostringstream m3; m3 << "  network (est):  " << fmt_hs(net_hashrate_)
-                                      << "   your share: " << std::fixed << std::setprecision(3) << share << "%";
+                                      << "   your share: " << fmt_pct(share, 3);
             right.push_back(m3.str());
-            // observed miners (distinct coinbase recipients) over recent window
-            size_t miners_obs = distinct_miners_recent(64);
-            std::ostringstream m4; m4 << "  miners observed (last 64 blks): " << miners_obs;
-            right.push_back(m4.str());
-            right.push_back(std::string("  ") + C_dim() + "* count = distinct coinbase recipients seen by this node" + C_reset());
+            // ETTF with precise difficulty from tip (2^32 * diff / miner_hps)
+            long double tip_diff = 0.0L;
+            if (chain_) {
+                auto t = chain_->tip();
+                tip_diff = difficulty_from_bits(hdr_bits(t));
+            }
+            double ettf_s = (hps > 0.0) ? (double)(tip_diff * 4294967296.0L) / hps : 0.0;
+            right.push_back(std::string("  ETTF (your rig): ") + (hps>0.0 ? fmt_duration(ettf_s) : std::string("—")));
+            right.push_back("");
+        }
+
+        // Miners census (observed coinbase recipients => accurate local metric)
+        {
+            size_t window=0;
+            auto top = top_miners(compact_?4:8, window);
+            right.push_back(std::string(C_bold()) + "Miners (observed)" + C_reset());
+            std::ostringstream head;
+            head << "  distinct: " << miner_counts_.size() << " / last " << window << " blocks";
+            right.push_back(head.str());
+            if (window > 0 && !top.empty()){
+                right.push_back("    addr (short)     blocks   share");
+                for (auto& [addr, cnt] : top){
+                    double pct = window? (100.0 * (double)cnt / (double)window) : 0.0;
+                    std::ostringstream ln;
+                    ln << "    " << std::left << std::setw(18) << fit(addr, 18)
+                       << "  " << std::right << std::setw(6) << cnt
+                       << "   " << std::setw(6) << std::fixed << std::setprecision(2) << pct << "%";
+                    right.push_back(ln.str());
+                }
+            } else {
+                right.push_back("  (insufficient data yet)");
+            }
+            right.push_back(std::string("  ") + C_dim() + "* purely from local blocks; not a guess of full network " + C_reset());
             right.push_back("");
         }
 
@@ -1322,6 +1460,7 @@ private:
         {
             right.push_back(std::string(C_bold()) + "Health & Security" + C_reset());
             right.push_back(std::string("  config reload: ") + (global::reload_requested.load()? "pending":"—"));
+            right.push_back(std::string("  status.json: ") + (global::dump_status_json.load()? "enabled":"disabled"));
             if (!hot_warning_.empty() && now_ms()-hot_warn_ts_ < 6000){
                 right.push_back(std::string("  ") + C_warn() + hot_warning_ + C_reset());
             }
@@ -1332,7 +1471,7 @@ private:
         }
 
         // Recent TXIDs
-        {
+        if (!compact_) {
             right.push_back(std::string(C_bold()) + "Recent TXIDs" + C_reset());
             if (recent_txids_.empty()) right.push_back("  (no txids yet)");
             size_t n = std::min<size_t>(recent_txids_.size(), 10);
@@ -1353,14 +1492,18 @@ private:
             out << std::left << std::setw(leftw) << l << " | " << r << "\n";
         }
 
-        // Footer + logs or shutdown status
+        // Footer + logs/help
         out << std::string((size_t)cols, '-') << "\n";
-        if (nstate_ == NodeState::Quitting){
+        if (show_help_) {
+            out << C_bold() << "Help" << C_reset() << "\n"
+                << "  q=quit   t=theme   p=pause logs   r=reload config   s=snapshot   v=verbose\n"
+                << "  ?=help   c=compact mode   g=glow accent\n";
+        } else if (nstate_ == NodeState::Quitting){
             out << C_bold() << "Shutting down" << C_reset() << "  " << C_dim() << "(Ctrl+C again = force)" << C_reset() << "\n";
             std::string phase = shutdown_phase_.empty() ? "initiating…" : shutdown_phase_;
             out << "  phase: " << phase << "\n";
         } else {
-            out << C_bold() << "Logs" << C_reset() << "  " << C_dim() << "(q=quit t=theme p=pause r=reload s=snap v=verbose)" << C_reset() << "\n";
+            out << C_bold() << "Logs" << C_reset() << "  " << C_dim() << "(q,t,p,r,s,v,?,c,g)" << C_reset() << "\n";
         }
         // logs
         int header_rows = (int)N + 2;
@@ -1405,18 +1548,30 @@ private:
     ConsoleWriter cw_;
     int  tick_{0};
     NodeState nstate_{NodeState::Starting};
+
+    // telemetry caches
     std::deque<BlockSummary> recent_blocks_;
     std::deque<std::string>  recent_txids_;
     std::unordered_set<std::string> recent_txid_set_;
+    std::unordered_map<std::string, size_t> miner_counts_;
+    size_t miner_window_{256};
+
+    // trends/sparks
     std::vector<double> spark_hs_;
     std::vector<double> net_spark_;
+    std::vector<double> mem_spark_;
+
     double net_hashrate_{0.0};
+    double avg_block_time_{(double)BLOCK_TIME_SECS};
     double eta_secs_{0.0};
     std::string shutdown_phase_;
     int shutdown_ok_{0};
     bool dark_theme_{true};
     bool paused_{false};
     bool degraded_override_{false};
+    bool show_help_{false};
+    bool compact_{false};
+    bool glow_{false};
     std::chrono::steady_clock::time_point start_tp_{std::chrono::steady_clock::now()};
     uint64_t uptime_s_{0};
     std::string hot_message_;
@@ -1744,7 +1899,7 @@ int main(int argc, char** argv){
             if (can_tui) { capture.stop(); tui.stop(); }
             return 11; // datadir lock failure
         }
-        // telemetry file path
+        // telemetry & status file paths
         global::telemetry_path = p_join(cfg.datadir, "telemetry.ndjson");
         global::telemetry_enabled.store(telemetry_flag);
         if (can_tui) {
