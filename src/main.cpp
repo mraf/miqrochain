@@ -761,70 +761,72 @@ public:
     ConsoleWriter(){ init(); }
     ~ConsoleWriter(){
 #ifdef _WIN32
-        if (opened_conout_ && hOut_ && hOut_ != INVALID_HANDLE_VALUE) CloseHandle(hOut_);
-#else
-        if (fd_ >= 0 && fd_ != STDOUT_FILENO) ::close(fd_);
+        if (own_conout_ && hConOut_ && hConOut_ != INVALID_HANDLE_VALUE) CloseHandle(hConOut_);
 #endif
     }
+
     void write_raw(const std::string& s){
 #ifdef _WIN32
-        if (!hOut_ || hOut_ == INVALID_HANDLE_VALUE) return;
+        if (!hConOut_ || hConOut_ == INVALID_HANDLE_VALUE) return;
 
-        // If this is a real console, use UTF-16 + WriteConsoleW to avoid mojibake forever.
-        if (is_console_) {
-            if (s.empty()) return;
-            int needed = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-            if (needed <= 0) {
-                DWORD wrote = 0;
-                WriteFile(hOut_, s.c_str(), (DWORD)s.size(), &wrote, nullptr);
-                return;
-            }
-            std::wstring ws;
-            ws.resize((size_t)needed);
-            MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &ws[0], needed);
+        // 1) Try wide console write (correct for any code page)
+        int need = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+        if (need > 0) {
+            if ((int)wbuf_.size() < need) wbuf_.resize((size_t)need);
+            MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), wbuf_.data(), need);
             DWORD wroteW = 0;
-            WriteConsoleW(hOut_, ws.c_str(), (DWORD)ws.size(), &wroteW, nullptr);
-        } else {
-            // Redirected/ConPTY pipe: write raw UTF-8 bytes
-            DWORD wrote = 0;
-            WriteFile(hOut_, s.c_str(), (DWORD)s.size(), &wrote, nullptr);
+            if (WriteConsoleW(hConOut_, wbuf_.data(), (DWORD)need, &wroteW, nullptr)) return;
+            // If WriteConsoleW fails (e.g., true pipe), fall through to raw bytes.
         }
+
+        // 2) Fallback: raw UTF-8 bytes (works with ConPTY/Windows Terminal pipes)
+        DWORD wrote = 0;
+        WriteFile(hConOut_, s.data(), (DWORD)s.size(), &wrote, nullptr);
 #else
-        int fd = (fd_ >= 0) ? fd_ : STDOUT_FILENO;
         size_t off = 0;
         while (off < s.size()) {
-            ssize_t n = ::write(fd, s.data()+off, s.size()-off);
-            if (n<=0) break;
+            ssize_t n = ::write(STDOUT_FILENO, s.data()+off, s.size()-off);
+            if (n <= 0) break;
             off += (size_t)n;
         }
 #endif
     }
+
 private:
     void init(){
 #ifdef _WIN32
-        hOut_ = GetStdHandle(STD_OUTPUT_HANDLE);
-        DWORD m=0;
-        is_console_ = (hOut_ && hOut_ != INVALID_HANDLE_VALUE && GetConsoleMode(hOut_, &m));
-        if (!is_console_) {
-            HANDLE hNew = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE|FILE_SHARE_READ,
-                                      NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hNew && hNew != INVALID_HANDLE_VALUE) {
-                hOut_ = hNew;
-                opened_conout_ = true;
-                if (GetConsoleMode(hOut_, &m)) is_console_ = true;
+        // Ensure we *have* a console (attach to parent or allocate one).
+        // (We already call term::ensure_console_bound() earlier, but this is cheap.)
+        if (!AttachConsole(ATTACH_PARENT_PROCESS)) AllocConsole();
+
+        // Prefer a real console handle independent of stdout/stderr redirection.
+        hConOut_ = CreateFileW(L"CONOUT$",
+                               GENERIC_READ|GENERIC_WRITE,
+                               FILE_SHARE_READ|FILE_SHARE_WRITE,
+                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hConOut_ != INVALID_HANDLE_VALUE) {
+            own_conout_ = true;
+            // Make sure VT + UTF-8 are enabled on that console.
+            SetConsoleOutputCP(65001);
+            SetConsoleCP(65001);
+            DWORD m = 0;
+            if (GetConsoleMode(hConOut_, &m)) {
+                m |= 0x0004 /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */;
+                m |= 0x0008 /* DISABLE_NEWLINE_AUTO_RETURN */;
+                SetConsoleMode(hConOut_, m);
             }
+        } else {
+            // Last resort: use whatever STDOUT is (pipe/ConPTY).
+            hConOut_ = GetStdHandle(STD_OUTPUT_HANDLE);
+            own_conout_ = false;
         }
-#else
-        fd_ = ::open("/dev/tty", O_WRONLY | O_CLOEXEC);
-        if (fd_ < 0) fd_ = STDOUT_FILENO;
 #endif
     }
+
 #ifdef _WIN32
-    HANDLE hOut_{nullptr};
-    bool   is_console_{false};
-    bool   opened_conout_{false};
-#else
-    int fd_ = -1;
+    HANDLE hConOut_{nullptr};
+    bool   own_conout_{false};
+    std::wstring wbuf_;
 #endif
 };
 
