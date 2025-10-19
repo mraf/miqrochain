@@ -35,7 +35,7 @@
 #include "hash160.h"
 #include "crypto/ecdsa_iface.h"
 #include "difficulty.h"
-#include "miner.h"
+// #include "miner.h"        // REMOVED: built-in miner eliminated
 #include "sha256.h"
 #include "hex.h"
 #include "tls_proxy.h"
@@ -627,39 +627,51 @@ static inline bool is_conpty_like() {
 #endif
 
 #ifdef _WIN32
-// Ensure we have a console and rebind process standard handles to it.
-// This lets us enable VT even when started from GUI or with redirected CRT.
+static inline bool is_pipe(HANDLE h) {
+    return h && h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_PIPE;
+}
+
+// ConPTY-safe: don't allocate a new console when STDOUT is a PIPE (Windows Terminal).
 static void ensure_console_bound() {
-    // Try to attach to the parent console; if that fails, allocate a new one.
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+
+    // ConPTY / Windows Terminal: STDOUT is a PIPE → leave handles alone.
+    if (is_pipe(hOut)) {
+    #ifdef _MSC_VER
+        _putenv_s("TERM", "xterm-256color");
+    #else
+        setenv("TERM", "xterm-256color", 1);
+    #endif
+        return;
+    }
+
+    // Classic console path: attach to parent or create a new one and rebind.
     if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
         AllocConsole();
     }
 
-    // Set UTF-8 I/O code pages early for proper box/emoji rendering.
-    SetConsoleOutputCP(65001);
-    SetConsoleCP(65001);
-
-    // Rebind STDOUT/STDERR/STDIN to real console handles (best-effort).
-    HANDLE hOut = CreateFileW(L"CONOUT$", GENERIC_READ|GENERIC_WRITE,
-                              FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
-                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hOut != INVALID_HANDLE_VALUE) {
-        SetStdHandle(STD_OUTPUT_HANDLE, hOut);
-        SetStdHandle(STD_ERROR_HANDLE,  hOut);
+    // Make sure the process STD* refer to the real console.
+    HANDLE hConOut = CreateFileW(L"CONOUT$", GENERIC_READ|GENERIC_WRITE,
+                                 FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
+                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hConOut != INVALID_HANDLE_VALUE) {
+        SetStdHandle(STD_OUTPUT_HANDLE, hConOut);
+        SetStdHandle(STD_ERROR_HANDLE,  hConOut);
+        SetConsoleOutputCP(65001);
     }
-    HANDLE hIn = CreateFileW(L"CONIN$", GENERIC_READ|GENERIC_WRITE,
-                             FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
-                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hIn != INVALID_HANDLE_VALUE) {
-        SetStdHandle(STD_INPUT_HANDLE, hIn);
+    HANDLE hConIn = CreateFileW(L"CONIN$", GENERIC_READ|GENERIC_WRITE,
+                                FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hConIn != INVALID_HANDLE_VALUE) {
+        SetStdHandle(STD_INPUT_HANDLE, hConIn);
+        SetConsoleCP(65001);
     }
 
-    // Hint downstream apps
-#ifdef _MSC_VER
+  #ifdef _MSC_VER
     _putenv_s("TERM", "xterm-256color");
-#else
+  #else
     setenv("TERM", "xterm-256color", 1);
-#endif
+  #endif
 }
 #endif
 
@@ -755,33 +767,43 @@ static inline void enable_vt(bool& vt_ok, bool prefer_utf8=true){
 
 } // namespace term
 
-// Console writer avoids recursion with log capture
+// ─────────────────────────────────────────────────────────────────────────────
+// Console writer that handles both real consoles and ConPTY correctly.
+// - ConPTY (Windows Terminal): write raw UTF-8 to STDOUT (pipe).
+// - Real console: WriteConsoleW to CONOUT$ (UTF-16), fallback to bytes only if needed.
+// ─────────────────────────────────────────────────────────────────────────────
 class ConsoleWriter {
 public:
     ConsoleWriter(){ init(); }
     ~ConsoleWriter(){
 #ifdef _WIN32
-        if (own_conout_ && hConOut_ && hConOut_ != INVALID_HANDLE_VALUE) CloseHandle(hConOut_);
+        if (own_conout_ && hOut_ && hOut_ != INVALID_HANDLE_VALUE) CloseHandle(hOut_);
 #endif
     }
 
     void write_raw(const std::string& s){
 #ifdef _WIN32
-        if (!hConOut_ || hConOut_ == INVALID_HANDLE_VALUE) return;
+        if (!hOut_ || hOut_ == INVALID_HANDLE_VALUE) return;
 
-        // 1) Try wide console write (correct for any code page)
+        // ConPTY path: just write raw UTF-8 bytes; WT interprets them correctly.
+        if (is_conpty_) {
+            DWORD wrote = 0;
+            WriteFile(hOut_, s.data(), (DWORD)s.size(), &wrote, nullptr);
+            return;
+        }
+
+        // Real console: prefer wide write (correct regardless of code page)
         int need = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
         if (need > 0) {
             if ((int)wbuf_.size() < need) wbuf_.resize((size_t)need);
             MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), wbuf_.data(), need);
             DWORD wroteW = 0;
-            if (WriteConsoleW(hConOut_, wbuf_.data(), (DWORD)need, &wroteW, nullptr)) return;
-            // If WriteConsoleW fails (e.g., true pipe), fall through to raw bytes.
+            if (WriteConsoleW(hOut_, wbuf_.data(), (DWORD)need, &wroteW, nullptr)) return;
         }
 
-        // 2) Fallback: raw UTF-8 bytes (works with ConPTY/Windows Terminal pipes)
+        // Last resort: raw bytes (will still be fine if console CP is UTF-8)
         DWORD wrote = 0;
-        WriteFile(hConOut_, s.data(), (DWORD)s.size(), &wrote, nullptr);
+        WriteFile(hOut_, s.data(), (DWORD)s.size(), &wrote, nullptr);
 #else
         size_t off = 0;
         while (off < s.size()) {
@@ -795,37 +817,44 @@ public:
 private:
     void init(){
 #ifdef _WIN32
-        // Ensure we *have* a console (attach to parent or allocate one).
-        // (We already call term::ensure_console_bound() earlier, but this is cheap.)
-        if (!AttachConsole(ATTACH_PARENT_PROCESS)) AllocConsole();
+        HANDLE stdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        const bool pipe = (stdOut && stdOut != INVALID_HANDLE_VALUE && GetFileType(stdOut) == FILE_TYPE_PIPE);
 
-        // Prefer a real console handle independent of stdout/stderr redirection.
-        hConOut_ = CreateFileW(L"CONOUT$",
-                               GENERIC_READ|GENERIC_WRITE,
-                               FILE_SHARE_READ|FILE_SHARE_WRITE,
-                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hConOut_ != INVALID_HANDLE_VALUE) {
+        if (pipe) {
+            // ConPTY/WT → use the provided pipe handle.
+            is_conpty_  = true;
+            hOut_       = stdOut;
+            own_conout_ = false;
+            return;
+        }
+
+        // Real console: open CONOUT$ independently of any redirection
+        hOut_ = CreateFileW(L"CONOUT$",
+                            GENERIC_READ|GENERIC_WRITE,
+                            FILE_SHARE_READ|FILE_SHARE_WRITE,
+                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hOut_ != INVALID_HANDLE_VALUE) {
             own_conout_ = true;
-            // Make sure VT + UTF-8 are enabled on that console.
             SetConsoleOutputCP(65001);
             SetConsoleCP(65001);
             DWORD m = 0;
-            if (GetConsoleMode(hConOut_, &m)) {
+            if (GetConsoleMode(hOut_, &m)) {
                 m |= 0x0004 /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */;
                 m |= 0x0008 /* DISABLE_NEWLINE_AUTO_RETURN */;
-                SetConsoleMode(hConOut_, m);
+                SetConsoleMode(hOut_, m);
             }
         } else {
-            // Last resort: use whatever STDOUT is (pipe/ConPTY).
-            hConOut_ = GetStdHandle(STD_OUTPUT_HANDLE);
+            // Fallback: whatever STDOUT is
+            hOut_ = stdOut;
             own_conout_ = false;
         }
 #endif
     }
 
 #ifdef _WIN32
-    HANDLE hConOut_{nullptr};
+    HANDLE hOut_{nullptr};
     bool   own_conout_{false};
+    bool   is_conpty_{false};
     std::wstring wbuf_;
 #endif
 };
@@ -1963,7 +1992,7 @@ private:
             right.insert(right.end(), b.begin(), b.end());
         }
 
-        // Mining
+        // Mining (telemetry + external miner heartbeat)
         {
             const bool active = g_miner_stats.active.load();
             const unsigned thr = g_miner_stats.threads.load();
@@ -2177,141 +2206,7 @@ static void fatal_terminate() noexcept {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
-/*                               Miner worker                                   */
-// ╚═══════════════════════════════════════════════════════════════════════════╝
-static uint64_t sum_coinbase_outputs(const Block& b) {
-    if (b.txs.empty()) return 0;
-    uint64_t s = 0; for (const auto& o : b.txs[0].vout) s += o.value; return s;
-}
-static void miner_worker(Chain* chain, Mempool* mempool, P2P* p2p,
-                         const std::vector<uint8_t> mine_pkh,
-                         unsigned threads) {
-    g_miner_stats.active.store(true);
-    g_miner_stats.threads.store(threads);
-    g_miner_stats.start = std::chrono::steady_clock::now();
-
-    std::random_device rd;
-    const uint64_t seed =
-        uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count()) ^
-        uint64_t(rd()) ^
-        uint64_t(std::hash<std::thread::id>{}(std::this_thread::get_id()));
-    std::mt19937_64 gen(seed);
-
-    const size_t kBlockMaxBytes = 900 * 1024;
-
-    while (!global::shutdown_requested.load()) {
-        try {
-            auto t = chain->tip();
-            // coinbase
-            Transaction cbt; TxIn cin; cin.prev.txid = std::vector<uint8_t>(32, 0); cin.prev.vout = 0;
-            cbt.vin.push_back(cin);
-            TxOut cbout; cbout.value = chain->subsidy_for_height(t.height + 1);
-            if (mine_pkh.size() != 20) {
-                log_error(std::string("miner assign pkh fatal: pkh size != 20 (got ") + std::to_string(mine_pkh.size()) + ")");
-                std::this_thread::sleep_for(std::chrono::milliseconds(80));
-                continue;
-            }
-            cbout.pkh.resize(20);
-            std::memcpy(cbout.pkh.data(), mine_pkh.data(), 20);
-            cbt.vout.push_back(cbout);
-            cbt.lock_time = static_cast<uint32_t>(t.height + 1);
-
-            const uint32_t ch = static_cast<uint32_t>(t.height + 1);
-            const uint32_t nowt = static_cast<uint32_t>(time(nullptr));
-            const uint64_t extraNonce = gen();
-            std::vector<uint8_t> tag; tag.reserve(1+4+4+8);
-            tag.push_back(0x01);
-            tag.push_back(uint8_t(ch      & 0xff)); tag.push_back(uint8_t((ch>>8) & 0xff));
-            tag.push_back(uint8_t((ch>>16)& 0xff)); tag.push_back(uint8_t((ch>>24)& 0xff));
-            tag.push_back(uint8_t(nowt      & 0xff)); tag.push_back(uint8_t((nowt>>8) & 0xff));
-            tag.push_back(uint8_t((nowt>>16)& 0xff)); tag.push_back(uint8_t((nowt>>24)& 0xff));
-            for (int i=0;i<8;i++) tag.push_back(uint8_t((extraNonce >> (8*i)) & 0xff));
-            cbt.vin[0].sig = std::move(tag);
-
-            // pack txs
-            std::vector<Transaction> txs;
-            try {
-                const size_t coinbase_sz = ser_tx(cbt).size();
-                const size_t budget = (kBlockMaxBytes > coinbase_sz) ? (kBlockMaxBytes - coinbase_sz) : 0;
-                auto cands = mempool->collect(120000);
-                size_t used=0;
-                for (auto& tx : cands) {
-                    const size_t sz = ser_tx(tx).size();
-                    if (used + sz > budget) continue;
-                    txs.emplace_back(std::move(tx));
-                    used += sz;
-                    if (used >= budget) break;
-                }
-            } catch(...) { txs.clear(); }
-
-            // mine
-            Block b;
-            try {
-                auto last = chain->last_headers(MIQ_RETARGET_INTERVAL);
-                const uint32_t nb = miq::epoch_next_bits(
-                    last, BLOCK_TIME_SECS, GENESIS_BITS,
-                    /*next_height=*/ t.height + 1, /*interval=*/ MIQ_RETARGET_INTERVAL);
-                b = miq::mine_block(t.hash, nb, cbt, txs, threads);
-            } catch (...) {
-                log_error("miner mine_block fatal");
-                continue;
-            }
-
-            // submit
-            try {
-                std::string err;
-                if (chain->submit_block(b, err)) {
-                    std::string miner_addr = "(unknown)";
-                    std::string cb_txid_hex = "(n/a)";
-                    if (!b.txs.empty()) {
-                        cb_txid_hex = to_hex(b.txs[0].txid());
-                        if (!b.txs[0].vout.empty() && b.txs[0].vout[0].pkh.size()==20) {
-                            miner_addr = base58check_encode(VERSION_P2PKH, b.txs[0].vout[0].pkh);
-                        }
-                    }
-                    const int noncb = (int)b.txs.size() - 1;
-                    g_miner_stats.accepted.fetch_add(1);
-                    g_miner_stats.last_height_ok.store(t.height + 1);
-                    g_miner_stats.last_height_rx.store(t.height + 1);
-
-                    BlockSummary bs;
-                    bs.height    = t.height + 1;
-                    bs.hash_hex  = to_hex(b.block_hash());
-                    bs.tx_count  = (uint32_t)b.txs.size();
-                    const uint64_t coinbase_total = sum_coinbase_outputs(b);
-                    const uint64_t subsidy = chain->subsidy_for_height(bs.height);
-                    if (coinbase_total >= subsidy) { bs.fees = coinbase_total - subsidy; bs.fees_known = true; }
-                    bs.miner = miner_addr;
-                    g_telemetry.push_block(bs);
-                    if (noncb > 0) {
-                        std::vector<std::string> txids; txids.reserve((size_t)noncb);
-                        for (size_t i=1;i<b.txs.size();++i) txids.push_back(to_hex(b.txs[i].txid()));
-                        g_telemetry.push_txids(txids);
-                    }
-
-                    log_info("mined block accepted, height=" + std::to_string(bs.height)
-                             + ", miner=" + miner_addr
-                             + ", coinbase_txid=" + cb_txid_hex
-                             + ", txs=" + std::to_string(std::max(0, noncb))
-                             + (bs.fees_known ? (", fees=" + std::to_string(bs.fees)) : ""));
-                    if (!global::shutdown_requested.load() && p2p) {
-                        p2p->announce_block_async(b.block_hash());
-                    }
-                } else {
-                    g_miner_stats.rejected.fetch_add(1);
-                    log_warn(std::string("mined block rejected: ") + err);
-                }
-            } catch (...) {
-                log_error("miner submit_block fatal");
-            }
-
-        } catch (...) {
-            log_error("miner outer fatal");
-            std::this_thread::sleep_for(std::chrono::milliseconds(80));
-        }
-    }
-}
+// (BUILT-IN MINER REMOVED ENTIRELY)
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 /*                                     CLI                                     */
@@ -2325,12 +2220,12 @@ static void print_usage(){
       << "  --genaddress                                 generate ECDSA-P2PKH address (priv/pk/address)\n"
       << "  --buildtx <priv_hex> <prev_txid_hex> <vout> <value> <to_address>  (prints txhex)\n"
       << "  --reindex_utxo                               rebuild chainstate/UTXO from current chain\n"
-      << "  --mine                                       run built-in miner (interactive address prompt)\n"
+      << "  --mine                                       [disabled] built-in miner removed; use an external miner\n"
       << "  --telemetry                                  write block accepts to telemetry.ndjson in datadir\n"
       << "\n"
       << "Env:\n"
       << "  MIQ_NO_TUI=1               disables the TUI; plain logs\n"
-      << "  MIQ_MINER_THREADS          overrides miner thread count\n"
+      << "  MIQ_MINER_THREADS          (ignored; built-in miner removed)\n"
       << "  MIQ_RPC_TOKEN              if set, HTTP gate token (synced to .cookie on start)\n"
       << "  MIQ_MINER_HEARTBEAT        path to heartbeat file for external miner presence\n"
       << "  MIQ_LOCK_RETRIES           retries when lock is busy (default 2)\n"
@@ -2346,7 +2241,7 @@ static bool is_recognized_arg(const std::string& s){
     if(s=="--genaddress") return true;
     if(s=="--buildtx") return true;
     if(s=="--reindex_utxo") return true;
-    if(s=="--mine") return true;
+    if(s=="--mine") return true;           // kept for compatibility; ignored
     if(s=="--telemetry") return true;
     if(s=="--help") return true;
     return false;
@@ -2411,7 +2306,7 @@ int main(int argc, char** argv){
     // Parse CLI
     Config cfg;
     std::string conf;
-    bool genaddr=false, buildtx=false, mine_flag=false, flag_reindex_utxo=false;
+    bool genaddr=false, buildtx=false, /*mine_flag=false,*/ flag_reindex_utxo=false; // built-in miner removed
     std::string privh, prevtxid_hex, toaddr;
     uint32_t vout=0; uint64_t value=0;
     for(int i=1;i<argc;i++){
@@ -2439,7 +2334,8 @@ int main(int argc, char** argv){
             value       = (uint64_t)std::stoull(argv[++i]);
             toaddr      = argv[++i];
         } else if(a=="--reindex_utxo"){ flag_reindex_utxo = true;
-        } else if(a=="--mine"){ mine_flag = true;
+        } else if(a=="--mine"){
+            // Built-in miner is disabled; accept and ignore for compatibility.
         } else if(a=="--telemetry"){ telemetry_flag = true;
         } else if(a=="--help"){ print_usage(); if (can_tui){ capture.stop(); tui.stop(); } return 0; }
     }
@@ -2610,46 +2506,8 @@ int main(int argc, char** argv){
             rpc_ok = true;
         }
 
-        // Optional built-in miner
-        unsigned thr_count = 0;
-        if (mine_flag) {
-            if (cfg.miner_threads) thr_count = cfg.miner_threads;
-            if (thr_count == 0) {
-                if (const char* s = std::getenv("MIQ_MINER_THREADS")) {
-                    char* end = nullptr; long v = std::strtol(s, &end, 10);
-                    if (end != s && v > 0 && v <= 256) thr_count = (unsigned)v;
-                }
-            }
-            if (thr_count == 0) thr_count = std::max(1u, std::thread::hardware_concurrency());
-
-            std::vector<uint8_t> mine_pkh;
-            if (MIQ_ISATTY()) {
-                std::string addr;
-                std::cout << "Enter P2PKH Base58 address to mine to (leave empty to cancel): ";
-                std::getline(std::cin, addr);
-                trim_inplace(addr);
-                if (!addr.empty()) {
-                    uint8_t ver=0; std::vector<uint8_t> payload;
-                    if (base58check_decode(addr, ver, payload) && ver==VERSION_P2PKH && payload.size()==20) {
-                        mine_pkh = payload;
-                    } else {
-                        log_error("Invalid mining address; built-in miner disabled.");
-                    }
-                } else {
-                    log_info("No address entered; built-in miner disabled.");
-                }
-            } else {
-                log_info("No TTY available; built-in miner disabled.");
-            }
-            if (!mine_pkh.empty()) {
-                P2P* p2p_ptr = cfg.no_p2p ? nullptr : &p2p;
-                std::thread th(miner_worker, &chain, &mempool, p2p_ptr, mine_pkh, thr_count);
-                th.detach();
-                log_info("Built-in miner started with " + std::to_string(thr_count) + " thread(s).");
-            }
-        } else {
-            log_info("Miner not started (use external miner or pass --mine).");
-        }
+        // Built-in miner was removed; inform once
+        log_info("Built-in miner has been removed; use an external miner. (--mine is accepted but ignored)");
 
         log_info(std::string(CHAIN_NAME) + " node running. RPC " + std::to_string(RPC_PORT) +
                  ", P2P " + std::to_string(P2P_PORT));
@@ -2693,7 +2551,7 @@ int main(int argc, char** argv){
             // degraded: stuck tip > 10 min
             if (now_ms() - last_tip_change_ms > 10*60*1000) degraded = true;
             // degraded: external miner heartbeat requested but dead (heuristic)
-            if (mine_flag == false && std::getenv("MIQ_MINER_HEARTBEAT") && !g_extminer.alive.load()) degraded = true;
+            if (std::getenv("MIQ_MINER_HEARTBEAT") && !g_extminer.alive.load()) degraded = true;
 
             if (can_tui) tui.set_health_degraded(degraded);
 
