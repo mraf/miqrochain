@@ -765,7 +765,33 @@ static inline void enable_vt(bool& vt_ok, bool prefer_utf8=true){
     vt_ok = r.first; (void)r;
 }
 
-} // namespace term
+// Treat either a real console (GetConsoleMode OK) or ConPTY/Windows Terminal (PIPE with hints)
+// as interactive output so the TUI can run.
+static inline bool supports_interactive_output() {
+#ifdef _WIN32
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!hOut || hOut == INVALID_HANDLE_VALUE) return false;
+
+    // Real console?
+    DWORD mode = 0;
+    if (GetConsoleMode(hOut, &mode)) return true;
+
+    // ConPTY/Windows Terminal: STDOUT is a PIPE, but well-known env hints are present.
+    DWORD type = GetFileType(hOut);
+    const bool is_pipe = (type == FILE_TYPE_PIPE);
+    const bool hinted =
+        (std::getenv("WT_SESSION")       ||  // Windows Terminal
+         std::getenv("ConEmuANSI")       ||  // ConEmu
+         std::getenv("TERMINUS_SUBPROC") ||  // Terminus
+         std::getenv("MSYS")             ||
+         std::getenv("MSYSTEM"));
+    return is_pipe && hinted;
+#else
+    return ::isatty(STDOUT_FILENO) == 1;
+#endif
+}
+
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Console writer that handles both real consoles and ConPTY correctly.
@@ -2289,11 +2315,14 @@ int main(int argc, char** argv){
         if(a == "--telemetry") telemetry_flag = true;
     }
     const bool want_tui = !disable_tui_flag && !env_truthy_local("MIQ_NO_TUI");
-    const bool console_is_tty = term::is_tty();
-    const bool can_tui  = want_tui && console_is_tty;
+// ConPTY-aware: allow TUI on Windows Terminal / ConPTY pipes as well.
+    const bool can_tui  = want_tui && term::supports_interactive_output();
 
-    ConsoleWriter cw;
-    cw.write_raw(u8"Starting miqrod…  (Ctrl+C to exit; Ctrl+C twice = force)\n");
+     ConsoleWriter cw;
+// Avoid mojibake before the console is fully UTF-8/VT configured
+     cw.write_raw(std::string(u8_ok ? "Starting miqrod…" : "Starting miqrod...")
+             + "  (Ctrl+C to exit; Ctrl+C twice = force)\n");
+
 
     LogCapture capture;
     if (can_tui) capture.start();
