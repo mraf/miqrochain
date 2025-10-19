@@ -512,10 +512,11 @@ static inline void get_winsize(int& cols, int& rows) {
 // Enable VT and probe Unicode ability.
 // vt_ok = ANSI escapes safe; u8_ok = safe to print non-ASCII UI glyphs
 static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
-    vt_ok = true; u8_ok = false;   // default: ASCII-safe
+    vt_ok = true; u8_ok = false;   // default: ASCII-safe everywhere
 #ifdef _WIN32
     vt_ok = false; u8_ok = false;
 
+    // VT enable (for colors/positioning) when possible
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD mode = 0;
     bool have_console = (h && h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode));
@@ -530,7 +531,6 @@ static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
             h = hConOut;
         }
     }
-
     if (have_console) {
         mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
         if (SetConsoleMode(h, mode)) {
@@ -539,33 +539,32 @@ static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
                 vt_ok = true;
             }
         }
-        // On a real console, we can safely switch to UTF-8 and use Unicode UI
-        if (SetConsoleOutputCP(CP_UTF8)) u8_ok = true;
-        bool have_conout = false;
-        HANDLE testCon = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE | FILE_SHARE_READ,
-                                     NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (testCon != INVALID_HANDLE_VALUE) { have_conout = true; CloseHandle(testCon); }
-        if (have_conout && SetConsoleOutputCP(CP_UTF8)) u8_ok = true;
-        SetConsoleCP(CP_UTF8);
     } else {
-        // ConPTY/pipe: we can still use VT, but don't assume Unicode decoding.
+        // ConPTY/pipe hints → allow VT, but DO NOT assume UTF-8
         DWORD type = GetFileType(GetStdHandle(STD_OUTPUT_HANDLE));
         const bool is_pipe = (type == FILE_TYPE_PIPE);
-        const bool hinted =
-            (std::getenv("WT_SESSION")       ||
-             std::getenv("ConEmuANSI")       ||
-             std::getenv("TERMINUS_SUBPROC") ||
-             std::getenv("MSYS")             ||
-             std::getenv("MSYSTEM"));
-        if (is_pipe && hinted) {
-            vt_ok = true;
-            u8_ok = false; // force ASCII to avoid mojibake
-        }
+        if (is_pipe) vt_ok = true;
+    }
+
+    // IMPORTANT: We only allow Unicode UI on Windows if the user explicitly asks for it
+    // AND we have a real console target that supports WriteConsoleW. Otherwise ASCII.
+    const bool force_utf8 = []{
+        const char* s = std::getenv("MIQ_TUI_UTF8");
+        return s && *s && std::strcmp(s,"0")!=0 && std::strcmp(s,"false")!=0 && std::strcmp(s,"False")!=0;
+    }();
+    if (force_utf8 && have_console) {
+        // best effort to switch in/out codepages when requested
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+        u8_ok = true;
     }
 
     if (hConOut != INVALID_HANDLE_VALUE) CloseHandle(hConOut);
-
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOALIGNMENTFAULTEXCEPT);
+#else
+    // Non-Windows terminals are typically UTF-8; allow Unicode by default.
+    vt_ok = true;
+    u8_ok = true;
 #endif
 }
 
@@ -584,7 +583,7 @@ public:
     }
     void write_raw(const std::string& s){
 #ifdef _WIN32
-        // Prefer true Unicode output via WriteConsoleW to avoid mojibake
+        // Prefer true Unicode output via WriteConsoleW; if Handle invalid, fall back.
         if (hFile_ && hFile_ != INVALID_HANDLE_VALUE) {
             int wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
             if (wlen > 0) {
@@ -594,7 +593,6 @@ public:
                 if (WriteConsoleW(hFile_, ws.c_str(), (DWORD)ws.size(), &wroteW, nullptr)) return;
             }
         }
-        // Fallback: raw bytes to STDOUT (pipe). TUI will be ASCII-only in this scenario.
         DWORD wrote = 0;
         WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), s.c_str(), (DWORD)s.size(), &wrote, nullptr);
 #else
@@ -605,8 +603,6 @@ public:
 private:
     void init(){
 #ifdef _WIN32
-        // Open the active console (works for real consoles). On ConPTY/pipe this may fail,
-        // and we'll fall back to raw WriteFile + ASCII-only UI.
         hFile_ = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE | FILE_SHARE_READ,
                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 #else
@@ -973,7 +969,7 @@ public:
     void set_enabled(bool on){ enabled_ = on; }
     void start() {
         if (!enabled_) return;
-        if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H\x1b[?25l"); // fixed: removed stray ']'
+        if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H\x1b[?25l");
         draw_once(true);
         key_thr_ = std::thread([this]{ key_loop(); });
         thr_     = std::thread([this]{ loop(); });
@@ -1680,7 +1676,8 @@ static void print_usage(){
       << "  MIQ_NO_TUI=1               disables the TUI; plain logs\n"
       << "  MIQ_MINER_THREADS          overrides miner thread count\n"
       << "  MIQ_RPC_TOKEN              if set, HTTP gate token (synced to .cookie on start)\n"
-      << "  MIQ_MINER_HEARTBEAT        path to heartbeat file for external miner presence\n";
+      << "  MIQ_MINER_HEARTBEAT        path to heartbeat file for external miner presence\n"
+      << "  MIQ_TUI_UTF8=1             OPT-IN: enable fancy Unicode UI on Windows consoles\n";
 }
 static bool is_recognized_arg(const std::string& s){
     if(s.rfind("--conf=",0)==0) return true;
