@@ -541,6 +541,11 @@ static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
         }
         // On a real console, we can safely switch to UTF-8 and use Unicode UI
         if (SetConsoleOutputCP(CP_UTF8)) u8_ok = true;
+        bool have_conout = false;
+        HANDLE testCon = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE | FILE_SHARE_READ,
+                                     NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (testCon != INVALID_HANDLE_VALUE) { have_conout = true; CloseHandle(testCon); }
+        if (have_conout && SetConsoleOutputCP(CP_UTF8)) u8_ok = true;
         SetConsoleCP(CP_UTF8);
     } else {
         // ConPTY/pipe: we can still use VT, but don't assume Unicode decoding.
@@ -853,7 +858,7 @@ static bool ensure_utxo_fully_indexed(Chain& chain, const std::string& datadir, 
         log_info("UTXO chainstate seems present; quick-skip deep probe.");
         return true;
     }
-    log_warn("UTXO chainstate missing/stale — reindex required.");
+    log_warn("UTXO chainstate missing/stale -- reindex required.");
     UTXOKV utxo_kv;
     std::string err;
     log_info("ReindexUTXO: starting full scan...");
@@ -866,7 +871,7 @@ static bool ensure_utxo_fully_indexed(Chain& chain, const std::string& datadir, 
     }
     log_info(std::string("ReindexUTXO: complete in ") + std::to_string((t1 - t0)/1000.0) + "s");
     if(!dir_exists_nonempty(chainstate_dir)){
-        log_error("ReindexUTXO claimed success but chainstate is empty — refusing to continue.");
+        log_error("ReindexUTXO claimed success but chainstate is empty -- refusing to continue.");
         return false;
     }
     return true;
@@ -1414,7 +1419,8 @@ private:
 
         {
             right.push_back(std::string(C_bold()) + "Health & Security" + C_reset());
-            right.push_back(std::string("  config reload: ") + (global::reload_requested.load()? "pending":"—"));
+            right.push_back(std::string("  config reload: ")
+               + (global::reload_requested.load()? "pending" : (u8_ok_? "—" : "-")));
             if (!hot_warning_.empty() && now_ms()-hot_warn_ts_ < 6000){
                 right.push_back(std::string("  ") + C_warn() + hot_warning_ + C_reset());
             }
