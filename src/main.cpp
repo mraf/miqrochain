@@ -1,11 +1,6 @@
 #ifdef _MSC_VER
   #pragma execution_character_set("utf-8")
-  #ifndef _CRT_SECURE_NO_WARNINGS
-  #define _CRT_SECURE_NO_WARNINGS 1
-  #endif
-  #pragma warning(disable: 4996)   // POSIX names (guarded below)
-  #pragma warning(disable: 26495)  // uninited member (false positives on atomics/pods)
-  #pragma warning(disable: 26451)  // arithmetic overflow in generated code (false pos)
+  #define _CRT_SECURE_NO_WARNINGS
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -13,10 +8,6 @@
 #ifdef _WIN32
   #ifndef NOMINMAX
   #define NOMINMAX 1
-  #endif
-  // Prefer Unicode console where available
-  #ifndef _WIN32_WINNT
-  #define _WIN32_WINNT 0x0603
   #endif
 #endif
 
@@ -35,7 +26,7 @@
 #include "hash160.h"
 #include "crypto/ecdsa_iface.h"
 #include "difficulty.h"
-// #include "miner.h"        // REMOVED: built-in miner eliminated
+#include "miner.h"
 #include "sha256.h"
 #include "hex.h"
 #include "tls_proxy.h"
@@ -44,7 +35,7 @@
 #include "reindex_utxo.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
-/* STL */
+// STL
 #include <thread>
 #include <cctype>
 #include <fstream>
@@ -79,7 +70,6 @@
 #include <array>
 #include <optional>
 #include <cmath>
-#include <cerrno>  // for errno
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OS headers (guarded)
@@ -92,12 +82,6 @@
   #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
   #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
   #endif
-  #ifndef DISABLE_NEWLINE_AUTO_RETURN
-  #define DISABLE_NEWLINE_AUTO_RETURN        0x0008
-  #endif
-  #ifndef ENABLE_VIRTUAL_TERMINAL_INPUT
-  #define ENABLE_VIRTUAL_TERMINAL_INPUT      0x0200
-  #endif
   #ifdef _MSC_VER
     #pragma comment(lib, "Psapi.lib")
   #endif
@@ -109,13 +93,7 @@
   #include <fcntl.h>
   #include <sys/types.h>
   #include <sys/stat.h>
-  #include <signal.h>   // <-- needed for kill()
   #define MIQ_ISATTY() (::isatty(fileno(stdin)) != 0)
-#endif
-
-#if defined(__APPLE__)
-  #include <mach/mach.h>
-  #include <mach/task_info.h>
 #endif
 
 #ifdef _WIN32
@@ -135,15 +113,14 @@ using namespace miq;
 #define MIQ_VERSION_MAJOR 0
 #endif
 #ifndef MIQ_VERSION_MINOR
-#define MIQ_VERSION_MINOR 8
+#define MIQ_VERSION_MINOR 7
 #endif
 #ifndef MIQ_VERSION_PATCH
-#define MIQ_VERSION_PATCH 0   // Ultra TUI + symmetry + robustness
+#define MIQ_VERSION_PATCH 0
 #endif
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║                         Global state & helpers                            ║
-/*  Safer shutdown, lock & telemetry flags.                                    */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 namespace global {
 static std::atomic<bool>    shutdown_requested{false};
@@ -152,31 +129,18 @@ static std::atomic<uint64_t>last_signal_ms{0};
 static std::atomic<bool>    reload_requested{false};   // SIGHUP / hotkey 'r'
 static std::string          lockfile_path;
 static std::string          pidfile_path;
-#ifdef _WIN32
-static HANDLE               lockfile_handle{nullptr};  // keep open to hold lock
-#endif
 static std::string          telemetry_path;
 static std::atomic<bool>    telemetry_enabled{false};
 static std::atomic<bool>    tui_snapshot_requested{false};
 static std::atomic<bool>    tui_toggle_theme{false};
 static std::atomic<bool>    tui_pause_logs{false};
 static std::atomic<bool>    tui_verbose{false};
-static std::atomic<bool>    tui_toggle_help{false};
-static std::atomic<bool>    tui_toggle_compact{false};
-static std::atomic<bool>    tui_toggle_glow{false};
-static std::atomic<bool>    dump_status_json{true};
-// More refined UI toggles
-static std::atomic<bool>    tui_toggle_borders{false};
-static std::atomic<bool>    tui_toggle_wave{false};
-static std::atomic<bool>    tui_toggle_layout_lock{false};
-static std::atomic<bool>    tui_toggle_units{false};
-static std::atomic<bool>    tui_toggle_contrast{false};
 }
 
 // time helpers
 static inline uint64_t now_ms() {
     using namespace std::chrono;
-    return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 static inline uint64_t now_s() {
     return (uint64_t)std::time(nullptr);
@@ -185,13 +149,13 @@ static inline uint64_t now_s() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Shutdown request w/ escalation (double signal within 2s => hard exit)
 static void request_shutdown(const char* why){
-    const bool first = !global::shutdown_initiated.exchange(true);
+    bool first = !global::shutdown_initiated.exchange(true);
     global::shutdown_requested.store(true);
     if (first) {
         log_warn(std::string("Shutdown requested: ") + (why ? why : "signal"));
     } else {
-        const uint64_t t = now_ms();
-        const uint64_t last = global::last_signal_ms.load();
+        uint64_t t = now_ms();
+        uint64_t last = global::last_signal_ms.load();
         if (last && (t - last) < 2000) {
             log_error("Forced immediate termination (double signal).");
 #ifdef _WIN32
@@ -203,35 +167,6 @@ static void request_shutdown(const char* why){
     }
     global::last_signal_ms.store(now_ms());
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Signal/console control handlers (cross-platform, warning-clean)
-#ifndef _WIN32
-static void sigshutdown_handler(int sig){
-    (void)sig;
-    request_shutdown("signal");
-}
-static void sighup_handler(int sig){
-    (void)sig;
-    global::reload_requested.store(true);
-    global::last_signal_ms.store(now_ms());
-}
-#else
-static BOOL WINAPI win_ctrl_handler(DWORD type){
-    switch(type){
-        case CTRL_C_EVENT:
-        case CTRL_BREAK_EVENT:
-        case CTRL_CLOSE_EVENT:
-            request_shutdown("console");
-            return TRUE;
-        case CTRL_LOGOFF_EVENT:
-        case CTRL_SHUTDOWN_EVENT:
-            request_shutdown("system");
-            return TRUE;
-        default: return FALSE;
-    }
-}
-#endif
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║                              Miner stats                                   ║
@@ -265,13 +200,13 @@ struct Telemetry {
     void push_block(const BlockSummary& b) {
         std::lock_guard<std::mutex> lk(mu);
         new_blocks.push_back(b);
-        while (new_blocks.size() > 512) new_blocks.pop_front();
+        while (new_blocks.size() > 256) new_blocks.pop_front();
     }
     void push_txids(const std::vector<std::string>& v) {
         std::lock_guard<std::mutex> lk(mu);
         for (auto& t : v) {
             new_txids.push_back(t);
-            while (new_txids.size() > 256) new_txids.pop_front();
+            while (new_txids.size() > 128) new_txids.pop_front();
         }
     }
     void drain(std::vector<BlockSummary>& out_blocks, std::vector<std::string>& out_txids) {
@@ -317,7 +252,7 @@ struct ExtMinerWatch {
     }
     void start(const std::string& datadir){
         const char* p = std::getenv("MIQ_MINER_HEARTBEAT");
-        path = (p && *p) ? std::string(p) : default_path(datadir);
+        path = p && *p ? std::string(p) : default_path(datadir);
         running.store(true);
         thr = std::thread([this]{
             using namespace std::chrono_literals;
@@ -391,174 +326,47 @@ static inline std::string p_join(const std::string& a, const std::string& b){
 #endif
 }
 
-// Robust atomic text write with cross-platform rename fallback.
 static bool write_text_atomic(const std::string& path, const std::string& body){
     std::error_code ec;
     auto dir = std::filesystem::path(path).parent_path();
     if(!dir.empty()) std::filesystem::create_directories(dir, ec);
     std::string tmp = path + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if(!f) return false;
-        f.write(body.data(), (std::streamsize)body.size());
-        f.flush();
-        if(!f) return false;
-    }
-    // First try a normal rename
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if(!f) return false;
+    f.write(body.data(), (std::streamsize)body.size());
+    f.flush();
+    f.close();
     std::filesystem::rename(tmp, path, ec);
-#ifdef _WIN32
-    if (ec) {
-        // Windows cannot replace an existing file atomically with std::filesystem::rename (pre-C++20).
-        std::filesystem::remove(path, ec);
-        ec.clear();
-        std::filesystem::rename(tmp, path, ec);
-    }
-#endif
-    if (ec) {
-        // Last-resort: copy then remove tmp
-        std::filesystem::copy_file(tmp, path, std::filesystem::copy_options::overwrite_existing, ec);
-        std::filesystem::remove(tmp, ec);
-    } else {
-        // Best effort: ensure tmp is gone
-        std::filesystem::remove(tmp, ec);
-    }
     return !ec;
 }
 
-// --- Lock helpers (polished & with fallback) ---------------------------------
-static int read_pidfile_int(const std::string& pidfile) {
-    std::vector<uint8_t> buf;
-    if (!read_file_all(pidfile, buf)) return -1;
-    std::string s(buf.begin(), buf.end());
-    trim_inplace(s);
-    if (s.empty()) return -1;
-    try {
-        long long v = std::stoll(s);
-        if (v <= 0 || v > 0x7fffffffLL) return -1;
-        return (int)v;
-    } catch (...) {
-        return -1;
-    }
-}
-
-static bool process_alive(int pid){
-    if (pid <= 0) return false;
-#ifdef _WIN32
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
-    if (!h) return false;
-    DWORD code = 0;
-    BOOL ok = GetExitCodeProcess(h, &code);
-    CloseHandle(h);
-    return ok && code == STILL_ACTIVE;
-#else
-    // kill(pid, 0) does not send a signal but errors if the process doesn't exist
-    int r = kill(pid, 0);
-    if (r == 0) return true;
-    if (errno == EPERM) return true; // exists but not permitted
-    return false;
-#endif
-}
-
-static bool remove_stale_lock(const std::string& lock, const std::string& pidfile){
-    std::error_code ec;
-    std::filesystem::remove(lock, ec);
-    std::filesystem::remove(pidfile, ec);
-    return true; // best-effort
-}
-
-// Acquire datadir lock with stale-detection, retries, and optional "steal"
-// Fallback knobs (env):
-//  - MIQ_LOCK_RETRIES: number of retry cycles (default 2)
-//  - MIQ_LOCK_WAIT_MS: wait per retry (default 250ms)
-//  - MIQ_STEAL_LOCK=1: if set, remove existing lock even if a process appears alive
+// Lock file (exclusive). Writes PID. Returns true if acquired.
 static bool acquire_datadir_lock(const std::string& datadir){
     std::error_code ec;
     std::filesystem::create_directories(datadir, ec);
     std::string lock = p_join(datadir, ".lock");
     std::string pid  = p_join(datadir, "miqrod.pid");
-
-    int retries = 2;
-    int wait_ms = 250;
-    bool steal  = false;
-    if (const char* s = std::getenv("MIQ_LOCK_RETRIES")) {
-        char* e=nullptr; long v = std::strtol(s, &e, 10);
-        if (e!=s && v>=0 && v<1000) retries = (int)v;
-    }
-    if (const char* s = std::getenv("MIQ_LOCK_WAIT_MS")) {
-        char* e=nullptr; long v = std::strtol(s, &e, 10);
-        if (e!=s && v>=0 && v<60000) wait_ms = (int)v;
-    }
-    if (const char* s = std::getenv("MIQ_STEAL_LOCK")) {
-        steal = (*s && *s!='0');
-    }
-
-    auto try_once = [&](bool log_on_fail)->bool{
 #ifdef _WIN32
-        HANDLE h = CreateFileA(lock.c_str(),
-                               GENERIC_READ | GENERIC_WRITE,
-                               0,           // no sharing
-                               NULL,
-                               CREATE_NEW,  // fail if exists
-                               FILE_ATTRIBUTE_NORMAL,
-                               NULL);
-        if (h == INVALID_HANDLE_VALUE) {
-            if (log_on_fail) log_error("Lock exists; another instance may be running.");
-            return false;
-        }
-        global::lockfile_handle = h;
+    HANDLE h = CreateFileA(lock.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        log_error("Another instance appears to be running (lock exists).");
+        return false;
+    }
+    CloseHandle(h);
 #else
-        int fd = ::open(lock.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
-        if (fd < 0) {
-            if (log_on_fail) log_error("Lock exists; another instance may be running.");
-            return false;
-        }
-        ::close(fd);
+    int fd = ::open(lock.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if (fd < 0) {
+        log_error("Another instance appears to be running (lock exists).");
+        return false;
+    }
+    ::close(fd);
 #endif
-        return true;
-    };
-
-    // First attempt
-    if (!try_once(false)) {
-        // Diagnose
-        const int other_pid = read_pidfile_int(pid);
-        const bool alive = process_alive(other_pid);
-        std::string diag = "Another instance appears to be running";
-        if (other_pid > 0) diag += std::string(" (pid=") + std::to_string(other_pid) + ")";
-        if (!alive && other_pid > 0) diag += " — but it looks stale";
-        log_warn(diag + ".");
-
-        // If stale (pid absent or not alive) — clean up and retry
-        if (!alive) {
-            log_warn("Stale lock detected — removing and retrying…");
-            remove_stale_lock(lock, pid);
-            if (try_once(false)) goto LOCK_OK;
-        }
-
-        // Retry loop (in case of race)
-        for (int i=0; i<retries && !global::shutdown_requested.load(); ++i){
-            std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-            if (try_once(i+1==retries)) goto LOCK_OK;
-        }
-
-        // Optional fallback: steal lock if explicitly requested
-        if (steal) {
-            log_warn("MIQ_STEAL_LOCK set — forcibly removing existing lock.");
-            remove_stale_lock(lock, pid);
-            if (!try_once(true)) {
-                log_error("Failed to acquire lock even after forced removal.");
-                return false;
-            }
-        } else {
-            log_error("Another instance appears to be running (lock exists). Set MIQ_STEAL_LOCK=1 to override.");
-            return false;
-        }
-    }
-
-LOCK_OK:
+    // write PID file
 #ifdef _WIN32
-    const int pidnum = (int)GetCurrentProcessId();
+    int pidnum = (int)GetCurrentProcessId();
 #else
-    const int pidnum = (int)getpid();
+    int pidnum = (int)getpid();
 #endif
     write_text_atomic(pid, std::to_string(pidnum) + "\n");
     global::lockfile_path = lock;
@@ -567,15 +375,28 @@ LOCK_OK:
 }
 static void release_datadir_lock(){
     std::error_code ec;
-#ifdef _WIN32
-    if (global::lockfile_handle) {
-        CloseHandle(global::lockfile_handle);
-        global::lockfile_handle = nullptr;
-    }
-#endif
     if (!global::pidfile_path.empty()) std::filesystem::remove(global::pidfile_path, ec);
     if (!global::lockfile_path.empty()) std::filesystem::remove(global::lockfile_path, ec);
 }
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                    Signals / console control / input                       ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+static void sighup_handler(int){ global::reload_requested.store(true); }
+static void sigshutdown_handler(int){ request_shutdown("signal"); }
+
+#ifdef _WIN32
+static BOOL WINAPI win_ctrl_handler(DWORD evt){
+    switch(evt){
+        case CTRL_C_EVENT:        request_shutdown("CTRL_C_EVENT");        return TRUE;
+        case CTRL_BREAK_EVENT:    request_shutdown("CTRL_BREAK_EVENT");    return TRUE;
+        case CTRL_CLOSE_EVENT:    request_shutdown("CTRL_CLOSE_EVENT");    return TRUE;
+        case CTRL_LOGOFF_EVENT:   request_shutdown("CTRL_LOGOFF_EVENT");   return TRUE;
+        case CTRL_SHUTDOWN_EVENT: request_shutdown("CTRL_SHUTDOWN_EVENT"); return TRUE;
+        default: return FALSE;
+    }
+}
+#endif
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 /*                               Resource metrics                              */
@@ -588,19 +409,12 @@ static uint64_t get_rss_bytes(){
     }
     return 0;
 #elif defined(__APPLE__)
-    task_basic_info_data_t tinfo{};
-    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
-    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&tinfo, &count) == KERN_SUCCESS) {
-        return (uint64_t)tinfo.resident_size;
-    }
+    std::ifstream f("/proc/self/statm"); uint64_t rss_pages=0, x=0;
+    if (f >> x >> rss_pages){ long p = sysconf(_SC_PAGESIZE); return (uint64_t)rss_pages * (uint64_t)p; }
     return 0;
 #else
-    std::ifstream f("/proc/self/statm");
-    uint64_t rss_pages=0, x=0;
-    if (f >> x >> rss_pages){
-        long p = sysconf(_SC_PAGESIZE);
-        if (p > 0) return (uint64_t)rss_pages * (uint64_t)p;
-    }
+    std::ifstream f("/proc/self/statm"); uint64_t rss_pages=0, x=0;
+    if (f >> x >> rss_pages){ long p = sysconf(_SC_PAGESIZE); return (uint64_t)rss_pages * (uint64_t)p; }
     return 0;
 #endif
 }
@@ -610,173 +424,24 @@ static uint64_t get_rss_bytes(){
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 namespace term {
 
-#ifdef _WIN32
-static inline bool is_handle_console(HANDLE h) {
-    DWORD m = 0;
-    return (h && h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &m));
-}
-static inline bool is_conpty_like() {
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD type = GetFileType(hOut);
-    const bool pipe = (type == FILE_TYPE_PIPE);
-    const bool hinted = (std::getenv("WT_SESSION") || std::getenv("ConEmuANSI") ||
-                         std::getenv("TERMINUS_SUBPROC") || std::getenv("MSYS") ||
-                         std::getenv("MSYSTEM"));
-    return pipe && hinted;
-}
-#endif
-
-#ifdef _WIN32
-static inline bool is_pipe(HANDLE h) {
-    return h && h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_PIPE;
-}
-
-// ConPTY-safe: don't allocate a new console when STDOUT is a PIPE (Windows Terminal).
-static void ensure_console_bound() {
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-
-    // ConPTY / Windows Terminal: STDOUT is a PIPE → leave handles alone.
-    if (is_pipe(hOut)) {
-    #ifdef _MSC_VER
-        _putenv_s("TERM", "xterm-256color");
-    #else
-        setenv("TERM", "xterm-256color", 1);
-    #endif
-        return;
-    }
-
-    // Classic console path: attach to parent or create a new one and rebind.
-    if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
-        AllocConsole();
-    }
-
-    // Make sure the process STD* refer to the real console.
-    HANDLE hConOut = CreateFileW(L"CONOUT$", GENERIC_READ|GENERIC_WRITE,
-                                 FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
-                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hConOut != INVALID_HANDLE_VALUE) {
-        SetStdHandle(STD_OUTPUT_HANDLE, hConOut);
-        SetStdHandle(STD_ERROR_HANDLE,  hConOut);
-        SetConsoleOutputCP(65001);
-    }
-    HANDLE hConIn = CreateFileW(L"CONIN$", GENERIC_READ|GENERIC_WRITE,
-                                FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
-                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hConIn != INVALID_HANDLE_VALUE) {
-        SetStdHandle(STD_INPUT_HANDLE, hConIn);
-        SetConsoleCP(65001);
-    }
-
-  #ifdef _MSC_VER
-    _putenv_s("TERM", "xterm-256color");
-  #else
-    setenv("TERM", "xterm-256color", 1);
-  #endif
-}
-#endif
-
+// Basic tty check remains available
 static inline bool is_tty() {
 #ifdef _WIN32
-    DWORD mode = 0;
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    return (hOut && hOut != INVALID_HANDLE_VALUE && GetConsoleMode(hOut, &mode));
+    return _isatty(_fileno(stdout)) != 0;
 #else
     return ::isatty(STDOUT_FILENO) == 1;
 #endif
 }
-static inline void get_winsize(int& cols, int& rows) {
-    cols = 120; rows = 40;
-#ifdef _WIN32
-    CONSOLE_SCREEN_BUFFER_INFO info;
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (GetConsoleScreenBufferInfo(hOut, &info)) {
-        cols = info.srWindow.Right - info.srWindow.Left + 1;
-        rows = info.srWindow.Bottom - info.srWindow.Top + 1;
-    }
-#else
-    struct winsize ws{};
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
-        if (ws.ws_col) cols = ws.ws_col;
-        if (ws.ws_row) rows = ws.ws_row;
-    }
-#endif
-    // snap to even to preserve symmetry
-    if (cols & 1) ++cols;
-}
 
-// Returns (vt_ok, u8_ok).
-// - vt_ok : terminal understands VT sequences
-// - u8_ok : Unicode glyphs safe (true under ConPTY/Windows Terminal or real console with UTF-8)
-static inline std::pair<bool,bool> enable_vt_and_probe_u8(bool prefer_utf8=true) {
-    bool vt_ok = true, u8_ok = true;
-#ifdef _WIN32
-    ensure_console_bound();
-
-    if (prefer_utf8) {
-        SetConsoleOutputCP(65001);
-        SetConsoleCP(65001);
-    }
-
-    auto set_out_mode = [](HANDLE h){
-        if (!h || h==INVALID_HANDLE_VALUE) return false;
-        DWORD m=0; if (!GetConsoleMode(h, &m)) return false;
-        m |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-        m |= DISABLE_NEWLINE_AUTO_RETURN;
-        return SetConsoleMode(h, m) != 0;
-    };
-    auto set_in_mode = [](HANDLE h){
-        if (!h || h==INVALID_HANDLE_VALUE) return false;
-        DWORD m=0; if (!GetConsoleMode(h, &m)) return false;
-        m |= ENABLE_VIRTUAL_TERMINAL_INPUT;
-        return SetConsoleMode(h, m) != 0;
-    };
-
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
-    HANDLE hIn  = GetStdHandle(STD_INPUT_HANDLE);
-
-    const bool console_out = is_handle_console(hOut);
-    const bool console_err = is_handle_console(hErr);
-    const bool conpty      = is_conpty_like();
-
-    bool okOut = console_out ? set_out_mode(hOut) : true; // VT not settable on pipes
-    bool okErr = console_err ? set_out_mode(hErr) : true;
-    bool okIn  = is_handle_console(hIn) ? set_in_mode(hIn) : true;
-
-    vt_ok = okOut && okErr && okIn;
-
-    UINT cp = GetConsoleOutputCP();
-    const bool forced_ascii = (std::getenv("MIQ_FORCE_ASCII") && *std::getenv("MIQ_FORCE_ASCII")!='0');
-    const bool forced_utf8  = (std::getenv("MIQ_FORCE_UTF8")  && *std::getenv("MIQ_FORCE_UTF8")!='0');
-
-    if (forced_ascii) u8_ok = false;
-    else if (forced_utf8) u8_ok = true;
-    else if (conpty) u8_ok = true;
-    else u8_ok = (console_out && cp == 65001);
-#else
-    (void)prefer_utf8;
-#endif
-    return {vt_ok, u8_ok};
-}
-
-// Legacy helper retained for non-Windows usage sites (no change in behavior elsewhere).
-static inline void enable_vt(bool& vt_ok, bool prefer_utf8=true){
-    auto r = enable_vt_and_probe_u8(prefer_utf8);
-    vt_ok = r.first; (void)r;
-}
-
-// Treat either a real console (GetConsoleMode OK) or ConPTY/Windows Terminal (PIPE with hints)
-// as interactive output so the TUI can run.
+// New: treat ConPTY/Windows Terminal as interactive output even if STDOUT is a pipe
 static inline bool supports_interactive_output() {
 #ifdef _WIN32
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (!hOut || hOut == INVALID_HANDLE_VALUE) return false;
-
-    // Real console?
-    DWORD mode = 0;
-    if (GetConsoleMode(hOut, &mode)) return true;
-
-    // ConPTY/Windows Terminal: STDOUT is a PIPE, but well-known env hints are present.
+    if (hOut && hOut != INVALID_HANDLE_VALUE) {
+        DWORD mode = 0;
+        if (GetConsoleMode(hOut, &mode)) return true; // real console
+    }
+    // Heuristic for ConPTY/terminal emulators when stdout is a PIPE
     DWORD type = GetFileType(hOut);
     const bool is_pipe = (type == FILE_TYPE_PIPE);
     const bool hinted =
@@ -791,97 +456,147 @@ static inline bool supports_interactive_output() {
 #endif
 }
 
+// Improved window size: try STDOUT, then fall back to CONOUT$
+static inline void get_winsize(int& cols, int& rows) {
+    cols = 120; rows = 38;
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!GetConsoleScreenBufferInfo(hOut, &info)) {
+        HANDLE hAlt = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hAlt != INVALID_HANDLE_VALUE) {
+            if (GetConsoleScreenBufferInfo(hAlt, &info)) {
+                cols = info.srWindow.Right - info.srWindow.Left + 1;
+                rows = info.srWindow.Bottom - info.srWindow.Top + 1;
+            }
+            CloseHandle(hAlt);
+            return;
+        }
+    } else {
+        cols = info.srWindow.Right - info.srWindow.Left + 1;
+        rows = info.srWindow.Bottom - info.srWindow.Top + 1;
+    }
+#else
+    struct winsize ws{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        if (ws.ws_col) cols = ws.ws_col;
+        if (ws.ws_row) rows = ws.ws_row;
+    }
+#endif
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Console writer that handles both real consoles and ConPTY correctly.
-// - ConPTY (Windows Terminal): write raw UTF-8 to STDOUT (pipe).
-// - Real console: WriteConsoleW to CONOUT$ (UTF-16), fallback to bytes only if needed.
-// ─────────────────────────────────────────────────────────────────────────────
+// New: enable VT and probe/ensure UTF-8 output.
+// - Returns vt_ok = whether ANSI escapes are safe
+// - Returns u8_ok = whether we can safely print non-ASCII UTF-8
+static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
+    vt_ok = true; u8_ok = true;
+#ifdef _WIN32
+    vt_ok = false; u8_ok = false;
+
+    // Try STDOUT first
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    bool have_console = (h && h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode));
+
+    // If STDOUT is a pipe (ConPTY scenario), try CONOUT$
+    HANDLE hConOut = INVALID_HANDLE_VALUE;
+    if (!have_console) {
+        hConOut = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hConOut != INVALID_HANDLE_VALUE && GetConsoleMode(hConOut, &mode)) {
+            have_console = true;
+            h = hConOut;
+        }
+    }
+
+    if (have_console) {
+        // Enable VT sequences
+        mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        if (SetConsoleMode(h, mode)) {
+            DWORD m2 = 0;
+            if (GetConsoleMode(h, &m2) && (m2 & ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+                vt_ok = true;
+            }
+        }
+
+        // Force UTF-8 code pages (best-effort)
+        UINT outPrev = GetConsoleOutputCP();
+        if (outPrev == CP_UTF8 || SetConsoleOutputCP(CP_UTF8)) {
+            u8_ok = true;
+            SetConsoleCP(CP_UTF8); // input code page too (best-effort)
+        }
+    } else {
+        // ConPTY/WT: treat as VT+UTF-8 capable if hints are present
+        DWORD type = GetFileType(GetStdHandle(STD_OUTPUT_HANDLE));
+        const bool is_pipe = (type == FILE_TYPE_PIPE);
+        const bool hinted =
+            (std::getenv("WT_SESSION")       ||
+             std::getenv("ConEmuANSI")       ||
+             std::getenv("TERMINUS_SUBPROC") ||
+             std::getenv("MSYS")             ||
+             std::getenv("MSYSTEM"));
+        if (is_pipe && hinted) { vt_ok = true; u8_ok = true; }
+    }
+
+    if (hConOut != INVALID_HANDLE_VALUE) CloseHandle(hConOut);
+
+    // Be robust: disable Windows error UI noise
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOALIGNMENTFAULTEXCEPT);
+#endif
+}
+
+} // namespace term
+
+// Console writer avoids recursion with log capture
 class ConsoleWriter {
 public:
     ConsoleWriter(){ init(); }
     ~ConsoleWriter(){
 #ifdef _WIN32
-        if (own_conout_ && hOut_ && hOut_ != INVALID_HANDLE_VALUE) CloseHandle(hOut_);
+        if (hFile_ && hFile_ != INVALID_HANDLE_VALUE) CloseHandle(hFile_);
+#else
+        if (fd_ >= 0 && fd_ != STDOUT_FILENO) ::close(fd_);
 #endif
     }
-
     void write_raw(const std::string& s){
 #ifdef _WIN32
-        if (!hOut_ || hOut_ == INVALID_HANDLE_VALUE) return;
-
-        // ConPTY path: just write raw UTF-8 bytes; WT interprets them correctly.
-        if (is_conpty_) {
-            DWORD wrote = 0;
-            WriteFile(hOut_, s.data(), (DWORD)s.size(), &wrote, nullptr);
-            return;
+        // Prefer true Unicode output via WriteConsoleW to avoid mojibake
+        if (hFile_ && hFile_ != INVALID_HANDLE_VALUE) {
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
+            if (wlen > 0) {
+                std::wstring ws((size_t)wlen, L'\0');
+                MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), ws.data(), wlen);
+                DWORD wroteW = 0;
+                WriteConsoleW(hFile_, ws.c_str(), (DWORD)ws.size(), &wroteW, nullptr);
+                return;
+            }
         }
-
-        // Real console: prefer wide write (correct regardless of code page)
-        int need = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-        if (need > 0) {
-            if ((int)wbuf_.size() < need) wbuf_.resize((size_t)need);
-            MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), wbuf_.data(), need);
-            DWORD wroteW = 0;
-            if (WriteConsoleW(hOut_, wbuf_.data(), (DWORD)need, &wroteW, nullptr)) return;
-        }
-
-        // Last resort: raw bytes (will still be fine if console CP is UTF-8)
+        // Fallback: raw bytes to STDOUT (pipe)
         DWORD wrote = 0;
-        WriteFile(hOut_, s.data(), (DWORD)s.size(), &wrote, nullptr);
+        WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), s.c_str(), (DWORD)s.size(), &wrote, nullptr);
 #else
-        size_t off = 0;
-        while (off < s.size()) {
-            ssize_t n = ::write(STDOUT_FILENO, s.data()+off, s.size()-off);
-            if (n <= 0) break;
-            off += (size_t)n;
-        }
+        int fd = (fd_ >= 0) ? fd_ : STDOUT_FILENO;
+        size_t off = 0; while (off < s.size()) { ssize_t n = ::write(fd, s.data()+off, s.size()-off); if (n<=0) break; off += (size_t)n; }
 #endif
     }
-
 private:
     void init(){
 #ifdef _WIN32
-        HANDLE stdOut = GetStdHandle(STD_OUTPUT_HANDLE);
-        const bool pipe = (stdOut && stdOut != INVALID_HANDLE_VALUE && GetFileType(stdOut) == FILE_TYPE_PIPE);
-
-        if (pipe) {
-            // ConPTY/WT → use the provided pipe handle.
-            is_conpty_  = true;
-            hOut_       = stdOut;
-            own_conout_ = false;
-            return;
-        }
-
-        // Real console: open CONOUT$ independently of any redirection
-        hOut_ = CreateFileW(L"CONOUT$",
-                            GENERIC_READ|GENERIC_WRITE,
-                            FILE_SHARE_READ|FILE_SHARE_WRITE,
-                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hOut_ != INVALID_HANDLE_VALUE) {
-            own_conout_ = true;
-            SetConsoleOutputCP(65001);
-            SetConsoleCP(65001);
-            DWORD m = 0;
-            if (GetConsoleMode(hOut_, &m)) {
-                m |= 0x0004 /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */;
-                m |= 0x0008 /* DISABLE_NEWLINE_AUTO_RETURN */;
-                SetConsoleMode(hOut_, m);
-            }
-        } else {
-            // Fallback: whatever STDOUT is
-            hOut_ = stdOut;
-            own_conout_ = false;
-        }
+        // Open the active console (works for ConPTY/Windows Terminal)
+        hFile_ = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE | FILE_SHARE_READ,
+                             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+#else
+        fd_ = ::open("/dev/tty", O_WRONLY | O_CLOEXEC);
+        if (fd_ < 0) fd_ = STDOUT_FILENO;
 #endif
     }
-
 #ifdef _WIN32
-    HANDLE hOut_{nullptr};
-    bool   own_conout_{false};
-    bool   is_conpty_{false};
-    std::wstring wbuf_;
+    HANDLE hFile_{};
+#else
+    int fd_ = -1;
 #endif
 };
 
@@ -948,6 +663,7 @@ public:
     }
 private:
     static std::string sanitize_line(const std::string& s){
+        // redact obvious secrets
         auto red = s;
         auto scrub = [&](const char* key){
             size_t pos = 0;
@@ -974,7 +690,7 @@ private:
             ssize_t n = ::read(readfd, tmp, sizeof(tmp));
             if (n <= 0) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); continue; }
 #endif
-            const int nn = (int)n;
+            int nn = (int)n;
             for (int i=0; i<nn; ++i) {
                 char c = tmp[i];
                 if (c == '\r') continue;
@@ -999,174 +715,52 @@ private:
 };
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-/*                               UI helpers (Ultra)                            */
+/*                               UI helpers                                    */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
-
-// — Numeric formatting —
-static inline std::string commas_u64(uint64_t v){
-    std::string s = std::to_string(v);
-    for (int i=(int)s.size()-3; i>0; i-=3) s.insert((size_t)i, ",");
-    return s;
-}
-static inline std::string fmt_hs_compact(double v){
-    static const char* u[] = {"H/s","kH/s","MH/s","GH/s","TH/s","PH/s","EH/s"};
-    int i=0; while(v>=1000.0 && i<6){ v/=1000.0; ++i; }
+static inline std::string short_hex(const std::string& h, size_t n=12){ return h.size()>n ? h.substr(0,n) : h; }
+static inline std::string fmt_hs(double v){
+    const char* u[] = {"H/s","kH/s","MH/s","GH/s","TH/s","PH/s"};
+    int i=0; while(v>=1000.0 && i<5){ v/=1000.0; ++i; }
     std::ostringstream o; o<<std::fixed<<std::setprecision(2)<<v<<" "<<u[i]; return o.str();
 }
-static inline std::string fmt_hs_full(double v){
-    if (v < 0) v = 0;
-    const uint64_t iv = (uint64_t)std::llround(v);
-    return commas_u64(iv) + " H/s";
-}
-static inline std::string fmt_num_compact(uint64_t v){
+static inline std::string fmt_num(uint64_t v){
     std::ostringstream o;
     if (v<1000) { o<<v; return o.str(); }
-    static const char* u[]={"","K","M","B","T","P"};
+    const char* u[]={"","K","M","B","T","P"};
     int i=0; double x=(double)v;
     while(x>=1000.0 && i<5){ x/=1000.0; ++i; }
     o<<std::fixed<<std::setprecision(x<10?2:(x<100?1:0))<<x<<u[i]; return o.str();
 }
-static inline std::string fmt_bytes_compact(uint64_t v){
-    static const char* u[] = {"B","KiB","MiB","GiB","TiB","PiB"};
+static inline std::string fmt_bytes(uint64_t v){
+    const char* u[] = {"B","KiB","MiB","GiB","TiB"};
     int i=0; double x = (double)v;
-    while (x>=1024.0 && i<5){ x/=1024.0; ++i; }
+    while (x>=1024.0 && i<4){ x/=1024.0; ++i; }
     std::ostringstream o; o<<std::fixed<<std::setprecision(x<10?2:(x<100?1:0))<<x<<" "<<u[i]; return o.str();
-}
-static inline std::string fmt_bytes_full(uint64_t v){
-    return commas_u64(v) + " B";
 }
 static inline std::string fmt_diff(long double d){
     if (d < 0) d = 0;
     long double x = d;
-    static const char* u[] = {"", "k", "M", "G", "T", "P", "E"};
+    const char* u[] = {"", "k", "M", "G", "T", "P", "E"};
     int i=0;
     while (x >= 1000.0L && i < 6){ x /= 1000.0L; ++i; }
     std::ostringstream o; o<<std::fixed<<std::setprecision(x<10?2:(x<100?1:0))<<(double)x<<u[i];
     return o.str();
 }
-static inline std::string fmt_pct(double x, int p=2){
-    if (x < 0) {
-        x = 0;
-    }
-    if (x > 100) {
-        x = 100;
-    }
-    std::ostringstream o; o<<std::fixed<<std::setprecision(p)<<x<<'%'; return o.str();
-}
-static inline std::string fmt_duration(double sec){
-    if (sec < 0) sec = 0;
-    uint64_t s = (uint64_t)(sec + 0.5);
-    uint64_t d = s / 86400; s %= 86400;
-    uint64_t h = s / 3600;  s %= 3600;
-    uint64_t m = s / 60;    s %= 60;
-    std::ostringstream o;
-    if (d) o<<d<<"d"<<std::setw(2)<<std::setfill('0')<<h<<"h";
-    else if (h) o<<h<<"h"<<std::setw(2)<<std::setfill('0')<<m<<"m";
-    else if (m) o<<m<<"m"<<std::setw(2)<<std::setfill('0')<<s<<"s";
-    else o<<s<<"s";
-    return o.str();
-}
 
-// — ANSI-aware width helpers (for stable columns) — UTF-8 safe, no split
-static inline bool is_ansi_start(const std::string& s, size_t i){
-    return i < s.size() && s[i] == '\x1b';
-}
-static size_t ansi_seq_len(const std::string& s, size_t i){
-    if (!is_ansi_start(s,i)) return 0;
-    size_t j = i+1;
-    if (j < s.size() && (s[j]=='[' || s[j]==']' || s[j]=='(' || s[j]==')')) {
-        ++j;
-        while (j < s.size()){
-            const char c = s[j++];
-            if ((c>='@' && c<='~')) break;
-        }
-        return j - i;
-    }
-    return 1;
-}
-static size_t display_width(const std::string& s){
-    size_t w=0;
-    for (size_t i=0;i<s.size();){
-        if (is_ansi_start(s,i)){ i += ansi_seq_len(s,i); continue; }
-        unsigned char c = (unsigned char)s[i];
-        if ((c & 0x80) == 0){ ++w; ++i; }
-        else {
-            if ((c & 0xE0) == 0xC0) i += 2;
-            else if ((c & 0xF0) == 0xE0) i += 3;
-            else if ((c & 0xF8) == 0xF0) i += 4;
-            else ++i;
-            ++w; // treat double-width as 1 cell for consistency with modern terminals
-        }
-    }
-    return w;
-}
-static std::string truncate_to_width(const std::string& s, int width){
-    if (width <= 0) return "";
-    size_t w=0; size_t i=0;
-    std::string out; out.reserve(s.size());
-    while (i<s.size()){
-        if (is_ansi_start(s,i)){ size_t k=ansi_seq_len(s,i); out.append(s, i, k); i+=k; continue; }
-        unsigned char c = (unsigned char)s[i];
-        size_t take = 1;
-        if ((c & 0x80) == 0) take = 1;
-        else if ((c & 0xE0) == 0xC0) take = 2;
-        else if ((c & 0xF0) == 0xE0) take = 3;
-        else if ((c & 0xF8) == 0xF0) take = 4;
-        if ((int)(w+1) > width) break;
-        out.append(s, i, take);
-        i += take;
-        ++w;
-    }
-    if ((int)w == width && i < s.size()){
-        // strip last glyph and append ASCII ellipsis to avoid mojibake
-        std::string noansi;
-        for (size_t j=0;j<out.size();){
-            if (is_ansi_start(out,j)){ size_t k=ansi_seq_len(out,j); j+=k; continue; }
-            unsigned char cc=(unsigned char)out[j];
-            size_t take = (cc&0x80)? ((cc&0xE0)==0xC0?2:((cc&0xF0)==0xE0?3:((cc&0xF8)==0xF0?4:1))):1;
-            noansi.append(out, j, take);
-            j+=take;
-        }
-        if (!noansi.empty()){
-            size_t pos = noansi.size()-1;
-            while (pos>0 && ((unsigned char)noansi[pos] & 0xC0) == 0x80) --pos;
-            noansi.erase(pos);
-        }
-        out = noansi + "...";
-    }
-    return out;
-}
-static std::string pad_right_ansi(const std::string& s, int width){
-    std::string t = truncate_to_width(s, width);
-    const int w = (int)display_width(t);
-    if (w < width) t.append((size_t)(width - w), ' ');
-    return t;
-}
-static inline std::string short_hex(const std::string& h, size_t n=12){ return h.size()>n ? h.substr(0,n) : h; }
-
-// UTF-8 repeater for border segments
-static std::string repeat_u8(const char* s, int n){
-    if (n <= 0) return {};
-    std::string out;
-    out.reserve(std::max(0, n) * 3);
-    for (int i = 0; i < n; ++i) out += s;
-    return out;
-}
-
-// — Visual elements —
-static inline std::string bar(int width, double frac, bool fancy, int hue_a=36, int hue_b=32, bool glow=false){
+static inline std::string bar(int width, double frac, bool vt_ok, int hue_a=36, int hue_b=32){
     if (width < 6) width = 6;
     if (frac < 0) { frac = 0; }
     if (frac > 1) { frac = 1; }
-    const int full = (int)((width-2)*frac + 0.5);
+    int full = (int)((width-2)*frac + 0.5);
     std::ostringstream o;
     o << '[';
-    if(fancy){
+    if(vt_ok){
         for(int i=0;i<width-2;i++){
-            const bool on = i < full;
-            const int hue = glow ? 35 + (i%2) : (hue_a - (i*(hue_a-hue_b))/std::max(1,width-2));
-            if (on) o << "\x1b["<<hue<<"m" << u8"█" << "\x1b[0m";
-            else    o << "\x1b[90m" << u8"·" << "\x1b[0m";
+            bool on = i < full;
+            int hue = hue_a - (i*(hue_a-hue_b))/std::max(1,width-2);
+            if (hue < 30) hue = 30;
+            if (on) o << "\x1b["<<hue<<"m" << "█" << "\x1b[0m";
+            else    o << "\x1b[90m" << "·" << "\x1b[0m";
         }
     }else{
         for(int i=0;i<width-2;i++) o << (i<full ? '#' : ' ');
@@ -1174,59 +768,42 @@ static inline std::string bar(int width, double frac, bool fancy, int hue_a=36, 
     o << ']';
     return o.str();
 }
-static std::string wave_line(int width, int tick, bool fancy, int hue_a=36, int hue_b=32){
-    static const char* blocks[] = { " ", u8"▁", u8"▂", u8"▃", u8"▄", u8"▅", u8"▆", u8"▇", u8"█" };
-    const int N = 8;
-    const char* ascii[] = { " ", ".", ".", "-", "-", "=", "=", "#", "#" };
+static std::string wave_line(int width, int tick, bool vt_ok, int hue_a=36, int hue_b=32){
+    static const char* blocks = " ▁▂▃▄▅▆▇█";
+    int N = (int)std::strlen(blocks)-1;
     if(width < 4) width = 4;
     std::ostringstream o;
     for(int i=0;i<width;i++){
-        const double x = (i + tick*0.72) * 0.21;
-        const double y = 0.5 + 0.5*std::sin(x) * std::cos((tick+i)*0.075);
+        double x = (i + tick*0.72) * 0.21;
+        double y = 0.5 + 0.5*std::sin(x) * std::cos((tick+i)*0.075);
         int idx = (int)std::round(y * N);
-        if(idx<0) {
-            idx=0;
-        }
-        if(idx>N) {
-            idx=N;
-        }
-        if(fancy){
-            const int hue = hue_a - (i*(hue_a-hue_b))/std::max(1,width);
+        if(idx<0) { idx=0; }
+        if(idx>N) { idx=N; }
+        if(vt_ok){
+            int hue = hue_a - (i*(hue_a-hue_b))/std::max(1,width);
+            if (hue < 30) hue = 30;
             o << "\x1b["<<hue<<"m" << blocks[idx] << "\x1b[0m";
         }else{
-            o << ascii[idx];
+            o << blocks[idx];
         }
     }
     return o.str();
 }
-static std::string spinner(bool unicode_ok, int tick){
-    if (unicode_ok) {
-        static const char* frames_utf8[] = {
-            u8"⠋", u8"⠙", u8"⠹", u8"⠸", u8"⠼",
-            u8"⠴", u8"⠦", u8"⠧", u8"⠇", u8"⠏"
-        };
-        return std::string(frames_utf8[tick % 10]);
-    } else {
-        static const char* frames_ascii[] = { "-", "\\", "|", "/" };
-        return std::string(frames_ascii[tick % 4]);
-    }
+static std::string spinner(int tick){
+    static const char* s = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+    return std::string(1, s[tick % 10]);
 }
 static std::string spark_ascii(const std::vector<double>& xs){
-    static const char bars[] = " .:-=+*%@#";
+    static const char bars[] = " .:-=+*#%@";
     if(xs.empty()) return "";
     double mn=xs[0], mx=xs[0];
     for(double v: xs){ mn = std::min(mn,v); mx = std::max(mx,v); }
-    const double span = (mx>mn)? (mx-mn) : 1.0;
+    double span = (mx>mn)? (mx-mn) : 1.0;
     std::string s;
-    s.reserve(xs.size());
     for(double v: xs){
         int idx = (int)std::round( (v-mn)/span * 9.0 );
-        if (idx < 0) {
-            idx = 0;
-        }
-        if (idx > 9) {
-            idx = 9;
-        }
+        if (idx < 0) { idx = 0; }
+        if (idx > 9) { idx = 9; }
         s.push_back(bars[idx]);
     }
     return s;
@@ -1243,7 +820,7 @@ static bool dir_exists_nonempty(const std::string& path){
 }
 static bool ensure_utxo_fully_indexed(Chain& chain, const std::string& datadir, bool force){
     const std::string chainstate_dir = p_join(datadir, "chainstate");
-    const bool need = force || !dir_exists_nonempty(chainstate_dir);
+    bool need = force || !dir_exists_nonempty(chainstate_dir);
     if(!need){
         log_info("UTXO chainstate seems present; quick-skip deep probe.");
         return true;
@@ -1283,7 +860,7 @@ static MempoolView mempool_view_fallback(MP* mp){
     MempoolView v{};
     if (!mp) return v;
     if constexpr (has_stats_method<MP>::value) {
-        auto s = mp->stats();
+        auto s = mp->stats(); // must have count/bytes/recent_adds or compatible fields
         v.count = (uint64_t)s.count;
         v.bytes = (uint64_t)s.bytes;
         v.recent_adds = (uint64_t)s.recent_adds;
@@ -1317,58 +894,58 @@ static uint32_t hdr_bits(const H& h){
     return (uint32_t)GENESIS_BITS;
 }
 
-// Difficulty helpers
+// Difficulty helpers: compact bits → target (long double), then difficulty ratio
 static long double compact_to_target_ld(uint32_t bits){
-    const uint32_t exp = bits >> 24;
-    const uint32_t mant = bits & 0x007fffff;
-    const long double m = (long double)mant;
-    const int shift = (int)exp - 3;
+    uint32_t exp = bits >> 24;
+    uint32_t mant = bits & 0x007fffff;
+    long double m = (long double)mant;
+    int shift = (int)exp - 3;
+    // Precise and portable: ldexp(x,k) = x * 2^k
     return std::ldexp(m, 8 * shift);
 }
 static long double difficulty_from_bits(uint32_t bits){
-    const long double t_one = compact_to_target_ld((uint32_t)GENESIS_BITS);
-    const long double t_cur = compact_to_target_ld(bits);
+    // Relative to "difficulty 1" at GENESIS_BITS (like Bitcoin)
+    long double t_one = compact_to_target_ld((uint32_t)GENESIS_BITS);
+    long double t_cur = compact_to_target_ld(bits);
     if (t_cur <= 0.0L) return 0.0L;
     return t_one / t_cur;
 }
 
 // Estimate network hashrate from recent headers
-static double estimate_network_hashrate(Chain* chain, double* out_avg_block_time=nullptr){
-    if (!chain) { if(out_avg_block_time) *out_avg_block_time = (double)BLOCK_TIME_SECS; return 0.0; }
+static double estimate_network_hashrate(Chain* chain){
+    if (!chain) return 0.0;
     const unsigned k = (unsigned)std::max<int>(MIQ_RETARGET_INTERVAL, 32);
     auto headers = chain->last_headers(k);
-    if (headers.size() < 2) { if(out_avg_block_time) *out_avg_block_time=(double)BLOCK_TIME_SECS; return 0.0; }
+    if (headers.size() < 2) return 0.0;
 
+    // timespan
     uint64_t t_first = hdr_time(headers.front());
     uint64_t t_last  = hdr_time(headers.back());
     if (t_last <= t_first) t_last = t_first + 1;
     double avg_block_time = double(t_last - t_first) / double(headers.size()-1);
     if (avg_block_time <= 0.0) avg_block_time = (double)BLOCK_TIME_SECS;
 
-    const uint32_t bits = hdr_bits(headers.back());
-    const long double diff = difficulty_from_bits(bits);
-    long double hps = (diff * 4294967296.0L) / avg_block_time; // 2^32
-    if (!std::isfinite((double)hps) || hps < 0) hps = 0.0L;
-    if (out_avg_block_time) *out_avg_block_time = avg_block_time;
+    // Difficulty at the tip header
+    uint32_t bits = hdr_bits(headers.back());
+    long double diff = difficulty_from_bits(bits);
+    // Expected hashes per block at difficulty 1 ≈ 2^32
+    long double hps = (diff * 4294967296.0L) / avg_block_time;
+    if (!std::isfinite((double)hps) || hps < 0) return 0.0;
     return (double)hps;
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-/*                                Ultra TUI 3.0                                */
+/*                                Pro TUI 3 Ultra                              */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 class TUI {
 public:
     enum class NodeState { Starting, Syncing, Running, Degraded, Quitting };
 
-    explicit TUI(bool vt_ok, bool unicode_ok)
-        : vt_ok_(vt_ok), unicode_ok_(unicode_ok) {
-        init_step_order(); base_ts_ms_ = now_ms();
-        if (!unicode_ok_) { show_borders_ = false; show_wave_ = false; glow_ = false; }
-    }
+    explicit TUI(bool vt_ok) : vt_ok_(vt_ok) { init_step_order(); }
     void set_enabled(bool on){ enabled_ = on; }
     void start() {
         if (!enabled_) return;
-        if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H\x1b[?25l");
+        if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H]\x1b[?25l");
         draw_once(true);
         key_thr_ = std::thread([this]{ key_loop(); });
         thr_     = std::thread([this]{ loop(); });
@@ -1389,36 +966,28 @@ public:
     void mark_step_fail(const std::string& title){ std::lock_guard<std::mutex> lk(mu_); ensure_step(title); failures_.insert(title); }
 
     // runtime refs
-    void set_runtime_refs(P2P* p2p_ptr, Chain* chain_ptr, Mempool* mempool_ptr) { p2p_ = p2p_ptr; chain_ = chain_ptr; mempool_ = mempool_ptr; }
+    void set_runtime_refs(P2P* p2p, Chain* chain, Mempool* mempool) { p2p_ = p2p; chain_ = chain; mempool_ = mempool; }
     void set_ports(uint16_t p2pport, uint16_t rpcport) { p2p_port_ = p2pport; rpc_port_ = rpcport; }
     void set_node_state(NodeState st){ std::lock_guard<std::mutex> lk(mu_); nstate_ = st; }
     void set_datadir(const std::string& d){ std::lock_guard<std::mutex> lk(mu_); datadir_ = d; }
 
-    // logs + telemetry in
+    // logs in
     void feed_logs(const std::deque<LogCapture::Line>& raw_lines) {
         std::lock_guard<std::mutex> lk(mu_);
         if (!paused_) {
             logs_.clear(); logs_.reserve(raw_lines.size());
-            for (auto& L : raw_lines) logs_.push_back(stylize_log(L));
+            for (auto& L : raw_lines){
+                logs_.push_back(stylize_log(L));
+            }
         }
+        // Drain block/tx telemetry
         std::vector<BlockSummary> nb; std::vector<std::string> ntx;
         g_telemetry.drain(nb, ntx);
         for (auto& b : nb) {
-            const bool is_new = recent_blocks_.empty() || recent_blocks_.back().height != b.height || recent_blocks_.back().hash_hex != b.hash_hex;
-            if (is_new) {
+            if (recent_blocks_.empty() || recent_blocks_.back().height != b.height || recent_blocks_.back().hash_hex != b.hash_hex) {
                 recent_blocks_.push_back(b);
-                if (!b.miner.empty()) miner_counts_[b.miner] += 1;
-                while (recent_blocks_.size() > miner_window_) {
-                    const auto& old = recent_blocks_.front();
-                    if (!old.miner.empty()) {
-                        auto it = miner_counts_.find(old.miner);
-                        if (it != miner_counts_.end() && it->second > 0) {
-                            if (--(it->second) == 0) miner_counts_.erase(it);
-                        }
-                    }
-                    recent_blocks_.pop_front();
-                }
                 telemetry_flush_disk(b);
+                while (recent_blocks_.size() > 64) recent_blocks_.pop_front();
             }
         }
         for (auto& t : ntx) {
@@ -1442,14 +1011,11 @@ public:
     void set_hot_warning(const std::string& w){ std::lock_guard<std::mutex> lk(mu_); hot_warning_ = w; hot_warn_ts_ = now_ms(); }
 
 private:
-    // small helper to pick unicode/ASCII safely
-    std::string U(const char* uni, const char* ascii) const { return unicode_ok_ ? std::string(uni) : std::string(ascii); }
-
     // styled lines (0=info 1=warn 2=err 3=trace 4=ok)
-    struct StyledLine { std::string txt; int level; uint64_t ts_ms; };
+    struct StyledLine { std::string txt; int level; };
     StyledLine stylize_log(const LogCapture::Line& L){
         const std::string& s = L.text;
-        StyledLine out{ s, 0, L.ts_ms };
+        StyledLine out{ s, 0 };
         if      (s.find("[FATAL]") != std::string::npos || s.find("[ERROR]") != std::string::npos) out.level=2;
         else if (s.find("[WARN]")  != std::string::npos) out.level=1;
         else if (s.find("accepted block") != std::string::npos || s.find("mined block accepted") != std::string::npos) out.level=4;
@@ -1484,33 +1050,35 @@ private:
         steps_.push_back({title, ok});
     }
 
-    // Color palette helpers
+    // colors
     const char* C_reset() const { return vt_ok_ ? "\x1b[0m" : ""; }
     const char* C_info()  const { return vt_ok_ ? (dark_theme_? "\x1b[36m":"\x1b[34m") : ""; }
     const char* C_warn()  const { return vt_ok_ ? "\x1b[33m" : ""; }
     const char* C_err()   const { return vt_ok_ ? "\x1b[31m" : ""; }
-    const char* C_dim()   const { return vt_ok_ ? (high_contrast_? "\x1b[2m":"\x1b[90m") : ""; }
-    const char* C_head()  const { return vt_ok_ ? (high_contrast_? "\x1b[95m":"\x1b[35m") : ""; }
-    const char* C_ok()    const { return vt_ok_ ? (high_contrast_? "\x1b[92m":"\x1b[32m") : ""; }
+    const char* C_dim()   const { return vt_ok_ ? "\x1b[90m" : ""; }
+    const char* C_head()  const { return vt_ok_ ? (dark_theme_? "\x1b[35m":"\x1b[35m") : ""; }
+    const char* C_ok()    const { return vt_ok_ ? "\x1b[32m" : ""; }
     const char* C_bold()  const { return vt_ok_ ? "\x1b[1m"  : ""; }
 
     static std::string fit(const std::string& s, int w){
-        return truncate_to_width(s, w);
+        if (w <= 0) return std::string();
+        if ((int)s.size() <= w) return s;
+        if (w <= 3) return std::string((size_t)w, '.');
+        return s.substr(0, (size_t)w-3) + "...";
     }
 
-    // compute top miners from rolling map
-    std::vector<std::pair<std::string, size_t>> top_miners(size_t topN, size_t& window) const {
-        window = std::min(miner_window_, (size_t)recent_blocks_.size());
-        std::vector<std::pair<std::string, size_t>> v(miner_counts_.begin(), miner_counts_.end());
-        std::sort(v.begin(), v.end(), [](auto& a, auto& b){
-            if (a.second != b.second) return a.second > b.second;
-            return a.first < b.first;
-        });
-        if (v.size() > topN) v.resize(topN);
-        return v;
+    // recent miner identities (coinbase recipients) over last K blocks in memory
+    size_t distinct_miners_recent(size_t window) const {
+        std::unordered_set<std::string> uniq;
+        size_t n = recent_blocks_.size();
+        size_t start = (n > window) ? (n - window) : 0;
+        for (size_t i = start; i < n; ++i) {
+            const auto& b = recent_blocks_[i];
+            if (!b.miner.empty()) uniq.insert(b.miner);
+        }
+        return uniq.size();
     }
 
-    // ── Key handling ────────────────────────────────────────────────────────
     void key_loop(){
         key_running_ = true;
 #ifdef _WIN32
@@ -1523,11 +1091,10 @@ private:
             }
         }
 #else
+        // raw mode
         termios oldt{};
-        const bool term_ok = (tcgetattr(STDIN_FILENO, &oldt) == 0);
-        termios newt{};
-        if (term_ok){
-            newt = oldt;
+        if (tcgetattr(STDIN_FILENO, &oldt) == 0){
+            termios newt = oldt;
             newt.c_lflag &= ~(ICANON | ECHO);
             newt.c_cc[VMIN]  = 0;
             newt.c_cc[VTIME] = 0;
@@ -1535,11 +1102,13 @@ private:
         }
         while (key_running_){
             unsigned char c=0;
-            const ssize_t n = ::read(STDIN_FILENO, &c, 1);
+            ssize_t n = ::read(STDIN_FILENO, &c, 1);
             if (n == 1) handle_key((int)c);
             else std::this_thread::sleep_for(std::chrono::milliseconds(16));
         }
-        if (term_ok) tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+        // restore
+        // best-effort (ignore failure)
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
 #endif
     }
     void handle_key(int c){
@@ -1550,228 +1119,50 @@ private:
             case 's': case 'S': global::tui_snapshot_requested.store(true); break;
             case 'v': case 'V': global::tui_verbose.store(!global::tui_verbose.load()); break;
             case 'r': case 'R': global::reload_requested.store(true); break;
-            case '?':           global::tui_toggle_help.store(true); break;
-            case 'c': case 'C': global::tui_toggle_compact.store(true); break;
-            case 'g': case 'G': global::tui_toggle_glow.store(true); break;
-            case 'b': case 'B': global::tui_toggle_borders.store(true); break;
-            case 'w': case 'W': global::tui_toggle_wave.store(true); break;
-            case 'l': case 'L': global::tui_toggle_layout_lock.store(true); break;
-            case 'u': case 'U': global::tui_toggle_units.store(true); break;
-            case 'h': case 'H': global::tui_toggle_contrast.store(true); break;
-            case 'x': case 'X': { std::lock_guard<std::mutex> lk(mu_); unicode_ok_ = !unicode_ok_; if (!unicode_ok_) { show_borders_=false; show_wave_=false; glow_=false; } } break;
             default: break;
         }
     }
 
-    // ── Layout primitives (ANSI-aware boxes & tables) ───────────────────────
-    struct ColSpec { int w; bool right; };
-
-    std::vector<std::string> render_box(const std::string& title, const std::vector<std::string>& body, int width){
-        const int w = std::max(8, width);
-        std::vector<std::string> out;
-        if (!show_borders_) {
-            std::string t = std::string(C_bold()) + title + C_reset();
-            out.push_back(pad_right_ansi(t, w));
-            out.push_back(pad_right_ansi(std::string(w, '-'), w));
-            for (auto& l : body) out.push_back(pad_right_ansi(l, w));
-            return out;
-        }
-        if (!unicode_ok_) {
-            // if borders asked but unicode not ok, degrade to ASCII layout header
-            std::string t = std::string(C_bold()) + title + C_reset();
-            out.push_back(pad_right_ansi(t, w));
-            out.push_back(pad_right_ansi(std::string(w, '-'), w));
-            for (auto& l : body) out.push_back(pad_right_ansi(l, w));
-            return out;
-        }
-        std::string cap = " " + title + " ";
-        const int capw = (int)display_width(cap);
-        const int left = (w-2 - capw)/2;
-        const int right = (w-2) - capw - left;
-        std::string top = u8"┌";
-        top += repeat_u8(u8"─", std::max(0,left));
-        top += cap;
-        top += repeat_u8(u8"─", std::max(0,right));
-        top += u8"┐";
-        out.push_back(pad_right_ansi(top, w));
-        for (auto& l : body){
-            std::string inner = pad_right_ansi(l, w-2);
-            out.push_back(std::string(u8"│") + inner + u8"│");
-        }
-        std::string bot = u8"└"; bot += repeat_u8(u8"─", w-2); bot += u8"┘";
-        out.push_back(pad_right_ansi(bot, w));
-        return out;
-    }
-
-    std::vector<std::string> render_table(const std::vector<std::string>& header,
-                                          const std::vector<std::vector<std::string>>& rows_in,
-                                          const std::vector<ColSpec>& colspec,
-                                          int width, bool zebra=false){
-        const int w = std::max(8, width);
-        std::vector<std::string> out;
-        const int inner = (show_borders_ && unicode_ok_) ? (w-2) : w;
-        int sumw=0; for (auto& c: colspec) sumw += c.w;
-        const int gaps = (int)colspec.size()-1;
-        const int padExtra = std::max(0, inner - sumw - gaps);
-        std::vector<int> cw; cw.reserve(colspec.size());
-        for (size_t i=0;i<colspec.size();++i){
-            const int add = (i+1==colspec.size())? padExtra : 0;
-            cw.push_back(colspec[i].w + add);
-        }
-        auto line_from_cells = [&](const std::vector<std::string>& cells)->std::string{
-            std::ostringstream o;
-            if (show_borders_ && unicode_ok_) o << u8"│";
-            for (size_t i=0;i<cells.size() && i<cw.size(); ++i){
-                const bool right = colspec[i].right;
-                const std::string& cell = cells[i];
-                std::string t = truncate_to_width(cell, cw[i]);
-                const int pad = cw[i] - (int)display_width(t);
-                if (right) o << std::string((size_t)pad, ' ') << t;
-                else       o << t << std::string((size_t)pad, ' ');
-                if (i+1 < cells.size()) o << " ";
-            }
-            if (show_borders_ && unicode_ok_) o << u8"│";
-            return pad_right_ansi(o.str(), w);
-        };
-        if (show_borders_ && unicode_ok_){
-            std::string top = u8"┌"; top += repeat_u8(u8"─", inner); top += u8"┐";
-            out.push_back(pad_right_ansi(top, w));
-        }
-        out.push_back(line_from_cells(header));
-        {
-            std::ostringstream u;
-            if (show_borders_ && unicode_ok_) u<<u8"│";
-            for (size_t i=0;i<cw.size();++i){
-                u<<repeat_u8(unicode_ok_?u8"─":"-", cw[i]);
-                if (i+1<cw.size()) u<<" ";
-            }
-            if (show_borders_ && unicode_ok_) u<<u8"│";
-            out.push_back(pad_right_ansi(u.str(), w));
-        }
-        for (size_t r=0; r<rows_in.size(); ++r){
-            std::string ln = line_from_cells(rows_in[r]);
-            if (zebra && (r%2)==1) ln = std::string(C_dim()) + ln + C_reset();
-            out.push_back(ln);
-        }
-        if (show_borders_ && unicode_ok_){
-            std::string bot = u8"└"; bot += repeat_u8(u8"─", inner); bot += u8"┘";
-            out.push_back(pad_right_ansi(bot, w));
-        }
-        return out;
-    }
-
-    // ── Main loop ────────────────────────────────────────────────────────────
     void loop(){
         using clock = std::chrono::steady_clock;
         using namespace std::chrono_literals;
         running_ = true;
         auto last_hs_time = clock::now();
-        auto last_stat_dump = clock::now();
         uint64_t last_stats_ms = now_ms();
         uint64_t last_net_ms   = now_ms();
-
         while (running_) {
             if(global::tui_toggle_theme.exchange(false)) { std::lock_guard<std::mutex> lk(mu_); dark_theme_ = !dark_theme_; }
-            if(global::tui_toggle_help.exchange(false))  { std::lock_guard<std::mutex> lk(mu_); show_help_ = !show_help_; }
-            if(global::tui_toggle_compact.exchange(false)) { std::lock_guard<std::mutex> lk(mu_); compact_ = !compact_; }
-            if(global::tui_toggle_glow.exchange(false))   { std::lock_guard<std::mutex> lk(mu_); glow_ = !glow_; }
-            if(global::tui_toggle_borders.exchange(false)){ std::lock_guard<std::mutex> lk(mu_); show_borders_ = !show_borders_; }
-            if(global::tui_toggle_wave.exchange(false))   { std::lock_guard<std::mutex> lk(mu_); show_wave_ = !show_wave_; }
-            if(global::tui_toggle_layout_lock.exchange(false)){ std::lock_guard<std::mutex> lk(mu_); layout_locked_ = !layout_locked_; }
-            if(global::tui_toggle_units.exchange(false)){ std::lock_guard<std::mutex> lk(mu_); long_units_ = !long_units_; }
-            if(global::tui_toggle_contrast.exchange(false)){ std::lock_guard<std::mutex> lk(mu_); high_contrast_ = !high_contrast_; }
-
             draw_once(false);
-            std::this_thread::sleep_for(std::chrono::milliseconds(vt_ok_ ? 8 : 75));
+            std::this_thread::sleep_for(std::chrono::milliseconds(vt_ok_ ? 8 : 75)); // adaptive
             ++tick_;
-
             if((clock::now()-last_hs_time) > 250ms){
                 last_hs_time = clock::now();
                 std::lock_guard<std::mutex> lk(mu_);
                 spark_hs_.push_back(g_miner_stats.hps.load());
                 if(spark_hs_.size() > 90) spark_hs_.erase(spark_hs_.begin());
-                if (mempool_) {
-                    auto v = mempool_view_fallback(mempool_);
-                    mem_spark_.push_back((double)v.count);
-                    if (mem_spark_.size() > 90) mem_spark_.erase(mem_spark_.begin());
-                }
             }
+            // snapshot hotkey
             if (global::tui_snapshot_requested.exchange(false)) snapshot_to_disk();
+            // periodic stats refresh (for uptime/mem)
             if (now_ms() - last_stats_ms > 1000) last_stats_ms = now_ms();
-
+            // update network hashrate ~1s
             if (now_ms() - last_net_ms > 1000){
                 last_net_ms = now_ms();
-                double avg_bt = 0.0;
-                double nh = estimate_network_hashrate(chain_, &avg_bt);
+                double nh = estimate_network_hashrate(chain_);
                 std::lock_guard<std::mutex> lk(mu_);
-                avg_block_time_ = avg_bt;
-                if (net_hashrate_ == 0.0) net_hashrate_ = nh;
-                else net_hashrate_ = net_hashrate_*0.75 + nh*0.25;
+                net_hashrate_ = nh;
                 net_spark_.push_back(nh);
                 if (net_spark_.size() > 90) net_spark_.erase(net_spark_.begin());
             }
-            if (global::dump_status_json.load() && (clock::now() - last_stat_dump) > 1s) {
-                last_stat_dump = clock::now();
-                dump_status_json();
-            }
         }
-    }
-
-    void dump_status_json(){
-        if (datadir_.empty()) return;
-        std::ostringstream o;
-        const uint64_t height = chain_ ? chain_->height() : 0;
-        std::string tip_hex;
-        long double tip_diff = 0.0L;
-        uint32_t tip_bits = (uint32_t)GENESIS_BITS;
-        if (chain_) {
-            auto t = chain_->tip();
-            tip_hex = to_hex(t.hash);
-            tip_bits = hdr_bits(t);
-            tip_diff = difficulty_from_bits(tip_bits);
-        }
-        size_t miners_window = std::min(miner_window_, (size_t)recent_blocks_.size());
-        auto top = top_miners(8, miners_window);
-
-        MempoolView mv{}; if (mempool_) mv = mempool_view_fallback(mempool_);
-        size_t peers = 0, verack_ok = 0;
-        if (p2p_) {
-            auto ps = p2p_->snapshot_peers();
-            peers = ps.size();
-            for (auto& p : ps) if (p.verack_ok) ++verack_ok;
-        }
-        o << "{";
-        o << "\"t\":"<<now_s()<<",";
-        o << "\"chain\":\""<<CHAIN_NAME<<"\",";        // NOLINT
-        o << "\"height\":"<<height<<",";
-        o << "\"tip\":\""<<tip_hex<<"\",";             // NOLINT
-        o << "\"bits\":"<<tip_bits<<",";
-        o << "\"difficulty\":"<<(double)tip_diff<<",";
-        o << "\"avg_block_time\":"<<avg_block_time_<<",";
-        o << "\"net_hashrate\":"<<net_hashrate_<<",";
-        o << "\"miner_hps\":"<<g_miner_stats.hps.load()<<",";
-        o << "\"miner_threads\":"<<g_miner_stats.threads.load()<<",";
-        o << "\"mempool_txs\":"<<mv.count<<",";
-        o << "\"peers\":"<<peers<<",";
-        o << "\"verack_ok\":"<<verack_ok<<",";
-        o << "\"miners_observed\":"<<miner_counts_.size()<<",";
-        o << "\"top_miners\":[";
-        for (size_t i=0;i<top.size();++i){
-            if (i) o<<",";
-            const auto& [addr,cnt] = top[i];
-            o<<"{\"addr\":\""<<addr<<"\",\"blocks\":"<<cnt<<"}";
-        }
-        o << "]";
-        o << "}\n";
-        write_text_atomic(p_join(datadir_, "status.json"), o.str());
     }
 
     void snapshot_to_disk(){
         if (datadir_.empty()) return;
-        int scols, srows; term::get_winsize(scols, srows);
+        int cols, rows; term::get_winsize(cols, rows);
         std::ostringstream out;
-        out << "MIQROCHAIN Ultra TUI snapshot ("<< now_s() <<")\n";
-        out << "Screen: " << scols << "x" << srows << "\n\n";
+        out << "MIQROCHAIN TUI snapshot ("<< now_s() <<")\n";
+        out << "Screen: " << cols << "x" << rows << "\n\n";
         out << "[System]\n";
         out << "uptime=" << uptime_s_ << "s  rss=" << get_rss_bytes() << " bytes\n";
         out << "[Chain]\n";
@@ -1779,10 +1170,10 @@ private:
         out << "[Peers]\n";
         if (p2p_){ out << "peers=" << p2p_->snapshot_peers().size() << "\n"; }
         out << "\n[Logs tail]\n";
-        const int take = 60;
+        int take = 60;
         int start = (int)logs_.size() - take; if (start < 0) start = 0;
         for (int i=start; i<(int)logs_.size(); ++i) out << logs_[i].txt << "\n";
-        const std::string path = p_join(datadir_, "tui_snapshot.txt");
+        std::string path = p_join(datadir_, "tui_snapshot.txt");
         write_text_atomic(path, out.str());
         hot_message_ = std::string("Snapshot saved -> ") + path;
         hot_msg_ts_ = now_ms();
@@ -1794,73 +1185,60 @@ private:
         return miner_on && node_run;
     }
 
-    // ── One frame render ─────────────────────────────────────────────────────
+    // panels
     void draw_once(bool first){
         std::lock_guard<std::mutex> lk(mu_);
-        int cols_term, rows_term; term::get_winsize(cols_term, rows_term);
-        if (layout_locked_) {
-            if (locked_cols_ == 0) { locked_cols_ = cols_term; locked_rows_ = rows_term; }
-            cols_term = locked_cols_; rows_term = locked_rows_;
-        } else {
-            locked_cols_ = locked_rows_ = 0;
-        }
-        // normalize minimums + symmetry
-        if (cols_term < 116) cols_term = 116;
-        if (rows_term < 36) rows_term = 36;
-        if (cols_term & 1) ++cols_term;
-
-        const int gutter = 1;
-        const int rightw = compact_ ? std::max(46, cols_term/3) : std::max(54, cols_term / 3);
-        const int leftw  = cols_term - rightw - gutter;
+        int cols, rows; term::get_winsize(cols, rows);
+        if (cols < 114) cols = 114;
+        if (rows < 34) rows = 34;
+        const int rightw = std::max(50, cols / 3);
+        const int leftw  = cols - rightw - 3;
 
         std::vector<std::string> left, right;
 
-        // Header
+        // Header bar
         {
-            if (!first && vt_ok_) cw_.write_raw("\x1b[H\x1b[0J");
             std::ostringstream h;
-            h << C_head() << "MIQROCHAIN" << C_reset() << "  Ultra TUI 3.0"
+            if (!first && vt_ok_) h << "\x1b[H\x1b[0J";
+            h << C_head() << (dark_theme_? "MIQROCHAIN":"MIQROCHAIN") << C_reset()
               << "  " << C_dim()
               << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
-              << "  " << U("•", "*") << "  Chain: " << CHAIN_NAME
-              << "  " << "P2P " << p2p_port_ << "  RPC " << rpc_port_
-              << C_reset()
-              << "  " << spinner(unicode_ok_, tick_);
-            left.push_back(pad_right_ansi(h.str(), leftw));
-            if (!banner_.empty()) left.push_back(pad_right_ansi(std::string("  ") + C_info() + banner_ + C_reset(), leftw));
-            if (!hot_message_.empty() && (now_ms() - hot_msg_ts_) < 4000)
-                left.push_back(pad_right_ansi(std::string("  ") + C_warn() + hot_message_ + C_reset(), leftw));
-            if (!compact_ && show_wave_)
-                left.push_back(pad_right_ansi(std::string("  ") + wave_line(leftw-2, tick_, (vt_ok_ && unicode_ok_), dark_theme_?36:34, dark_theme_?32:30), leftw));
+              << "  •  Chain: " << CHAIN_NAME
+              << "  •  P2P " << p2p_port_ << "  •  RPC " << rpc_port_ << C_reset()
+              << "  " << spinner(tick_) ;
+            left.push_back(h.str());
+            left.push_back("");
+            if(!banner_.empty()){
+                left.push_back(std::string("  ") + C_info() + banner_ + C_reset());
+            }
+            if (!hot_message_.empty() && (now_ms() - hot_msg_ts_) < 4000){
+                left.push_back(std::string("  ") + C_warn() + hot_message_ + C_reset());
+            }
+            // Animated gradient wave
+            left.push_back(std::string("  ") + wave_line(leftw-2, tick_, vt_ok_, dark_theme_?36:34, dark_theme_?32:30));
+            left.push_back("");
         }
 
-        // System box
+        // System panel
         {
+            left.push_back(std::string(C_bold()) + "System" + C_reset());
             uptime_s_ = (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_tp_).count();
-            const uint64_t rss = get_rss_bytes();
-            std::vector<std::string> body;
-            std::ostringstream ln1, ln2;
-            ln1 << "uptime: " << fmt_duration((double)uptime_s_);
-            ln1 << "   rss: " << (long_units_? fmt_bytes_full(rss) : fmt_bytes_compact(rss));
-            ln1 << "   hw_threads: " << std::thread::hardware_concurrency();
-            body.push_back(ln1.str());
-            ln2 << "theme: " << (dark_theme_? "dark":"light")
-                << "   contrast: " << (high_contrast_? "high":"normal")
-                << "   logs: " << (paused_? "paused":"live")
-                << "   verbose: " << (global::tui_verbose.load()? "yes":"no")
-                << "   mode: " << (compact_? "compact":"full")
-                << "   borders: " << (show_borders_? "on":"off")
-                << "   unicode: " << (unicode_ok_? "on":"off");
-            body.push_back(ln2.str());
-            auto b = render_box("System", body, leftw);
-            left.insert(left.end(), b.begin(), b.end());
+            uint64_t rss = get_rss_bytes();
+            std::ostringstream ln;
+            ln << "  uptime: " << uptime_s_ << "s"
+               << "   rss: " << fmt_bytes(rss)
+               << "   threads: " << std::thread::hardware_concurrency();
+            left.push_back(ln.str());
+            left.push_back(std::string("  theme: ") + (dark_theme_? "dark":"light")
+                          + "   logs: " + (paused_? "paused":"live")
+                          + "   verbose: " + (global::tui_verbose.load()? "yes":"no"));
+            left.push_back("");
         }
 
-        // Node state box
+        // Node state panel
         {
-            std::vector<std::string> body;
             std::ostringstream s;
-            s << "state: ";
+            s << C_bold() << "Node" << C_reset() << "   State: ";
             NodeState show_state = nstate_;
             if (degraded_override_) show_state = NodeState::Degraded;
             switch(show_state){
@@ -1871,291 +1249,222 @@ private:
                 case NodeState::Quitting: s << C_warn() << "shutting down" << C_reset(); break;
             }
             if (miner_running_badge()){
-                s << "   " << C_bold() << C_ok() << (unicode_ok_ ? u8"⛏ RUNNING" : "[MINER RUNNING]") << C_reset();
+                s << "   " << C_bold() << C_ok() << "⛏ RUNNING" << C_reset();
             }
-            body.push_back(s.str());
-            auto b = render_box("Node", body, leftw);
-            left.insert(left.end(), b.begin(), b.end());
+            left.push_back(s.str());
+            left.push_back("");
         }
 
-        // Startup progress box
+        // Startup progress
         {
-            size_t total = steps_.size(), okc = 0; for (auto& s : steps_) if (s.second) ++okc;
-            const double frac = (double)okc / std::max<size_t>(1,total);
-            const int bw = std::max(10, leftw-4);
-            std::vector<std::string> body;
+            left.push_back(std::string(C_bold()) + "Startup" + C_reset());
+            size_t total = steps_.size(), okc = 0;
+            for (auto& s : steps_) if (s.second) ++okc;
+            int bw = std::max(10, leftw - 20);
+            double frac = (double)okc / std::max<size_t>(1,total);
             std::ostringstream progress;
-            const bool fancy = vt_ok_ && unicode_ok_;
-            progress << bar(std::min(60,bw), frac, fancy, dark_theme_?36:34, dark_theme_?32:30, glow_)
-                     << "  " << okc << "/" << total << " completed";
-            if (eta_secs_ > 0 && frac < 0.999)
+            progress << "  " << bar(bw, frac, vt_ok_, dark_theme_?36:34, dark_theme_?32:30) << "  "
+                     << okc << "/" << total << " completed";
+            if (eta_secs_ > 0 && frac < 0.999){
                 progress << "  " << C_dim() << "(~" << std::fixed << std::setprecision(1) << eta_secs_ << "s)" << C_reset();
-            body.push_back(progress.str());
-            if (!compact_) {
-                for (auto& s : steps_) {
-                    const bool ok = s.second;
-                    const bool failed = failures_.count(s.first) > 0;
-                    std::ostringstream ln;
-                    if (ok)         ln << C_ok()  << " [OK]   " << C_reset();
-                    else if (failed)ln << C_err() << " [FAIL] " << C_reset();
-                    else            ln << C_dim() << " [..]   " << C_reset();
-                    ln << s.first;
-                    body.push_back(ln.str());
-                }
             }
-            auto b = render_box("Startup", body, leftw);
-            left.insert(left.end(), b.begin(), b.end());
+            left.push_back(progress.str());
+            for (auto& s : steps_) {
+                bool ok = s.second;
+                bool failed = failures_.count(s.first) > 0;
+                std::ostringstream ln;
+                ln << "    ";
+                if (ok)         ln << C_ok()  << "[OK]    " << C_reset();
+                else if (failed)ln << C_err() << "[FAIL]  " << C_reset();
+                else            ln << C_dim() << "[..]    " << C_reset();
+                ln << s.first;
+                left.push_back(ln.str());
+            }
+            left.push_back("");
         }
 
-        // Chain status + recent blocks table
+        // Chain status
         {
-            const uint64_t height = chain_ ? chain_->height() : 0;
+            left.push_back(std::string(C_bold()) + "Chain" + C_reset());
+            uint64_t height = chain_ ? chain_->height() : 0;
             std::string tip_hex;
             long double tip_diff = 0.0L;
-            uint32_t tip_bits = (uint32_t)GENESIS_BITS;
             if (chain_) {
                 auto t = chain_->tip();
                 tip_hex = to_hex(t.hash);
-                tip_bits = hdr_bits(t);
-                tip_diff = difficulty_from_bits(tip_bits);
+                tip_diff = difficulty_from_bits(hdr_bits(t));
             }
-            std::vector<std::string> top;
-            {
-                std::ostringstream line1;
-                line1 << "height: " << commas_u64(height) << "   tip: " << short_hex(tip_hex, 12);
-                top.push_back(line1.str());
-                std::ostringstream line2;
-                line2 << "difficulty: " << fmt_diff(tip_diff)
-                      << "   net hashrate: " << (long_units_ ? fmt_hs_full(net_hashrate_) : fmt_hs_compact(net_hashrate_));
-                top.push_back(line2.str());
-                const uint64_t blocks_into_epoch = (MIQ_RETARGET_INTERVAL ? (height % MIQ_RETARGET_INTERVAL) : 0);
-                const uint64_t blocks_to_retarget = MIQ_RETARGET_INTERVAL ? (MIQ_RETARGET_INTERVAL - blocks_into_epoch) : 0;
-                const double eta_retarget_s = avg_block_time_ * (double)blocks_to_retarget;
-                std::ostringstream rt; rt<<"retarget in: "<<blocks_to_retarget<<" blocks (~"<<fmt_duration(eta_retarget_s)<<")";
-                top.push_back(rt.str());
-                top.push_back(std::string("trend: ") + spark_ascii(net_spark_));
-            }
-            auto head = std::vector<std::string>{"Hgt","Txs","Fees","Hash","Miner"};
-            std::vector<ColSpec> colspec_chain = { {8,true},{6,true},{10,true},{12,false},{20,false} };
-            std::vector<std::vector<std::string>> rows_chain;
-            const size_t N = recent_blocks_.size();
-            const size_t show = std::min<size_t>(compact_?6:8, N);
+            left.push_back(std::string("  height: ") + std::to_string(height)
+                          + "   tip: " + short_hex(tip_hex, 12));
+            left.push_back(std::string("  difficulty: ") + fmt_diff(tip_diff)
+                          + "   net hashrate: " + fmt_hs(net_hashrate_));
+            left.push_back(std::string("  trend:      ") + spark_ascii(net_spark_));
+            // recent blocks
+            size_t N = recent_blocks_.size();
+            size_t show = std::min<size_t>(8, N);
             for (size_t i=0;i<show;i++){
                 const auto& b = recent_blocks_[N-1-i];
-                rows_chain.push_back({
-                    std::to_string(b.height),
-                    b.tx_count ? std::to_string(b.tx_count) : std::string("?"),
-                    b.fees_known ? commas_u64(b.fees) : std::string("?"),
-                    short_hex(b.hash_hex.empty()? "(?)":b.hash_hex, 12),
-                    b.miner.empty()? "(unknown)": b.miner
-                });
+                std::ostringstream ln;
+                ln << "  h=" << b.height
+                   << "  txs=" << (b.tx_count ? std::to_string(b.tx_count) : std::string("?"))
+                   << "  fees=" << (b.fees_known ? std::to_string(b.fees) : std::string("?"))
+                   << "  hash=" << short_hex(b.hash_hex.empty() ? std::string("(?)") : b.hash_hex, 12);
+                if (!b.miner.empty()) ln << "  miner=" << b.miner;
+                left.push_back(ln.str());
             }
-            auto chain_box = render_box("Chain", top, leftw);
-            left.insert(left.end(), chain_box.begin(), chain_box.end());
-            if (show > 0){
-                auto tbl = render_table(head, rows_chain, colspec_chain, leftw, /*zebra=*/true);
-                left.insert(left.end(), tbl.begin(), tbl.end());
-            }
+            if (N==0) left.push_back("  (no blocks yet)");
+            left.push_back("");
         }
 
-        // ─ Right column boxes ────────────────────────────────────────────────
+        // Right column: Network/Mempool/Miner/Health/Logs
         // Network
         if (p2p_) {
+            right.push_back(std::string(C_bold()) + "Network" + C_reset());
             auto peers = p2p_->snapshot_peers();
+
+            // Sort peers: verack_ok first, lowest latency, lowest rxbuf, lowest inflight
             std::stable_sort(peers.begin(), peers.end(), [](const auto& a, const auto& b){
                 if (a.verack_ok != b.verack_ok) return a.verack_ok > b.verack_ok;
                 if (a.last_seen_ms != b.last_seen_ms) return a.last_seen_ms < b.last_seen_ms;
                 if (a.rx_buf != b.rx_buf) return a.rx_buf < b.rx_buf;
                 return a.inflight < b.inflight;
             });
-            const size_t peers_n = peers.size();
+
+            size_t peers_n = peers.size();
             size_t inflight_tx = 0, rxbuf_sum = 0, awaiting_pongs = 0, verack_ok = 0;
             for (auto& s : peers) { inflight_tx += (size_t)s.inflight; rxbuf_sum += (size_t)s.rx_buf; if (s.awaiting_pong) ++awaiting_pongs; if (s.verack_ok) ++verack_ok; }
-            std::vector<std::string> sline;
-            {
-                std::ostringstream ss;
-                ss << "peers: " << peers_n
-                   << "   verack_ok: " << verack_ok
-                   << "   inflight: " << inflight_tx
-                   << "   rxbuf: " << rxbuf_sum
-                   << "   pings-waiting: " << awaiting_pongs;
-                sline.push_back(ss.str());
-            }
-            auto box_hdr = render_box("Network", sline, rightw);
-            right.insert(right.end(), box_hdr.begin(), box_hdr.end());
-
-            // Table
-            std::vector<std::string> head = {"IP","ok","last(ms)","rx","inflight"};
-            std::vector<ColSpec> colspec_peers = { {18,false},{4,false},{9,true},{7,true},{8,true} };
-            std::vector<std::vector<std::string>> rows_peers;
-            const size_t showp = std::min(peers.size(), (size_t)(compact_?6:8));
-            for (size_t i=0;i<showp; ++i) {
+            right.push_back(std::string("  peers: ") + std::to_string(peers_n)
+                            + "   verack_ok: " + std::to_string(verack_ok)
+                            + "   inflight: " + std::to_string(inflight_tx)
+                            + "   rxbuf: " + std::to_string(rxbuf_sum)
+                            + "   pings-waiting: " + std::to_string(awaiting_pongs));
+            // show top peers table
+            std::ostringstream hdr;
+            hdr << "    " << std::left << std::setw(18) << "IP"
+                << " " << std::setw(5) << "ok"
+                << " " << std::setw(8) << "last(ms)"
+                << " " << std::setw(7) << "rx"
+                << " " << std::setw(8) << "inflight";
+            right.push_back(hdr.str());
+            size_t show = std::min(peers.size(), (size_t)8);
+            for (size_t i=0;i<show; ++i) {
                 const auto& s = peers[i];
-                std::string ip = s.ip; if ((int)display_width(ip) > 18) ip = pad_right_ansi(ip.substr(0,15) + "...", 18);
-                rows_peers.push_back({
-                    ip,
-                    s.verack_ok ? (std::string(C_ok()) + "ok" + C_reset()) : (std::string(C_warn()) + ".." + C_reset()),
-                    std::to_string((uint64_t)s.last_seen_ms),
-                    std::to_string((uint64_t)s.rx_buf),
-                    std::to_string((uint64_t)s.inflight)
-                });
+                std::string ip = s.ip; if ((int)ip.size() > 18) ip = ip.substr(0,15) + "...";
+                std::ostringstream ln;
+                ln << "    " << std::left << std::setw(18) << ip
+                   << " " << std::setw(5) << (s.verack_ok ? (std::string(C_ok()) + "ok" + C_reset()) : (std::string(C_warn()) + ".." + C_reset()))
+                   << " " << std::right << std::setw(8) << (uint64_t)s.last_seen_ms
+                   << " " << std::setw(7) << (uint64_t)s.rx_buf
+                   << " " << std::setw(8) << (uint64_t)s.inflight;
+                right.push_back(ln.str());
             }
-            auto tbl = render_table(head, rows_peers, colspec_peers, rightw, /*zebra=*/true);
-            right.insert(right.end(), tbl.begin(), tbl.end());
+            if (peers.size() > show) right.push_back(std::string("    ... +") + std::to_string(peers.size()-show) + " more");
+            right.push_back("");
         }
 
-        // Mempool
+        // Mempool (resilient to API)
         if (mempool_) {
+            right.push_back(std::string(C_bold()) + "Mempool" + C_reset());
             auto stat = mempool_view_fallback(mempool_);
-            std::vector<std::string> lines;
-            std::ostringstream l1;
-            l1 << "txs: " << commas_u64(stat.count);
-            if (stat.bytes) l1 << "   bytes: " << (long_units_? fmt_bytes_full(stat.bytes) : fmt_bytes_compact(stat.bytes));
-            if (stat.recent_adds) l1 << "   recent_adds: " << commas_u64(stat.recent_adds);
-            lines.push_back(l1.str());
-            lines.push_back(std::string("trend: ") + spark_ascii(mem_spark_));
-            auto b = render_box("Mempool", lines, rightw);
-            right.insert(right.end(), b.begin(), b.end());
+            right.push_back(std::string("  txs: ") + std::to_string(stat.count)
+                            + (stat.bytes? (std::string("   bytes: ") + fmt_bytes(stat.bytes)) : std::string())
+                            + (stat.recent_adds? (std::string("   recent_adds: ") + std::to_string(stat.recent_adds)) : std::string()));
+            right.push_back("");
         }
 
-        // Mining (telemetry + external miner heartbeat)
+        // Miner
         {
-            const bool active = g_miner_stats.active.load();
-            const unsigned thr = g_miner_stats.threads.load();
-            const uint64_t ok  = g_miner_stats.accepted.load();
-            const uint64_t rej = g_miner_stats.rejected.load();
-            const double   hps = g_miner_stats.hps.load();
-            long double tip_diff = 0.0L;
-            if (chain_) tip_diff = difficulty_from_bits(hdr_bits(chain_->tip()));
+            right.push_back(std::string(C_bold()) + "Mining" + C_reset());
+            bool active = g_miner_stats.active.load();
+            unsigned thr = g_miner_stats.threads.load();
+            uint64_t ok  = g_miner_stats.accepted.load();
+            uint64_t rej = g_miner_stats.rejected.load();
+            double   hps = g_miner_stats.hps.load();
 
-            std::vector<std::string> body;
-            {
-                std::ostringstream m1;
-                m1 << "status: " << (active ? (std::string(C_ok()) + "running" + C_reset()) : (std::string(C_dim()) + "idle" + C_reset()))
-                   << "   threads: " << thr
-                   << "   ext: " << (g_extminer.alive.load() ? (std::string(C_ok()) + "alive" + C_reset()) : (std::string(C_dim()) + (unicode_ok_? "—":"-") + C_reset()));
-                body.push_back(m1.str());
-                std::ostringstream m2; m2 << "accepted: " << commas_u64(ok) << "   rejected: " << commas_u64(rej); body.push_back(m2.str());
-                body.push_back(std::string("miner hashrate: ") + (long_units_? fmt_hs_full(hps) : fmt_hs_compact(hps)));
-                body.push_back(std::string("miner trend:    ") + spark_ascii(spark_hs_));
-                double share = (net_hashrate_ > 0.0) ? (hps / net_hashrate_) * 100.0 : 0.0;
-                if (share < 0.0) {
-                    share = 0.0;
-                }
-                if (share > 100.0) {
-                    share = 100.0;
-                }
-                std::ostringstream m3; m3 << "network (est):  " << (long_units_? fmt_hs_full(net_hashrate_) : fmt_hs_compact(net_hashrate_))
-                                          << "   your share: " << fmt_pct(share, 3);
-                body.push_back(m3.str());
-                const double ettf_s = (hps > 0.0) ? (double)(tip_diff * 4294967296.0L) / hps : 0.0;
-                body.push_back(std::string("ETTF (your rig): ") + (hps>0.0 ? fmt_duration(ettf_s) : std::string(unicode_ok_? "—":"-")));
-            }
-            auto b = render_box("Mining", body, rightw);
-            right.insert(right.end(), b.begin(), b.end());
-        }
-
-        // Miners census
-        {
-            size_t window=0;
-            auto top = top_miners(compact_?4:8, window);
-            std::vector<std::string> head = {"addr(short)","blocks","share"};
-            std::vector<ColSpec> colspec_miners = { {18,false},{7,true},{7,true} };
-            std::vector<std::vector<std::string>> rows_miners;
-            for (auto& [addr, cnt] : top){
-                const double pct = window? (100.0 * (double)cnt / (double)window) : 0.0;
-                rows_miners.push_back({
-                    fit(addr, 18),
-                    std::to_string(cnt),
-                    fmt_pct(pct, 2)
-                });
-            }
-            std::vector<std::string> info;
-            {
-                std::ostringstream h;
-                h << "distinct: " << miner_counts_.size() << " / last " << window << " blocks";
-                info.push_back(h.str());
-                info.push_back(std::string(C_dim()) + "* local observation only" + C_reset());
-            }
-            auto hdr = render_box("Miners (observed)", info, rightw);
-            right.insert(right.end(), hdr.begin(), hdr.end());
-            if (!rows_miners.empty()){
-                auto tbl = render_table(head, rows_miners, colspec_miners, rightw, /*zebra=*/true);
-                right.insert(right.end(), tbl.begin(), tbl.end());
-            }
+            std::ostringstream m1;
+            m1 << "  status: " << (active ? (std::string(C_ok()) + "running" + C_reset()) : (std::string(C_dim()) + "idle" + C_reset()))
+               << "   threads: " << thr
+               << "   ext: " << (g_extminer.alive.load() ? (std::string(C_ok()) + "alive" + C_reset()) : (std::string(C_dim()) + "—" + C_reset()));
+            right.push_back(m1.str());
+            std::ostringstream m2; m2 << "  accepted: " << ok << "   rejected: " << rej; right.push_back(m2.str());
+            right.push_back(std::string("  miner hashrate: ") + fmt_hs(hps));
+            right.push_back(std::string("  miner trend:    ") + spark_ascii(spark_hs_));
+            // network & share
+            double share = (net_hashrate_ > 0.0) ? (hps / net_hashrate_) * 100.0 : 0.0;
+            if (share < 0.0) share = 0.0;
+            if (share > 100.0) share = 100.0;
+            std::ostringstream m3; m3 << "  network (est):  " << fmt_hs(net_hashrate_)
+                                      << "   your share: " << std::fixed << std::setprecision(3) << share << "%";
+            right.push_back(m3.str());
+            // observed miners (distinct coinbase recipients) over recent window
+            size_t miners_obs = distinct_miners_recent(64);
+            std::ostringstream m4; m4 << "  miners observed (last 64 blks): " << miners_obs;
+            right.push_back(m4.str());
+            right.push_back(std::string("  ") + C_dim() + "* count = distinct coinbase recipients seen by this node" + C_reset());
+            right.push_back("");
         }
 
         // Health/Security
         {
-            std::vector<std::string> body;
-            body.push_back(std::string("config reload: ") + (global::reload_requested.load()? "pending":U("—","-")));
-            body.push_back(std::string("status.json: ") + (global::dump_status_json.load()? "enabled":"disabled"));
-            if (!hot_warning_.empty() && now_ms()-hot_warn_ts_ < 6000)
-                body.push_back(std::string(C_warn()) + hot_warning_ + C_reset());
-            if (!datadir_.empty())
-                body.push_back(std::string("datadir: ") + datadir_);
-            auto b = render_box("Health & Security", body, rightw);
-            right.insert(right.end(), b.begin(), b.end());
+            right.push_back(std::string(C_bold()) + "Health & Security" + C_reset());
+            right.push_back(std::string("  config reload: ") + (global::reload_requested.load()? "pending":"—"));
+            if (!hot_warning_.empty() && now_ms()-hot_warn_ts_ < 6000){
+                right.push_back(std::string("  ") + C_warn() + hot_warning_ + C_reset());
+            }
+            if (!datadir_.empty()){
+                right.push_back(std::string("  datadir: ") + datadir_);
+            }
+            right.push_back("");
         }
 
         // Recent TXIDs
-        if (!compact_) {
-            std::vector<std::string> body;
-            if (recent_txids_.empty()) body.push_back("(no txids yet)");
-            const size_t n = std::min<size_t>(recent_txids_.size(), 10);
+        {
+            right.push_back(std::string(C_bold()) + "Recent TXIDs" + C_reset());
+            if (recent_txids_.empty()) right.push_back("  (no txids yet)");
+            size_t n = std::min<size_t>(recent_txids_.size(), 10);
             for (size_t i=0;i<n;i++){
-                body.push_back(short_hex(recent_txids_[recent_txids_.size()-1-i], 20));
+                right.push_back(std::string("  ") + short_hex(recent_txids_[recent_txids_.size()-1-i], 20));
             }
-            auto b = render_box("Recent TXIDs", body, rightw);
-            right.insert(right.end(), b.begin(), b.end());
+            right.push_back("");
         }
 
-        // Compose two columns with ANSI-aware padding
+        // Compose two columns
         std::ostringstream out;
-        const size_t NL = left.size(), NR = right.size(), N = std::max(NL, NR);
+        size_t NL = left.size(), NR = right.size(), N = std::max(NL, NR);
         for (size_t i=0;i<N;i++){
-            std::string l = (i<NL) ? pad_right_ansi(left[i], leftw) : std::string((size_t)leftw, ' ');
-            std::string r = (i<NR) ? pad_right_ansi(right[i], rightw) : std::string((size_t)rightw, ' ');
-            out << l << std::string((size_t)gutter, ' ') << r << "\n";
+            std::string l = (i<NL) ? left[i] : "";
+            std::string r = (i<NR) ? right[i] : "";
+            if ((int)l.size() > leftw)  l = fit(l, leftw);
+            if ((int)r.size() > rightw) r = fit(r, rightw);
+            out << std::left << std::setw(leftw) << l << " | " << r << "\n";
         }
 
-        // Footer + logs/help
-        out << pad_right_ansi((unicode_ok_?repeat_u8(u8"─", cols_term):std::string((size_t)cols_term,'-')), cols_term) << "\n";
-        if (show_help_) {
-            std::string help = std::string(C_bold()) + "Help" + C_reset() + "  "
-                "q=quit  t=theme  h=contrast  p=pause logs  r=reload config  s=snapshot  v=verbose  "
-                "?=help  c=compact  g=glow  b=borders  w=wave  l=lock layout  u=units  x=unicode on/off";
-            out << pad_right_ansi(help, cols_term) << "\n";
-        } else if (nstate_ == NodeState::Quitting){
-            std::string s1 = std::string(C_bold()) + "Shutting down" + C_reset() + "  " + C_dim() + "(Ctrl+C again = force)" + C_reset();
-            out << pad_right_ansi(s1, cols_term) << "\n";
-            const std::string phase = shutdown_phase_.empty() ? "initiating..." : shutdown_phase_;
-            out << pad_right_ansi(std::string("  phase: ") + phase, cols_term) << "\n";
+        // Footer + logs or shutdown status
+        out << std::string((size_t)cols, '-') << "\n";
+        if (nstate_ == NodeState::Quitting){
+            out << C_bold() << "Shutting down" << C_reset() << "  " << C_dim() << "(Ctrl+C again = force)" << C_reset() << "\n";
+            std::string phase = shutdown_phase_.empty() ? "initiating…" : shutdown_phase_;
+            out << "  phase: " << phase << "\n";
         } else {
-            std::string h = std::string(C_bold()) + "Logs" + C_reset() + "  " + C_dim() + "(q,t,h,p,r,s,v,?,c,g,b,w,l,u,x)" + C_reset();
-            out << pad_right_ansi(h, cols_term) << "\n";
+            out << C_bold() << "Logs" << C_reset() << "  " << C_dim() << "(q=quit t=theme p=pause r=reload s=snap v=verbose)" << C_reset() << "\n";
         }
-
-        // logs (timestamped, ANSI-aware)
-        const int header_rows = (int)N + 2;
-        int remain = rows_term - header_rows - 3;
+        // logs
+        int header_rows = (int)N + 2;
+        int remain = rows - header_rows - 3;
         if (remain < 8) remain = 8;
         int start = (int)logs_.size() - remain;
         if (start < 0) start = 0;
         for (int i=start; i<(int)logs_.size(); ++i) {
             const auto& line = logs_[i];
-            const double dt = (double)(line.ts_ms - base_ts_ms_) / 1000.0;
-            std::ostringstream pref; pref<<std::fixed<<std::setprecision(3)<<std::setw(8)<<dt<<"s ";
-            const std::string txt = pref.str() + line.txt;
             switch(line.level){
-                case 2: out << pad_right_ansi(std::string(C_err())  + txt + C_reset(), cols_term) << "\n"; break;
-                case 1: out << pad_right_ansi(std::string(C_warn()) + txt + C_reset(), cols_term) << "\n"; break;
-                case 3: out << pad_right_ansi(std::string(C_dim())  + txt + C_reset(), cols_term) << "\n"; break;
-                case 4: out << pad_right_ansi(std::string(C_ok())   + txt + C_reset(), cols_term) << "\n"; break;
-                default: out << pad_right_ansi(txt, cols_term) << "\n"; break;
+                case 2: out << C_err()  << line.txt << C_reset() << "\n"; break;
+                case 1: out << C_warn() << line.txt << C_reset() << "\n"; break;
+                case 3: out << C_dim()  << line.txt << C_reset() << "\n"; break;
+                case 4: out << C_ok()   << line.txt << C_reset() << "\n"; break;
+                default: out << line.txt << "\n"; break;
             }
         }
-        const int printed = (int)logs_.size() - start;
+        int printed = (int)logs_.size() - start;
         for (int i=printed; i<remain; ++i) out << "\n";
         cw_.write_raw(out.str());
     }
@@ -2163,7 +1472,6 @@ private:
 private:
     bool enabled_{true};
     bool vt_ok_{true};
-    bool unicode_ok_{true};
     std::atomic<bool> running_{false};
     std::atomic<bool> key_running_{false};
     std::thread thr_, key_thr_;
@@ -2183,42 +1491,23 @@ private:
     ConsoleWriter cw_;
     int  tick_{0};
     NodeState nstate_{NodeState::Starting};
-
-    // telemetry caches
     std::deque<BlockSummary> recent_blocks_;
     std::deque<std::string>  recent_txids_;
     std::unordered_set<std::string> recent_txid_set_;
-    std::unordered_map<std::string, size_t> miner_counts_;
-    size_t miner_window_{256};
-
-    // trends/sparks
     std::vector<double> spark_hs_;
     std::vector<double> net_spark_;
-    std::vector<double> mem_spark_;
-
     double net_hashrate_{0.0};
-    double avg_block_time_{(double)BLOCK_TIME_SECS};
     double eta_secs_{0.0};
     std::string shutdown_phase_;
     int shutdown_ok_{0};
     bool dark_theme_{true};
-    bool high_contrast_{false};
     bool paused_{false};
     bool degraded_override_{false};
-    bool show_help_{false};
-    bool compact_{false};
-    bool glow_{false};
-    bool show_borders_{true};
-    bool show_wave_{true};
-    bool layout_locked_{false};
-    bool long_units_{false};
-
-    int  locked_cols_{0}, locked_rows_{0};
-    uint64_t base_ts_ms_{0};
     std::chrono::steady_clock::time_point start_tp_{std::chrono::steady_clock::now()};
     uint64_t uptime_s_{0};
     std::string hot_message_;
     uint64_t hot_msg_ts_{0};
+
     std::string hot_warning_;
     uint64_t hot_warn_ts_{0};
 };
@@ -2227,12 +1516,146 @@ private:
 /*                          Fatal terminate hook                                */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 static void fatal_terminate() noexcept {
-    std::fputs("[FATAL] std::terminate() called (background) — suppressing abort, initiating shutdown\n", stderr);
+    std::fputs("[FATAL] std::terminate() called (background) - initiating shutdown\n", stderr);
     request_shutdown("terminate");
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
-// (BUILT-IN MINER REMOVED ENTIRELY)
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+/*                               Miner worker                                   */
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+static uint64_t sum_coinbase_outputs(const Block& b) {
+    if (b.txs.empty()) return 0;
+    uint64_t s = 0; for (const auto& o : b.txs[0].vout) s += o.value; return s;
+}
+static void miner_worker(Chain* chain, Mempool* mempool, P2P* p2p,
+                         const std::vector<uint8_t> mine_pkh,
+                         unsigned threads) {
+    g_miner_stats.active.store(true);
+    g_miner_stats.threads.store(threads);
+    g_miner_stats.start = std::chrono::steady_clock::now();
+
+    std::random_device rd;
+    const uint64_t seed =
+        uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count()) ^
+        uint64_t(rd()) ^
+        uint64_t(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    std::mt19937_64 gen(seed);
+
+    const size_t kBlockMaxBytes = 900 * 1024;
+
+    while (!global::shutdown_requested.load()) {
+        try {
+            auto t = chain->tip();
+            // coinbase
+            Transaction cbt; TxIn cin; cin.prev.txid = std::vector<uint8_t>(32, 0); cin.prev.vout = 0;
+            cbt.vin.push_back(cin);
+            TxOut cbout; cbout.value = chain->subsidy_for_height(t.height + 1);
+            if (mine_pkh.size() != 20) {
+                log_error(std::string("miner assign pkh fatal: pkh size != 20 (got ") + std::to_string(mine_pkh.size()) + ")");
+                std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                continue;
+            }
+            cbout.pkh.resize(20);
+            std::memcpy(cbout.pkh.data(), mine_pkh.data(), 20);
+            cbt.vout.push_back(cbout);
+            cbt.lock_time = static_cast<uint32_t>(t.height + 1);
+
+            const uint32_t ch = static_cast<uint32_t>(t.height + 1);
+            const uint32_t now = static_cast<uint32_t>(time(nullptr));
+            const uint64_t extraNonce = gen();
+            std::vector<uint8_t> tag; tag.reserve(1+4+4+8);
+            tag.push_back(0x01);
+            tag.push_back(uint8_t(ch      & 0xff)); tag.push_back(uint8_t((ch>>8) & 0xff));
+            tag.push_back(uint8_t((ch>>16)& 0xff)); tag.push_back(uint8_t((ch>>24)& 0xff));
+            tag.push_back(uint8_t(now      & 0xff)); tag.push_back(uint8_t((now>>8) & 0xff));
+            tag.push_back(uint8_t((now>>16)& 0xff)); tag.push_back(uint8_t((now>>24)& 0xff));
+            for (int i=0;i<8;i++) tag.push_back(uint8_t((extraNonce >> (8*i)) & 0xff));
+            cbt.vin[0].sig = std::move(tag);
+
+            // pack txs
+            std::vector<Transaction> txs;
+            try {
+                const size_t coinbase_sz = ser_tx(cbt).size();
+                const size_t budget = (kBlockMaxBytes > coinbase_sz) ? (kBlockMaxBytes - coinbase_sz) : 0;
+                auto cands = mempool->collect(120000);
+                size_t used=0;
+                for (auto& tx : cands) {
+                    size_t sz = ser_tx(tx).size();
+                    if (used + sz > budget) continue;
+                    txs.emplace_back(std::move(tx));
+                    used += sz;
+                    if (used >= budget) break;
+                }
+            } catch(...) { txs.clear(); }
+
+            // mine (using available API)
+            Block b;
+            try {
+                auto last = chain->last_headers(MIQ_RETARGET_INTERVAL);
+                uint32_t nb = miq::epoch_next_bits(
+                    last, BLOCK_TIME_SECS, GENESIS_BITS,
+                    /*next_height=*/ t.height + 1, /*interval=*/ MIQ_RETARGET_INTERVAL);
+                b = miq::mine_block(t.hash, nb, cbt, txs, threads);
+            } catch (...) {
+                log_error("miner mine_block fatal");
+                continue;
+            }
+
+            // submit
+            try {
+                std::string err;
+                if (chain->submit_block(b, err)) {
+                    std::string miner_addr = "(unknown)";
+                    std::string cb_txid_hex = "(n/a)";
+                    if (!b.txs.empty()) {
+                        cb_txid_hex = to_hex(b.txs[0].txid());
+                        if (!b.txs[0].vout.empty() && b.txs[0].vout[0].pkh.size()==20) {
+                            miner_addr = base58check_encode(VERSION_P2PKH, b.txs[0].vout[0].pkh);
+                        }
+                    }
+                    int noncb = (int)b.txs.size() - 1;
+                    g_miner_stats.accepted.fetch_add(1);
+                    g_miner_stats.last_height_ok.store(t.height + 1);
+                    g_miner_stats.last_height_rx.store(t.height + 1);
+
+                    BlockSummary bs;
+                    bs.height    = t.height + 1;
+                    bs.hash_hex  = to_hex(b.block_hash());
+                    bs.tx_count  = (uint32_t)b.txs.size();
+                    uint64_t coinbase_total = sum_coinbase_outputs(b);
+                    uint64_t subsidy = chain->subsidy_for_height(bs.height);
+                    if (coinbase_total >= subsidy) { bs.fees = coinbase_total - subsidy; bs.fees_known = true; }
+                    bs.miner = miner_addr;
+                    g_telemetry.push_block(bs);
+                    if (noncb > 0) {
+                        std::vector<std::string> txids; txids.reserve((size_t)noncb);
+                        for (size_t i=1;i<b.txs.size();++i) txids.push_back(to_hex(b.txs[i].txid()));
+                        g_telemetry.push_txids(txids);
+                    }
+
+                    log_info("mined block accepted, height=" + std::to_string(bs.height)
+                             + ", miner=" + miner_addr
+                             + ", coinbase_txid=" + cb_txid_hex
+                             + ", txs=" + std::to_string(std::max(0, noncb))
+                             + (bs.fees_known ? (", fees=" + std::to_string(bs.fees)) : ""));
+                    if (!global::shutdown_requested.load() && p2p) {
+                        p2p->announce_block_async(b.block_hash());
+                    }
+                } else {
+                    g_miner_stats.rejected.fetch_add(1);
+                    log_warn(std::string("mined block rejected: ") + err);
+                }
+            } catch (...) {
+                log_error("miner submit_block fatal");
+            }
+
+        } catch (...) {
+            log_error("miner outer fatal");
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        }
+    }
+}
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 /*                                     CLI                                     */
@@ -2242,23 +1665,18 @@ static void print_usage(){
       << "miqrod (node) options:\n"
       << "  --conf=<path>                                config file (key=value)\n"
       << "  --datadir=<path>                             data directory (overrides config)\n"
-      << "  --no-tui                                     disable the Ultra TUI (plain logs)\n"
+      << "  --no-tui                                     disable the Pro TUI (plain logs)\n"
       << "  --genaddress                                 generate ECDSA-P2PKH address (priv/pk/address)\n"
       << "  --buildtx <priv_hex> <prev_txid_hex> <vout> <value> <to_address>  (prints txhex)\n"
       << "  --reindex_utxo                               rebuild chainstate/UTXO from current chain\n"
-      << "  --mine                                       [disabled] built-in miner removed; use an external miner\n"
+      << "  --mine                                       run built-in miner (interactive address prompt)\n"
       << "  --telemetry                                  write block accepts to telemetry.ndjson in datadir\n"
       << "\n"
       << "Env:\n"
       << "  MIQ_NO_TUI=1               disables the TUI; plain logs\n"
-      << "  MIQ_MINER_THREADS          (ignored; built-in miner removed)\n"
+      << "  MIQ_MINER_THREADS          overrides miner thread count\n"
       << "  MIQ_RPC_TOKEN              if set, HTTP gate token (synced to .cookie on start)\n"
-      << "  MIQ_MINER_HEARTBEAT        path to heartbeat file for external miner presence\n"
-      << "  MIQ_LOCK_RETRIES           retries when lock is busy (default 2)\n"
-      << "  MIQ_LOCK_WAIT_MS           ms to wait between lock retries (default 250ms)\n"
-      << "  MIQ_STEAL_LOCK=1           forcibly remove existing lock as a fallback option\n"
-      << "  MIQ_FORCE_UTF8=1           force Unicode UI even under pipes\n"
-      << "  MIQ_FORCE_ASCII=1          force ASCII UI (no box drawing)\n";
+      << "  MIQ_MINER_HEARTBEAT        path to heartbeat file for external miner presence\n";
 }
 static bool is_recognized_arg(const std::string& s){
     if(s.rfind("--conf=",0)==0) return true;
@@ -2267,7 +1685,7 @@ static bool is_recognized_arg(const std::string& s){
     if(s=="--genaddress") return true;
     if(s=="--buildtx") return true;
     if(s=="--reindex_utxo") return true;
-    if(s=="--mine") return true;           // kept for compatibility; ignored
+    if(s=="--mine") return true;
     if(s=="--telemetry") return true;
     if(s=="--help") return true;
     return false;
@@ -2299,12 +1717,8 @@ int main(int argc, char** argv){
 #endif
     std::set_terminate(&fatal_terminate);
 
-    bool vt_ok = true;
-    bool u8_ok = true;
-    {
-        auto r = term::enable_vt_and_probe_u8(true); // robust VT + Unicode/ConPTY probe
-        vt_ok = r.first; u8_ok = r.second;
-    }
+    bool vt_ok = true, u8_ok = true;
+    term::enable_vt_and_probe_u8(vt_ok, u8_ok);
 
     // Discover TUI intent early (so we capture logs only if using TUI)
     bool disable_tui_flag = false;
@@ -2315,27 +1729,26 @@ int main(int argc, char** argv){
         if(a == "--telemetry") telemetry_flag = true;
     }
     const bool want_tui = !disable_tui_flag && !env_truthy_local("MIQ_NO_TUI");
-// ConPTY-aware: allow TUI on Windows Terminal / ConPTY pipes as well.
     const bool can_tui  = want_tui && term::supports_interactive_output();
 
-     ConsoleWriter cw;
-// Avoid mojibake before the console is fully UTF-8/VT configured
-     cw.write_raw(std::string(u8_ok ? "Starting miqrod…" : "Starting miqrod...")
-             + "  (Ctrl+C to exit; Ctrl+C twice = force)\n");
-
+    ConsoleWriter cw;
+    if (u8_ok)
+        cw.write_raw("Starting miqrod…  (Ctrl+C to exit; Ctrl+C twice = force)\n");
+    else
+        cw.write_raw("Starting miqrod...  (Ctrl+C to exit; Ctrl+C twice = force)\n");
 
     LogCapture capture;
     if (can_tui) capture.start();
     else std::fprintf(stderr, "[INFO] TUI disabled (plain logs).\n");
 
-    TUI tui(vt_ok, u8_ok);
+    TUI tui(vt_ok);
     tui.set_enabled(can_tui);
     tui.set_ports(P2P_PORT, RPC_PORT);
 
     // Parse CLI
     Config cfg;
     std::string conf;
-    bool genaddr=false, buildtx=false, /*mine_flag=false,*/ flag_reindex_utxo=false; // built-in miner removed
+    bool genaddr=false, buildtx=false, mine_flag=false, flag_reindex_utxo=false;
     std::string privh, prevtxid_hex, toaddr;
     uint32_t vout=0; uint64_t value=0;
     for(int i=1;i<argc;i++){
@@ -2363,8 +1776,7 @@ int main(int argc, char** argv){
             value       = (uint64_t)std::stoull(argv[++i]);
             toaddr      = argv[++i];
         } else if(a=="--reindex_utxo"){ flag_reindex_utxo = true;
-        } else if(a=="--mine"){
-            // Built-in miner is disabled; accept and ignore for compatibility.
+        } else if(a=="--mine"){ mine_flag = true;
         } else if(a=="--telemetry"){ telemetry_flag = true;
         } else if(a=="--help"){ print_usage(); if (can_tui){ capture.stop(); tui.stop(); } return 0; }
     }
@@ -2418,9 +1830,9 @@ int main(int argc, char** argv){
         std::filesystem::create_directories(cfg.datadir, ec);
         if(!acquire_datadir_lock(cfg.datadir)){
             if (can_tui) { capture.stop(); tui.stop(); }
-            return 11;
+            return 11; // datadir lock failure
         }
-        // telemetry & status file paths
+        // telemetry file path
         global::telemetry_path = p_join(cfg.datadir, "telemetry.ndjson");
         global::telemetry_enabled.store(telemetry_flag);
         if (can_tui) {
@@ -2511,7 +1923,7 @@ int main(int argc, char** argv){
             setenv("MIQ_RPC_REQUIRE_TOKEN", "1", 1);
 #endif
             try {
-                const std::string cookie_path = p_join(cfg.datadir, ".cookie");
+                std::string cookie_path = p_join(cfg.datadir, ".cookie");
                 std::vector<uint8_t> buf;
                 if (!read_file_all(cookie_path, buf)) throw std::runtime_error("cookie read fail");
                 std::string tok(buf.begin(), buf.end());
@@ -2535,8 +1947,46 @@ int main(int argc, char** argv){
             rpc_ok = true;
         }
 
-        // Built-in miner was removed; inform once
-        log_info("Built-in miner has been removed; use an external miner. (--mine is accepted but ignored)");
+        // Optional built-in miner
+        unsigned thr_count = 0;
+        if (mine_flag) {
+            if (cfg.miner_threads) thr_count = cfg.miner_threads;
+            if (thr_count == 0) {
+                if (const char* s = std::getenv("MIQ_MINER_THREADS")) {
+                    char* end = nullptr; long v = std::strtol(s, &end, 10);
+                    if (end != s && v > 0 && v <= 256) thr_count = (unsigned)v;
+                }
+            }
+            if (thr_count == 0) thr_count = std::max(1u, std::thread::hardware_concurrency());
+
+            std::vector<uint8_t> mine_pkh;
+            if (MIQ_ISATTY()) {
+                std::string addr;
+                std::cout << "Enter P2PKH Base58 address to mine to (leave empty to cancel): ";
+                std::getline(std::cin, addr);
+                trim_inplace(addr);
+                if (!addr.empty()) {
+                    uint8_t ver=0; std::vector<uint8_t> payload;
+                    if (base58check_decode(addr, ver, payload) && ver==VERSION_P2PKH && payload.size()==20) {
+                        mine_pkh = payload;
+                    } else {
+                        log_error("Invalid mining address; built-in miner disabled.");
+                    }
+                } else {
+                    log_info("No address entered; built-in miner disabled.");
+                }
+            } else {
+                log_info("No TTY available; built-in miner disabled.");
+            }
+            if (!mine_pkh.empty()) {
+                P2P* p2p_ptr = cfg.no_p2p ? nullptr : &p2p;
+                std::thread th(miner_worker, &chain, &mempool, p2p_ptr, mine_pkh, thr_count);
+                th.detach();
+                log_info("Built-in miner started with " + std::to_string(thr_count) + " thread(s).");
+            }
+        } else {
+            log_info("Miner not started (use external miner or pass --mine).");
+        }
 
         log_info(std::string(CHAIN_NAME) + " node running. RPC " + std::to_string(RPC_PORT) +
                  ", P2P " + std::to_string(P2P_PORT));
@@ -2550,7 +2000,7 @@ int main(int argc, char** argv){
         uint64_t last_tip_height_seen = chain.height();
         uint64_t last_tip_change_ms   = now_ms();
         uint64_t last_peer_warn_ms    = 0;
-        const uint64_t start_of_run_ms      = now_ms();
+        uint64_t start_of_run_ms      = now_ms();
 
         // main loop
         while(!global::shutdown_requested.load()){
@@ -2561,7 +2011,7 @@ int main(int argc, char** argv){
                 tui.feed_logs(lines);
             }
             // track height
-            const uint64_t h = chain.height();
+            uint64_t h = chain.height();
             if (h != last_tip_height_seen){
                 g_miner_stats.last_height_rx.store(h);
                 last_tip_height_seen = h;
@@ -2570,7 +2020,7 @@ int main(int argc, char** argv){
             // degraded: no peers for > 60s when p2p enabled
             bool degraded = false;
             if (!cfg.no_p2p){
-                const auto n = p2p.snapshot_peers().size();
+                auto n = p2p.snapshot_peers().size();
                 if (n == 0 && now_ms() - last_peer_warn_ms > 60000){
                     if (can_tui) tui.set_hot_warning("No peers connected — check network/firewall?");
                     last_peer_warn_ms = now_ms();
@@ -2580,7 +2030,7 @@ int main(int argc, char** argv){
             // degraded: stuck tip > 10 min
             if (now_ms() - last_tip_change_ms > 10*60*1000) degraded = true;
             // degraded: external miner heartbeat requested but dead (heuristic)
-            if (std::getenv("MIQ_MINER_HEARTBEAT") && !g_extminer.alive.load()) degraded = true;
+            if (mine_flag == false && std::getenv("MIQ_MINER_HEARTBEAT") && !g_extminer.alive.load()) degraded = true;
 
             if (can_tui) tui.set_health_degraded(degraded);
 
@@ -2623,6 +2073,7 @@ int main(int argc, char** argv){
             if (can_tui) tui.set_shutdown_phase("Stopping miner watch…", true);
         } catch(...) { log_warn("Miner watch stop threw"); }
 
+        // Allow UI to render final frames
         std::this_thread::sleep_for(std::chrono::milliseconds(140));
 
         log_info("Shutdown complete.");
