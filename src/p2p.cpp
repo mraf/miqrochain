@@ -24,6 +24,8 @@
 #include <cstdlib>  // getenv
 #include <mutex>
 #include <type_traits>
+#include <thread>
+#include <cerrno>
 
 #ifndef _WIN32
 #include <signal.h>
@@ -408,7 +410,6 @@ static bool miq_resolve_endpoints_from_string(const std::string& input, uint16_t
     if (miq_try_numeric_v6(host, port, ep)) { out_eps.push_back(ep); return true; }
     if (miq_try_numeric_v4(host, port, ep)) { out_eps.push_back(ep); return true; }
 
-    // Hostname → both AAAA and A
 #ifdef _WIN32
     ADDRINFOA hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_flags = AI_ADDRCONFIG;
     PADDRINFOA res = nullptr;
@@ -525,7 +526,7 @@ static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
         if (n == 0) return false;
         sent += (size_t)n;
 #else
-       ssize_t n = ::send(s, data + sent, std::min<size_t>(len - sent, (size_t)SSIZE_MAX), 0);
+        ssize_t n = ::send(s, data + sent, (len - sent), 0);
         if (n < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -1229,8 +1230,10 @@ static Sock create_server_v6(uint16_t port){
     int yes = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
     // Prefer v6-only (we already have a v4 listener)
+#ifdef IPV6_V6ONLY
     int v6only = 1;
     setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&v6only, sizeof(v6only));
+#endif
     sockaddr_in6 a6{}; a6.sin6_family = AF_INET6; a6.sin6_addr = in6addr_any; a6.sin6_port = htons(port);
     if (bind(s, (sockaddr*)&a6, sizeof(a6)) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
     if (listen(s, SOMAXCONN) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
@@ -1266,7 +1269,7 @@ bool P2P::ipv4_is_public(uint32_t be_ip){
     if (A == 0 || A == 10 || A == 127) return false;
     if (A == 169 && B == 254) return false;
     if (A == 192 && B == 168) return false;
-    if (A == 172 && (uint8_t(be_ip>>20) & 0x0F) >= 1 && (uint8_t(be_ip>>20) & 0x0F) <= 15) return false;
+    if (A == 172 && B >= 16 && B <= 31) return false; // correct 172.16/12 check
     if (A >= 224) return false;
     return true;
 }
@@ -1317,6 +1320,15 @@ bool P2P::start(uint16_t port){
 #endif
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
+#endif
+
+    // Force 9883 from constants if defined
+#ifdef MIQ_DEFAULT_PORT
+    if (port != (uint16_t)MIQ_DEFAULT_PORT) {
+        log_warn("P2P: overriding requested port " + std::to_string(port) +
+                 " to MIQ_DEFAULT_PORT=" + std::to_string((int)MIQ_DEFAULT_PORT));
+        port = (uint16_t)MIQ_DEFAULT_PORT;
+    }
 #endif
 
     load_bans();
