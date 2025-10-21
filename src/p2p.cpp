@@ -1075,14 +1075,15 @@ bool P2P::check_rate(PeerState& ps, const char* key) {
 
     struct Map { const char* key; const char* family; };
     static const Map kTable[] = {
-        {"invb",   "inv"},
-        {"invtx",  "inv"},
-        {"getb",   "get"},
-        {"getbi",  "get"},
-        {"gettx",  "get"},
-        {"gethdr", "get"},
-        {"addr",   "addr"},
-        {"getaddr","addr"},
+        {"invb",       "inv"},
+        {"invtx",      "inv"},
+        {"getb",       "get"},
+        {"getbi",      "get"},
+        {"gettx",      "get"},
+        {"gethdr",     "get"},     // legacy alias
+        {"getheaders", "get"},     // actual command name
+        {"addr",       "addr"},
+        {"getaddr",    "addr"},
     };
 
     for (const auto& e : kTable) {
@@ -1686,7 +1687,7 @@ static bool violates_group_diversity(const std::unordered_map<Sock, miq::PeerSta
 }
 
 void P2P::handle_new_peer(Sock c, const std::string& ip){
-    PeerState ps;
+    PeerState ps{};
     ps.sock = c;
     ps.ip   = ip;
     ps.mis  = 0;
@@ -2838,7 +2839,10 @@ void P2P::loop(){
                     ps.rx.erase(ps.rx.begin(), ps.rx.begin() + (ptrdiff_t)off);
                     if (ps.rx.empty()) rx_clear_start(s);
                 }
-
+                {
+                    auto itg = g_gate.find(s);
+                    if (itg != g_gate.end()) itg->second.rx_bytes = ps.rx.size();
+                }
                 if (!ps.rx.empty()) {
                     auto it0 = g_rx_started_ms.find(s);
                     if (it0 != g_rx_started_ms.end()) {
