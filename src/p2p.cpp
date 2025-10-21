@@ -14,7 +14,6 @@
 #include <tuple>
 #include <cstring>
 #include <fcntl.h>
-#include <netinet/tcp.h>
 #include <fstream>
 #include <algorithm>
 #include <vector>
@@ -30,6 +29,10 @@
 #include <cerrno>
 #include <cstdint>
 #include <climits>
+
+#ifndef _WIN32
+#include <netinet/tcp.h>
+#endif
 
 #ifndef _WIN32
 #include <signal.h>
