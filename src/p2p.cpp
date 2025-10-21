@@ -28,6 +28,8 @@
 #include <type_traits>
 #include <thread>
 #include <cerrno>
+#include <cstdint>
+#include <climits>
 
 #ifndef _WIN32
 #include <signal.h>
@@ -369,7 +371,7 @@ static bool miq_try_numeric_v6(const std::string& h, uint16_t port, MiqEndpoint&
 }
 static bool miq_try_numeric_v4(const std::string& h, uint16_t port, MiqEndpoint& out) {
     sockaddr_in a4{}; a4.sin_family = AF_INET; a4.sin_port = htons(port);
-    if (inet_pton(AF_INET, h.c_str(), &a4->sin_addr) == 1) {
+    if (inet_pton(AF_INET, h.c_str(), &a4.sin_addr) == 1) {
         memcpy(&out.ss, &a4, sizeof(a4)); out.len =
 #ifdef _WIN32
             (int)
@@ -955,7 +957,6 @@ static Sock dial_be_ipv4(uint32_t be_ip, uint16_t port){
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = be_ip; a.sin_port = htons(port);
     Sock s = miq_connect_nb((sockaddr*)&a, (socklen_t)sizeof(a), MIQ_CONNECT_TIMEOUT_MS);
     return s;
-    return s;
 }
 
 // v6 loopback helper
@@ -1051,6 +1052,15 @@ static inline std::vector<uint8_t> miq_build_version_payload() {
     svc |= (1ull<<1);   // tx relay supported
     miq_put_u64le(v, svc);
     return v;
+}
+
+// Small helper to throttle header pipelining safely.
+static inline bool can_accept_hdr_batch(miq::PeerState& ps, int64_t now) {
+    const int      kMaxInflight = 2;
+    const int64_t  kMinGapMs    = 50; // keep tiny gap to avoid tight spins
+    if (ps.inflight_hdr_batches >= (uint32_t)kMaxInflight) return false;
+    if (ps.last_hdr_batch_done_ms && (now - ps.last_hdr_batch_done_ms) < kMinGapMs) return false;
+    return true;
 }
 
 } // anon
@@ -1277,6 +1287,7 @@ static Sock create_server(uint16_t port){
     if (bind(s, (sockaddr*)&a, sizeof(a)) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
     if (listen(s, SOMAXCONN) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
     (void)miq_set_nonblock(s);
+    (void)miq_set_nodelay(s);
     return s;
 }
 static Sock create_server_v6(uint16_t port){
@@ -1288,7 +1299,6 @@ static Sock create_server_v6(uint16_t port){
     if (s == MIQ_INVALID_SOCK) return MIQ_INVALID_SOCK;
     int yes = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
-    // Prefer v6-only (we already have a v4 listener)
 #ifdef IPV6_V6ONLY
     int v6only = 1;
     setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&v6only, sizeof(v6only));
@@ -1297,6 +1307,7 @@ static Sock create_server_v6(uint16_t port){
     if (bind(s, (sockaddr*)&a6, sizeof(a6)) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
     if (listen(s, SOMAXCONN) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
     (void)miq_set_nonblock(s);
+    (void)miq_set_nodelay(s);
     return s;
 }
 
@@ -1527,7 +1538,7 @@ void P2P::stop(){
 
 // === outbound connect helpers ===============================================
 
-// REVISED: dual-stack + literal-safe resolver
+// REVISED: dual-stack + literal-safe resolver (non-blocking connect + timeout)
 bool P2P::connect_seed(const std::string& host, uint16_t port){
     {
         int64_t now = now_ms();
@@ -1561,15 +1572,8 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
             if (banned_.count(be_ip_to_string(be_ip))) continue;
         }
 
-#ifdef _WIN32
-        Sock ts = socket(ne.ss.ss_family, SOCK_STREAM, IPPROTO_TCP);
-#else
-        Sock ts = socket(ne.ss.ss_family, SOCK_STREAM, 0);
-#endif
-        if (ts == MIQ_INVALID_SOCK) continue;
-
-        if (connect(ts, (const sockaddr*)&ne.ss, ne.len) != 0) {
-            CLOSESOCK(ts);
+        Sock ts = miq_connect_nb((const sockaddr*)&ne.ss, ne.len, MIQ_CONNECT_TIMEOUT_MS);
+        if (ts == MIQ_INVALID_SOCK) {
             continue;
         }
 
@@ -1608,6 +1612,8 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     ps.tx_tokens  = MIQ_RATE_TX_BURST;
     ps.last_refill_ms = ps.last_ms;
     ps.inflight_hdr_batches = 0;
+    ps.last_hdr_batch_done_ms = 0;
+    ps.sent_getheaders = false;
     ps.rate.last_ms = ps.last_ms;
     ps.banscore = 0;
     ps.version = 0;
@@ -1686,6 +1692,8 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     ps.tx_tokens  = MIQ_RATE_TX_BURST;
     ps.last_refill_ms = ps.last_ms;
     ps.inflight_hdr_batches = 0;
+    ps.last_hdr_batch_done_ms = 0;
+    ps.sent_getheaders = false;
     ps.rate.last_ms = ps.last_ms;
     ps.banscore = 0;
     ps.version = 0;
@@ -2100,25 +2108,26 @@ void P2P::loop(){
                     if (!cand) break;
                     uint32_t be_ip;
                     if (!parse_ipv4(cand->host, be_ip) || !ipv4_is_public(be_ip)) {
-                        g_addrman.mark_attempt(cand);
+                        g_addrman.mark_attempt(*cand);
                         continue;
                     }
-                    if (is_self_be(be_ip)) { g_addrman.mark_attempt(cand); continue; }
+                    if (is_self_be(be_ip)) { g_addrman.mark_attempt(*cand); continue; }
                     if (violates_group_diversity(peers_, be_ip)) {
-                        g_addrman.mark_attempt(cand);
+                        g_addrman.mark_attempt(*cand);
                         continue;
                     }
                     std::string dotted = be_ip_to_string(be_ip);
-                    if (banned_.count(dotted)) { g_addrman.mark_attempt(cand); continue; }
+                    if (banned_.count(dotted)) { g_addrman.mark_attempt(*cand); continue; }
                     bool connected = false;
                     for (auto& kv : peers_) if (kv.second.ip == dotted) { connected = true; break; }
-                    if (connected) { g_addrman.mark_attempt(cand); continue; }
+                    if (connected) { g_addrman.mark_attempt(*cand); continue; }
 
                     Sock s = dial_be_ipv4(be_ip, g_listen_port);
                     if (s != MIQ_INVALID_SOCK) {
                         PeerState ps; ps.sock = s; ps.ip = dotted; ps.mis=0; ps.last_ms=now_ms();
                         ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
-                        ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
+                        ps.inflight_hdr_batches = 0; ps.last_hdr_batch_done_ms = 0; ps.sent_getheaders = false;
+                        ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
                         peers_[s] = ps;
                         g_trickle_last_ms[s] = 0;
                         log_info("P2P: outbound (addrman) " + ps.ip);
@@ -2128,7 +2137,7 @@ void P2P::loop(){
                         (void)miq_send(s, msg);
                         dialed = true;
                     } else {
-                        g_addrman.mark_attempt(cand);
+                        g_addrman.mark_attempt(*cand);
                     }
                 }
 
@@ -2164,7 +2173,8 @@ void P2P::loop(){
                                 ps.blk_tokens = MIQ_RATE_BLOCK_BURST;
                                 ps.tx_tokens  = MIQ_RATE_TX_BURST;
                                 ps.last_refill_ms = ps.last_ms;
-                                ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
+                                ps.inflight_hdr_batches = 0; ps.last_hdr_batch_done_ms = 0; ps.sent_getheaders = false;
+                                ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
                                 peers_[s] = ps;
                                 g_trickle_last_ms[s] = 0;
 
@@ -2199,7 +2209,8 @@ void P2P::loop(){
                                 if (s != MIQ_INVALID_SOCK) {
                                     PeerState ps; ps.sock=s; ps.ip=dotted; ps.mis=0; ps.last_ms=now_ms();
                                     ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
-                                    ps.inflight_hdr_batches = 0; ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
+                                    ps.inflight_hdr_batches = 0; ps.last_hdr_batch_done_ms = 0; ps.sent_getheaders = false;
+                                    ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
                                     peers_[s]=ps;
                                     g_trickle_last_ms[s] = 0;
                                     log_info("P2P: feeler " + dotted);
@@ -2307,6 +2318,8 @@ void P2P::loop(){
                     P2P_TRACE("reject hairpin inbound");
                     CLOSESOCK(c);
                 } else {
+                    (void)miq_set_nonblock(c);
+                    (void)miq_set_nodelay(c);
                     int64_t tnow = now_ms();
                     if (tnow - inbound_win_start_ms_ > 60000) {
                         inbound_win_start_ms_ = tnow;
@@ -2349,6 +2362,8 @@ void P2P::loop(){
                     P2P_TRACE("reject hairpin inbound v6");
                     CLOSESOCK(c);
                 } else {
+                    (void)miq_set_nonblock(c);
+                    (void)miq_set_nodelay(c);
                     int64_t tnow = now_ms();
                     if (tnow - inbound_win_start_ms_ > 60000) {
                         inbound_win_start_ms_ = tnow;
