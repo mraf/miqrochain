@@ -13,6 +13,8 @@
 #include <chrono>
 #include <tuple>
 #include <cstring>
+#include <fcntl.h>
+#include <netinet/tcp.h>
 #include <fstream>
 #include <algorithm>
 #include <vector>
@@ -367,7 +369,7 @@ static bool miq_try_numeric_v6(const std::string& h, uint16_t port, MiqEndpoint&
 }
 static bool miq_try_numeric_v4(const std::string& h, uint16_t port, MiqEndpoint& out) {
     sockaddr_in a4{}; a4.sin_family = AF_INET; a4.sin_port = htons(port);
-    if (inet_pton(AF_INET, h.c_str(), &a4.sin_addr) == 1) {
+    if (inet_pton(AF_INET, h.c_str(), &a4->sin_addr) == 1) {
         memcpy(&out.ss, &a4, sizeof(a4)); out.len =
 #ifdef _WIN32
             (int)
@@ -624,6 +626,70 @@ static inline bool miq_safe_preverack_cmd(const std::string& cmd) {
 static inline int64_t now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+#ifndef MIQ_CONNECT_TIMEOUT_MS
+#define MIQ_CONNECT_TIMEOUT_MS 5000
+#endif
+
+// --- socket helpers: non-blocking + nodelay + timed connect -----------------
+static inline void miq_set_nodelay(Sock s) {
+    int one = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
+               reinterpret_cast<const char*>(&one), sizeof(one));
+}
+
+static inline bool miq_set_nonblock(Sock s) {
+#ifdef _WIN32
+    u_long mode = 1;
+    return ioctlsocket(s, FIONBIO, &mode) == 0;
+#else
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags < 0) return false;
+    return fcntl(s, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+}
+
+// Create a socket, set non-blocking, connect with timeout, return the socket or MIQ_INVALID_SOCK.
+static Sock miq_connect_nb(const sockaddr* sa, socklen_t slen, int timeout_ms) {
+#ifdef _WIN32
+    Sock s = socket(sa->sa_family, SOCK_STREAM, IPPROTO_TCP);
+#else
+    Sock s = socket(sa->sa_family, SOCK_STREAM, 0);
+#endif
+    if (s == MIQ_INVALID_SOCK) return MIQ_INVALID_SOCK;
+    (void)miq_set_nonblock(s);
+    (void)miq_set_nodelay(s);
+
+#ifdef _WIN32
+    int rc = ::connect(s, sa, (int)slen);
+    if (rc == SOCKET_ERROR) {
+        int e = WSAGetLastError();
+        if (e != WSAEWOULDBLOCK && e != WSAEINPROGRESS) {
+            CLOSESOCK(s);
+            return MIQ_INVALID_SOCK;
+        }
+        WSAPOLLFD pfd{}; pfd.fd = s; pfd.events = POLLWRNORM; pfd.revents = 0;
+        rc = WSAPoll(&pfd, 1, timeout_ms);
+        if (rc <= 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
+        // verify connect result
+        int soerr = 0; int sl = sizeof(soerr);
+        getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &sl);
+        if (soerr != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
+    }
+#else
+    int rc = ::connect(s, sa, slen);
+    if (rc != 0) {
+        if (errno != EINPROGRESS) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
+        struct pollfd pfd{ s, POLLOUT, 0 };
+        rc = ::poll(&pfd, 1, timeout_ms);
+        if (rc <= 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
+        int soerr = 0; socklen_t sl = sizeof(soerr);
+        getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &sl);
+        if (soerr != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
+    }
+#endif
+    return s;
 }
 static inline int64_t seed_backoff_base_ms(){
     return (int64_t)env_u64("MIQ_SEED_BACKOFF_MS_BASE", 15000ULL);
@@ -886,17 +952,9 @@ static Sock dial_be_ipv4(uint32_t be_ip, uint16_t port){
     if (is_loopback_be(be_ip) || is_self_be(be_ip)) {
         return MIQ_INVALID_SOCK;
     }
-#ifdef _WIN32
-    Sock s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-#else
-    Sock s = socket(AF_INET, SOCK_STREAM, 0);
-#endif
-    if (s == MIQ_INVALID_SOCK) return MIQ_INVALID_SOCK;
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = be_ip; a.sin_port = htons(port);
-    if (connect(s, (sockaddr*)&a, sizeof(a)) != 0) {
-        CLOSESOCK(s);
-        return MIQ_INVALID_SOCK;
-    }
+    Sock s = miq_connect_nb((sockaddr*)&a, (socklen_t)sizeof(a), MIQ_CONNECT_TIMEOUT_MS);
+    return s;
     return s;
 }
 
@@ -1218,6 +1276,7 @@ static Sock create_server(uint16_t port){
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
     if (bind(s, (sockaddr*)&a, sizeof(a)) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
     if (listen(s, SOMAXCONN) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
+    (void)miq_set_nonblock(s);
     return s;
 }
 static Sock create_server_v6(uint16_t port){
@@ -1237,6 +1296,7 @@ static Sock create_server_v6(uint16_t port){
     sockaddr_in6 a6{}; a6.sin6_family = AF_INET6; a6.sin6_addr = in6addr_any; a6.sin6_port = htons(port);
     if (bind(s, (sockaddr*)&a6, sizeof(a6)) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
     if (listen(s, SOMAXCONN) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
+    (void)miq_set_nonblock(s);
     return s;
 }
 
@@ -2040,19 +2100,19 @@ void P2P::loop(){
                     if (!cand) break;
                     uint32_t be_ip;
                     if (!parse_ipv4(cand->host, be_ip) || !ipv4_is_public(be_ip)) {
-                        g_addrman.mark_attempt(*cand);
+                        g_addrman.mark_attempt(cand);
                         continue;
                     }
-                    if (is_self_be(be_ip)) { g_addrman.mark_attempt(*cand); continue; }
+                    if (is_self_be(be_ip)) { g_addrman.mark_attempt(cand); continue; }
                     if (violates_group_diversity(peers_, be_ip)) {
-                        g_addrman.mark_attempt(*cand);
+                        g_addrman.mark_attempt(cand);
                         continue;
                     }
                     std::string dotted = be_ip_to_string(be_ip);
-                    if (banned_.count(dotted)) { g_addrman.mark_attempt(*cand); continue; }
+                    if (banned_.count(dotted)) { g_addrman.mark_attempt(cand); continue; }
                     bool connected = false;
                     for (auto& kv : peers_) if (kv.second.ip == dotted) { connected = true; break; }
-                    if (connected) { g_addrman.mark_attempt(*cand); continue; }
+                    if (connected) { g_addrman.mark_attempt(cand); continue; }
 
                     Sock s = dial_be_ipv4(be_ip, g_listen_port);
                     if (s != MIQ_INVALID_SOCK) {
@@ -2068,7 +2128,7 @@ void P2P::loop(){
                         (void)miq_send(s, msg);
                         dialed = true;
                     } else {
-                        g_addrman.mark_attempt(*cand);
+                        g_addrman.mark_attempt(cand);
                     }
                 }
 
