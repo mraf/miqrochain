@@ -2502,13 +2502,8 @@ void P2P::loop(){
                         if (m.payload.size() >= 12) {
                             for(int i=0;i<8;i++) peer_services |= ((uint64_t)m.payload[4+i]) << (8*i);
                         }
-                        ps.version = peer_ver;
-                        ps.features = 0;
-#if MIQ_ENABLE_HEADERS_FIRST
-                        ps.features |= (1ull<<0);
-#endif
-                        ps.features |= (1ull<<1);
-
+                      ps.version  = peer_ver;
+                        ps.features = peer_services;
                         if (ps.version > 0 && ps.version < min_peer_version_) {
                             log_warn(std::string("P2P: dropping old peer ") + ps.ip);
                             dead.push_back(s);
@@ -2775,6 +2770,7 @@ void P2P::loop(){
                             if (++ps.mis > 10) { dead.push_back(s); }
                             continue;
                         }
+                        const size_t kHdrBatchMax = 2000; // must match build_headers_payload()
                         size_t accepted = 0;
                         std::string herr;
                         for (const auto& h : hs) {
@@ -2786,12 +2782,12 @@ void P2P::loop(){
                         }
 
                         {
-                            bool zero_progress = hs.empty() || (accepted == 0);
+                            bool zero_progress = (!at_tip) && (accepted == 0);
                             if (zero_progress) {
                                 int &z = g_zero_hdr_batches[s];
                                 z++;
                                 if (z >= 3) {
-                                    log_warn("P2P: headers made no progress after 3 batches; falling back to by-index sync");
+                                    log_warn("P2P: no headers progress after 3 full batches; falling back to by-index sync");
                                     ps.banscore = std::min(ps.banscore + 1, MIQ_P2P_MAX_BANSCORE);
                                     ps.syncing = true;
                                     ps.next_index = chain_.height() + 1;
@@ -2807,7 +2803,7 @@ void P2P::loop(){
                         chain_.next_block_fetch_targets(want, /*max*/32);
                         for (const auto& w : want) request_block_hash(ps, w);
 
-                        if (!g_logged_headers_done && !want.empty()) {
+                        if (!g_logged_headers_done && (!want.empty() || at_tip)) {
                             g_logged_headers_done = true;
                             log_info("[IBD] headers phase complete; switching to blocks");
                         }
@@ -2816,7 +2812,7 @@ void P2P::loop(){
                         ps.last_hdr_batch_done_ms = now_ms();
                         if (ps.inflight_hdr_batches == 0) ps.sent_getheaders = false;
 
-                        if (ps.inflight_hdr_batches == 0) {
+                        if (ps.inflight_hdr_batches == 0 && !at_tip) {
                             std::vector<std::vector<uint8_t>> locator2;
                             chain_.build_locator(locator2);
                             std::vector<uint8_t> stop2(32, 0);
