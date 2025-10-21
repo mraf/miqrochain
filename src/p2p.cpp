@@ -2781,6 +2781,9 @@ void P2P::loop(){
                             g_last_progress_ms = now_ms();
                         }
 
+                        // Define at_tip based on batch fullness: short/empty ⇒ tip.
+                        bool at_tip = (hs.size() < kHdrBatchMax);
+
                         {
                             bool zero_progress = (!at_tip) && (accepted == 0);
                             if (zero_progress) {
