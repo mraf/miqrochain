@@ -187,6 +187,8 @@ struct MinerStats {
     std::atomic<double>   hps{0.0}; // stays 0 unless miner API exposes tries
 } g_miner_stats;
 
+static std::string g_miner_address_b58; // display mined-to address
+
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║                           Telemetry buffers                                ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
@@ -345,14 +347,61 @@ static bool write_text_atomic(const std::string& path, const std::string& body){
     return !ec;
 }
 
+// Utility: is a PID alive?
+static bool pid_alive(int pid){
+#ifdef _WIN32
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+    if (!h) return false;
+    DWORD code = 0;
+    BOOL ok = GetExitCodeProcess(h, &code);
+    CloseHandle(h);
+    if (!ok) return false;
+    return (code == STILL_ACTIVE);
+#else
+    if (pid <= 0) return false;
+    int r = kill(pid, 0);
+    if (r == 0) return true;
+    return errno == EPERM ? true : false; // process exists but no permission
+#endif
+}
+
+// Purge stale lock/pid files if previous process is not alive.
+static void purge_stale_lock(const std::string& datadir){
+    std::error_code ec;
+    std::string lock = p_join(datadir, ".lock");
+    std::string pid  = p_join(datadir, "miqrod.pid");
+    bool lock_exists = std::filesystem::exists(lock, ec);
+    if (!lock_exists) return;
+
+    bool remove_ok = true;
+    int pidnum = -1;
+    if (std::filesystem::exists(pid, ec)) {
+        std::ifstream f(pid);
+        if (f) { f >> pidnum; }
+    }
+    if (pidnum > 0 && pid_alive(pidnum)) {
+        // Running instance; do NOT purge.
+        remove_ok = false;
+    }
+    if (remove_ok) {
+        std::filesystem::remove(lock, ec);
+        std::filesystem::remove(pid, ec);
+        if (!ec) {
+            std::fprintf(stderr, "[WARN] Stale .lock detected and removed; continuing.\n");
+        }
+    }
+}
+
 // Lock file (exclusive). Keeps handle open for the entire process lifetime.
 static bool acquire_datadir_lock(const std::string& datadir){
     std::error_code ec;
     std::filesystem::create_directories(datadir, ec);
+    // Always attempt to purge stale lock first
+    purge_stale_lock(datadir);
+
     std::string lock = p_join(datadir, ".lock");
     std::string pid  = p_join(datadir, "miqrod.pid");
 #ifdef _WIN32
-    // CREATE_NEW + no sharing => exclusive. Keep handle until release.
     HANDLE h = CreateFileA(lock.c_str(),
                            GENERIC_READ | GENERIC_WRITE,
                            0,                // no sharing
@@ -361,15 +410,25 @@ static bool acquire_datadir_lock(const std::string& datadir){
                            FILE_ATTRIBUTE_NORMAL,
                            NULL);
     if (h == INVALID_HANDLE_VALUE) {
-        log_error("Another instance appears to be running (lock exists).");
-        return false;
+        // Retry once after purge (in case another process created it meanwhile)
+        purge_stale_lock(datadir);
+        h = CreateFileA(lock.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            log_error("Another instance appears to be running (lock exists).");
+            return false;
+        }
     }
     global::lock_handle = h;
 #else
     int fd = ::open(lock.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
     if (fd < 0) {
-        log_error("Another instance appears to be running (lock exists).");
-        return false;
+        // Retry once after purge
+        purge_stale_lock(datadir);
+        fd = ::open(lock.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+        if (fd < 0) {
+            log_error("Another instance appears to be running (lock exists).");
+            return false;
+        }
     }
     global::lock_fd = fd;
 #endif
@@ -463,13 +522,12 @@ static inline bool supports_interactive_output() {
         DWORD mode = 0;
         if (GetConsoleMode(hOut, &mode)) return true; // real console
     }
-    // Heuristic for ConPTY/terminal emulators when stdout is a PIPE
     DWORD type = GetFileType(hOut);
     const bool is_pipe = (type == FILE_TYPE_PIPE);
     const bool hinted =
-        (std::getenv("WT_SESSION")       ||  // Windows Terminal
-         std::getenv("ConEmuANSI")       ||  // ConEmu
-         std::getenv("TERMINUS_SUBPROC") ||  // Terminus
+        (std::getenv("WT_SESSION")       ||
+         std::getenv("ConEmuANSI")       ||
+         std::getenv("TERMINUS_SUBPROC") ||
          std::getenv("MSYS")             ||
          std::getenv("MSYSTEM"));
     return is_pipe && hinted;
@@ -478,7 +536,7 @@ static inline bool supports_interactive_output() {
 #endif
 }
 
-// Improved window size: try STDOUT, then fall back to CONOUT$
+// Improved window size
 static inline void get_winsize(int& cols, int& rows) {
     cols = 120; rows = 38;
 #ifdef _WIN32
@@ -510,13 +568,10 @@ static inline void get_winsize(int& cols, int& rows) {
 }
 
 // Enable VT and probe Unicode ability.
-// vt_ok = ANSI escapes safe; u8_ok = safe to print non-ASCII UI glyphs
 static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
-    vt_ok = true; u8_ok = false;   // default: ASCII-safe everywhere
+    vt_ok = true; u8_ok = false;
 #ifdef _WIN32
     vt_ok = false; u8_ok = false;
-
-    // VT enable (for colors/positioning) when possible
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD mode = 0;
     bool have_console = (h && h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode));
@@ -540,20 +595,16 @@ static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
             }
         }
     } else {
-        // ConPTY/pipe hints → allow VT, but DO NOT assume UTF-8
         DWORD type = GetFileType(GetStdHandle(STD_OUTPUT_HANDLE));
         const bool is_pipe = (type == FILE_TYPE_PIPE);
         if (is_pipe) vt_ok = true;
     }
 
-    // IMPORTANT: We only allow Unicode UI on Windows if the user explicitly asks for it
-    // AND we have a real console target that supports WriteConsoleW. Otherwise ASCII.
     const bool force_utf8 = []{
         const char* s = std::getenv("MIQ_TUI_UTF8");
         return s && *s && std::strcmp(s,"0")!=0 && std::strcmp(s,"false")!=0 && std::strcmp(s,"False")!=0;
     }();
     if (force_utf8 && have_console) {
-        // best effort to switch in/out codepages when requested
         SetConsoleOutputCP(CP_UTF8);
         SetConsoleCP(CP_UTF8);
         u8_ok = true;
@@ -562,7 +613,6 @@ static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
     if (hConOut != INVALID_HANDLE_VALUE) CloseHandle(hConOut);
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOALIGNMENTFAULTEXCEPT);
 #else
-    // Non-Windows terminals are typically UTF-8; allow Unicode by default.
     vt_ok = true;
     u8_ok = true;
 #endif
@@ -583,7 +633,6 @@ public:
     }
     void write_raw(const std::string& s){
 #ifdef _WIN32
-        // Prefer true Unicode output via WriteConsoleW; if Handle invalid, fall back.
         if (hFile_ && hFile_ != INVALID_HANDLE_VALUE) {
             int wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
             if (wlen > 0) {
@@ -680,7 +729,6 @@ public:
     }
 private:
     static std::string sanitize_line(const std::string& s){
-        // redact obvious secrets
         auto red = s;
         auto scrub = [&](const char* key){
             size_t pos = 0;
@@ -764,54 +812,20 @@ static inline std::string fmt_diff(long double d){
     return o.str();
 }
 
-static inline std::string bar(int width, double frac, bool vt_ok, bool u8_ok){
+static inline std::string bar(int width, double frac, bool /*vt_ok*/, bool /*u8_ok*/){
     if (width < 6) width = 6;
-    if (frac < 0) { frac = 0; }
-    if (frac > 1) { frac = 1; }
+    if (frac < 0) frac = 0;
+    if (frac > 1) frac = 1;
     int full = (int)((width-2)*frac + 0.5);
     std::ostringstream o;
     o << '[';
-    if (u8_ok) {
-        for(int i=0;i<width-2;i++){
-            bool on = i < full;
-            if(vt_ok){
-                if (on) o << "\x1b[36m" << "█" << "\x1b[0m";
-                else    o << "\x1b[90m" << "·" << "\x1b[0m";
-            }else{
-                o << (on ? "█" : "·");
-            }
-        }
-    } else {
-        for(int i=0;i<width-2;i++) o << (i<full ? '#' : ' ');
-    }
+    for(int i=0;i<width-2;i++) o << (i<full ? '#' : ' ');
     o << ']';
     return o.str();
 }
-static std::string wave_line(int width, int tick, bool vt_ok, bool u8_ok){
-    if(width < 4) width = 4;
-    std::ostringstream o;
-    if (u8_ok) {
-        static const char* blocks = " ▁▂▃▄▅▆▇█";
-        int N = (int)std::strlen(blocks)-1;
-        for(int i=0;i<width;i++){
-            double x = (i + tick*0.72) * 0.21;
-            double y = 0.5 + 0.5*std::sin(x) * std::cos((tick+i)*0.075);
-            int idx = (int)std::round(y * N); if(idx<0) idx=0; if(idx>N) idx=N;
-            if(vt_ok) o << "\x1b[36m" << blocks[idx] << "\x1b[0m";
-            else      o << blocks[idx];
-        }
-    } else {
-        // ASCII wave
-        const char ascii[] = "-~_^";
-        int N = (int)sizeof(ascii)-2;
-        for(int i=0;i<width;i++){
-            double x = (i + tick*0.72) * 0.21;
-            double y = 0.5 + 0.5*std::sin(x) * std::cos((tick+i)*0.075);
-            int idx = (int)std::round(y * N); if(idx<0) idx=0; if(idx>N) idx=N;
-            o << ascii[idx];
-        }
-    }
-    return o.str();
+static std::string straight_line(int width){
+    if (width < 1) width = 1;
+    return std::string((size_t)width, '-');
 }
 static std::string spinner(int tick, bool u8_ok){
     if (u8_ok) {
@@ -831,8 +845,8 @@ static std::string spark_ascii(const std::vector<double>& xs){
     std::string s;
     for(double v: xs){
         int idx = (int)std::round( (v-mn)/span * 9.0 );
-        if (idx < 0) { idx = 0; }
-        if (idx > 9) { idx = 9; }
+        if (idx < 0) idx = 0;
+        if (idx > 9) idx = 9;
         s.push_back(bars[idx]);
     }
     return s;
@@ -889,7 +903,7 @@ static MempoolView mempool_view_fallback(MP* mp){
     MempoolView v{};
     if (!mp) return v;
     if constexpr (has_stats_method<MP>::value) {
-        auto s = mp->stats(); // must have count/bytes/recent_adds or compatible fields
+        auto s = mp->stats();
         v.count = (uint64_t)s.count;
         v.bytes = (uint64_t)s.bytes;
         v.recent_adds = (uint64_t)s.recent_adds;
@@ -923,7 +937,7 @@ static uint32_t hdr_bits(const H& h){
     return (uint32_t)GENESIS_BITS;
 }
 
-// Difficulty helpers: compact bits → target (long double), then difficulty ratio
+// Difficulty helpers
 static long double compact_to_target_ld(uint32_t bits){
     uint32_t exp = bits >> 24;
     uint32_t mant = bits & 0x007fffff;
@@ -938,7 +952,7 @@ static long double difficulty_from_bits(uint32_t bits){
     return t_one / t_cur;
 }
 
-// Estimate network hashrate from recent headers
+// Estimate network hashrate
 static double estimate_network_hashrate(Chain* chain){
     if (!chain) return 0.0;
     const unsigned k = (unsigned)std::max<int>(MIQ_RETARGET_INTERVAL, 32);
@@ -995,6 +1009,13 @@ public:
     void set_node_state(NodeState st){ std::lock_guard<std::mutex> lk(mu_); nstate_ = st; }
     void set_datadir(const std::string& d){ std::lock_guard<std::mutex> lk(mu_); datadir_ = d; }
 
+    // mining gate
+    void set_mining_gate(bool available, const std::string& reason){
+        std::lock_guard<std::mutex> lk(mu_);
+        mining_gate_available_ = available;
+        mining_gate_reason_ = reason;
+    }
+
     // logs in
     void feed_logs(const std::deque<LogCapture::Line>& raw_lines) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -1035,7 +1056,6 @@ public:
     void set_hot_warning(const std::string& w){ std::lock_guard<std::mutex> lk(mu_); hot_warning_ = w; hot_warn_ts_ = now_ms(); }
 
 private:
-    // styled lines (0=info 1=warn 2=err 3=trace 4=ok)
     struct StyledLine { std::string txt; int level; };
     StyledLine stylize_log(const LogCapture::Line& L){
         const std::string& s = L.text;
@@ -1074,7 +1094,6 @@ private:
         steps_.push_back({title, ok});
     }
 
-    // colors
     const char* C_reset() const { return vt_ok_ ? "\x1b[0m" : ""; }
     const char* C_info()  const { return vt_ok_ ? (dark_theme_? "\x1b[36m":"\x1b[34m") : ""; }
     const char* C_warn()  const { return vt_ok_ ? "\x1b[33m" : ""; }
@@ -1231,7 +1250,7 @@ private:
             if (!hot_message_.empty() && (now_ms() - hot_msg_ts_) < 4000){
                 left.push_back(std::string("  ") + C_warn() + hot_message_ + C_reset());
             }
-            left.push_back(std::string("  ") + wave_line(leftw-2, tick_, vt_ok_, u8_ok_));
+            left.push_back(std::string("  ") + straight_line(leftw-2));
             left.push_back("");
         }
 
@@ -1306,16 +1325,23 @@ private:
             uint64_t height = chain_ ? chain_->height() : 0;
             std::string tip_hex;
             long double tip_diff = 0.0L;
+            uint64_t tip_age_s = 0;
             if (chain_) {
                 auto t = chain_->tip();
                 tip_hex = to_hex(t.hash);
                 tip_diff = difficulty_from_bits(hdr_bits(t));
+                uint64_t tsec = hdr_time(t);
+                if (tsec) {
+                    uint64_t now = (uint64_t)std::time(nullptr);
+                    tip_age_s = (now > tsec) ? (now - tsec) : 0;
+                }
             }
             left.push_back(std::string("  height: ") + std::to_string(height)
                           + "   tip: " + short_hex(tip_hex, 12));
-            left.push_back(std::string("  difficulty: ") + fmt_diff(tip_diff)
-                          + "   net hashrate: " + fmt_hs(net_hashrate_));
-            left.push_back(std::string("  trend:      ") + spark_ascii(net_spark_));
+            left.push_back(std::string("  tip age: ") + std::to_string(tip_age_s) + "s"
+                          + "   difficulty: " + fmt_diff(tip_diff));
+            left.push_back(std::string("  net hashrate: ") + fmt_hs(net_hashrate_));
+            left.push_back(std::string("  trend:        ") + spark_ascii(net_spark_));
             size_t N = recent_blocks_.size();
             size_t show = std::min<size_t>(8, N);
             for (size_t i=0;i<show;i++){
@@ -1391,14 +1417,31 @@ private:
             uint64_t ok  = g_miner_stats.accepted.load();
             uint64_t rej = g_miner_stats.rejected.load();
             double   hps = g_miner_stats.hps.load();
+            uint64_t miner_uptime = 0;
+            if (active) {
+                miner_uptime = (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - g_miner_stats.start).count();
+            }
+
+            std::ostringstream m0;
+            m0 << "  available: " << (mining_gate_available_ ? (std::string(C_ok())+"yes"+C_reset()) :
+                                                       (std::string(C_warn())+"no"+C_reset()));
+            if (!mining_gate_reason_.empty()) m0 << "  (" << mining_gate_reason_ << ")";
+            right.push_back(m0.str());
 
             std::ostringstream m1;
             m1 << "  status: " << (active ? (std::string(C_ok()) + "running" + C_reset()) : (std::string(C_dim()) + "idle" + C_reset()))
                << "   threads: " << thr
                << "   ext: " << (g_extminer.alive.load() ? (std::string(C_ok()) + "alive" + C_reset()) : (std::string(C_dim()) + "-" + C_reset()));
             right.push_back(m1.str());
+
+            if (!g_miner_address_b58.empty()) {
+                right.push_back(std::string("  to: ") + g_miner_address_b58);
+            }
+
             std::ostringstream m2; m2 << "  accepted: " << ok << "   rejected: " << rej; right.push_back(m2.str());
             right.push_back(std::string("  miner hashrate: ") + fmt_hs(hps));
+            right.push_back(std::string("  miner uptime: ") + std::to_string(miner_uptime) + "s");
             right.push_back(std::string("  miner trend:    ") + spark_ascii(spark_hs_));
             double share = (net_hashrate_ > 0.0) ? (hps / net_hashrate_) * 100.0 : 0.0;
             if (share < 0.0) share = 0.0;
@@ -1409,6 +1452,10 @@ private:
             size_t miners_obs = distinct_miners_recent(64);
             std::ostringstream m4; m4 << "  miners observed (last 64 blks): " << miners_obs;
             right.push_back(m4.str());
+            std::ostringstream m5; m5 << "  last ok height: " << g_miner_stats.last_height_ok.load()
+                                      << "   last rx height: " << g_miner_stats.last_height_rx.load();
+            right.push_back(m5.str());
+
             right.push_back(std::string("  ") + C_dim() + "* count = distinct coinbase recipients seen by this node" + C_reset());
             right.push_back("");
         }
@@ -1514,6 +1561,10 @@ private:
     uint64_t hot_msg_ts_{0};
     std::string hot_warning_;
     uint64_t hot_warn_ts_{0};
+
+    // mining gate status
+    bool        mining_gate_available_{false};
+    std::string mining_gate_reason_;
 };
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -1669,7 +1720,7 @@ static void print_usage(){
       << "  --genaddress                                 generate ECDSA-P2PKH address (priv/pk/address)\n"
       << "  --buildtx <priv_hex> <prev_txid_hex> <vout> <value> <to_address>  (prints txhex)\n"
       << "  --reindex_utxo                               rebuild chainstate/UTXO from current chain\n"
-      << "  --mine                                       run built-in miner (interactive address prompt)\n"
+      << "  --mine                                       run built-in miner (interactive address prompt; starts when synced)\n"
       << "  --telemetry                                  write block accepts to telemetry.ndjson in datadir\n"
       << "\n"
       << "Env:\n"
@@ -1695,6 +1746,27 @@ static bool is_recognized_arg(const std::string& s){
     const char* v = std::getenv(name);
     if(!v||!*v) return false;
     if(std::strcmp(v,"0")==0 || std::strcmp(v,"false")==0 || std::strcmp(v,"False")==0) return false;
+    return true;
+}
+
+// Sync-gate evaluator: peers>0, height>0, recent tip.
+static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out){
+    size_t peers = 0;
+    if (p2p) peers = p2p->snapshot_peers().size();
+    if (peers == 0) { why_out = "no peers"; return false; }
+
+    uint64_t h = chain.height();
+    if (h == 0) { why_out = "headers syncing"; return false; }
+
+    auto tip = chain.tip();
+    uint64_t tsec = hdr_time(tip);
+    if (tsec == 0) { why_out = "waiting for headers time"; return false; }
+    uint64_t now = (uint64_t)std::time(nullptr);
+    uint64_t age = (now > tsec) ? (now - tsec) : 0;
+    const uint64_t fresh = std::max<uint64_t>(BLOCK_TIME_SECS * 3, 300);
+    if (age > fresh) { why_out = "tip too old"; return false; }
+
+    why_out.clear();
     return true;
 }
 
@@ -1892,6 +1964,7 @@ int main(int argc, char** argv){
                 p2p_ok = true;
                 log_info("P2P listening on " + std::to_string(P2P_PORT));
                 if (can_tui) { tui.mark_step_ok("Start P2P listener"); tui.mark_step_started("Connect seeds"); }
+                // Ensure we connect to the configured seed host/port (e.g., seed.miqrochain.org:9883)
                 p2p.connect_seed(DNS_SEED, P2P_PORT);
                 if (can_tui) tui.mark_step_ok("Connect seeds");
             } else {
@@ -1939,7 +2012,12 @@ int main(int argc, char** argv){
             rpc_ok = true;
         }
 
+        // Prepare built-in miner (address prompt), but DO NOT start until synced.
         unsigned thr_count = 0;
+        std::vector<uint8_t> mine_pkh;
+        bool miner_spawned = false;
+        bool miner_armed   = false;
+
         if (mine_flag) {
             if (cfg.miner_threads) thr_count = cfg.miner_threads;
             if (thr_count == 0) {
@@ -1950,16 +2028,18 @@ int main(int argc, char** argv){
             }
             if (thr_count == 0) thr_count = std::max(1u, std::thread::hardware_concurrency());
 
-            std::vector<uint8_t> mine_pkh;
             if (MIQ_ISATTY()) {
                 std::string addr;
-                std::cout << "Enter P2PKH Base58 address to mine to (leave empty to cancel): ";
+                std::cout << "Enter P2PKH Base58 address to mine to (will start when synced; empty to cancel): ";
                 std::getline(std::cin, addr);
                 trim_inplace(addr);
                 if (!addr.empty()) {
                     uint8_t ver=0; std::vector<uint8_t> payload;
                     if (base58check_decode(addr, ver, payload) && ver==VERSION_P2PKH && payload.size()==20) {
                         mine_pkh = payload;
+                        g_miner_address_b58 = addr;
+                        miner_armed = true;
+                        log_info("Miner armed; waiting for node to finish syncing before start.");
                     } else {
                         log_error("Invalid mining address; built-in miner disabled.");
                     }
@@ -1968,12 +2048,6 @@ int main(int argc, char** argv){
                 }
             } else {
                 log_info("No TTY available; built-in miner disabled.");
-            }
-            if (!mine_pkh.empty()) {
-                P2P* p2p_ptr = cfg.no_p2p ? nullptr : &p2p;
-                std::thread th(miner_worker, &chain, &mempool, p2p_ptr, mine_pkh, thr_count);
-                th.detach();
-                log_info("Built-in miner started with " + std::to_string(thr_count) + " thread(s).");
             }
         } else {
             log_info("Miner not started (use external miner or pass --mine).");
@@ -1993,6 +2067,11 @@ int main(int argc, char** argv){
         uint64_t last_peer_warn_ms    = 0;
         uint64_t start_of_run_ms      = now_ms();
 
+        // Initial "at height 0" nudge
+        if (chain.height() == 0) {
+            log_info("Waiting for headers from seed (" + std::string(DNS_SEED) + ":" + std::to_string(P2P_PORT) + ")...");
+        }
+
         while(!global::shutdown_requested.load()){
             std::this_thread::sleep_for(std::chrono::milliseconds(can_tui ? 120 : 500));
             if (can_tui){
@@ -2006,6 +2085,24 @@ int main(int argc, char** argv){
                 last_tip_height_seen = h;
                 last_tip_change_ms = now_ms();
             }
+
+            // Sync gate & mining availability
+            {
+                std::string why;
+                bool synced = compute_sync_gate(chain, &p2p, why);
+                tui.set_mining_gate(synced, synced ? "" : why);
+
+                if (synced && miner_armed && !miner_spawned) {
+                    // Start miner now
+                    P2P* p2p_ptr = cfg.no_p2p ? nullptr : &p2p;
+                    std::thread th(miner_worker, &chain, &mempool, p2p_ptr, mine_pkh, thr_count);
+                    th.detach();
+                    miner_spawned = true;
+                    log_info("Sync complete — mining can start.");
+                    if (can_tui) tui.set_hot_warning("Mining started");
+                }
+            }
+
             bool degraded = false;
             if (!cfg.no_p2p){
                 auto n = p2p.snapshot_peers().size();
@@ -2016,7 +2113,7 @@ int main(int argc, char** argv){
                 if (n == 0 && now_ms() - start_of_run_ms > 60000) degraded = true;
             }
             if (now_ms() - last_tip_change_ms > 10*60*1000) degraded = true;
-            if (mine_flag == false && std::getenv("MIQ_MINER_HEARTBEAT") && !g_extminer.alive.load()) degraded = true;
+            if (!miner_armed && std::getenv("MIQ_MINER_HEARTBEAT") && !g_extminer.alive.load()) degraded = true;
 
             if (can_tui) tui.set_health_degraded(degraded);
 
