@@ -317,7 +317,14 @@ static bool miq_parse_host_port(const std::string& in_raw, std::string& host, ui
         host = in.substr(1, rb - 1);
         if (rb + 1 < in.size() && in[rb + 1] == ':') {
             std::string p = in.substr(rb + 2);
-            if (!p.empty()) port_out = static_cast<uint16_t>(std::stoi(p));
+            if (!p.empty()) {
+                char* end=nullptr;
+                unsigned long v = std::strtoul(p.c_str(), &end, 10);
+                if (end && *end == '\0' && v <= 65535UL) {
+                    port_out = static_cast<uint16_t>(v);
+                } /* else: keep default_port */
+            }
+
         }
         return true;
     }
@@ -331,7 +338,13 @@ static bool miq_parse_host_port(const std::string& in_raw, std::string& host, ui
     if (pos != std::string::npos) {
         host = in.substr(0, pos);
         std::string p = in.substr(pos + 1);
-        if (!p.empty()) port_out = static_cast<uint16_t>(std::stoi(p));
+        if (!p.empty()) {
+            char* end=nullptr;
+            unsigned long v = std::strtoul(p.c_str(), &end, 10);
+            if (end && *end == '\0' && v <= 65535UL) {
+                port_out = static_cast<uint16_t>(v);
+            }
+        }
     } else {
         host = in;
     }
@@ -454,7 +467,7 @@ static std::unordered_map<Sock, PeerGate> g_gate;
 // Tunables (local to this TU)
 static const size_t MAX_MSG_BYTES = 2 * 1024 * 1024; // 2 MiB per message (soft)
 static const int    MAX_BANSCORE  = MIQ_P2P_MAX_BANSCORE;
-static const int    HANDSHAKE_MS  = 10000;
+static const int    HANDSHAKE_MS  = MIQ_P2P_VERACK_TIMEOUT_MS;
 
 // IBD phase logging flags
 static bool g_logged_headers_started = false;
@@ -500,7 +513,9 @@ static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
         int n = send(s, reinterpret_cast<const char*>(data + sent), (int)std::min<size_t>(INT32_MAX, len - sent), 0);
         if (n == SOCKET_ERROR) {
             int e = WSAGetLastError();
-            if (e == WSAEWOULDBLOCK) { // spin briefly; sockets are blocking in our usage
+            if (e == WSAEWOULDBLOCK) {
+                WSAPOLLFD pfd{}; pfd.fd = s; pfd.events = POLLWRNORM; pfd.revents = 0;
+                (void)WSAPoll(&pfd, 1, 10);
                 continue;
             }
             char buf[96]; sprintf_s(buf, "send() failed WSAE=%d", e);
@@ -510,9 +525,14 @@ static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
         if (n == 0) return false;
         sent += (size_t)n;
 #else
-        ssize_t n = send(s, data + sent, len - sent, 0);
+       ssize_t n = ::send(s, data + sent, std::min<size_t>(len - sent, (size_t)SSIZE_MAX), 0);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd{ s, POLLOUT, 0 };
+                (void)::poll(&pfd, 1, 10);
+                continue;
+            }
             miq::log_warn("P2P: send() failed");
             return false;
         }
@@ -538,9 +558,15 @@ static inline int miq_recv(Sock s, uint8_t* buf, size_t bufsz) {
     }
     return n;
 #else
-    ssize_t n = recv(s, buf, bufsz, 0);
-    if (n < 0) return -1;
-    return (int)n;
+    for (;;) {
+        ssize_t n = ::recv(s, buf, bufsz, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            return -1;
+        }
+        return (int)n;
+    }
 #endif
 }
 
@@ -730,7 +756,8 @@ static bool is_private_be(uint32_t be_ip){
     if (A == 0 || A == 10 || A == 127) return true;
     if (A == 169 && B == 254) return true;
     if (A == 192 && B == 168) return true;
-    if (A == 172 && (uint8_t(be_ip>>20) & 0x0F) >= 1 && (uint8_t(be_ip>>20) & 0x0F) <= 15) return true;
+    /* 172.16.0.0/12 == 172.(16..31).x.x */
+    if (A == 172 && B >= 16 && B <= 31) return true;
     if (A >= 224) return true;
     return false;
 }
@@ -898,8 +925,10 @@ static bool is_self_endpoint(Sock fd, uint16_t listen_port){
         (void)l;
 
         // explicit: loopback inbound is allowed; only reject if hairpin on same port
-        if ((ntohl(peer_be) >> 24) == 127) return false;
-
+        if ((ntohl(peer_be) >> 24) == 127) {
+            if (peer_port == listen_port) return true;
+            return false;
+        }
         if (is_self_be(peer_be)) {
             if (peer_port == listen_port) {
                 return true;
@@ -909,7 +938,10 @@ static bool is_self_endpoint(Sock fd, uint16_t listen_port){
     } else if (peer.ss_family == AF_INET6 && local.ss_family == AF_INET6) {
         auto* p6 = (sockaddr_in6*)&peer;
         auto* l6 = (sockaddr_in6*)&local;
-        if (is_loopback_v6(p6->sin6_addr)) return false; // allow ::1
+        if (is_loopback_v6(p6->sin6_addr)) {
+            if (ntohs(p6->sin6_port) == listen_port) return true;
+            return false;
+        }
         // Conservative hairpin detect: same v6 address AND same port as our listener.
         if (std::memcmp(&p6->sin6_addr, &l6->sin6_addr, sizeof(in6_addr)) == 0) {
             if (ntohs(p6->sin6_port) == listen_port) {
@@ -2770,7 +2802,10 @@ void P2P::loop(){
         // ---- Guarded removals (single, consistent path) --------------------
         for (Sock s : dead) {
             gate_on_close(s);
-            CLOSESOCK(s);
+            auto it = peers_.find(s);
+            if (it != peers_.end() && it->second.sock != MIQ_INVALID_SOCK) {
+                CLOSESOCK(s);
+            }
             peers_.erase(s);
             g_zero_hdr_batches.erase(s);
             g_preverack_counts.erase(s);
