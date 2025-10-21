@@ -9,7 +9,7 @@ Miqrochain Core is the reference implementation of the **MIQ** peer‑to‑peer 
 
 **Default ports**
 
-- P2P: `9833/tcp`
+- P2P: `9883/tcp`
 - JSON‑RPC: `9834/tcp`
 
 Miqrochain Core uses **libsecp256k1** (the Bitcoin Core secp256k1 library) for ECDSA. The build system will automatically fetch it at configure time if a system package is not available. LevelDB is used by default for the chainstate (RocksDB optional).
@@ -127,10 +127,10 @@ datadir=/var/lib/miq
 
 # Networking
 no_p2p=0
-p2p_port=9833
+p2p_port=9883
 # Bootstrap peers (example):
-addnode=miqseed1.duckdns.org:9833
-addnode=miqroseed1.freeddns.org:9833
+addnode=miqseed1.duckdns.org:9883
+addnode=miqroseed1.freeddns.org:9883
 
 # RPC
 no_rpc=0
@@ -242,7 +242,7 @@ If built **without** wallet encryption (default), these RPCs are no‑ops.
 
 ## Networking
 
-- **P2P port**: 55001/tcp. Open or port‑forward this on your router for a public node.  
+- **P2P port**: 9883/tcp. Open or port‑forward this on your router for a public node.  
 - **RPC port**: 9834/tcp (binds to loopback by default).  
 - Seeds / bootstrapping are defined in `src/seeds.cpp`. You can add bootstrap DNS names or IPs.
 
