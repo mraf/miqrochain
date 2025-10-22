@@ -32,7 +32,7 @@
 #include "tls_proxy.h"
 #include "ibd_monitor.h"
 #include "utxo_kv.h"
-#include "reindex_utxo.h"
+#include "reindex_utxo.h"  // <-- ensures ensure_utxo_fully_indexed(...) is declared
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STL
@@ -603,7 +603,7 @@ static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
 
     const bool force_utf8 = []{
         const char* s = std::getenv("MIQ_TUI_UTF8");
-        return s && *s && std::strcmp(s,"0")!=0 && std::strcmp(s,"false")!=0 && std::strcmp(s,"False")!=0;
+        return s && *s ? (std::strcmp(s,"0")!=0 && std::strcmp(s,"false")!=0 && std::strcmp(s,"False")!=0) : false;
     }();
     if (force_utf8 && have_console) {
         SetConsoleOutputCP(CP_UTF8);
@@ -726,7 +726,8 @@ static inline std::string straight_line(int w){
 }
 static inline std::string bar(int width, double frac, bool /*vt_ok*/, bool u8_ok){
     if (width < 3) width = 3;
-    if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+    if (frac < 0) frac = 0;
+    if (frac > 1) frac = 1; // <- split lines to avoid -Wmisleading-indentation
     int inner = width - 2;
     int full  = (int)std::round(frac * inner);
     std::string out; out.reserve((size_t)width);
@@ -836,14 +837,16 @@ static inline std::string spark_ascii(const std::vector<double>& v){
     for (double x : v){ if (x < mn) mn = x; if (x > mx) mx = x; }
     double span = (mx - mn);
     bool fancy = env_truthy_local("MIQ_TUI_UTF8");
-    const char* blocks8 = "▁▂▃▄▅▆▇█";
+    const char* blocks8 = "▁▂▃▄▅▆▇█"; // 8 glyphs, UTF-8 (3 bytes each)
     const char* ascii   = " .:-=+*#%@";
     std::string out; out.reserve(v.size());
     for (double x : v){
         int idx = 0;
         if (span > 0) idx = (int)std::floor((x - mn) / span * 7.999);
-        if (idx < 0) idx = 0; if (idx > 7) idx = 7;
-        out += fancy ? std::string(blocks8 + idx, 3) : std::string(1, ascii[(size_t)idx]);
+        if (idx < 0) idx = 0;
+        if (idx > 7) idx = 7; // <- split lines to avoid -Wmisleading-indentation
+        out += fancy ? std::string(blocks8 + idx*3, 3)   // <- correct UTF-8 indexing
+                     : std::string(1, ascii[(size_t)idx]);
     }
     return out;
 }
