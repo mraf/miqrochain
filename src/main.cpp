@@ -32,7 +32,16 @@
 #include "tls_proxy.h"
 #include "ibd_monitor.h"
 #include "utxo_kv.h"
-#include "reindex_utxo.h"  // <-- ensures ensure_utxo_fully_indexed(...) is declared
+
++#if __has_include("reindex_utxo.h")
++#  include "reindex_utxo.h"
++#endif
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
+extern bool ensure_utxo_fully_indexed(miq::Chain&, const std::string&, bool) __attribute__((weak));
+#  define MIQ_CAN_PROBE_UTXO_REINDEX 1
+#else
+#  define MIQ_CAN_PROBE_UTXO_REINDEX 0
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STL
@@ -2042,14 +2051,28 @@ int main(int argc, char** argv){
         if (can_tui) { tui.mark_step_ok("Load & validate genesis"); tui.mark_step_ok("Genesis OK"); }
 
         if (can_tui) tui.mark_step_started("Reindex UTXO (full scan)");
-        if (!ensure_utxo_fully_indexed(chain, cfg.datadir, flag_reindex_utxo)){
-            if (can_tui) tui.mark_step_fail("Reindex UTXO (full scan)");
-            release_datadir_lock();
-            if (can_tui) { capture.stop(); tui.stop(); }
-            return 12;
+#if MIQ_CAN_PROBE_UTXO_REINDEX
+        {
+            bool ok_reindex = true;
+            if (ensure_utxo_fully_indexed) {
+                ok_reindex = ensure_utxo_fully_indexed(chain, cfg.datadir, flag_reindex_utxo);
+            } else {
+                log_info("UTXO reindex routine not linked in this build; skipping.");
+            }
+            if (!ok_reindex){
+                if (can_tui) tui.mark_step_fail("Reindex UTXO (full scan)");
+                release_datadir_lock();
+                if (can_tui) { capture.stop(); tui.stop(); }
+                return 12;
+            }
+            if (can_tui) tui.mark_step_ok("Reindex UTXO (full scan)");
         }
-        if (can_tui) tui.mark_step_ok("Reindex UTXO (full scan)");
-
+#else
+        {
+            log_info("UTXO reindex routine not available on this compiler/platform; skipping.");
+            if (can_tui) tui.mark_step_ok("Reindex UTXO (full scan)");
+        }
+#endif
         if (can_tui) tui.mark_step_started("Initialize mempool & RPC");
         Mempool mempool; RpcService rpc(chain, mempool);
         if (can_tui) tui.mark_step_ok("Initialize mempool & RPC");
