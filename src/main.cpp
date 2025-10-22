@@ -461,7 +461,7 @@ static void release_datadir_lock(){
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                    Signals / console control / input                       ║
+/*                    Signals / console control / input                       */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 static void sighup_handler(int){ global::reload_requested.store(true); }
 static void sigshutdown_handler(int){ request_shutdown("signal"); }
@@ -778,199 +778,6 @@ private:
     std::vector<std::string> pending_;
     std::deque<Line> lines_;
 };
-
-// ╔═══════════════════════════════════════════════════════════════════════════╗
-/*                               UI helpers                                    */
-// ╚═══════════════════════════════════════════════════════════════════════════╝
-static inline std::string short_hex(const std::string& h, size_t n=12){ return h.size()>n ? h.substr(0,n) : h; }
-static inline std::string fmt_hs(double v){
-    const char* u[] = {"H/s","kH/s","MH/s","GH/s","TH/s","PH/s"};
-    int i=0; while(v>=1000.0 && i<5){ v/=1000.0; ++i; }
-    std::ostringstream o; o<<std::fixed<<std::setprecision(2)<<v<<" "<<u[i]; return o.str();
-}
-static inline std::string fmt_num(uint64_t v){
-    std::ostringstream o;
-    if (v<1000) { o<<v; return o.str(); }
-    const char* u[]={"","K","M","B","T","P"};
-    int i=0; double x=(double)v;
-    while(x>=1000.0 && i<5){ x/=1000.0; ++i; }
-    o<<std::fixed<<std::setprecision(x<10?2:(x<100?1:0))<<x<<u[i]; return o.str();
-}
-static inline std::string fmt_bytes(uint64_t v){
-    const char* u[] = {"B","KiB","MiB","GiB","TiB"};
-    int i=0; double x = (double)v;
-    while (x>=1024.0 && i<4){ x/=1024.0; ++i; }
-    std::ostringstream o; o<<std::fixed<<std::setprecision(x<10?2:(x<100?1:0))<<x<<" "<<u[i]; return o.str();
-}
-static inline std::string fmt_diff(long double d){
-    if (d < 0) d = 0;
-    long double x = d;
-    const char* u[] = {"", "k", "M", "G", "T", "P", "E"};
-    int i=0;
-    while (x >= 1000.0L && i < 6){ x /= 1000.0L; ++i; }
-    std::ostringstream o; o<<std::fixed<<std::setprecision(x<10?2:(x<100?1:0))<<(double)x<<u[i];
-    return o.str();
-}
-
-static inline std::string bar(int width, double frac, bool /*vt_ok*/, bool /*u8_ok*/){
-    if (width < 6) width = 6;
-    if (frac < 0) frac = 0;
-    if (frac > 1) frac = 1;
-    int full = (int)((width-2)*frac + 0.5);
-    std::ostringstream o;
-    o << '[';
-    for(int i=0;i<width-2;i++) o << (i<full ? '#' : ' ');
-    o << ']';
-    return o.str();
-}
-static std::string straight_line(int width){
-    if (width < 1) width = 1;
-    return std::string((size_t)width, '-');
-}
-static std::string spinner(int tick, bool u8_ok){
-    if (u8_ok) {
-        static const char* s = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
-        return std::string(1, s[tick % 10]);
-    } else {
-        static const char* s2 = "-\\|/";
-        return std::string(1, s2[tick % 4]);
-    }
-}
-static std::string spark_ascii(const std::vector<double>& xs){
-    static const char bars[] = " .:-=+*#%@";
-    if(xs.empty()) return "";
-    double mn=xs[0], mx=xs[0];
-    for(double v: xs){ mn = std::min(mn,v); mx = std::max(mx,v); }
-    double span = (mx>mn)? (mx-mn) : 1.0;
-    std::string s;
-    for(double v: xs){
-        int idx = (int)std::round( (v-mn)/span * 9.0 );
-        if (idx < 0) idx = 0;
-        if (idx > 9) idx = 9;
-        s.push_back(bars[idx]);
-    }
-    return s;
-}
-
-// ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                   UTXO chainstate presence + full reindex                 ║
-// ╚═══════════════════════════════════════════════════════════════════════════╝
-static bool dir_exists_nonempty(const std::string& path){
-    std::error_code ec; if(!std::filesystem::exists(path, ec)) return false;
-    for (auto it = std::filesystem::directory_iterator(path, ec);
-         it != std::filesystem::directory_iterator(); ++it) return true;
-    return false;
-}
-static bool ensure_utxo_fully_indexed(Chain& chain, const std::string& datadir, bool force){
-    const std::string chainstate_dir = p_join(datadir, "chainstate");
-    bool need = force || !dir_exists_nonempty(chainstate_dir);
-    if(!need){
-        log_info("UTXO chainstate seems present; quick-skip deep probe.");
-        return true;
-    }
-    log_warn("UTXO chainstate missing/stale -- reindex required.");
-    UTXOKV utxo_kv;
-    std::string err;
-    log_info("ReindexUTXO: starting full scan...");
-    const auto t0 = now_ms();
-    const bool ok = ReindexUTXO(chain, utxo_kv, /*compact_after=*/true, err);
-    const auto t1 = now_ms();
-    if(!ok){
-        log_error(std::string("ReindexUTXO failed: ") + (err.empty()?"unknown":err));
-        return false;
-    }
-    log_info(std::string("ReindexUTXO: complete in ") + std::to_string((t1 - t0)/1000.0) + "s");
-    if(!dir_exists_nonempty(chainstate_dir)){
-        log_error("ReindexUTXO claimed success but chainstate is empty -- refusing to continue.");
-        return false;
-    }
-    return true;
-}
-
-// ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                    Traits: mempool & header safe accessors                ║
-// ╚═══════════════════════════════════════════════════════════════════════════╝
-template<typename, typename = void> struct has_stats_method : std::false_type{};
-template<typename T> struct has_stats_method<T, std::void_t<decltype(std::declval<T&>().stats())>> : std::true_type{};
-template<typename, typename = void> struct has_size_method  : std::false_type{};
-template<typename T> struct has_size_method<T,  std::void_t<decltype(std::declval<T&>().size())>>  : std::true_type{};
-template<typename, typename = void> struct has_count_method : std::false_type{};
-template<typename T> struct has_count_method<T, std::void_t<decltype(std::declval<T&>().count())>> : std::true_type{};
-
-struct MempoolView { uint64_t count=0, bytes=0, recent_adds=0; };
-template<typename MP>
-static MempoolView mempool_view_fallback(MP* mp){
-    MempoolView v{};
-    if (!mp) return v;
-    if constexpr (has_stats_method<MP>::value) {
-        auto s = mp->stats();
-        v.count = (uint64_t)s.count;
-        v.bytes = (uint64_t)s.bytes;
-        v.recent_adds = (uint64_t)s.recent_adds;
-    } else if constexpr (has_size_method<MP>::value) {
-        v.count = (uint64_t)mp->size();
-    } else if constexpr (has_count_method<MP>::value) {
-        v.count = (uint64_t)mp->count();
-    }
-    return v;
-}
-
-template<typename, typename = void> struct has_time_field : std::false_type{};
-template<typename H> struct has_time_field<H, std::void_t<decltype(std::declval<H>().time)>> : std::true_type{};
-template<typename, typename = void> struct has_timestamp_field : std::false_type{};
-template<typename H> struct has_timestamp_field<H, std::void_t<decltype(std::declval<H>().timestamp)>> : std::true_type{};
-template<typename, typename = void> struct has_bits_field : std::false_type{};
-template<typename H> struct has_bits_field<H, std::void_t<decltype(std::declval<H>().bits)>> : std::true_type{};
-template<typename, typename = void> struct has_nBits_field : std::false_type{};
-template<typename H> struct has_nBits_field<H, std::void_t<decltype(std::declval<H>().nBits)>> : std::true_type{};
-
-template<typename H>
-static uint64_t hdr_time(const H& h){
-    if constexpr (has_time_field<H>::value) return (uint64_t)h.time;
-    if constexpr (has_timestamp_field<H>::value) return (uint64_t)h.timestamp;
-    return 0;
-}
-template<typename H>
-static uint32_t hdr_bits(const H& h){
-    if constexpr (has_bits_field<H>::value) return (uint32_t)h.bits;
-    if constexpr (has_nBits_field<H>::value) return (uint32_t)h.nBits;
-    return (uint32_t)GENESIS_BITS;
-}
-
-// Difficulty helpers
-static long double compact_to_target_ld(uint32_t bits){
-    uint32_t exp = bits >> 24;
-    uint32_t mant = bits & 0x007fffff;
-    long double m = (long double)mant;
-    int shift = (int)exp - 3;
-    return std::ldexp(m, 8 * shift);
-}
-static long double difficulty_from_bits(uint32_t bits){
-    long double t_one = compact_to_target_ld((uint32_t)GENESIS_BITS);
-    long double t_cur = compact_to_target_ld(bits);
-    if (t_cur <= 0.0L) return 0.0L;
-    return t_one / t_cur;
-}
-
-// Estimate network hashrate
-static double estimate_network_hashrate(Chain* chain){
-    if (!chain) return 0.0;
-    const unsigned k = (unsigned)std::max<int>(MIQ_RETARGET_INTERVAL, 32);
-    auto headers = chain->last_headers(k);
-    if (headers.size() < 2) return 0.0;
-
-    uint64_t t_first = hdr_time(headers.front());
-    uint64_t t_last  = hdr_time(headers.back());
-    if (t_last <= t_first) t_last = t_first + 1;
-    double avg_block_time = double(t_last - t_first) / double(headers.size()-1);
-    if (avg_block_time <= 0.0) avg_block_time = (double)BLOCK_TIME_SECS;
-
-    uint32_t bits = hdr_bits(headers.back());
-    long double diff = difficulty_from_bits(bits);
-    long double hps = (diff * 4294967296.0L) / avg_block_time; // 2^32
-    if (!std::isfinite((double)hps) || hps < 0) return 0.0;
-    return (double)hps;
-}
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 /*                                Pro TUI 3 Ultra                              */
@@ -1749,6 +1556,90 @@ static bool is_recognized_arg(const std::string& s){
     return true;
 }
 
+// Traits & helpers used below
+
+template<typename, typename = void> struct has_stats_method : std::false_type{};
+template<typename T> struct has_stats_method<T, std::void_t<decltype(std::declval<T&>().stats())>> : std::true_type{};
+template<typename, typename = void> struct has_size_method  : std::false_type{};
+template<typename T> struct has_size_method<T,  std::void_t<decltype(std::declval<T&>().size())>>  : std::true_type{};
+template<typename, typename = void> struct has_count_method : std::false_type{};
+template<typename T> struct has_count_method<T, std::void_t<decltype(std::declval<T&>().count())>> : std::true_type{};
+
+struct MempoolView { uint64_t count=0, bytes=0, recent_adds=0; };
+template<typename MP>
+static MempoolView mempool_view_fallback(MP* mp){
+    MempoolView v{};
+    if (!mp) return v;
+    if constexpr (has_stats_method<MP>::value) {
+        auto s = mp->stats();
+        v.count = (uint64_t)s.count;
+        v.bytes = (uint64_t)s.bytes;
+        v.recent_adds = (uint64_t)s.recent_adds;
+    } else if constexpr (has_size_method<MP>::value) {
+        v.count = (uint64_t)mp->size();
+    } else if constexpr (has_count_method<MP>::value) {
+        v.count = (uint64_t)mp->count();
+    }
+    return v;
+}
+
+template<typename, typename = void> struct has_time_field : std::false_type{};
+template<typename H> struct has_time_field<H, std::void_t<decltype(std::declval<H>().time)>> : std::true_type{};
+template<typename, typename = void> struct has_timestamp_field : std::false_type{};
+template<typename H> struct has_timestamp_field<H, std::void_t<decltype(std::declval<H>().timestamp)>> : std::true_type{};
+template<typename, typename = void> struct has_bits_field : std::false_type{};
+template<typename H> struct has_bits_field<H, std::void_t<decltype(std::declval<H>().bits)>> : std::true_type{};
+template<typename, typename = void> struct has_nBits_field : std::false_type{};
+template<typename H> struct has_nBits_field<H, std::void_t<decltype(std::declval<H>().nBits)>> : std::true_type{};
+
+template<typename H>
+static uint64_t hdr_time(const H& h){
+    if constexpr (has_time_field<H>::value) return (uint64_t)h.time;
+    if constexpr (has_timestamp_field<H>::value) return (uint64_t)h.timestamp;
+    return 0;
+}
+template<typename H>
+static uint32_t hdr_bits(const H& h){
+    if constexpr (has_bits_field<H>::value) return (uint32_t)h.bits;
+    if constexpr (has_nBits_field<H>::value) return (uint32_t)h.nBits;
+    return (uint32_t)GENESIS_BITS;
+}
+
+// Difficulty helpers
+static long double compact_to_target_ld(uint32_t bits){
+    uint32_t exp = bits >> 24;
+    uint32_t mant = bits & 0x007fffff;
+    long double m = (long double)mant;
+    int shift = (int)exp - 3;
+    return std::ldexp(m, 8 * shift);
+}
+static long double difficulty_from_bits(uint32_t bits){
+    long double t_one = compact_to_target_ld((uint32_t)GENESIS_BITS);
+    long double t_cur = compact_to_target_ld(bits);
+    if (t_cur <= 0.0L) return 0.0L;
+    return t_one / t_cur;
+}
+
+// Estimate network hashrate
+static double estimate_network_hashrate(Chain* chain){
+    if (!chain) return 0.0;
+    const unsigned k = (unsigned)std::max<int>(MIQ_RETARGET_INTERVAL, 32);
+    auto headers = chain->last_headers(k);
+    if (headers.size() < 2) return 0.0;
+
+    uint64_t t_first = hdr_time(headers.front());
+    uint64_t t_last  = hdr_time(headers.back());
+    if (t_last <= t_first) t_last = t_first + 1;
+    double avg_block_time = double(t_last - t_first) / double(headers.size()-1);
+    if (avg_block_time <= 0.0) avg_block_time = (double)BLOCK_TIME_SECS;
+
+    uint32_t bits = hdr_bits(headers.back());
+    long double diff = difficulty_from_bits(bits);
+    long double hps = (diff * 4294967296.0L) / avg_block_time; // 2^32
+    if (!std::isfinite((double)hps) || hps < 0) return 0.0;
+    return (double)hps;
+}
+
 // Sync-gate evaluator: peers>0, height>0, recent tip.
 static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out){
     size_t peers = 0;
@@ -1768,6 +1659,124 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out){
 
     why_out.clear();
     return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IBD helpers (NEW) — smart start/finish + explicit error on failure
+// ─────────────────────────────────────────────────────────────────────────────
+static inline bool path_exists_nonempty(const std::string& p){
+    std::error_code ec;
+    if(!std::filesystem::exists(p, ec)) return false;
+    for (auto it = std::filesystem::directory_iterator(p, ec);
+         it != std::filesystem::directory_iterator(); ++it) return true;
+    return false;
+}
+static bool has_existing_blocks_or_state(const std::string& datadir){
+    return path_exists_nonempty(p_join(datadir, "blocks")) ||
+           path_exists_nonempty(p_join(datadir, "chainstate"));
+}
+static bool tip_fresh_enough(Chain& chain){
+    auto tip = chain.tip();
+    uint64_t tsec = hdr_time(tip);
+    if (tsec == 0) return false;
+    uint64_t now = (uint64_t)std::time(nullptr);
+    uint64_t age = (now > tsec) ? (now - tsec) : 0;
+    const uint64_t fresh = std::max<uint64_t>(BLOCK_TIME_SECS * 3, 300);
+    return age <= fresh;
+}
+// Decide whether to enter IBD:
+//  - New node (no blocks/chainstate) => yes
+//  - Height==0 => yes
+//  - Has some data but tip is stale => yes
+//  - Otherwise => skip (already synced enough)
+static bool should_enter_ibd(Chain& chain, const std::string& datadir){
+    if (chain.height() == 0) return true;
+    if (!has_existing_blocks_or_state(datadir)) return true;
+    if (!tip_fresh_enough(chain)) return true;
+    return false;
+}
+
+// Active IBD loop: try to reach a "synced" state (compute_sync_gate true).
+// Surfaces a concrete error if it can't finish.
+static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
+                             bool can_tui, TUI* tui, std::string& out_err){
+    // If we don't need IBD, we're done.
+    if (!should_enter_ibd(chain, datadir)) return true;
+
+    if (!p2p) {
+        out_err = "P2P disabled (cannot sync headers/blocks)";
+        return false;
+    }
+
+    using namespace std::chrono_literals;
+
+    const uint64_t kNoPeerTimeoutMs      = 90 * 1000;
+    const uint64_t kNoProgressTimeoutMs  = 180 * 1000;
+    const uint64_t kStableOkMs           = 8 * 1000;
+    const uint64_t kMaxWallMs            = 30 * 60 * 1000;
+    const uint64_t t0                    = now_ms();
+    uint64_t       lastSeedDialMs        = 0;
+    uint64_t       lastProgressMs        = now_ms();
+    uint64_t       lastHeight            = chain.height();
+
+    // Make sure we’ve nudged the seed right away.
+    p2p->connect_seed(DNS_SEED, P2P_PORT);
+    lastSeedDialMs = now_ms();
+
+    if (can_tui) tui->set_node_state(TUI::NodeState::Syncing);
+
+    while (!global::shutdown_requested.load()) {
+        // Hard wall clock timeout
+        if (now_ms() - t0 > kMaxWallMs) { out_err = "IBD timeout (no completion within time budget)"; break; }
+
+        // Ensure we periodically re-nudge the seed if peer count is low.
+        size_t peers = p2p->snapshot_peers().size();
+        if (peers < 2 && now_ms() - lastSeedDialMs > 15 * 1000) {
+            p2p->connect_seed(DNS_SEED, P2P_PORT);
+            lastSeedDialMs = now_ms();
+        }
+
+        // Early no-peer failure
+        if (peers == 0 && now_ms() - t0 > kNoPeerTimeoutMs) {
+            out_err = std::string("no peers reachable (seed: ") + DNS_SEED + ":" + std::to_string(P2P_PORT) + ")";
+            break;
+        }
+
+        // Track progress by height advancing
+        uint64_t h = chain.height();
+        if (h > lastHeight) {
+            lastHeight = h;
+            lastProgressMs = now_ms();
+        } else {
+            // With peers but no header progress → fail after some time
+            if (peers > 0 && now_ms() - lastProgressMs > kNoProgressTimeoutMs) {
+                out_err = "no headers/blocks progress from peers";
+                break;
+            }
+        }
+
+        // Check "synced" state and require short stability window
+        std::string why;
+        if (compute_sync_gate(chain, p2p, why)) {
+            const uint64_t okStart = now_ms();
+            bool stable = true;
+            while (now_ms() - okStart < kStableOkMs) {
+                std::this_thread::sleep_for(200ms);
+                if (!compute_sync_gate(chain, p2p, why)) { stable = false; break; }
+            }
+            if (stable) {
+                // Success
+                return true;
+            }
+        }
+
+        std::this_thread::sleep_for(250ms);
+    }
+
+    if (global::shutdown_requested.load())
+        out_err = "shutdown requested during IBD";
+
+    return false;
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -1978,6 +1987,32 @@ int main(int argc, char** argv){
         start_ibd_monitor(&chain, &p2p);
         if (can_tui) tui.mark_step_ok("Start IBD monitor");
 
+        // ─────────────────────────────────────────────────────────────────────
+        // NEW STEP: IBD sync phase (smart start/finish, surfaces real error)
+        // ─────────────────────────────────────────────────────────────────────
+        if (can_tui) tui.mark_step_started("IBD sync phase");
+        std::string ibd_err;
+        bool ibd_ok = perform_ibd_sync(chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, &tui, ibd_err);
+        if (ibd_ok) {
+            if (can_tui) {
+                tui.mark_step_ok("IBD sync phase");
+                tui.set_banner("Initial block download complete. Node is synced.");
+                tui.set_node_state(TUI::NodeState::Running);
+                tui.set_mining_gate(true, "");
+            }
+            log_info("IBD sync completed successfully.");
+        } else {
+            if (can_tui) {
+                tui.mark_step_fail("IBD sync phase");
+                tui.set_node_state(TUI::NodeState::Degraded);
+                tui.set_hot_warning(std::string("BLOCKS MINED LOCALLY WILL NOT BE VALID — ") + ibd_err);
+                tui.set_mining_gate(false, ibd_err + " — blocks mined locally will not be valid");
+            }
+            log_error(std::string("IBD sync failed: ") + ibd_err);
+            log_error("BLOCKS MINED LOCALLY WILL NOT BE VALID");
+        }
+
+        // Start RPC after IBD step so the TUI step order aligns
         bool rpc_ok = false;
         if (can_tui) tui.mark_step_started("Start RPC server");
         if(!cfg.no_rpc){
@@ -2056,10 +2091,16 @@ int main(int argc, char** argv){
         log_info(std::string(CHAIN_NAME) + " node running. RPC " + std::to_string(RPC_PORT) +
                  ", P2P " + std::to_string(P2P_PORT));
         if (can_tui) {
-            tui.set_banner(u8_ok ? "Miqrochain node running — syncing & serving peers…" :
-                                   "Miqrochain node running - syncing & serving peers...");
-            if ((p2p_ok || cfg.no_p2p) && rpc_ok) tui.set_node_state(TUI::NodeState::Running);
-            else tui.set_node_state(TUI::NodeState::Syncing);
+            // If IBD failed earlier, keep Degraded; otherwise Running
+            if (ibd_ok) {
+                tui.set_banner(u8_ok ? "Miqrochain node running — synced & serving peers…" :
+                                       "Miqrochain node running - synced & serving peers...");
+                tui.set_node_state(TUI::NodeState::Running);
+            } else {
+                tui.set_banner(u8_ok ? "Node running — IBD failed (see error). Mining disabled." :
+                                       "Node running - IBD failed (see error). Mining disabled.");
+                tui.set_node_state(TUI::NodeState::Degraded);
+            }
         }
 
         uint64_t last_tip_height_seen = chain.height();
@@ -2106,11 +2147,11 @@ int main(int argc, char** argv){
             bool degraded = false;
             if (!cfg.no_p2p){
                 auto n = p2p.snapshot_peers().size();
-                if (n == 0 && now_ms() - last_peer_warn_ms > 60000){
+                if (n == 0 && now_ms() - last_peer_warn_ms > 60'000){
                     if (can_tui) tui.set_hot_warning("No peers connected - check network/firewall?");
                     last_peer_warn_ms = now_ms();
                 }
-                if (n == 0 && now_ms() - start_of_run_ms > 60000) degraded = true;
+                if (n == 0 && now_ms() - start_of_run_ms > 60'000) degraded = true;
             }
             if (now_ms() - last_tip_change_ms > 10*60*1000) degraded = true;
             if (!miner_armed && std::getenv("MIQ_MINER_HEARTBEAT") && !g_extminer.alive.load()) degraded = true;
