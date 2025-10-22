@@ -209,7 +209,6 @@
 #endif
 
 #ifndef MIQ_P2P_GETADDR_INTERVAL_MS
-#define MIQ_P2P_P2P_GETADDR_INTERVAL_MS_SHADOW 120000
 #define MIQ_P2P_GETADDR_INTERVAL_MS 120000
 #endif
 #if MIQ_FILTER_PROFILE_STRICT
@@ -1288,6 +1287,9 @@ static Sock create_server(uint16_t port){
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_ANY); a.sin_port = htons(port);
     int yes = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+#ifdef _WIN32
+    setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&yes, sizeof(yes));
+#endif
     if (bind(s, (sockaddr*)&a, sizeof(a)) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
     if (listen(s, SOMAXCONN) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
     (void)miq_set_nonblock(s);
@@ -1303,6 +1305,9 @@ static Sock create_server_v6(uint16_t port){
     if (s == MIQ_INVALID_SOCK) return MIQ_INVALID_SOCK;
     int yes = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+#ifdef _WIN32
+    setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&yes, sizeof(yes));
+#endif
 #ifdef IPV6_V6ONLY
     int v6only = 1;
     setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&v6only, sizeof(v6only));
@@ -1584,6 +1589,11 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
         // Connected
         s = ts;
         peer_ip = miq_ntop_sockaddr(ne.ss);
+        if (banned_.count(peer_ip) || is_ip_banned(peer_ip, now_ms())) {
+            CLOSESOCK(s);
+            s = MIQ_INVALID_SOCK;
+            continue;
+        }
 
         // Reject obvious hairpin on same port
         if (is_self_endpoint(s, g_listen_port)) {
@@ -1853,13 +1863,14 @@ bool P2P::rate_consume_tx(PeerState& ps, size_t nbytes){
 
 void P2P::maybe_send_getaddr(PeerState& ps){
     int64_t t = now_ms();
-    if (t - ps.last_getaddr_ms < (int64_t)MIQ_P2P_GETADDR_INTERVAL_MS) return;
-    ps.last_getaddr_ms = t;
+    // Allow first ever send immediately; then rate-limit
+    if (ps.last_getaddr_ms != 0 &&
+        (t - ps.last_getaddr_ms) < (int64_t)MIQ_P2P_GETADDR_INTERVAL_MS) return;
     auto msg = encode_msg("getaddr", {});
     if (check_rate(ps, "get", 1.0, t)) {
         (void)miq_send(ps.sock, msg);
+        ps.last_getaddr_ms = t;
     }
-}
 
 void P2P::send_addr_snapshot(PeerState& ps){
     if (!check_rate(ps, "addr", 1.0, now_ms())) return;
@@ -1901,7 +1912,8 @@ void P2P::send_addr_snapshot(PeerState& ps){
 }
 void P2P::handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload){
     int64_t t = now_ms();
-    if (t - ps.last_addr_ms < MIQ_ADDR_MIN_INTERVAL_MS) {
+    if (ps.last_addr_ms != 0 &&
+        (t - ps.last_addr_ms) < (int64_t)MIQ_ADDR_MIN_INTERVAL_MS) {
         if (++ps.mis > 20) { bump_ban(ps, ps.ip, "addr-interval", t); }
         return;
     }
@@ -2408,7 +2420,13 @@ void P2P::loop(){
 
             auto &ps = it->second;
 
-            bool ready = (fds[base + i].revents & POLL_RD) != 0;
+            short rev = fds[base + i].revents;
+            if (rev & (POLLERR | POLLHUP | POLLNVAL)) {
+                P2P_TRACE("close poll err/hup");
+                dead.push_back(s);
+                continue;
+            }
+            bool ready = (rev & POLL_RD) != 0;
 
             if (ready) {
                 uint8_t buf[65536];
@@ -2763,6 +2781,9 @@ void P2P::loop(){
                     } else if (cmd == "headers") {
                         if (unsolicited_drop(ps, "headers", "")) {
                             P2P_TRACE("drop unsolicited headers (no ban)");
+                            // Defensively clear any stale inflight to avoid header sync deadlock.
+                            ps.sent_getheaders = false;
+                            ps.inflight_hdr_batches = 0;
                             continue;
                         }
                         std::vector<BlockHeader> hs;
