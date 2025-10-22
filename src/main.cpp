@@ -70,6 +70,7 @@
 #include <array>
 #include <optional>
 #include <cmath>
+#include <cerrno>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OS headers (guarded)
@@ -667,6 +668,208 @@ private:
 };
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
+/*                              Helper utilities                               */
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+// small truthy helper reused for ASCII fallbacks
+static inline bool env_truthy_local(const char* name){
+    const char* v = std::getenv(name);
+    if(!v||!*v) return false;
+    if(std::strcmp(v,"0")==0 || std::strcmp(v,"false")==0 || std::strcmp(v,"False")==0) return false;
+    return true;
+}
+
+// Bytes pretty-printer
+static inline std::string fmt_bytes(uint64_t v){
+    static const char* units[] = {"B","KiB","MiB","GiB","TiB","PiB"};
+    double d = (double)v;
+    int u = 0;
+    while (d >= 1024.0 && u < 5){ d /= 1024.0; ++u; }
+    std::ostringstream o; o<<std::fixed<<std::setprecision(u?1:0)<<d<<" "<<units[u];
+    return o.str();
+}
+
+// Hashrate pretty-printer
+static inline std::string fmt_hs(double v){
+    static const char* units[] = {"H/s","kH/s","MH/s","GH/s","TH/s","PH/s","EH/s"};
+    double d = (double)v;
+    int u = 0;
+    while (d >= 1000.0 && u < 6){ d /= 1000.0; ++u; }
+    std::ostringstream o; o<<std::fixed<<std::setprecision(u?2:0)<<d<<" "<<units[u];
+    return o.str();
+}
+
+// Difficulty pretty
+static inline std::string fmt_diff(long double d){
+    double x = (double)d;
+    static const char* units[] = {"","k","M","G","T","P","E"};
+    int u = 0;
+    while (x >= 1000.0 && u < 6){ x/=1000.0; ++u; }
+    std::ostringstream o; o<<std::fixed<<std::setprecision(u?2:0)<<x<<units[u];
+    return o.str();
+}
+
+// Spinner & drawing helpers
+static inline std::string spinner(int tick, bool fancy){
+    if (fancy){
+        static const char* frames[] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
+        return frames[(size_t)(tick % 10)];
+    } else {
+        static const char frames[] = {'-','\\','|','/'};
+        return std::string(1, frames[(size_t)(tick & 3)]);
+    }
+}
+static inline std::string straight_line(int w){
+    if (w <= 0) return {};
+    // keep ASCII here for max portability
+    return std::string((size_t)w, '-');
+}
+static inline std::string bar(int width, double frac, bool /*vt_ok*/, bool u8_ok){
+    if (width < 3) width = 3;
+    if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+    int inner = width - 2;
+    int full  = (int)std::round(frac * inner);
+    std::string out; out.reserve((size_t)width);
+    out.push_back('[');
+    if (u8_ok && env_truthy_local("MIQ_TUI_UTF8")){
+        for (int i=0;i<inner;i++) out += (i<full ? "█" : " ");
+    } else {
+        for (int i=0;i<inner;i++) out.push_back(i<full ? '#' : ' ');
+    }
+    out.push_back(']');
+    return out;
+}
+static inline std::string short_hex(const std::string& h, int keep){
+    if ((int)h.size() <= keep) return h;
+    int half = keep/2;
+    const char* ell = env_truthy_local("MIQ_TUI_UTF8")? "…" : "...";
+    return h.substr(0,(size_t)half) + ell + h.substr(h.size()-(size_t)(keep-half));
+}
+
+// Traits & helpers used by TUI and elsewhere
+template<typename, typename = void> struct has_stats_method : std::false_type{};
+template<typename T> struct has_stats_method<T, std::void_t<decltype(std::declval<T&>().stats())>> : std::true_type{};
+template<typename, typename = void> struct has_size_method  : std::false_type{};
+template<typename T> struct has_size_method<T,  std::void_t<decltype(std::declval<T&>().size())>>  : std::true_type{};
+template<typename, typename = void> struct has_count_method : std::false_type{};
+template<typename T> struct has_count_method<T, std::void_t<decltype(std::declval<T&>().count())>> : std::true_type{};
+
+struct MempoolView { uint64_t count=0, bytes=0, recent_adds=0; };
+template<typename MP>
+static MempoolView mempool_view_fallback(MP* mp){
+    MempoolView v{};
+    if (!mp) return v;
+    if constexpr (has_stats_method<MP>::value) {
+        auto s = mp->stats();
+        v.count = (uint64_t)s.count;
+        v.bytes = (uint64_t)s.bytes;
+        v.recent_adds = (uint64_t)s.recent_adds;
+    } else if constexpr (has_size_method<MP>::value) {
+        v.count = (uint64_t)mp->size();
+    } else if constexpr (has_count_method<MP>::value) {
+        v.count = (uint64_t)mp->count();
+    }
+    return v;
+}
+
+template<typename, typename = void> struct has_time_field : std::false_type{};
+template<typename H> struct has_time_field<H, std::void_t<decltype(std::declval<H>().time)>> : std::true_type{};
+template<typename, typename = void> struct has_timestamp_field : std::false_type{};
+template<typename H> struct has_timestamp_field<H, std::void_t<decltype(std::declval<H>().timestamp)>> : std::true_type{};
+template<typename, typename = void> struct has_bits_field : std::false_type{};
+template<typename H> struct has_bits_field<H, std::void_t<decltype(std::declval<H>().bits)>> : std::true_type{};
+template<typename, typename = void> struct has_nBits_field : std::false_type{};
+template<typename H> struct has_nBits_field<H, std::void_t<decltype(std::declval<H>().nBits)>> : std::true_type{};
+
+template<typename H>
+static uint64_t hdr_time(const H& h){
+    if constexpr (has_time_field<H>::value) return (uint64_t)h.time;
+    if constexpr (has_timestamp_field<H>::value) return (uint64_t)h.timestamp;
+    return 0;
+}
+template<typename H>
+static uint32_t hdr_bits(const H& h){
+    if constexpr (has_bits_field<H>::value) return (uint32_t)h.bits;
+    if constexpr (has_nBits_field<H>::value) return (uint32_t)h.nBits;
+    return (uint32_t)GENESIS_BITS;
+}
+
+// Difficulty helpers
+static long double compact_to_target_ld(uint32_t bits){
+    uint32_t exp = bits >> 24;
+    uint32_t mant = bits & 0x007fffff;
+    long double m = (long double)mant;
+    int shift = (int)exp - 3;
+    return std::ldexp(m, 8 * shift);
+}
+static long double difficulty_from_bits(uint32_t bits){
+    long double t_one = compact_to_target_ld((uint32_t)GENESIS_BITS);
+    long double t_cur = compact_to_target_ld(bits);
+    if (t_cur <= 0.0L) return 0.0L;
+    return t_one / t_cur;
+}
+
+// Estimate network hashrate (used in TUI loop)
+static double estimate_network_hashrate(Chain* chain){
+    if (!chain) return 0.0;
+    const unsigned k = (unsigned)std::max<int>(MIQ_RETARGET_INTERVAL, 32);
+    auto headers = chain->last_headers(k);
+    if (headers.size() < 2) return 0.0;
+
+    uint64_t t_first = hdr_time(headers.front());
+    uint64_t t_last  = hdr_time(headers.back());
+    if (t_last <= t_first) t_last = t_first + 1;
+    double avg_block_time = double(t_last - t_first) / double(headers.size()-1);
+    if (avg_block_time <= 0.0) avg_block_time = (double)BLOCK_TIME_SECS;
+
+    uint32_t bits = hdr_bits(headers.back());
+    long double diff = difficulty_from_bits(bits);
+    long double hps = (diff * 4294967296.0L) / avg_block_time; // 2^32
+    if (!std::isfinite((double)hps) || hps < 0) return 0.0;
+    return (double)hps;
+}
+
+// Sparklines
+static inline std::string spark_ascii(const std::vector<double>& v){
+    if (v.empty()) return std::string("-");
+    double mn = v.front(), mx = v.front();
+    for (double x : v){ if (x < mn) mn = x; if (x > mx) mx = x; }
+    double span = (mx - mn);
+    bool fancy = env_truthy_local("MIQ_TUI_UTF8");
+    const char* blocks8 = "▁▂▃▄▅▆▇█";
+    const char* ascii   = " .:-=+*#%@";
+    std::string out; out.reserve(v.size());
+    for (double x : v){
+        int idx = 0;
+        if (span > 0) idx = (int)std::floor((x - mn) / span * 7.999);
+        if (idx < 0) idx = 0; if (idx > 7) idx = 7;
+        out += fancy ? std::string(blocks8 + idx, 3) : std::string(1, ascii[(size_t)idx]);
+    }
+    return out;
+}
+
+// Sync gate helper (used both in TUI texts and IBD logic)
+static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out){
+    size_t peers = 0;
+    if (p2p) peers = p2p->snapshot_peers().size();
+    if (peers == 0) { why_out = "no peers"; return false; }
+
+    uint64_t h = chain.height();
+    if (h == 0) { why_out = "headers syncing"; return false; }
+
+    auto tip = chain.tip();
+    uint64_t tsec = hdr_time(tip);
+    if (tsec == 0) { why_out = "waiting for headers time"; return false; }
+    uint64_t now = (uint64_t)std::time(nullptr);
+    uint64_t age = (now > tsec) ? (now - tsec) : 0;
+    const uint64_t fresh = std::max<uint64_t>(BLOCK_TIME_SECS * 3, 300);
+    if (age > fresh) { why_out = "tip too old"; return false; }
+
+    why_out.clear();
+    return true;
+}
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
 /*                                 Log capture                                 */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 class LogCapture {
@@ -887,6 +1090,7 @@ private:
             "Start P2P listener",
             "Connect seeds",
             "Start IBD monitor",
+            "IBD sync phase",         // <── shown explicitly
             "Start RPC server",
             "RPC ready"
         };
@@ -1549,120 +1753,9 @@ static bool is_recognized_arg(const std::string& s){
     if(s=="--help") return true;
     return false;
 }
-[[maybe_unused]] static bool env_truthy_local(const char* name){
-    const char* v = std::getenv(name);
-    if(!v||!*v) return false;
-    if(std::strcmp(v,"0")==0 || std::strcmp(v,"false")==0 || std::strcmp(v,"False")==0) return false;
-    return true;
-}
-
-// Traits & helpers used below
-
-template<typename, typename = void> struct has_stats_method : std::false_type{};
-template<typename T> struct has_stats_method<T, std::void_t<decltype(std::declval<T&>().stats())>> : std::true_type{};
-template<typename, typename = void> struct has_size_method  : std::false_type{};
-template<typename T> struct has_size_method<T,  std::void_t<decltype(std::declval<T&>().size())>>  : std::true_type{};
-template<typename, typename = void> struct has_count_method : std::false_type{};
-template<typename T> struct has_count_method<T, std::void_t<decltype(std::declval<T&>().count())>> : std::true_type{};
-
-struct MempoolView { uint64_t count=0, bytes=0, recent_adds=0; };
-template<typename MP>
-static MempoolView mempool_view_fallback(MP* mp){
-    MempoolView v{};
-    if (!mp) return v;
-    if constexpr (has_stats_method<MP>::value) {
-        auto s = mp->stats();
-        v.count = (uint64_t)s.count;
-        v.bytes = (uint64_t)s.bytes;
-        v.recent_adds = (uint64_t)s.recent_adds;
-    } else if constexpr (has_size_method<MP>::value) {
-        v.count = (uint64_t)mp->size();
-    } else if constexpr (has_count_method<MP>::value) {
-        v.count = (uint64_t)mp->count();
-    }
-    return v;
-}
-
-template<typename, typename = void> struct has_time_field : std::false_type{};
-template<typename H> struct has_time_field<H, std::void_t<decltype(std::declval<H>().time)>> : std::true_type{};
-template<typename, typename = void> struct has_timestamp_field : std::false_type{};
-template<typename H> struct has_timestamp_field<H, std::void_t<decltype(std::declval<H>().timestamp)>> : std::true_type{};
-template<typename, typename = void> struct has_bits_field : std::false_type{};
-template<typename H> struct has_bits_field<H, std::void_t<decltype(std::declval<H>().bits)>> : std::true_type{};
-template<typename, typename = void> struct has_nBits_field : std::false_type{};
-template<typename H> struct has_nBits_field<H, std::void_t<decltype(std::declval<H>().nBits)>> : std::true_type{};
-
-template<typename H>
-static uint64_t hdr_time(const H& h){
-    if constexpr (has_time_field<H>::value) return (uint64_t)h.time;
-    if constexpr (has_timestamp_field<H>::value) return (uint64_t)h.timestamp;
-    return 0;
-}
-template<typename H>
-static uint32_t hdr_bits(const H& h){
-    if constexpr (has_bits_field<H>::value) return (uint32_t)h.bits;
-    if constexpr (has_nBits_field<H>::value) return (uint32_t)h.nBits;
-    return (uint32_t)GENESIS_BITS;
-}
-
-// Difficulty helpers
-static long double compact_to_target_ld(uint32_t bits){
-    uint32_t exp = bits >> 24;
-    uint32_t mant = bits & 0x007fffff;
-    long double m = (long double)mant;
-    int shift = (int)exp - 3;
-    return std::ldexp(m, 8 * shift);
-}
-static long double difficulty_from_bits(uint32_t bits){
-    long double t_one = compact_to_target_ld((uint32_t)GENESIS_BITS);
-    long double t_cur = compact_to_target_ld(bits);
-    if (t_cur <= 0.0L) return 0.0L;
-    return t_one / t_cur;
-}
-
-// Estimate network hashrate
-static double estimate_network_hashrate(Chain* chain){
-    if (!chain) return 0.0;
-    const unsigned k = (unsigned)std::max<int>(MIQ_RETARGET_INTERVAL, 32);
-    auto headers = chain->last_headers(k);
-    if (headers.size() < 2) return 0.0;
-
-    uint64_t t_first = hdr_time(headers.front());
-    uint64_t t_last  = hdr_time(headers.back());
-    if (t_last <= t_first) t_last = t_first + 1;
-    double avg_block_time = double(t_last - t_first) / double(headers.size()-1);
-    if (avg_block_time <= 0.0) avg_block_time = (double)BLOCK_TIME_SECS;
-
-    uint32_t bits = hdr_bits(headers.back());
-    long double diff = difficulty_from_bits(bits);
-    long double hps = (diff * 4294967296.0L) / avg_block_time; // 2^32
-    if (!std::isfinite((double)hps) || hps < 0) return 0.0;
-    return (double)hps;
-}
-
-// Sync-gate evaluator: peers>0, height>0, recent tip.
-static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out){
-    size_t peers = 0;
-    if (p2p) peers = p2p->snapshot_peers().size();
-    if (peers == 0) { why_out = "no peers"; return false; }
-
-    uint64_t h = chain.height();
-    if (h == 0) { why_out = "headers syncing"; return false; }
-
-    auto tip = chain.tip();
-    uint64_t tsec = hdr_time(tip);
-    if (tsec == 0) { why_out = "waiting for headers time"; return false; }
-    uint64_t now = (uint64_t)std::time(nullptr);
-    uint64_t age = (now > tsec) ? (now - tsec) : 0;
-    const uint64_t fresh = std::max<uint64_t>(BLOCK_TIME_SECS * 3, 300);
-    if (age > fresh) { why_out = "tip too old"; return false; }
-
-    why_out.clear();
-    return true;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
-// IBD helpers (NEW) — smart start/finish + explicit error on failure
+// IBD helpers — smart start/finish + explicit error on failure
 // ─────────────────────────────────────────────────────────────────────────────
 static inline bool path_exists_nonempty(const std::string& p){
     std::error_code ec;
