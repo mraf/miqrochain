@@ -1060,7 +1060,7 @@ static inline std::vector<uint8_t> miq_build_version_payload() {
 static inline bool can_accept_hdr_batch(miq::PeerState& ps, int64_t now) {
     const int      kMaxInflight = 2;
     const int64_t  kMinGapMs    = 50; // keep tiny gap to avoid tight spins
-    if (ps.inflight_hdr_batches >= (uint32_t)kMaxInflight) return false;
+    if (static_cast<uint32_t>(ps.inflight_hdr_batches) >= static_cast<uint32_t>(kMaxInflight)) return false;
     if (ps.last_hdr_batch_done_ms && (now - ps.last_hdr_batch_done_ms) < kMinGapMs) return false;
     return true;
 }
@@ -1871,13 +1871,13 @@ void P2P::maybe_send_getaddr(PeerState& ps){
         (void)miq_send(ps.sock, msg);
         ps.last_getaddr_ms = t;
     }
-
+}
 void P2P::send_addr_snapshot(PeerState& ps){
     if (!check_rate(ps, "addr", 1.0, now_ms())) return;
     std::vector<uint8_t> payload;
     payload.reserve(MIQ_ADDR_RESPONSE_MAX * 4);
     size_t cnt = 0;
-
+}
 #if MIQ_ENABLE_ADDRMAN
     {
         std::unordered_set<uint32_t> emitted;
