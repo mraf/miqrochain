@@ -1872,12 +1872,13 @@ void P2P::maybe_send_getaddr(PeerState& ps){
         ps.last_getaddr_ms = t;
     }
 }
+
 void P2P::send_addr_snapshot(PeerState& ps){
     if (!check_rate(ps, "addr", 1.0, now_ms())) return;
     std::vector<uint8_t> payload;
     payload.reserve(MIQ_ADDR_RESPONSE_MAX * 4);
     size_t cnt = 0;
-}
+
 #if MIQ_ENABLE_ADDRMAN
     {
         std::unordered_set<uint32_t> emitted;
