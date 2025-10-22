@@ -42,11 +42,11 @@ bool TryOpenP2PPort(uint16_t port, std::string* external_ip_out){
                                   "TCP", nullptr, "0");
     if(add == UPNPCOMMAND_SUCCESS){
         LOG_INFO("UPnP: mapped TCP %s -> %s:%s", port_str, lanaddr, port_str);
-        freeUPNPUrls(&urls); freeUPNPDevlist(devlist);
+        FreeUPNPUrls(&urls); freeUPNPDevlist(devlist);
         return true;
     }else{
         LOG_WARN("UPnP: mapping failed (code=%d)", add);
-        freeUPNPUrls(&urls); freeUPNPDevlist(devlist);
+        FreeUPNPUrls(&urls); freeUPNPDevlist(devlist);
         return false;
     }
 #else
