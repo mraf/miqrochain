@@ -2119,7 +2119,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             break;
         }
 
-        +        {
+            {
             uint64_t cur = chain.height();
             uint64_t est_target = std::max<uint64_t>(cur, estimate_target_height_by_time(g_genesis_time_s.load()));
             uint64_t discovered = (cur >= height_at_seed_connect) ? (cur - height_at_seed_connect) : 0;
