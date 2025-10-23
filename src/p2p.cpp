@@ -635,7 +635,7 @@ static inline int miq_recv(Sock s, uint8_t* buf, size_t bufsz) {
 static inline void send_gettx(Sock sock, const std::vector<uint8_t>& txid) {
     if (txid.size() != 32) return;
     auto m = miq::encode_msg("gettx", txid);
-    (void)miq_send(sock, m);
+    (void)send_or_close(sock, m);
 }
 
 static inline uint64_t env_u64(const char* name, uint64_t defv){
@@ -669,6 +669,7 @@ static std::unordered_map<std::string, std::pair<int64_t,int64_t>> g_seed_backof
 
 // ---- Header zero-progress tracker (socket -> consecutive empty batches) ----
 static std::unordered_map<Sock,int> g_zero_hdr_batches;
+static std::unordered_map<Sock,bool> g_hdr_flip;
 
 // ---- NEW: pre-verack safe allow-list & counters ----------------------------
 static std::unordered_map<Sock,int> g_preverack_counts;  // socket -> early safe msg count
@@ -815,6 +816,7 @@ static inline void gate_on_close(Sock fd){
     g_preverack_counts.erase(fd);
     g_cmd_rl.erase(fd); // NEW: clean up per-socket rate-limiter windows
     g_inflight_block_ts.erase(fd); // also drop any inflight block timers for this socket
+    g_hdr_flip.erase(fd);
 }
 static inline bool gate_on_bytes(Sock fd, size_t add){
     auto it = g_gate.find(fd);
@@ -2416,16 +2418,21 @@ void P2P::loop(){
 #if MIQ_ENABLE_HEADERS_FIRST
                 std::vector<std::vector<uint8_t>> locator;
                 chain_.build_locator(locator);
+                std::vector<std::vector<uint8_t>> loc_rev = locator;
+                for (auto& h : loc_rev) std::reverse(h.begin(), h.end());
                 std::vector<uint8_t> stop(32, 0);
-                auto pl = build_getheaders_payload(locator, stop);
-                auto m  = encode_msg("getheaders", pl);
+                auto pl_n = build_getheaders_payload(locator, stop);
+                auto pl_f = build_getheaders_payload(loc_rev, stop);
+                auto m_n  = encode_msg("getheaders", pl_n);
+                auto m_f  = encode_msg("getheaders", pl_f);
                 int probes = 0;
                 for (auto& kv : peers_) {
                     if (kv.second.verack_ok &&
                         can_accept_hdr_batch(kv.second, now_ms()) &&
                         check_rate(kv.second, "hdr", 1.0, now_ms())) {
                         kv.second.sent_getheaders = true;
-                        (void)send_or_close(kv.first, m);
+                        const bool flip = g_hdr_flip[kv.first];
+                        (void)send_or_close(kv.first, flip ? m_f : m_n);
                         kv.second.inflight_hdr_batches++;
                         g_last_hdr_req_ms[kv.first] = now_ms();
                         if (++probes >= 2) break;
@@ -2736,7 +2743,7 @@ void P2P::loop(){
                         return true;
                     };
 
-                    // --- NEW: finish-handshake helper (idempotent) -----------
+// --- NEW: finish-handshake helper (idempotent) -----------
                     auto try_finish_handshake = [&](){
                         auto itg2 = g_gate.find(s);
                         if (itg2 == g_gate.end()) return;
@@ -2751,6 +2758,9 @@ void P2P::loop(){
                         if (peer_supports_headers) {
                             std::vector<std::vector<uint8_t>> locator;
                             chain_.build_locator(locator);
+                            if (g_hdr_flip[(Sock)s]) {
+                                for (auto& h : locator) std::reverse(h.begin(), h.end());
+                            }
                             std::vector<uint8_t> stop(32, 0);
                             auto pl2 = build_getheaders_payload(locator, stop);
                             auto m2  = encode_msg("getheaders", pl2);
@@ -2778,7 +2788,7 @@ void P2P::loop(){
                         auto ff = encode_msg("feefilter", plff);
                         (void)send_or_close(s, ff);
                     };
-
+  
                     if (cmd == "version") {
                         int32_t peer_ver = 0; uint64_t peer_services = 0;
                         if (m.payload.size() >= 4) {
@@ -2807,9 +2817,6 @@ void P2P::loop(){
                             }
                         }
 
-                        // If their verack already arrived earlier, we can finish now.
-                        try_finish_handshake();
-
                     } else if (cmd == "verack") {
                         auto itg = g_gate.find(s);
                         if (itg != g_gate.end()) {
@@ -2827,7 +2834,10 @@ void P2P::loop(){
 #endif
                         ps.whitelisted = is_loopback(ps.ip) || is_whitelisted_ip(ps.ip);
                         // Now that we have their verack, try to finish handshake if version already processed.
-                        try_finish_handshake();
+                          try_finish_handshake();
+
+                        } else if (cmd == "version") {
+                          try_finish_handshake();
 
                     } else if (cmd == "ping") {
                         auto pong = encode_msg("pong", m.payload);
@@ -3065,6 +3075,7 @@ void P2P::loop(){
                             if (zero_progress) {
                                 int &z = g_zero_hdr_batches[s];
                                 z++;
+                                g_hdr_flip[s] = !g_hdr_flip[s]; // alternate locator orientation next time
                                 if (z >= 3) {
                                     log_warn("P2P: no headers progress after 3 full batches; falling back to by-index sync");
                                     ps.banscore = std::min(ps.banscore + 1, MIQ_P2P_MAX_BANSCORE);
@@ -3094,6 +3105,9 @@ void P2P::loop(){
                         if (ps.inflight_hdr_batches == 0 && !at_tip) {
                             std::vector<std::vector<uint8_t>> locator2;
                             chain_.build_locator(locator2);
+                            if (g_hdr_flip[s]) {
+                                for (auto& h : locator2) std::reverse(h.begin(), h.end());
+                            }
                             std::vector<uint8_t> stop2(32, 0);
                             auto pl2 = build_getheaders_payload(locator2, stop2);
                             auto m2  = encode_msg("getheaders", pl2);
