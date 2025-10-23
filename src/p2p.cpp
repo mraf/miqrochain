@@ -712,6 +712,25 @@ namespace {
   static std::unordered_map<Sock, std::unordered_map<std::string,int64_t>> g_inflight_block_ts;
 }
 
+namespace {
+  // key: 64-hex block hash  -> next index into a snapshot of candidate peers
+  static std::unordered_map<std::string, size_t> g_rr_next_idx;
+
+  // Pick the next peer for a given key from a stable snapshot of candidates.
+  // Advances the cursor so future lookups rotate fairly.
+  static inline Sock rr_pick_peer_for_key(const std::string& keyHex,
+                                          const std::vector<Sock>& candidates)
+  {
+      if (candidates.empty()) return MIQ_INVALID_SOCK;
+      size_t &i = g_rr_next_idx[keyHex];
+      if (i >= candidates.size()) {
+          i %= candidates.size();
+      }
+      Sock chosen = candidates[i];
+      i = (i + 1) % candidates.size();
+      return chosen;
+  }
+}
 // Light-touch guard for peers_ against snapshot_peers() racing the loop
 namespace {
   static std::mutex g_peers_mu;
@@ -2205,6 +2224,7 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
         std::string src_ip = "?";
         auto pit = peers_.find(sock);
         if (pit != peers_.end()) src_ip = pit->second.ip;
+        g_rr_next_idx.erase(hexkey(bh));
 
         log_info("P2P: accepted block height=" + std::to_string(chain_.height())
                  + " miner=" + miner
@@ -2472,7 +2492,36 @@ void P2P::loop(){
             for (size_t i=0;i<32;i++) {
               h[i] = (uint8_t)((hexv(k[2*i])<<4) | hexv(k[2*i+1]));
             }
-            for (auto& kv2 : peers_) if (kv2.first != s_exp) { request_block_hash(kv2.second, h); break; }
+            std::vector<Sock> cands;
+            cands.reserve(peers_.size());
+            for (auto& kv2 : peers_) {
+              if (kv2.first == s_exp) continue;
+              if (!kv2.second.verack_ok) continue;
+              cands.push_back(kv2.first);
+            }
+            // If no verack_ok yet (rare early), fall back to anyone but s_exp
+            if (cands.empty()) {
+              for (auto& kv2 : peers_) {
+                if (kv2.first == s_exp) continue;
+                cands.push_back(kv2.first);
+              }
+            }
+
+            // Round-robin pick per-hash; try a few candidates until one accepts
+            if (!cands.empty()) {
+              size_t attempts = std::min<size_t>(cands.size(), 4);
+              for (size_t tries = 0; tries < attempts; ++tries) {
+                Sock target = rr_pick_peer_for_key(k, cands);
+                if (target == MIQ_INVALID_SOCK) break;
+                auto itpeer = peers_.find(target);
+                if (itpeer == peers_.end()) continue;
+                size_t before = itpeer->second.inflight_blocks.size();
+                request_block_hash(itpeer->second, h);
+                if (itpeer->second.inflight_blocks.size() > before) {
+                  break; // successfully queued with this peer
+                }
+              }
+            }
           }
         }
   
@@ -2726,7 +2775,6 @@ void P2P::loop(){
                         auto verack = encode_msg("verack", {});
                         (void)send_or_close(s, verack);
                         gate_mark_sent_verack(s);
-                        try_finish_handshake();
                     }
 
                     auto inv_tick = [&](unsigned add)->bool{
