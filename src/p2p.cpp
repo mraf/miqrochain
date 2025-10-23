@@ -2988,7 +2988,7 @@ void P2P::loop(){
                 ps.sent_getheaders = false;
             }
 #endif
-
+        }
         // ---- Guarded removals (single, consistent path) --------------------
         for (Sock s : dead) {
             gate_on_close(s);
@@ -3058,7 +3058,6 @@ void P2P::loop(){
     }
 #endif
     }
-}
 std::vector<PeerSnapshot> P2P::snapshot_peers() const {
     std::vector<PeerSnapshot> out;
     out.reserve(peers_.size());
