@@ -103,6 +103,9 @@ extern bool ensure_utxo_fully_indexed(miq::Chain&, const std::string&, bool) __a
   #include <fcntl.h>
   #include <sys/types.h>
   #include <sys/stat.h>
+  #include <ifaddrs.h>
+  #include <netdb.h>
+  #include <arpa/inet.h>
   #define MIQ_ISATTY() (::isatty(fileno(stdin)) != 0)
 #  if defined(__APPLE__)
 #    include <mach/mach.h>
@@ -116,6 +119,8 @@ extern bool ensure_utxo_fully_indexed(miq::Chain&, const std::string&, bool) __a
   #ifdef max
     #undef max
   #endif
+#include <iphlpapi.h>
+  #pragma comment(lib, "Iphlpapi.lib")
 #endif
 
 using namespace miq;
@@ -154,6 +159,8 @@ static HANDLE               lock_handle{NULL};
 static int                  lock_fd{-1};
 #endif
 }
+
++static std::atomic<bool> g_we_are_seed{false};
 
 // time helpers
 static inline uint64_t now_ms() {
@@ -764,6 +771,119 @@ static inline std::string short_hex(const std::string& h, int keep){
     return h.substr(0,(size_t)half) + ell + h.substr(h.size()-(size_t)(keep-half));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Net helpers: resolve host, collect local IPs, compare, and compute seed role
+// ─────────────────────────────────────────────────────────────────────────────
+static std::vector<std::string> resolve_host_ip_strings(const std::string& host){
+    std::vector<std::string> out;
+    addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
+    addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) return out;
+    for (auto* p = res; p; p = p->ai_next){
+        char buf[INET6_ADDRSTRLEN]{};
+        if (p->ai_family == AF_INET) {
+            auto* sa = reinterpret_cast<sockaddr_in*>(p->ai_addr);
+            if (inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf))) out.emplace_back(buf);
+        } else if (p->ai_family == AF_INET6) {
+            auto* sa6 = reinterpret_cast<sockaddr_in6*>(p->ai_addr);
+            if (inet_ntop(AF_INET6, &sa6->sin6_addr, buf, sizeof(buf))) out.emplace_back(buf);
+        }
+    }
+    freeaddrinfo(res);
+    // de-dup
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+static std::vector<std::string> local_ip_strings(){
+    std::vector<std::string> out;
+#ifdef _WIN32
+    ULONG flags = GAA_FLAG_SKIP_FRIENDLY_NAME | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG sz = 0;
+    if (GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, nullptr, &sz) == ERROR_BUFFER_OVERFLOW){
+        std::vector<char> buf(sz);
+        IP_ADAPTER_ADDRESSES* aa = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+        if (GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, aa, &sz) == NO_ERROR){
+            for (auto* a = aa; a; a = a->Next){
+                for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next){
+                    char tmp[INET6_ADDRSTRLEN]{};
+                    if (ua->Address.lpSockaddr->sa_family == AF_INET){
+                        auto* sa = reinterpret_cast<sockaddr_in*>(ua->Address.lpSockaddr);
+                        if (inet_ntop(AF_INET, &sa->sin_addr, tmp, sizeof(tmp))) out.emplace_back(tmp);
+                    } else if (ua->Address.lpSockaddr->sa_family == AF_INET6){
+                        auto* sa6 = reinterpret_cast<sockaddr_in6*>(ua->Address.lpSockaddr);
+                        if (inet_ntop(AF_INET6, &sa6->sin6_addr, tmp, sizeof(tmp))) out.emplace_back(tmp);
+                    }
+                }
+            }
+        }
+    }
+#else
+    ifaddrs* ifa = nullptr;
+    if (getifaddrs(&ifa) == 0 && ifa){
+        for (auto* p = ifa; p; p = p->ifa_next){
+            if (!p->ifa_addr) continue;
+            int fam = p->ifa_addr->sa_family;
+            char tmp[INET6_ADDRSTRLEN]{};
+            if (fam == AF_INET){
+                auto* sa = reinterpret_cast<sockaddr_in*>(p->ifa_addr);
+                if (inet_ntop(AF_INET, &sa->sin_addr, tmp, sizeof(tmp))) out.emplace_back(tmp);
+            } else if (fam == AF_INET6){
+                auto* sa6 = reinterpret_cast<sockaddr_in6*>(p->ifa_addr);
+                if (inet_ntop(AF_INET6, &sa6->sin6_addr, tmp, sizeof(tmp))) out.emplace_back(tmp);
+            }
+        }
+        freeifaddrs(ifa);
+    }
+#endif
+    // Include optional explicit public IP hint
+    if (const char* hint = std::getenv("MIQ_PUBLIC_IP"); hint && *hint) out.emplace_back(hint);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+static bool is_loopback_or_linklocal(const std::string& ip){
+    if (ip == "127.0.0.1" || ip == "::1") return true;
+    if (ip.rfind("169.254.",0)==0) return true;
+    if (ip.rfind("fe80:",0)==0 || ip.rfind("FE80:",0)==0) return true;
+    return false;
+}
+
+struct SeedRole {
+    bool we_are_seed{false};
+    std::string detail;
+    std::vector<std::string> seed_ips;
+    std::vector<std::string> local_ips;
+};
+
+static SeedRole compute_seed_role(){
+    SeedRole r;
+    r.seed_ips  = resolve_host_ip_strings(DNS_SEED);
+    r.local_ips = local_ip_strings();
+    // Ignore loopbacks/link-locals to reduce false positives on dev boxes
+    std::vector<std::string> filt_locals;
+    filt_locals.reserve(r.local_ips.size());
+    for (auto& s : r.local_ips) if (!is_loopback_or_linklocal(s)) filt_locals.push_back(s);
+    for (const auto& seed_ip : r.seed_ips){
+        for (const auto& lip : filt_locals){
+            if (seed_ip == lip){
+                r.we_are_seed = true;
+                r.detail = std::string("seed A/AAAA (") + seed_ip + ") matches local IP";
+                return r;
+            }
+        }
+    }
+    if (r.seed_ips.empty()){
+        r.detail = "seed host has no A/AAAA records";
+    } else {
+        r.detail = "seed host resolves to different IP(s)";
+    }
+    return r;
+}
+
+
 // Traits & helpers used by TUI and elsewhere
 template<typename, typename = void> struct has_stats_method : std::false_type{};
 template<typename T> struct has_stats_method<T, std::void_t<decltype(std::declval<T&>().stats())>> : std::true_type{};
@@ -1094,6 +1214,7 @@ public:
 
     void set_health_degraded(bool b){ std::lock_guard<std::mutex> lk(mu_); degraded_override_ = b; }
     void set_hot_warning(const std::string& w){ std::lock_guard<std::mutex> lk(mu_); hot_warning_ = w; hot_warn_ts_ = now_ms(); }
+    void set_banner_append(const std::string& tail){ std::lock_guard<std::mutex> lk(mu_); if (!banner_.empty()) banner_ += "  "; banner_ += tail; }
 
 private:
     struct StyledLine { std::string txt; int level; };
@@ -1610,6 +1731,47 @@ private:
 };
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
+/*                                Seed Sentinel                                 */
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+class SeedSentinel {
+public:
+    void start(P2P* p2p, TUI* tui){
+        stop();
+        running_.store(true);
+        thr_ = std::thread([=]{ loop(p2p, tui); });
+    }
+    void stop(){
+        running_.store(false);
+        if (thr_.joinable()) thr_.join();
+    }
+private:
+    void loop(P2P* p2p, TUI* tui){
+        using namespace std::chrono_literals;
+        uint64_t last_note_ms = 0;
+        while (running_.load() && !global::shutdown_requested.load()){
+            auto role = compute_seed_role();
+            bool prev = g_we_are_seed.load();
+            g_we_are_seed.store(role.we_are_seed);
+            if (role.we_are_seed && !prev){
+                log_warn(std::string("This node matches ")+DNS_SEED+" — acting as seed; keep it healthy.");
+                if (tui) tui->set_hot_warning("You are the public seed host");
+            }
+            // Gentle health checks
+            size_t peers = p2p ? p2p->snapshot_peers().size() : 0;
+            if (role.we_are_seed && peers == 0){
+                if (now_ms() - last_note_ms > 30'000){
+                    log_warn("SeedSentinel: 0 peers connected while acting as seed — check firewall/DNS.");
+                    last_note_ms = now_ms();
+                }
+            }
+            std::this_thread::sleep_for(10s);
+        }
+    }
+    std::atomic<bool> running_{false};
+    std::thread thr_;
+};
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
 /*                          Fatal terminate hook                                */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 static void fatal_terminate() noexcept {
@@ -1932,6 +2094,51 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
 }
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
+/*                                 IBD Guard                                    */
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+class IBDGuard {
+public:
+    void start(Chain* chain, P2P* p2p, const std::string& datadir, bool can_tui, TUI* tui){
+        stop();
+        running_.store(true);
+        thr_ = std::thread([=]{ loop(chain, p2p, datadir, can_tui, tui); });
+    }
+    void stop(){
+        running_.store(false);
+        if (thr_.joinable()) thr_.join();
+    }
+private:
+    void loop(Chain* chain, P2P* p2p, const std::string& datadir, bool can_tui, TUI* tui){
+        using namespace std::chrono_literals;
+        uint64_t backoff_ms = 2'000; // exponential up to 2 minutes
+        while (running_.load() && !global::shutdown_requested.load()){
+            std::string why;
+            bool gate = compute_sync_gate(*chain, p2p, why);
+            if (!gate && should_enter_ibd(*chain, datadir)){
+                std::string err;
+                if (tui && can_tui){
+                    tui->set_node_state(TUI::NodeState::Syncing);
+                    tui->set_hot_warning("Re-entering IBD (" + (why.empty()?"stale/empty":why) + ")");
+                }
+                bool ok = perform_ibd_sync(*chain, p2p, datadir, can_tui, tui, err);
+                if (!ok){
+                    log_warn(std::string("IBDGuard: IBD attempt failed: ")+err);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+                    backoff_ms = std::min<uint64_t>(backoff_ms * 2, 120'000);
+                } else {
+                    log_info("IBDGuard: node resynced.");
+                    backoff_ms = 2'000;
+                    if (tui && can_tui) tui->set_node_state(TUI::NodeState::Running);
+                }
+            }
+            std::this_thread::sleep_for(3s);
+        }
+    }
+    std::atomic<bool> running_{false};
+    std::thread thr_;
+};
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
 /*                                     main                                    */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 int main(int argc, char** argv){
@@ -2148,7 +2355,8 @@ int main(int argc, char** argv){
         } else if (can_tui) {
             tui.mark_step_ok("Start P2P listener");
         }
-
+        SeedSentinel seed_sentinel;
+        seed_sentinel.start(&p2p, can_tui ? &tui : nullptr);
         if (can_tui) tui.mark_step_started("Start IBD monitor");
         start_ibd_monitor(&chain, &p2p);
         if (can_tui) tui.mark_step_ok("Start IBD monitor");
@@ -2177,8 +2385,10 @@ int main(int argc, char** argv){
             log_error(std::string("IBD sync failed: ") + ibd_err);
             log_error("BLOCKS MINED LOCALLY WILL NOT BE VALID");
         }
-
-        // Start RPC after IBD step so the TUI step order aligns
+        
+        IBDGuard ibd_guard;
+        ibd_guard.start(&chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, can_tui ? &tui : nullptr);
+        
         bool rpc_ok = false;
         if (can_tui) tui.mark_step_started("Start RPC server");
         if(!cfg.no_rpc){
@@ -2261,6 +2471,11 @@ int main(int argc, char** argv){
             if (ibd_ok) {
                 tui.set_banner(u8_ok ? "Miqrochain node running — synced & serving peers…" :
                                        "Miqrochain node running - synced & serving peers...");
+                auto role = compute_seed_role();
+                if (role.we_are_seed) {
+                    tui.set_banner_append(std::string("SEED: ") + DNS_SEED);
+                    tui.set_hot_warning("Acting as seed — keep port open");
+                }
                 tui.set_node_state(TUI::NodeState::Running);
             } else {
                 tui.set_banner(u8_ok ? "Node running — IBD failed (see error). Mining disabled." :
@@ -2321,6 +2536,10 @@ int main(int argc, char** argv){
             }
             if (now_ms() - last_tip_change_ms > 10*60*1000) degraded = true;
             if (!miner_armed && std::getenv("MIQ_MINER_HEARTBEAT") && !g_extminer.alive.load()) degraded = true;
+            if (g_we_are_seed.load()){
+                // Seed host with no peers is definitely degraded
+                if (p2p.snapshot_peers().empty()) degraded = true;
+            }
 
             if (can_tui) tui.set_health_degraded(degraded);
 
@@ -2354,6 +2573,12 @@ int main(int argc, char** argv){
             p2p.stop();
             if (can_tui) tui.set_shutdown_phase("Stopping P2P...", true);
         } catch(...) { log_warn("P2P stop threw"); }
+
+        try {
+            if (can_tui) tui.set_shutdown_phase("Stopping IBD/Seed sentinels...", false);
+            // Ensure background sentinels are stopped before miner watch
+            // (objects go out of scope here)
+        } catch(...) { }
 
         try {
             if (can_tui) tui.set_shutdown_phase("Stopping miner watch...", false);
