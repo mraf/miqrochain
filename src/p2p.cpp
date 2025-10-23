@@ -878,7 +878,7 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
                 }
             }
             if (!g.got_verack){
-                if (!miq_safe_preverack_cmd(cmd)) return false;
+                if (!miq_safe_preverack_cmd(cmd)) { return false; /* ignore silently */ }
                 // Never penalize safe pre-verack getheaders/headers; drop-count only other safe cmds.
                 if (!g.is_loopback && cmd != "getheaders" && cmd != "headers") {
                     int &cnt = g_preverack_counts[fd];
@@ -2429,7 +2429,13 @@ void P2P::loop(){
                 auto m_n  = encode_msg("getheaders", pl_n);
                 auto m_f  = encode_msg("getheaders", pl_f);
                 int probes = 0;
-                for (auto& kv : peers_) {
+                std::vector<std::pair<Sock,PeerState>> snapshot;
+                {
+                    std::lock_guard<std::mutex> lk2(g_peers_mu);
+                    for (auto& kv : peers_) snapshot.push_back(kv);
+                }
+                for (auto& kvp : snapshot) {
+                    auto& kv = kvp;
                     if (kv.second.verack_ok &&
                         can_accept_hdr_batch(kv.second, now_ms()) &&
                         check_rate(kv.second, "hdr", 1.0, now_ms())) {
@@ -2720,6 +2726,7 @@ void P2P::loop(){
                         auto verack = encode_msg("verack", {});
                         (void)send_or_close(s, verack);
                         gate_mark_sent_verack(s);
+                        try_finish_handshake();
                     }
 
                     auto inv_tick = [&](unsigned add)->bool{
@@ -2819,7 +2826,9 @@ void P2P::loop(){
                                 }
                             }
                         }
-
+                      
+                        try_finish_handshake();
+                      
                     } else if (cmd == "verack") {
                         auto itg = g_gate.find(s);
                         if (itg != g_gate.end()) {
@@ -3188,8 +3197,11 @@ void P2P::loop(){
             }
             if (ps.syncing) {
                 if ((tnow - g_last_progress_ms) > (int64_t)MIQ_P2P_STALL_RETRY_MS) {
-                    ps.syncing = false;
-                    log_info("[IBD] index phase complete; at tip");
+                    // No recent progress: re-request the same index instead of claiming we're at tip.
+                    request_block_index(ps, ps.next_index);
+                    g_last_progress_ms = tnow;  // push the stall window forward
+                    log_info(std::string("[IBD] index phase stalled; retrying idx=")
+                             + std::to_string(ps.next_index));
                 }
             }
         }
@@ -3228,8 +3240,11 @@ void P2P::loop(){
                 if (!announce_tx_q_.empty()) { todos.swap(announce_tx_q_); }
             }
             if (!todos.empty()) {
+                std::vector<Sock> sockets;
+                { std::lock_guard<std::mutex> lk2(g_peers_mu);
+                  for (auto& kv : peers_) sockets.push_back(kv.first); }
                 for (const auto& txid : todos) {
-                    for (auto& kv : peers_) trickle_enqueue(kv.first, txid);
+                    for (auto s : sockets) trickle_enqueue(s, txid);
                 }
             }
         }
@@ -3246,8 +3261,11 @@ void P2P::loop(){
             }
             for (const auto& h : todo) {
                 auto m = encode_msg("invb", h);
-                for (auto& kv : peers_) {
-                    (void)send_or_close(kv.first, m);
+                std::vector<Sock> sockets;
+                { std::lock_guard<std::mutex> lk2(g_peers_mu);
+                  for (auto& kv : peers_) sockets.push_back(kv.first); }
+                for (auto s : sockets) {
+                    (void)send_or_close(s, m);
                 }
             }
         }
