@@ -104,6 +104,9 @@ extern bool ensure_utxo_fully_indexed(miq::Chain&, const std::string&, bool) __a
   #include <sys/types.h>
   #include <sys/stat.h>
   #define MIQ_ISATTY() (::isatty(fileno(stdin)) != 0)
+#  if defined(__APPLE__)
+#    include <mach/mach.h>
+#  endif
 #endif
 
 #ifdef _WIN32
@@ -500,8 +503,13 @@ static uint64_t get_rss_bytes(){
     }
     return 0;
 #elif defined(__APPLE__)
-    std::ifstream f("/proc/self/statm"); uint64_t rss_pages=0, x=0;
-    if (f >> x >> rss_pages){ long p = sysconf(_SC_PAGESIZE); return (uint64_t)rss_pages * (uint64_t)p; }
+    // /proc/self/statm doesn't exist on macOS; use Mach APIs.
+    mach_task_basic_info info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    task_t task = mach_task_self();
+    if (task_info(task, MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
+        return (uint64_t)info.resident_size;
+    }
     return 0;
 #else
     std::ifstream f("/proc/self/statm"); uint64_t rss_pages=0, x=0;
@@ -881,6 +889,16 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out){
     return true;
 }
 
+static bool any_verack_peer(P2P* p2p){
+    if (!p2p) return false;
+    auto peers = p2p->snapshot_peers();
+    for (const auto& s : peers){
+        if (s.verack_ok) return true;
+    }
+    return false;
+}
+
+
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 /*                                 Log capture                                 */
 // ╚═══════════════════════════════════════════════════════════════════════════╝
@@ -1101,6 +1119,7 @@ private:
             "Initialize mempool & RPC",
             "Start P2P listener",
             "Connect seeds",
+            "Peer handshake (verack)",
             "Start IBD monitor",
             "IBD sync phase",         // <── shown explicitly
             "Start RPC server",
@@ -1818,6 +1837,8 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
     const uint64_t kNoPeerTimeoutMs      = 90 * 1000;
     const uint64_t kNoProgressTimeoutMs  = 180 * 1000;
     const uint64_t kStableOkMs           = 8 * 1000;
+    const uint64_t kHandshakeTimeoutMs   = 60 * 1000;
+    const uint64_t kSeedNudgeMs          = 10 * 1000;
     const uint64_t kMaxWallMs            = 30 * 60 * 1000;
     const uint64_t t0                    = now_ms();
     uint64_t       lastSeedDialMs        = 0;
@@ -1829,6 +1850,32 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
     lastSeedDialMs = now_ms();
 
     if (can_tui) tui->set_node_state(TUI::NodeState::Syncing);
+    if (tui && can_tui) tui->mark_step_started("Peer handshake (verack)");
+    {
+        const uint64_t hs_t0 = now_ms();
+        while (!global::shutdown_requested.load()) {
+            if (any_verack_peer(p2p)) {
+                if (tui && can_tui) tui->mark_step_ok("Peer handshake (verack)");
+                break; // proceed to IBD
+            }
+            // keep nudging the seed if needed
+            if (now_ms() - lastSeedDialMs > kSeedNudgeMs) {
+                p2p->connect_seed(DNS_SEED, P2P_PORT);
+                lastSeedDialMs = now_ms();
+            }
+            if (now_ms() - hs_t0 > kHandshakeTimeoutMs) {
+                out_err = "no peers completed handshake (verack)";
+                if (tui && can_tui) tui->mark_step_fail("Peer handshake (verack)");
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        if (global::shutdown_requested.load()){
+            out_err = "shutdown requested during handshake";
+            if (tui && can_tui) tui->mark_step_fail("Peer handshake (verack)");
+            return false;
+        }
+    }
 
     while (!global::shutdown_requested.load()) {
         // Hard wall clock timeout
@@ -1836,7 +1883,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
 
         // Ensure we periodically re-nudge the seed if peer count is low.
         size_t peers = p2p->snapshot_peers().size();
-        if (peers < 2 && now_ms() - lastSeedDialMs > 15 * 1000) {
+        if (peers < 2 && now_ms() - lastSeedDialMs > kSeedNudgeMs) {
             p2p->connect_seed(DNS_SEED, P2P_PORT);
             lastSeedDialMs = now_ms();
         }
