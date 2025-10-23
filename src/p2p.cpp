@@ -82,13 +82,13 @@
 // Handshake & pacing
 #if MIQ_FILTER_PROFILE_STRICT
   #ifndef MIQ_P2P_VERACK_TIMEOUT_MS
-  #define MIQ_P2P_VERACK_TIMEOUT_MS 7000
+  #define MIQ_P2P_VERACK_TIMEOUT_MS 15000
   #endif
   #ifndef MIQ_P2P_PING_EVERY_MS
   #define MIQ_P2P_PING_EVERY_MS     20000
   #endif
   #ifndef MIQ_P2P_PONG_TIMEOUT_MS
-  #define MIQ_P2P_PONG_TIMEOUT_MS   10000
+  #define MIQ_P2P_PONG_TIMEOUT_MS   25000
   #endif
   #ifndef MIQ_PREVERACK_QUEUE_MAX
   #define MIQ_PREVERACK_QUEUE_MAX   6
@@ -213,7 +213,7 @@
 #endif
 #if MIQ_FILTER_PROFILE_STRICT
   #ifndef MIQ_P2P_NEW_INBOUND_CAP_PER_MIN
-  #define MIQ_P2P_NEW_INBOUND_CAP_PER_MIN 40
+  #define MIQ_P2P_NEW_INBOUND_CAP_PER_MIN 200
   #endif
   #ifndef MIQ_P2P_INV_WINDOW_MS
   #define MIQ_P2P_INV_WINDOW_MS 10000
@@ -466,6 +466,7 @@ struct PeerGate {
     size_t rx_bytes{0};
     Clock::time_point t_conn{Clock::now()};
     Clock::time_point t_last{Clock::now()};
+    int64_t hs_last_ms{0};
 };
 
 // Keyed by per-connection socket fd/handle
@@ -712,6 +713,8 @@ static inline void gate_on_connect(Sock fd){
     pg.t_conn = Clock::now();
     pg.t_last = pg.t_conn;
     pg.is_loopback = false; // default; set after we learn the IP
+    pg.hs_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now().time_since_epoch()).count();
     g_gate[fd] = pg;
     g_trickle_last_ms[fd] = 0;
 }
@@ -737,10 +740,6 @@ static inline bool gate_on_bytes(Sock fd, size_t add){
     if (it == g_gate.end()) return false;
     it->second.rx_bytes += add;
     it->second.t_last = Clock::now();
-    if (it->second.rx_bytes > MAX_MSG_BYTES){
-        it->second.banscore += 20;
-        return it->second.banscore >= MAX_BANSCORE;
-    }
     return false;
 }
 static inline bool gate_on_command(Sock fd, const std::string& cmd,
@@ -772,10 +771,14 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
                 g.got_version = true;
                 should_send_verack = true;
                 g_preverack_counts.erase(fd);
+                g.hs_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now().time_since_epoch()).count();
             }
         } else if (cmd == "verack"){
             g.got_verack = true;
             g_preverack_counts.erase(fd);
+            g.hs_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now().time_since_epoch()).count();
         } else {
             if (!g.got_version) {
                 if (miq_safe_preverack_cmd(cmd)) {
@@ -788,12 +791,11 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
             }
             if (!g.got_verack){
                 if (!miq_safe_preverack_cmd(cmd)) return false;
-                // Do NOT count safe pre-verack from local wallet (127.0.0.1)
-                if (!g.is_loopback) {
+                // Never penalize safe pre-verack getheaders/headers; drop-count only other safe cmds.
+                if (!g.is_loopback && cmd != "getheaders" && cmd != "headers") {
                     int &cnt = g_preverack_counts[fd];
                     if (++cnt > MIQ_PREVERACK_QUEUE_MAX) {
-                        g.banscore += 5;
-                        if (g.banscore >= MAX_BANSCORE) { close_code = 402; P2P_TRACE("close fd="+std::to_string((uintptr_t)fd)+" reason=pre-verack-overflow"); return true; }
+                        // soft-drop extra safe messages during handshake; no banscore/close
                         return false;
                     }
                 }
@@ -872,6 +874,15 @@ static bool parse_ipv4_dotted(const std::string& dotted, uint32_t& be_ip){
 #endif
     be_ip = tmp.sin_addr.s_addr;
     return true;
+}
+
+static inline void gate_mark_sent_verack(Sock fd){
+    auto it = g_gate.find(fd);
+    if (it != g_gate.end()){
+        it->second.sent_verack = true;
+        it->second.hs_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now().time_since_epoch()).count();
+    }
 }
 
 static inline bool is_loopback_be(uint32_t be_ip){
@@ -1005,10 +1016,9 @@ static bool is_self_endpoint(Sock fd, uint16_t listen_port){
             return false;
         }
         // Conservative hairpin detect: same v6 address AND same port as our listener.
-        if (std::memcmp(&p6->sin6_addr, &l6->sin6_addr, sizeof(in6_addr)) == 0) {
-            if (ntohs(p6->sin6_port) == listen_port) {
-                return true;
-            }
+        if (std::memcmp(&p6->sin6_addr, &l6->sin6_addr, sizeof(in6_addr)) == 0 &&
+            ntohs(p6->sin6_port) == listen_port) {
+            return true;
         }
     }
     return false;
@@ -1058,7 +1068,7 @@ static inline std::vector<uint8_t> miq_build_version_payload() {
 
 // Small helper to throttle header pipelining safely.
 static inline bool can_accept_hdr_batch(miq::PeerState& ps, int64_t now) {
-    const int      kMaxInflight = 2;
+    const int      kMaxInflight = 4;
     const int64_t  kMinGapMs    = 50; // keep tiny gap to avoid tight spins
     if (static_cast<uint32_t>(ps.inflight_hdr_batches) >= static_cast<uint32_t>(kMaxInflight)) return false;
     if (ps.last_hdr_batch_done_ms && (now - ps.last_hdr_batch_done_ms) < kMinGapMs) return false;
@@ -1079,8 +1089,8 @@ bool P2P::check_rate(PeerState& ps, const char* key) {
         {"getb",       "get"},
         {"getbi",      "get"},
         {"gettx",      "get"},
-        {"gethdr",     "get"},     // legacy alias
-        {"getheaders", "get"},     // actual command name
+        {"gethdr",     "hdr"},     // legacy alias
+        {"getheaders", "hdr"},     // actual command name
         {"addr",       "addr"},
         {"getaddr",    "addr"},
     };
@@ -1215,7 +1225,7 @@ namespace {
 
     static std::vector<uint8_t> build_getheaders_payload(const std::vector<std::vector<uint8_t>>& locator,
                                                          const std::vector<uint8_t>& stop){
-        const uint8_t n = (uint8_t)std::min<size_t>(locator.size(), 32);
+        const uint8_t n = (uint8_t)std::min<size_t>(locator.size(), 64);
         std::vector<uint8_t> v; v.reserve(1 + n*32 + 32);
         v.push_back(n);
         for (size_t i=0;i<n;i++) v.insert(v.end(), locator[i].begin(), locator[i].end());
@@ -1346,10 +1356,18 @@ static inline uint32_t be(uint8_t a, uint8_t b, uint8_t c, uint8_t d){
 }
 bool P2P::ipv4_is_public(uint32_t be_ip){
     uint8_t A = uint8_t(be_ip>>24), B = uint8_t(be_ip>>16);
+    uint8_t C = uint8_t(be_ip>>8),  D = uint8_t(be_ip>>0);
     if (A == 0 || A == 10 || A == 127) return false;
     if (A == 169 && B == 254) return false;
     if (A == 192 && B == 168) return false;
     if (A == 172 && B >= 16 && B <= 31) return false; // correct 172.16/12 check
+    if (A == 100 && (B >= 64 && B <= 127)) return false;
+    if (A == 192 && B == 0 && C == 0) return false;
+    if (A == 192 && B == 0 && C == 2) return false;
+    if (A == 192 && B == 88 && C == 99) return false;
+    if (A == 198 && (B == 18 || B == 19)) return false;
+    if (A == 198 && B == 51 && C == 100) return false;
+    if (A == 203 && B == 0 && C == 113) return false;
     if (A >= 224) return false;
     return true;
 }
@@ -2262,10 +2280,11 @@ void P2P::loop(){
                 for (auto& kv : peers_) {
                     if (kv.second.verack_ok &&
                         can_accept_hdr_batch(kv.second, now_ms()) &&
-                        check_rate(kv.second, "get", 1.0, now_ms())) {
+                        check_rate(kv.second, "hdr", 1.0, now_ms())) {
                         kv.second.sent_getheaders = true;
                         (void)miq_send(kv.first, m);
                         kv.second.inflight_hdr_batches++;
+                        kv.second.last_hdr_batch_done_ms = now_ms(); // mark request time
                         if (++probes >= 2) break;
                     }
                 }
@@ -2461,11 +2480,16 @@ void P2P::loop(){
                     // FIXED: only drop if decoder made no forward progress (0 bytes).
                     size_t advanced = (off > off_before) ? (off - off_before) : 0;
                     if (advanced == 0) {
-                        miq::log_warn("P2P: decoded frame made no progress; dropping peer defensively");
-                        dead.push_back(s);
-                        break;
+                        miq::log_warn("P2P: decoded frame made no progress; waiting for more data");
+                        break; // do not drop; allow more bytes to arrive
                     }
-
+                    // Incremental compaction to avoid temporary oversize before final trim.
+                    if (off >= 65536 && off <= ps.rx.size()) {
+                        ps.rx.erase(ps.rx.begin(), ps.rx.begin() + (ptrdiff_t)off);
+                        off = 0;
+                        auto itg0 = g_gate.find(s);
+                        if (itg0 != g_gate.end()) itg0->second.rx_bytes = ps.rx.size();
+                    }
                     std::string cmd(m.cmd, m.cmd + 12);
                     size_t z = cmd.find('\0');
                     if (z != std::string::npos) {
@@ -2487,6 +2511,7 @@ void P2P::loop(){
                     if (send_verack) {
                         auto verack = encode_msg("verack", {});
                         (void)miq_send(s, verack);
+                        gate_mark_sent_verack(s);
                     }
 
                     auto inv_tick = [&](unsigned add)->bool{
@@ -2521,7 +2546,7 @@ void P2P::loop(){
                         if (m.payload.size() >= 12) {
                             for(int i=0;i<8;i++) peer_services |= ((uint64_t)m.payload[4+i]) << (8*i);
                         }
-                      ps.version  = peer_ver;
+                        ps.version  = peer_ver;
                         ps.features = peer_services;
                         if (ps.version > 0 && ps.version < min_peer_version_) {
                             log_warn(std::string("P2P: dropping old peer ") + ps.ip);
@@ -2533,9 +2558,33 @@ void P2P::loop(){
                             dead.push_back(s);
                             break;
                         }
+if MIQ_ENABLE_HEADERS_FIRST
+                        {
+                            std::vector<std::vector<uint8_t>> locator;
+                            chain_.build_locator(locator);
+                            std::vector<uint8_t> stop(32, 0);
+                            auto pl = build_getheaders_payload(locator, stop);
+                            auto msg = encode_msg("getheaders", pl);
+                            if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms())) {
+                                ps.sent_getheaders = true;
+                                (void)miq_send(s, msg);
+                                ps.inflight_hdr_batches++;
+                                ps.last_hdr_batch_done_ms = now_ms(); // also marks request time
+                            }
+                        }
+#endif
 
                     } else if (cmd == "verack") {
-                        ps.verack_ok = true;
+                        auto itg = g_gate.find(s);
+                        if (itg != g_gate.end()) {
+                            itg->second.got_verack = true; // (already set in gate, but idempotent)
+                            itg->second.hs_last_ms = now_ms();
+                            if (ps.version > 0 &&
+                                ( (ps.features & required_features_mask_) == required_features_mask_ ) &&
+                                itg->second.sent_verack) {
+                                ps.verack_ok = true;
+                            }
+                        }
                         g_preverack_counts.erase(s);
 #if MIQ_ENABLE_ADDRMAN
                         uint32_t be_ip;
@@ -2554,10 +2603,11 @@ void P2P::loop(){
                             std::vector<uint8_t> stop(32, 0);
                             auto pl = build_getheaders_payload(locator, stop);
                             auto msg = encode_msg("getheaders", pl);
-                            if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "get", 1.0, now_ms())) {
+                            if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms())) {
                                 ps.sent_getheaders = true;
                                 (void)miq_send(s, msg);
                                 ps.inflight_hdr_batches++;
+                                ps.last_hdr_batch_done_ms = now_ms();
                             }
                         }
 
@@ -2775,18 +2825,23 @@ void P2P::loop(){
                             if (!hs2.empty()) hs.swap(hs2);
                         }
 
+                        if (!hs.empty()) {
+                            bool stop_is_nonzero = false;
+                            for (auto b : stop) { if (b) { stop_is_nonzero = true; break; } }
+                            if (stop_is_nonzero) {
+                                size_t keep = hs.size();
+                                for (size_t i=0;i<hs.size();++i){
+                                    // Best-effort: if next header links to 'stop', don't go past it.
+                                    if (hs[i].prev_hash == stop) { keep = i; break; }
+                                }
+                                if (keep < hs.size()) hs.resize(keep);
+                            }
+                        }
                         auto out = build_headers_payload(hs);
                         auto msg = encode_msg("headers", out);
                         (void)miq_send(s, msg);
 
                     } else if (cmd == "headers") {
-                        if (unsolicited_drop(ps, "headers", "")) {
-                            P2P_TRACE("drop unsolicited headers (no ban)");
-                            // Defensively clear any stale inflight to avoid header sync deadlock.
-                            ps.sent_getheaders = false;
-                            ps.inflight_hdr_batches = 0;
-                            continue;
-                        }
                         std::vector<BlockHeader> hs;
                         if (!parse_headers_payload(m.payload, hs)) {
                             if (++ps.mis > 10) { dead.push_back(s); }
@@ -2796,18 +2851,28 @@ void P2P::loop(){
                         size_t accepted = 0;
                         std::string herr;
                         for (const auto& h : hs) {
-                            if (chain_.accept_header(h, herr)) accepted++;
+                            if (chain_.accept_header(h, herr)) {
+                                accepted++;
+                            } else {
+                                // Client-side endianness tolerance: retry with reversed 32B fields
+                                BlockHeader hr = h;
+                                std::reverse(hr.prev_hash.begin(),   hr.prev_hash.end());
+                                std::reverse(hr.merkle_root.begin(), hr.merkle_root.end());
+                                if (chain_.accept_header(hr, herr)) accepted++;
+                            }
                         }
 
                         if (accepted > 0) {
                             g_last_progress_ms = now_ms();
+                            g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
                         }
 
                         // Define at_tip based on batch fullness: short/empty ⇒ tip.
                         bool at_tip = (hs.size() < kHdrBatchMax);
 
                         {
-                            bool zero_progress = (!at_tip) && (accepted == 0);
+                            bool zero_progress = (!at_tip) && (accepted == 0) &&
+                                (now_ms() - g_last_progress_ms) > (int64_t)MIQ_P2P_STALL_RETRY_MS;
                             if (zero_progress) {
                                 int &z = g_zero_hdr_batches[s];
                                 z++;
@@ -2843,10 +2908,11 @@ void P2P::loop(){
                             std::vector<uint8_t> stop2(32, 0);
                             auto pl2 = build_getheaders_payload(locator2, stop2);
                             auto m2  = encode_msg("getheaders", pl2);
-                            if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "get", 1.0, now_ms())) {
+                            if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms())) {
                                  ps.sent_getheaders = true;
                                  (void)miq_send(s, m2);
                                  ps.inflight_hdr_batches++;
+                                 ps.last_hdr_batch_done_ms = now_ms(); // mark request time
                             }
                         }
 #endif
@@ -2883,10 +2949,11 @@ void P2P::loop(){
             auto itg = g_gate.find(s);
             if (itg != g_gate.end()) is_lb = itg->second.is_loopback;
 
-            if (!ps.verack_ok && (tnow - ps.last_ms) > MIQ_P2P_VERACK_TIMEOUT_MS) {
+            int64_t hs_last = itg != g_gate.end() ? itg->second.hs_last_ms : 0;
+            if (!ps.verack_ok && hs_last > 0 && (tnow - hs_last) > MIQ_P2P_VERACK_TIMEOUT_MS) {
                 if (is_lb) {
                     // extend the timer for localhost tools/wallets
-                    ps.last_ms = tnow;
+                    itg->second.hs_last_ms = tnow;
                 } else {
                     P2P_TRACE("close verack-timeout");
                     dead.push_back(s);
@@ -2900,10 +2967,11 @@ void P2P::loop(){
                     (void)miq_send(s, ping);
                     ps.last_ping_ms = tnow;
                     ps.awaiting_pong = true;
-                } else if (ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PONG_TIMEOUT_MS) {
+                } else if (ps.awaiting_pong) {
+                    int64_t eff_pong_timeout = MIQ_P2P_PONG_TIMEOUT_MS * ((ps.syncing || !g_logged_headers_done) ? 3 : 1);
+                    if ((tnow - ps.last_ping_ms) > eff_pong_timeout) {
                     if (!is_lb) {
                         P2P_TRACE("close pong-timeout");
-                        bump_ban(ps, ps.ip, "pong-timeout", now_ms());
                         dead.push_back(s);
                     } else {
                         // loopback: clear awaiting state but keep the socket
@@ -2913,6 +2981,13 @@ void P2P::loop(){
                 }
             }
         }
+#if MIQ_ENABLE_HEADERS_FIRST
+            if (ps.sent_getheaders && ps.inflight_hdr_batches > 0 &&
+                (tnow - ps.last_hdr_batch_done_ms) > (int64_t)MIQ_P2P_STALL_RETRY_MS * 2) {
+                ps.inflight_hdr_batches = 0;
+                ps.sent_getheaders = false;
+            }
+#endif
 
         // ---- Guarded removals (single, consistent path) --------------------
         for (Sock s : dead) {
