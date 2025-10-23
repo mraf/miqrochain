@@ -814,6 +814,7 @@ static inline void gate_on_close(Sock fd){
     g_zero_hdr_batches.erase(fd);
     g_preverack_counts.erase(fd);
     g_cmd_rl.erase(fd); // NEW: clean up per-socket rate-limiter windows
+    g_inflight_block_ts.erase(fd); // also drop any inflight block timers for this socket
 }
 static inline bool gate_on_bytes(Sock fd, size_t add){
     auto it = g_gate.find(fd);
@@ -2025,7 +2026,7 @@ void P2P::maybe_send_getaddr(PeerState& ps){
         (t - ps.last_getaddr_ms) < (int64_t)MIQ_P2P_GETADDR_INTERVAL_MS) return;
     auto msg = encode_msg("getaddr", {});
     if (check_rate(ps, "get", 1.0, t)) {
-        (void)miq_send(ps.sock, msg);
+        (void)send_or_close(ps.sock, msg);
         ps.last_getaddr_ms = t;
     }
 }
@@ -2066,7 +2067,7 @@ void P2P::send_addr_snapshot(PeerState& ps){
         ++cnt;
     }
     auto msg = encode_msg("addr", payload);
-    (void)miq_send(ps.sock, msg);
+    (void)send_or_close(ps.sock, msg);
 }
 void P2P::handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload){
     int64_t t = now_ms();
@@ -2780,22 +2781,32 @@ void P2P::loop(){
 
 #if MIQ_ENABLE_HEADERS_FIRST
                         {
-                            std::vector<std::vector<uint8_t>> locator;
-                            chain_.build_locator(locator);
-                            std::vector<uint8_t> stop(32, 0);
-                            auto pl = build_getheaders_payload(locator, stop);
-                            auto msg = encode_msg("getheaders", pl);
-                            if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms())) {
-                                ps.sent_getheaders = true;
-                                (void)send_or_close(s, msg);
-                                ps.inflight_hdr_batches++;
-                                g_last_hdr_req_ms[(Sock)s] = now_ms();
+                            const bool peer_supports_headers = (ps.features & (1ull<<0)) != 0;
+                        if (peer_supports_headers) {
+                            {
+                                std::vector<std::vector<uint8_t>> locator;
+                                chain_.build_locator(locator);
+                                std::vector<uint8_t> stop(32, 0);
+                                auto pl = build_getheaders_payload(locator, stop);
+                                auto msg = encode_msg("getheaders", pl);
+                                if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms())) {
+                                    ps.sent_getheaders = true;
+                                    (void)send_or_close(s, msg);
+                                    ps.inflight_hdr_batches++;
+                                    g_last_hdr_req_ms[(Sock)s] = now_ms();
+                                    ps.last_hdr_batch_done_ms = now_ms(); // start watchdog window even if no reply yet
+                                }
                             }
-                        }
 
-                        if (!g_logged_headers_started) {
-                            g_logged_headers_started = true;
-                            log_info("[IBD] headers phase started");
+                            if (!g_logged_headers_started) {
+                                g_logged_headers_started = true;
+                                log_info("[IBD] headers phase started");
+                            }
+                        } else {
+                            // Peer lacks headers-first capability: fall back to by-index immediately
+                            ps.syncing = true;
+                            ps.next_index = chain_.height() + 1;
+                            request_block_index(ps, ps.next_index);
                         }
 #else
                         ps.syncing = true;
@@ -3158,6 +3169,9 @@ void P2P::loop(){
                 (tnow - ps.last_hdr_batch_done_ms) > (int64_t)MIQ_P2P_STALL_RETRY_MS * 2) {
                 ps.inflight_hdr_batches = 0;
                 ps.sent_getheaders = false;
+                ps.syncing = true;
+                ps.next_index = chain_.height() + 1;
+                request_block_index(ps, ps.next_index);
             }
 #endif
         }
@@ -3174,6 +3188,7 @@ void P2P::loop(){
             g_preverack_counts.erase(s);
             g_trickle_last_ms.erase(s);
             g_cmd_rl.erase(s); // mirror cleanup in case gate_on_close wasn't hit
+            g_inflight_block_ts.erase(s);
         }
 
         // trickle any queued invtx payloads (enqueued by broadcast_inv_tx)
