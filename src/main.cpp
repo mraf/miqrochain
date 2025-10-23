@@ -125,6 +125,8 @@ extern bool ensure_utxo_fully_indexed(miq::Chain&, const std::string&, bool) __a
 
 using namespace miq;
 
+static std::atomic<uint64_t> g_genesis_time_s{0};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Versions
 #ifndef MIQ_VERSION_MAJOR
@@ -947,6 +949,13 @@ static long double difficulty_from_bits(uint32_t bits){
     return t_one / t_cur;
 }
 
+static inline uint64_t estimate_target_height_by_time(uint64_t genesis_ts){
+    if (!genesis_ts) return 0;
+    uint64_t now = (uint64_t)std::time(nullptr);
+    if (now <= genesis_ts) return 1;
+    return 1 + (now - genesis_ts) / (uint64_t)BLOCK_TIME_SECS;
+}
+
 // Estimate network hashrate (used in TUI loop)
 static double estimate_network_hashrate(Chain* chain){
     if (!chain) return 0.0;
@@ -1215,6 +1224,14 @@ public:
     void set_health_degraded(bool b){ std::lock_guard<std::mutex> lk(mu_); degraded_override_ = b; }
     void set_hot_warning(const std::string& w){ std::lock_guard<std::mutex> lk(mu_); hot_warning_ = w; hot_warn_ts_ = now_ms(); }
     void set_banner_append(const std::string& tail){ std::lock_guard<std::mutex> lk(mu_); if (!banner_.empty()) banner_ += "  "; banner_ += tail; }
+    void set_ibd_progress(uint64_t cur, uint64_t target, uint64_t discovered_from_seed,
+                          const std::string& stage, const std::string& seed_host,
+                          bool finished){
+        std::lock_guard<std::mutex> lk(mu_);
+        ibd_cur_ = cur; ibd_target_ = std::max(target, cur); ibd_discovered_ = discovered_from_seed;
+        ibd_stage_ = stage; ibd_seed_host_ = seed_host; ibd_done_ = finished; ibd_visible_ = !finished;
+        ibd_last_update_ms_ = now_ms();
+    }
 
 private:
     struct StyledLine { std::string txt; int level; };
@@ -1482,6 +1499,27 @@ private:
             left.push_back("");
         }
 
+        {
+            if (nstate_ == NodeState::Syncing || ibd_visible_ || (!ibd_done_ && ibd_target_ > 0)) {
+                left.push_back(std::string(C_bold()) + "Initial Block Download" + C_reset());
+                std::ostringstream meta;
+                if (!ibd_seed_host_.empty()) meta << "  seed: " << ibd_seed_host_ << "   ";
+                meta << "stage: " << (ibd_stage_.empty() ? "discovering" : ibd_stage_);
+                left.push_back(meta.str());
+                int bw = std::max(10, leftw - 20);
+                double frac = (ibd_target_ ? std::min(1.0, (double)ibd_cur_ / (double)ibd_target_) : 0.0);
+                std::ostringstream p;
+                p << "  " << bar(bw, frac, vt_ok_, u8_ok_) << "  "
+                  << ibd_cur_ << "/" << ibd_target_ << " blocks  ("
+                  << std::fixed << std::setprecision(1) << (frac * 100.0) << "%)";
+                left.push_back(p.str());
+                std::ostringstream d; d << "  discovered from seed: " << ibd_discovered_;
+                if (ibd_done_) d << "   " << C_ok() << "complete" << C_reset();
+                left.push_back(d.str());
+                left.push_back("");
+            }
+        }
+
         // Chain status
         {
             left.push_back(std::string(C_bold()) + "Chain" + C_reset());
@@ -1724,6 +1762,15 @@ private:
     uint64_t hot_msg_ts_{0};
     std::string hot_warning_;
     uint64_t hot_warn_ts_{0};
+
+    bool        ibd_visible_{false};
+    bool        ibd_done_{false};
+    uint64_t    ibd_cur_{0};
+    uint64_t    ibd_target_{0};
+    uint64_t    ibd_discovered_{0};
+    std::string ibd_stage_;
+    std::string ibd_seed_host_;
+    uint64_t    ibd_last_update_ms_{0};
 
     // mining gate status
     bool        mining_gate_available_{false};
@@ -1994,6 +2041,8 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
         return false;
     }
 
+    
+
     using namespace std::chrono_literals;
 
     const uint64_t kNoPeerTimeoutMs      = 90 * 1000;
@@ -2006,6 +2055,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
     uint64_t       lastSeedDialMs        = 0;
     uint64_t       lastProgressMs        = now_ms();
     uint64_t       lastHeight            = chain.height();
+    uint64_t       height_at_seed_connect= lastHeight;
 
     // Make sure we’ve nudged the seed right away.
     p2p->connect_seed(DNS_SEED, P2P_PORT);
@@ -2015,6 +2065,8 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
     if (tui && can_tui) tui->mark_step_started("Peer handshake (verack)");
     {
         const uint64_t hs_t0 = now_ms();
+        bool seed_noted = false;
+        uint64_t last_log_ms = 0;
         while (!global::shutdown_requested.load()) {
             if (any_verack_peer(p2p)) {
                 if (tui && can_tui) tui->mark_step_ok("Peer handshake (verack)");
@@ -2025,6 +2077,17 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                 p2p->connect_seed(DNS_SEED, P2P_PORT);
                 lastSeedDialMs = now_ms();
             }
+            if (!seed_noted && any_verack_peer(p2p)) {
+                seed_noted = true;
+                height_at_seed_connect = chain.height();
+                if (tui && can_tui) {
+                    tui->set_banner(std::string("Connected to seed: ") + DNS_SEED);
+                    tui->set_ibd_progress(chain.height(),
+                                          std::max(chain.height(), estimate_target_height_by_time(g_genesis_time_s.load())),
+                                          0, "headers", DNS_SEED, false);
+                }
+            }
+
             if (now_ms() - hs_t0 > kHandshakeTimeoutMs) {
                 out_err = "no peers completed handshake (verack)";
                 if (tui && can_tui) tui->mark_step_fail("Peer handshake (verack)");
@@ -2056,6 +2119,24 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             break;
         }
 
+        +        {
+            uint64_t cur = chain.height();
+            uint64_t est_target = std::max<uint64_t>(cur, estimate_target_height_by_time(g_genesis_time_s.load()));
+            uint64_t discovered = (cur >= height_at_seed_connect) ? (cur - height_at_seed_connect) : 0;
+            const char* stage = (cur == 0 ? "headers" : "blocks");
+            if (tui && can_tui) {
+                tui->set_ibd_progress(cur, est_target, discovered, stage, DNS_SEED, false);
+            } else {
+                static uint64_t last_note_ms = 0;
+                if (now_ms() - last_note_ms > 2500) {
+                    double pct = (est_target ? (100.0 * (double)cur / (double)est_target) : 0.0);
+                    log_info(std::string("[IBD] ") + stage + ": " + std::to_string(cur) + "/" + std::to_string(est_target)
+                             + "  ~" + (std::ostringstream{} << std::fixed << std::setprecision(1) << pct).str() + "%  discovered-from-seed=" + std::to_string(discovered));
+                    last_note_ms = now_ms();
+                }
+            }
+        }
+
         // Track progress by height advancing
         uint64_t h = chain.height();
         if (h > lastHeight) {
@@ -2079,7 +2160,10 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                 if (!compute_sync_gate(chain, p2p, why)) { stable = false; break; }
             }
             if (stable) {
-                // Success
+            if (tui && can_tui) {
+                    tui->set_ibd_progress(chain.height(), std::max<uint64_t>(chain.height(), estimate_target_height_by_time(g_genesis_time_s.load())),
+                                          (chain.height() >= height_at_seed_connect ? (chain.height() - height_at_seed_connect) : 0), "complete", DNS_SEED, true);
+                }
                 return true;
             }
         }
@@ -2294,6 +2378,7 @@ int main(int argc, char** argv){
             if (raw.empty()) { log_error("GENESIS_RAW_BLOCK_HEX empty"); release_datadir_lock(); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
             Block g;
             if (!deser_block(raw, g)) { log_error("Genesis deserialize failed"); release_datadir_lock(); if (can_tui){ capture.stop(); tui.stop(); } return 1; }
+            g_genesis_time_s.store(hdr_time(g.header));
             const std::string got_hash = to_hex(g.block_hash());
             const std::string want_hash= std::string(GENESIS_HASH_HEX);
             const std::string got_merkle = to_hex(g.header.merkle_root);
@@ -2364,6 +2449,7 @@ int main(int argc, char** argv){
         // ─────────────────────────────────────────────────────────────────────
         // NEW STEP: IBD sync phase (smart start/finish, surfaces real error)
         // ─────────────────────────────────────────────────────────────────────
+        if (can_tui) tui.set_ibd_progress(chain.height(), std::max<uint64_t>(chain.height(), estimate_target_height_by_time(g_genesis_time_s.load())), 0, "headers", DNS_SEED, false);
         if (can_tui) tui.mark_step_started("IBD sync phase");
         std::string ibd_err;
         bool ibd_ok = perform_ibd_sync(chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, &tui, ibd_err);
