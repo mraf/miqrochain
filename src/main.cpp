@@ -2035,6 +2035,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                              bool can_tui, TUI* tui, std::string& out_err){
     // If we don't need IBD, we're done.
     if (!should_enter_ibd(chain, datadir)) return true;
+    const bool we_are_seed = compute_seed_role().we_are_seed;
 
     if (!p2p) {
         out_err = "P2P disabled (cannot sync headers/blocks)";
@@ -2058,22 +2059,31 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
     uint64_t       height_at_seed_connect= lastHeight;
 
     // Make sure we’ve nudged the seed right away.
-    p2p->connect_seed(DNS_SEED, P2P_PORT);
-    lastSeedDialMs = now_ms();
-
+    if (!we_are_seed) {
+        p2p->connect_seed(DNS_SEED, P2P_PORT);
+        lastSeedDialMs = now_ms();
+    } else {
+        log_info(std::string("Seed self-detect: skipping outbound connect to ")
+                 + DNS_SEED + " (waiting for inbound peers).");
+    }
     if (can_tui) tui->set_node_state(TUI::NodeState::Syncing);
     if (tui && can_tui) tui->mark_step_started("Peer handshake (verack)");
     {
         const uint64_t hs_t0 = now_ms();
         bool seed_noted = false;
-        uint64_t last_log_ms = 0;
+        const uint64_t handshake_deadline_ms =
+            we_are_seed ? (hs_t0 + 5 * 60 * 1000) : (hs_t0 + kHandshakeTimeoutMs);
+        if (we_are_seed) {
+            log_info("IBD: acting as seed host — waiting for inbound verack (up to ~5 min).");
+            if (tui && can_tui) tui->set_banner("Seed mode: waiting for inbound peers…");
+        }
         while (!global::shutdown_requested.load()) {
             if (any_verack_peer(p2p)) {
                 if (tui && can_tui) tui->mark_step_ok("Peer handshake (verack)");
                 break; // proceed to IBD
             }
             // keep nudging the seed if needed
-            if (now_ms() - lastSeedDialMs > kSeedNudgeMs) {
+            if (!we_are_seed && (now_ms() - lastSeedDialMs > kSeedNudgeMs)) {
                 p2p->connect_seed(DNS_SEED, P2P_PORT);
                 lastSeedDialMs = now_ms();
             }
@@ -2088,8 +2098,14 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                 }
             }
 
-            if (now_ms() - hs_t0 > kHandshakeTimeoutMs) {
-                out_err = "no peers completed handshake (verack)";
+            if (now_ms() > handshake_deadline_ms) {
+                if (we_are_seed) {
+                    out_err = "no inbound peers completed handshake while acting as seed";
+                    log_warn("IBD: seed mode handshake timed out — check DNS and port forwarding.");
+                } else {
+                    out_err = "no peers completed handshake (verack)";
+                }
+
                 if (tui && can_tui) tui->mark_step_fail("Peer handshake (verack)");
                 return false;
             }
@@ -2108,14 +2124,20 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
 
         // Ensure we periodically re-nudge the seed if peer count is low.
         size_t peers = p2p->snapshot_peers().size();
-        if (peers < 2 && now_ms() - lastSeedDialMs > kSeedNudgeMs) {
+        if (!we_are_seed && peers < 2 && now_ms() - lastSeedDialMs > kSeedNudgeMs) {
             p2p->connect_seed(DNS_SEED, P2P_PORT);
             lastSeedDialMs = now_ms();
         }
 
         // Early no-peer failure
-        if (peers == 0 && now_ms() - t0 > kNoPeerTimeoutMs) {
-            out_err = std::string("no peers reachable (seed: ") + DNS_SEED + ":" + std::to_string(P2P_PORT) + ")";
+        const uint64_t no_peer_budget =
+            we_are_seed ? (5 * 60 * 1000) : kNoPeerTimeoutMs;
+        if (peers == 0 && now_ms() - t0 > no_peer_budget) {
+            if (we_are_seed) {
+                out_err = "no peers reachable while acting as seed (check DNS A/AAAA and firewall/NAT)";
+            } else {
+                out_err = std::string("no peers reachable (seed: ") + DNS_SEED + ":" + std::to_string(P2P_PORT) + ")";
+            }
             break;
         }
 
@@ -2130,8 +2152,14 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                 static uint64_t last_note_ms = 0;
                 if (now_ms() - last_note_ms > 2500) {
                     double pct = (est_target ? (100.0 * (double)cur / (double)est_target) : 0.0);
-                    log_info(std::string("[IBD] ") + stage + ": " + std::to_string(cur) + "/" + std::to_string(est_target)
-                             + "  ~" + (std::ostringstream{} << std::fixed << std::setprecision(1) << pct).str() + "%  discovered-from-seed=" + std::to_string(discovered));
+                    std::ostringstream oss;
+                    oss << std::fixed << std::setprecision(1) << pct;
+                    std::string pct_s = oss.str();
+                    log_info(std::string("[IBD] ") + stage + ": "
+                             + std::to_string(cur) + "/" + std::to_string(est_target)
+                             + "  ~" + pct_s + "%  discovered-from-seed="
+                             + std::to_string(discovered)
+                             + (we_are_seed ? "  (seed-mode: waiting for inbound peers)" : ""));
                     last_note_ms = now_ms();
                 }
             }
@@ -2431,9 +2459,17 @@ int main(int argc, char** argv){
                 p2p_ok = true;
                 log_info("P2P listening on " + std::to_string(P2P_PORT));
                 if (can_tui) { tui.mark_step_ok("Start P2P listener"); tui.mark_step_started("Connect seeds"); }
-                // Ensure we connect to the configured seed host/port (e.g., seed.miqrochain.org:9883)
-                p2p.connect_seed(DNS_SEED, P2P_PORT);
-                if (can_tui) tui.mark_step_ok("Connect seeds");
+                if (!compute_seed_role().we_are_seed) {
+                    p2p.connect_seed(DNS_SEED, P2P_PORT);
+                    if (can_tui) tui.mark_step_ok("Connect seeds");
+                } else {
+                    log_info(std::string("Seed self-detect: skipping outbound connect to ")
+                             + DNS_SEED + " (waiting for inbound peers).");
+                    if (can_tui) {
+                        tui.mark_step_ok("Connect seeds");
+                        tui.set_hot_warning("Running as public seed — ensure port is open");
+                    }
+                }
             } else {
                 log_warn("P2P failed to start on port " + std::to_string(P2P_PORT));
             }
