@@ -533,6 +533,8 @@ static int64_t g_next_stall_probe_ms = 0;
 static std::unordered_map<Sock, std::vector<std::vector<uint8_t>>> g_trickle_q;
 static std::unordered_map<Sock, int64_t> g_trickle_last_ms;
 
+static std::unordered_map<Sock,int64_t> g_last_hdr_req_ms;
+
 // Per-peer sliding-window message counters
 static std::unordered_map<Sock,
     std::unordered_map<std::string, std::pair<int64_t,uint32_t>>> g_cmd_rl;
@@ -774,6 +776,7 @@ static inline void gate_on_close(Sock fd){
     g_gate.erase(fd);
     g_trickle_q.erase(fd);
     g_trickle_last_ms.erase(fd);
+    g_last_hdr_req_ms.erase(fd);
     g_peer_minrelay_kb.erase(fd);
     g_peer_last_ff_ms.erase(fd);
     rx_clear_start(fd);
@@ -786,6 +789,8 @@ static inline bool gate_on_bytes(Sock fd, size_t add){
     if (it == g_gate.end()) return false;
     it->second.rx_bytes += add;
     it->second.t_last = Clock::now();
+    // trip the gate if a single peer accumulates too much pending RX
+    if (it->second.rx_bytes > MAX_MSG_BYTES) return true;
     return false;
 }
 static inline bool gate_on_command(Sock fd, const std::string& cmd,
@@ -1117,7 +1122,9 @@ static inline bool can_accept_hdr_batch(miq::PeerState& ps, int64_t now) {
     const int      kMaxInflight = 4;
     const int64_t  kMinGapMs    = 50; // keep tiny gap to avoid tight spins
     if (static_cast<uint32_t>(ps.inflight_hdr_batches) >= static_cast<uint32_t>(kMaxInflight)) return false;
-    if (ps.last_hdr_batch_done_ms && (now - ps.last_hdr_batch_done_ms) < kMinGapMs) return false;
+    auto it = g_last_hdr_req_ms.find((Sock)ps.sock);
+    int64_t last_req = (it == g_last_hdr_req_ms.end()) ? 0 : it->second;
+    if (last_req && (now - last_req) < kMinGapMs) return false;
     return true;
 }
 
@@ -2378,7 +2385,7 @@ void P2P::loop(){
                         kv.second.sent_getheaders = true;
                         (void)miq_send(kv.first, m);
                         kv.second.inflight_hdr_batches++;
-                        kv.second.last_hdr_batch_done_ms = now_ms(); // mark request time
+                        g_last_hdr_req_ms[kv.first] = now_ms();
                         if (++probes >= 2) break;
                     }
                 }
@@ -2693,7 +2700,7 @@ void P2P::loop(){
                                 ps.sent_getheaders = true;
                                 (void)miq_send(s, msg);
                                 ps.inflight_hdr_batches++;
-                                ps.last_hdr_batch_done_ms = now_ms(); // also marks request time
+                                g_last_hdr_req_ms[(Sock)s] = now_ms(); // SEND time
                             }
                         }
 #endif
@@ -2731,7 +2738,7 @@ void P2P::loop(){
                                 ps.sent_getheaders = true;
                                 (void)miq_send(s, msg);
                                 ps.inflight_hdr_batches++;
-                                ps.last_hdr_batch_done_ms = now_ms();
+                                g_last_hdr_req_ms[(Sock)s] = now_ms();
                             }
                         }
 
@@ -2975,6 +2982,7 @@ void P2P::loop(){
                         }
 
                         if (accepted > 0) {
+                            log_info("P2P: headers from " + ps.ip + " n=" + std::to_string(hs.size()) + " accepted=" + std::to_string(accepted));
                             g_last_progress_ms = now_ms();
                             g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
                         }
@@ -3024,7 +3032,7 @@ void P2P::loop(){
                                  ps.sent_getheaders = true;
                                  (void)miq_send(s, m2);
                                  ps.inflight_hdr_batches++;
-                                 ps.last_hdr_batch_done_ms = now_ms(); // mark request time
+                                 g_last_hdr_req_ms[s] = now_ms();      // SEND time
                             }
                         }
 #endif
