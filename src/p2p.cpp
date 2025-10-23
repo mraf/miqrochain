@@ -1427,12 +1427,53 @@ P2P::~P2P(){ stop(); }
 
 void P2P::load_bans(){
     std::ifstream f(datadir_ + "/bans.txt");
-    std::string ip;
-    while (f >> ip) banned_.insert(ip);
+    if (!f) return;
+    std::string line;
+    const int64_t now = now_ms();
+   while (std::getline(f, line)) {
+        // strip comments and whitespace
+        size_t hash = line.find('#');
+        if (hash != std::string::npos) line.erase(hash);
+        auto trim = [](std::string &s){
+            size_t a=0,b=s.size();
+            while (a<b && (unsigned char)s[a] <= ' ') ++a;
+            while (b>a && (unsigned char)s[b-1] <= ' ') --b;
+            s = s.substr(a,b-a);
+        };
+        trim(line);
+        if (line.empty()) continue;
+
+        // Supported formats:
+        //   "1.2.3.4"                           -> permanent ban
+        //   "1.2.3.4 UNTIL=1700000000000"       -> timed ban until epoch-ms
+        std::string ip = line;
+        int64_t until = 0;
+        auto p = line.find("UNTIL=");
+        if (p != std::string::npos) {
+            ip = miq_trim(line.substr(0, p));
+            const std::string val = line.substr(p + 6);
+            char *end = nullptr;
+            long long ms = std::strtoll(val.c_str(), &end, 10);
+            if (end && (*end == 0 || *end == ' ')) until = (int64_t)ms;
+        }
+        if (until > now) {
+            timed_bans_[ip] = until;  // respect future timed bans if present
+        } else {
+            banned_.insert(ip);       // permanent (or expired timed ban → ignore timing)
+        }
+    }
 }
+
 void P2P::save_bans(){
     std::ofstream f(datadir_ + "/bans.txt", std::ios::trunc);
-    for (auto& ip : banned_) f << ip << "\n";
+    if (!f) return;
+    // Persist permanent bans only. Timed bans are in-memory and will expire.
+    for (const auto& ip : banned_) {
+        auto it = timed_bans_.find(ip);
+        if (it == timed_bans_.end()) {
+            f << ip << "\n";
+        }
+    }
 }
 
 void P2P::bump_ban(PeerState& ps, const std::string& ip, const char* reason, int64_t now_ms)
@@ -1444,7 +1485,9 @@ void P2P::bump_ban(PeerState& ps, const std::string& ip, const char* reason, int
     }
     // Timed ban record
     timed_bans_[ip] = now_ms + default_ban_ms_;
-    banned_.insert(ip);
+    P2P_TRACE(std::string("ban set (timed) ip=") + ip +
+              " ms_left=" + std::to_string((timed_bans_[ip] > now_ms) ? (timed_bans_[ip] - now_ms) : 0) +
+              " reason=" + (reason?reason:""));
 
     // Close socket to enforce the ban immediately.
     Sock s = ps.sock;
@@ -2176,6 +2219,7 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
 
 void P2P::loop(){
     int64_t last_addr_save_ms = now_ms();
+    int64_t last_ban_purge_ms = last_addr_save_ms;
     int64_t last_dial_ms = now_ms();
 
     while (running_) {
@@ -2389,6 +2433,16 @@ void P2P::loop(){
         int rc = poll(fds.data(), fds.size(), 200);
 #endif
         if (rc < 0) continue;
+        {
+            int64_t tnow = now_ms();
+            if (tnow - last_ban_purge_ms > 60000) {
+                for (auto it = timed_bans_.begin(); it != timed_bans_.end(); ) {
+                    if (it->second <= tnow) it = timed_bans_.erase(it);
+                    else ++it;
+                }
+                last_ban_purge_ms = tnow;
+            }
+        }
 
         // Accept new peers (with soft inbound rate cap) - IPv4
         if (srv_ != MIQ_INVALID_SOCK && srv_idx_v4 < fds.size() && (fds[srv_idx_v4].revents & POLL_RD)) {
@@ -2425,8 +2479,16 @@ void P2P::loop(){
 #else
                         inet_ntop(AF_INET, &ca.sin_addr, ipbuf, (socklen_t)sizeof(ipbuf));
 #endif
-                        if (banned_.count(ipbuf) || is_ip_banned(ipbuf, now_ms())) {
-                            P2P_TRACE(std::string("reject inbound banned ip=") + ipbuf);
+                        const int64_t now = now_ms();
+                        if (banned_.count(ipbuf)) {
+                            P2P_TRACE(std::string("reject inbound banned(permanent) ip=") + ipbuf);
+                            CLOSESOCK(c);
+                        } else if (is_ip_banned(ipbuf, now)) {
+                            int64_t ms_left = 0;
+                            auto itb = timed_bans_.find(std::string(ipbuf));
+                            if (itb != timed_bans_.end() && itb->second > now) ms_left = itb->second - now;
+                            P2P_TRACE(std::string("reject inbound banned(timed) ip=") + ipbuf +
+                                      " ms_left=" + std::to_string(ms_left));
                             CLOSESOCK(c);
                         } else {
                             handle_new_peer(c, ipbuf);
@@ -2472,8 +2534,16 @@ void P2P::loop(){
                         inet_ntop(AF_INET6, &ca6.sin6_addr, ipbuf, (socklen_t)sizeof(ipbuf));
 #endif
                         std::string ip(ipbuf[0] ? ipbuf : "unknown");
-                        if (banned_.count(ip) || is_ip_banned(ip, now_ms())) {
-                            P2P_TRACE(std::string("reject inbound banned ip6=") + ip);
+                        const int64_t now = now_ms();
+                        if (banned_.count(ip)) {
+                            P2P_TRACE(std::string("reject inbound banned(permanent) ip6=") + ip);
+                            CLOSESOCK(c);
+                        } else if (is_ip_banned(ip, now)) {
+                            int64_t ms_left = 0;
+                            auto itb = timed_bans_.find(ip);
+                            if (itb != timed_bans_.end() && itb->second > now) ms_left = itb->second - now;
+                            P2P_TRACE(std::string("reject inbound banned(timed) ip6=") + ip +
+                                      " ms_left=" + std::to_string(ms_left));
                             CLOSESOCK(c);
                         } else {
                             handle_new_peer(c, ip);
