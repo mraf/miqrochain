@@ -600,6 +600,13 @@ static inline bool miq_send(Sock s, const std::vector<uint8_t>& v){
     if (v.empty()) return true;
     return miq_send(s, v.data(), v.size());
 }
+
+static inline bool send_or_close(Sock s, const std::vector<uint8_t>& v){
+  if (miq_send(s, v)) return true;
+  schedule_close(s);
+  return false;
+}
+
 static inline int miq_recv(Sock s, uint8_t* buf, size_t bufsz) {
 #ifdef _WIN32
     int n = recv(s, reinterpret_cast<char*>(buf), (int)bufsz, 0);
@@ -679,9 +686,33 @@ static inline int64_t now_ms() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+static inline int64_t wall_ms() {
+  using namespace std::chrono;
+  return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+
 #ifndef MIQ_CONNECT_TIMEOUT_MS
 #define MIQ_CONNECT_TIMEOUT_MS 5000
 #endif
+
+namespace {
+  static std::unordered_set<Sock> g_force_close;
+  static inline void schedule_close(Sock s){ if (s!=MIQ_INVALID_SOCK) g_force_close.insert(s); }
+
+  static std::unordered_set<Sock> g_outbounds;
+  static inline size_t outbound_count(){ return g_outbounds.size(); }
+}
+
+// Track inflight block request timestamps without touching PeerState layout
+namespace {
+  static std::unordered_map<Sock, std::unordered_map<std::string,int64_t>> g_inflight_block_ts;
+}
+
+// Light-touch guard for peers_ against snapshot_peers() racing the loop
+namespace {
+  static std::mutex g_peers_mu;
+}
+
 
 // --- socket helpers: non-blocking + nodelay + timed connect -----------------
 static inline void miq_set_nodelay(Sock s) {
@@ -1436,7 +1467,8 @@ void P2P::load_bans(){
     std::ifstream f(datadir_ + "/bans.txt");
     if (!f) return;
     std::string line;
-    const int64_t now = now_ms();
+    const int64_t now_wall   = wall_ms();
+    const int64_t now_steady = now_ms();
    while (std::getline(f, line)) {
         // strip comments and whitespace
         size_t hash = line.find('#');
@@ -1463,8 +1495,8 @@ void P2P::load_bans(){
             long long ms = std::strtoll(val.c_str(), &end, 10);
             if (end && (*end == 0 || *end == ' ')) until = (int64_t)ms;
         }
-        if (until > now) {
-            timed_bans_[ip] = until;  // respect future timed bans if present
+        if (until > now_wall) {
+            timed_bans_[ip] = now_steady + (until - now_wall);
         } else {
             banned_.insert(ip);       // permanent (or expired timed ban → ignore timing)
         }
@@ -1490,19 +1522,13 @@ void P2P::bump_ban(PeerState& ps, const std::string& ip, const char* reason, int
         P2P_TRACE(std::string("skip-ban loopback/whitelist ip=") + ip + " reason=" + (reason?reason:""));
         return;
     }
-    // Timed ban record
+    
     timed_bans_[ip] = now_ms + default_ban_ms_;
     P2P_TRACE(std::string("ban set (timed) ip=") + ip +
               " ms_left=" + std::to_string((timed_bans_[ip] > now_ms) ? (timed_bans_[ip] - now_ms) : 0) +
               " reason=" + (reason?reason:""));
-
-    // Close socket to enforce the ban immediately.
-    Sock s = ps.sock;
-    if (s != MIQ_INVALID_SOCK) {
-        P2P_TRACE(std::string("ban-close ip=") + ip + " reason=" + (reason?reason:""));
-        CLOSESOCK(s);
-        ps.sock = MIQ_INVALID_SOCK;
-    }
+    // Defer close so the main loop handles unified close/erase
+    schedule_close((Sock)ps.sock);
     (void)reason;
 }
 
@@ -1766,13 +1792,18 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 
     // Gate first, then mark loopback (so flag actually sticks)
     gate_on_connect(s);
+    {
+        std::lock_guard<std::mutex> lk(g_peers_mu);
+        // mark as outbound for gating/diversity
+        g_outbounds.insert(s);
+    }
     if (parse_ipv4(ps.ip, be_ip)) {
         gate_set_loopback(s, is_loopback_be(be_ip));
     }
 
     miq_set_keepalive(s);
     auto msg = encode_msg("version", miq_build_version_payload());
-    (void)miq_send(s, msg);
+    (void)send_or_close(s, msg);
 
     return true;
 }
@@ -1800,6 +1831,7 @@ static bool violates_group_diversity(const std::unordered_map<Sock, miq::PeerSta
     };
 
     for (const auto& kv : peers){
+        if (!g_outbounds.count(kv.first)) continue;
         const auto& ps = kv.second;
         uint32_t be_ip2 = 0;
         if (!parse_be_ipv4(ps.ip, be_ip2)) continue;
@@ -1851,7 +1883,7 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     }
 
     auto msg = encode_msg("version", miq_build_version_payload());
-    (void)miq_send(c, msg);
+    (void)send_or_close(c, msg);
 }
 
 void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
@@ -1897,8 +1929,11 @@ static void trickle_flush(){
         while (!q.empty() && n_send < MIQ_P2P_TRICKLE_BATCH) {
             const auto& txid = q.back();
             auto m = miq::encode_msg("invtx", txid);
-            (void)miq_send(s, m);
-            q.pop_back();
+            if (send_or_close(s, m)) {
+                q.pop_back();
+            } else {
+                break; // scheduled for close; stop emitting
+            }
             ++n_send;
         }
         g_trickle_last_ms[s] = tnow;
@@ -1911,14 +1946,15 @@ void P2P::request_tx(PeerState& ps, const std::vector<uint8_t>& txid){
     const size_t max_inflight_tx = caps_.max_txs ? caps_.max_txs : (size_t)128;
     if (ps.inflight_tx.size() >= max_inflight_tx) return;
     auto m = encode_msg("gettx", txid);
-    (void)miq_send(ps.sock, m);
-    ps.inflight_tx.insert(hexkey(txid));
+    if (send_or_close(ps.sock, m)) {
+        ps.inflight_tx.insert(hexkey(txid));
+    }
 }
 
 void P2P::send_tx(Sock sock, const std::vector<uint8_t>& raw){
     if (raw.empty()) return;
     auto m = encode_msg("tx", raw);
-    (void)miq_send(sock, m);
+    (void)send_or_close(sock, m);
 }
 
 void P2P::start_sync_with_peer(PeerState& ps){
@@ -1931,7 +1967,7 @@ void P2P::request_block_index(PeerState& ps, uint64_t index){
     uint8_t p[8];
     for (int i=0;i<8;i++) p[i] = (uint8_t)((index >> (8*i)) & 0xFF);
     auto msg = encode_msg("getbi", std::vector<uint8_t>(p, p+8));
-    (void)miq_send(ps.sock, msg);
+    (void)send_or_close(ps.sock, msg);
 }
 
 void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
@@ -1940,14 +1976,17 @@ void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     if (!check_rate(ps, "get", 1.0, now_ms())) return;
     if (ps.inflight_blocks.size() >= max_inflight_blocks) return;
     auto msg = encode_msg("getb", h);
-    (void)miq_send(ps.sock, msg);
-    ps.inflight_blocks.insert(hexkey(h));
+    const std::string key = hexkey(h);
+    if (send_or_close(ps.sock, msg)) {
+        ps.inflight_blocks.insert(key);
+        g_inflight_block_ts[(Sock)ps.sock][key] = now_ms();
+    }
 }
 
 void P2P::send_block(Sock s, const std::vector<uint8_t>& raw){
     if (raw.empty()) return;
     auto msg = encode_msg("block", raw);
-    (void)miq_send(s, msg);
+    (void)send_or_close(s, msg);
 }
 
 // === rate-limit helpers ======================================================
@@ -2232,7 +2271,7 @@ void P2P::loop(){
     int64_t last_dial_ms = now_ms();
 
     while (running_) {
-        if ((int)peers_.size() < MIQ_OUTBOUND_TARGET && g_listen_port != 0) {
+        if ((int)outbound_count() < MIQ_OUTBOUND_TARGET && g_listen_port != 0) {
             int64_t tnow = now_ms();
             if (tnow - last_dial_ms > MIQ_DIAL_INTERVAL_MS) {
                 last_dial_ms = tnow;
@@ -2264,13 +2303,13 @@ void P2P::loop(){
                         ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
                         ps.inflight_hdr_batches = 0; ps.last_hdr_batch_done_ms = 0; ps.sent_getheaders = false;
                         ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
-                        peers_[s] = ps;
+                        { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
                         g_trickle_last_ms[s] = 0;
                         log_info("P2P: outbound (addrman) " + ps.ip);
                         gate_on_connect(s);
                         gate_set_loopback(s, is_loopback_be(be_ip));
                         auto msg = encode_msg("version", miq_build_version_payload());
-                        (void)miq_send(s, msg);
+                        (void)send_or_close(s, msg);
                         dialed = true;
                     } else {
                         g_addrman.mark_attempt(*cand);
@@ -2311,7 +2350,7 @@ void P2P::loop(){
                                 ps.last_refill_ms = ps.last_ms;
                                 ps.inflight_hdr_batches = 0; ps.last_hdr_batch_done_ms = 0; ps.sent_getheaders = false;
                                 ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
-                                peers_[s] = ps;
+                                { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
                                 g_trickle_last_ms[s] = 0;
 
                                 log_info("P2P: outbound to known " + ps.ip);
@@ -2319,7 +2358,7 @@ void P2P::loop(){
                                 miq_set_keepalive(s);
                                 gate_set_loopback(s, is_loopback_be(pick));
                                 auto msg = encode_msg("version", miq_build_version_payload());
-                                (void)miq_send(s, msg);
+                                (void)send_or_close(s, msg);
                             }
                         }
                     }
@@ -2348,14 +2387,14 @@ void P2P::loop(){
                                     ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
                                     ps.inflight_hdr_batches = 0; ps.last_hdr_batch_done_ms = 0; ps.sent_getheaders = false;
                                     ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
-                                    peers_[s]=ps;
+                                    { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s]=ps; g_outbounds.insert(s); }
                                     g_trickle_last_ms[s] = 0;
                                     log_info("P2P: feeler " + dotted);
                                     gate_on_connect(s);
                                     miq_set_keepalive(s);
                                     gate_set_loopback(s, is_loopback_be(be_ip));
                                     auto msg = encode_msg("version", miq_build_version_payload());
-                                    (void)miq_send(s, msg);
+                                    (void)send_or_close(s, msg);
                                 }
                             }
                         }
@@ -2395,8 +2434,33 @@ void P2P::loop(){
                 g_next_stall_probe_ms = tnow + MIQ_P2P_STALL_RETRY_MS;
             }
         }
-
+        // === NEW: timeout & retry for inflight blocks =======================
+        {
+          const int64_t tnow = now_ms();
+          const int64_t block_to_ms = 2 * MIQ_P2P_STALL_RETRY_MS;
+          std::vector<std::pair<Sock,std::string>> expired;
+          for (auto& bySock : g_inflight_block_ts) {
+            for (auto& kv : bySock.second) {
+              if (tnow - kv.second > block_to_ms) expired.emplace_back(bySock.first, kv.first);
+            }
+          }
+          for (auto& e : expired) {
+            Sock s_exp = e.first; const std::string& k = e.second;
+            auto itp = peers_.find(s_exp);
+            if (itp != peers_.end()) itp->second.inflight_blocks.erase(k);
+            g_inflight_block_ts[s_exp].erase(k);
+            // hex -> raw 32 bytes
+            std::vector<uint8_t> h(32);
+            auto hexv = [](char c)->int{ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return 10+(c-'a'); if(c>='A'&&c<='F')return 10+(c-'A'); return 0; };
+            for (size_t i=0;i<32;i++) {
+              h[i] = (uint8_t)((hexv(k[2*i])<<4) | hexv(k[2*i+1]));
+            }
+            for (auto& kv2 : peers_) if (kv2.first != s_exp) { request_block_hash(kv2.second, h); break; }
+          }
+        }
+  
         // --- build pollfd list (SNAPSHOT of peers_) ---
+        std::lock_guard<std::mutex> lk(g_peers_mu);
         std::vector<PollFD> fds;
         std::vector<Sock>   peer_fd_order;
         size_t srv_idx_v4 = (size_t)-1, srv_idx_v6 = (size_t)-1;
@@ -2564,6 +2628,12 @@ void P2P::loop(){
 
         // Read/process peers
         std::vector<Sock> dead;
+          if (!g_force_close.empty()) {
+            for (Sock s : g_force_close) {
+                dead.push_back(s);
+            }
+            g_force_close.clear();
+        }
         for (size_t i = 0; i < peer_fd_order.size(); ++i) {
             if (base + i >= fds.size()) continue;
             Sock s = peer_fd_order[i];
@@ -2637,7 +2707,7 @@ void P2P::loop(){
                     }
                     if (send_verack) {
                         auto verack = encode_msg("verack", {});
-                        (void)miq_send(s, verack);
+                        (void)send_or_close(s, verack);
                         gate_mark_sent_verack(s);
                     }
 
@@ -2685,21 +2755,6 @@ void P2P::loop(){
                             dead.push_back(s);
                             break;
                         }
-#if MIQ_ENABLE_HEADERS_FIRST
-                        {
-                            std::vector<std::vector<uint8_t>> locator;
-                            chain_.build_locator(locator);
-                            std::vector<uint8_t> stop(32, 0);
-                            auto pl = build_getheaders_payload(locator, stop);
-                            auto msg = encode_msg("getheaders", pl);
-                            if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms())) {
-                                ps.sent_getheaders = true;
-                                (void)miq_send(s, msg);
-                                ps.inflight_hdr_batches++;
-                                g_last_hdr_req_ms[(Sock)s] = now_ms(); // SEND time
-                            }
-                        }
-#endif
 
                     } else if (cmd == "verack") {
                         auto itg = g_gate.find(s);
@@ -2732,7 +2787,7 @@ void P2P::loop(){
                             auto msg = encode_msg("getheaders", pl);
                             if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms())) {
                                 ps.sent_getheaders = true;
-                                (void)miq_send(s, msg);
+                                (void)send_or_close(s, msg);
                                 ps.inflight_hdr_batches++;
                                 g_last_hdr_req_ms[(Sock)s] = now_ms();
                             }
@@ -2754,12 +2809,12 @@ void P2P::loop(){
                             std::vector<uint8_t> pl(8);
                             for(int i=0;i<8;i++) pl[i] = (uint8_t)((mrf >> (8*i)) & 0xFF);
                             auto ff = encode_msg("feefilter", pl);
-                            (void)miq_send(s, ff);
+                            (void)send_or_close(s, ff);
                         }
 
                     } else if (cmd == "ping") {
                         auto pong = encode_msg("pong", m.payload);
-                        (void)miq_send(s, pong);
+                        (void)send_or_close(s, pong);
 
                     } else if (cmd == "pong") {
                         ps.awaiting_pong = false;
@@ -2812,6 +2867,7 @@ void P2P::loop(){
                             continue;
                         }
                             ps.inflight_blocks.erase(bh);
+                            g_inflight_block_ts[(Sock)s].erase(bh);
                             handle_incoming_block(s, m.payload);
                         }
 
@@ -3026,7 +3082,7 @@ void P2P::loop(){
                             auto m2  = encode_msg("getheaders", pl2);
                             if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms())) {
                                  ps.sent_getheaders = true;
-                                 (void)miq_send(s, m2);
+                                 (void)send_or_close(s, m2);
                                  ps.inflight_hdr_batches++;
                                  g_last_hdr_req_ms[s] = now_ms();      // SEND time
                             }
@@ -3113,6 +3169,7 @@ void P2P::loop(){
                 CLOSESOCK(s);
             }
             peers_.erase(s);
+            g_outbounds.erase(s);
             g_zero_hdr_batches.erase(s);
             g_preverack_counts.erase(s);
             g_trickle_last_ms.erase(s);
@@ -3177,6 +3234,7 @@ void P2P::loop(){
 std::vector<PeerSnapshot> P2P::snapshot_peers() const {
     std::vector<PeerSnapshot> out;
     out.reserve(peers_.size());
+    std::lock_guard<std::mutex> lk(g_peers_mu);
     for (const auto& kv : peers_) {
         const auto& ps = kv.second;
         PeerSnapshot s;
