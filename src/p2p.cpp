@@ -1356,7 +1356,7 @@ static inline uint32_t be(uint8_t a, uint8_t b, uint8_t c, uint8_t d){
 }
 bool P2P::ipv4_is_public(uint32_t be_ip){
     uint8_t A = uint8_t(be_ip>>24), B = uint8_t(be_ip>>16);
-    uint8_t C = uint8_t(be_ip>>8),  D = uint8_t(be_ip>>0);
+    uint8_t C = uint8_t(be_ip>>8),  D MIQ_MAYBE_UNUSED = uint8_t(be_ip>>0);
     if (A == 0 || A == 10 || A == 127) return false;
     if (A == 169 && B == 254) return false;
     if (A == 192 && B == 168) return false;
@@ -2558,7 +2558,7 @@ void P2P::loop(){
                             dead.push_back(s);
                             break;
                         }
-if MIQ_ENABLE_HEADERS_FIRST
+#if MIQ_ENABLE_HEADERS_FIRST
                         {
                             std::vector<std::vector<uint8_t>> locator;
                             chain_.build_locator(locator);
