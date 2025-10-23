@@ -553,6 +553,9 @@ static inline void rx_clear_start(Sock fd){
     g_rx_started_ms.erase(fd);
 }
 
+namespace {
+  static inline void schedule_close(Sock s);
+}
 // --- small Windows-safe send/recv helpers -----------------------------------
 // Hardened: loop on partial sends
 static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
@@ -2835,10 +2838,7 @@ void P2P::loop(){
                         ps.whitelisted = is_loopback(ps.ip) || is_whitelisted_ip(ps.ip);
                         // Now that we have their verack, try to finish handshake if version already processed.
                           try_finish_handshake();
-
-                        } else if (cmd == "version") {
-                          try_finish_handshake();
-
+                      
                     } else if (cmd == "ping") {
                         auto pong = encode_msg("pong", m.payload);
                         (void)send_or_close(s, pong);
@@ -2896,8 +2896,12 @@ void P2P::loop(){
                             ps.inflight_blocks.erase(bh);
                             g_inflight_block_ts[(Sock)s].erase(bh);
                             handle_incoming_block(s, m.payload);
+                            if (ps.syncing) {
+                                ps.next_index = chain_.height() + 1;
+                                request_block_index(ps, ps.next_index);
+                            }
                         }
-
+                      
                     } else if (cmd == "invtx") {
                         if (!check_rate(ps, "inv", 0.25, now_ms())) {
                             bump_ban(ps, ps.ip, "inv-flood", now_ms());
@@ -3177,10 +3181,15 @@ void P2P::loop(){
                         P2P_TRACE("close pong-timeout");
                         dead.push_back(s);
                     } else {
-                        // loopback: clear awaiting state but keep the socket
                         ps.awaiting_pong = false;
                         ps.last_ping_ms = tnow;
                     }
+                }
+            }
+            if (ps.syncing) {
+                if ((tnow - g_last_progress_ms) > (int64_t)MIQ_P2P_STALL_RETRY_MS) {
+                    ps.syncing = false;
+                    log_info("[IBD] index phase complete; at tip");
                 }
             }
         }
