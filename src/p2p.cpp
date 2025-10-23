@@ -276,6 +276,7 @@
   #endif
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #include <mstcpip.h>
   #pragma comment(lib, "Ws2_32.lib")
   using Sock   = SOCKET;
   using PollFD = WSAPOLLFD;
@@ -295,6 +296,45 @@
   #define MIQ_INVALID_SOCK (-1)
   #define CLOSESOCK(s) close(s)
 #endif
+
+static inline void miq_set_cloexec(Sock s) {
+#ifndef _WIN32
+    int flags = fcntl(s, F_GETFD, 0);
+    if (flags >= 0) (void)fcntl(s, F_SETFD, flags | FD_CLOEXEC);
+#else
+    (void)s; // no CLOEXEC on winsock
+#endif
+}
+
+static inline void miq_set_keepalive(Sock s) {
+    int one = 1;
+    (void)setsockopt(s, SOL_SOCKET, SO_KEEPALIVE,
+                     reinterpret_cast<const char*>(&one), sizeof(one));
+#ifdef _WIN32
+    // 60s idle, then 15s interval, 4 probes
+    tcp_keepalive ka;
+    ka.onoff = 1;
+    ka.keepalivetime = 60 * 1000;
+    ka.keepaliveinterval = 15 * 1000;
+    DWORD ret = 0;
+    (void)WSAIoctl(s, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &ret, nullptr, nullptr);
+#else
+    // Linux: TCP_KEEPIDLE/TCP_KEEPINTVL/TCP_KEEPCNT ; macOS/BSD: TCP_KEEPALIVE seconds
+    int v;
+#  if defined(TCP_KEEPIDLE)
+    v = 60;  (void)setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE,  &v, sizeof(v));
+#  endif
+#  if defined(TCP_KEEPINTVL)
+    v = 15;  (void)setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &v, sizeof(v));
+#  endif
+#  if defined(TCP_KEEPCNT)
+    v = 4;   (void)setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT,   &v, sizeof(v));
+#  endif
+#  if defined(__APPLE__) && defined(TCP_KEEPALIVE)
+    v = 60;  (void)setsockopt(s, IPPROTO_TCP, TCP_KEEPALIVE, &v, sizeof(v));
+#  endif
+#endif
+}
 
 // ----- IPv6/IPv4 literal + hostname resolver (drop-in, no new files) -------
 struct MiqEndpoint {
@@ -516,6 +556,8 @@ static inline void rx_clear_start(Sock fd){
 static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
     if (!data || len == 0) return true;
     size_t sent = 0;
+    const int kMaxSpinMs = 2000; // upper bound total wait per call
+    int waited_ms = 0;
     while (sent < len) {
 #ifdef _WIN32
         int n = send(s, reinterpret_cast<const char*>(data + sent), (int)std::min<size_t>(INT32_MAX, len - sent), 0);
@@ -523,7 +565,8 @@ static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
             int e = WSAGetLastError();
             if (e == WSAEWOULDBLOCK) {
                 WSAPOLLFD pfd{}; pfd.fd = s; pfd.events = POLLWRNORM; pfd.revents = 0;
-                (void)WSAPoll(&pfd, 1, 10);
+                int rc = WSAPoll(&pfd, 1, 10);
+                if (rc <= 0 && (waited_ms += 10) >= kMaxSpinMs) return false;
                 continue;
             }
             char buf[96]; sprintf_s(buf, "send() failed WSAE=%d", e);
@@ -538,7 +581,8 @@ static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 struct pollfd pfd{ s, POLLOUT, 0 };
-                (void)::poll(&pfd, 1, 10);
+                int rc = ::poll(&pfd, 1, 10);
+                if (rc <= 0 && (waited_ms += 10) >= kMaxSpinMs) return false;
                 continue;
             }
             miq::log_warn("P2P: send() failed");
@@ -663,6 +707,7 @@ static Sock miq_connect_nb(const sockaddr* sa, socklen_t slen, int timeout_ms) {
     Sock s = socket(sa->sa_family, SOCK_STREAM, 0);
 #endif
     if (s == MIQ_INVALID_SOCK) return MIQ_INVALID_SOCK;
+    miq_set_cloexec(s);
     (void)miq_set_nonblock(s);
     (void)miq_set_nodelay(s);
 
@@ -694,6 +739,7 @@ static Sock miq_connect_nb(const sockaddr* sa, socklen_t slen, int timeout_ms) {
         if (soerr != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
     }
 #endif
+    miq_set_keepalive(s);
     return s;
 }
 static inline int64_t seed_backoff_base_ms(){
@@ -1294,6 +1340,7 @@ static Sock create_server(uint16_t port){
     Sock s = socket(AF_INET, SOCK_STREAM, 0);
 #endif
     if (s == MIQ_INVALID_SOCK) return MIQ_INVALID_SOCK;
+    miq_set_cloexec(s);
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_ANY); a.sin_port = htons(port);
     int yes = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
@@ -1303,7 +1350,6 @@ static Sock create_server(uint16_t port){
     if (bind(s, (sockaddr*)&a, sizeof(a)) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
     if (listen(s, SOMAXCONN) != 0) { CLOSESOCK(s); return MIQ_INVALID_SOCK; }
     (void)miq_set_nonblock(s);
-    (void)miq_set_nodelay(s);
     return s;
 }
 static Sock create_server_v6(uint16_t port){
@@ -1313,6 +1359,7 @@ static Sock create_server_v6(uint16_t port){
     Sock s = socket(AF_INET6, SOCK_STREAM, 0);
 #endif
     if (s == MIQ_INVALID_SOCK) return MIQ_INVALID_SOCK;
+    miq_set_cloexec(s);
     int yes = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
 #ifdef _WIN32
@@ -1673,6 +1720,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
         gate_set_loopback(s, is_loopback_be(be_ip));
     }
 
+    miq_set_keepalive(s);
     auto msg = encode_msg("version", miq_build_version_payload());
     (void)miq_send(s, msg);
 
@@ -2215,6 +2263,7 @@ void P2P::loop(){
 
                                 log_info("P2P: outbound to known " + ps.ip);
                                 gate_on_connect(s);
+                                miq_set_keepalive(s);
                                 gate_set_loopback(s, is_loopback_be(pick));
                                 auto msg = encode_msg("version", miq_build_version_payload());
                                 (void)miq_send(s, msg);
@@ -2250,6 +2299,7 @@ void P2P::loop(){
                                     g_trickle_last_ms[s] = 0;
                                     log_info("P2P: feeler " + dotted);
                                     gate_on_connect(s);
+                                    miq_set_keepalive(s);
                                     gate_set_loopback(s, is_loopback_be(be_ip));
                                     auto msg = encode_msg("version", miq_build_version_payload());
                                     (void)miq_send(s, msg);
@@ -2356,6 +2406,8 @@ void P2P::loop(){
                 } else {
                     (void)miq_set_nonblock(c);
                     (void)miq_set_nodelay(c);
+                    miq_set_cloexec(c);
+                    miq_set_keepalive(c);
                     int64_t tnow = now_ms();
                     if (tnow - inbound_win_start_ms_ > 60000) {
                         inbound_win_start_ms_ = tnow;
@@ -2400,6 +2452,8 @@ void P2P::loop(){
                 } else {
                     (void)miq_set_nonblock(c);
                     (void)miq_set_nodelay(c);
+                    miq_set_cloexec(c);
+                    miq_set_keepalive(c);
                     int64_t tnow = now_ms();
                     if (tnow - inbound_win_start_ms_ > 60000) {
                         inbound_win_start_ms_ = tnow;
@@ -2824,19 +2878,7 @@ void P2P::loop(){
                             chain_.get_headers_from_locator(loc_rev, 2000, hs2);
                             if (!hs2.empty()) hs.swap(hs2);
                         }
-
-                        if (!hs.empty()) {
-                            bool stop_is_nonzero = false;
-                            for (auto b : stop) { if (b) { stop_is_nonzero = true; break; } }
-                            if (stop_is_nonzero) {
-                                size_t keep = hs.size();
-                                for (size_t i=0;i<hs.size();++i){
-                                    // Best-effort: if next header links to 'stop', don't go past it.
-                                    if (hs[i].prev_hash == stop) { keep = i; break; }
-                                }
-                                if (keep < hs.size()) hs.resize(keep);
-                            }
-                        }
+                      
                         auto out = build_headers_payload(hs);
                         auto msg = encode_msg("headers", out);
                         (void)miq_send(s, msg);
