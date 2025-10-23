@@ -74,9 +74,9 @@
 #  endif
 #endif
 
-+#ifndef MIQ_TRY_HEADERS_ANYWAY
-+#define MIQ_TRY_HEADERS_ANYWAY 1
-+#endif
+#ifndef MIQ_TRY_HEADERS_ANYWAY
+#define MIQ_TRY_HEADERS_ANYWAY 1
+#endif
 
 // ===== STRICT FILTER PROFILE (central knobs) ================================
 #ifndef MIQ_FILTER_PROFILE_STRICT
