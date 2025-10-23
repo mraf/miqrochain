@@ -1105,7 +1105,7 @@ static bool is_self_endpoint(Sock fd, uint16_t listen_port){
         (void)l;
 
         // explicit: loopback inbound is allowed; only reject if hairpin on same port
-        if ((ntohl(peer_be) >> 24) == 127) {
+        if (is_loopback_be(peer_be)) {
             if (peer_port == listen_port) return true;
             return false;
         }
@@ -2449,21 +2449,32 @@ void P2P::loop(){
                 auto m_n  = encode_msg("getheaders", pl_n);
                 auto m_f  = encode_msg("getheaders", pl_f);
                 int probes = 0;
-                std::vector<std::pair<Sock,PeerState>> snapshot;
+                // Snapshot just the sockets; update real PeerState under lock.
+                std::vector<Sock> snapshot;
                 {
                     std::lock_guard<std::mutex> lk2(g_peers_mu);
-                    for (auto& kv : peers_) snapshot.push_back(kv);
+                    snapshot.reserve(peers_.size());
+                    for (auto& kv : peers_) snapshot.push_back(kv.first);
                 }
-                for (auto& kvp : snapshot) {
-                    auto& kv = kvp;
-                    if (kv.second.verack_ok &&
-                        can_accept_hdr_batch(kv.second, now_ms()) &&
-                        check_rate(kv.second, "hdr", 1.0, now_ms())) {
-                        kv.second.sent_getheaders = true;
-                        const bool flip = g_hdr_flip[kv.first];
-                        (void)send_or_close(kv.first, flip ? m_f : m_n);
-                        kv.second.inflight_hdr_batches++;
-                        g_last_hdr_req_ms[kv.first] = now_ms();
+                for (Sock sd : snapshot) {
+                    bool do_send = false;
+                    bool flip = false;
+                    {
+                        std::lock_guard<std::mutex> lk2(g_peers_mu);
+                        auto itp = peers_.find(sd);
+                        if (itp != peers_.end() &&
+                            itp->second.verack_ok &&
+                            can_accept_hdr_batch(itp->second, now_ms()) &&
+                            check_rate(itp->second, "hdr", 1.0, now_ms())) {
+                            itp->second.sent_getheaders = true;
+                            itp->second.inflight_hdr_batches++;
+                            g_last_hdr_req_ms[sd] = now_ms();
+                            flip = g_hdr_flip[sd];
+                            do_send = true;
+                        }
+                    }
+                    if (do_send) {
+                        (void)send_or_close(sd, flip ? m_f : m_n);
                         if (++probes >= 2) break;
                     }
                 }
@@ -2569,7 +2580,7 @@ void P2P::loop(){
 #ifdef _WIN32
         int rc = WSAPoll(fds.data(), (ULONG)fds.size(), 200);
 #else
-        int rc = poll(fds.data(), fds.size(), 200);
+        int rc = poll(fds.data(), (nfds_t)fds.size(), 200);
 #endif
         if (rc < 0) continue;
         {
