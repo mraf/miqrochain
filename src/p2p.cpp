@@ -2425,7 +2425,7 @@ void P2P::loop(){
                         can_accept_hdr_batch(kv.second, now_ms()) &&
                         check_rate(kv.second, "hdr", 1.0, now_ms())) {
                         kv.second.sent_getheaders = true;
-                        (void)miq_send(kv.first, m);
+                        (void)send_or_close(kv.first, m);
                         kv.second.inflight_hdr_batches++;
                         g_last_hdr_req_ms[kv.first] = now_ms();
                         if (++probes >= 2) break;
@@ -2736,6 +2736,49 @@ void P2P::loop(){
                         return true;
                     };
 
+                    // --- NEW: finish-handshake helper (idempotent) -----------
+                    auto try_finish_handshake = [&](){
+                        auto itg2 = g_gate.find(s);
+                        if (itg2 == g_gate.end()) return;
+                        auto& gg = itg2->second;
+                        if (ps.verack_ok) return;
+                        if (!(gg.got_version && gg.got_verack && gg.sent_verack)) return;
+
+                        ps.verack_ok = true;
+
+#if MIQ_ENABLE_HEADERS_FIRST
+                        const bool peer_supports_headers = (ps.features & (1ull<<0)) != 0;
+                        if (peer_supports_headers) {
+                            std::vector<std::vector<uint8_t>> locator;
+                            chain_.build_locator(locator);
+                            std::vector<uint8_t> stop(32, 0);
+                            auto pl2 = build_getheaders_payload(locator, stop);
+                            auto m2  = encode_msg("getheaders", pl2);
+                            if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms())) {
+                                ps.sent_getheaders = true;
+                                (void)send_or_close(s, m2);
+                                ps.inflight_hdr_batches++;
+                                g_last_hdr_req_ms[(Sock)s] = now_ms();
+                                ps.last_hdr_batch_done_ms  = now_ms();
+                            }
+                            if (!g_logged_headers_started) { g_logged_headers_started = true; log_info("[IBD] headers phase started"); }
+                        } else
+#endif
+                        {
+                            ps.syncing = true;
+                            ps.next_index = chain_.height() + 1;
+                            request_block_index(ps, ps.next_index);
+                        }
+
+                        // Ask for addresses + publish our fee filter
+                        maybe_send_getaddr(ps);
+                        uint64_t mrf = local_min_relay_kb();
+                        std::vector<uint8_t> plff(8);
+                        for (int i=0;i<8;i++) plff[i] = (uint8_t)((mrf >> (8*i)) & 0xFF);
+                        auto ff = encode_msg("feefilter", plff);
+                        (void)send_or_close(s, ff);
+                    };
+
                     if (cmd == "version") {
                         int32_t peer_ver = 0; uint64_t peer_services = 0;
                         if (m.payload.size() >= 4) {
@@ -2751,22 +2794,27 @@ void P2P::loop(){
                             dead.push_back(s);
                             break;
                         }
-                        if ((ps.features & required_features_mask_) != required_features_mask_) {
-                            log_warn(std::string("P2P: dropping peer missing required features ") + ps.ip);
-                            dead.push_back(s);
-                            break;
+                        {
+                            // Soften feature mask: allow peers missing only the headers-first bit.
+                            uint64_t missing = required_features_mask_ & ~ps.features;
+                            if (missing) {
+                                const uint64_t HDR_BIT = (1ull<<0);
+                                if ((missing & ~HDR_BIT) != 0) {
+                                    log_warn(std::string("P2P: dropping peer missing required features ") + ps.ip);
+                                    dead.push_back(s);
+                                    break;
+                                }
+                            }
                         }
+
+                        // If their verack already arrived earlier, we can finish now.
+                        try_finish_handshake();
 
                     } else if (cmd == "verack") {
                         auto itg = g_gate.find(s);
                         if (itg != g_gate.end()) {
                             itg->second.got_verack = true; // (already set in gate, but idempotent)
                             itg->second.hs_last_ms = now_ms();
-                            if (ps.version > 0 &&
-                                ( (ps.features & required_features_mask_) == required_features_mask_ ) &&
-                                itg->second.sent_verack) {
-                                ps.verack_ok = true;
-                            }
                         }
                         g_preverack_counts.erase(s);
 #if MIQ_ENABLE_ADDRMAN
@@ -2778,50 +2826,8 @@ void P2P::loop(){
                         }
 #endif
                         ps.whitelisted = is_loopback(ps.ip) || is_whitelisted_ip(ps.ip);
-
-#if MIQ_ENABLE_HEADERS_FIRST
-                        {
-                            const bool peer_supports_headers = (ps.features & (1ull<<0)) != 0;
-                        if (peer_supports_headers) {
-                            {
-                                std::vector<std::vector<uint8_t>> locator;
-                                chain_.build_locator(locator);
-                                std::vector<uint8_t> stop(32, 0);
-                                auto pl = build_getheaders_payload(locator, stop);
-                                auto msg = encode_msg("getheaders", pl);
-                                if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms())) {
-                                    ps.sent_getheaders = true;
-                                    (void)send_or_close(s, msg);
-                                    ps.inflight_hdr_batches++;
-                                    g_last_hdr_req_ms[(Sock)s] = now_ms();
-                                    ps.last_hdr_batch_done_ms = now_ms(); // start watchdog window even if no reply yet
-                                }
-                            }
-
-                            if (!g_logged_headers_started) {
-                                g_logged_headers_started = true;
-                                log_info("[IBD] headers phase started");
-                            }
-                        } else {
-                            // Peer lacks headers-first capability: fall back to by-index immediately
-                            ps.syncing = true;
-                            ps.next_index = chain_.height() + 1;
-                            request_block_index(ps, ps.next_index);
-                        }
-#else
-                        ps.syncing = true;
-                        ps.next_index = chain_.height() + 1;
-                        request_block_index(ps, ps.next_index);
-#endif
-                        maybe_send_getaddr(ps);
-
-                        {
-                            uint64_t mrf = local_min_relay_kb();
-                            std::vector<uint8_t> pl(8);
-                            for(int i=0;i<8;i++) pl[i] = (uint8_t)((mrf >> (8*i)) & 0xFF);
-                            auto ff = encode_msg("feefilter", pl);
-                            (void)send_or_close(s, ff);
-                        }
+                        // Now that we have their verack, try to finish handshake if version already processed.
+                        try_finish_handshake();
 
                     } else if (cmd == "ping") {
                         auto pong = encode_msg("pong", m.payload);
@@ -3021,7 +3027,7 @@ void P2P::loop(){
                       
                         auto out = build_headers_payload(hs);
                         auto msg = encode_msg("headers", out);
-                        (void)miq_send(s, msg);
+                        (void)send_or_close(s, msg);
 
                     } else if (cmd == "headers") {
                         std::vector<BlockHeader> hs;
@@ -3147,7 +3153,7 @@ void P2P::loop(){
             if (ps.verack_ok) {
                 if (!ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PING_EVERY_MS) {
                     auto ping = encode_msg("ping", {});
-                    (void)miq_send(s, ping);
+                    (void)send_or_close(s, ping);
                     ps.last_ping_ms = tnow;
                     ps.awaiting_pong = true;
                 } else if (ps.awaiting_pong) {
@@ -3218,7 +3224,7 @@ void P2P::loop(){
             for (const auto& h : todo) {
                 auto m = encode_msg("invb", h);
                 for (auto& kv : peers_) {
-                    (void)miq_send(kv.first, m);
+                    (void)send_or_close(kv.first, m);
                 }
             }
         }
