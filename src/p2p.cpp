@@ -1908,7 +1908,8 @@ static void trickle_flush(){
 void P2P::request_tx(PeerState& ps, const std::vector<uint8_t>& txid){
     if (txid.size()!=32) return;
     if (!check_rate(ps, "get", 1.0, now_ms())) return;
-    if (ps.inflight_tx.size() >= caps_.max_txs) return;
+    const size_t max_inflight_tx = caps_.max_txs ? caps_.max_txs : (size_t)128;
+    if (ps.inflight_tx.size() >= max_inflight_tx) return;
     auto m = encode_msg("gettx", txid);
     (void)miq_send(ps.sock, m);
     ps.inflight_tx.insert(hexkey(txid));
@@ -1935,8 +1936,9 @@ void P2P::request_block_index(PeerState& ps, uint64_t index){
 
 void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     if (h.size()!=32) return;
+    const size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : (size_t)32;
     if (!check_rate(ps, "get", 1.0, now_ms())) return;
-    if (ps.inflight_blocks.size() >= caps_.max_blocks) return;
+    if (ps.inflight_blocks.size() >= max_inflight_blocks) return;
     auto msg = encode_msg("getb", h);
     (void)miq_send(ps.sock, msg);
     ps.inflight_blocks.insert(hexkey(h));
@@ -2584,12 +2586,6 @@ void P2P::loop(){
                 int n = miq_recv(s, buf, sizeof(buf));
                 if (n <= 0) { P2P_TRACE("close read<=0"); dead.push_back(s); continue; }
 
-                if (gate_on_bytes(s, (size_t)n)) {
-                    P2P_TRACE("close RX over MAX_MSG_BYTES");
-                    dead.push_back(s);
-                    continue;
-                }
-
                 ps.last_ms = now_ms();
 
                 ps.rx.insert(ps.rx.end(), buf, buf + n);
@@ -2812,9 +2808,9 @@ void P2P::loop(){
                             if (!deser_block(m.payload, hb)) { if (++ps.mis > 10) { dead.push_back(s); } continue; }
                             const std::string bh = hexkey(hb.block_hash());
                             if (unsolicited_drop(ps, "block", bh)) {
-                                bump_ban(ps, ps.ip, "unsolicited-block", now_ms());
-                                continue;
-                            }
+                            // Polite ignore: unsolicited blocks are common during IBD on some impls.
+                            continue;
+                        }
                             ps.inflight_blocks.erase(bh);
                             handle_incoming_block(s, m.payload);
                         }
@@ -2856,9 +2852,9 @@ void P2P::loop(){
 
                         ps.inflight_tx.erase(key);
                         if (unsolicited_drop(ps, "tx", key)) {
-                            bump_ban(ps, ps.ip, "unsolicited-tx", now_ms());
-                            continue;
-                        }
+                        // Polite ignore: remote may proactively relay deps.
+                        continue;
+                    }
 
                         if (seen_txids_.insert(key).second) {
                             std::string err;
