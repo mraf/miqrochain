@@ -74,6 +74,10 @@
 #  endif
 #endif
 
++#ifndef MIQ_TRY_HEADERS_ANYWAY
++#define MIQ_TRY_HEADERS_ANYWAY 1
++#endif
+
 // ===== STRICT FILTER PROFILE (central knobs) ================================
 #ifndef MIQ_FILTER_PROFILE_STRICT
 #define MIQ_FILTER_PROFILE_STRICT 1
@@ -540,6 +544,7 @@ static std::unordered_map<Sock,
     std::unordered_map<std::string, std::pair<int64_t,uint32_t>>> g_cmd_rl;
 
 // Per-socket parse deadlines for partial frames
+static std::unordered_map<uint64_t,int64_t> g_last_idx_probe_ms;
 static std::unordered_map<Sock, int64_t> g_rx_started_ms;
 static inline void rx_track_start(Sock fd){
     if (g_rx_started_ms.find(fd)==g_rx_started_ms.end())
@@ -1183,8 +1188,12 @@ static inline bool can_accept_hdr_batch(miq::PeerState& ps, int64_t now) {
     if (last_req && (now - last_req) < kMinGapMs) return false;
     return true;
 }
-
-} // anon
+static inline std::string miq_idx_key(uint64_t idx) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "IDX_%016llx", (unsigned long long)idx);
+    return std::string(buf);
+}
+}
 
 namespace miq {
 
@@ -2824,7 +2833,8 @@ void P2P::loop(){
 
 #if MIQ_ENABLE_HEADERS_FIRST
                         const bool peer_supports_headers = (ps.features & (1ull<<0)) != 0;
-                        if (peer_supports_headers) {
+                        const bool try_headers = peer_supports_headers || (MIQ_TRY_HEADERS_ANYWAY != 0);
+                        if (try_headers) {
                             std::vector<std::vector<uint8_t>> locator;
                             chain_.build_locator(locator);
                             if (g_hdr_flip[(Sock)s]) {
@@ -3256,11 +3266,34 @@ void P2P::loop(){
             }
             if (ps.syncing) {
                 if ((tnow - g_last_progress_ms) > (int64_t)MIQ_P2P_STALL_RETRY_MS) {
-                    // No recent progress: re-request the same index instead of claiming we're at tip.
+                    // No recent progress on the index path: retry on *this* peer…
                     request_block_index(ps, ps.next_index);
-                    g_last_progress_ms = tnow;  // push the stall window forward
-                    log_info(std::string("[IBD] index phase stalled; retrying idx=")
-                             + std::to_string(ps.next_index));
+                    // …and (bounded) escalate to ONE additional peer to avoid
+                    // spinning forever on a single non-responsive node.
+                    const uint64_t idx = ps.next_index;
+                    const int64_t  last_probe = (g_last_idx_probe_ms.count(idx) ? g_last_idx_probe_ms[idx] : 0);
+                    if (tnow - last_probe > (int64_t)(MIQ_P2P_STALL_RETRY_MS / 2)) {
+                        std::vector<Sock> cands;
+                        cands.reserve(peers_.size());
+                        for (auto& kv2 : peers_) {
+                            if (kv2.first == s) continue;
+                            if (!kv2.second.verack_ok) continue;
+                            cands.push_back(kv2.first);
+                        }
+                        if (!cands.empty()) {
+                            Sock t = rr_pick_peer_for_key(miq_idx_key(idx), cands);
+                            if (t != MIQ_INVALID_SOCK) {
+                                auto itT = peers_.find(t);
+                                if (itT != peers_.end()) {
+                                    request_block_index(itT->second, idx);
+                                }
+                            }
+                        }
+                        g_last_idx_probe_ms[idx] = tnow;
+                    }
+                    g_last_progress_ms = tnow;  // move the stall window forward
+                    log_info(std::string("[IBD] index phase stalled; retried idx=")
+                             + std::to_string(ps.next_index) + " (escalation enabled)");
                 }
             }
         }
