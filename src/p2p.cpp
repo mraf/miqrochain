@@ -2341,6 +2341,7 @@ void P2P::loop(){
                         { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
                         g_trickle_last_ms[s] = 0;
                         log_info("P2P: outbound (addrman) " + ps.ip);
+                        miq_set_keepalive(s);
                         gate_on_connect(s);
                         gate_set_loopback(s, is_loopback_be(be_ip));
                         auto msg = encode_msg("version", miq_build_version_payload());
@@ -2491,6 +2492,41 @@ void P2P::loop(){
                 g_next_stall_probe_ms = tnow + MIQ_P2P_STALL_RETRY_MS;
             }
         }
+
+        // === Long-running block fetch watchdog & reassignment ===============
+        {
+          const int64_t tnow = now_ms();
+          const int64_t block_to_ms = 2 * MIQ_P2P_STALL_RETRY_MS;
+          std::vector<std::pair<Sock,std::string>> expired;
+          for (auto& bySock : g_inflight_block_ts) {
+            for (auto& kv : bySock.second) {
+              if (tnow - kv.second > block_to_ms) expired.emplace_back(bySock.first, kv.first);
+            }
+          }
+          for (auto& e : expired) {
+            Sock s_exp = e.first; const std::string& k = e.second;
+            auto itp = peers_.find(s_exp);
+            if (itp != peers_.end()) itp->second.inflight_blocks.erase(k);
+            g_inflight_block_ts[s_exp].erase(k);
+            // hex -> raw 32B
+            auto hexv = [](char c)->int{ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return 10+(c-'a'); if(c>='A'&&c<='F')return 10+(c-'A'); return 0; };
+            std::vector<uint8_t> h(32);
+            for (size_t i=0;i<32;i++) h[i] = (uint8_t)((hexv(k[2*i])<<4)|(hexv(k[2*i+1])));
+            // pick another peer (verack_ok preferred)
+            std::vector<Sock> cands;
+            for (auto& kv2 : peers_) if (kv2.first!=s_exp && kv2.second.verack_ok) cands.push_back(kv2.first);
+            if (cands.empty()) { for (auto& kv2:peers_) if (kv2.first!=s_exp) cands.push_back(kv2.first); }
+            if (!cands.empty()) {
+              // Round-robin per-hash for fairness
+              static std::unordered_map<std::string,size_t> rr;
+              size_t &i = rr[k]; if (i >= cands.size()) i %= cands.size();
+              Sock t = cands[i]; i = (i+1) % cands.size();
+              auto itT = peers_.find(t);
+              if (itT != peers_.end()) request_block_hash(itT->second, h);
+            }
+          }
+        }
+        
         // === NEW: timeout & retry for inflight blocks =======================
         {
           const int64_t tnow = now_ms();
@@ -2740,7 +2776,10 @@ void P2P::loop(){
             if (ready) {
                 uint8_t buf[65536];
                 int n = miq_recv(s, buf, sizeof(buf));
-                if (n <= 0) { P2P_TRACE("close read<=0"); dead.push_back(s); continue; }
+                if (n <= 0) {
+                    if (n < 0) { P2P_TRACE("close read<0"); dead.push_back(s); }
+                    continue;
+                }
 
                 ps.last_ms = now_ms();
 
@@ -2759,7 +2798,6 @@ void P2P::loop(){
                     size_t off_before = off;
                     bool ok = decode_msg(ps.rx, off, m);
                     if (!ok) break;
-
                     // FIXED: only drop if decoder made no forward progress (0 bytes).
                     size_t advanced = (off > off_before) ? (off - off_before) : 0;
                     if (advanced == 0) {
@@ -2884,15 +2922,11 @@ void P2P::loop(){
                             break;
                         }
                         {
-                            // Soften feature mask: allow peers missing only the headers-first bit.
                             uint64_t missing = required_features_mask_ & ~ps.features;
-                            if (missing) {
-                                const uint64_t HDR_BIT = (1ull<<0);
-                                if ((missing & ~HDR_BIT) != 0) {
-                                    log_warn(std::string("P2P: dropping peer missing required features ") + ps.ip);
-                                    dead.push_back(s);
-                                    break;
-                                }
+                            const uint64_t HDR_BIT = (1ull<<0);
+                            if ((missing & ~HDR_BIT) != 0) {
+                                log_warn(std::string("P2P: dropping peer missing required features ") + ps.ip);
+                                dead.push_back(s); break;
                             }
                         }
                       
@@ -3107,8 +3141,6 @@ void P2P::loop(){
                         // Try native orientation first (BE as our chain stores it).
                         std::vector<BlockHeader> hs;
                         chain_.get_headers_from_locator(locator, 2000, hs);
-
-                        // **Bulletproof fix**: if no progress, retry with each 32B hash reversed (LE<->BE)
                         if (hs.empty() && !locator.empty()) {
                             std::vector<std::vector<uint8_t>> loc_rev = locator;
                             for (auto& h : loc_rev) std::reverse(h.begin(), h.end());
@@ -3255,12 +3287,13 @@ void P2P::loop(){
                 } else if (ps.awaiting_pong) {
                     int64_t eff_pong_timeout = MIQ_P2P_PONG_TIMEOUT_MS * ((ps.syncing || !g_logged_headers_done) ? 3 : 1);
                     if ((tnow - ps.last_ping_ms) > eff_pong_timeout) {
-                    if (!is_lb) {
-                        P2P_TRACE("close pong-timeout");
-                        dead.push_back(s);
-                    } else {
-                        ps.awaiting_pong = false;
-                        ps.last_ping_ms = tnow;
+                        if (!is_lb) {
+                            P2P_TRACE("close pong-timeout");
+                            dead.push_back(s);
+                        } else {
+                            ps.awaiting_pong = false;
+                            ps.last_ping_ms = tnow;
+                        }
                     }
                 }
             }
