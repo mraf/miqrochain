@@ -160,7 +160,7 @@ static int                  lock_fd{-1};
 #endif
 }
 
-+static std::atomic<bool> g_we_are_seed{false};
+static std::atomic<bool> g_we_are_seed{false};
 
 // time helpers
 static inline uint64_t now_ms() {
