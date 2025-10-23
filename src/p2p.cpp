@@ -3057,7 +3057,7 @@ void P2P::loop(){
         }
     }
 #endif
-
+    }
 std::vector<PeerSnapshot> P2P::snapshot_peers() const {
     std::vector<PeerSnapshot> out;
     out.reserve(peers_.size());
