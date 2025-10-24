@@ -149,8 +149,11 @@
 #  endif
 #endif
 
+#ifdef MIQ_FALLBACK_MAX_MSG_SIZE
+#undef MIQ_FALLBACK_MAX_MSG_SIZE
+#endif
 #ifndef MAX_MSG_SIZE
-#define MIQ_FALLBACK_MAX_MSG_SIZE (64u * 1024u * 1024u)
+#define MIQ_FALLBACK_MAX_MSG_SIZE (64u * 1024u * 1024u)   /* raise soft RX buf default to 64 MiB */
 #else
 #define MIQ_FALLBACK_MAX_MSG_SIZE (MAX_MSG_SIZE)
 #endif
@@ -713,7 +716,7 @@ static inline int miq_outbound_target(){
     return g_seed_mode ? MIQ_SEED_MODE_OUTBOUND_TARGET : MIQ_OUTBOUND_TARGET;
 }
 
-static bool unsolicited_drop(miq::PeerState& ps, const char* what, const std::string& keyHex){
+static MIQ_MAYBE_UNUSED bool unsolicited_drop(miq::PeerState& ps, const char* what, const std::string& keyHex){
     (void)what; (void)keyHex;
     if (!ps.verack_ok) return true;
     // During IBD, accept only if inflight has an entry for this object
