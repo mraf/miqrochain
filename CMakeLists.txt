@@ -180,6 +180,7 @@ set(MIQ_CORE_SOURCES_NO_NAT
     src/wallet_store.h src/wallet_store.cpp
     src/reindex_utxo.h
     src/reindex_utxo.cpp
+    src/ensure_utxo_reindex.cpp
     src/constants.h
     src/config.h src/config.cpp
     src/log.h src/log.cpp
