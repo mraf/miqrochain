@@ -3329,10 +3329,12 @@ void P2P::loop(){
                              + std::to_string(ps.next_index) + " (escalation enabled)");
                 }
             }
-        }
 #if MIQ_ENABLE_HEADERS_FIRST
-            if (ps.sent_getheaders && ps.inflight_hdr_batches > 0 &&
-                (tnow - ps.last_hdr_batch_done_ms) > (int64_t)MIQ_P2P_STALL_RETRY_MS * 2) {
+            if (ps.sent_getheaders &&
+                ps.inflight_hdr_batches > 0 &&
+                (tnow - ps.last_hdr_batch_done_ms) >
+                    (int64_t)MIQ_P2P_STALL_RETRY_MS * 2) {
+                // Header pipeline appears stuck; fall back to by-index sync for this peer.
                 ps.inflight_hdr_batches = 0;
                 ps.sent_getheaders = false;
                 ps.syncing = true;
@@ -3417,7 +3419,7 @@ void P2P::loop(){
         }
     }
 #endif
-    }
+  
 std::vector<PeerSnapshot> P2P::snapshot_peers() const {
     std::vector<PeerSnapshot> out;
     out.reserve(peers_.size());
