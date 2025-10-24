@@ -722,6 +722,10 @@ static inline int miq_outbound_target(){
     return g_seed_mode ? MIQ_SEED_MODE_OUTBOUND_TARGET : MIQ_OUTBOUND_TARGET;
 }
 
+namespace {
+extern std::unordered_set<std::string> g_global_inflight_blocks;
+}
+
 static MIQ_MAYBE_UNUSED bool unsolicited_drop(miq::PeerState& ps, const char* what, const std::string& keyHex){
     (void)what; (void)keyHex;
     if (!ps.verack_ok) return true;
@@ -785,7 +789,7 @@ namespace {
 }
 
 namespace {
-  static std::unordered_set<std::string> g_global_inflight_blocks; // any peer -> requested block-hash
+  std::unordered_set<std::string> g_global_inflight_blocks; // any peer -> requested block-hash
 }
 
 namespace {
