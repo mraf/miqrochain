@@ -175,7 +175,8 @@
 #define MIQ_P2P_BAD_PEER_MAX_STALLS 3           /* disconnect peers that stall repeatedly */
 #endif
 #ifndef MIQ_HEADERS_EMPTY_LIMIT
-#define MIQ_HEADERS_EMPTY_LIMIT 3        
+#define MIQ_HEADERS_EMPTY_LIMIT 3
+#endif
 
 #ifndef MIQ_RATE_BLOCK_BPS
 #define MIQ_RATE_BLOCK_BPS (1024u * 1024u)
@@ -1625,7 +1626,6 @@ static Sock g_srv6_ = MIQ_INVALID_SOCK;
 bool P2P::start(uint16_t port){
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
-#endif
 #endif
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
@@ -3244,7 +3244,6 @@ void P2P::loop(){
                                     ps.next_index = chain_.height() + 1;
                                     request_block_index(ps, ps.next_index);
                                 }
-                            } else {
                                 g_zero_hdr_batches[s] = 0;
                             }
                         }
