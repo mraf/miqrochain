@@ -50,7 +50,8 @@
 #define MIQ_SEED_MODE_OUTBOUND_TARGET 1
 #endif
 #ifndef MIQ_IBD_FALLBACK_AFTER_MS
-#define MIQ_IBD_FALLBACK_AFTER_MS (10*60*1000)  /* 10 minutes without headers progress -> index fallback */
+#define MIQ_IBD_FALLBACK_AFTER_MS (5 * 60 * 1000)
+#endif
 #ifndef MIQ_P2P_TRACE
 #define MIQ_P2P_TRACE 1
 #endif
