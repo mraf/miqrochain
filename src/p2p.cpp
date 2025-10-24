@@ -153,9 +153,15 @@
 #undef MIQ_FALLBACK_MAX_MSG_SIZE
 #endif
 #ifndef MAX_MSG_SIZE
-#define MIQ_FALLBACK_MAX_MSG_SIZE (64u * 1024u * 1024u)   /* raise soft RX buf default to 64 MiB */
+#define MIQ_FALLBACK_MAX_MSG_SIZE (64u * 1024u * 1024u)
 #else
 #define MIQ_FALLBACK_MAX_MSG_SIZE (MAX_MSG_SIZE)
+#endif
+
+#ifdef __has_include
+#  if __has_include("constants.h")
+#    include "constants.h"
+#  endif
 #endif
 
 #ifndef MAX_BLOCK_SIZE
