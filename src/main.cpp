@@ -1506,14 +1506,22 @@ private:
                 if (!ibd_seed_host_.empty()) meta << "  seed: " << ibd_seed_host_ << "   ";
                 meta << "stage: " << (ibd_stage_.empty() ? "discovering" : ibd_stage_);
                 left.push_back(meta.str());
+                if (ibd_target_ > ibd_cur_) {
                 int bw = std::max(10, leftw - 20);
-                double frac = (ibd_target_ ? std::min(1.0, (double)ibd_cur_ / (double)ibd_target_) : 0.0);
+                double frac = std::min(1.0, (ibd_target_ ? (double)ibd_cur_ / (double)ibd_target_ : 0.0));
                 std::ostringstream p;
                 p << "  " << bar(bw, frac, vt_ok_, u8_ok_) << "  "
                   << ibd_cur_ << "/" << ibd_target_ << " blocks  ("
                   << std::fixed << std::setprecision(1) << (frac * 100.0) << "%)";
                 left.push_back(p.str());
-                std::ostringstream d; d << "  discovered from seed: " << ibd_discovered_;
+            } else {
+                // Facts only: show what we've actually found so far.
+                std::ostringstream p;
+                p << "  scanned so far: " << ibd_cur_ << " blocks";
+                left.push_back(p.str());
+            }
+            std::ostringstream d;
+            d << "  discovered from seed: " << ibd_discovered_;
                 if (ibd_done_) d << "   " << C_ok() << "complete" << C_reset();
                 left.push_back(d.str());
                 left.push_back("");
@@ -2004,6 +2012,21 @@ static inline bool path_exists_nonempty(const std::string& p){
          it != std::filesystem::directory_iterator(); ++it) return true;
     return false;
 }
+
+static bool should_enter_ibd_reason(Chain& chain, const std::string& datadir, std::string* why){
+    auto tell = [&](const char* s){ if (why) *why = s; };
+    // Fresh install / empty state: certainly need IBD.
+    if (!path_exists_nonempty(p_join(datadir, "blocks")) &&
+        !path_exists_nonempty(p_join(datadir, "chainstate"))) { tell("no local blocks/chainstate"); return true; }
+    // No blocks known yet (only genesis): need headers/blocks.
+    if (chain.height() == 0) { tell("no headers/blocks yet"); return true; }
+    // Stale tip: need a catch-up IBD.
+    if (!tip_fresh_enough(chain)) { tell("tip too old"); return true; }
+    // Otherwise we are synced enough — skip IBD.
+    tell("up to date");
+    return false;
+}
+
 static bool has_existing_blocks_or_state(const std::string& datadir){
     return path_exists_nonempty(p_join(datadir, "blocks")) ||
            path_exists_nonempty(p_join(datadir, "chainstate"));
@@ -2017,24 +2040,23 @@ static bool tip_fresh_enough(Chain& chain){
     const uint64_t fresh = std::max<uint64_t>(BLOCK_TIME_SECS * 3, 300);
     return age <= fresh;
 }
-// Decide whether to enter IBD:
-//  - New node (no blocks/chainstate) => yes
-//  - Height==0 => yes
-//  - Has some data but tip is stale => yes
-//  - Otherwise => skip (already synced enough)
 static bool should_enter_ibd(Chain& chain, const std::string& datadir){
-    if (chain.height() == 0) return true;
-    if (!has_existing_blocks_or_state(datadir)) return true;
-    if (!tip_fresh_enough(chain)) return true;
-    return false;
+    return should_enter_ibd_reason(chain, datadir, nullptr);
 }
 
 // Active IBD loop: try to reach a "synced" state (compute_sync_gate true).
 // Surfaces a concrete error if it can't finish.
 static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                              bool can_tui, TUI* tui, std::string& out_err){
-    // If we don't need IBD, we're done.
-    if (!should_enter_ibd(chain, datadir)) return true;
+    {
+        std::string reason;
+        if (!should_enter_ibd_reason(chain, datadir, &reason)) {
+            return true;
+        } else {
+            log_info(std::string("IBD: starting (reason: ") + reason + ")");
+            if (tui && can_tui) tui->set_banner(std::string("Initial block download — ") + reason);
+        }
+    }
     const bool we_are_seed = compute_seed_role().we_are_seed;
 
     if (!p2p) {
@@ -2093,7 +2115,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                 if (tui && can_tui) {
                     tui->set_banner(std::string("Connected to seed: ") + DNS_SEED);
                     tui->set_ibd_progress(chain.height(),
-                                          std::max(chain.height(), estimate_target_height_by_time(g_genesis_time_s.load())),
+                                          chain.height(),
                                           0, "headers", DNS_SEED, false);
                 }
             }
@@ -2143,23 +2165,17 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
 
             {
             uint64_t cur = chain.height();
-            uint64_t est_target = std::max<uint64_t>(cur, estimate_target_height_by_time(g_genesis_time_s.load()));
             uint64_t discovered = (cur >= height_at_seed_connect) ? (cur - height_at_seed_connect) : 0;
             const char* stage = (cur == 0 ? "headers" : "blocks");
             if (tui && can_tui) {
-                tui->set_ibd_progress(cur, est_target, discovered, stage, DNS_SEED, false);
+                tui->set_ibd_progress(cur, cur, discovered, stage, DNS_SEED, false);
             } else {
                 static uint64_t last_note_ms = 0;
                 if (now_ms() - last_note_ms > 2500) {
-                    double pct = (est_target ? (100.0 * (double)cur / (double)est_target) : 0.0);
-                    std::ostringstream oss;
-                    oss << std::fixed << std::setprecision(1) << pct;
-                    std::string pct_s = oss.str();
-                    log_info(std::string("[IBD] ") + stage + ": "
-                             + std::to_string(cur) + "/" + std::to_string(est_target)
-                             + "  ~" + pct_s + "%  discovered-from-seed="
-                             + std::to_string(discovered)
-                             + (we_are_seed ? "  (seed-mode: waiting for inbound peers)" : ""));
+                    log_info(std::string("[IBD] ") + stage + ": height="
+                              std::to_string(cur)
+                              "  discovered-from-seed=" + std::to_string(discovered)
+                              (we_are_seed ? "  (seed-mode: waiting for inbound peers)" : ""));
                     last_note_ms = now_ms();
                 }
             }
@@ -2189,8 +2205,10 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             }
             if (stable) {
             if (tui && can_tui) {
-                    tui->set_ibd_progress(chain.height(), std::max<uint64_t>(chain.height(), estimate_target_height_by_time(g_genesis_time_s.load())),
-                                          (chain.height() >= height_at_seed_connect ? (chain.height() - height_at_seed_connect) : 0), "complete", DNS_SEED, true);
+                    tui->set_ibd_progress(chain.height(),
+                                          chain.height(),
+                                          (chain.height() >= height_at_seed_connect ? (chain.height() - height_at_seed_connect) : 0),
+                                          "complete", DNS_SEED, true);
                 }
                 return true;
             }
@@ -2485,7 +2503,10 @@ int main(int argc, char** argv){
         // ─────────────────────────────────────────────────────────────────────
         // NEW STEP: IBD sync phase (smart start/finish, surfaces real error)
         // ─────────────────────────────────────────────────────────────────────
-        if (can_tui) tui.set_ibd_progress(chain.height(), std::max<uint64_t>(chain.height(), estimate_target_height_by_time(g_genesis_time_s.load())), 0, "headers", DNS_SEED, false);
+        if (can_tui) {
+            // Only show what is known at start; no estimated future height.
+            tui.set_ibd_progress(chain.height(), chain.height(), 0, "headers", DNS_SEED, false);
+        }
         if (can_tui) tui.mark_step_started("IBD sync phase");
         std::string ibd_err;
         bool ibd_ok = perform_ibd_sync(chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, &tui, ibd_err);
@@ -2634,7 +2655,7 @@ int main(int argc, char** argv){
             {
                 std::string why;
                 bool synced = compute_sync_gate(chain, &p2p, why);
-                tui.set_mining_gate(synced, synced ? "" : why);
+                if (can_tui) tui.set_mining_gate(synced, synced ? "" : why);
 
                 if (synced && miner_armed && !miner_spawned) {
                     // Start miner now
@@ -2698,8 +2719,8 @@ int main(int argc, char** argv){
 
         try {
             if (can_tui) tui.set_shutdown_phase("Stopping IBD/Seed sentinels...", false);
-            // Ensure background sentinels are stopped before miner watch
-            // (objects go out of scope here)
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            if (can_tui) tui.set_shutdown_phase("Stopping IBD/Seed sentinels...", true);
         } catch(...) { }
 
         try {
