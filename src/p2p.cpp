@@ -39,6 +39,18 @@
 #endif
 
 // ----- lightweight trace toggle ------------------------------------------------
+#ifndef MIQ_DEBUG_TRACE_NAMES
+#define MIQ_DEBUG_TRACE_NAMES 0
+#endif
+
+#ifndef MIQ_SEED_MODE_ENV
+#define MIQ_SEED_MODE_ENV "MIQ_IS_SEED"
+#endif
+#ifndef MIQ_SEED_MODE_OUTBOUND_TARGET
+#define MIQ_SEED_MODE_OUTBOUND_TARGET 1
+#endif
+#ifndef MIQ_IBD_FALLBACK_AFTER_MS
+#define MIQ_IBD_FALLBACK_AFTER_MS (10*60*1000)  /* 10 minutes without headers progress -> index fallback */
 #ifndef MIQ_P2P_TRACE
 #define MIQ_P2P_TRACE 1
 #endif
@@ -151,6 +163,18 @@
 #ifndef MIQ_P2P_MAX_BUFSZ
 #define MIQ_P2P_MAX_BUFSZ (MIQ_FALLBACK_MAX_MSG_SIZE + (512u * 1024u))
 #endif
+
+#ifndef MIQ_MSG_HARD_MAX
+#define MIQ_MSG_HARD_MAX (8u * 1024u * 1024u)   /* never accept messages over 8 MiB */
+#endif
+#ifndef MIQ_PARSE_DEADLINE_MS
+#define MIQ_PARSE_DEADLINE_MS 45000             /* per-frame parse deadline (ms) */
+#endif
+#ifndef MIQ_P2P_BAD_PEER_MAX_STALLS
+#define MIQ_P2P_BAD_PEER_MAX_STALLS 3           /* disconnect peers that stall repeatedly */
+#endif
+#ifndef MIQ_HEADERS_EMPTY_LIMIT
+#define MIQ_HEADERS_EMPTY_LIMIT 3        
 
 #ifndef MIQ_RATE_BLOCK_BPS
 #define MIQ_RATE_BLOCK_BPS (1024u * 1024u)
@@ -679,6 +703,30 @@ static std::unordered_map<std::string, std::pair<int64_t,int64_t>> g_seed_backof
 static std::unordered_map<Sock,int> g_zero_hdr_batches;
 static std::unordered_map<Sock,bool> g_hdr_flip;
 
+static std::unordered_map<Sock,int> g_peer_stalls;        // # of detected stalls
+static std::unordered_map<Sock,int64_t> g_last_hdr_ok_ms; // time of last accepted headers
+
+static bool g_seed_mode = false;
+static inline int miq_outbound_target(){
+    return g_seed_mode ? MIQ_SEED_MODE_OUTBOUND_TARGET : MIQ_OUTBOUND_TARGET;
+}
+
+static bool unsolicited_drop(miq::PeerState& ps, const char* what, const std::string& keyHex){
+    (void)what; (void)keyHex;
+    if (!ps.verack_ok) return true;
+    // During IBD, accept only if inflight has an entry for this object
+    if (ps.syncing) {
+        if (what && std::strcmp(what,"block")==0) {
+            return ps.inflight_blocks.find(keyHex) == ps.inflight_blocks.end();
+        }
+        if (what && std::strcmp(what,"tx")==0) {
+            return ps.inflight_tx.find(keyHex) == ps.inflight_tx.end();
+        }
+    }
+    // Otherwise allow (normal steady-state relay)
+    return false;
+}
+
 // ---- NEW: pre-verack safe allow-list & counters ----------------------------
 static std::unordered_map<Sock,int> g_preverack_counts;  // socket -> early safe msg count
 static inline bool miq_safe_preverack_cmd(const std::string& cmd) {
@@ -688,6 +736,10 @@ static inline bool miq_safe_preverack_cmd(const std::string& cmd) {
     };
     for (auto* s : k) if (cmd == s) return true;
     return false;
+}
+
+static inline bool env_truthy(const char* name){
+    const char* v = std::getenv(name); return v && *v && (v[0]=='1'||v[0]=='y'||v[0]=='Y'||v[0]=='t'||v[0]=='T');
 }
 
 static inline int64_t now_ms() {
@@ -1573,6 +1625,7 @@ bool P2P::start(uint16_t port){
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
 #endif
+#endif
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
@@ -1580,6 +1633,8 @@ bool P2P::start(uint16_t port){
     // Force 9883 from constants if defined
 #ifdef MIQ_DEFAULT_PORT
     if (port != (uint16_t)MIQ_DEFAULT_PORT) {
+        g_seed_mode = env_truthy(MIQ_SEED_MODE_ENV);
+        if (g_seed_mode) log_info("P2P: seed-mode enabled (reduced outbound target)");
         log_warn("P2P: overriding requested port " + std::to_string(port) +
                  " to MIQ_DEFAULT_PORT=" + std::to_string((int)MIQ_DEFAULT_PORT));
         port = (uint16_t)MIQ_DEFAULT_PORT;
@@ -1628,6 +1683,9 @@ bool P2P::start(uint16_t port){
     gather_self_from_env();
     if (!g_self_v4.empty()) {
         log_info("P2P: self-ip guard active: " + self_list_for_log());
+      }
+    if (!g_seed_mode) {
+        g_seed_mode = env_truthy(MIQ_SEED_MODE_ENV);
     }
 
     {
@@ -2306,7 +2364,7 @@ void P2P::loop(){
     int64_t last_dial_ms = now_ms();
 
     while (running_) {
-        if ((int)outbound_count() < MIQ_OUTBOUND_TARGET && g_listen_port != 0) {
+        if ((int)outbound_count() < miq_outbound_target() && g_listen_port != 0) {
             int64_t tnow = now_ms();
             if (tnow - last_dial_ms > MIQ_DIAL_INTERVAL_MS) {
                 last_dial_ms = tnow;
@@ -2491,40 +2549,6 @@ void P2P::loop(){
 #endif
                 g_next_stall_probe_ms = tnow + MIQ_P2P_STALL_RETRY_MS;
             }
-        }
-
-        // === Long-running block fetch watchdog & reassignment ===============
-        {
-          const int64_t tnow = now_ms();
-          const int64_t block_to_ms = 2 * MIQ_P2P_STALL_RETRY_MS;
-          std::vector<std::pair<Sock,std::string>> expired;
-          for (auto& bySock : g_inflight_block_ts) {
-            for (auto& kv : bySock.second) {
-              if (tnow - kv.second > block_to_ms) expired.emplace_back(bySock.first, kv.first);
-            }
-          }
-          for (auto& e : expired) {
-            Sock s_exp = e.first; const std::string& k = e.second;
-            auto itp = peers_.find(s_exp);
-            if (itp != peers_.end()) itp->second.inflight_blocks.erase(k);
-            g_inflight_block_ts[s_exp].erase(k);
-            // hex -> raw 32B
-            auto hexv = [](char c)->int{ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return 10+(c-'a'); if(c>='A'&&c<='F')return 10+(c-'A'); return 0; };
-            std::vector<uint8_t> h(32);
-            for (size_t i=0;i<32;i++) h[i] = (uint8_t)((hexv(k[2*i])<<4)|(hexv(k[2*i+1])));
-            // pick another peer (verack_ok preferred)
-            std::vector<Sock> cands;
-            for (auto& kv2 : peers_) if (kv2.first!=s_exp && kv2.second.verack_ok) cands.push_back(kv2.first);
-            if (cands.empty()) { for (auto& kv2:peers_) if (kv2.first!=s_exp) cands.push_back(kv2.first); }
-            if (!cands.empty()) {
-              // Round-robin per-hash for fairness
-              static std::unordered_map<std::string,size_t> rr;
-              size_t &i = rr[k]; if (i >= cands.size()) i %= cands.size();
-              Sock t = cands[i]; i = (i+1) % cands.size();
-              auto itT = peers_.find(t);
-              if (itT != peers_.end()) request_block_hash(itT->second, h);
-            }
-          }
         }
         
         // === NEW: timeout & retry for inflight blocks =======================
@@ -2797,6 +2821,12 @@ void P2P::loop(){
                 while (true) {
                     size_t off_before = off;
                     bool ok = decode_msg(ps.rx, off, m);
+                    if (ok && m.payload.size() > MIQ_MSG_HARD_MAX) {
+                        log_warn("P2P: message over hard max (" + std::to_string(m.payload.size()) + " bytes) from " + ps.ip);
+                        bump_ban(ps, ps.ip, "oversize-message", now_ms());
+                        dead.push_back(s);
+                        break;
+                    }
                     if (!ok) break;
                     // FIXED: only drop if decoder made no forward progress (0 bytes).
                     size_t advanced = (off > off_before) ? (off - off_before) : 0;
@@ -3178,6 +3208,7 @@ void P2P::loop(){
                             log_info("P2P: headers from " + ps.ip + " n=" + std::to_string(hs.size()) + " accepted=" + std::to_string(accepted));
                             g_last_progress_ms = now_ms();
                             g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
+                            g_last_hdr_ok_ms[(Sock)s] = g_last_progress_ms;
                         }
 
                         // Define at_tip based on batch fullness: short/empty ⇒ tip.
@@ -3190,13 +3221,27 @@ void P2P::loop(){
                                 int &z = g_zero_hdr_batches[s];
                                 z++;
                                 g_hdr_flip[s] = !g_hdr_flip[s]; // alternate locator orientation next time
-                                if (z >= 3) {
+                                if (z >= MIQ_HEADERS_EMPTY_LIMIT) {
                                     log_warn("P2P: no headers progress after 3 full batches; falling back to by-index sync");
                                     ps.banscore = std::min(ps.banscore + 1, MIQ_P2P_MAX_BANSCORE);
                                     ps.syncing = true;
                                     ps.next_index = chain_.height() + 1;
                                     request_block_index(ps, ps.next_index);
                                     z = 0;
+                                    g_peer_stalls[(Sock)s]++;
+                                    if (g_peer_stalls[(Sock)s] >= MIQ_P2P_BAD_PEER_MAX_STALLS && !is_loopback(ps.ip)) {
+                                        // disconnect persistently stalling peer (keeps the network moving)
+                                        log_warn("P2P: disconnecting persistently stalling peer " + ps.ip);
+                                        dead.push_back(s);
+                                    }
+                                }
+                            } else {
+                                // If we are in headers and have not advanced for a long time overall, fallback globally.
+                                if (!g_logged_headers_done && (now_ms() - g_last_progress_ms) > (int64_t)MIQ_IBD_FALLBACK_AFTER_MS) {
+                                    log_warn("[IBD] headers overall progress timeout; switching to index fallback");
+                                    ps.syncing = true;
+                                    ps.next_index = chain_.height() + 1;
+                                    request_block_index(ps, ps.next_index);
                                 }
                             } else {
                                 g_zero_hdr_batches[s] = 0;
@@ -3296,6 +3341,14 @@ void P2P::loop(){
                         }
                     }
                 }
+              if (!ps.syncing && !g_logged_headers_done) {
+                    int64_t last_ok = g_last_hdr_ok_ms.count(s) ? g_last_hdr_ok_ms[s] : 0;
+                    if (last_ok && (tnow - last_ok) > (int64_t)(MIQ_P2P_STALL_RETRY_MS * 4) && !is_lb) {
+                        log_warn("P2P: deprioritizing header-stalled peer " + ps.ip);
+                        g_peer_stalls[s]++;
+                        if (g_peer_stalls[s] >= MIQ_P2P_BAD_PEER_MAX_STALLS) dead.push_back(s);
+                    }
+                }
             }
             if (ps.syncing) {
                 if ((tnow - g_last_progress_ms) > (int64_t)MIQ_P2P_STALL_RETRY_MS) {
@@ -3353,6 +3406,8 @@ void P2P::loop(){
             peers_.erase(s);
             g_outbounds.erase(s);
             g_zero_hdr_batches.erase(s);
+            g_peer_stalls.erase(s);
+            g_last_hdr_ok_ms.erase(s);
             g_preverack_counts.erase(s);
             g_trickle_last_ms.erase(s);
             g_cmd_rl.erase(s); // mirror cleanup in case gate_on_close wasn't hit
