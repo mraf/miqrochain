@@ -2013,6 +2013,9 @@ static inline bool path_exists_nonempty(const std::string& p){
     return false;
 }
 
+static bool tip_fresh_enough(Chain& chain);
+static bool has_existing_blocks_or_state(const std::string& datadir);
+
 static bool should_enter_ibd_reason(Chain& chain, const std::string& datadir, std::string* why){
     auto tell = [&](const char* s){ if (why) *why = s; };
     // Fresh install / empty state: certainly need IBD.
@@ -2163,7 +2166,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             break;
         }
 
-            {
+        {
             uint64_t cur = chain.height();
             uint64_t discovered = (cur >= height_at_seed_connect) ? (cur - height_at_seed_connect) : 0;
             const char* stage = (cur == 0 ? "headers" : "blocks");
@@ -2172,10 +2175,10 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             } else {
                 static uint64_t last_note_ms = 0;
                 if (now_ms() - last_note_ms > 2500) {
-                    log_info(std::string("[IBD] ") + stage + ": height="
-                              std::to_string(cur)
-                              "  discovered-from-seed=" + std::to_string(discovered)
-                              (we_are_seed ? "  (seed-mode: waiting for inbound peers)" : ""));
+                    log_info(std::string("[IBD] ") + stage + ": height=" +
+                             std::to_string(cur) +
+                             "  discovered-from-seed=" + std::to_string(discovered) +
+                             (we_are_seed ? "  (seed-mode: waiting for inbound peers)" : ""));
                     last_note_ms = now_ms();
                 }
             }
