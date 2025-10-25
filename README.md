@@ -1,298 +1,218 @@
-# Miqrochain Core (MIQ)
+# Miqrochain
 
-Miqrochain Core is the reference implementation of the **MIQ** peer‑to‑peer cryptocurrency. It includes:
+A compact, experimental blockchain node written in modern C++.
 
-- A full validating node (`miqrod`) with JSON‑RPC
-- A wallet (HD, P2PKH) with optional at‑rest encryption
-- A built‑in CPU miner
-- Utility tools (e.g., `miq-keygen` for address generation)
-
-**Default ports**
-
-- P2P: `9883/tcp`
-- JSON‑RPC: `9834/tcp`
-
-Miqrochain Core uses **libsecp256k1** (the Bitcoin Core secp256k1 library) for ECDSA. The build system will automatically fetch it at configure time if a system package is not available. LevelDB is used by default for the chainstate (RocksDB optional).
+> **Wallet status:** wallets are still being forged and actively in progress. Expect breaking changes until the first tagged wallet preview.
 
 ---
 
-## What is Miqrochain?
+## Quick Facts
 
-Miqrochain (MIQ) is a Proof‑of‑Work blockchain with:
-- Block target: **8 minutes**
-- Consensus: **SHA‑256 PoW**
-- Initial block subsidy: **50 MIQ**
-- Coinbase maturity: **100 blocks**
-- Supply cap & halving schedule defined in `src/constants.h`
-
-The repository ships a **fixed genesis**. Nodes compiled from this repo (unmodified constants) all join the same public MIQ network.
+- **P2P port:** `9883` (TCP)
+- **RPC port:** `9833` (JSON-RPC over HTTP)
+- **Default daemons:** `miqrod` (node), `miqwallet` (WIP)
+- **Build:** CMake + C++17
+- **Status:** Experimental (not production-ready)
 
 ---
 
-## License
+## Table of Contents
 
-Miqrochain Core is open source under the **MIT** license. See `LICENSE`.
+- [Features](#features)
+- [Build](#build)
+  - [Linux / Ubuntu](#linux--ubuntu)
+  - [Windows (MSVC)](#windows-msvc)
+  - [macOS](#macos)
+- [Quick Start](#quick-start)
+  - [Run a node](#run-a-node)
+  - [Use JSON-RPC](#use-json-rpc)
+  - [Mining (testing only)](#mining-testing-only)
+- [Configuration](#configuration)
+  - [Command-line flags](#command-line-flags)
+  - [Environment variables](#environment-variables)
+- [Networking Notes](#networking-notes)
+- [Data & Logs](#data--logs)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [Security & Production Readiness](#security--production-readiness)
+- [License](#license)
 
 ---
 
-## Quick start (build & run)
+## Features
+
+- Dual-stack networking (IPv4/IPv6), non-blocking sockets; hardened for Windows & POSIX
+- Headers-first initial sync with automatic fallback to by-index on stalls
+- Per-peer rate limiting; transaction trickle relay; fee filtering (min relay fee)
+- Orphan block manager with memory/entry caps
+- Optional peer address manager (if compiled in), legacy peer store compatibility
+- NAT/UPnP try-open for friendlier home setups
+- Minimal JSON-RPC interface for node control and inspection
+
+> Source layout lives under `src/` (e.g., `p2p.*`, `chain.*`, `mempool.*`, `rpc.*`, `wallet/*` [WIP]).
+
+---
+
+## Build
+
+### Prerequisites
+
+- CMake ≥ 3.16
+- A C++17 compiler
+  - Linux/macOS: GCC ≥ 9 or Clang ≥ 10
+  - Windows: Visual Studio 2019/2022 (MSVC)
+- Standard system threads (pthread on POSIX; Win32 on Windows)
+
+> If your environment uses a package manager, install **cmake** and a **C++ toolchain** first.
+
+### Linux / Ubuntu
+
+Tested on Ubuntu 20.04/22.04+.
 
 ```bash
-# Linux/macOS (Release build)
+# 1) Install toolchain
+sudo apt update
+sudo apt install -y build-essential cmake git
+
+# 2) Clone
 git clone https://github.com/takumichronen/miqrochain.git
 cd miqrochain
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-cmake --build . --parallel
 
-# Start node without networking/mining/RPC (smoke test)
-./miqrod --no_p2p=1 --no_mine=1 --no_rpc=1
+# 3) Configure + build (Release)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 
-# Generate an address for mining or receiving funds
-./miqrod --genaddress
-# or
-./miq-keygen
-```
+# (optional) Install to /usr/local
+# sudo cmake --install build
+Windows (MSVC)
+Requires Visual Studio with the Desktop development with C++ workload.
 
-Windows instructions are in the next section.
+powershell
 
----
+# Use "x64 Native Tools Command Prompt" or "Developer PowerShell for VS"
+git clone https://github.com/takumichronen/miqrochain.git
+cd miqrochain
 
-## Build prerequisites
+cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+Artifacts will be under build\Release\.
 
-**Required**
-- CMake ≥ 3.16
-- A C++17 compiler (GCC/Clang/MSVC)
-- OpenSSL (libcrypto, libssl)
-- POSIX threads (Linux/macOS) or Win32 (Windows)
+macOS
+Tested on macOS 12+ (Apple Silicon & Intel).
 
-**Bundled / auto‑fetched**
-- **libsecp256k1** (Bitcoin Core): fetched via CMake `FetchContent` if not found on the system
-- **LevelDB** (system or auto‑fetch; RocksDB optional)
+bash
 
-> Meson/Autotools are **not** required for libsecp; CMake fetches and builds it for you.
+# 1) Install Xcode command line tools
+xcode-select --install
 
----
+# 2) Install cmake via Homebrew (recommended)
+brew install cmake
 
-## Building from source
+# 3) Clone + build
+git clone https://github.com/takumichronen/miqrochain.git
+cd miqrochain
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+Quick Start
+Run a node
+bash
 
-### Linux/macOS
+# stores chain data in ./data, listens on P2P 9883 and RPC 9833
+./build/miqrod --datadir ./data --p2p 9883 --rpc 9833
+Keep RPC bound to 127.0.0.1 unless you know what you’re doing. If you expose it, protect it (auth, firewall, or a TLS reverse proxy).
 
-```bash
-# 0) Install OpenSSL headers via your package manager
-#    Ubuntu/Debian: sudo apt-get install -y build-essential cmake pkg-config libssl-dev
-#    Fedora:        sudo dnf install -y cmake gcc-c++ openssl-devel
-#    macOS (brew):  brew install cmake openssl@3
+Use JSON-RPC
+From the same machine:
 
-# 1) Configure
-mkdir -p build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
+bash
 
-# 2) Build
-cmake --build . --parallel
+# Basic chain info
+curl -s -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}' \
+  http://127.0.0.1:9833
 
-# 3) Binaries
-#   build/miqrod      -> daemon (node + miner + RPC)
-#   build/miq-keygen  -> address generator
-```
+# Best block hash
+curl -s -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"getbestblockhash","params":[]}' \
+  http://127.0.0.1:9833
+Common methods (non-exhaustive):
 
-### Windows (MSVC)
+getblockchaininfo, getnetworkinfo, getbestblockhash
 
-```powershell
-# 0) Prereqs: Visual Studio 2022 (Desktop C++), CMake, OpenSSL (vcpkg recommended)
+getblock <hash|height>, getrawblock <hash|height>
 
-cmake -G "Visual Studio 17 2022" -A x64 `
-  -DSECP256K1_EXHAUSTIVE_TESTS=OFF `
-  -DLEVELDB_BUILD_TESTS=OFF `
-  -DLEVELDB_BUILD_BENCHMARKS=OFF `
-  ..
+getmempoolinfo, getrawmempool
 
-# 3) Build *Release* and in parallel
-cmake --build . --config Release --parallel
+submitblock <hex>, sendrawtransaction <hex>
 
-**Notes**
-- The build will try to use a system `secp256k1` if present (vcpkg/Conan, etc.). Otherwise, it fetches the official bitcoin‑core repo at the configured tag and builds it as part of your tree.
-- If you’re offline on first configure, provide `secp256k1` locally or re‑run configure when online.
+peers, ban <ip>, unban <ip>, getbans
 
----
+Mining helpers: setgenerate <on> <threads>, getminerstats
 
-## Initial configuration
+Mining (testing only)
+bash
 
-You can run `miqrod` with flags or a config file. A typical `miq.conf`:
+# Enable 2 mining threads (development/testing only)
+curl -s -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"setgenerate","params":[true, 2]}' \
+  http://127.0.0.1:9833
+Configuration
+Command-line flags
+Flag	Description
+--datadir <path>	Where to store chain state and logs (e.g., ./data).
+--p2p <port>	P2P listen port (default used here: 9883).
+--rpc <port>	RPC listen port (default used here: 9833).
+--seed 1	Seed mode (reduced outbound target; also settable via env).
+--upnp 1	Attempt to open the P2P port via UPnP/NAT-PMP.
+--loglevel <lvl>	Adjust logging verbosity (if available in your build).
 
-```
-# miq.conf
-# Data directory (recommended to set explicitly)
-datadir=/var/lib/miq
+Run miqrod --help to see the exact flags exposed by your build.
 
-# Networking
-no_p2p=0
-p2p_port=9883
-# Bootstrap peers (example):
-addnode=miqseed1.duckdns.org:9883
-addnode=miqroseed1.freeddns.org:9883
+Environment variables
+Variable	Meaning
+MIQ_IS_SEED=1	Enable seed mode (affects outbound connection targets).
+MIQ_MIN_RELAY_FEE_RATE=<miqr/kB>	Local fee filter for transaction relay.
+MIQ_SELF_IP=<ip1,ip2,...>	Mark local/self IPv4s to avoid self-dials/hairpins.
 
-# RPC
-no_rpc=0
-rpc_bind=127.0.0.1:9834
+Networking Notes
+Open/forward P2P TCP 9883 if you want to accept inbound peers.
 
-# Mining
-no_mine=0
-miner_threads=4
-# Set your coinbase recipient (P2PKH)
-# Alternatively set env: MIQ_MINING_ADDR=...
-mining_addr=YOUR_MIQ_ADDRESS
-```
+RPC runs on TCP 9833. Keep it localhost-only unless you have strong protections.
 
-**Windows**: paths like `C:\miq\miq.conf` work the same.
+The node avoids dialing loopback/self and limits outbound peers per /16 to reduce eclipse risk.
 
----
+IPv4 and IPv6 are supported; sockets are non-blocking with keep-alive.
 
-## Running the node
+Ubuntu UFW example:
 
-Examples:
+bash:
 
-```bash
-# Point to explicit datadir and conf:
-./miqrod --conf /etc/miq/miq.conf
+sudo ufw allow 9883/tcp     # P2P
+# rpc is typically local only; if you must expose:
+# sudo ufw allow from <your-ip> to any port 9833 proto tcp
+Data & Logs
+Chain data and logs live under --datadir (e.g., ./data).
 
-# Minimal local test (no peers/mining/RPC):
-./miqrod --no_p2p=1 --no_mine=1 --no_rpc=1
-```
+Peer addresses persist to peers.dat / peers2.dat (if addrman is compiled in).
 
-The node logs to stdout and its datadir. Use `--help` for all flags.
+Bans are stored in bans.txt (supports permanent and timed entries).
 
----
+Troubleshooting
+No peers? Ensure TCP 9883 is reachable (firewall/NAT). Consider --upnp 1 for home networks. Give DNS seeds some time.
 
-## Generating addresses
+RPC errors? Confirm the node is running and you’re calling http://127.0.0.1:9833. Check logs under --datadir.
 
-Two equivalent ways:
+Sync stalls? The node auto-falls back from headers-first to by-index; ensure multiple peers and stable connectivity.
 
-```bash
-# 1) Built into the daemon:
-./miqrod --genaddress
+Contributing
+PRs and issues are welcome! Please include:
 
-# 2) Standalone tool:
-./miq-keygen
-```
+OS & compiler (e.g., Ubuntu 22.04 + GCC 13, Windows 11 + MSVC 2022, macOS 14 + Apple Clang)
 
-Both print a **P2PKH** address and a 32‑byte private key hex. Keep your private key safe.
+Exact build steps and relevant logs
 
----
+Small, focused PRs for easier review
 
-## Mining
-
-1) Make or pick a payout address (above).  
-2) Ensure you have at least one peer (public seed, `-addnode`, or port‑forwarding).  
-3) Start the node with mining enabled:
-
-```bash
-# Example: 6 threads, explicit coinbase recipient via env
-export MIQ_MINING_ADDR=<YOUR_MIQ_ADDRESS>
-./miqrod --miner_threads=6
-```
-
-**Heads‑up**: mining without peers can put you on a partition; later, the chain with the most cumulative work wins and your blocks could be orphaned. Connect peers **first**, then mine.
-
----
-
-## JSON‑RPC examples
-
-Default RPC bind: `127.0.0.1:9834`. POST JSON to `/`.
-
-```bash
-# Chain tip info
-curl -s -H "Content-Type: application/json" \
-  -d '{"method":"gettipinfo","params":[]}' http://127.0.0.1:9834/
-
-# List your known addresses (if wallet loaded)
-curl -s -H "Content-Type: application/json" \
-  -d '{"method":"listaddresses","params":[]}' http://127.0.0.1:9834/
-
-# Get wallet info (balances, etc.)
-curl -s -H "Content-Type: application/json" \
-  -d '{"method":"getwalletinfo","params":[]}' http://127.0.0.1:9834/
-
-# Create and send from HD (example)
-curl -s -H "Content-Type: application/json" \
-  -d '{"method":"sendfromhd","params":["<dest_addr>", 100000]}' \
-  http://127.0.0.1:9834/
-
-# Temporarily unlock wallet (if encryption enabled at build)
-curl -s -H "Content-Type: application/json" \
-  -d '{"method":"walletunlock","params":["passphrase", 60]}' \
-  http://127.0.0.1:9834/
-```
-
-> RPC set may evolve; run `--help` or consult `src/rpc.cpp` for current methods and parameters.
-
----
-
-## Wallet encryption (optional)
-
-If compiled with `-DMIQ_ENABLE_WALLET_ENC=ON`, the wallet supports at‑rest encryption (OpenSSL). Typical flow:
-
-1. Encrypt or set passphrase via RPC (see wallet methods in `src/rpc.cpp`).  
-2. Use `walletunlock <passphrase> <timeout_seconds>` to cache a passphrase for signing/spending.  
-3. `walletlock` to clear cache.
-
-If built **without** wallet encryption (default), these RPCs are no‑ops.
-
----
-
-## Networking
-
-- **P2P port**: 9883/tcp. Open or port‑forward this on your router for a public node.  
-- **RPC port**: 9834/tcp (binds to loopback by default).  
-- Seeds / bootstrapping are defined in `src/seeds.cpp`. You can add bootstrap DNS names or IPs.
-
-Optional UPnP/NAT‑PMP support is available with `-DMIQ_ENABLE_UPNP=ON` if `miniupnpc` is installed.
-
----
-
-## Data directories
-
-Use `--datadir=/path/to/miqdata` or set `datadir=` in `miq.conf`.
-
-- **Linux**: e.g., `/var/lib/miq`, `~/.miq`  
-- **Windows**: e.g., `C:\miqdata`
-
-The chainstate, blocks, wallet store, and logs live under the datadir.
-
----
-
-## Testing
-
-Enable with `-DMIQ_BUILD_TESTS=ON`:
-
-```bash
-mkdir -p build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release -DMIQ_BUILD_TESTS=ON ..
-cmake --build . --parallel
-ctest --output-on-failure
-```
-
----
-
-## Security disclosure
-
-If you discover a security issue, **please report it responsibly**. Avoid opening a public issue for vulnerabilities. Contact the maintainers privately (e.g., via the repository’s security policy or a dedicated security contact).
-
----
-
-## Contributing
-
-PRs are welcome. Please keep changes focused and avoid consensus‑affecting modifications without prior discussion. Prefer modern C++17, small focused commits, green CI, and changes that do not break existing RPC or network behavior unless explicitly intended.
-
----
-
-### Troubleshooting
-
-- **Genesis deserialization failed / exits on boot**  
-  Ensure you are building this repo **unmodified** (the pinned `GENESIS_RAW_BLOCK_HEX` in `src/constants.h` is correct). If you have local edits, the serialized length must match exactly.
-
-- **Address generation appears “stuck”**  
-  The project uses **libsecp256k1**; keygen is instant in Release. If you see a hang, confirm you’re running `miqrod --genaddress` or `miq-keygen` and not inadvertently starting the miner.
-
-- **“Connection refused” on RPC**  
-  Start with `no_rpc=0` or omit it; ensure `rpc_bind` is correct (default `127.0.0.1:9834`) and your client connects to the same host/port.
+Security & Production Readiness
+This repository is experimental.
+Wallet components are in flux and not production-ready yet. Still being forged to work 100% with miqrochain and sending miq successfully.
