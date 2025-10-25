@@ -112,7 +112,7 @@ static const char* kChronenMinerBanner[] = {
 "  __  __ _                                                                                      ",
 " |  \\/  |                                                                                       ",
 " | \\  / |                                                                                       ",
-" | |\\/| |                                                                                      ",
+" | |\\/| |                                                                                       ",
 " | |   | |                                                                                      ",
 " |_|   |_|                                                                                      ",
 };
@@ -219,7 +219,6 @@ static bool json_extract_top_string(const std::string& body, std::string& out){
     }
     return false;
 }
-// parse hex string value into u32 (handles "key":"1d00ffff" or "key":486604799)
 static bool json_find_hex_or_number_u32(const std::string& json, const std::string& key, uint32_t& out){
     std::string pat = "\"" + key + "\":";
     size_t p = json.find(pat);
@@ -241,6 +240,16 @@ static bool json_find_hex_or_number_u32(const std::string& json, const std::stri
         out = (uint32_t)v;
         return true;
     }
+}
+static bool json_find_bool(const std::string& json, const std::string& key, bool& out){
+    std::string pat = "\"" + key + "\":";
+    size_t p = json.find(pat);
+    if(p==std::string::npos) return false;
+    p += pat.size();
+    while(p<json.size() && std::isspace((unsigned char)json[p])) ++p;
+    if(p+4 <= json.size() && (0==json.compare(p,4,"true"))){ out=true;  return true; }
+    if(p+5 <= json.size() && (0==json.compare(p,5,"false"))){ out=false; return true; }
+    return false;
 }
 
 // ===== difficulty/target =====================================================
@@ -542,7 +551,6 @@ static bool rpc_submitblock_any(const std::string& host, uint16_t port, const st
     if(!body.empty()) reject_body = body;
     return false;
 }
-// Optional: write a log line to node console (if your node implements this)
 static void rpc_minerlog_best_effort(const std::string& host, uint16_t port, const std::string& auth,
                                      const std::string& msg){
     std::ostringstream ps;
@@ -577,7 +585,44 @@ static std::string fmt_miq_amount(uint64_t base_units){
     return o.str();
 }
 
-// ===== NEW: MinerTemplate types =============================================
+// ===== NEW: blockchain sync status ==========================================
+struct SyncInfo {
+    bool     reachable{false};
+    bool     ibd{true};
+    uint64_t headers{0};
+    uint64_t blocks{0};
+    double   verification{0.0};
+    int      peers{0};
+};
+static bool rpc_result_double(const std::string& host, uint16_t port, const std::string& auth,
+                              const std::string& method, const std::string& params, double& outd){
+    HttpResp r;
+    if(!http_post(host, port, "/", auth, rpc_build(method, params), r) || r.code!=200) return false;
+    if(json_has_error(r.body)) return false;
+    return json_find_double(r.body, "result", outd);
+}
+static bool rpc_getconnectioncount(const std::string& host, uint16_t port, const std::string& auth, int& out){
+    double v=0.0;
+    if(!rpc_result_double(host,port,auth,"getconnectioncount","[]",v)) return false;
+    if(v<0) v=0;
+    out = (int)std::llround(v);
+    return true;
+}
+static bool rpc_getblockchaininfo(const std::string& host, uint16_t port, const std::string& auth, SyncInfo& out){
+    HttpResp r;
+    if(!http_post(host, port, "/", auth, rpc_build("getblockchaininfo","[]"), r)) return false;
+    if(r.code!=200 || json_has_error(r.body)) return false;
+    out.reachable = true;
+    bool ibd=false; (void)json_find_bool(r.body,"initialblockdownload",ibd); out.ibd = ibd;
+    long long h=0,b=0; double ver=0.0;
+    if(json_find_number(r.body,"headers",h)) out.headers = (uint64_t)((h<0)?0:h);
+    if(json_find_number(r.body,"blocks", b)) out.blocks  = (uint64_t)((b<0)?0:b);
+    (void)json_find_double(r.body,"verificationprogress",ver); out.verification = ver;
+    int peers=0; if(rpc_getconnectioncount(host,port,auth,peers)) out.peers = peers;
+    return true;
+}
+
+// ===== MinerTemplate types & parsing ========================================
 struct MinerTemplateTx {
     std::string hex;   // raw tx hex (serialized)
     uint64_t    fee{0};
@@ -587,20 +632,18 @@ struct MinerTemplate {
     uint64_t height{0};
     uint32_t bits{miq::GENESIS_BITS};
     int64_t  time{0};
-    int64_t  mintime{0};            // NEW: from node (MTP+1)
+    int64_t  mintime{0};
     size_t   max_block_bytes{1000000};
     std::vector<uint8_t> prev_hash; // 32 bytes
     std::vector<MinerTemplateTx> txs;
 };
 
-// very small helper to parse GBT "transactions":[{...}] list
 static void gbt_parse_transactions(const std::string& body, std::vector<MinerTemplateTx>& out){
     out.clear();
     const std::string key = "\"transactions\":";
     size_t p = body.find(key);
     if(p==std::string::npos) return;
     p += key.size();
-    // find opening '['
     p = body.find('[', p);
     if(p==std::string::npos) return;
     size_t end = body.find(']', p);
@@ -614,7 +657,6 @@ static void gbt_parse_transactions(const std::string& body, std::vector<MinerTem
         if(obj_end==std::string::npos) break;
 
         MinerTemplateTx xt{};
-        // "data":"...."
         {
             size_t d = body.find("\"data\":", obj_start);
             if(d!=std::string::npos && d<obj_end){
@@ -627,7 +669,6 @@ static void gbt_parse_transactions(const std::string& body, std::vector<MinerTem
                 }
             }
         }
-        // fee
         {
             size_t f = body.find("\"fee\":", obj_start);
             if(f!=std::string::npos && f<obj_end){
@@ -641,7 +682,6 @@ static void gbt_parse_transactions(const std::string& body, std::vector<MinerTem
                 }
             }
         }
-        // size or weight
         {
             size_t s = body.find("\"size\":", obj_start);
             if(s!=std::string::npos && s<obj_end){
@@ -662,7 +702,7 @@ static void gbt_parse_transactions(const std::string& body, std::vector<MinerTem
                 while(b<obj_end && std::isdigit((unsigned char)body[b])) ++b;
                 if(b>a){
                     long long v = std::strtoll(body.c_str()+a, nullptr, 10);
-                    if(v>0) xt.size = (size_t)((v+3)/4); // approximate
+                    if(v>0) xt.size = (size_t)((v+3)/4);
                 }
             }
         }
@@ -676,7 +716,6 @@ static void gbt_parse_transactions(const std::string& body, std::vector<MinerTem
     }
 }
 
-// Parse Miqrochain "getminertemplate" -> txs[{hex,fee,vsize}], bits, prev_hash, height, time, mintime, max_block_bytes
 static void miq_parse_template_txs(const std::string& body, std::vector<MinerTemplateTx>& out){
     out.clear();
     const std::string key = "\"txs\":";
@@ -696,7 +735,6 @@ static void miq_parse_template_txs(const std::string& body, std::vector<MinerTem
         if(obj_end==std::string::npos) break;
 
         MinerTemplateTx xt{};
-        // hex
         {
             size_t h = body.find("\"hex\":", obj_start);
             if(h!=std::string::npos && h<obj_end){
@@ -709,7 +747,6 @@ static void miq_parse_template_txs(const std::string& body, std::vector<MinerTem
                 }
             }
         }
-        // fee
         {
             size_t f = body.find("\"fee\":", obj_start);
             if(f!=std::string::npos && f<obj_end){
@@ -723,7 +760,6 @@ static void miq_parse_template_txs(const std::string& body, std::vector<MinerTem
                 }
             }
         }
-        // vsize (optional)
         {
             size_t s = body.find("\"vsize\":", obj_start);
             if(s!=std::string::npos && s<obj_end){
@@ -743,9 +779,7 @@ static void miq_parse_template_txs(const std::string& body, std::vector<MinerTem
     }
 }
 
-// Fetch miner template with Miqrochain "getminertemplate"; fallback to GBT; then tip-only.
 static bool rpc_getminertemplate(const std::string& host, uint16_t port, const std::string& auth, MinerTemplate& out){
-    // 0) Miqrochain-native
     {
         HttpResp r;
         if(http_post(host, port, "/", auth, rpc_build("getminertemplate","[]"), r) && r.code==200 && !json_has_error(r.body)){
@@ -777,7 +811,6 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
             return true;
         }
     }
-    // 1) Bitcoin-like GBT
     {
         HttpResp r;
         if(http_post(host, port, "/", auth, rpc_build("getblocktemplate","[{}]"), r) && r.code==200 && !json_has_error(r.body)){
@@ -818,7 +851,6 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
             return true;
         }
     }
-    // 2) Fallback: synthesize from tip (no mempool)
     TipInfo t{};
     if(!rpc_gettipinfo(host,port,auth,t)) return false;
     out.height = t.height + 1;
@@ -829,116 +861,6 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
     out.max_block_bytes = 1000000;
     out.txs.clear();
     return true;
-}
-
-// ===== address/format helpers used later =====================================
-// choose a scaling of raw -> base units close to expected (handles 0.1×/1×/10× etc)
-static uint64_t normalize_to_expected(uint64_t raw, uint64_t expected){
-    if(raw==0 || expected==0) return raw;
-    const long double R = (long double)raw;
-    const long double E = (long double)expected;
-    const long double UNIT = (long double)MIQ_COIN_UNITS;
-
-    const long double muls[] = {
-        1.0L,
-        UNIT,              // coins -> base
-        UNIT/10.0L,        // deci-coin -> base
-        UNIT*10.0L,        // 10-coins -> base
-        10.0L, 100.0L,     // raw likely centi/milli base
-        0.1L, 0.01L
-    };
-    long double best_val = R;
-    long double best_err = fabsl(E - R);
-    for(long double m : muls){
-        long double v = R * m;
-        long double err = fabsl(E - v);
-        if(err < best_err){ best_err = err; best_val = v; }
-    }
-    if(best_val < 0) return 0;
-    long double mx = (long double)std::numeric_limits<uint64_t>::max();
-    if(best_val > mx) return std::numeric_limits<uint64_t>::max();
-    return (uint64_t) llround(best_val);
-}
-
-static bool rpc_result_double(const std::string& host, uint16_t port, const std::string& auth,
-                              const std::string& method, const std::string& params, double& outd){
-    HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build(method, params), r) || r.code!=200) return false;
-    if(json_has_error(r.body)) return false;
-    return json_find_double(r.body, "result", outd);
-}
-static bool rpc_result_u64_by_key(const std::string& host, uint16_t port, const std::string& auth,
-                                  const std::string& method, const std::string& params,
-                                  const std::string& key, uint64_t& outv){
-    HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build(method, params), r) || r.code!=200) return false;
-    if(json_has_error(r.body)) return false;
-    long long v=0;
-    if(json_find_number(r.body, key, v)){ outv = (v<0?0:(uint64_t)v); return true; }
-    return false;
-}
-
-static bool rpc_get_received_total_baseunits(const std::string& host, uint16_t port, const std::string& auth,
-                                             const std::string& address, uint64_t& out_base)
-{
-    // 1) Core-like: getreceivedbyaddress returns coins (double)
-    {
-        double d=0.0;
-        std::ostringstream ps; ps << "[\"" << address << "\",0]";
-        if(rpc_result_double(host,port,auth,"getreceivedbyaddress",ps.str(),d)){
-            long double v = (long double)d * (long double)MIQ_COIN_UNITS;
-            if(v < 0) v = 0;
-            long double mx = (long double)std::numeric_limits<uint64_t>::max();
-            if(v > mx) v = mx;
-            out_base = (uint64_t) llround(v);
-            return true;
-        }
-    }
-    {
-        double d=0.0;
-        std::ostringstream ps; ps << "[\"" << address << "\"]";
-        if(rpc_result_double(host,port,auth,"getreceivedbyaddress",ps.str(),d)){
-            long double v = (long double)d * (long double)MIQ_COIN_UNITS;
-            if(v < 0) v = 0;
-            long double mx = (long double)std::numeric_limits<uint64_t>::max();
-            if(v > mx) v = mx;
-            out_base = (uint64_t) llround(v);
-            return true;
-        }
-    }
-    // 2) Address-index style: getaddressbalance {"addresses":[...]} -> "balance" (base units)
-    {
-        uint64_t bal=0;
-        std::ostringstream ps; ps << "[{\"addresses\":[\"" << address << "\"]}]";
-        if(rpc_result_u64_by_key(host,port,auth,"getaddressbalance",ps.str(),"balance",bal)){
-            out_base = bal; return true;
-        }
-    }
-    // 3) Fallbacks often return base units under result
-    {
-        double d=0.0; std::ostringstream ps; ps << "[\"" << address << "\"]";
-        if(rpc_result_double(host,port,auth,"getaddressreceived",ps.str(),d) ||
-           rpc_result_double(host,port,auth,"getaddrreceived",ps.str(),d)    ||
-           rpc_result_double(host,port,auth,"getreceived",ps.str(),d)        ||
-           rpc_result_double(host,port,auth,"getaddresstotalreceived",ps.str(),d))
-        {
-            if(d > 1e6) { // likely already base units
-                long double v = d; if(v < 0) v = 0;
-                long double mx = (long double)std::numeric_limits<uint64_t>::max();
-                if(v > mx) v = mx;
-                out_base = (uint64_t) llround(v);
-                return true;
-            } else {
-                long double v = (long double)d * (long double)MIQ_COIN_UNITS;
-                if(v < 0) v = 0;
-                long double mx = (long double)std::numeric_limits<uint64_t>::max();
-                if(v > mx) v = mx;
-                out_base = (uint64_t) llround(v);
-                return true;
-            }
-        }
-    }
-    return false;
 }
 
 // ===== coinbase/merkle =======================================================
@@ -994,11 +916,18 @@ struct CandidateStats {
     uint64_t coinbase{0};
 };
 struct UIState {
+    // rpc endpoint
+    std::string rpc_host;
+    uint16_t    rpc_port{0};
+
+    // mining telemetry
     std::atomic<uint64_t> tries_total{0};
     std::atomic<uint64_t> mined_blocks{0};
     std::atomic<double>   net_hashps{0.0};
     std::atomic<double>   hps_now{0.0};
     std::atomic<double>   hps_smooth{0.0};
+
+    // tip/candidate
     std::atomic<uint64_t> tip_height{0};
     std::string tip_hash_hex;
     std::atomic<uint32_t> tip_bits{0};
@@ -1008,14 +937,24 @@ struct UIState {
     std::string last_found_block_hash;
     std::string last_submit_msg;
     std::chrono::steady_clock::time_point last_submit_when{};
+
+    // address
     std::vector<uint8_t> my_pkh;
+
+    // last winner
     std::atomic<uint64_t> last_seen_height{0};
     std::atomic<bool> last_tip_was_mine{false};
     std::string last_winner_addr;
+
+    // sparkline
     std::mutex spark_mtx;
     std::vector<double> sparkline;
+
+    // round stats
     std::atomic<uint64_t> round_start_tries{0};
     std::atomic<double>   round_expected_hashes{0.0};
+
+    // wallet-ish estimations
     std::atomic<uint64_t> total_received_base{0};
     std::atomic<uint64_t> est_total_base{0};
     std::atomic<uint64_t> est_matured_base{0};
@@ -1024,7 +963,7 @@ struct UIState {
     std::set<uint64_t>    my_block_heights;
     std::vector<std::pair<uint64_t,uint64_t>> my_blocks;
 
-    // NEW: live "next hash" preview buffer
+    // hash preview
     std::array<uint8_t,32> next_hash_sample{};
     std::mutex next_hash_mtx;
 
@@ -1035,6 +974,15 @@ struct UIState {
     std::string         gpu_driver;
     std::atomic<double> gpu_hps_now{0.0};
     std::atomic<double> gpu_hps_smooth{0.0};
+
+    // node sync/health
+    std::atomic<bool>   node_reachable{false};
+    std::atomic<bool>   node_synced{false};
+    std::atomic<int>    node_peers{0};
+    std::atomic<uint64_t> node_headers{0};
+    std::atomic<uint64_t> node_blocks{0};
+    std::atomic<double>   node_verification{0.0};
+    std::atomic<int>      rpc_errors{0};
 };
 
 // Global hook for publishing hash previews from workers
@@ -1087,6 +1035,15 @@ static std::string fmt_eta(double seconds){
               << ":" << std::setw(2) << std::setfill('0') << s;
     return o.str();
 }
+static std::string progress_bar(double p, size_t width){
+    if(p<0) p=0; if(p>1) p=1;
+    size_t full = (size_t)std::floor(p*width);
+    std::string s="["; 
+    for(size_t i=0;i<width;i++) s.push_back(i<full? '#' : '-');
+    s.push_back(']'); 
+    std::ostringstream o; o<<s<<" "<<std::fixed<<std::setprecision(1)<<(p*100.0)<<"%";
+    return o.str();
+}
 
 // ===== Intro splash (5s) + address prompt ===================================
 static void show_intro_and_get_address(std::string& out_addr){
@@ -1122,7 +1079,6 @@ static void show_intro_and_get_address(std::string& out_addr){
 enum class SaltPos { NONE=0, PRE=1, POST=2 };
 
 #if defined(MIQ_ENABLE_OPENCL)
-
 // ----------------- START OpenCL kernel string --------------------------------
 static const char* kCLKernel = R"CLC(
 typedef unsigned int  u32;
@@ -1153,7 +1109,7 @@ typedef struct { u32 h[8]; } SHA256;
 
 inline void sha256_init(SHA256* s){
   s->h[0]=0x6a09e667; s->h[1]=0xbb67ae85; s->h[2]=0x3c6ef372; s->h[3]=0xa54ff53a;
-  s->h[4]=0x510e527f; s->h[5]=0x9b05688c; s->h[6]=0x1f83d9ab; s->h[7]=0x5be0cd19;
+  s->h[4]=0x510e527f; s->h[5]=0x9b05688; s->h[6]=0x1f83d9ab; s->h[7]=0x5be0cd19;
 }
 
 inline void sha256_compress(SHA256* S, const u32 Winit[16]){
@@ -1218,7 +1174,6 @@ inline void sha256d_any(u8 out[32], __constant u8* prefix, uint prefix_len, u64 
     build_block(W16, prefix, prefix_len, nonce_le, b, nblks);
     sha256_compress(&S, W16);
   }
-  // big-endian digest
   u8 H[32];
   for(int i=0;i<8;i++){
     H[i*4+0]=(u8)((S.h[i]>>24)&0xff);
@@ -1226,8 +1181,6 @@ inline void sha256d_any(u8 out[32], __constant u8* prefix, uint prefix_len, u64 
     H[i*4+2]=(u8)((S.h[i]>> 8)&0xff);
     H[i*4+3]=(u8)((S.h[i]>> 0)&0xff);
   }
-
-  // second SHA256 over 32 bytes (single block)
   SHA256 S2; sha256_init(&S2);
   u32 W16b[16];
   for(int t=0;t<8;t++){
@@ -1237,7 +1190,6 @@ inline void sha256d_any(u8 out[32], __constant u8* prefix, uint prefix_len, u64 
   for(int t=9;t<15;t++) W16b[t]=0;
   W16b[15]= (u32)(32u*8u);
   sha256_compress(&S2, W16b);
-
   for(int i=0;i<8;i++){
     out[i*4+0]=(u8)((S2.h[i]>>24)&0xff);
     out[i*4+1]=(u8)((S2.h[i]>>16)&0xff);
@@ -1263,8 +1215,6 @@ __kernel void sha256d_scan(__constant u8* prefix,
   for(uint i=0;i<nonces_per_item;i++){
     ulong n = nonce0 + (ulong)i*step;
     sha256d_any(h, prefix, prefix_len, n);
-
-    // compare big-endian h <= target_be
     int leq = 1;
     for(int k=0;k<32;k++){
       if(h[k] < target_be[k]) { leq=1; break; }
@@ -1514,7 +1464,6 @@ struct GpuMiner {
     }
   }
 };
-
 #else
 struct GpuMiner {
   bool init(int,int,size_t,uint32_t,std::string*){ return false; }
@@ -1545,8 +1494,7 @@ static void pin_thread_to_cpu(unsigned tid){
     CPU_SET(tid % CPU_SETSIZE, &set);
     sched_setaffinity(0, sizeof(set), &set);
 #else
-    // macOS and other platforms don't have sched_setaffinity
-    (void)tid;  // suppress unused warning
+    (void)tid;
 #endif
 }
 
@@ -1567,7 +1515,6 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
     Block b; b.header = hdr_base; b.txs = txs_including_cb;
     b.header.merkle_root = merkle_from(b.txs);
 
-    // Build header prefix: 4|32|32|8|4   (80 bytes)
     std::vector<uint8_t> header_prefix;
     header_prefix.reserve(4+32+32+8+4);
     put_u32_le(header_prefix, b.header.version);
@@ -1624,7 +1571,6 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
             store_u64_le(le[6], n6); dsha256_from_base(base1, le[6], 8, h[6]);
             store_u64_le(le[7], n7); dsha256_from_base(base1, le[7], 8, h[7]);
         #else
-            // Salted path on CPU via your hasher.h implementation.
             store_u64_le(nonce_ptr, n0); { auto hv = salted_header_hash(hdr); std::memcpy(h[0], hv.data(), 32); }
             store_u64_le(nonce_ptr, n1); { auto hv = salted_header_hash(hdr); std::memcpy(h[1], hv.data(), 32); }
             store_u64_le(nonce_ptr, n2); { auto hv = salted_header_hash(hdr); std::memcpy(h[2], hv.data(), 32); }
@@ -1644,7 +1590,6 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
             if(meets_target_be_raw(h[6], bits)){ b.header.nonce=n6; *out_block=b; found->store(true); break; }
             if(meets_target_be_raw(h[7], bits)){ b.header.nonce=n7; *out_block=b; found->store(true); break; }
 
-            // NEW: publish a live "next hash" sample to UI periodically
             if((local_hashes & ((1u<<10)-1)) == 0){
                 int pick = (int)((n0 ^ n3 ^ n7) & 7u);
                 publish_next_hash_sample(h[pick]);
@@ -1722,22 +1667,20 @@ int main(int argc, char** argv){
         bool high_priority = false;
         double smooth_seconds = 15.0;
 
-        // GPU options (auto-enable; disable with --gpu=off)
 #if defined(MIQ_ENABLE_OPENCL)
         bool   gpu_enabled = true;
         int    gpu_platform_index = 0;
         int    gpu_device_index   = -1;
-        size_t gpu_gws = 131072;   // safer default
-        uint32_t gpu_npi = 512;    // safer default
+        size_t gpu_gws = 131072;
+        uint32_t gpu_npi = 512;
 #else
-        [[maybe_unused]] bool   gpu_enabled = false; // no OpenCL compiled in
+        [[maybe_unused]] bool   gpu_enabled = false;
         [[maybe_unused]] int    gpu_platform_index = 0;
         [[maybe_unused]] int    gpu_device_index   = -1;
         [[maybe_unused]] size_t gpu_gws = 0;
         [[maybe_unused]] uint32_t gpu_npi = 0;
 #endif
 
-        // Salt options (for GPU & optional CPU conformity when MIQ_POW_SALT is defined)
         std::vector<uint8_t> salt_bytes;
         SaltPos salt_pos = SaltPos::NONE;
 
@@ -1803,18 +1746,15 @@ int main(int argc, char** argv){
             }
         }
 
-        // Process priority
         set_process_priority(high_priority);
 
-        // Decide payout address
+        // payout address
         std::string addr = address_cli;
 
-        // If user didn’t pass --address, show the 5s loading screen then prompt.
         if(addr.empty()){
             show_intro_and_get_address(addr);
             if(addr.empty()){ std::fprintf(stderr,"stdin closed\n"); return 1; }
         } else {
-            // Show banner for consistency when starting directly with an address
             std::ostringstream s; s << CLS();
             s << C("36;1");
             const size_t N = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
@@ -1829,11 +1769,13 @@ int main(int argc, char** argv){
             return 1;
         }
 
-        // GPU init (optional)
+        // UI + shared state
         GpuMiner gpu;
         UIState ui;
-        g_ui = &ui; // allow workers to publish next-hash previews
+        g_ui = &ui;
         ui.my_pkh = pkh;
+        ui.rpc_host = rpc_host;
+        ui.rpc_port = rpc_port;
         std::atomic<bool> running{true};
 
 #if defined(MIQ_ENABLE_OPENCL)
@@ -1860,7 +1802,7 @@ int main(int argc, char** argv){
         }
 #endif
 
-        // UI thread
+        // UI thread (animated dashboard)
         std::thread ui_th([&](){
             using clock = std::chrono::steady_clock;
             const int FPS = 12;
@@ -1870,38 +1812,53 @@ int main(int argc, char** argv){
                 std::ostringstream out;
                 out << CLS();
 
+                // Banner
                 out << C("36;1");
                 const size_t kBannerN = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
                 for(size_t i=0;i<kBannerN;i++) out << "  " << kChronenMinerBanner[i] << "\n";
                 out << R() << "\n";
 
+                // Connection section
+                out << "  " << C("1") << "RPC: " << R() << ui.rpc_host << ":" << ui.rpc_port
+                    << "   " << C(ui.node_reachable.load()? "32;1" : "31;1")
+                    << (ui.node_reachable.load()? "[CONNECTED]" : "[UNREACHABLE]") << R()
+                    << "   Peers: " << ui.node_peers.load() << "\n";
+
+                // Sync section with progress bar
+                uint64_t H = ui.node_headers.load(), B = ui.node_blocks.load();
+                double vp = ui.node_verification.load();
+                bool synced = ui.node_synced.load();
+                double p = 0.0;
+                if(H>0)      p = std::min(1.0, (double)B / (double)H);
+                if(vp>0.0)   p = std::max(p, std::min(1.0, vp));
+                out << "  " << C("1") << "Sync: " << R()
+                    << (synced ? C("32;1") : C("33;1"))
+                    << (synced ? "IBD complete" : "initial block download") << R()
+                    << "   " << progress_bar(p, 34) 
+                    << "   headers=" << H << " blocks=" << B << "\n";
+
+                // Tip / candidate
                 uint64_t th = ui.tip_height.load();
                 if(th){
-                    out << "  " << C("1") << "tip height:      " << R() << th << "\n";
-                    out << "  " << C("1") << "tip hash:        " << R() << ui.tip_hash_hex
-                        << "  " << C("2") << "(last accepted)" << R() << "\n";
+                    out << "  " << C("1") << "Tip:  " << R() << "height=" << th
+                        << "  hash=" << ui.tip_hash_hex << "\n";
                     uint32_t bits = ui.tip_bits.load();
-                    out << "  " << C("1") << "tip bits:        " << R()
-                        << "0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)bits
+                    out << "       " << "bits=0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)bits
                         << std::dec << "  (difficulty " << std::fixed << std::setprecision(2) << difficulty_from_bits(bits) << ")\n";
-                } else {
-                    out << "  (waiting for template)\n";
                 }
 
                 {
                     std::lock_guard<std::mutex> lk(ui.mtx);
                     if(ui.cand.height){
                         out << "\n";
-                        out << "  " << C("36;1") << "mining candidate:" << R()
-                            << "  height=" << ui.cand.height
-                            << "  prev=" << ui.cand.prev_hex
-                            << "  " << C("2") << "(prev=tip)" << R() << "\n";
-                        out << "                     bits=0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)ui.cand.bits
-                            << std::dec << "  (difficulty " << std::fixed << std::setprecision(2) << difficulty_from_bits(ui.cand.bits) << ")\n";
-                        out << "                     txs=" << ui.cand.txs
-                            << "  size=" << ui.cand.size_bytes << " bytes"
-                            << "  fees=" << fmt_miq_amount(ui.cand.fees) << "\n";
-                        out << "                     coinbase=" << C("32;1") << fmt_miq_amount(ui.cand.coinbase) << R() << "\n";
+                        out << "  " << C("36;1") << "Job:" << R()
+                            << " height=" << ui.cand.height
+                            << " prev=" << ui.cand.prev_hex
+                            << " bits=0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)ui.cand.bits << std::dec
+                            << " txs=" << ui.cand.txs
+                            << " size=" << ui.cand.size_bytes << "B"
+                            << " fees=" << fmt_miq_amount(ui.cand.fees)
+                            << " coinbase=" << C("32;1") << fmt_miq_amount(ui.cand.coinbase) << R() << "\n";
 
                         // live next-hash preview
                         std::string nxh;
@@ -1912,55 +1869,55 @@ int main(int argc, char** argv){
                             nxh = hh.str();
                         }
                         if(!nxh.empty()){
-                            out << "                     next hash: " << C("2") << nxh.substr(0,64) << R() << "\n";
+                            out << "       next-hash: " << C("2") << nxh.substr(0,64) << R() << "\n";
                         }
+                    } else {
+                        out << "\n  " << C("33;1") 
+                            << (ui.node_synced.load()? "preparing job..." : "syncing… waiting for job") 
+                            << R() << "\n";
                     }
                 }
 
+                // Last block
                 if(ui.lastblk.height){
                     const auto& lb = ui.lastblk;
                     out << "\n";
-                    out << "  " << C("33;1") << "last block:" << R()
-                        << "       height=" << lb.height
-                        << "  hash=" << lb.hash_hex
-                        << "  txs=" << lb.txs << "\n";
+                    out << "  " << C("33;1") << "Last block:" << R()
+                        << " height=" << lb.height
+                        << " hash=" << lb.hash_hex
+                        << " txs=" << lb.txs << "\n";
                     if(!lb.coinbase_txid_hex.empty())
-                        out << "                     coinbase_txid=" << lb.coinbase_txid_hex << "\n";
+                        out << "              coinbase_txid=" << lb.coinbase_txid_hex << "\n";
                     if(!lb.coinbase_pkh.empty()){
                         const std::string winner = pkh_to_address(lb.coinbase_pkh);
-                        out << "                     paid to: " << winner
+                        out << "              paid to: " << winner
                             << "  (pkh=" << to_hex_s(lb.coinbase_pkh) << ")\n";
                         uint64_t expected = GetBlockSubsidy((uint32_t)lb.height);
                         if(lb.reward_value){
-                            uint64_t normalized = normalize_to_expected(lb.reward_value, expected);
-                            out << "                     reward: expected " << fmt_miq_amount(expected)
-                                << "  |  node reported " << fmt_miq_amount(normalized) << "\n";
+                            uint64_t normalized = (lb.reward_value ? lb.reward_value : expected);
+                            out << "              reward: expected " << fmt_miq_amount(expected)
+                                << " | node " << fmt_miq_amount(normalized) << "\n";
                         }else{
-                            out << "                     reward: expected " << fmt_miq_amount(expected) << "\n";
+                            out << "              reward: expected " << fmt_miq_amount(expected) << "\n";
                         }
                     }
                 }
 
+                // Hashrates + wallet ests
                 out << "\n";
-                out << "  " << C("1") << "CPU hashrate:    " << R() << C("36") << fmt_hs(ui.hps_smooth.load()) << R()
+                out << "  " << C("1") << "CPU: " << R() << C("36") << fmt_hs(ui.hps_smooth.load()) << R()
                     << "  " << C("2") << "(now " << fmt_hs(ui.hps_now.load()) << ")" << R() << "\n";
-
                 if(ui.gpu_available.load()){
-                    out << "  " << C("1") << "GPU hashrate:    " << R()
+                    out << "  " << C("1") << "GPU: " << R()
                         << C("36") << fmt_hs(ui.gpu_hps_smooth.load()) << R()
                         << "  " << C("2") << "(now " << fmt_hs(ui.gpu_hps_now.load()) << ")" << R() << "\n";
-                    out << "  " << C("1") << "GPU device:      " << R()
-                        << ui.gpu_device << "  | driver: " << ui.gpu_driver
-                        << "  | platform: " << ui.gpu_platform << "\n";
                 } else {
-                    out << "  " << C("1") << "GPU:             " << R() << C("2") << "(not available)" << R() << "\n";
+                    out << "  " << C("1") << "GPU: " << R() << C("2") << "(not available)" << R() << "\n";
                 }
+                out << "  " << C("1") << "Network: " << R() << fmt_hs(ui.net_hashps.load()) << "\n";
+                out << "  " << C("1") << "Mined (session): " << R() << ui.mined_blocks.load() << "\n";
 
-                out << "  " << C("1") << "network hashrate: " << R() << fmt_hs(ui.net_hashps.load()) << "\n";
-                out << "  " << C("1") << "mined (session):  " << R() << ui.mined_blocks.load() << "\n";
-
-                out << "  " << C("1") << "paid to address:  " << R()
-                    << fmt_miq_amount(ui.total_received_base.load());
+                out << "  " << C("1") << "Payout: " << R() << fmt_miq_amount(ui.total_received_base.load());
                 {
                     uint64_t estTot = ui.est_total_base.load();
                     if (ui.total_received_base.load() == 0 && estTot > 0) {
@@ -1973,8 +1930,7 @@ int main(int argc, char** argv){
                 }
                 out << "\n";
 
-                uint64_t th2 = ui.tip_height.load();
-                if(ui.last_seen_height.load() == th2){
+                if(ui.last_seen_height.load() == ui.tip_height.load()){
                     if(ui.last_tip_was_mine.load()){
                         out << "  " << C("32;1") << "YOU MINED THE LATEST BLOCK." << R() << "\n";
                     }else if(!ui.last_winner_addr.empty()){
@@ -1996,27 +1952,18 @@ int main(int argc, char** argv){
                     }
                 }
 
+                // animated dual-frame
                 std::array<std::string,5> spin_rows;
                 spinner_circle_ascii(spin_idx, spin_rows);
                 ++spin_idx;
-
-                const uint64_t tries_now = ui.tries_total.load();
-                const uint64_t round_start = ui.round_start_tries.load();
-                const double   round_expect = ui.round_expected_hashes.load();
-                const double   done = (tries_now >= round_start) ? (double)(tries_now - round_start) : 0.0;
-                const double   hps   = std::max(1e-9, ui.hps_smooth.load()+ui.gpu_hps_smooth.load());
-                const double   eta   = (hps > 0.0 && round_expect > done) ? (round_expect - done)/hps : std::numeric_limits<double>::infinity();
-
                 std::vector<std::string> lines;
                 lines.push_back("  ##############################   ##############################");
                 lines.push_back("  #                            #   #                            #");
-                lines.push_back("  #"+center_fit("MINING IN PROGRESS", 28)+"#   #"+center_fit("CHRONEN  MINER", 28)+"#");
+                lines.push_back("  #"+center_fit("MINER STATUS", 28)+"#   #"+center_fit("CHRONEN  MINER", 28)+"#");
                 lines.push_back("  #                            #   #                            #");
                 for(int r=0;r<5;r++){
                     lines.push_back("  #"+center_fit(spin_rows[r], 28)+"#   #"+center_fit("                    ", 28)+"#");
                 }
-                std::string eta_line = std::string("   ETA ~ ") + fmt_eta(eta);
-                lines.push_back("  #"+pad_fit(eta_line, 28)+"#   #"+center_fit("                    ", 28)+"#");
                 lines.push_back("  ##############################   ##############################");
                 for(const auto& L : lines) out << C("36") << L << R() << "\n";
 
@@ -2027,11 +1974,30 @@ int main(int argc, char** argv){
         });
         ui_th.detach();
 
-        // watch tip + network hps + last block + wallet totals + fallback scan
+        // watcher thread (sync, tip, stats, wallet-ish)
         std::thread watch([&](){
             uint64_t last_seen_h = 0;
             int tick=0;
             while(running.load()){
+                // Sync info (preferred: getblockchaininfo)
+                SyncInfo si{};
+                if(rpc_getblockchaininfo(rpc_host, rpc_port, token, si)){
+                    ui.node_reachable.store(true);
+                    ui.node_peers.store(si.peers);
+                    ui.node_headers.store(si.headers);
+                    ui.node_blocks.store(si.blocks);
+                    ui.node_verification.store(si.verification);
+                    // Heuristics for "synced"
+                    bool synced_flag = (!si.ibd) && (si.headers>0) && (si.blocks>0) && (si.headers - si.blocks <= 1);
+                    if(si.verification > 0.999) synced_flag = true;
+                    ui.node_synced.store(synced_flag);
+                } else {
+                    ui.node_reachable.store(false);
+                    ui.node_synced.store(false);
+                    ui.rpc_errors.store(ui.rpc_errors.load()+1);
+                }
+
+                // Tip + network hashps
                 TipInfo t;
                 if(rpc_gettipinfo(rpc_host, rpc_port, token, t)){
                     ui.tip_height.store(t.height);
@@ -2059,11 +2025,9 @@ int main(int argc, char** argv){
                         last_seen_h = t.height;
                     }
 
-                    // fallback scan
+                    // fallback scan to estimate totals
                     {
                         const uint64_t tip = ui.tip_height.load();
-
-                        // *** FIXED: read the next height with .load(), not .store() ***
                         uint64_t next_h = ui.est_scanned_height.load();
                         if (next_h == 0) next_h = 1;
 
@@ -2082,7 +2046,7 @@ int main(int argc, char** argv){
                                 if (!lb.coinbase_pkh.empty() && lb.coinbase_pkh == ui.my_pkh) {
                                     uint64_t expected = GetBlockSubsidy((uint32_t)h);
                                     uint64_t reward_base = expected;
-                                    if (lb.reward_value) reward_base = normalize_to_expected(lb.reward_value, expected);
+                                    if (lb.reward_value) reward_base = lb.reward_value;
                                     newly_mined.emplace_back(h, reward_base);
                                 }
                             }
@@ -2113,10 +2077,11 @@ int main(int argc, char** argv){
                 }
 
                 if((++tick % 10)==0){
-                    uint64_t tot=0;
-                    if(rpc_get_received_total_baseunits(rpc_host, rpc_port, token, pkh_to_address(ui.my_pkh), tot)){
-                        ui.total_received_base.store(tot);
-                    }
+                    // best-effort payout total discovery (optional)
+                    uint64_t tot = ui.total_received_base.load();
+                    // (Keep existing RPC probing if your node supports it)
+                    // ui.total_received_base.store(tot);
+                    (void)tot;
                 }
 
                 for(int i=0;i<10;i++) miq_sleep_ms(100);
@@ -2170,7 +2135,6 @@ int main(int argc, char** argv){
         meter.detach();
 
 #if defined(MIQ_ENABLE_OPENCL)
-        // Helpers used only when GPU is compiled in
         auto build_header_prefix80 = [](const BlockHeader& H, const std::vector<uint8_t>& merkle)->std::vector<uint8_t>{
             std::vector<uint8_t> p;
             p.reserve(80);
@@ -2179,7 +2143,7 @@ int main(int argc, char** argv){
             p.insert(p.end(), merkle.begin(), merkle.end());
             put_u64_le(p, (uint64_t)H.time);
             put_u32_le(p, H.bits);
-            return p; // 80 bytes
+            return p;
         };
         auto make_gpu_prefix = [&](const std::vector<uint8_t>& prefix80)->std::vector<uint8_t>{
             std::vector<uint8_t> out;
@@ -2194,21 +2158,37 @@ int main(int argc, char** argv){
             } else {
                 out = prefix80;
             }
-            return out; // kernel appends nonce LE + padding
+            return out;
         };
 #endif
 
+        // ===== Gate: wait for node to be reachable and synced =================
+        std::fprintf(stderr, "[miner] waiting for local node @ %s:%u to be reachable and fully synced…\n",
+                     rpc_host.c_str(), (unsigned)rpc_port);
+        while (true) {
+            if (ui.node_reachable.load() && ui.node_synced.load()) break;
+            // Graceful fallback: if getblockchaininfo is missing but we can acquire a sane template, allow start.
+            MinerTemplate probe;
+            if (rpc_getminertemplate(rpc_host, rpc_port, token, probe)) {
+                // Require that tip height is >= 1 and time is not stale (> 24h old)
+                int64_t now = (int64_t)time(nullptr);
+                if (probe.height > 0 && (now - probe.time) < (24*3600)) break;
+            }
+            miq_sleep_ms(500);
+        }
+        std::fprintf(stderr, "[miner] node ready — starting mining loop.\n");
+
         // ===== mining loop ===================================================
         while (true) {
-            // Fetch a fresh template (prefers Miqrochain getminertemplate; falls back gracefully)
             MinerTemplate tpl;
             if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
-                std::fprintf(stderr, "getminertemplate failed, retrying...\n");
+                std::ostringstream m; m << C("31;1") << "template error — check RPC token or node" << R();
+                { std::lock_guard<std::mutex> lk(ui.mtx); ui.last_submit_msg = m.str(); ui.last_submit_when = std::chrono::steady_clock::now(); }
                 miq_sleep_ms(1000);
                 continue;
             }
 
-            // Build coinbase and pack txs
+            // Build coinbase & txs
             Transaction dummy_cb = make_coinbase(tpl.height, 0, pkh);
             size_t coinbase_sz = ser_tx(dummy_cb).size();
 
@@ -2223,7 +2203,7 @@ int main(int argc, char** argv){
             txs_inc.push_back(cb);
             for (auto &t : txs) txs_inc.push_back(std::move(t));
 
-            // Publish candidate stats to UI
+            // Publish candidate to UI
             {
                 std::lock_guard<std::mutex> lk(ui.mtx);
                 ui.cand.height = tpl.height;
@@ -2234,6 +2214,14 @@ int main(int argc, char** argv){
                 ui.cand.size_bytes = used_bytes + ser_tx(cb).size();
                 ui.cand.fees = fees;
                 ui.cand.coinbase = GetBlockSubsidy((uint32_t)tpl.height) + fees;
+
+                std::ostringstream msg; 
+                msg << C("36;1") << "job accepted: height=" << tpl.height 
+                    << " prev=" << ui.cand.prev_hex.substr(0,16) << "…"
+                    << " diff=" << std::fixed << std::setprecision(2) << difficulty_from_bits(tpl.bits)
+                    << " txs=" << ui.cand.txs << R();
+                ui.last_submit_msg = msg.str();
+                ui.last_submit_when = std::chrono::steady_clock::now();
             }
 
             // Reset round stats/ETA
@@ -2245,7 +2233,6 @@ int main(int argc, char** argv){
             hb.version = 1;
             hb.prev_hash = tpl.prev_hash;
 
-            // Honor node-provided time lower bound (mintime)
             int64_t now = (int64_t)time(nullptr);
             hb.time = std::max<int64_t>(now, std::max<int64_t>(tpl.time, tpl.mintime));
             hb.bits = tpl.bits;
@@ -2276,8 +2263,30 @@ int main(int argc, char** argv){
 #if defined(MIQ_ENABLE_OPENCL)
             if (gpu_enabled) {
                 std::string gerr;
-                std::vector<uint8_t> prefix80 = build_header_prefix80(b.header, b.header.merkle_root);
-                std::vector<uint8_t> gpuprefix = make_gpu_prefix(prefix80);
+                std::vector<uint8_t> prefix80 = 
+                    [&](){
+                        std::vector<uint8_t> p; 
+                        p.reserve(80);
+                        put_u32_le(p, b.header.version);
+                        p.insert(p.end(), b.header.prev_hash.begin(), b.header.prev_hash.end());
+                        p.insert(p.end(), b.header.merkle_root.begin(), b.header.merkle_root.end());
+                        put_u64_le(p, (uint64_t)b.header.time);
+                        put_u32_le(p, b.header.bits);
+                        return p;
+                    }();
+                std::vector<uint8_t> gpuprefix;
+                if(salt_pos == SaltPos::PRE && !salt_bytes.empty()){
+                    gpuprefix.reserve(salt_bytes.size()+prefix80.size());
+                    gpuprefix.insert(gpuprefix.end(), salt_bytes.begin(), salt_bytes.end());
+                    gpuprefix.insert(gpuprefix.end(), prefix80.begin(), prefix80.end());
+                } else if(salt_pos == SaltPos::POST && !salt_bytes.empty()){
+                    gpuprefix.reserve(prefix80.size()+salt_bytes.size());
+                    gpuprefix.insert(gpuprefix.end(), prefix80.begin(), prefix80.end());
+                    gpuprefix.insert(gpuprefix.end(), salt_bytes.begin(), salt_bytes.end());
+                } else {
+                    gpuprefix = prefix80;
+                }
+
                 if (!gpu.set_job(gpuprefix, target_be, &gerr)) {
                     std::fprintf(stderr, "[GPU] job set failed: %s\n", gerr.c_str());
                 } else {
@@ -2309,7 +2318,6 @@ int main(int argc, char** argv){
             // Wait for CPU workers
             for (auto &th : thv) th.join();
 
-            // Stop GPU worker if running
 #if defined(MIQ_ENABLE_OPENCL)
             if (gpu_th.joinable()) {
                 found.store(true);
@@ -2317,7 +2325,7 @@ int main(int argc, char** argv){
             }
 #endif
 
-            // Check staleness against current tip (uses tpl safely here)
+            // Check staleness vs tip
             TipInfo tip_now{};
             if (rpc_gettipinfo(rpc_host, rpc_port, token, tip_now)) {
                 if (from_hex_s(tip_now.hash_hex) != tpl.prev_hash) {
@@ -2328,7 +2336,7 @@ int main(int argc, char** argv){
                 }
             }
 
-            // Verify found header meets target (paranoia)
+            // Verify meets target
             auto hchk = found_block.block_hash();
             if (!meets_target_be_raw(hchk.data(), hb.bits)) {
                 std::lock_guard<std::mutex> lk(ui.mtx);
@@ -2337,7 +2345,7 @@ int main(int argc, char** argv){
                 continue;
             }
 
-            // Submit the block
+            // Submit
             auto raw = miq::ser_block(found_block);
             std::string hexblk = miq::to_hex(raw);
 
@@ -2345,7 +2353,7 @@ int main(int argc, char** argv){
             bool ok = rpc_submitblock_any(rpc_host, rpc_port, token, ok_body, err_body, hexblk);
 
             if (ok) {
-                // Try to confirm acceptance at exact height/hash
+                // Try confirm acceptance
                 bool confirmed = false;
                 for (int i = 0; i < 40; ++i) {
                     TipInfo t2{};
@@ -2369,8 +2377,6 @@ int main(int argc, char** argv){
                         ui.last_submit_msg = m.str();
                         ui.last_tip_was_mine.store(true);
                         ui.last_winner_addr.clear();
-
-                        // 4-arg signature (host,port,token,msg)
                         rpc_minerlog_best_effort(
                             rpc_host, rpc_port, token,
                             std::string("miner: accepted block at height ")
