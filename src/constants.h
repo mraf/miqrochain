@@ -49,6 +49,10 @@
 #define MIQ_OUTBOUND_TARGET 4
 #endif
 
+#ifdef MIQ_INDEX_PIPELINE
+#define MIQ_INDEX_PIPELINE 16
+#endif
+
 // Outbound dialing cadence (ms)
 #ifndef MIQ_DIAL_INTERVAL_MS
 #define MIQ_DIAL_INTERVAL_MS 15000
