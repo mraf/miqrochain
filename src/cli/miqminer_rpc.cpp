@@ -440,6 +440,10 @@ static std::string rpc_build(const std::string& method, const std::string& param
 // ===== RPC wrappers ==========================================================
 struct TipInfo { uint64_t height{0}; std::string hash_hex; uint32_t bits{0}; int64_t time{0}; };
 
+static bool rpc_getblockhash(const std::string& host, uint16_t port, const std::string& auth,
+                             uint64_t height, std::string& out);
+static bool rpc_getblock_time_bits(const std::string& host, uint16_t port, const std::string& auth,
+                                   const std::string& hh, long long& out_time, uint32_t& out_bits);
 static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::string& auth, TipInfo& out){
 {
         HttpResp r;
@@ -1072,7 +1076,7 @@ static inline std::string center_fit(const std::string& s, size_t width){
     size_t right = width - s.size() - left;
     return std::string(left,' ') + s + std::string(right,' ');
 }
-static [[maybe_unused]] std::string fmt_eta(double seconds){
+[[maybe_unused]] static std::string fmt_eta(double seconds){
     if(!std::isfinite(seconds) || seconds <= 0) return std::string("--:--");
     long long s = (long long)std::llround(seconds);
     long long h = s / 3600; s %= 3600;
