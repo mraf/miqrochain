@@ -3,6 +3,31 @@
 #include <cstddef>
 #include <string>
 
+#ifndef MIQ_RATE_BLOCK_BPS
+#define MIQ_RATE_BLOCK_BPS   (16u * 1024u * 1024u)
+#endif
+#ifndef MIQ_RATE_BLOCK_BURST
+#define MIQ_RATE_BLOCK_BURST (64u * 1024u * 1024u)
+#endif
+#ifndef MIQ_RATE_TX_BPS
+#define MIQ_RATE_TX_BPS      (1u * 1024u * 1024u)
+#endif
+#ifndef MIQ_RATE_TX_BURST
+#define MIQ_RATE_TX_BURST    (4u * 1024u * 1024u)
+#endif
+#ifndef MIQ_P2P_STALL_RETRY_MS
+#define MIQ_P2P_STALL_RETRY_MS 5000
+#endif
+#ifndef MIQ_IBD_FALLBACK_AFTER_MS
+#define MIQ_IBD_FALLBACK_AFTER_MS (45 * 1000)
+#endif
+#ifndef MIQ_OUTBOUND_TARGET
+#define MIQ_OUTBOUND_TARGET 8
+#endif
+#ifndef MIQ_SEED_MODE_OUTBOUND_TARGET
+#define MIQ_SEED_MODE_OUTBOUND_TARGET 2
+#endif
+
 //
 // ==== P2P/addrman tuning (macros picked up by p2p.cpp) =====================
 // These are optional overrides; p2p.cpp only defines its own defaults if these
@@ -153,5 +178,12 @@ static constexpr size_t MAX_MSG_SIZE   = 2 * 1024 * 1024; // 2 MiB
 
 // Optional: default RPC token (empty = no token unless MIQ_RPC_TOKEN env set)
 static constexpr const char* RPC_TOKEN_DEFAULT = "";
+
+#ifndef MIQ_DIAL_INTERVAL_MS
+#define MIQ_DIAL_INTERVAL_MS 3000
+#endif
+#ifndef MIQ_HEADERS_EMPTY_LIMIT
+#define MIQ_HEADERS_EMPTY_LIMIT 2
+#endif
 
 }
