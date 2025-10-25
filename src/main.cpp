@@ -2468,6 +2468,7 @@ int main(int argc, char** argv){
         if (can_tui) tui.mark_step_ok("Initialize mempool & RPC");
 
         P2P p2p(chain);
+        p2p.set_inflight_caps(256, 128);
         p2p.set_datadir(cfg.datadir);
         p2p.set_mempool(&mempool);
         rpc.set_p2p(&p2p);
