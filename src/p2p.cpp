@@ -267,7 +267,7 @@
   #define MIQ_P2P_TRICKLE_BATCH 48
   #endif
   #ifndef MIQ_P2P_STALL_RETRY_MS
-  #define MIQ_P2P_STALL_RETRY_MS 60000
+  #define MIQ_P2P_STALL_RETRY_MS 15000
   #endif
 #else
   #ifndef MIQ_P2P_NEW_INBOUND_CAP_PER_MIN
@@ -284,9 +284,6 @@
   #endif
   #ifndef MIQ_P2P_TRICKLE_BATCH
   #define MIQ_P2P_TRICKLE_BATCH 64
-  #endif
-  #ifndef MIQ_P2P_STALL_RETRY_MS
-  #define MIQ_P2P_STALL_RETRY_MS 60000
   #endif
 #endif
 
@@ -826,6 +823,17 @@ static inline void miq_set_nodelay(Sock s) {
                reinterpret_cast<const char*>(&one), sizeof(one));
 }
 
+static inline void miq_set_sockbufs(Sock s) {
+    int sz = 1<<20; // 1 MiB
+#if defined(_WIN32)
+    (void)setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*)&sz, sizeof(sz));
+    (void)setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&sz, sizeof(sz));
+#else
+    (void)setsockopt(s, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+    (void)setsockopt(s, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+#endif
+}
+
 static inline bool miq_set_nonblock(Sock s) {
 #ifdef _WIN32
     u_long mode = 1;
@@ -848,6 +856,7 @@ static Sock miq_connect_nb(const sockaddr* sa, socklen_t slen, int timeout_ms) {
     miq_set_cloexec(s);
     (void)miq_set_nonblock(s);
     (void)miq_set_nodelay(s);
+    miq_set_sockbufs(s);
 
 #ifdef _WIN32
     int rc = ::connect(s, sa, (int)slen);
@@ -2069,8 +2078,18 @@ void P2P::send_tx(Sock sock, const std::vector<uint8_t>& raw){
 
 void P2P::start_sync_with_peer(PeerState& ps){
     ps.syncing = true;
+    ps.inflight_index = 0;
     ps.next_index = chain_.height() + 1;
-    request_block_index(ps, ps.next_index);
+    fill_index_pipeline(ps);
+}
+
+void P2P::fill_index_pipeline(PeerState& ps){
+    const uint32_t pipe = (uint32_t)MIQ_INDEX_PIPELINE;
+    while (ps.inflight_index < pipe) {
+        uint64_t idx = ps.next_index++;
+        request_block_index(ps, idx);
+        ps.inflight_index++;
+    }
 }
 
 void P2P::request_block_index(PeerState& ps, uint64_t index){
@@ -2717,6 +2736,7 @@ void P2P::loop(){
                 } else {
                     (void)miq_set_nonblock(c);
                     (void)miq_set_nodelay(c);
+                    miq_set_sockbufs(c);
                     miq_set_cloexec(c);
                     miq_set_keepalive(c);
                     int64_t tnow = now_ms();
@@ -2771,6 +2791,7 @@ void P2P::loop(){
                 } else {
                     (void)miq_set_nonblock(c);
                     (void)miq_set_nodelay(c);
+                    miq_set_sockbufs(c);
                     miq_set_cloexec(c);
                     miq_set_keepalive(c);
                     int64_t tnow = now_ms();
@@ -2962,8 +2983,9 @@ void P2P::loop(){
 #endif
                         {
                             ps.syncing = true;
+                            ps.inflight_index = 0;
                             ps.next_index = chain_.height() + 1;
-                            request_block_index(ps, ps.next_index);
+                            fill_index_pipeline(ps);
                         }
 
                         // Ask for addresses + publish our fee filter
@@ -3070,19 +3092,25 @@ void P2P::loop(){
                             Block hb;
                             if (!deser_block(m.payload, hb)) { if (++ps.mis > 10) { dead.push_back(s); } continue; }
                             const std::string bh = hexkey(hb.block_hash());
+                            bool drop_unsolicited = false;
                             if (!ps.syncing) {
-                                if (unsolicited_drop(ps, "block", bh)) {
-                                    // Polite ignore: unsolicited blocks are common during IBD on some impls.
-                                    continue;
+                                // Accept unsolicited if parent is known (header or full block)
+                                bool parent_known = chain_.header_exists(hb.header.prev_hash) || chain_.have_block(hb.header.prev_hash);
+                                if (!parent_known && unsolicited_drop(ps, "block", bh)) {
+                                    drop_unsolicited = true;
                                 }
+                            }
+                            if (drop_unsolicited) {
+                                // Polite ignore: unsolicited blocks are common during IBD on some impls.
+                                continue;
                             }
                             ps.inflight_blocks.erase(bh);
                             g_inflight_block_ts[(Sock)s].erase(bh);
                             g_global_inflight_blocks.erase(bh);
                             handle_incoming_block(s, m.payload);
                             if (ps.syncing) {
-                                ps.next_index = chain_.height() + 1;
-                                request_block_index(ps, ps.next_index);
+                                if (ps.inflight_index > 0) ps.inflight_index--;
+                                fill_index_pipeline(ps);
                             }
                         }
                       
@@ -3274,8 +3302,9 @@ void P2P::loop(){
                                     log_warn("P2P: no headers progress after 3 full batches; falling back to by-index sync");
                                     ps.banscore = std::min(ps.banscore + 1, MIQ_P2P_MAX_BANSCORE);
                                     ps.syncing = true;
+                                    ps.inflight_index = 0;
                                     ps.next_index = chain_.height() + 1;
-                                    request_block_index(ps, ps.next_index);
+                                    fill_index_pipeline(ps);
                                     z = 0;
                                     g_peer_stalls[(Sock)s]++;
                                     if (g_peer_stalls[(Sock)s] >= MIQ_P2P_BAD_PEER_MAX_STALLS && !is_loopback(ps.ip)) {
