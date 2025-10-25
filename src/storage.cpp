@@ -23,6 +23,16 @@
 
 namespace fs = std::filesystem;
 namespace miq {
+
+static bool fast_sync_enabled() {
+    const char* e = std::getenv("MIQ_FAST_SYNC");
+    return e && (e[0]=='1' || e[0]=='t' || e[0]=='T' || e[0]=='y' || e[0]=='Y');
+}
+static inline int64_t now_ms_steady(){
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
+}
+
 bool Storage::open(const std::string& dir){
     fs::create_directories(dir);
     path_blocks_ = dir + "/blocks.dat";
@@ -57,7 +67,7 @@ bool miq::Storage::append_block(const std::vector<uint8_t>& raw,
     f.write((const char*)&sz, sizeof(sz));
     f.write((const char*)raw.data(), sz);
     f.flush();
-    flush_path(path_blocks_);
+    if (!fast_sync_enabled()) { flush_path(path_blocks_); }
 
     offsets_.push_back(off);
     uint32_t idx = (uint32_t)offsets_.size()-1;
@@ -77,8 +87,7 @@ bool miq::Storage::append_block(const std::vector<uint8_t>& raw,
         hm.write((const char*)&ksz, sizeof(ksz));
         hm.write(hexh.c_str(), ksz);
         hm.write((const char*)&idx, sizeof(idx));
-        hm.flush();
-        flush_path(path_hashmap_);
+        hm.flush(); if (!fast_sync_enabled()) { flush_path(path_hashmap_); }
     }
     return true;
 }
