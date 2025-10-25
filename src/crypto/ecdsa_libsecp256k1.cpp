@@ -3,6 +3,7 @@
 #include <array>
 #include <mutex>
 #include <cstring>
+#include <cstdio>   // fprintf
 
 #include "crypto/ecdsa_iface.h"
 #include "crypto/secure_random.h"
@@ -20,7 +21,10 @@ static void init_ctx() {
         uint8_t seed[32];
         // Use your OS RNG wrapper
         ::miq::secure_random(seed, sizeof(seed), nullptr);
-        (void)secp256k1_context_randomize(g_ctx, seed);
+        if (secp256k1_context_randomize(g_ctx, seed) != 1) {
+            // Best-effort hardening; not fatal if it fails. Log once to stderr (no extra deps).
+            std::fprintf(stderr, "libsecp256k1: context_randomize() returned non-success; continuing without extra randomization.\n");
+        }
         std::memset(seed, 0, sizeof(seed));
     });
 }
