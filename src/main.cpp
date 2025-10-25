@@ -37,7 +37,9 @@
 #  include "reindex_utxo.h"
 #endif
 #if (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
-extern bool ensure_utxo_fully_indexed(miq::Chain&, const std::string&, bool) __attribute__((weak));
+namespace miq {
+extern bool ensure_utxo_fully_indexed(Chain&, const std::string&, bool) __attribute__((weak));
+}
 #  define MIQ_CAN_PROBE_UTXO_REINDEX 1
 #else
 #  define MIQ_CAN_PROBE_UTXO_REINDEX 0

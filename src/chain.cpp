@@ -513,7 +513,19 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
             /*next_height=*/ next_height,
             /*interval=*/ MIQ_RETARGET_INTERVAL
         );
-        if (h.bits != expected) { err = "bad header bits"; return false; }
+        if (h.bits != expected) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "0x%08x", expected);
+            std::string exp_str(buf);
+            snprintf(buf, sizeof(buf), "0x%08x", h.bits);
+            std::string got_str(buf);
+            log_warn("Header validation failed: height=" + std::to_string(next_height) +
+                     " expected_bits=" + exp_str +
+                     " got_bits=" + got_str +
+                     " window_size=" + std::to_string(window.size()));
+            err = "bad header bits";
+            return false;
+        }
     }
 
     // POW
@@ -563,6 +575,7 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
         parent_work   = itp->second.work_sum;
     } else if (h.prev_hash == tip_.hash) {
         parent_height = tip_.height;
+        parent_work   = work_from_bits(tip_.bits);  // FIX: set parent_work for genesis chain
     }
     m.height   = parent_height + 1;
     m.work_sum = parent_work + work_from_bits(h.bits);
@@ -605,8 +618,13 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
     std::vector<std::vector<uint8_t>> up, down;
     if (!find_header_fork(tip_.hash, bh, up, down)) return;
 
-    for (const auto& hh : down) {
+    // up contains blocks from best_header UP to common ancestor
+    // down contains blocks from tip DOWN to common ancestor
+    // We want to download blocks from common ancestor UP to best_header
+    // So we should use up, but in reverse order (from common ancestor to best_header)
+    for (auto it = up.rbegin(); it != up.rend(); ++it) {
         if (out.size() >= max) break;
+        const auto& hh = *it;
         std::vector<uint8_t> tmp;
         bool have_orphan = orphan_get(hh, tmp);
         if (!have_block(hh) && !have_orphan) out.push_back(hh);
@@ -641,25 +659,81 @@ bool Chain::find_header_fork(const std::vector<uint8_t>& a,
     while (A && hx.height > hy.height) {
         path_up_from_b.push_back(x);
         auto it = header_index_.find(hk(hx.prev));
-        if (it == header_index_.end()) break;
-        hx = it->second;
-        x = hx.hash;
+        if (it == header_index_.end()) {
+            // Check if parent is the tip
+            if (hx.prev == tip_.hash) {
+                // Don't update hx, just break - we've found the common ancestor (tip)
+                break;
+            } else {
+                break;
+            }
+        } else {
+            hx = it->second;
+            x = hx.hash;
+        }
     }
     while (A && hy.height > hx.height) {
         path_down_from_a.push_back(y);
         auto it = header_index_.find(hk(hy.prev));
-        if (it == header_index_.end()) break;
-        hy = it->second;
-        y = hy.hash;
+        if (it == header_index_.end()) {
+            // Check if parent is the tip
+            if (hy.prev == tip_.hash) {
+                hy.hash = tip_.hash;
+                hy.height = tip_.height;
+                hy.prev = std::vector<uint8_t>(32, 0);
+                y = tip_.hash;
+            } else {
+                break;
+            }
+        } else {
+            hy = it->second;
+            y = hy.hash;
+        }
     }
     while (x != y) {
         path_up_from_b.push_back(x);
         path_down_from_a.push_back(y);
         auto itx = header_index_.find(hk(hx.prev));
         auto ity = header_index_.find(hk(hy.prev));
-        if (itx == header_index_.end() || ity == header_index_.end()) break;
-        hx = itx->second; x = hx.hash;
-        hy = ity->second; y = hy.hash;
+        if (itx == header_index_.end() && ity == header_index_.end()) {
+            // Both parents not found; check if they're the tip
+            if (hx.prev == tip_.hash && hy.prev == tip_.hash) {
+                break; // Found common ancestor (tip)
+            } else if (hx.prev == tip_.hash) {
+                hx.hash = tip_.hash;
+                hx.height = tip_.height;
+                hx.prev = std::vector<uint8_t>(32, 0);
+                x = tip_.hash;
+            } else if (hy.prev == tip_.hash) {
+                hy.hash = tip_.hash;
+                hy.height = tip_.height;
+                hy.prev = std::vector<uint8_t>(32, 0);
+                y = tip_.hash;
+            } else {
+                break;
+            }
+        } else if (itx == header_index_.end()) {
+            if (hx.prev == tip_.hash) {
+                hx.hash = tip_.hash;
+                hx.height = tip_.height;
+                hx.prev = std::vector<uint8_t>(32, 0);
+                x = tip_.hash;
+            } else {
+                break;
+            }
+        } else if (ity == header_index_.end()) {
+            if (hy.prev == tip_.hash) {
+                hy.hash = tip_.hash;
+                hy.height = tip_.height;
+                hy.prev = std::vector<uint8_t>(32, 0);
+                y = tip_.hash;
+            } else {
+                break;
+            }
+        } else {
+            hx = itx->second; x = hx.hash;
+            hy = ity->second; y = hy.hash;
+        }
     }
     std::reverse(path_down_from_a.begin(), path_down_from_a.end());
     return true;

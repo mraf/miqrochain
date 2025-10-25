@@ -1539,11 +1539,14 @@ static void pin_thread_to_cpu(unsigned tid){
 #if defined(_WIN32)
     DWORD_PTR mask = (DWORD_PTR)1 << (tid % (8*sizeof(DWORD_PTR)));
     SetThreadAffinityMask(GetCurrentThread(), mask);
-#else
+#elif defined(__linux__)
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(tid % CPU_SETSIZE, &set);
     sched_setaffinity(0, sizeof(set), &set);
+#else
+    // macOS and other platforms don't have sched_setaffinity
+    (void)tid;  // suppress unused warning
 #endif
 }
 
