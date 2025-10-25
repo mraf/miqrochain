@@ -165,6 +165,11 @@ static std::vector<uint8_t> from_hex_s(const std::string& h){ return miq::from_h
 static inline bool json_has_error(const std::string& json){
     size_t e = json.find("\"error\"");
     if(e==std::string::npos) return false;
+    size_t colon = json.find(':', e);
+    if(colon != std::string::npos){
+        size_t p = json.find_first_not_of(" \t\r\n", colon+1);
+        if(p != std::string::npos && json.compare(p,4,"null")==0) return false;
+    }
     size_t r = json.find("\"result\"");
     return (r==std::string::npos) || (e < r);
 }
@@ -437,15 +442,40 @@ struct TipInfo { uint64_t height{0}; std::string hash_hex; uint32_t bits{0}; int
 
 static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::string& auth, TipInfo& out){
     HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build("gettipinfo","[]"), r) || r.code!=200) return false;
-    if(json_has_error(r.body)) return false;
-    long long h=0,b=0,t=0; std::string hh;
-    if(!json_find_number(r.body,"height",h)) return false;
-    if(!json_find_string(r.body,"hash",hh)) return false;
-    if(!json_find_number(r.body,"bits",b)) return false;
-    if(!json_find_number(r.body,"time",t)) return false;
-    out.height=(uint64_t)h; out.hash_hex=hh; out.bits=sanitize_bits((uint32_t)b); out.time=(int64_t)t;
-    return true;
+        if(http_post(host, port, "/", auth, rpc_build("gettipinfo","[]"), r) && r.code==200 && !json_has_error(r.body)){
+            long long h=0,b=0,t=0; std::string hh;
+            if(json_find_number(r.body,"height",h) &&
+               json_find_string(r.body,"hash",hh) &&
+               json_find_number(r.body,"bits",b) &&
+               json_find_number(r.body,"time",t))
+            {
+                out.height=(uint64_t)h; out.hash_hex=hh; out.bits=sanitize_bits((uint32_t)b); out.time=(int64_t)t;
+                return true;
+            }
+        }
+    }
+    // Fallback path (portable): getblockchaininfo → bestblockhash/blocks → getblock
+    {
+        HttpResp r;
+        if(!http_post(host, port, "/", auth, rpc_build("getblockchaininfo","[]"), r) || r.code!=200 || json_has_error(r.body))
+            return false;
+        long long blocks=0;
+        std::string besthash;
+        (void)json_find_number(r.body, "blocks", blocks);
+        (void)json_find_string(r.body, "bestblockhash", besthash);
+        if(besthash.empty()){
+            // Try via height
+            if(blocks<=0) return false;
+            if(!rpc_getblockhash(host, port, auth, (uint64_t)blocks, besthash)) return false;
+        }
+        long long t=0; uint32_t bits=0;
+        if(!rpc_getblock_time_bits(host, port, auth, besthash, t, bits)) return false;
+        out.height = (blocks>0)? (uint64_t)blocks : 0;
+        out.hash_hex = besthash;
+        out.bits = sanitize_bits(bits ? bits : miq::GENESIS_BITS);
+        out.time = (int64_t)t;
+        return true;
+    }
 }
 static bool rpc_getminerstats(const std::string& host, uint16_t port, const std::string& auth, double& out_net_hs){
     HttpResp r;
@@ -473,6 +503,22 @@ static bool rpc_getblock_header_time(const std::string& host, uint16_t port, con
     if(json_find_number(r.body, "time", t)) { out_time=t; return true; }
     return false;
 }
+
+static bool rpc_getblock_time_bits(const std::string& host, uint16_t port, const std::string& auth,
+                                   const std::string& hh, long long& out_time, uint32_t& out_bits){
+    std::ostringstream ps; ps<<"[\""<<hh<<"\"]";
+    HttpResp r;
+    if(!http_post(host, port, "/", auth, rpc_build("getblock", ps.str()), r) || r.code != 200) return false;
+    if(json_has_error(r.body)) return false;
+    long long t=0; uint32_t b=0;
+    (void)json_find_number(r.body, "time", t);
+    (void)json_find_hex_or_number_u32(r.body, "bits", b);
+    if(!t && !b) return false;
+    out_time = t;
+    out_bits = sanitize_bits(b ? b : miq::GENESIS_BITS);
+    return true;
+}
+
 struct LastBlockInfo {
     uint64_t height{0};
     std::string hash_hex;
@@ -2162,21 +2208,26 @@ int main(int argc, char** argv){
         };
 #endif
 
-        // ===== Gate: wait for node to be reachable and synced =================
-        std::fprintf(stderr, "[miner] waiting for local node @ %s:%u to be reachable and fully synced…\n",
+        std::fprintf(stderr, "[miner] probing node @ %s:%u for miner templates…\n",
                      rpc_host.c_str(), (unsigned)rpc_port);
-        while (true) {
-            if (ui.node_reachable.load() && ui.node_synced.load()) break;
-            // Graceful fallback: if getblockchaininfo is missing but we can acquire a sane template, allow start.
+        auto has_nonzero_prev = [](const std::vector<uint8_t>& v){
+            if(v.size()!=32) return false;
+            for(uint8_t b: v) if(b) return true;
+            return false;
+        };
+        for(;;){
             MinerTemplate probe;
-            if (rpc_getminertemplate(rpc_host, rpc_port, token, probe)) {
-                // Require that tip height is >= 1 and time is not stale (> 24h old)
+            if(rpc_getminertemplate(rpc_host, rpc_port, token, probe)){
                 int64_t now = (int64_t)time(nullptr);
-                if (probe.height > 0 && (now - probe.time) < (24*3600)) break;
+                if(has_nonzero_prev(probe.prev_hash) && (probe.height>0 || probe.time>0) &&
+                   (now - (probe.time?probe.time:now)) < (24*3600))
+                {
+                    break; // ready to mine
+                }
             }
             miq_sleep_ms(500);
         }
-        std::fprintf(stderr, "[miner] node ready — starting mining loop.\n");
+        std::fprintf(stderr, "[miner] template available — starting mining loop.\n");
 
         // ===== mining loop ===================================================
         while (true) {
