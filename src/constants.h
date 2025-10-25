@@ -98,6 +98,10 @@ static constexpr uint64_t BLOCK_TIME_SECS = 480; // 8 minutes
 static constexpr uint16_t P2P_PORT = 9883;      // (kept as-is per your current config)
 static constexpr uint16_t RPC_PORT = 9834;
 
+#ifndef MIQ_INDEX_PIPELINE
+#define MIQ_INDEX_PIPELINE 8
+#endif
+
 // Historical 32-bit network tag you already had; we continue to honor it.
 static constexpr uint32_t MAGIC = 0xA3FB9E21;
 
