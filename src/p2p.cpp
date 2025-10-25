@@ -2924,7 +2924,6 @@ void P2P::loop(){
                         return true;
                     };
 
-// --- NEW: finish-handshake helper (idempotent) -----------
                     auto try_finish_handshake = [&](){
                         auto itg2 = g_gate.find(s);
                         if (itg2 == g_gate.end()) return;
@@ -2933,6 +2932,8 @@ void P2P::loop(){
                         if (!(gg.got_version && gg.got_verack && gg.sent_verack)) return;
 
                         ps.verack_ok = true;
+                        const int64_t hs_ms = now_ms() - gg.t_conn_ms;
+                        log_info(std::string("P2P: handshake complete with ")+ps.ip+" in "+std::to_string(hs_ms)+" ms");
 
 #if MIQ_ENABLE_HEADERS_FIRST
                         const bool peer_supports_headers = (ps.features & (1ull<<0)) != 0;
@@ -3248,7 +3249,7 @@ void P2P::loop(){
                         if (used_reverse) { g_hdr_flip[s] = true; }
 
                         std::vector<std::vector<uint8_t>> want;
-                        chain_.next_block_fetch_targets(want, /*max*/32);
+                        chain_.next_block_fetch_targets(want, caps_.max_blocks ? caps_.max_blocks : (size_t)64);
                         // Define at_tip conservatively: empty batch OR short batch AND no blocks desired
                         bool at_tip = (hs.empty()) || ((hs.size() < kHdrBatchMax) && want.empty());
 
