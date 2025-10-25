@@ -537,9 +537,11 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 struct PeerGate {
-    bool got_version{false};
     bool sent_verack{false};
+    bool got_version{false};
     bool got_verack{false};
+    // Timestamp when TCP connect succeeds (steady clock, ms)
+    int64_t t_conn_ms{0};
     bool is_loopback{false};   // mark if this fd belongs to 127.0.0.1 peer
     int  banscore{0};
     size_t rx_bytes{0};
@@ -894,6 +896,7 @@ static inline void gate_on_connect(Sock fd){
     PeerGate pg;
     pg.t_conn = Clock::now();
     pg.t_last = pg.t_conn;
+    pg.t_conn_ms = now_ms();
     pg.is_loopback = false; // default; set after we learn the IP
     pg.hs_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now().time_since_epoch()).count();
@@ -2932,7 +2935,7 @@ void P2P::loop(){
                         if (!(gg.got_version && gg.got_verack && gg.sent_verack)) return;
 
                         ps.verack_ok = true;
-                        const int64_t hs_ms = now_ms() - gg.conn_ms;
+                        const int64_t hs_ms = now_ms() - gg.t_conn_ms;
                         log_info(std::string("P2P: handshake complete with ")+ps.ip+" in "+std::to_string(hs_ms)+" ms");
 
 #if MIQ_ENABLE_HEADERS_FIRST
