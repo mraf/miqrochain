@@ -3229,6 +3229,7 @@ void P2P::loop(){
                         }
                         const size_t kHdrBatchMax = 2000; // must match build_headers_payload()
                         size_t accepted = 0;
+                        bool   used_reverse = false;
                         std::string herr;
                         for (const auto& h : hs) {
                             if (chain_.accept_header(h, herr)) {
@@ -3238,9 +3239,13 @@ void P2P::loop(){
                                 BlockHeader hr = h;
                                 std::reverse(hr.prev_hash.begin(),   hr.prev_hash.end());
                                 std::reverse(hr.merkle_root.begin(), hr.merkle_root.end());
-                                if (chain_.accept_header(hr, herr)) accepted++;
+                                if (chain_.accept_header(hr, herr)) {
+                                    accepted++;
+                                    used_reverse = true;
+                                }
                             }
                         }
+                        if (used_reverse) { g_hdr_flip[s] = true; }
 
                         std::vector<std::vector<uint8_t>> want;
                         chain_.next_block_fetch_targets(want, /*max*/32);
@@ -3475,7 +3480,15 @@ void P2P::loop(){
             g_preverack_counts.erase(s);
             g_trickle_last_ms.erase(s);
             g_cmd_rl.erase(s); // mirror cleanup in case gate_on_close wasn't hit
-            g_inflight_block_ts.erase(s);
+            {
+                auto it_ts = g_inflight_block_ts.find(s);
+                if (it_ts != g_inflight_block_ts.end()) {
+                    for (const auto& kv : it_ts->second) {
+                        g_global_inflight_blocks.erase(kv.first);
+                    }
+                    g_inflight_block_ts.erase(it_ts);
+                }
+            }
         }
 
         // trickle any queued invtx payloads (enqueued by broadcast_inv_tx)
