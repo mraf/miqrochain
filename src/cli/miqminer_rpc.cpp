@@ -441,15 +441,19 @@ static std::string rpc_build(const std::string& method, const std::string& param
 struct TipInfo { uint64_t height{0}; std::string hash_hex; uint32_t bits{0}; int64_t time{0}; };
 
 static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::string& auth, TipInfo& out){
+{
         HttpResp r;
-        if(http_post(host, port, "/", auth, rpc_build("gettipinfo","[]"), r) && r.code==200 && !json_has_error(r.body)){
+        if (http_post(host, port, "/", auth, rpc_build("gettipinfo","[]"), r)
+            && r.code==200 && !json_has_error(r.body)) {
             long long h=0,b=0,t=0; std::string hh;
-            if(json_find_number(r.body,"height",h) &&
-               json_find_string(r.body,"hash",hh) &&
-               json_find_number(r.body,"bits",b) &&
-               json_find_number(r.body,"time",t))
-            {
-                out.height=(uint64_t)h; out.hash_hex=hh; out.bits=sanitize_bits((uint32_t)b); out.time=(int64_t)t;
+            if (json_find_number(r.body,"height",h) &&
+                json_find_string(r.body,"hash",hh) &&
+                json_find_number(r.body,"bits",b) &&
+                json_find_number(r.body,"time",t)) {
+                out.height = (uint64_t)h;
+                out.hash_hex = hh;
+                out.bits = sanitize_bits((uint32_t)b);
+                out.time = (int64_t)t;
                 return true;
             }
         }
@@ -457,24 +461,23 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
     // Fallback (portable): getblockchaininfo → bestblockhash/blocks → getblock
     {
         HttpResp r;
-        if(!http_post(host, port, "/", auth, rpc_build("getblockchaininfo","[]"), r) || r.code!=200 || json_has_error(r.body))
-            return false;
-        long long blocks=0;
-        std::string besthash;
+        if (!http_post(host, port, "/", auth, rpc_build("getblockchaininfo","[]"), r)
+            || r.code!=200 || json_has_error(r.body)) return false;
+        long long blocks=0; std::string besthash;
         (void)json_find_number(r.body, "blocks", blocks);
         (void)json_find_string(r.body, "bestblockhash", besthash);
-        if(besthash.empty()){
-            if(blocks<=0) return false;
-            if(!rpc_getblockhash(host, port, auth, (uint64_t)blocks, besthash)) return false;
+        if (besthash.empty()) {
+            if (blocks<=0) return false;
+            if (!rpc_getblockhash(host, port, auth, (uint64_t)blocks, besthash)) return false;
         }
         long long t=0; uint32_t bits=0;
-        if(!rpc_getblock_time_bits(host, port, auth, besthash, t, bits)) return false;
+        if (!rpc_getblock_time_bits(host, port, auth, besthash, t, bits)) return false;
         out.height = (blocks>0)? (uint64_t)blocks : 0;
         out.hash_hex = besthash;
         out.bits = sanitize_bits(bits ? bits : miq::GENESIS_BITS);
         out.time = (int64_t)t;
         return true;
-    }
+}
 }
 static bool rpc_getminerstats(const std::string& host, uint16_t port, const std::string& auth, double& out_net_hs){
     HttpResp r;
@@ -493,6 +496,7 @@ static bool rpc_getblockhash(const std::string& host, uint16_t port, const std::
     if(json_extract_top_string(r.body, out)) return true;
     return false;
 }
+
 static bool rpc_getblock_header_time(const std::string& host, uint16_t port, const std::string& auth, const std::string& hh, long long& out_time){
     std::ostringstream ps; ps<<"[\""<<hh<<"\"]";
     HttpResp r;
