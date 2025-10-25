@@ -97,6 +97,7 @@ struct PeerState {
     // sync
     bool        syncing{false};
     uint64_t    next_index{0};
+    uint32_t    inflight_index{0};
 
     // per-peer RX buffer & liveness
     std::vector<uint8_t> rx;
@@ -290,7 +291,7 @@ private:
     // per-family pacing config
     struct FamilyRate { double per_sec; double burst; };
     std::unordered_map<std::string, FamilyRate> rate_cfg_{
-        {"get",  {5.0,   10.0}},
+        {"get",  {20.0,  40.0}},
         {"inv",  {100.0, 200.0}},
         {"addr", {1.0,   2.0}},
     };
@@ -307,6 +308,7 @@ private:
     // sync & block serving
     void start_sync_with_peer(PeerState& ps);
     void request_block_index(PeerState& ps, uint64_t index);
+    void fill_index_pipeline(PeerState& ps);
     void request_block_hash(PeerState& ps, const std::vector<uint8_t>& h);
     void handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw);
 
