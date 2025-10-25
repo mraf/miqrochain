@@ -2932,7 +2932,7 @@ void P2P::loop(){
                         if (!(gg.got_version && gg.got_verack && gg.sent_verack)) return;
 
                         ps.verack_ok = true;
-                        const int64_t hs_ms = now_ms() - gg.t_conn_ms;
+                        const int64_t hs_ms = now_ms() - gg.conn_ms;
                         log_info(std::string("P2P: handshake complete with ")+ps.ip+" in "+std::to_string(hs_ms)+" ms");
 
 #if MIQ_ENABLE_HEADERS_FIRST
