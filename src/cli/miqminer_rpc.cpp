@@ -441,7 +441,7 @@ static std::string rpc_build(const std::string& method, const std::string& param
 struct TipInfo { uint64_t height{0}; std::string hash_hex; uint32_t bits{0}; int64_t time{0}; };
 
 static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::string& auth, TipInfo& out){
-    HttpResp r;
+        HttpResp r;
         if(http_post(host, port, "/", auth, rpc_build("gettipinfo","[]"), r) && r.code==200 && !json_has_error(r.body)){
             long long h=0,b=0,t=0; std::string hh;
             if(json_find_number(r.body,"height",h) &&
@@ -454,7 +454,7 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
             }
         }
     }
-    // Fallback path (portable): getblockchaininfo → bestblockhash/blocks → getblock
+    // Fallback (portable): getblockchaininfo → bestblockhash/blocks → getblock
     {
         HttpResp r;
         if(!http_post(host, port, "/", auth, rpc_build("getblockchaininfo","[]"), r) || r.code!=200 || json_has_error(r.body))
@@ -464,7 +464,6 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
         (void)json_find_number(r.body, "blocks", blocks);
         (void)json_find_string(r.body, "bestblockhash", besthash);
         if(besthash.empty()){
-            // Try via height
             if(blocks<=0) return false;
             if(!rpc_getblockhash(host, port, auth, (uint64_t)blocks, besthash)) return false;
         }
@@ -1069,7 +1068,7 @@ static inline std::string center_fit(const std::string& s, size_t width){
     size_t right = width - s.size() - left;
     return std::string(left,' ') + s + std::string(right,' ');
 }
-static std::string fmt_eta(double seconds){
+static [[maybe_unused]] std::string fmt_eta(double seconds){
     if(!std::isfinite(seconds) || seconds <= 0) return std::string("--:--");
     long long s = (long long)std::llround(seconds);
     long long h = s / 3600; s %= 3600;
@@ -1082,7 +1081,8 @@ static std::string fmt_eta(double seconds){
     return o.str();
 }
 static std::string progress_bar(double p, size_t width){
-    if(p<0) p=0; if(p>1) p=1;
+    if(p<0) { p=0; }
+    if(p>1) { p=1; }
     size_t full = (size_t)std::floor(p*width);
     std::string s="["; 
     for(size_t i=0;i<width;i++) s.push_back(i<full? '#' : '-');
