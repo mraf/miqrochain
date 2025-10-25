@@ -199,7 +199,7 @@ public:
     std::vector<PeerSnapshot> snapshot_peers() const;
 
     // runtime tuning knobs
-    struct InflightCaps { size_t max_txs{64}; size_t max_blocks{16}; };
+    truct InflightCaps { size_t max_txs{256}; size_t max_blocks{128}; };
     inline void set_inflight_caps(size_t max_txs, size_t max_blocks) {
         caps_.max_txs   = max_txs;
         caps_.max_blocks= max_blocks;
