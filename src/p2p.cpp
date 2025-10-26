@@ -2104,8 +2104,9 @@ void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     const size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : (size_t)32;
     if (!check_rate(ps, "get", 1.0, now_ms())) return;
     if (ps.inflight_blocks.size() >= max_inflight_blocks) return;
-    auto msg = encode_msg("getb", h);
     const std::string key = hexkey(h);
+    if (g_global_inflight_blocks.count(key)) return;
+    auto msg = encode_msg("getb", h);
     if (send_or_close(ps.sock, msg)) {
         ps.inflight_blocks.insert(key);
         g_global_inflight_blocks.insert(key);
@@ -3112,6 +3113,18 @@ void P2P::loop(){
                                 if (ps.inflight_index > 0) ps.inflight_index--;
                                 fill_index_pipeline(ps);
                             }
+                          } else {
+                                const size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : (size_t)32;
+                                if (ps.inflight_blocks.size() < max_inflight_blocks) {
+                                    std::vector<std::vector<uint8_t>> want2;
+                                    chain_.next_block_fetch_targets(want2, max_inflight_blocks);
+                                    for (const auto& h2 : want2) {
+                                        if (ps.inflight_blocks.size() >= max_inflight_blocks) break;
+                                        const std::string key2 = hexkey(h2);
+                                        if (g_global_inflight_blocks.count(key2)) continue;
+                                        request_block_hash(ps, h2);
+                                    }
+                                }
                         }
                       
                     } else if (cmd == "invtx") {
@@ -3320,6 +3333,7 @@ void P2P::loop(){
                                     ps.syncing = true;
                                     ps.next_index = chain_.height() + 1;
                                     request_block_index(ps, ps.next_index);
+                                    ps.inflight_index++;
                                 }
                                 g_zero_hdr_batches[s] = 0;
                             }
@@ -3433,6 +3447,7 @@ void P2P::loop(){
                 if ((tnow - g_last_progress_ms) > (int64_t)MIQ_P2P_STALL_RETRY_MS) {
                     // No recent progress on the index path: retry on *this* peer…
                     request_block_index(ps, ps.next_index);
+                    ps.inflight_index++;
                     // …and (bounded) escalate to ONE additional peer to avoid
                     // spinning forever on a single non-responsive node.
                     const uint64_t idx = ps.next_index;
@@ -3494,6 +3509,7 @@ void P2P::loop(){
                     ps.syncing = true;
                     ps.next_index = chain_.height() + 1;
                     request_block_index(ps, ps.next_index);
+                    ps.inflight_index++;
                 }
             }
 #endif
