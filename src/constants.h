@@ -49,7 +49,7 @@
 #define MIQ_OUTBOUND_TARGET 4
 #endif
 
-#ifdef MIQ_INDEX_PIPELINE
+#ifndef MIQ_INDEX_PIPELINE
 #define MIQ_INDEX_PIPELINE 16
 #endif
 
