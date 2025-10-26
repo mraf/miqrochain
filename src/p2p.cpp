@@ -1563,6 +1563,7 @@ static inline uint32_t be(uint8_t a, uint8_t b, uint8_t c, uint8_t d){
 bool P2P::ipv4_is_public(uint32_t be_ip){
     uint8_t A = uint8_t(be_ip>>24), B = uint8_t(be_ip>>16);
     uint8_t C = uint8_t(be_ip>>8),  D MIQ_MAYBE_UNUSED = uint8_t(be_ip>>0);
+    (void)D;
     if (A == 0 || A == 10 || A == 127) return false;
     if (A == 169 && B == 254) return false;
     if (A == 192 && B == 168) return false;
@@ -3109,6 +3110,19 @@ void P2P::loop(){
                             g_inflight_block_ts[(Sock)s].erase(bh);
                             g_global_inflight_blocks.erase(bh);
                             handle_incoming_block(s, m.payload);
+                            if (!ps.syncing) {
+                                const size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : (size_t)32;
+                                if (ps.inflight_blocks.size() < max_inflight_blocks) {
+                                    std::vector<std::vector<uint8_t>> want2;
+                                    chain_.next_block_fetch_targets(want2, max_inflight_blocks);
+                                    for (const auto& h2 : want2) {
+                                        if (ps.inflight_blocks.size() >= max_inflight_blocks) break;
+                                        const std::string key2 = hexkey(h2);
+                                        if (g_global_inflight_blocks.count(key2)) continue;
+                                        request_block_hash(ps, h2);
+                                    }
+                                }
+                            }
                             if (ps.syncing) {
                                 if (ps.inflight_index > 0) ps.inflight_index--;
                                 fill_index_pipeline(ps);
