@@ -444,8 +444,10 @@ static bool rpc_getblockhash(const std::string& host, uint16_t port, const std::
                              uint64_t height, std::string& out);
 static bool rpc_getblock_time_bits(const std::string& host, uint16_t port, const std::string& auth,
                                    const std::string& hh, long long& out_time, uint32_t& out_bits);
+
 static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::string& auth, TipInfo& out){
-{
+    // Fast path: dedicated RPC (if present)
+    {
         HttpResp r;
         if (http_post(host, port, "/", auth, rpc_build("gettipinfo","[]"), r)
             && r.code==200 && !json_has_error(r.body)) {
@@ -481,8 +483,9 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
         out.bits = sanitize_bits(bits ? bits : miq::GENESIS_BITS);
         out.time = (int64_t)t;
         return true;
+    }
 }
-}
+
 static bool rpc_getminerstats(const std::string& host, uint16_t port, const std::string& auth, double& out_net_hs){
     HttpResp r;
     if(!http_post(host, port, "/", auth, rpc_build("getminerstats","[]"), r) || r.code!=200) return false;
@@ -2216,28 +2219,9 @@ int main(int argc, char** argv){
         };
 #endif
 
-        std::fprintf(stderr, "[miner] probing node @ %s:%u for miner templates…\n",
-                     rpc_host.c_str(), (unsigned)rpc_port);
-        auto has_nonzero_prev = [](const std::vector<uint8_t>& v){
-            if(v.size()!=32) return false;
-            for(uint8_t b: v) if(b) return true;
-            return false;
-        };
-        for(;;){
-            MinerTemplate probe;
-            if(rpc_getminertemplate(rpc_host, rpc_port, token, probe)){
-                int64_t now = (int64_t)time(nullptr);
-                if(has_nonzero_prev(probe.prev_hash) && (probe.height>0 || probe.time>0) &&
-                   (now - (probe.time?probe.time:now)) < (24*3600))
-                {
-                    break; // ready to mine
-                }
-            }
-            miq_sleep_ms(500);
-        }
-        std::fprintf(stderr, "[miner] template available — starting mining loop.\n");
+        // ===== START MINING LOOP IMMEDIATELY (no IBD/template gate) ==========
+        std::fprintf(stderr, "[miner] starting mining loop (no IBD gate; will auto-refresh jobs).\n");
 
-        // ===== mining loop ===================================================
         while (true) {
             MinerTemplate tpl;
             if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
