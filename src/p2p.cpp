@@ -3112,30 +3112,54 @@ void P2P::loop(){
                                 // Polite ignore: unsolicited blocks are common during IBD on some impls.
                                 continue;
                             }
+                            // clear inflight for this block
                             ps.inflight_blocks.erase(bh);
-                            g_inflight_block_ts[(Sock)s].erase(bh);
-                            g_global_inflight_blocks.erase(bh);
-                            handle_incoming_block(s, m.payload);
-                            if (!ps.syncing) {
-                                const size_t base_cap = caps_.max_blocks ? caps_.max_blocks : (size_t)32;
-                                std::vector<std::vector<uint8_t>> want2;
-                                chain_.next_block_fetch_targets(want2, base_cap);
-
+                           g_inflight_block_ts[(Sock)s].erase(bh);
+                           g_global_inflight_blocks.erase(bh);
+                            // accept/process+                            handle_incoming_block(s, m.payload);
+                            // After any processed block, opportunistically fan-out more wants across peers.
+                            const size_t base_cap = caps_.max_blocks ? caps_.max_blocks
+                                                                      : (!g_logged_headers_done ? (size_t)128 : (size_t)32);
+                            std::vector<std::vector<uint8_t>> want2;
+                            chain_.next_block_fetch_targets(want2, base_cap);
+                            if (!want2.empty()) {
                                 std::vector<Sock> cands;
                                 { std::lock_guard<std::mutex> lk2(g_peers_mu);
                                   for (auto& kvp : peers_) if (kvp.second.verack_ok) cands.push_back(kvp.first); }
-                                if (cands.empty()) cands.push_back(sock); // fallback: current peer
-
+                                if (cands.empty()) cands.push_back(s); // fallback to current peer
                                 for (const auto& h2 : want2) {
                                     const std::string key2 = hexkey(h2);
                                     if (g_global_inflight_blocks.count(key2)) continue;
                                     Sock t = rr_pick_peer_for_key(key2, cands);
                                     auto itT = peers_.find(t);
-                                    if (itT != peers_.end()) {
-                                        request_block_hash(itT->second, h2);
-                                    }
+                                    if (itT != peers_.end()) request_block_hash(itT->second, h2);
                                 }
                             }
+
+                            if (ps.syncing) {
+                                if (ps.inflight_index > 0) ps.inflight_index--;
+                                fill_index_pipeline(ps);
+                            }
+                        } else {
+                            // Malformed/empty payload; keep the pipeline moving with a fan-out.
+                            const size_t base_cap = caps_.max_blocks ? caps_.max_blocks
+                                                                      : (!g_logged_headers_done ? (size_t)128 : (size_t)32);
+                            std::vector<std::vector<uint8_t>> want2;
+                            chain_.next_block_fetch_targets(want2, base_cap);
+                            if (!want2.empty()) {
+                                std::vector<Sock> cands;
+                                { std::lock_guard<std::mutex> lk2(g_peers_mu);
+                                  for (auto& kvp : peers_) if (kvp.second.verack_ok) cands.push_back(kvp.first); }
+                                if (cands.empty()) cands.push_back(s); // fallback to current peer
+                                for (const auto& h2 : want2) {
+                                    const std::string key2 = hexkey(h2);
+                                    if (g_global_inflight_blocks.count(key2)) continue;
+                                    Sock t = rr_pick_peer_for_key(key2, cands);
+                                    auto itT = peers_.find(t);
+                                    if (itT != peers_.end()) request_block_hash(itT->second, h2);
+                                }
+                            }
+                        }
                             if (ps.syncing) {
                                 if (ps.inflight_index > 0) ps.inflight_index--;
                                 fill_index_pipeline(ps);
