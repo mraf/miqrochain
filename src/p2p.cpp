@@ -953,15 +953,18 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
     if (it == g_gate.end()) return false;
     auto& g = it->second;
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - g.t_conn).count();
-    if (!g.got_verack && ms > HANDSHAKE_MS){
-        // Loopback is lenient: extend instead of closing
-        if (g.is_loopback) {
-            g.t_conn = Clock::now();
-        } else {
-            close_code = 408;
-            P2P_TRACE("close fd=" + std::to_string((uintptr_t)fd) + " reason=handshake-timeout");
-            return true;
+    g.hs_last_ms = now_ms();
+    // Handshake watchdog based on last activity (not raw connect time).
+    if (!g.got_verack) {
+        int64_t idle = now_ms() - g.hs_last_ms;   // will be small if traffic is flowing
+        if (idle > HANDSHAKE_MS) {
+            if (g.is_loopback) {
+                g.hs_last_ms = now_ms();          // be lenient with localhost tools
+            } else {
+                close_code = 408;
+                P2P_TRACE("close fd=" + std::to_string((uintptr_t)fd) + " reason=handshake-timeout");
+                return true;
+            }
         }
     }
 
@@ -982,6 +985,7 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
         } else {
             if (!g.got_version) {
                 if (miq_safe_preverack_cmd(cmd)) {
+                    // safe pre-version traffic is fine; liveness already refreshed
                     return false;
                 } else {
                     g.banscore += 10;
@@ -1665,6 +1669,13 @@ bool P2P::start(uint16_t port){
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
+
+    g_logged_headers_started = false;
+    g_logged_headers_done    = false;
+    g_global_inflight_blocks.clear();
+    g_inflight_block_ts.clear();
+    g_rr_next_idx.clear();
+    g_last_hdr_req_ms.clear();
 
 #ifdef MIQ_DEFAULT_PORT
     (void)MIQ_DEFAULT_PORT;
@@ -3102,10 +3113,11 @@ void P2P::loop(){
                             const std::string bh = hexkey(hb.block_hash());
                             bool drop_unsolicited = false;
                             if (!ps.syncing) {
-                                // Accept unsolicited if parent is known (header or full block)
+                                // During headers phase we prefer liveness: take orphan and chase parent.
+                                const bool in_headers_phase = !g_logged_headers_done;
                                 bool parent_known = chain_.header_exists(hb.header.prev_hash) || chain_.have_block(hb.header.prev_hash);
-                                if (!parent_known && unsolicited_drop(ps, "block", bh)) {
-                                    drop_unsolicited = true;
+                                if (!parent_known && !in_headers_phase) {
+                                    if (unsolicited_drop(ps, "block", bh)) drop_unsolicited = true;
                                 }
                             }
                             if (drop_unsolicited) {
