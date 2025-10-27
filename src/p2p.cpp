@@ -933,7 +933,7 @@ static inline void gate_on_close(Sock fd){
     g_inflight_block_ts.erase(fd); // also drop any inflight block timers for this socket
     g_hdr_flip.erase(fd);
 }
-static inline bool gate_on_bytes(Sock fd, size_t add){
+[[maybe_unused]] static inline bool gate_on_bytes(Sock fd, size_t add){
     auto it = g_gate.find(fd);
     if (it == g_gate.end()) return false;
     it->second.rx_bytes += add;
@@ -1161,7 +1161,7 @@ static std::string self_list_for_log(){
     return out;
 }
 
-static inline uint16_t v4_group16(uint32_t be_ip){
+[[maybe_unused]] static inline uint16_t v4_group16(uint32_t be_ip){
     uint8_t A = uint8_t(be_ip>>24), B = uint8_t(be_ip>>16);
     return (uint16_t(A) << 8) | uint16_t(B);
 }
@@ -1271,7 +1271,7 @@ static inline std::vector<uint8_t> miq_build_version_payload() {
 }
 
 // Small helper to throttle header pipelining safely.
-static inline bool can_accept_hdr_batch(miq::PeerState& ps, int64_t now) {
+[[maybe_unused]] static inline bool can_accept_hdr_batch(miq::PeerState& ps, int64_t now) {
     const int      kMaxInflight = 4;
     const int64_t  kMinGapMs    = 50; // keep tiny gap to avoid tight spins
     if (static_cast<uint32_t>(ps.inflight_hdr_batches) >= static_cast<uint32_t>(kMaxInflight)) return false;
@@ -1562,7 +1562,7 @@ bool P2P::parse_ipv4(const std::string& dotted, uint32_t& be_ip){
     be_ip = tmp.sin_addr.s_addr;
     return true;
 }
-static inline uint32_t be(uint8_t a, uint8_t b, uint8_t c, uint8_t d){
+[[maybe_unused]] static inline uint32_t be(uint8_t a, uint8_t b, uint8_t c, uint8_t d){
     return (uint32_t(a)<<24)|(uint32_t(b)<<16)|(uint32_t(c)<<8)|uint32_t(d);
 }
 bool P2P::ipv4_is_public(uint32_t be_ip){
@@ -3138,8 +3138,8 @@ void P2P::loop(){
                             chain_.next_block_fetch_targets(want2, base_cap);
                             if (!want2.empty()) {
                                 std::vector<Sock> cands;
-                                { std::lock_guard<std::mutex> lk2(g_peers_mu);
-                                  for (auto& kvp : peers_) if (kvp.second.verack_ok) cands.push_back(kvp.first); }
+                                // NOTE: g_peers_mu is already locked by the outer scope at line 2685
+                                for (auto& kvp : peers_) if (kvp.second.verack_ok) cands.push_back(kvp.first);
                                 if (cands.empty()) cands.push_back(s); // fallback to current peer
                                 for (const auto& h2 : want2) {
                                     const std::string key2 = hexkey(h2);
@@ -3162,8 +3162,8 @@ void P2P::loop(){
                             chain_.next_block_fetch_targets(want2, base_cap);
                             if (!want2.empty()) {
                                 std::vector<Sock> cands;
-                                { std::lock_guard<std::mutex> lk2(g_peers_mu);
-                                  for (auto& kvp : peers_) if (kvp.second.verack_ok) cands.push_back(kvp.first); }
+                                // NOTE: g_peers_mu is already locked by the outer scope at line 2685
+                                for (auto& kvp : peers_) if (kvp.second.verack_ok) cands.push_back(kvp.first);
                                 if (cands.empty()) cands.push_back(s); // fallback to current peer
                                 for (const auto& h2 : want2) {
                                     const std::string key2 = hexkey(h2);
@@ -3389,8 +3389,8 @@ void P2P::loop(){
 
                         if (!want.empty()) {
                             std::vector<Sock> cands;
-                            { std::lock_guard<std::mutex> lk2(g_peers_mu);
-                              for (auto& kvx : peers_) if (kvx.second.verack_ok) cands.push_back(kvx.first); }
+                            // NOTE: g_peers_mu is already locked by the outer scope at line 2685
+                            for (auto& kvx : peers_) if (kvx.second.verack_ok) cands.push_back(kvx.first);
                             if (cands.empty()) cands.push_back((Sock)ps.sock);
                             for (const auto& w : want) {
                                 const std::string key = hexkey(w);

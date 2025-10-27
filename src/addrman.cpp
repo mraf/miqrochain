@@ -74,7 +74,7 @@ static inline uint64_t fnv1a64(const void* data, size_t n, uint64_t seed = 14695
     return h;
 }
 
-static inline uint32_t clamp_u32(uint64_t v) {
+[[maybe_unused]] static inline uint32_t clamp_u32(uint64_t v) {
     return v > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() : (uint32_t)v;
 }
 

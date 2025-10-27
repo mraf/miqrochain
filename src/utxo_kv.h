@@ -33,7 +33,7 @@ public:
         void spend(const std::vector<uint8_t>& txid, uint32_t vout);
         bool commit(bool sync=true, std::string* err = nullptr) { return b_.commit(sync, err); }
     private:
-        UTXOKV& kv_;
+        [[maybe_unused]] UTXOKV& kv_;
         KVDB::Batch b_;
     };
 

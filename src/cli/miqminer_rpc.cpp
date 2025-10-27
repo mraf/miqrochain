@@ -301,7 +301,7 @@ static bool json_find_hex_or_number_u32(const std::string& json, const std::stri
         return true;
     }
 }
-static bool json_find_bool(const std::string& json, const std::string& key, bool& out){
+[[maybe_unused]] static bool json_find_bool(const std::string& json, const std::string& key, bool& out){
     std::string pat = "\"" + key + "\":";
     size_t p = json.find(pat);
     if(p==std::string::npos) return false;
@@ -367,13 +367,13 @@ static inline void put_u32_le(std::vector<uint8_t>& v, uint32_t x){
     v.push_back(uint8_t((x>>16)&0xff));
     v.push_back(uint8_t((x>>24)&0xff));
 }
-static inline void put_u64_le(std::vector<uint8_t>& v, uint64_t x){
+[[maybe_unused]] static inline void put_u64_le(std::vector<uint8_t>& v, uint64_t x){
     v.push_back(uint8_t((x>>0 )&0xff)); v.push_back(uint8_t((x>>8 )&0xff));
     v.push_back(uint8_t((x>>16)&0xff)); v.push_back(uint8_t((x>>24)&0xff));
     v.push_back(uint8_t((x>>32)&0xff)); v.push_back(uint8_t((x>>40)&0xff));
     v.push_back(uint8_t((x>>48)&0xff)); v.push_back(uint8_t((x>>56)&0xff));
 }
-static inline void store_u64_le(uint8_t* p, uint64_t x){
+[[maybe_unused]] static inline void store_u64_le(uint8_t* p, uint64_t x){
     p[0]=uint8_t((x>>0 )&0xff); p[1]=uint8_t((x>>8 )&0xff);
     p[2]=uint8_t((x>>16)&0xff); p[3]=uint8_t((x>>24)&0xff);
     p[4]=uint8_t((x>>32)&0xff); p[5]=uint8_t((x>>40)&0xff);
@@ -1138,7 +1138,7 @@ static std::string spark_ascii(const std::vector<double>& xs){
     }
     return s;
 }
-static inline std::string pad_fit(const std::string& s, size_t width){
+[[maybe_unused]] static inline std::string pad_fit(const std::string& s, size_t width){
     if(s.size() >= width) return s.substr(0, width);
     return s + std::string(width - s.size(), ' ');
 }
@@ -1160,7 +1160,7 @@ static inline std::string center_fit(const std::string& s, size_t width){
               << ":" << std::setw(2) << std::setfill('0') << s;
     return o.str();
 }
-static std::string progress_bar(double p, size_t width){
+[[maybe_unused]] static std::string progress_bar(double p, size_t width){
     if(p<0) { p=0; }
     if(p>1) { p=1; }
     size_t full = (size_t)std::floor(p*width);
@@ -1993,7 +1993,7 @@ int main(int argc, char** argv){
             }
 
             while(ui.running.load(std::memory_order_relaxed)){
-                TermSize ts = get_term_size();
+                [[maybe_unused]] TermSize ts = get_term_size();
                 std::ostringstream out;
                 out << CLS();
 
@@ -2293,7 +2293,7 @@ int main(int argc, char** argv){
         meter.detach();
 
 #if defined(MIQ_ENABLE_OPENCL)
-        auto build_header_prefix80 = [](const BlockHeader& H, const std::vector<uint8_t>& merkle)->std::vector<uint8_t>{
+        [[maybe_unused]] auto build_header_prefix80 = [](const BlockHeader& H, const std::vector<uint8_t>& merkle)->std::vector<uint8_t>{
             std::vector<uint8_t> p;
             p.reserve(76);
             put_u32_le(p, H.version);
@@ -2303,7 +2303,7 @@ int main(int argc, char** argv){
             put_u32_le(p, H.bits);
             return p;
         };
-        auto make_gpu_prefix = [&](const std::vector<uint8_t>& prefix80)->std::vector<uint8_t>{
+        [[maybe_unused]] auto make_gpu_prefix = [&](const std::vector<uint8_t>& prefix80)->std::vector<uint8_t>{
             std::vector<uint8_t> out;
             if(salt_pos == SaltPos::PRE && !salt_bytes.empty()){
                 out.reserve(salt_bytes.size()+prefix80.size());
