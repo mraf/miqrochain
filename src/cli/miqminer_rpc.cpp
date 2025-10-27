@@ -380,6 +380,13 @@ static inline void store_u64_le(uint8_t* p, uint64_t x){
     p[6]=uint8_t((x>>48)&0xff); p[7]=uint8_t((x>>56)&0xff);
 }
 
+static inline void store_u32_le(uint8_t* p, uint32_t x){
+    p[0]=uint8_t((x>>0 )&0xff);
+    p[1]=uint8_t((x>>8 )&0xff);
+    p[2]=uint8_t((x>>16)&0xff);
+    p[3]=uint8_t((x>>24)&0xff);
+}
+
 // ===== minimal HTTP/JSON-RPC ================================================
 struct HttpResp { int code{0}; std::string body; };
 
@@ -731,41 +738,10 @@ static std::string fmt_miq_amount(uint64_t base_units){
     return o.str();
 }
 
-// ===== NEW: blockchain sync status ==========================================
-struct SyncInfo {
-    bool     reachable{false};
-    bool     ibd{true};
-    uint64_t headers{0};
-    uint64_t blocks{0};
-    double   verification{0.0};
-    int      peers{0};
-};
-static bool rpc_result_double(const std::string& host, uint16_t port, const std::string& auth,
-                              const std::string& method, const std::string& params, double& outd){
-    HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build(method, params), r) || r.code!=200) return false;
-    if(json_has_error(r.body)) return false;
-    return json_find_double(r.body, "result", outd);
-}
-static bool rpc_getconnectioncount(const std::string& host, uint16_t port, const std::string& auth, int& out){
-    double v=0.0;
-    if(!rpc_result_double(host,port,auth,"getconnectioncount","[]",v)) return false;
-    if(v<0) v=0;
-    out = (int)std::llround(v);
-    return true;
-}
-static bool rpc_getblockchaininfo(const std::string& host, uint16_t port, const std::string& auth, SyncInfo& out){
-    HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build("getblockchaininfo","[]"), r)) return false;
-    if(r.code!=200 || json_has_error(r.body)) return false;
-    out.reachable = true;
-    bool ibd=false; (void)json_find_bool(r.body,"initialblockdownload",ibd); out.ibd = ibd;
-    long long h=0,b=0; double ver=0.0;
-    if(json_find_number(r.body,"headers",h)) out.headers = (uint64_t)((h<0)?0:h);
-    if(json_find_number(r.body,"blocks", b)) out.blocks  = (uint64_t)((b<0)?0:b);
-    (void)json_find_double(r.body,"verificationprogress",ver); out.verification = ver;
-    int peers=0; if(rpc_getconnectioncount(host,port,auth,peers)) out.peers = peers;
-    return true;
+static std::string fmt_miq_whole_dot(uint64_t base_units){
+    uint64_t whole = base_units / MIQ_COIN_UNITS;
+    std::ostringstream o; o << whole << '.';
+    return o.str();
 }
 
 // ===== MinerTemplate types & parsing ========================================
@@ -1296,7 +1272,7 @@ inline void build_block(u32 W16[16],
                         u64 nonce_le, uint blk_idx, uint nblks)
 {
   u8 B[64];
-  u64 L = (u64)prefix_len + 8u;
+  u64 L = (u64)prefix_len + 4u;
   u64 Lbits = L * 8u;
 
   for(int i=0;i<64;i++){
@@ -1304,10 +1280,10 @@ inline void build_block(u32 W16[16],
     u8 v = 0;
     if(off < (u64)prefix_len){
       v = prefix[off];
-    } else if(off < (u64)prefix_len + 8u){
+    } else if(off < (u64)prefix_len + 4u){
       uint j = (uint)(off - (u64)prefix_len);
       v = (u8)((nonce_le >> (8u*j)) & 0xffu);
-    } else if(off == (u64)prefix_len + 8u){
+    } else if(off == (u64)prefix_len + 4u){
       v = 0x80u;
     } else {
       u64 last_block_start = (u64)(nblks*64u);
@@ -1329,7 +1305,7 @@ inline void build_block(u32 W16[16],
 }
 
 inline void sha256d_any(u8 out[32], __constant u8* prefix, uint prefix_len, u64 nonce_le){
-  u64 L = (u64)prefix_len + 8u;
+  u64 L = (u64)prefix_len + 4u;
   uint nblks = (uint)((L + 1u + 8u + 63u)/64u);
   SHA256 S; sha256_init(&S);
   for(uint b=0;b<nblks;b++){
@@ -1680,11 +1656,11 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
     b.header.merkle_root = merkle_from(b.txs);
 
     std::vector<uint8_t> header_prefix;
-    header_prefix.reserve(4+32+32+8+4);
+    header_prefix.reserve(4+32+32+4+4);
     put_u32_le(header_prefix, b.header.version);
     header_prefix.insert(header_prefix.end(), b.header.prev_hash.begin(),   b.header.prev_hash.end());
     header_prefix.insert(header_prefix.end(), b.header.merkle_root.begin(), b.header.merkle_root.end());
-    put_u64_le(header_prefix, (uint64_t)b.header.time);
+    put_u32_le(header_prefix, (uint32_t)b.header.time);
     put_u32_le(header_prefix, b.header.bits);
     const size_t nonce_off = header_prefix.size();
 
@@ -1697,7 +1673,7 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
 #endif
 
     std::vector<uint8_t> hdr = header_prefix;
-    hdr.resize(header_prefix.size() + 8);
+    hdr.resize(header_prefix.size() + 4);
     uint8_t* nonce_ptr = hdr.data() + nonce_off;
     (void)nonce_ptr;
 
@@ -1725,24 +1701,24 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
             uint8_t h[8][32];
 
         #if !defined(MIQ_POW_SALT)
-            uint8_t le[8][8];
-            store_u64_le(le[0], n0); dsha256_from_base(base1, le[0], 8, h[0]);
-            store_u64_le(le[1], n1); dsha256_from_base(base1, le[1], 8, h[1]);
-            store_u64_le(le[2], n2); dsha256_from_base(base1, le[2], 8, h[2]);
-            store_u64_le(le[3], n3); dsha256_from_base(base1, le[3], 8, h[3]);
-            store_u64_le(le[4], n4); dsha256_from_base(base1, le[4], 8, h[4]);
-            store_u64_le(le[5], n5); dsha256_from_base(base1, le[5], 8, h[5]);
-            store_u64_le(le[6], n6); dsha256_from_base(base1, le[6], 8, h[6]);
-            store_u64_le(le[7], n7); dsha256_from_base(base1, le[7], 8, h[7]);
+            uint8_t le4[8][4];
+            store_u32_le(le4[0], (uint32_t)n0); dsha256_from_base(base1, le4[0], 4, h[0]);
+            store_u32_le(le4[1], (uint32_t)n1); dsha256_from_base(base1, le4[1], 4, h[1]);
+            store_u32_le(le4[2], (uint32_t)n2); dsha256_from_base(base1, le4[2], 4, h[2]);
+            store_u32_le(le4[3], (uint32_t)n3); dsha256_from_base(base1, le4[3], 4, h[3]);
+            store_u32_le(le4[4], (uint32_t)n4); dsha256_from_base(base1, le4[4], 4, h[4]);
+            store_u32_le(le4[5], (uint32_t)n5); dsha256_from_base(base1, le4[5], 4, h[5]);
+            store_u32_le(le4[6], (uint32_t)n6); dsha256_from_base(base1, le4[6], 4, h[6]);
+            store_u32_le(le4[7], (uint32_t)n7); dsha256_from_base(base1, le4[7], 4, h[7]);
         #else
-            store_u64_le(nonce_ptr, n0); { auto hv = salted_header_hash(hdr); std::memcpy(h[0], hv.data(), 32); }
-            store_u64_le(nonce_ptr, n1); { auto hv = salted_header_hash(hdr); std::memcpy(h[1], hv.data(), 32); }
-            store_u64_le(nonce_ptr, n2); { auto hv = salted_header_hash(hdr); std::memcpy(h[2], hv.data(), 32); }
-            store_u64_le(nonce_ptr, n3); { auto hv = salted_header_hash(hdr); std::memcpy(h[3], hv.data(), 32); }
-            store_u64_le(nonce_ptr, n4); { auto hv = salted_header_hash(hdr); std::memcpy(h[4], hv.data(), 32); }
-            store_u64_le(nonce_ptr, n5); { auto hv = salted_header_hash(hdr); std::memcpy(h[5], hv.data(), 32); }
-            store_u64_le(nonce_ptr, n6); { auto hv = salted_header_hash(hdr); std::memcpy(h[6], hv.data(), 32); }
-            store_u64_le(nonce_ptr, n7); { auto hv = salted_header_hash(hdr); std::memcpy(h[7], hv.data(), 32); }
+            store_u32_le(nonce_ptr, (uint32_t)n0); { auto hv = salted_header_hash(hdr); std::memcpy(h[0], hv.data(), 32); }
+            store_u32_le(nonce_ptr, (uint32_t)n1); { auto hv = salted_header_hash(hdr); std::memcpy(h[1], hv.data(), 32); }
+            store_u32_le(nonce_ptr, (uint32_t)n2); { auto hv = salted_header_hash(hdr); std::memcpy(h[2], hv.data(), 32); }
+            store_u32_le(nonce_ptr, (uint32_t)n3); { auto hv = salted_header_hash(hdr); std::memcpy(h[3], hv.data(), 32); }
+            store_u32_le(nonce_ptr, (uint32_t)n4); { auto hv = salted_header_hash(hdr); std::memcpy(h[4], hv.data(), 32); }
+            store_u32_le(nonce_ptr, (uint32_t)n5); { auto hv = salted_header_hash(hdr); std::memcpy(h[5], hv.data(), 32); }
+            store_u32_le(nonce_ptr, (uint32_t)n6); { auto hv = salted_header_hash(hdr); std::memcpy(h[6], hv.data(), 32); }
+            store_u32_le(nonce_ptr, (uint32_t)n7); { auto hv = salted_header_hash(hdr); std::memcpy(h[7], hv.data(), 32); }
         #endif
 
             if(meets_target_be_raw(h[0], bits)){ b.header.nonce=n0; *out_block=b; found->store(true); break; }
@@ -2027,23 +2003,9 @@ int main(int argc, char** argv){
                 for(size_t i=0;i<kBannerN;i++) out << "  " << kChronenMinerBanner[i] << "\n";
                 out << R() << "\n";
 
-                // Connection & Sync
                 out << "  " << C("1") << "RPC: " << R() << ui.rpc_host << ":" << ui.rpc_port
                     << "   " << C(ui.node_reachable.load()? "32;1" : "31;1")
-                    << (ui.node_reachable.load()? "[CONNECTED]" : "[UNREACHABLE]") << R()
-                    << "   Peers: " << ui.node_peers.load() << "\n";
-
-                uint64_t H = ui.node_headers.load(), B = ui.node_blocks.load();
-                double vp = ui.node_verification.load();
-                bool synced = ui.node_synced.load();
-                double p = 0.0;
-                if(H>0)      p = std::min(1.0, (double)B / (double)H);
-                if(vp>0.0)   p = std::max(p, std::min(1.0, vp));
-                out << "  " << C("1") << "Sync: " << R()
-                    << (synced ? C("32;1") : C("33;1"))
-                    << (synced ? "IBD complete" : "initial block download") << R()
-                    << "   " << progress_bar(p, (size_t)std::max(20, ts.cols - 64))
-                    << "   headers=" << H << " blocks=" << B << "\n";
+                    << (ui.node_reachable.load()? "[CONNECTED]" : "[UNREACHABLE]") << R() << "\n";
 
                 // Tip / candidate
                 uint64_t th = ui.tip_height.load();
@@ -2125,7 +2087,11 @@ int main(int argc, char** argv){
                 out << "  " << C("1") << "Network: " << R() << fmt_hs(ui.net_hashps.load()) << "\n";
                 out << "  " << C("1") << "Mined (session): " << R() << ui.mined_blocks.load() << "\n";
 
-                out << "  " << C("1") << "Payout: " << R() << fmt_miq_amount(ui.total_received_base.load());
+                uint64_t paid_base = ui.total_received_base.load();
+                out << "  " << C("1") << "Payout addr: " << R() << pkh_to_address(ui.my_pkh) << "\n";
+                out << "  " << C("1") << "Paid total : " << R()
+                    << C("36;1") << fmt_miq_whole_dot(paid_base) << R()
+                    << "  " << C("2") << "(" << fmt_miq_amount(paid_base) << ")" << R();
                 {
                     uint64_t estTot = ui.est_total_base.load();
                     if (ui.total_received_base.load() == 0 && estTot > 0) {
@@ -2189,26 +2155,12 @@ int main(int argc, char** argv){
             uint64_t last_seen_h = 0;
             int tick=0;
             while(ui.running.load()){
-                // Sync info (preferred: getblockchaininfo)
-                SyncInfo si{};
-                if(rpc_getblockchaininfo(rpc_host, rpc_port, token, si)){
-                    ui.node_reachable.store(true);
-                    ui.node_peers.store(si.peers);
-                    ui.node_headers.store(si.headers);
-                    ui.node_blocks.store(si.blocks);
-                    ui.node_verification.store(si.verification);
-                    bool synced_flag = (!si.ibd) && (si.headers>0) && (si.blocks>0) && (si.headers - si.blocks <= 1);
-                    if(si.verification > 0.999) synced_flag = true;
-                    ui.node_synced.store(synced_flag);
-                } else {
-                    ui.node_reachable.store(false);
-                    ui.node_synced.store(false);
-                    ui.rpc_errors.store(ui.rpc_errors.load()+1);
-                }
+                ui.node_reachable.store(false);
 
                 // Tip + network hashps
                 TipInfo t;
                 if(rpc_gettipinfo(rpc_host, rpc_port, token, t)){
+                    ui.node_reachable.store(true);
                     ui.tip_height.store(t.height);
                     ui.tip_hash_hex = t.hash_hex;
                     ui.tip_bits.store(t.bits);
@@ -2280,7 +2232,7 @@ int main(int argc, char** argv){
                                 }
                             }
                             ui.est_total_base.store(est_total);
-                            ui.est_matured_base.store(est_matured);
+                            ui.total_received_base.store(est_matured);
                         }
                     }
                 }
@@ -2343,11 +2295,11 @@ int main(int argc, char** argv){
 #if defined(MIQ_ENABLE_OPENCL)
         auto build_header_prefix80 = [](const BlockHeader& H, const std::vector<uint8_t>& merkle)->std::vector<uint8_t>{
             std::vector<uint8_t> p;
-            p.reserve(80);
+            p.reserve(76);
             put_u32_le(p, H.version);
             p.insert(p.end(), H.prev_hash.begin(), H.prev_hash.end());
             p.insert(p.end(), merkle.begin(), merkle.end());
-            put_u64_le(p, (uint64_t)H.time);
+            put_u32_le(p, (uint32_t)H.time);
             put_u32_le(p, H.bits);
             return p;
         };
@@ -2371,7 +2323,7 @@ int main(int argc, char** argv){
         // ===== mining loop with periodic refresh (prevents stale templates)
         std::fprintf(stderr, "[miner] starting mining loop (auto-refresh jobs, clean shutdown).\n");
 
-        const int JOB_REFRESH_SECONDS = 45; // refresh header time/tx set periodically
+        const int JOB_REFRESH_SECONDS = 30; // tighter refresh to keep nTime fresh
         while (ui.running.load()) {
             MinerTemplate tpl;
             if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
@@ -2458,28 +2410,28 @@ int main(int argc, char** argv){
 #if defined(MIQ_ENABLE_OPENCL)
             if (gpu_enabled) {
                 std::string gerr;
-                std::vector<uint8_t> prefix80 = 
+                std::vector<uint8_t> prefix76 = 
                     [&](){
                         std::vector<uint8_t> p; 
-                        p.reserve(80);
+                        p.reserve(76);
                         put_u32_le(p, b.header.version);
                         p.insert(p.end(), b.header.prev_hash.begin(), b.header.prev_hash.end());
                         p.insert(p.end(), b.header.merkle_root.begin(), b.header.merkle_root.end());
-                        put_u64_le(p, (uint64_t)b.header.time);
+                        put_u32_le(p, (uint32_t)b.header.time);
                         put_u32_le(p, b.header.bits);
                         return p;
                     }();
                 std::vector<uint8_t> gpuprefix;
                 if(salt_pos == SaltPos::PRE && !salt_bytes.empty()){
-                    gpuprefix.reserve(salt_bytes.size()+prefix80.size());
+                    gpuprefix.reserve(salt_bytes.size()+prefix76.size());
                     gpuprefix.insert(gpuprefix.end(), salt_bytes.begin(), salt_bytes.end());
-                    gpuprefix.insert(gpuprefix.end(), prefix80.begin(), prefix80.end());
+                    gpuprefix.insert(gpuprefix.end(), prefix76.begin(), prefix76.end());
                 } else if(salt_pos == SaltPos::POST && !salt_bytes.empty()){
-                    gpuprefix.reserve(prefix80.size()+salt_bytes.size());
-                    gpuprefix.insert(gpuprefix.end(), prefix80.begin(), prefix80.end());
+                    gpuprefix.reserve(prefix76.size()+salt_bytes.size());
+                    gpuprefix.insert(gpuprefix.end(), prefix76.begin(), prefix76.end());
                     gpuprefix.insert(gpuprefix.end(), salt_bytes.begin(), salt_bytes.end());
                 } else {
-                    gpuprefix = prefix80;
+                    gpuprefix = prefix76;
                 }
 
                 if (!gpu.set_job(gpuprefix, target_be, &gerr)) {
