@@ -952,20 +952,20 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
     auto it = g_gate.find(fd);
     if (it == g_gate.end()) return false;
     auto& g = it->second;
-
-    g.hs_last_ms = now_ms();
+  
     // Handshake watchdog based on last activity (not raw connect time).
     if (!g.got_verack) {
-        int64_t idle = now_ms() - g.hs_last_ms;   // will be small if traffic is flowing
+        const int64_t idle = now_ms() - g.hs_last_ms;
         if (idle > HANDSHAKE_MS) {
             if (g.is_loopback) {
-                g.hs_last_ms = now_ms();          // be lenient with localhost tools
+                g.hs_last_ms = now_ms(); // be lenient with localhost tools
             } else {
                 close_code = 408;
                 P2P_TRACE("close fd=" + std::to_string((uintptr_t)fd) + " reason=handshake-timeout");
                 return true;
             }
         }
+    }
     }
 
     if (!cmd.empty()){
@@ -3113,7 +3113,7 @@ void P2P::loop(){
                             const std::string bh = hexkey(hb.block_hash());
                             bool drop_unsolicited = false;
                             if (!ps.syncing) {
-                                // During headers phase we prefer liveness: take orphan and chase parent.
+                                // During headers phase prefer progress: accept as orphan & request parent.
                                 const bool in_headers_phase = !g_logged_headers_done;
                                 bool parent_known = chain_.header_exists(hb.header.prev_hash) || chain_.have_block(hb.header.prev_hash);
                                 if (!parent_known && !in_headers_phase) {
