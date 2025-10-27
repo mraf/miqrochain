@@ -953,12 +953,14 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
     if (it == g_gate.end()) return false;
     auto& g = it->second;
   
-    // Handshake watchdog based on last activity (not raw connect time).
+    const int64_t now = now_ms();
+    const int64_t last = (g.hs_last_ms ? g.hs_last_ms : g.t_conn_ms);
     if (!g.got_verack) {
-        const int64_t idle = now_ms() - g.hs_last_ms;
+        const int64_t idle = now - last;
         if (idle > HANDSHAKE_MS) {
             if (g.is_loopback) {
-                g.hs_last_ms = now_ms(); // be lenient with localhost tools
+                // Be lenient with localhost wallets/tools.
+                g.hs_last_ms = now;
             } else {
                 close_code = 408;
                 P2P_TRACE("close fd=" + std::to_string((uintptr_t)fd) + " reason=handshake-timeout");
@@ -974,18 +976,16 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
                 g.got_version = true;
                 should_send_verack = true;
                 g_preverack_counts.erase(fd);
-                g.hs_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    Clock::now().time_since_epoch()).count();
+                g.hs_last_ms = now_ms();
             }
         } else if (cmd == "verack"){
             g.got_verack = true;
             g_preverack_counts.erase(fd);
-            g.hs_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                Clock::now().time_since_epoch()).count();
+            g.hs_last_ms = now_ms();
         } else {
             if (!g.got_version) {
                 if (miq_safe_preverack_cmd(cmd)) {
-                    // safe pre-version traffic is fine; liveness already refreshed
+                    g.hs_last_ms = now_ms();
                     return false;
                 } else {
                     g.banscore += 10;
@@ -1003,6 +1003,7 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
                         return false;
                     }
                 }
+                g.hs_last_ms = now_ms();
             }
         }
     }
@@ -1458,10 +1459,9 @@ namespace {
     }
 
     static std::vector<uint8_t> build_headers_payload(const std::vector<BlockHeader>& hs){
-        const uint16_t n = (uint16_t)std::min<size_t>(hs.size(), 2000);
-        std::vector<uint8_t> v; v.reserve(2 + (size_t)n*HEADER_WIRE_BYTES);
-        v.push_back((uint8_t)(n & 0xff));
-        v.push_back((uint8_t)((n >> 8) & 0xff));
+        const uint8_t n = (uint8_t)std::min<size_t>(hs.size(), 200); // cap to 200 for reply sanity
+        std::vector<uint8_t> v; v.reserve(1 + (size_t)n*HEADER_WIRE_BYTES);
+        v.push_back(n);
         for (size_t i=0;i<n;i++){
             auto h = ser_header(hs[i]);
             v.insert(v.end(), h.begin(), h.end());
@@ -1469,13 +1469,34 @@ namespace {
         return v;
     }
     static bool parse_headers_payload(const std::vector<uint8_t>& p, std::vector<BlockHeader>& out){
-        if (p.size() < 2) return false;
-        uint16_t n = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-        size_t need = 2 + (size_t)n*HEADER_WIRE_BYTES;
-        if (p.size() < need) return false;
-        out.clear(); out.reserve(n);
-        size_t off = 2;
-        for (uint16_t i=0;i<n;i++){
+        out.clear();
+        if (p.size() < 1) return false;
+
+        auto parse_n = [&](size_t hdr, size_t& n, size_t& off)->bool{
+            if (hdr == 1) {
+                n   = (size_t)p[0];
+                off = 1;
+                return true;
+            } else if (hdr == 2 && p.size() >= 2) {
+                n   = (size_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+                off = 2;
+                return true;
+            }
+            return false;
+        };
+
+        // Try 2-byte first (some newer peers), then 1-byte (older peers).
+        size_t n=0, off=0;
+        bool ok = parse_n(2, n, off);
+        size_t need = (ok ? off + n*HEADER_WIRE_BYTES : 0);
+        if (!ok || p.size() != need) {
+            ok = parse_n(1, n, off);
+            need = (ok ? off + n*HEADER_WIRE_BYTES : 0);
+        }
+        if (!ok || p.size() != need) return false;
+
+        out.reserve(n);
+        for (size_t i=0;i<n;i++){
             BlockHeader h;
             if (!deser_header(p.data()+off, p.size()-off, h)) return false;
             out.push_back(std::move(h));
@@ -2980,8 +3001,7 @@ void P2P::loop(){
 
 #if MIQ_ENABLE_HEADERS_FIRST
                         const bool peer_supports_headers = (ps.features & (1ull<<0)) != 0;
-                        const bool try_headers = peer_supports_headers || (MIQ_TRY_HEADERS_ANYWAY != 0);
-                        if (try_headers) {
+                        if (peer_supports_headers || (MIQ_TRY_HEADERS_ANYWAY != 0)) {
                             std::vector<std::vector<uint8_t>> locator;
                             chain_.build_locator(locator);
                             if (g_hdr_flip[(Sock)s]) {
@@ -2989,7 +3009,8 @@ void P2P::loop(){
                             }
                             std::vector<uint8_t> stop(32, 0);
                             auto pl2 = build_getheaders_payload(locator, stop);
-                            auto m2  = encode_msg("getheaders", pl2);
+                            const char* cmd_name = peer_supports_headers ? "getheaders" : "gethdr";
+                            auto m2  = encode_msg(cmd_name, pl2);
                             if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms())) {
                                 ps.sent_getheaders = true;
                                 (void)send_or_close(s, m2);
@@ -3018,6 +3039,9 @@ void P2P::loop(){
   
                     if (cmd == "version") {
                         int32_t peer_ver = 0; uint64_t peer_services = 0;
+                        if (!m.payload.empty()) {
+                            // tolerate 0- or short-length payloads from old peers
+                        }
                         if (m.payload.size() >= 4) {
                             peer_ver = (int32_t)((uint32_t)m.payload[0] | ((uint32_t)m.payload[1]<<8) | ((uint32_t)m.payload[2]<<16) | ((uint32_t)m.payload[3]<<24));
                         }
@@ -3113,7 +3137,8 @@ void P2P::loop(){
                             const std::string bh = hexkey(hb.block_hash());
                             bool drop_unsolicited = false;
                             if (!ps.syncing) {
-                                // During headers phase prefer progress: accept as orphan & request parent.
+                                // During IBD/headers, accept orphans and chase parents; after headers complete,
+                                // keep the unsolicited guard unless parent is known.
                                 const bool in_headers_phase = !g_logged_headers_done;
                                 bool parent_known = chain_.header_exists(hb.header.prev_hash) || chain_.have_block(hb.header.prev_hash);
                                 if (!parent_known && !in_headers_phase) {
@@ -3418,7 +3443,9 @@ void P2P::loop(){
                             }
                             std::vector<uint8_t> stop2(32, 0);
                             auto pl2 = build_getheaders_payload(locator2, stop2);
-                            auto m2  = encode_msg("getheaders", pl2);
+                            const bool peer_supports_headers2 = (ps.features & (1ull<<0)) != 0;
+                            const char* cmd_name2 = peer_supports_headers2 ? "getheaders" : "gethdr";
+                            auto m2  = encode_msg(cmd_name2, pl2);
                             if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms())) {
                                  ps.sent_getheaders = true;
                                  (void)send_or_close(s, m2);
@@ -3568,7 +3595,9 @@ void P2P::loop(){
                         }
                         std::vector<uint8_t> stop2(32, 0);
                         auto pl2 = build_getheaders_payload(locator2, stop2);
-                        auto m2  = encode_msg("getheaders", pl2);
+                        const bool peer_supports_headers3 = (ps2.features & (1ull<<0)) != 0;
+                        const char* cmd_name3 = peer_supports_headers3 ? "getheaders" : "gethdr";
+                        auto m2  = encode_msg(cmd_name3, pl2);
                         ps2.sent_getheaders = true;
                         (void)send_or_close(kvx.first, m2);
                         ps2.inflight_hdr_batches++;
