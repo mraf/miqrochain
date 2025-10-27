@@ -866,12 +866,8 @@ static SeedRole compute_seed_role(){
     SeedRole r;
     r.seed_ips  = resolve_host_ip_strings(DNS_SEED);
     r.local_ips = local_ip_strings();
-    // Ignore loopbacks/link-locals to reduce false positives on dev boxes
-    std::vector<std::string> filt_locals;
-    filt_locals.reserve(r.local_ips.size());
-    for (auto& s : r.local_ips) if (!is_loopback_or_linklocal(s)) filt_locals.push_back(s);
     for (const auto& seed_ip : r.seed_ips){
-        for (const auto& lip : filt_locals){
+        for (const auto& lip : r.local_ips){
             if (seed_ip == lip){
                 r.we_are_seed = true;
                 r.detail = std::string("seed A/AAAA (") + seed_ip + ") matches local IP";
@@ -879,14 +875,23 @@ static SeedRole compute_seed_role(){
             }
         }
     }
-    if (r.seed_ips.empty()){
-        r.detail = "seed host has no A/AAAA records";
-    } else {
-        r.detail = "seed host resolves to different IP(s)";
+    // Heuristic 2: explicit override via env (useful behind NAT/port-forward).
+    if (const char* f = std::getenv("MIQ_FORCE_SEED"); f && *f && std::strcmp(f,"0")!=0 &&
+        std::strcmp(f,"false")!=0 && std::strcmp(f,"False")!=0){
+        r.we_are_seed = true;
+        r.detail = "MIQ_FORCE_SEED=1";
+        return r;
     }
+    r.detail = r.seed_ips.empty() ? "seed host has no A/AAAA records"
+                                  : "seed host resolves to different IP(s)";
     return r;
 }
 
+static inline bool solo_seed_mode(P2P* p2p){
+    auto role = compute_seed_role();
+    size_t peers = p2p ? p2p->snapshot_peers().size() : 0;
+    return role.we_are_seed && peers == 0;
+}
 
 // Traits & helpers used by TUI and elsewhere
 template<typename, typename = void> struct has_stats_method : std::false_type{};
@@ -1001,12 +1006,15 @@ static inline std::string spark_ascii(const std::vector<double>& v){
 
 // Sync gate helper (used both in TUI texts and IBD logic)
 static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out){
-    size_t peers = 0;
-    if (p2p) peers = p2p->snapshot_peers().size();
-    if (peers == 0) { why_out = "no peers"; return false; }
+    size_t peers = p2p ? p2p->snapshot_peers().size() : 0;
+    const bool seed_solo = compute_seed_role().we_are_seed && peers == 0;
+    if (!seed_solo && peers == 0) { why_out = "no peers"; return false; }
 
     uint64_t h = chain.height();
-    if (h == 0) { why_out = "headers syncing"; return false; }
+    if (h == 0) {
+        if (seed_solo) { why_out.clear(); return true; } // allow solo mining from genesis
+        why_out = "headers syncing"; return false;
+    }
 
     auto tip = chain.tip();
     uint64_t tsec = hdr_time(tip);
@@ -2127,14 +2135,19 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
 
             if (now_ms() > handshake_deadline_ms) {
                 if (we_are_seed) {
-                    out_err = "no inbound peers completed handshake while acting as seed";
-                    log_warn("IBD: seed mode handshake timed out — check DNS and port forwarding.");
+                    // SOLO-SEED: allow the node to proceed without peers so it can mine the first blocks.
+                    log_warn("IBD: seed mode handshake timed out — entering SOLO-SEED mode (no peers yet).");
+                    if (tui && can_tui) {
+                        tui->mark_step_ok("Peer handshake (verack)");
+                        tui->set_banner("Seed solo mode: no peers yet — mining unlocked.");
+                        tui->set_ibd_progress(chain.height(), chain.height(), 0, "complete", DNS_SEED, true);
+                    }
+                    return true; // treat IBD as trivially complete to unlock mining
                 } else {
                     out_err = "no peers completed handshake (verack)";
+                    if (tui && can_tui) tui->mark_step_fail("Peer handshake (verack)");
+                    return false;
                 }
-
-                if (tui && can_tui) tui->mark_step_fail("Peer handshake (verack)");
-                return false;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
@@ -2247,6 +2260,10 @@ private:
         using namespace std::chrono_literals;
         uint64_t backoff_ms = 2'000; // exponential up to 2 minutes
         while (running_.load() && !global::shutdown_requested.load()){
+            if (p2p && solo_seed_mode(p2p)) {
+                std::this_thread::sleep_for(3s);
+                continue;
+            }
             std::string why;
             bool gate = compute_sync_gate(*chain, p2p, why);
             if (!gate && should_enter_ibd(*chain, datadir)){
@@ -2525,6 +2542,16 @@ int main(int argc, char** argv){
             }
             log_info("IBD sync completed successfully.");
         } else {
+            if (solo_seed_mode(cfg.no_p2p ? nullptr : &p2p)) {
+                // Bootstrap solo: treat as OK so local mining can proceed.
+                if (can_tui) {
+                    tui.mark_step_ok("IBD sync phase");
+                    tui.set_banner("Seed solo mode — no peers yet. Mining enabled.");
+                    tui.set_node_state(TUI::NodeState::Running);
+                    tui.set_mining_gate(true, "");
+                }
+                log_info("IBD sync skipped (seed solo mode).");
+            } else {
             if (can_tui) {
                 tui.mark_step_fail("IBD sync phase");
                 tui.set_node_state(TUI::NodeState::Degraded);
@@ -2533,6 +2560,7 @@ int main(int argc, char** argv){
             }
             log_error(std::string("IBD sync failed: ") + ibd_err);
             log_error("BLOCKS MINED LOCALLY WILL NOT BE VALID");
+          }
         }
         
         IBDGuard ibd_guard;
@@ -2542,10 +2570,14 @@ int main(int argc, char** argv){
         if (can_tui) tui.mark_step_started("Start RPC server");
         if(!cfg.no_rpc){
             miq::rpc_enable_auth_cookie(cfg.datadir);
+            // Friendlier defaults for local miners: allow loopback without token unless the user overrides.
+            if (const char* req = std::getenv("MIQ_RPC_REQUIRE_TOKEN"); !(req && *req)) {
 #ifdef _WIN32
-            _putenv_s("MIQ_RPC_REQUIRE_TOKEN", "1");
+                _putenv_s("MIQ_RPC_REQUIRE_TOKEN", "0");
+                _putenv_s("MIQ_RPC_ALLOW_LOOPBACK", "1");
 #else
-            setenv("MIQ_RPC_REQUIRE_TOKEN", "1", 1);
+                setenv("MIQ_RPC_REQUIRE_TOKEN", "0", 1);
+                setenv("MIQ_RPC_ALLOW_LOOPBACK", "1", 1);
 #endif
             try {
                 std::string cookie_path = p_join(cfg.datadir, ".cookie");
@@ -2616,8 +2648,8 @@ int main(int argc, char** argv){
         log_info(std::string(CHAIN_NAME) + " node running. RPC " + std::to_string(RPC_PORT) +
                  ", P2P " + std::to_string(P2P_PORT));
         if (can_tui) {
-            // If IBD failed earlier, keep Degraded; otherwise Running
-            if (ibd_ok) {
+            const bool ibd_ok_or_solo = ibd_ok || solo_seed_mode(cfg.no_p2p ? nullptr : &p2p);
+            if (ibd_ok_or_solo) {
                 tui.set_banner(u8_ok ? "Miqrochain node running — synced & serving peers…" :
                                        "Miqrochain node running - synced & serving peers...");
                 auto role = compute_seed_role();
@@ -2706,9 +2738,9 @@ int main(int argc, char** argv){
         }
 
         if (can_tui) {
-            tui.set_node_state(TUI::NodeState::Quitting);
-            tui.set_banner("Shutting down safely...");
-        }
+                tui.set_node_state(TUI::NodeState::Quitting);
+                tui.set_banner("Shutting down safely...");
+            }
         log_info("Shutdown requested - stopping services...");
 
         try {
