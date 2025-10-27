@@ -579,6 +579,7 @@ static std::unordered_map<Sock,
 
 // Per-socket parse deadlines for partial frames
 static std::unordered_map<uint64_t,int64_t> g_last_idx_probe_ms;
+static std::unordered_map<uint64_t,int64_t> g_last_wait_log_ms;
 static std::unordered_map<Sock, int64_t> g_rx_started_ms;
 static inline void rx_track_start(Sock fd){
     if (g_rx_started_ms.find(fd)==g_rx_started_ms.end())
@@ -2102,7 +2103,12 @@ void P2P::request_block_index(PeerState& ps, uint64_t index){
 
 void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     if (h.size()!=32) return;
-    const size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : (size_t)32;
+    size_t base_default = (size_t)32;
+    if (!g_logged_headers_done) {
+        // Aggressive but safe fanout for IBD
+        base_default = (size_t)128;
+    }
+    const size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : base_default;
     if (!check_rate(ps, "get", 1.0, now_ms())) return;
     if (ps.inflight_blocks.size() >= max_inflight_blocks) return;
     const std::string key = hexkey(h);
@@ -3111,15 +3117,22 @@ void P2P::loop(){
                             g_global_inflight_blocks.erase(bh);
                             handle_incoming_block(s, m.payload);
                             if (!ps.syncing) {
-                                const size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : (size_t)32;
-                                if (ps.inflight_blocks.size() < max_inflight_blocks) {
-                                    std::vector<std::vector<uint8_t>> want2;
-                                    chain_.next_block_fetch_targets(want2, max_inflight_blocks);
-                                    for (const auto& h2 : want2) {
-                                        if (ps.inflight_blocks.size() >= max_inflight_blocks) break;
-                                        const std::string key2 = hexkey(h2);
-                                        if (g_global_inflight_blocks.count(key2)) continue;
-                                        request_block_hash(ps, h2);
+                                const size_t base_cap = caps_.max_blocks ? caps_.max_blocks : (size_t)32;
+                                std::vector<std::vector<uint8_t>> want2;
+                                chain_.next_block_fetch_targets(want2, base_cap);
+
+                                std::vector<Sock> cands;
+                                { std::lock_guard<std::mutex> lk2(g_peers_mu);
+                                  for (auto& kvp : peers_) if (kvp.second.verack_ok) cands.push_back(kvp.first); }
+                                if (cands.empty()) cands.push_back(sock); // fallback: current peer
+
+                                for (const auto& h2 : want2) {
+                                    const std::string key2 = hexkey(h2);
+                                    if (g_global_inflight_blocks.count(key2)) continue;
+                                    Sock t = rr_pick_peer_for_key(key2, cands);
+                                    auto itT = peers_.find(t);
+                                    if (itT != peers_.end()) {
+                                        request_block_hash(itT->second, h2);
                                     }
                                 }
                             }
@@ -3128,16 +3141,22 @@ void P2P::loop(){
                                 fill_index_pipeline(ps);
                             }
                           } else {
-                                const size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : (size_t)32;
-                                if (ps.inflight_blocks.size() < max_inflight_blocks) {
-                                    std::vector<std::vector<uint8_t>> want2;
-                                    chain_.next_block_fetch_targets(want2, max_inflight_blocks);
-                                    for (const auto& h2 : want2) {
-                                        if (ps.inflight_blocks.size() >= max_inflight_blocks) break;
-                                        const std::string key2 = hexkey(h2);
-                                        if (g_global_inflight_blocks.count(key2)) continue;
-                                        request_block_hash(ps, h2);
-                                    }
+                                const size_t base_cap = caps_.max_blocks ? caps_.max_blocks : (size_t)32;
+                                std::vector<std::vector<uint8_t>> want2;
+                                chain_.next_block_fetch_targets(want2, base_cap);
+
+                                std::vector<Sock> cands;
+                                { std::lock_guard<std::mutex> lk2(g_peers_mu);
+                                  for (auto& kvp : peers_) if (kvp.second.verack_ok) cands.push_back(kvp.first); }
+                                if (cands.empty()) cands.push_back(sock);
+
+                                for (const auto& h2 : want2) {
+                                    const std::string key2 = hexkey(h2);
+                                    if (g_global_inflight_blocks.count(key2)) continue;
+                                    Sock t = rr_pick_peer_for_key(key2, cands);
+                                    auto itT = peers_.find(t);
+                                    if (itT != peers_.end()) request_block_hash(itT->second, h2);
+                                }
                                 }
                         }
                       
@@ -3353,7 +3372,19 @@ void P2P::loop(){
                             }
                         }
 
-                        for (const auto& w : want) request_block_hash(ps, w);
+                        if (!want.empty()) {
+                            std::vector<Sock> cands;
+                            { std::lock_guard<std::mutex> lk2(g_peers_mu);
+                              for (auto& kvx : peers_) if (kvx.second.verack_ok) cands.push_back(kvx.first); }
+                            if (cands.empty()) cands.push_back((Sock)ps.sock);
+                            for (const auto& w : want) {
+                                const std::string key = hexkey(w);
+                                if (g_global_inflight_blocks.count(key)) continue;
+                                Sock t = rr_pick_peer_for_key(key, cands);
+                                auto itT = peers_.find(t);
+                                if (itT != peers_.end()) request_block_hash(itT->second, w);
+                            }
+                        }
 
                         if (!g_logged_headers_done && (!want.empty() || at_tip)) {
                             g_logged_headers_done = true;
@@ -3459,14 +3490,20 @@ void P2P::loop(){
             }
             if (ps.syncing) {
                 if ((tnow - g_last_progress_ms) > (int64_t)MIQ_P2P_STALL_RETRY_MS) {
-                    // No recent progress on the index path: retry on *this* peer…
-                    request_block_index(ps, ps.next_index);
-                    ps.inflight_index++;
-                    // …and (bounded) escalate to ONE additional peer to avoid
-                    // spinning forever on a single non-responsive node.
-                    const uint64_t idx = ps.next_index;
-                    const int64_t  last_probe = (g_last_idx_probe_ms.count(idx) ? g_last_idx_probe_ms[idx] : 0);
-                    if (tnow - last_probe > (int64_t)(MIQ_P2P_STALL_RETRY_MS / 2)) {
+                    uint64_t oldest_inflight =
+                        (ps.next_index > ps.inflight_index)
+                            ? (ps.next_index - ps.inflight_index)
+                            : (uint64_t)chain_.height() + 1; // safe floor
+
+                    const int64_t last_probe =
+                        (g_last_idx_probe_ms.count(oldest_inflight) ? g_last_idx_probe_ms[oldest_inflight] : 0);
+
+                    if (tnow - last_probe >= (int64_t)MIQ_P2P_STALL_RETRY_MS) {
+                        // Re-request the same *oldest* index on this peer (retry only; do NOT inflate inflight count).
+                        request_block_index(ps, oldest_inflight);
+                        g_last_idx_probe_ms[oldest_inflight] = tnow;
+
+                        // Bounded escalation: also poke exactly one other peer for this index.
                         std::vector<Sock> cands;
                         cands.reserve(peers_.size());
                         for (auto& kv2 : peers_) {
@@ -3475,18 +3512,27 @@ void P2P::loop(){
                             cands.push_back(kv2.first);
                         }
                         if (!cands.empty()) {
-                            Sock t = rr_pick_peer_for_key(miq_idx_key(idx), cands);
+                            Sock t = rr_pick_peer_for_key(miq_idx_key(oldest_inflight), cands);
                             if (t != MIQ_INVALID_SOCK) {
                                 auto itT = peers_.find(t);
                                 if (itT != peers_.end()) {
-                                    request_block_index(itT->second, idx);
+                                    request_block_index(itT->second, oldest_inflight);
                                 }
                             }
                         }
-                        g_last_idx_probe_ms[idx] = tnow;
+                        log_info(std::string("[IBD] index phase stalled; retried idx=")
+                                 + std::to_string(oldest_inflight) + " (escalation enabled)");
+                    } else {
+                        // Too soon to probe again. If this persists, log a calm status once per minute.
+                        const int64_t last_wait =
+                            (g_last_wait_log_ms.count(oldest_inflight) ? g_last_wait_log_ms[oldest_inflight] : 0);
+                        if (tnow - last_wait >= 60000) {
+                            log_info(std::string("[IBD] waiting for block ")
+                                     + std::to_string(oldest_inflight)
+                                     + " (likely not produced yet; throttled re-probes)");
+                            g_last_wait_log_ms[oldest_inflight] = tnow;
+                        }
                     }
-                    log_info(std::string("[IBD] index phase stalled; retried idx=")
-                             + std::to_string(ps.next_index) + " (escalation enabled)");
                 }
             }
 #if MIQ_ENABLE_HEADERS_FIRST
