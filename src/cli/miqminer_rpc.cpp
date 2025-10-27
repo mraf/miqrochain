@@ -35,6 +35,7 @@
 #include <array>
 #include <fstream>
 #include <unordered_map>
+#include <signal.h>
 
 #if defined(_WIN32)
   #ifndef NOMINMAX
@@ -50,6 +51,11 @@
   using socket_t = SOCKET;
   #define miq_closesocket closesocket
   static void miq_sleep_ms(unsigned ms){ Sleep(ms); }
+  static void set_socket_timeouts(socket_t s, int ms_send, int ms_recv){
+    DWORD tvs = (DWORD)ms_send, tvr = (DWORD)ms_recv;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tvs, sizeof(tvs));
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tvr, sizeof(tvr));
+  }
 #else
   #include <sys/types.h>
   #include <sys/socket.h>
@@ -60,9 +66,16 @@
   #include <sys/resource.h>
   #include <sys/stat.h>
   #include <sched.h>
+  #include <sys/ioctl.h>
   using socket_t = int;
   #define miq_closesocket ::close
   static void miq_sleep_ms(unsigned ms){ usleep(ms*1000); }
+  static void set_socket_timeouts(socket_t s, int ms_send, int ms_recv){
+    struct timeval tvs{ ms_send/1000, (int)((ms_send%1000)*1000) };
+    struct timeval tvr{ ms_recv/1000, (int)((ms_recv%1000)*1000) };
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tvs, sizeof(tvs));
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tvr, sizeof(tvr));
+  }
 #endif
 
 // -------- OpenCL (optional) --------------------------------------------------
@@ -106,8 +119,12 @@ static bool g_use_ansi = true;
 static inline std::string C(const char* code){ return g_use_ansi ? std::string("\x1b[")+code+"m" : std::string(); }
 static inline std::string R(){ return g_use_ansi ? std::string("\x1b[0m") : std::string(); }
 static inline const char* CLS(){ return g_use_ansi ? "\x1b[2J\x1b[H" : ""; }
+static inline void set_title(const std::string& t){
+    if(!g_use_ansi) return;
+    std::cout << "\x1b]0;" << t << "\x07";
+}
 
-// BIG ASCII banner (cyan). This spells MiQ.
+// BIG ASCII banner (kept minimal & clean; cyan). This spells MiQ.
 static const char* kChronenMinerBanner[] = {
 "  __  __ _                                                                                      ",
 " |  \\/  |                                                                                       ",
@@ -127,6 +144,28 @@ static inline void trim(std::string& s){
     while(j>i && std::isspace((unsigned char)s[j-1])) --j;
     s.assign(s.data()+i, j-i);
 }
+
+struct TermSize { int cols{120}; int rows{40}; };
+static TermSize get_term_size(){
+    TermSize ts{};
+#if defined(_WIN32)
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if(GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)){
+        ts.cols = (int)(csbi.srWindow.Right - csbi.srWindow.Left + 1);
+        ts.rows = (int)(csbi.srWindow.Bottom - csbi.srWindow.Top + 1);
+    }
+#else
+    struct winsize w{};
+    if(ioctl(1, TIOCGWINSZ, &w)==0){
+        if(w.ws_col) ts.cols = (int)w.ws_col;
+        if(w.ws_row) ts.rows = (int)w.ws_row;
+    }
+#endif
+    if(ts.cols < 60) ts.cols = 60;
+    if(ts.rows < 24) ts.rows = 24;
+    return ts;
+}
+
 static std::string default_cookie_path(){
 #ifdef _WIN32
     char* v=nullptr; size_t len=0;
@@ -161,6 +200,23 @@ static bool read_all_file(const std::string& path, std::string& out){
 static std::string to_hex_s(const std::vector<uint8_t>& v){ return miq::to_hex(v); }
 static std::vector<uint8_t> from_hex_s(const std::string& h){ return miq::from_hex(h); }
 
+// ===== minimal timed logger ==================================================
+static std::mutex g_log_mtx;
+static void log_line(const std::string& m){
+    std::lock_guard<std::mutex> lk(g_log_mtx);
+    std::ofstream f("miqminer.log", std::ios::app);
+    if(!f.good()) return;
+    auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+#if defined(_WIN32)
+    struct tm tmv; localtime_s(&tmv, &now);
+    char buf[64]; strftime(buf,sizeof(buf),"%Y-%m-%d %H:%M:%S",&tmv);
+#else
+    struct tm tmv; localtime_r(&now, &tmv);
+    char buf[64]; strftime(buf,sizeof(buf),"%Y-%m-%d %H:%M:%S",&tmv);
+#endif
+    f << "[" << buf << "] " << m << "\n";
+}
+
 // ===== JSON helpers ==========================================================
 static inline bool json_has_error(const std::string& json){
     size_t e = json.find("\"error\"");
@@ -179,7 +235,6 @@ static bool json_find_string(const std::string& json, const std::string& key, st
     if(p==std::string::npos) return false;
     p += pat.size();
     while(p<json.size() && std::isspace((unsigned char)json[p])) ++p;
-    // accept either  "value"  or  value (we only handle strings here)
     if(p>=json.size() || json[p]!='"') return false;
     ++p;
     size_t q = p;
@@ -328,6 +383,36 @@ static inline void store_u64_le(uint8_t* p, uint64_t x){
 // ===== minimal HTTP/JSON-RPC ================================================
 struct HttpResp { int code{0}; std::string body; };
 
+static inline std::string str_tolower(std::string s){
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+    return s;
+}
+static std::string dechunk_if_needed(const std::string& raw){
+    // Very small & safe dechunker (only if Transfer-Encoding: chunked is present).
+    size_t hdr_end = raw.find("\r\n\r\n");
+    if(hdr_end==std::string::npos) return raw;
+    std::string headers = raw.substr(0, hdr_end);
+    std::string lower = str_tolower(headers);
+    if(lower.find("transfer-encoding: chunked")==std::string::npos) return raw;
+    std::string body = raw.substr(hdr_end+4);
+    std::string out; out.reserve(body.size());
+    size_t p=0;
+    while(p<body.size()){
+        size_t eol = body.find("\r\n", p);
+        if(eol==std::string::npos) break;
+        std::string nhex = body.substr(p, eol-p);
+        size_t chunk = 0;
+        try{ chunk = (size_t)std::stoul(nhex, nullptr, 16); }catch(...){ break; }
+        p = eol + 2;
+        if(chunk==0) break;
+        if(p+chunk > body.size()) break;
+        out.append(body, p, chunk);
+        p += chunk;
+        if(p+2 <= body.size()) p += 2; // skip CRLF
+    }
+    return raw.substr(0, hdr_end+4) + out;
+}
+
 static bool http_post(const std::string& host, uint16_t port, const std::string& path,
                       const std::string& auth_token, const std::string& json, HttpResp& out)
 {
@@ -352,10 +437,12 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
         s = (socket_t)socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 #if defined(_WIN32)
         if(s==INVALID_SOCKET) continue;
+        set_socket_timeouts(s, 7000, 10000);
         if(connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen)==0) break;
         miq_closesocket(s); s = INVALID_SOCKET;
 #else
         if(s<0) continue;
+        set_socket_timeouts(s, 7000, 10000);
         if(connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen)==0) break;
         miq_closesocket(s); s = -1;
 #endif
@@ -406,11 +493,14 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
     WSACleanup();
 #endif
 
-    size_t sp = resp.find(' ');
+    // Handle chunked transfer (harden)
+    std::string resp2 = dechunk_if_needed(resp);
+
+    size_t sp = resp2.find(' ');
     if(sp == std::string::npos) return false;
-    int code = std::atoi(resp.c_str()+sp+1);
-    size_t hdr_end = resp.find("\r\n\r\n");
-    std::string body = (hdr_end==std::string::npos)? std::string() : resp.substr(hdr_end+4);
+    int code = std::atoi(resp2.c_str()+sp+1);
+    size_t hdr_end = resp2.find("\r\n\r\n");
+    std::string body = (hdr_end==std::string::npos)? std::string() : resp2.substr(hdr_end+4);
     out.code = code; out.body = std::move(body);
     return true;
 }
@@ -1039,6 +1129,9 @@ struct UIState {
     std::atomic<uint64_t> node_blocks{0};
     std::atomic<double>   node_verification{0.0};
     std::atomic<int>      rpc_errors{0};
+
+    // shutdown
+    std::atomic<bool>    running{true};
 };
 
 // Global hook for publishing hash previews from workers
@@ -1102,16 +1195,32 @@ static std::string progress_bar(double p, size_t width){
     return o.str();
 }
 
-// ===== Intro splash (5s) + address prompt ===================================
-static void show_intro_and_get_address(std::string& out_addr){
+// ===== Intro splash & robust address prompt =================================
+static void enable_virtual_terminal(){
 #if defined(_WIN32)
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
     if (h != INVALID_HANDLE_VALUE) { DWORD mode=0; if (GetConsoleMode(h,&mode)) SetConsoleMode(h, mode | 0x0004); }
 #endif
+}
+static bool prompt_address_until_valid(std::string& out_addr){
+    for(;;){
+        std::cout << "\n  Enter P2PKH Base58 address to mine to: " << std::flush;
+        if(!std::getline(std::cin, out_addr)) return false;
+        trim(out_addr);
+        if(out_addr.empty()) continue;
+        std::vector<uint8_t> tmp;
+        if(parse_p2pkh(out_addr, tmp)) return true;
+        std::cout << "  " << C("31;1") << "Invalid address." << R()
+                  << " Expecting Base58Check P2PKH (version 0x"
+                  << std::hex << std::setw(2) << std::setfill('0') << (unsigned)miq::VERSION_P2PKH
+                  << std::dec << "). Try again.\n";
+    }
+}
+static void show_intro(){
     using clock = std::chrono::steady_clock;
     auto t0 = clock::now();
     int spin = 0;
-    while(std::chrono::duration<double>(clock::now()-t0).count() < 5.0){
+    while(std::chrono::duration<double>(clock::now()-t0).count() < 2.0){
         std::ostringstream s;
         s << CLS();
         s << C("36;1");
@@ -1123,13 +1232,10 @@ static void show_intro_and_get_address(std::string& out_addr){
         spinner_circle_ascii(spin++, rows);
         s << "  " << C("36;1") << center_fit("CHRONEN MINER", 60) << R() << "\n\n";
         for(auto& r: rows) s << "      " << C("36") << r << R() << "\n";
-        s << "\n  " << C("33;1") << "LOADING DEPENDENCIES" << R() << "\n";
+        s << "\n  " << C("33;1") << "INITIALIZING" << R() << "\n";
         std::cout << s.str() << std::flush;
         miq_sleep_ms(1000/12);
     }
-    std::cout << "\n  Enter P2PKH Base58 address to mine to: " << std::flush;
-    std::getline(std::cin, out_addr);
-    trim(out_addr);
 }
 
 // ===== OpenCL GPU miner ======================================================
@@ -1562,6 +1668,7 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
                                   const std::vector<Transaction> txs_including_cb,
                                   uint32_t bits,
                                   std::atomic<bool>* found,
+                                  std::atomic<bool>* abort_round,
                                   ThreadCounter* counter,
                                   bool pin_affinity,
                                   unsigned tid, unsigned stride,
@@ -1603,9 +1710,9 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
     const uint64_t BATCH = (1ull<<15);
     uint64_t local_hashes = 0;
 
-    while(!found->load(std::memory_order_relaxed)){
+    while(!found->load(std::memory_order_relaxed) && !abort_round->load(std::memory_order_relaxed)){
         uint64_t todo = BATCH;
-        while(todo && !found->load(std::memory_order_relaxed)){
+        while(todo && !found->load(std::memory_order_relaxed) && !abort_round->load(std::memory_order_relaxed)){
             const uint64_t n0 = nonce; nonce += step;
             const uint64_t n1 = nonce; nonce += step;
             const uint64_t n2 = nonce; nonce += step;
@@ -1660,7 +1767,7 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
                 local_hashes = 0;
             }
         }
-        if(found->load(std::memory_order_relaxed)) break;
+        if(found->load(std::memory_order_relaxed) || abort_round->load(std::memory_order_relaxed)) break;
     }
     if(local_hashes){
         counter->hashes.fetch_add(local_hashes, std::memory_order_relaxed);
@@ -1706,15 +1813,28 @@ static void usage(){
     "  - GPU requires build with -DMIQ_ENABLE_OPENCL and OpenCL runtime installed\n";
 }
 
+// ===== graceful shutdown =====================================================
+static std::atomic<bool>* g_running_flag = nullptr;
+#if defined(_WIN32)
+static BOOL WINAPI ctrl_handler(DWORD type){
+    if(type==CTRL_C_EVENT || type==CTRL_CLOSE_EVENT || type==CTRL_BREAK_EVENT){
+        if(g_running_flag) g_running_flag->store(false);
+        return TRUE;
+    }
+    return FALSE;
+}
+#else
+static void sig_handler(int){
+    if(g_running_flag) g_running_flag->store(false);
+}
+#endif
+
 // ===== main ==================================================================
 int main(int argc, char** argv){
     try{
-#if defined(_WIN32)
-        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-        if (h != INVALID_HANDLE_VALUE) {
-            DWORD mode=0; if (GetConsoleMode(h,&mode)) SetConsoleMode(h, mode | 0x0004);
-        }
-#endif
+        enable_virtual_terminal();
+        set_title("Chronen Miner");
+
         std::string rpc_host = "127.0.0.1";
         uint16_t    rpc_port = (uint16_t)miq::RPC_PORT;
         std::string token;
@@ -1802,22 +1922,24 @@ int main(int argc, char** argv){
                 if(read_all_file(default_cookie_path(), cookie)) token = cookie;
             }
         }
+        if(const char* aenv = std::getenv("MIQ_ADDRESS")){
+            if(address_cli.empty()) address_cli = aenv;
+        }
 
         set_process_priority(high_priority);
 
-        // payout address
+        // ===== Splash & address
+        show_intro();
         std::string addr = address_cli;
 
+        if(!addr.empty()){
+            std::vector<uint8_t> tmp;
+            if(!parse_p2pkh(addr, tmp)) addr.clear();
+        }
         if(addr.empty()){
-            show_intro_and_get_address(addr);
-            if(addr.empty()){ std::fprintf(stderr,"stdin closed\n"); return 1; }
-        } else {
-            std::ostringstream s; s << CLS();
-            s << C("36;1");
-            const size_t N = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
-            for(size_t i=0;i<N;i++) s << "  " << kChronenMinerBanner[i] << "\n";
-            s << R() << "\n";
-            std::cout << s.str() << std::flush;
+            if(!prompt_address_until_valid(addr)){
+                std::fprintf(stderr,"stdin closed\n"); return 1;
+            }
         }
 
         std::vector<uint8_t> pkh;
@@ -1830,16 +1952,24 @@ int main(int argc, char** argv){
         GpuMiner gpu;
         UIState ui;
         g_ui = &ui;
+        g_running_flag = &ui.running;
         ui.my_pkh = pkh;
         ui.rpc_host = rpc_host;
         ui.rpc_port = rpc_port;
-        std::atomic<bool> running{true};
+
+#if defined(_WIN32)
+        SetConsoleCtrlHandler(ctrl_handler, TRUE);
+#else
+        signal(SIGINT, sig_handler);
+        signal(SIGTERM, sig_handler);
+#endif
 
 #if defined(MIQ_ENABLE_OPENCL)
         if(gpu_enabled){
             std::string gerr;
             if(!gpu.init(gpu_platform_index, gpu_device_index, gpu_gws, gpu_npi, &gerr)){
                 std::fprintf(stderr,"[GPU] init failed: %s\n", gerr.c_str());
+                log_line(std::string("[GPU] init failed: ")+gerr);
                 gpu_enabled = false;
             } else {
                 ui.gpu_available.store(true);
@@ -1850,6 +1980,7 @@ int main(int argc, char** argv){
                 std::fprintf(stderr,"[GPU] Using device  : %s\n", ui.gpu_device.c_str());
                 std::fprintf(stderr,"[GPU] Driver        : %s\n", ui.gpu_driver.c_str());
                 std::fprintf(stderr,"[GPU] gws=%zu  nonces/item=%u\n", gpu_gws, gpu_npi);
+                log_line("[GPU] platform: "+ui.gpu_platform+" device: "+ui.gpu_device+" driver: "+ui.gpu_driver);
             }
         }
 #else
@@ -1859,13 +1990,34 @@ int main(int argc, char** argv){
         }
 #endif
 
-        // UI thread (animated dashboard)
+        // ===== UI thread (animated dashboard)
         std::thread ui_th([&](){
             using clock = std::chrono::steady_clock;
             const int FPS = 12;
             const auto frame_dt = std::chrono::milliseconds(1000/FPS);
             int spin_idx = 0;
-            while(running.load(std::memory_order_relaxed)){
+
+            // Config card (one-time)
+            {
+                std::ostringstream s;
+                s << CLS();
+                s << C("36;1");
+                const size_t kBannerN = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
+                for(size_t i=0;i<kBannerN;i++) s << "  " << kChronenMinerBanner[i] << "\n";
+                s << R() << "\n";
+                s << "  " << C("1") << "Endpoint: " << R() << ui.rpc_host << ":" << ui.rpc_port << "\n";
+                s << "  " << C("1") << "Address : " << R() << pkh_to_address(ui.my_pkh) << "\n";
+                s << "  " << C("1") << "Threads : " << R() << (int)threads << (pin_affinity?"  (affinity)":"") << (high_priority?"  (high-priority)":"") << "\n";
+#if defined(MIQ_ENABLE_OPENCL)
+                s << "  " << C("1") << "GPU     : " << R() << (ui.gpu_available.load() ? (ui.gpu_platform+" / "+ui.gpu_device) : std::string("(disabled)")) << "\n";
+#endif
+                s << "\n  Preparing dashboard…\n";
+                std::cout << s.str() << std::flush;
+                miq_sleep_ms(650);
+            }
+
+            while(ui.running.load(std::memory_order_relaxed)){
+                TermSize ts = get_term_size();
                 std::ostringstream out;
                 out << CLS();
 
@@ -1875,13 +2027,12 @@ int main(int argc, char** argv){
                 for(size_t i=0;i<kBannerN;i++) out << "  " << kChronenMinerBanner[i] << "\n";
                 out << R() << "\n";
 
-                // Connection section
+                // Connection & Sync
                 out << "  " << C("1") << "RPC: " << R() << ui.rpc_host << ":" << ui.rpc_port
                     << "   " << C(ui.node_reachable.load()? "32;1" : "31;1")
                     << (ui.node_reachable.load()? "[CONNECTED]" : "[UNREACHABLE]") << R()
                     << "   Peers: " << ui.node_peers.load() << "\n";
 
-                // Sync section with progress bar
                 uint64_t H = ui.node_headers.load(), B = ui.node_blocks.load();
                 double vp = ui.node_verification.load();
                 bool synced = ui.node_synced.load();
@@ -1891,7 +2042,7 @@ int main(int argc, char** argv){
                 out << "  " << C("1") << "Sync: " << R()
                     << (synced ? C("32;1") : C("33;1"))
                     << (synced ? "IBD complete" : "initial block download") << R()
-                    << "   " << progress_bar(p, 34) 
+                    << "   " << progress_bar(p, (size_t)std::max(20, ts.cols - 64))
                     << "   headers=" << H << " blocks=" << B << "\n";
 
                 // Tip / candidate
@@ -1997,7 +2148,7 @@ int main(int argc, char** argv){
 
                 {
                     auto age = std::chrono::duration<double>(clock::now() - ui.last_submit_when).count();
-                    if(!ui.last_submit_msg.empty() && age < 5.0){
+                    if(!ui.last_submit_msg.empty() && age < 7.0){
                         out << "  " << ui.last_submit_msg << "\n";
                     }
                 }
@@ -2009,20 +2160,22 @@ int main(int argc, char** argv){
                     }
                 }
 
-                // animated dual-frame
+                // Animated cards
                 std::array<std::string,5> spin_rows;
                 spinner_circle_ascii(spin_idx, spin_rows);
                 ++spin_idx;
-                std::vector<std::string> lines;
-                lines.push_back("  ##############################   ##############################");
-                lines.push_back("  #                            #   #                            #");
-                lines.push_back("  #"+center_fit("MINER STATUS", 28)+"#   #"+center_fit("CHRONEN  MINER", 28)+"#");
-                lines.push_back("  #                            #   #                            #");
-                for(int r=0;r<5;r++){
-                    lines.push_back("  #"+center_fit(spin_rows[r], 28)+"#   #"+center_fit("                    ", 28)+"#");
+                {
+                    std::vector<std::string> lines;
+                    lines.push_back("  ##############################   ##############################");
+                    lines.push_back("  #                            #   #                            #");
+                    lines.push_back("  #"+center_fit("MINER STATUS", 28)+"#   #"+center_fit("CHRONEN  MINER", 28)+"#");
+                    lines.push_back("  #                            #   #                            #");
+                    for(int r=0;r<5;r++){
+                        lines.push_back("  #"+center_fit(spin_rows[r], 28)+"#   #"+center_fit("                    ", 28)+"#");
+                    }
+                    lines.push_back("  ##############################   ##############################");
+                    for(const auto& L : lines) out << C("36") << L << R() << "\n";
                 }
-                lines.push_back("  ##############################   ##############################");
-                for(const auto& L : lines) out << C("36") << L << R() << "\n";
 
                 out << "\n  Press Ctrl+C to quit.\n";
                 std::cout << out.str() << std::flush;
@@ -2031,11 +2184,11 @@ int main(int argc, char** argv){
         });
         ui_th.detach();
 
-        // watcher thread (sync, tip, stats, wallet-ish)
+        // ===== watcher thread (sync, tip, stats, wallet-ish)
         std::thread watch([&](){
             uint64_t last_seen_h = 0;
             int tick=0;
-            while(running.load()){
+            while(ui.running.load()){
                 // Sync info (preferred: getblockchaininfo)
                 SyncInfo si{};
                 if(rpc_getblockchaininfo(rpc_host, rpc_port, token, si)){
@@ -2044,7 +2197,6 @@ int main(int argc, char** argv){
                     ui.node_headers.store(si.headers);
                     ui.node_blocks.store(si.blocks);
                     ui.node_verification.store(si.verification);
-                    // Heuristics for "synced"
                     bool synced_flag = (!si.ibd) && (si.headers>0) && (si.blocks>0) && (si.headers - si.blocks <= 1);
                     if(si.verification > 0.999) synced_flag = true;
                     ui.node_synced.store(synced_flag);
@@ -2134,14 +2286,11 @@ int main(int argc, char** argv){
                 }
 
                 if((++tick % 10)==0){
-                    // best-effort payout total discovery (optional)
-                    uint64_t tot = ui.total_received_base.load();
-                    // (Keep existing RPC probing if your node supports it)
-                    // ui.total_received_base.store(tot);
-                    (void)tot;
+                    // best-effort payout total discovery (optional hook)
+                    (void)ui.total_received_base.load();
                 }
 
-                for(int i=0;i<10;i++) miq_sleep_ms(100);
+                for(int i=0;i<10 && ui.running.load();i++) miq_sleep_ms(100);
             }
         });
         watch.detach();
@@ -2157,7 +2306,7 @@ int main(int argc, char** argv){
             uint64_t last_sum = 0;
             double ema_now = 0.0;
             double ema_smooth = 0.0;
-            while(running.load()){
+            while(ui.running.load()){
                 uint64_t sum = 0;
                 for(auto& c: thr_counts) sum += c.hashes.load(std::memory_order_relaxed);
 
@@ -2186,7 +2335,7 @@ int main(int argc, char** argv){
                 }
 
                 last_sum = sum; last = now;
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                for(int i=0;i<10 && ui.running.load(); ++i) miq_sleep_ms(20);
             }
         });
         meter.detach();
@@ -2219,15 +2368,17 @@ int main(int argc, char** argv){
         };
 #endif
 
-        // ===== START MINING LOOP IMMEDIATELY (no IBD/template gate) ==========
-        std::fprintf(stderr, "[miner] starting mining loop (no IBD gate; will auto-refresh jobs).\n");
+        // ===== mining loop with periodic refresh (prevents stale templates)
+        std::fprintf(stderr, "[miner] starting mining loop (auto-refresh jobs, clean shutdown).\n");
 
-        while (true) {
+        const int JOB_REFRESH_SECONDS = 45; // refresh header time/tx set periodically
+        while (ui.running.load()) {
             MinerTemplate tpl;
             if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
                 std::ostringstream m; m << C("31;1") << "template error — check RPC token or node" << R();
                 { std::lock_guard<std::mutex> lk(ui.mtx); ui.last_submit_msg = m.str(); ui.last_submit_when = std::chrono::steady_clock::now(); }
-                miq_sleep_ms(1000);
+                log_line("template error (getminertemplate failed)");
+                for(int i=0;i<20 && ui.running.load(); ++i) miq_sleep_ms(100);
                 continue;
             }
 
@@ -2276,8 +2427,8 @@ int main(int argc, char** argv){
             hb.version = 1;
             hb.prev_hash = tpl.prev_hash;
 
-            int64_t now = (int64_t)time(nullptr);
-            hb.time = std::max<int64_t>(now, std::max<int64_t>(tpl.time, tpl.mintime));
+            int64_t now_ts = (int64_t)time(nullptr);
+            hb.time = std::max<int64_t>(now_ts, std::max<int64_t>(tpl.time, tpl.mintime));
             hb.bits = tpl.bits;
             hb.nonce = 0;
 
@@ -2288,13 +2439,14 @@ int main(int argc, char** argv){
 
             // CPU mining threads
             std::atomic<bool> found{false};
+            std::atomic<bool> abort_round{false};
             std::vector<std::thread> thv;
             Block found_block;
 
             for (unsigned tid = 0; tid < threads; ++tid) {
                 thv.emplace_back(
                     mine_worker_optimized, hb, txs_inc, hb.bits,
-                    &found, &thr_counts[tid], pin_affinity, tid, threads, &found_block
+                    &found, &abort_round, &thr_counts[tid], pin_affinity, tid, threads, &found_block
                 );
             }
 
@@ -2332,14 +2484,16 @@ int main(int argc, char** argv){
 
                 if (!gpu.set_job(gpuprefix, target_be, &gerr)) {
                     std::fprintf(stderr, "[GPU] job set failed: %s\n", gerr.c_str());
+                    log_line(std::string("[GPU] job set failed: ")+gerr);
                 } else {
                     gpu_th = std::thread([&](){
                         uint64_t base_nonce =
                             (static_cast<uint64_t>(time(nullptr)) << 32) ^ 0x9e3779b97f4a7c15ull ^ 0xa5a5a5a5ULL;
-                        while (!found.load(std::memory_order_relaxed)) {
+                        while (!found.load(std::memory_order_relaxed) && !abort_round.load(std::memory_order_relaxed) && ui.running.load()) {
                             uint64_t n = 0; bool ok = false; double ghps = 0.0;
                             if (!gpu.run_round(base_nonce, gpu_npi, n, ok, ghps, 0.25, 2.0)) {
                                 std::fprintf(stderr, "[GPU] run_round failed.\n");
+                                log_line("[GPU] run_round failed (stopping GPU thread)");
                                 break;
                             }
                             g_ui->gpu_hps_now.store(gpu.ema_now);
@@ -2358,15 +2512,54 @@ int main(int argc, char** argv){
             }
 #endif
 
+            auto round_start_wall = std::chrono::steady_clock::now();
+            bool did_abort_refresh = false;
+
+            // Refresh/abort monitor
+            std::thread refresh_mon([&](){
+                while(!found.load() && ui.running.load()){
+                    // Refresh after JOB_REFRESH_SECONDS for fresh time/mempool
+                    auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - round_start_wall).count();
+                    if(dt >= JOB_REFRESH_SECONDS){
+                        abort_round.store(true);
+                        did_abort_refresh = true;
+                        break;
+                    }
+                    // Abort if tip advanced (stale prevhash)
+                    TipInfo tip_now{};
+                    if(rpc_gettipinfo(rpc_host, rpc_port, token, tip_now)){
+                        if(from_hex_s(tip_now.hash_hex) != tpl.prev_hash){
+                            abort_round.store(true);
+                            did_abort_refresh = true;
+                            break;
+                        }
+                    }
+                    for(int i=0;i<10 && !found.load() && !abort_round.load() && ui.running.load(); ++i) miq_sleep_ms(50);
+                }
+            });
+
             // Wait for CPU workers
             for (auto &th : thv) th.join();
 
 #if defined(MIQ_ENABLE_OPENCL)
             if (gpu_th.joinable()) {
-                found.store(true);
+                abort_round.store(true);
                 gpu_th.join();
             }
 #endif
+            if(refresh_mon.joinable()) refresh_mon.join();
+
+            if(!ui.running.load()) break;
+
+            // If we refreshed/aborted (no solution), continue to next template
+            if(!found.load()){
+                if(did_abort_refresh){
+                    std::lock_guard<std::mutex> lk(ui.mtx);
+                    ui.last_submit_msg = C("33;1") + std::string("job refreshed (new time/chain state)") + R();
+                    ui.last_submit_when = std::chrono::steady_clock::now();
+                }
+                continue;
+            }
 
             // Check staleness vs tip
             TipInfo tip_now{};
@@ -2375,6 +2568,7 @@ int main(int argc, char** argv){
                     std::lock_guard<std::mutex> lk(ui.mtx);
                     ui.last_submit_msg = std::string("submit skipped: template stale (chain advanced)");
                     ui.last_submit_when = std::chrono::steady_clock::now();
+                    log_line("submit skipped: stale template");
                     continue;
                 }
             }
@@ -2385,6 +2579,7 @@ int main(int argc, char** argv){
                 std::lock_guard<std::mutex> lk(ui.mtx);
                 ui.last_submit_msg = "internal: solved header doesn't meet target (skipping)";
                 ui.last_submit_when = std::chrono::steady_clock::now();
+                log_line("internal mismatch: header doesn't meet target (skipped)");
                 continue;
             }
 
@@ -2398,7 +2593,7 @@ int main(int argc, char** argv){
             if (ok) {
                 // Try confirm acceptance
                 bool confirmed = false;
-                for (int i = 0; i < 40; ++i) {
+                for (int i = 0; i < 40 && ui.running.load(); ++i) {
                     TipInfo t2{};
                     if (rpc_gettipinfo(rpc_host, rpc_port, token, t2)) {
                         if (t2.height == tpl.height &&
@@ -2425,11 +2620,13 @@ int main(int argc, char** argv){
                             std::string("miner: accepted block at height ")
                             + std::to_string(tpl.height) + " " + ui.last_found_block_hash
                         );
+                        log_line("accepted block at height "+std::to_string(tpl.height)+" hash="+ui.last_found_block_hash);
                     } else {
                         std::ostringstream m; m << C("33;1")
                                                 << "submit accepted (pending tip refresh) hash="
                                                 << ui.last_found_block_hash << R();
                         ui.last_submit_msg = m.str();
+                        log_line("submit accepted (awaiting tip confirm), hash="+ui.last_found_block_hash);
                     }
                     ui.last_submit_when = std::chrono::steady_clock::now();
                 }
@@ -2442,14 +2639,22 @@ int main(int argc, char** argv){
                 }
                 ui.last_submit_msg = m.str();
                 ui.last_submit_when = std::chrono::steady_clock::now();
+                log_line("submit rejected / rpc failed");
             }
         }
 
+        // Final clear/exit
+        std::cout << "\n" << C("33;1") << "Exiting…" << R() << std::endl;
+        log_line("miner exited cleanly");
+        return 0;
+
     } catch(const std::exception& ex){
         std::fprintf(stderr,"[FATAL] %s\n", ex.what());
+        log_line(std::string("[FATAL] ")+ex.what());
         return 1;
     } catch(...){
         std::fprintf(stderr,"[FATAL] unknown\n");
+        log_line("[FATAL] unknown");
         return 1;
     }
 }
