@@ -942,12 +942,10 @@ static inline bool gate_on_bytes(Sock fd, size_t add){
     if (it->second.rx_bytes > MAX_MSG_BYTES) return true;
     return false;
 }
-static inline bool gate_on_command(
-    Sock fd,
-    const std::string& cmd,
-    /*out*/ bool& should_send_verack,
-    /*out*/ int& close_code
-){
+static inline bool gate_on_command(Sock fd, const std::string& cmd,
+                                   /*out*/ bool& should_send_verack,
+                                   /*out*/ int& close_code)
+{
     should_send_verack = false;
     close_code = 0;
 
@@ -955,16 +953,13 @@ static inline bool gate_on_command(
     if (it == g_gate.end()) return false;
     auto& g = it->second;
 
-    const int64_t now = now_ms();
-    const int64_t last = (g.hs_last_ms ? g.hs_last_ms : g.t_conn_ms);
-
-    // Handshake watchdog: base timeout on previous activity/connection time.
+    g.hs_last_ms = now_ms();
+    // Handshake watchdog based on last activity (not raw connect time).
     if (!g.got_verack) {
-        const int64_t idle = now - last;
+        int64_t idle = now_ms() - g.hs_last_ms;   // will be small if traffic is flowing
         if (idle > HANDSHAKE_MS) {
             if (g.is_loopback) {
-                // Be lenient with localhost wallets/tools.
-                g.hs_last_ms = now;
+                g.hs_last_ms = now_ms();          // be lenient with localhost tools
             } else {
                 close_code = 408;
                 P2P_TRACE("close fd=" + std::to_string((uintptr_t)fd) + " reason=handshake-timeout");
@@ -973,64 +968,48 @@ static inline bool gate_on_command(
         }
     }
 
-    // NOTE: only refresh hs_last_ms once we've actually processed a command
-    if (!cmd.empty()) {
-        if (cmd == "version") {
-            if (!g.got_version) {
+    if (!cmd.empty()){
+        if (cmd == "version"){
+            if (!g.got_version){
                 g.got_version = true;
                 should_send_verack = true;
                 g_preverack_counts.erase(fd);
-                g.hs_last_ms = now_ms();
+                g.hs_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now().time_since_epoch()).count();
             }
-        } else if (cmd == "verack") {
+        } else if (cmd == "verack"){
             g.got_verack = true;
             g_preverack_counts.erase(fd);
-            g.hs_last_ms = now_ms();
+            g.hs_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now().time_since_epoch()).count();
         } else {
-            // Pre-version traffic handling
             if (!g.got_version) {
                 if (miq_safe_preverack_cmd(cmd)) {
-                    g.hs_last_ms = now_ms();
-                    // allow safe pre-version traffic
+                    // safe pre-version traffic is fine; liveness already refreshed
                     return false;
                 } else {
                     g.banscore += 10;
-                    if (g.banscore >= MAX_BANSCORE) {
-                        close_code = 400;
-                        P2P_TRACE("close fd=" + std::to_string((uintptr_t)fd) + " reason=pre-version-bad");
-                        return true;
-                    }
+                    if (g.banscore >= MAX_BANSCORE) { close_code = 400; P2P_TRACE("close fd="+std::to_string((uintptr_t)fd)+" reason=pre-version-bad"); return true; }
                     return false;
                 }
             }
-
-            // Pre-verack: allow a limited number of safe messages
-            if (!g.got_verack) {
-                if (!miq_safe_preverack_cmd(cmd)) {
-                    // ignore silently
-                    return false;
-                }
+            if (!g.got_verack){
+                if (!miq_safe_preverack_cmd(cmd)) { return false; /* ignore silently */ }
+                // Never penalize safe pre-verack getheaders/headers; drop-count only other safe cmds.
                 if (!g.is_loopback && cmd != "getheaders" && cmd != "headers") {
                     int &cnt = g_preverack_counts[fd];
                     if (++cnt > MIQ_PREVERACK_QUEUE_MAX) {
-                        // soft-drop extras during handshake
+                        // soft-drop extra safe messages during handshake; no banscore/close
                         return false;
                     }
                 }
-                g.hs_last_ms = now_ms();
             }
         }
     }
 
-    if (g.banscore >= MAX_BANSCORE) {
-        close_code = 400;
-        P2P_TRACE("close fd=" + std::to_string((uintptr_t)fd) + " reason=banscore");
-        return true;
-    }
-
+    if (g.banscore >= MAX_BANSCORE){ close_code = 400; P2P_TRACE("close fd="+std::to_string((uintptr_t)fd)+" reason=banscore"); return true; }
     return false;
 }
-
 
 // === legacy persisted IPv4 addr set (kept for backward compat) ==============
 static void save_addrs_to_disk(const std::string& datadir,
@@ -1415,65 +1394,97 @@ bool P2P::check_rate(PeerState& ps,
 
 #if MIQ_ENABLE_HEADERS_FIRST
 namespace {
-static constexpr size_t HEADER_WIRE_BYTES = 88;
+    static constexpr size_t HEADER_WIRE_BYTES = 88;
 
-    // Send 1-byte count for compatibility with older peers
-    static std::vector<uint8_t> build_headers_payload(const std::vector<BlockHeader>& hs){
-        const uint8_t n = (uint8_t)std::min<size_t>(hs.size(), 200);
-        std::vector<uint8_t> v; v.reserve(1 + (size_t)n * HEADER_WIRE_BYTES);
+    static inline void put_u32le(std::vector<uint8_t>& v, uint32_t x){
+        v.push_back((uint8_t)((x>>0)&0xff));
+        v.push_back((uint8_t)((x>>8)&0xff));
+        v.push_back((uint8_t)((x>>16)&0xff));
+        v.push_back((uint8_t)((x>>24)&0xff));
+    }
+    static inline void put_u64le(std::vector<uint8_t>& v, uint64_t x){
+        for(int i=0;i<8;i++) v.push_back((uint8_t)((x>>(8*i))&0xff));
+    }
+    static inline void put_i64le(std::vector<uint8_t>& v, int64_t x){
+        put_u64le(v, (uint64_t)x);
+    }
+    static inline uint32_t get_u32le(const uint8_t* p){ return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24); }
+    static inline uint64_t get_u64le(const uint8_t* p){ uint64_t z=0; for(int i=0;i<8;i++) z|=((uint64_t)p[i])<<(8*i); return z; }
+    static inline int64_t  get_i64le(const uint8_t* p){ return (int64_t)get_u64le(p); }
+
+    static std::vector<uint8_t> ser_header(const BlockHeader& h){
+        std::vector<uint8_t> v; v.reserve(HEADER_WIRE_BYTES);
+        put_u32le(v, h.version);
+        v.insert(v.end(), h.prev_hash.begin(),   h.prev_hash.end());
+        v.insert(v.end(), h.merkle_root.begin(), h.merkle_root.end());
+        put_i64le(v, h.time);
+        put_u32le(v, h.bits);
+        put_u64le(v, h.nonce);
+        return v;
+    }
+    static bool deser_header(const uint8_t* p, size_t n, BlockHeader& h){
+        if (n < HEADER_WIRE_BYTES) return false;
+        h.version = get_u32le(p+0);
+        h.prev_hash.assign(p+4,   p+4+32);
+        h.merkle_root.assign(p+36, p+36+32);
+        h.time = get_i64le(p+68);
+        h.bits = get_u32le(p+76);
+        h.nonce= get_u64le(p+80);
+        return true;
+    }
+
+    static std::vector<uint8_t> build_getheaders_payload(const std::vector<std::vector<uint8_t>>& locator,
+                                                         const std::vector<uint8_t>& stop){
+        const uint8_t n = (uint8_t)std::min<size_t>(locator.size(), 64);
+        std::vector<uint8_t> v; v.reserve(1 + n*32 + 32);
         v.push_back(n);
-        for (size_t i = 0; i < n; ++i) {
+        for (size_t i=0;i<n;i++) v.insert(v.end(), locator[i].begin(), locator[i].end());
+        if (stop.size()==32) v.insert(v.end(), stop.begin(), stop.end());
+        else v.insert(v.end(), 32, 0);
+        return v;
+    }
+    static bool parse_getheaders_payload(const std::vector<uint8_t>& p,
+                                         std::vector<std::vector<uint8_t>>& locator,
+                                         std::vector<uint8_t>& stop){
+        if (p.size() < 1+32) return false;
+        uint8_t n = p[0];
+        size_t need = 1 + (size_t)n*32 + 32;
+        if (p.size() < need) return false;
+        locator.clear();
+        size_t off = 1;
+        for (uint8_t i=0;i<n;i++){ locator.emplace_back(p.begin()+off, p.begin()+off+32); off+=32; }
+        stop.assign(p.begin()+off, p.begin()+off+32);
+        return true;
+    }
+
+    static std::vector<uint8_t> build_headers_payload(const std::vector<BlockHeader>& hs){
+        const uint16_t n = (uint16_t)std::min<size_t>(hs.size(), 2000);
+        std::vector<uint8_t> v; v.reserve(2 + (size_t)n*HEADER_WIRE_BYTES);
+        v.push_back((uint8_t)(n & 0xff));
+        v.push_back((uint8_t)((n >> 8) & 0xff));
+        for (size_t i=0;i<n;i++){
             auto h = ser_header(hs[i]);
             v.insert(v.end(), h.begin(), h.end());
         }
         return v;
     }
-
-    // Parse both 1-byte and 2-byte counts (older/newer peers)
     static bool parse_headers_payload(const std::vector<uint8_t>& p, std::vector<BlockHeader>& out){
-        out.clear();
-        if (p.size() < 1) return false;
-
-        auto try_parse = [&](size_t hdr_bytes, size_t& n, size_t& off)->bool{
-            if (hdr_bytes == 1) {
-                if (p.size() < 1) return false;
-                n = (size_t)p[0];
-                off = 1;
-                return true;
-            }
-            if (hdr_bytes == 2) {
-                if (p.size() < 2) return false;
-                uint16_t nn = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-                n = (size_t)nn;
-                off = 2;
-                return true;
-            }
-            return false;
-        };
-
-        size_t n = 0, off = 0;
-
-        // Try 2-byte first
-        bool ok = try_parse(2, n, off);
-        size_t need = ok ? (off + n * HEADER_WIRE_BYTES) : 0;
-        if (!ok || p.size() != need) {
-            // Fallback to 1-byte
-            ok = try_parse(1, n, off);
-            need = ok ? (off + n * HEADER_WIRE_BYTES) : 0;
-        }
-        if (!ok || p.size() != need) return false;
-
-        out.reserve(n);
-        for (size_t i = 0; i < n; ++i) {
+        if (p.size() < 2) return false;
+        uint16_t n = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+        size_t need = 2 + (size_t)n*HEADER_WIRE_BYTES;
+        if (p.size() < need) return false;
+        out.clear(); out.reserve(n);
+        size_t off = 2;
+        for (uint16_t i=0;i<n;i++){
             BlockHeader h;
-            if (!deser_header(p.data() + off, p.size() - off, h)) return false;
+            if (!deser_header(p.data()+off, p.size()-off, h)) return false;
             out.push_back(std::move(h));
             off += HEADER_WIRE_BYTES;
         }
         return true;
     }
 }
-#endif
+#endif // MIQ_ENABLE_HEADERS_FIRST
 
 #if MIQ_ENABLE_ADDRMAN
 namespace {
@@ -2969,7 +2980,8 @@ void P2P::loop(){
 
 #if MIQ_ENABLE_HEADERS_FIRST
                         const bool peer_supports_headers = (ps.features & (1ull<<0)) != 0;
-                        if (peer_supports_headers || (MIQ_TRY_HEADERS_ANYWAY != 0)) {
+                        const bool try_headers = peer_supports_headers || (MIQ_TRY_HEADERS_ANYWAY != 0);
+                        if (try_headers) {
                             std::vector<std::vector<uint8_t>> locator;
                             chain_.build_locator(locator);
                             if (g_hdr_flip[(Sock)s]) {
@@ -2977,8 +2989,7 @@ void P2P::loop(){
                             }
                             std::vector<uint8_t> stop(32, 0);
                             auto pl2 = build_getheaders_payload(locator, stop);
-                            const char* cmd_name = peer_supports_headers ? "getheaders" : "gethdr";
-                            auto m2  = encode_msg(cmd_name, pl2);
+                            auto m2  = encode_msg("getheaders", pl2);
                             if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms())) {
                                 ps.sent_getheaders = true;
                                 (void)send_or_close(s, m2);
@@ -3007,9 +3018,6 @@ void P2P::loop(){
   
                     if (cmd == "version") {
                         int32_t peer_ver = 0; uint64_t peer_services = 0;
-                        if (!m.payload.empty()) {
-                            // tolerate 0- or short-length payloads from old peers
-                        }
                         if (m.payload.size() >= 4) {
                             peer_ver = (int32_t)((uint32_t)m.payload[0] | ((uint32_t)m.payload[1]<<8) | ((uint32_t)m.payload[2]<<16) | ((uint32_t)m.payload[3]<<24));
                         }
@@ -3105,8 +3113,7 @@ void P2P::loop(){
                             const std::string bh = hexkey(hb.block_hash());
                             bool drop_unsolicited = false;
                             if (!ps.syncing) {
-                                // During IBD/headers, accept orphans and chase parents; after headers complete,
-                                // keep the unsolicited guard unless parent is known.
+                                // During headers phase we prefer liveness: take orphan and chase parent.
                                 const bool in_headers_phase = !g_logged_headers_done;
                                 bool parent_known = chain_.header_exists(hb.header.prev_hash) || chain_.have_block(hb.header.prev_hash);
                                 if (!parent_known && !in_headers_phase) {
@@ -3411,9 +3418,7 @@ void P2P::loop(){
                             }
                             std::vector<uint8_t> stop2(32, 0);
                             auto pl2 = build_getheaders_payload(locator2, stop2);
-                            const bool peer_supports_headers2 = (ps.features & (1ull<<0)) != 0;
-                            const char* cmd_name2 = peer_supports_headers2 ? "getheaders" : "gethdr";
-                            auto m2  = encode_msg(cmd_name2, pl2);
+                            auto m2  = encode_msg("getheaders", pl2);
                             if (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms())) {
                                  ps.sent_getheaders = true;
                                  (void)send_or_close(s, m2);
@@ -3563,9 +3568,7 @@ void P2P::loop(){
                         }
                         std::vector<uint8_t> stop2(32, 0);
                         auto pl2 = build_getheaders_payload(locator2, stop2);
-                        const bool peer_supports_headers3 = (ps2.features & (1ull<<0)) != 0;
-                        const char* cmd_name3 = peer_supports_headers3 ? "getheaders" : "gethdr";
-                        auto m2  = encode_msg(cmd_name3, pl2);
+                        auto m2  = encode_msg("getheaders", pl2);
                         ps2.sent_getheaders = true;
                         (void)send_or_close(kvx.first, m2);
                         ps2.inflight_hdr_batches++;
