@@ -2321,9 +2321,9 @@ int main(int argc, char** argv){
 #endif
 
         // ===== mining loop with periodic refresh (prevents stale templates)
-        std::fprintf(stderr, "[miner] starting mining loop (auto-refresh jobs, clean shutdown).\n");
+        std::fprintf(stderr, "[miner] starting mining loop (one job per tip; clean shutdown).\n");
 
-        const int JOB_REFRESH_SECONDS = 30; // tighter refresh to keep nTime fresh
+        std::string last_job_prev_hex;
         while (ui.running.load()) {
             MinerTemplate tpl;
             if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
@@ -2331,6 +2331,12 @@ int main(int argc, char** argv){
                 { std::lock_guard<std::mutex> lk(ui.mtx); ui.last_submit_msg = m.str(); ui.last_submit_when = std::chrono::steady_clock::now(); }
                 log_line("template error (getminertemplate failed)");
                 for(int i=0;i<20 && ui.running.load(); ++i) miq_sleep_ms(100);
+                continue;
+            }
+
+            if (tpl.prev_hash.size() != 32) {
+                log_line("template rejected: prev_hash size invalid");
+                for(int i=0;i<10 && ui.running.load(); ++i) miq_sleep_ms(100);
                 continue;
             }
 
@@ -2351,23 +2357,28 @@ int main(int argc, char** argv){
 
             // Publish candidate to UI
             {
+                const std::string cur_prev_hex = to_hex_s(tpl.prev_hash);
                 std::lock_guard<std::mutex> lk(ui.mtx);
                 ui.cand.height = tpl.height;
-                ui.cand.prev_hex = to_hex_s(tpl.prev_hash);
+                ui.cand.prev_hex = cur_prev_hex;
                 ui.cand.bits = tpl.bits;
                 ui.cand.time = tpl.time;
                 ui.cand.txs = txs_inc.size();
                 ui.cand.size_bytes = used_bytes + ser_tx(cb).size();
                 ui.cand.fees = fees;
                 ui.cand.coinbase = GetBlockSubsidy((uint32_t)tpl.height) + fees;
-
-                std::ostringstream msg; 
-                msg << C("36;1") << "job accepted: height=" << tpl.height 
-                    << " prev=" << ui.cand.prev_hex.substr(0,16) << "…"
-                    << " diff=" << std::fixed << std::setprecision(2) << difficulty_from_bits(tpl.bits)
-                    << " txs=" << ui.cand.txs << R();
-                ui.last_submit_msg = msg.str();
-                ui.last_submit_when = std::chrono::steady_clock::now();
+                if (last_job_prev_hex != cur_prev_hex) {
+                    std::ostringstream msg;
+                    msg << C("36;1") << "job accepted: height=" << tpl.height
+                        << " prev=" << ui.cand.prev_hex.substr(0,16) << "…"
+                        << " diff=" << std::fixed << std::setprecision(2) << difficulty_from_bits(tpl.bits)
+                        << " txs=" << ui.cand.txs << R();
+                    ui.last_submit_msg = msg.str();
+                    ui.last_submit_when = std::chrono::steady_clock::now();
+                    last_job_prev_hex = cur_prev_hex;
+                } else {
+                    // Same prev_hash as previous job -> silently continue without re-announcing
+                }
             }
 
             // Reset round stats/ETA
@@ -2464,32 +2475,21 @@ int main(int argc, char** argv){
             }
 #endif
 
-            auto round_start_wall = std::chrono::steady_clock::now();
-            bool did_abort_refresh = false;
-
-            // Refresh/abort monitor
-            std::thread refresh_mon([&](){
-                while(!found.load() && ui.running.load()){
-                    // Refresh after JOB_REFRESH_SECONDS for fresh time/mempool
-                    auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - round_start_wall).count();
-                    if(dt >= JOB_REFRESH_SECONDS){
-                        abort_round.store(true);
-                        did_abort_refresh = true;
-                        break;
-                    }
-                    // Abort if tip advanced (stale prevhash)
+            std::thread stale_mon([&](){
+                while(!found.load(std::memory_order_relaxed) && ui.running.load()){
                     TipInfo tip_now{};
                     if(rpc_gettipinfo(rpc_host, rpc_port, token, tip_now)){
                         if(from_hex_s(tip_now.hash_hex) != tpl.prev_hash){
                             abort_round.store(true);
-                            did_abort_refresh = true;
                             break;
                         }
                     }
-                    for(int i=0;i<10 && !found.load() && !abort_round.load() && ui.running.load(); ++i) miq_sleep_ms(50);
+                    for(int i=0;i<10 && !found.load(std::memory_order_relaxed) && !abort_round.load(std::memory_order_relaxed) && ui.running.load(); ++i){
+                        miq_sleep_ms(50);
+                    }
                 }
             });
-
+          
             // Wait for CPU workers
             for (auto &th : thv) th.join();
 
@@ -2499,19 +2499,11 @@ int main(int argc, char** argv){
                 gpu_th.join();
             }
 #endif
-            if(refresh_mon.joinable()) refresh_mon.join();
+            if(stale_mon.joinable()) stale_mon.join();
 
             if(!ui.running.load()) break;
 
-            // If we refreshed/aborted (no solution), continue to next template
-            if(!found.load()){
-                if(did_abort_refresh){
-                    std::lock_guard<std::mutex> lk(ui.mtx);
-                    ui.last_submit_msg = C("33;1") + std::string("job refreshed (new time/chain state)") + R();
-                    ui.last_submit_when = std::chrono::steady_clock::now();
-                }
-                continue;
-            }
+            if(!found.load()) { continue; }
 
             // Check staleness vs tip
             TipInfo tip_now{};
