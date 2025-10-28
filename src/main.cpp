@@ -155,7 +155,7 @@ static std::string          telemetry_path;
 static std::atomic<bool>    telemetry_enabled{false};
 static std::atomic<bool>    tui_snapshot_requested{false};
 static std::atomic<bool>    tui_toggle_theme{false};
-static std::atomic<bool>    tui_pause_logs{false};
+[[maybe_unused]] static std::atomic<bool>    tui_pause_logs{false};
 static std::atomic<bool>    tui_verbose{false};
 #ifdef _WIN32
 static HANDLE               lock_handle{NULL};
@@ -535,7 +535,7 @@ static uint64_t get_rss_bytes(){
 namespace term {
 
 // Basic tty check remains available
-static inline bool is_tty() {
+[[maybe_unused]] static inline bool is_tty() {
 #ifdef _WIN32
     return _isatty(_fileno(stdout)) != 0;
 #else
@@ -848,7 +848,7 @@ static std::vector<std::string> local_ip_strings(){
     return out;
 }
 
-static bool is_loopback_or_linklocal(const std::string& ip){
+[[maybe_unused]] static bool is_loopback_or_linklocal(const std::string& ip){
     if (ip == "127.0.0.1" || ip == "::1") return true;
     if (ip.rfind("169.254.",0)==0) return true;
     if (ip.rfind("fe80:",0)==0 || ip.rfind("FE80:",0)==0) return true;
@@ -956,7 +956,7 @@ static long double difficulty_from_bits(uint32_t bits){
     return t_one / t_cur;
 }
 
-static inline uint64_t estimate_target_height_by_time(uint64_t genesis_ts){
+[[maybe_unused]] static inline uint64_t estimate_target_height_by_time(uint64_t genesis_ts){
     if (!genesis_ts) return 0;
     uint64_t now = (uint64_t)std::time(nullptr);
     if (now <= genesis_ts) return 1;
@@ -2040,7 +2040,7 @@ static bool should_enter_ibd_reason(Chain& chain, const std::string& datadir, st
     return false;
 }
 
-static bool has_existing_blocks_or_state(const std::string& datadir){
+[[maybe_unused]] static bool has_existing_blocks_or_state(const std::string& datadir){
     return path_exists_nonempty(p_join(datadir, "blocks")) ||
            path_exists_nonempty(p_join(datadir, "chainstate"));
 }
@@ -2493,7 +2493,7 @@ int main(int argc, char** argv){
 
         g_extminer.start(cfg.datadir);
 
-        bool p2p_ok = false;
+        [[maybe_unused]] bool p2p_ok = false;
         if (can_tui) { tui.mark_step_started("Start P2P listener"); tui.set_node_state(TUI::NodeState::Starting); }
         if(!cfg.no_p2p){
             if(p2p.start(P2P_PORT)){
@@ -2552,21 +2552,21 @@ int main(int argc, char** argv){
                 }
                 log_info("IBD sync skipped (seed solo mode).");
             } else {
-            if (can_tui) {
-                tui.mark_step_fail("IBD sync phase");
-                tui.set_node_state(TUI::NodeState::Degraded);
-                tui.set_hot_warning(std::string("BLOCKS MINED LOCALLY WILL NOT BE VALID — ") + ibd_err);
-                tui.set_mining_gate(false, ibd_err + " — blocks mined locally will not be valid");
+                if (can_tui) {
+                    tui.mark_step_fail("IBD sync phase");
+                    tui.set_node_state(TUI::NodeState::Degraded);
+                    tui.set_hot_warning(std::string("BLOCKS MINED LOCALLY WILL NOT BE VALID — ") + ibd_err);
+                    tui.set_mining_gate(false, ibd_err + " — blocks mined locally will not be valid");
+                }
+                log_error(std::string("IBD sync failed: ") + ibd_err);
+                log_error("BLOCKS MINED LOCALLY WILL NOT BE VALID");
             }
-            log_error(std::string("IBD sync failed: ") + ibd_err);
-            log_error("BLOCKS MINED LOCALLY WILL NOT BE VALID");
-          }
         }
         
         IBDGuard ibd_guard;
         ibd_guard.start(&chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, can_tui ? &tui : nullptr);
         
-        bool rpc_ok = false;
+        [[maybe_unused]] bool rpc_ok = false;
         if (can_tui) tui.mark_step_started("Start RPC server");
         if(!cfg.no_rpc){
             miq::rpc_enable_auth_cookie(cfg.datadir);
@@ -2593,6 +2593,7 @@ int main(int argc, char** argv){
                 log_info("HTTP gate token synchronized with RPC cookie");
             } catch (...) {
                 log_warn("Could not sync MIQ_RPC_TOKEN to cookie; clients may need X-Auth-Token");
+            }
             }
             rpc.start(RPC_PORT);
             rpc_ok = true;

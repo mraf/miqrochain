@@ -28,7 +28,7 @@ static bool fast_sync_enabled() {
     const char* e = std::getenv("MIQ_FAST_SYNC");
     return e && (e[0]=='1' || e[0]=='t' || e[0]=='T' || e[0]=='y' || e[0]=='Y');
 }
-static inline int64_t now_ms_steady(){
+[[maybe_unused]] static inline int64_t now_ms_steady(){
     using clock = std::chrono::steady_clock;
     return std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count();
 }
@@ -42,7 +42,7 @@ bool Storage::open(const std::string& dir){
     offsets_.clear(); hash_to_index_.clear();
     std::ofstream ensure(path_blocks_, std::ios::app|std::ios::binary); ensure.close();
     std::ifstream f(path_blocks_, std::ios::binary);
-    uint64_t off=0; uint32_t idx=0;
+    uint64_t off=0; [[maybe_unused]] uint32_t idx=0;
     while(true){
         uint32_t sz=0; f.read((char*)&sz,sizeof(sz)); if(!f) break;
         offsets_.push_back(off);

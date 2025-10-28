@@ -28,7 +28,7 @@ static inline void append_salt_vec(std::vector<uint8_t>& buf){
     buf.insert(buf.end(), MIQ_POW_SALT, MIQ_POW_SALT + (size_t)MIQ_POW_SALT_LEN);
 }
 #else
-static inline void append_salt_vec(std::vector<uint8_t>&){ /* no salt */ }
+[[maybe_unused]] static inline void append_salt_vec(std::vector<uint8_t>&){ /* no salt */ }
 #endif
 
 // ========= Portable SHA-256 (streaming) =========

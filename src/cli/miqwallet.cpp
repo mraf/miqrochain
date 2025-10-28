@@ -57,7 +57,7 @@ static uint64_t env_u64(const char* name, uint64_t defv){
     }
     return defv;
 }
-static bool env_truthy(const char* name){
+[[maybe_unused]] static bool env_truthy(const char* name){
     const char* v = std::getenv(name);
     if(!v) return false;
     std::string s = v;

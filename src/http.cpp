@@ -45,7 +45,7 @@
   #define closesocket ::close
 #endif
 
-static inline void miq_sleep_ms(unsigned ms){
+[[maybe_unused]] static inline void miq_sleep_ms(unsigned ms){
 #ifdef _WIN32
   Sleep(ms);
 #else
@@ -550,7 +550,7 @@ void HttpServer::start(
 
     // Create socket, bind, listen
     sock_t s = (sock_t)(~(sock_t)0);
-    sockaddr_storage bound_sa{}; socklen_t bound_len = 0;
+    sockaddr_storage bound_sa{}; [[maybe_unused]] socklen_t bound_len = 0;
     for(addrinfo* ai = res; ai; ai = ai->ai_next){
         s = (sock_t)socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 #ifdef _WIN32
@@ -596,7 +596,7 @@ void HttpServer::start(
 #endif
 
     // Main accept loop
-    auto thread_fn = [this, s, bound_sa, bound_len, on_json, env_token, env_req, allow_cors,
+    auto thread_fn = [this, s, bound_sa, on_json, env_token, env_req, allow_cors,
                       max_conn, ip_rps, ip_burst, max_hdr_bytes, max_body_bytes, recv_timeout_ms,
                       enable_metrics, metrics_public, enable_healthz, access_log](){
         try {
