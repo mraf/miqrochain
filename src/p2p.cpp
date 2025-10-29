@@ -2314,6 +2314,42 @@ void P2P::remove_orphan_by_hex(const std::string& child_hex){
     if (dit != orphan_order_.end()) orphan_order_.erase(dit);
 }
 
+// Helper: Update peer performance metrics when a block is successfully received
+static void update_peer_performance(PeerState& ps, const std::string& block_hex,
+                                     const std::unordered_map<Sock, std::unordered_map<std::string, int64_t>>& inflight_ts,
+                                     int64_t now_ms) {
+    // Find when this block was requested
+    auto sock_it = inflight_ts.find(ps.sock);
+    if (sock_it != inflight_ts.end()) {
+        auto block_it = sock_it->second.find(block_hex);
+        if (block_it != sock_it->second.end()) {
+            int64_t request_time = block_it->second;
+            int64_t delivery_time = now_ms - request_time;
+
+            // Update statistics
+            ps.total_blocks_received++;
+            ps.total_block_delivery_time_ms += delivery_time;
+            ps.last_block_received_ms = now_ms;
+            ps.successful_deliveries++;
+
+            // Calculate exponential moving average (EMA) with alpha=0.2
+            // This gives more weight to recent deliveries
+            if (ps.total_blocks_received == 1) {
+                ps.avg_block_delivery_ms = delivery_time;
+            } else {
+                ps.avg_block_delivery_ms = (int64_t)(0.8 * ps.avg_block_delivery_ms + 0.2 * delivery_time);
+            }
+
+            // Update health score (0.0 = bad, 1.0 = good)
+            // Based on success rate and delivery speed
+            double success_rate = (double)ps.successful_deliveries /
+                                 (ps.successful_deliveries + ps.failed_deliveries + 1);
+            double speed_factor = std::min(1.0, 30000.0 / std::max(1000.0, (double)ps.avg_block_delivery_ms));
+            ps.health_score = 0.7 * success_rate + 0.3 * speed_factor;
+        }
+    }
+}
+
 void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
     if (raw.empty() || raw.size() > MIQ_FALLBACK_MAX_BLOCK_SZ) return;
 
@@ -2352,7 +2388,11 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
         const std::string miner = miq_miner_from_block(b);
         std::string src_ip = "?";
         auto pit = peers_.find(sock);
-        if (pit != peers_.end()) src_ip = pit->second.ip;
+        if (pit != peers_.end()) {
+            src_ip = pit->second.ip;
+            // Update peer performance metrics for adaptive timeout
+            update_peer_performance(pit->second, hexkey(bh), g_inflight_block_ts, now_ms());
+        }
         g_rr_next_idx.erase(hexkey(bh));
 
         log_info("P2P: accepted block height=" + std::to_string(chain_.height())
@@ -2594,6 +2634,22 @@ void P2P::loop(){
                 // Stall detected: height hasn't increased for MIQ_P2P_STALL_RETRY_MS
                 int64_t stall_duration_ms = tnow - g_last_progress_ms;
                 log_info("P2P: stall detected - no height progress for " + std::to_string(stall_duration_ms / 1000) + "s (height=" + std::to_string(h) + ", peers=" + std::to_string(peers_.size()) + ")");
+
+                // Log peer health during stalls (helps diagnose slow peers)
+                if (!g_logged_headers_done) {
+                    std::string health_summary;
+                    for (const auto& kv : peers_) {
+                        if (!kv.second.verack_ok) continue;
+                        health_summary += "\n  " + kv.second.ip +
+                                        ": health=" + std::to_string((int)(kv.second.health_score * 100)) + "%" +
+                                        " avg_delivery=" + std::to_string(kv.second.avg_block_delivery_ms / 1000) + "s" +
+                                        " blocks=" + std::to_string(kv.second.total_blocks_received) +
+                                        " inflight=" + std::to_string(kv.second.inflight_blocks.size());
+                    }
+                    if (!health_summary.empty()) {
+                        log_info("P2P: peer health summary:" + health_summary);
+                    }
+                }
 #if MIQ_ENABLE_HEADERS_FIRST
                 std::vector<std::vector<uint8_t>> locator;
                 chain_.build_locator(locator);
@@ -2643,18 +2699,51 @@ void P2P::loop(){
             }
         }
         
-        // === NEW: timeout & retry for inflight blocks =======================
+        // === NEW: Adaptive timeout & retry for inflight blocks =======================
         {
           const int64_t tnow = now_ms();
-          const int64_t block_to_ms = 2 * MIQ_P2P_STALL_RETRY_MS;
           std::vector<std::pair<Sock,std::string>> expired;
+
+          // Use adaptive timeout based on peer performance
           for (auto& bySock : g_inflight_block_ts) {
+            auto pit = peers_.find(bySock.first);
+            if (pit == peers_.end()) continue;
+
+            PeerState& ps = pit->second;
+
+            // Calculate adaptive timeout for this peer
+            // Base timeout: use peer's average delivery time + 3 standard deviations (generous)
+            // During IBD: multiply by 3 to be extra lenient with slow seeds
+            // After IBD: use 2x for faster response
+            int64_t base_timeout = ps.avg_block_delivery_ms;
+
+            // Add buffer based on peer health (unhealthy peers get more time)
+            double health_multiplier = 2.0 - ps.health_score; // 1.0 (healthy) to 2.0 (unhealthy)
+
+            // IBD multiplier: 3x during sync, 1.5x after
+            double ibd_multiplier = !g_logged_headers_done ? 3.0 : 1.5;
+
+            // Final adaptive timeout
+            int64_t adaptive_timeout = (int64_t)(base_timeout * health_multiplier * ibd_multiplier);
+
+            // Clamp to reasonable bounds: min 30s, max 180s during IBD, max 60s after
+            int64_t min_timeout = 30000;
+            int64_t max_timeout = !g_logged_headers_done ? 180000 : 60000;
+            adaptive_timeout = std::max(min_timeout, std::min(max_timeout, adaptive_timeout));
+
+            // Check each inflight block for this peer
             for (auto& kv : bySock.second) {
-              if (tnow - kv.second > block_to_ms) expired.emplace_back(bySock.first, kv.first);
+              if (tnow - kv.second > adaptive_timeout) {
+                expired.emplace_back(bySock.first, kv.first);
+                // Track failed delivery for health score
+                ps.failed_deliveries++;
+                ps.health_score = std::max(0.1, ps.health_score * 0.9); // Decay health on timeout
+              }
             }
           }
+
           if (!expired.empty()) {
-            log_info("P2P: " + std::to_string(expired.size()) + " inflight block(s) timed out after " + std::to_string(block_to_ms / 1000) + "s - retrying from other peers");
+            log_info("P2P: " + std::to_string(expired.size()) + " inflight block(s) timed out (adaptive) - retrying from other peers");
           }
           for (auto& e : expired) {
             Sock s_exp = e.first; const std::string& k = e.second;
@@ -2668,22 +2757,35 @@ void P2P::loop(){
             for (size_t i=0;i<32;i++) {
               h[i] = (uint8_t)((hexv(k[2*i])<<4) | hexv(k[2*i+1]));
             }
-            std::vector<Sock> cands;
-            cands.reserve(peers_.size());
+            // Build candidate list sorted by health score (best peers first)
+            std::vector<std::pair<Sock, double>> cands_with_score;
+            cands_with_score.reserve(peers_.size());
             for (auto& kv2 : peers_) {
               if (kv2.first == s_exp) continue;
               if (!kv2.second.verack_ok) continue;
-              cands.push_back(kv2.first);
+              cands_with_score.emplace_back(kv2.first, kv2.second.health_score);
             }
             // If no verack_ok yet (rare early), fall back to anyone but s_exp
-            if (cands.empty()) {
+            if (cands_with_score.empty()) {
               for (auto& kv2 : peers_) {
                 if (kv2.first == s_exp) continue;
-                cands.push_back(kv2.first);
+                cands_with_score.emplace_back(kv2.first, kv2.second.health_score);
               }
             }
 
+            // Sort by health score (descending) - prioritize healthy peers
+            std::sort(cands_with_score.begin(), cands_with_score.end(),
+                     [](const auto& a, const auto& b) { return a.second > b.second; });
+
+            // Extract just the sockets for round-robin
+            std::vector<Sock> cands;
+            cands.reserve(cands_with_score.size());
+            for (const auto& p : cands_with_score) {
+              cands.push_back(p.first);
+            }
+
             // Round-robin pick per-hash; try a few candidates until one accepts
+            // Prioritize healthier peers by trying them first
             if (!cands.empty()) {
               size_t attempts = std::min<size_t>(cands.size(), 4);
               for (size_t tries = 0; tries < attempts; ++tries) {
