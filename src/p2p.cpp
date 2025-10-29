@@ -2336,7 +2336,8 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             orphan_order_.push_back(child_hex);
             orphan_bytes_ += raw.size();
             evict_orphans_if_needed();
-            log_info("P2P: stored orphan block child=" + child_hex + " parent=" + parent_hex);
+            log_info("P2P: stored orphan block child=" + child_hex + " parent=" + parent_hex
+                     + " (total_orphans=" + std::to_string(orphans_.size()) + ")");
         }
 
         auto pit = peers_.find(sock);
@@ -2373,22 +2374,29 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
     if (it != orphan_children_.end()) {
         q.assign(it->second.begin(), it->second.end());
         orphan_children_.erase(it);
+        // Found orphan children waiting for this parent - process them
     }
+    // Note: During normal sequential sync, no orphans are expected
 
     while (!q.empty()){
         std::string child_hex = q.back();
         q.pop_back();
 
         auto oit = orphans_.find(child_hex);
-        if (oit == orphans_.end()) continue;
+        if (oit == orphans_.end()) {
+            // Orphan was already processed or evicted
+            continue;
+        }
 
         Block ob;
         if (!deser_block(oit->second.raw, ob)) {
+            log_warn("P2P: failed to deserialize orphan " + child_hex + ", dropping");
             remove_orphan_by_hex(child_hex);
             continue;
         }
 
         if (chain_.have_block(oit->second.hash)) {
+            // Chain already has this block, remove from orphans
             remove_orphan_by_hex(child_hex);
             continue;
         }
@@ -2397,12 +2405,14 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
         if (chain_.submit_block(ob, err)) {
             const std::string miner = miq_miner_from_block(ob);
             log_info("P2P: accepted orphan as block height=" + std::to_string(chain_.height())
-                     + " miner=" + miner);
+                     + " miner=" + miner
+                     + " (remaining_orphans=" + std::to_string(orphans_.size() - 1) + ")");
 
             broadcast_inv_block(oit->second.hash);
             const std::string new_parent_hex = child_hex;
             remove_orphan_by_hex(child_hex);
 
+            // Check for grandchildren (orphans waiting for this orphan)
             auto cit = orphan_children_.find(new_parent_hex);
             if (cit != orphan_children_.end()) {
                 for (const auto& g : cit->second) q.push_back(g);
@@ -2581,6 +2591,9 @@ void P2P::loop(){
                 g_last_progress_ms = tnow;
                 g_next_stall_probe_ms = tnow + MIQ_P2P_STALL_RETRY_MS;
             } else if (tnow >= g_next_stall_probe_ms && !peers_.empty()) {
+                // Stall detected: height hasn't increased for MIQ_P2P_STALL_RETRY_MS
+                int64_t stall_duration_ms = tnow - g_last_progress_ms;
+                log_info("P2P: stall detected - no height progress for " + std::to_string(stall_duration_ms / 1000) + "s (height=" + std::to_string(h) + ", peers=" + std::to_string(peers_.size()) + ")");
 #if MIQ_ENABLE_HEADERS_FIRST
                 std::vector<std::vector<uint8_t>> locator;
                 chain_.build_locator(locator);
@@ -2623,6 +2636,10 @@ void P2P::loop(){
                 }
 #endif
                 g_next_stall_probe_ms = tnow + MIQ_P2P_STALL_RETRY_MS;
+            } else if (tnow >= g_next_stall_probe_ms && peers_.empty()) {
+                // No peers connected during stall
+                log_warn("P2P: stall detected with NO PEERS connected (height=" + std::to_string(h) + ") - attempting to reconnect");
+                g_next_stall_probe_ms = tnow + MIQ_P2P_STALL_RETRY_MS;
             }
         }
         
@@ -2635,6 +2652,9 @@ void P2P::loop(){
             for (auto& kv : bySock.second) {
               if (tnow - kv.second > block_to_ms) expired.emplace_back(bySock.first, kv.first);
             }
+          }
+          if (!expired.empty()) {
+            log_info("P2P: " + std::to_string(expired.size()) + " inflight block(s) timed out after " + std::to_string(block_to_ms / 1000) + "s - retrying from other peers");
           }
           for (auto& e : expired) {
             Sock s_exp = e.first; const std::string& k = e.second;
@@ -3144,6 +3164,8 @@ void P2P::loop(){
                                 for (const auto& h2 : want2) {
                                     const std::string key2 = hexkey(h2);
                                     if (g_global_inflight_blocks.count(key2)) continue;
+                                    // Skip blocks that are already stored as orphans
+                                    if (orphans_.count(key2)) continue;
                                     Sock t = rr_pick_peer_for_key(key2, cands);
                                     auto itT = peers_.find(t);
                                     if (itT != peers_.end()) request_block_hash(itT->second, h2);
@@ -3168,6 +3190,8 @@ void P2P::loop(){
                                 for (const auto& h2 : want2) {
                                     const std::string key2 = hexkey(h2);
                                     if (g_global_inflight_blocks.count(key2)) continue;
+                                    // Skip blocks that are already stored as orphans
+                                    if (orphans_.count(key2)) continue;
                                     Sock t = rr_pick_peer_for_key(key2, cands);
                                     auto itT = peers_.find(t);
                                     if (itT != peers_.end()) request_block_hash(itT->second, h2);
@@ -3395,6 +3419,8 @@ void P2P::loop(){
                             for (const auto& w : want) {
                                 const std::string key = hexkey(w);
                                 if (g_global_inflight_blocks.count(key)) continue;
+                                // Skip blocks that are already stored as orphans
+                                if (orphans_.count(key)) continue;
                                 Sock t = rr_pick_peer_for_key(key, cands);
                                 auto itT = peers_.find(t);
                                 if (itT != peers_.end()) request_block_hash(itT->second, w);
@@ -3483,7 +3509,9 @@ void P2P::loop(){
                     ps.last_ping_ms = tnow;
                     ps.awaiting_pong = true;
                 } else if (ps.awaiting_pong) {
-                    int64_t eff_pong_timeout = MIQ_P2P_PONG_TIMEOUT_MS * ((ps.syncing || !g_logged_headers_done) ? 3 : 1);
+                    // During IBD/sync, give peers 6x more time to respond (90s instead of 15s)
+                    // Seeds are often busy sending blocks and may be slow to respond to pings
+                    int64_t eff_pong_timeout = MIQ_P2P_PONG_TIMEOUT_MS * ((ps.syncing || !g_logged_headers_done) ? 6 : 1);
                     if ((tnow - ps.last_ping_ms) > eff_pong_timeout) {
                         if (!is_lb) {
                             P2P_TRACE("close pong-timeout");
@@ -3593,8 +3621,20 @@ void P2P::loop(){
         for (Sock s : dead) {
             gate_on_close(s);
             auto it = peers_.find(s);
-            if (it != peers_.end() && it->second.sock != MIQ_INVALID_SOCK) {
-                CLOSESOCK(s);
+            if (it != peers_.end()) {
+                // Log peer disconnection with context
+                std::string reason = "unknown";
+                size_t inflight = it->second.inflight_blocks.size();
+                bool was_syncing = it->second.syncing;
+                std::string ip = it->second.ip;
+
+                if (inflight > 0 || was_syncing) {
+                    log_info("P2P: disconnecting peer " + ip + " (inflight_blocks=" + std::to_string(inflight) + ", syncing=" + (was_syncing ? "yes" : "no") + ", remaining_peers=" + std::to_string(peers_.size() - 1) + ")");
+                }
+
+                if (it->second.sock != MIQ_INVALID_SOCK) {
+                    CLOSESOCK(s);
+                }
             }
             peers_.erase(s);
             g_outbounds.erase(s);
