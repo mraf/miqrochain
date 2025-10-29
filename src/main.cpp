@@ -114,6 +114,8 @@ extern bool ensure_utxo_fully_indexed(Chain&, const std::string&, bool) __attrib
 #  endif
 #endif
 
+
+
 #ifdef _WIN32
   #ifdef min
     #undef min
@@ -128,6 +130,9 @@ extern bool ensure_utxo_fully_indexed(Chain&, const std::string&, bool) __attrib
 using namespace miq;
 
 static std::atomic<uint64_t> g_genesis_time_s{0};
+
+static std::string g_seed_host = DNS_SEED;
+static inline const char* seed_host_cstr(){ return g_seed_host.c_str(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Versions
@@ -778,6 +783,21 @@ static inline std::string short_hex(const std::string& h, int keep){
 // ─────────────────────────────────────────────────────────────────────────────
 // Net helpers: resolve host, collect local IPs, compare, and compute seed role
 // ─────────────────────────────────────────────────────────────────────────────
+
+static inline std::string ip_norm(const std::string& ip){
+    if (ip.find('.') != std::string::npos){
+        // If there's a colon, assume v6 wrapper and take the tail after last ':'
+        size_t pos = ip.rfind(':');
+        if (pos != std::string::npos){
+            std::string tail = ip.substr(pos + 1);
+            // crude check for dotted-quad
+            int dots = 0; for(char c: tail) if (c=='.') ++dots;
+            if (dots == 3) return tail;
+        }
+    }
+    return ip;
+}
+
 static std::vector<std::string> resolve_host_ip_strings(const std::string& host){
     std::vector<std::string> out;
     addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
@@ -787,10 +807,10 @@ static std::vector<std::string> resolve_host_ip_strings(const std::string& host)
         char buf[INET6_ADDRSTRLEN]{};
         if (p->ai_family == AF_INET) {
             auto* sa = reinterpret_cast<sockaddr_in*>(p->ai_addr);
-            if (inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf))) out.emplace_back(buf);
+            if (inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf))) out.emplace_back(ip_norm(buf));
         } else if (p->ai_family == AF_INET6) {
             auto* sa6 = reinterpret_cast<sockaddr_in6*>(p->ai_addr);
-            if (inet_ntop(AF_INET6, &sa6->sin6_addr, buf, sizeof(buf))) out.emplace_back(buf);
+            if (inet_ntop(AF_INET6, &sa6->sin6_addr, buf, sizeof(buf))) out.emplace_back(ip_norm(buf));
         }
     }
     freeaddrinfo(res);
@@ -814,10 +834,10 @@ static std::vector<std::string> local_ip_strings(){
                     char tmp[INET6_ADDRSTRLEN]{};
                     if (ua->Address.lpSockaddr->sa_family == AF_INET){
                         auto* sa = reinterpret_cast<sockaddr_in*>(ua->Address.lpSockaddr);
-                        if (inet_ntop(AF_INET, &sa->sin_addr, tmp, sizeof(tmp))) out.emplace_back(tmp);
+                        if (inet_ntop(AF_INET, &sa->sin_addr, tmp, sizeof(tmp))) out.emplace_back(ip_norm(tmp));
                     } else if (ua->Address.lpSockaddr->sa_family == AF_INET6){
                         auto* sa6 = reinterpret_cast<sockaddr_in6*>(ua->Address.lpSockaddr);
-                        if (inet_ntop(AF_INET6, &sa6->sin6_addr, tmp, sizeof(tmp))) out.emplace_back(tmp);
+                        if (inet_ntop(AF_INET6, &sa6->sin6_addr, tmp, sizeof(tmp))) out.emplace_back(ip_norm(tmp));
                     }
                 }
             }
@@ -832,17 +852,17 @@ static std::vector<std::string> local_ip_strings(){
             char tmp[INET6_ADDRSTRLEN]{};
             if (fam == AF_INET){
                 auto* sa = reinterpret_cast<sockaddr_in*>(p->ifa_addr);
-                if (inet_ntop(AF_INET, &sa->sin_addr, tmp, sizeof(tmp))) out.emplace_back(tmp);
+                if (inet_ntop(AF_INET, &sa->sin_addr, tmp, sizeof(tmp))) out.emplace_back(ip_norm(tmp));
             } else if (fam == AF_INET6){
                 auto* sa6 = reinterpret_cast<sockaddr_in6*>(p->ifa_addr);
-                if (inet_ntop(AF_INET6, &sa6->sin6_addr, tmp, sizeof(tmp))) out.emplace_back(tmp);
+                if (inet_ntop(AF_INET6, &sa6->sin6_addr, tmp, sizeof(tmp))) out.emplace_back(ip_norm(tmp));
             }
         }
         freeifaddrs(ifa);
     }
 #endif
     // Include optional explicit public IP hint
-    if (const char* hint = std::getenv("MIQ_PUBLIC_IP"); hint && *hint) out.emplace_back(hint);
+    if (const char* hint = std::getenv("MIQ_PUBLIC_IP"); hint && *hint) out.emplace_back(ip_norm(hint));
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;
@@ -864,13 +884,13 @@ struct SeedRole {
 
 static SeedRole compute_seed_role(){
     SeedRole r;
-    r.seed_ips  = resolve_host_ip_strings(DNS_SEED);
+    r.seed_ips  = resolve_host_ip_strings(seed_host_cstr());
     r.local_ips = local_ip_strings();
     for (const auto& seed_ip : r.seed_ips){
         for (const auto& lip : r.local_ips){
             if (seed_ip == lip){
                 r.we_are_seed = true;
-                r.detail = std::string("seed A/AAAA (") + seed_ip + ") matches local IP";
+                r.detail = std::string("seed (") + seed_host_cstr() + ") A/AAAA (" + seed_ip + ") matches local IP";
                 return r;
             }
         }
@@ -2095,11 +2115,11 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
 
     // Make sure we’ve nudged the seed right away.
     if (!we_are_seed) {
-        p2p->connect_seed(DNS_SEED, P2P_PORT);
+        p2p->connect_seed(seed_host_cstr(), P2P_PORT);
         lastSeedDialMs = now_ms();
     } else {
         log_info(std::string("Seed self-detect: skipping outbound connect to ")
-                 + DNS_SEED + " (waiting for inbound peers).");
+                 + seed_host_cstr() + " (waiting for inbound peers).");
     }
     if (can_tui) tui->set_node_state(TUI::NodeState::Syncing);
     if (tui && can_tui) tui->mark_step_started("Peer handshake (verack)");
@@ -2119,17 +2139,17 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             }
             // keep nudging the seed if needed
             if (!we_are_seed && (now_ms() - lastSeedDialMs > kSeedNudgeMs)) {
-                p2p->connect_seed(DNS_SEED, P2P_PORT);
+                p2p->connect_seed(seed_host_cstr(), P2P_PORT);
                 lastSeedDialMs = now_ms();
             }
             if (!seed_noted && any_verack_peer(p2p)) {
                 seed_noted = true;
                 height_at_seed_connect = chain.height();
                 if (tui && can_tui) {
-                    tui->set_banner(std::string("Connected to seed: ") + DNS_SEED);
+                    tui->set_banner(std::string("Connected to seed: ") + seed_host_cstr());
                     tui->set_ibd_progress(chain.height(),
                                           chain.height(),
-                                          0, "headers", DNS_SEED, false);
+                                          0, "headers", seed_host_cstr(), false);
                 }
             }
 
@@ -2165,7 +2185,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
         // Ensure we periodically re-nudge the seed if peer count is low.
         size_t peers = p2p->snapshot_peers().size();
         if (!we_are_seed && peers < 2 && now_ms() - lastSeedDialMs > kSeedNudgeMs) {
-            p2p->connect_seed(DNS_SEED, P2P_PORT);
+            p2p->connect_seed(seed_host_cstr(), P2P_PORT);
             lastSeedDialMs = now_ms();
         }
 
@@ -2186,7 +2206,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             uint64_t discovered = (cur >= height_at_seed_connect) ? (cur - height_at_seed_connect) : 0;
             const char* stage = (cur == 0 ? "headers" : "blocks");
             if (tui && can_tui) {
-                tui->set_ibd_progress(cur, cur, discovered, stage, DNS_SEED, false);
+                tui->set_ibd_progress(cur, cur, discovered, stage, seed_host_cstr(), false);
             } else {
                 static uint64_t last_note_ms = 0;
                 if (now_ms() - last_note_ms > 2500) {
@@ -2226,7 +2246,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                     tui->set_ibd_progress(chain.height(),
                                           chain.height(),
                                           (chain.height() >= height_at_seed_connect ? (chain.height() - height_at_seed_connect) : 0),
-                                          "complete", DNS_SEED, true);
+                                          "complete", seed_host_cstr(), true);
                 }
                 return true;
             }
@@ -2336,6 +2356,10 @@ int main(int argc, char** argv){
     TUI tui(vt_ok, u8_ok);
     tui.set_enabled(can_tui);
     tui.set_ports(P2P_PORT, RPC_PORT);
+
+    if (const char* sh = std::getenv("MIQ_SEED_HOST"); sh && *sh) {
+        g_seed_host = sh;
+    }
 
     // Parse CLI
     Config cfg;
@@ -2501,11 +2525,11 @@ int main(int argc, char** argv){
                 log_info("P2P listening on " + std::to_string(P2P_PORT));
                 if (can_tui) { tui.mark_step_ok("Start P2P listener"); tui.mark_step_started("Connect seeds"); }
                 if (!compute_seed_role().we_are_seed) {
-                    p2p.connect_seed(DNS_SEED, P2P_PORT);
+                    p2p.connect_seed(seed_host_cstr(), P2P_PORT);
                     if (can_tui) tui.mark_step_ok("Connect seeds");
                 } else {
                     log_info(std::string("Seed self-detect: skipping outbound connect to ")
-                             + DNS_SEED + " (waiting for inbound peers).");
+                             + seed_host_cstr() + " (waiting for inbound peers).");
                     if (can_tui) {
                         tui.mark_step_ok("Connect seeds");
                         tui.set_hot_warning("Running as public seed — ensure port is open");
@@ -2528,7 +2552,7 @@ int main(int argc, char** argv){
         // ─────────────────────────────────────────────────────────────────────
         if (can_tui) {
             // Only show what is known at start; no estimated future height.
-            tui.set_ibd_progress(chain.height(), chain.height(), 0, "headers", DNS_SEED, false);
+            tui.set_ibd_progress(chain.height(), chain.height(), 0, "headers", seed_host_cstr(), false);
         }
         if (can_tui) tui.mark_step_started("IBD sync phase");
         std::string ibd_err;
@@ -2655,7 +2679,7 @@ int main(int argc, char** argv){
                                        "Miqrochain node running - synced & serving peers...");
                 auto role = compute_seed_role();
                 if (role.we_are_seed) {
-                    tui.set_banner_append(std::string("SEED: ") + DNS_SEED);
+                    tui.set_banner_append(std::string("SEED: ") + seed_host_cstr());
                     tui.set_hot_warning("Acting as seed — keep port open");
                 }
                 tui.set_node_state(TUI::NodeState::Running);
