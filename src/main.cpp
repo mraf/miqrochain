@@ -134,6 +134,8 @@ static std::atomic<uint64_t> g_genesis_time_s{0};
 static std::string g_seed_host = DNS_SEED;
 static inline const char* seed_host_cstr(){ return g_seed_host.c_str(); }
 
+static std::atomic<bool> g_assume_seed_hairpin{false};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Versions
 #ifndef MIQ_VERSION_MAJOR
@@ -875,6 +877,17 @@ static std::vector<std::string> local_ip_strings(){
     return false;
 }
 
+static inline bool is_private_v4(const std::string& ip){
+    return ip.rfind("10.",0)==0
+        || ip.rfind("192.168.",0)==0
+        || (ip.rfind("172.",0)==0 && [] (const std::string& s){
+              // 172.16.0.0/12
+              int a=0; char dot=0;
+              if (std::sscanf(s.c_str(),"172.%d%c",&a,&dot)==2 && dot=='.') return (a>=16 && a<=31);
+              return false;
+           }(ip));
+}
+
 struct SeedRole {
     bool we_are_seed{false};
     std::string detail;
@@ -910,7 +923,7 @@ static SeedRole compute_seed_role(){
 static inline bool solo_seed_mode(P2P* p2p){
     auto role = compute_seed_role();
     size_t peers = p2p ? p2p->snapshot_peers().size() : 0;
-    return role.we_are_seed && peers == 0;
+    return (role.we_are_seed || g_assume_seed_hairpin.load()) && peers == 0;
 }
 
 // Traits & helpers used by TUI and elsewhere
@@ -1837,13 +1850,13 @@ private:
             auto role = compute_seed_role();
             bool prev = g_we_are_seed.load();
             g_we_are_seed.store(role.we_are_seed);
-            if (role.we_are_seed && !prev){
-                log_warn(std::string("This node matches ")+DNS_SEED+" — acting as seed; keep it healthy.");
+            if ((role.we_are_seed || g_assume_seed_hairpin.load()) && !prev){
+                log_warn(std::string("This node matches/assumes ")+seed_host_cstr()+" — acting as seed; keep it healthy.");
                 if (tui) tui->set_hot_warning("You are the public seed host");
             }
             // Gentle health checks
             size_t peers = p2p ? p2p->snapshot_peers().size() : 0;
-            if (role.we_are_seed && peers == 0){
+            if ((role.we_are_seed || g_assume_seed_hairpin.load()) && peers == 0){
                 if (now_ms() - last_note_ms > 30'000){
                     log_warn("SeedSentinel: 0 peers connected while acting as seed — check firewall/DNS.");
                     last_note_ms = now_ms();
@@ -2090,7 +2103,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             if (tui && can_tui) tui->set_banner(std::string("Initial block download — ") + reason);
         }
     }
-    const bool we_are_seed = compute_seed_role().we_are_seed;
+    bool we_are_seed = compute_seed_role().we_are_seed || g_assume_seed_hairpin.load();
 
     if (!p2p) {
         out_err = "P2P disabled (cannot sync headers/blocks)";
@@ -2112,11 +2125,13 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
     uint64_t       lastProgressMs        = now_ms();
     uint64_t       lastHeight            = chain.height();
     uint64_t       height_at_seed_connect= lastHeight;
+    uint32_t       seed_dials            = 0;
 
     // Make sure we’ve nudged the seed right away.
     if (!we_are_seed) {
         p2p->connect_seed(seed_host_cstr(), P2P_PORT);
         lastSeedDialMs = now_ms();
+        ++seed_dials;
     } else {
         log_info(std::string("Seed self-detect: skipping outbound connect to ")
                  + seed_host_cstr() + " (waiting for inbound peers).");
@@ -2134,22 +2149,32 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
         }
         while (!global::shutdown_requested.load()) {
             if (any_verack_peer(p2p)) {
-                if (tui && can_tui) tui->mark_step_ok("Peer handshake (verack)");
+                height_at_seed_connect = chain.height();
+                if (tui && can_tui) {
+                    tui->mark_step_ok("Peer handshake (verack)");
+                    tui->set_banner(std::string("Connected to seed: ") + seed_host_cstr());
+                    tui->set_ibd_progress(chain.height(),
+                                          chain.height(),
+                                          0, "headers", seed_host_cstr(), false);
+                }
+                seed_noted = true;
                 break; // proceed to IBD
             }
             // keep nudging the seed if needed
             if (!we_are_seed && (now_ms() - lastSeedDialMs > kSeedNudgeMs)) {
                 p2p->connect_seed(seed_host_cstr(), P2P_PORT);
                 lastSeedDialMs = now_ms();
-            }
-            if (!seed_noted && any_verack_peer(p2p)) {
-                seed_noted = true;
-                height_at_seed_connect = chain.height();
-                if (tui && can_tui) {
-                    tui->set_banner(std::string("Connected to seed: ") + seed_host_cstr());
-                    tui->set_ibd_progress(chain.height(),
-                                          chain.height(),
-                                          0, "headers", seed_host_cstr(), false);
+                ++seed_dials;
+                if (seed_dials >= 5) {
+                    auto ips = resolve_host_ip_strings(seed_host_cstr());
+                    bool any_public = false;
+                    for (auto& ip : ips) { if (!is_private_v4(ip) && !is_loopback_or_linklocal(ip)) { any_public = true; break; } }
+                    if (any_public && p2p && p2p->snapshot_peers().empty()){
+                        g_assume_seed_hairpin.store(true);
+                        we_are_seed = true;
+                        log_warn("IBD: assuming SEED mode due to probable NAT hairpin (repeated seed dial fails with 0 peers).");
+                        if (tui && can_tui) tui->set_banner("Seed solo mode (hairpin) — waiting for inbound peers…");
+                    }
                 }
             }
 
@@ -2160,10 +2185,19 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                     if (tui && can_tui) {
                         tui->mark_step_ok("Peer handshake (verack)");
                         tui->set_banner("Seed solo mode: no peers yet — mining unlocked.");
-                        tui->set_ibd_progress(chain.height(), chain.height(), 0, "complete", DNS_SEED, true);
+                        tui->set_ibd_progress(chain.height(), chain.height(), 0, "complete", seed_host_cstr(), true);
                     }
                     return true; // treat IBD as trivially complete to unlock mining
                 } else {
+                    if (g_assume_seed_hairpin.load()){
+                        log_warn("IBD: hairpin seed assumption during handshake — proceeding in SOLO-SEED mode.");
+                        if (tui && can_tui) {
+                            tui->mark_step_ok("Peer handshake (verack)");
+                            tui->set_banner("Seed solo mode (hairpin) — mining unlocked.");
+                            tui->set_ibd_progress(chain.height(), chain.height(), 0, "complete", seed_host_cstr(), true);
+                        }
+                        return true;
+                    }
                     out_err = "no peers completed handshake (verack)";
                     if (tui && can_tui) tui->mark_step_fail("Peer handshake (verack)");
                     return false;
@@ -2187,6 +2221,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
         if (!we_are_seed && peers < 2 && now_ms() - lastSeedDialMs > kSeedNudgeMs) {
             p2p->connect_seed(seed_host_cstr(), P2P_PORT);
             lastSeedDialMs = now_ms();
+            ++seed_dials;
         }
 
         // Early no-peer failure
@@ -2196,7 +2231,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             if (we_are_seed) {
                 out_err = "no peers reachable while acting as seed (check DNS A/AAAA and firewall/NAT)";
             } else {
-                out_err = std::string("no peers reachable (seed: ") + DNS_SEED + ":" + std::to_string(P2P_PORT) + ")";
+                out_err = std::string("no peers reachable (seed: ") + seed_host_cstr() + ":" + std::to_string(P2P_PORT) + ")";
             }
             break;
         }
@@ -2524,7 +2559,7 @@ int main(int argc, char** argv){
                 p2p_ok = true;
                 log_info("P2P listening on " + std::to_string(P2P_PORT));
                 if (can_tui) { tui.mark_step_ok("Start P2P listener"); tui.mark_step_started("Connect seeds"); }
-                if (!compute_seed_role().we_are_seed) {
+                if (!(compute_seed_role().we_are_seed || g_assume_seed_hairpin.load())) {
                     p2p.connect_seed(seed_host_cstr(), P2P_PORT);
                     if (can_tui) tui.mark_step_ok("Connect seeds");
                 } else {
