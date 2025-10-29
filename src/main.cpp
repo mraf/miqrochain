@@ -882,7 +882,7 @@ static inline bool is_private_v4(const std::string& ip){
         || ip.rfind("192.168.",0)==0
         || (ip.rfind("172.",0)==0 && [] (const std::string& s){
               // 172.16.0.0/12
-              int a=0,b=0; char dot=0;
+              int a=0; char dot=0;
               if (std::sscanf(s.c_str(),"172.%d%c",&a,&dot)==2 && dot=='.') return (a>=16 && a<=31);
               return false;
            }(ip));
@@ -2125,11 +2125,13 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
     uint64_t       lastProgressMs        = now_ms();
     uint64_t       lastHeight            = chain.height();
     uint64_t       height_at_seed_connect= lastHeight;
+    uint32_t       seed_dials            = 0;
 
     // Make sure we’ve nudged the seed right away.
     if (!we_are_seed) {
         p2p->connect_seed(seed_host_cstr(), P2P_PORT);
         lastSeedDialMs = now_ms();
+        ++seed_dials;
     } else {
         log_info(std::string("Seed self-detect: skipping outbound connect to ")
                  + seed_host_cstr() + " (waiting for inbound peers).");
