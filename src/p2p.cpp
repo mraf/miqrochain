@@ -175,7 +175,7 @@
 #endif
 
 #ifndef MIQ_MSG_HARD_MAX
-#define MIQ_MSG_HARD_MAX (64u * 1024u * 1024u)   /* never accept messages over 8 MiB */
+#define MIQ_MSG_HARD_MAX (MIQ_FALLBACK_MAX_BLOCK_SZ + (2u * 1024u * 1024u))
 #endif
 #ifndef MIQ_PARSE_DEADLINE_MS
 #define MIQ_PARSE_DEADLINE_MS 45000             /* per-frame parse deadline (ms) */
@@ -1610,8 +1610,9 @@ bool P2P::ipv4_is_public(uint32_t be_ip){
 }
 
 P2P::P2P(Chain& c) : chain_(c) {
-    orphan_bytes_limit_ = (size_t)MIQ_ORPHAN_MAX_BYTES;
-    orphan_count_limit_ = (size_t)MIQ_ORPHAN_MAX_COUNT;
+    orphan_bytes_limit_  = (size_t)MIQ_ORPHAN_MAX_BYTES;
+    orphan_count_limit_  = (size_t)MIQ_ORPHAN_MAX_COUNT;
+    msg_deadline_ms_     = (int64_t)MIQ_PARSE_DEADLINE_MS;
 }
 P2P::~P2P(){ stop(); }
 
@@ -1848,6 +1849,19 @@ void P2P::stop(){
     }
 #endif
 }
+
+    g_outbounds.clear();
+    g_force_close.clear();
+    g_rr_next_idx.clear();
+    g_inflight_block_ts.clear();
+    g_global_inflight_blocks.clear();
+    g_trickle_q.clear();
+    g_trickle_last_ms.clear();
+    g_last_hdr_req_ms.clear();
+    g_zero_hdr_batches.clear();
+    g_hdr_flip.clear();
+    g_peer_stalls.clear();
+    g_last_hdr_ok_ms.clear();
 
 // === outbound connect helpers ===============================================
 
@@ -2540,7 +2554,7 @@ void P2P::loop(){
                      bool is_v4 = parse_ipv4(cand->host, be_ip);
                      if (is_v4 && !ipv4_is_public(be_ip)) { g_addrman.mark_attempt(*cand); continue; }
                      if (is_v4 && is_self_be(be_ip)) { g_addrman.mark_attempt(*cand); continue; }
-                     if (is_v4 && peers_.size() >= MIQ_OUTBOUND_TARGET && violates_group_diversity(peers_, be_ip)) {
+                     if (is_v4 && outbound_count() >= (size_t)MIQ_OUTBOUND_TARGET && violates_group_diversity(peers_, be_ip)) {
                          g_addrman.mark_attempt(*cand); continue;
                      }
                      std::string dotted = is_v4 ? be_ip_to_string(be_ip) : cand->host;
@@ -2935,6 +2949,15 @@ void P2P::loop(){
             }
         }
 
+        if (now_ms() - last_addr_save_ms >= (int64_t)MIQ_ADDR_SAVE_INTERVAL_MS) {
+            save_addrs_to_disk(datadir_, addrv4_);
+#if MIQ_ENABLE_ADDRMAN
+            std::string err;
+            (void)g_addrman.save(g_addrman_path, err);
+#endif
+            last_addr_save_ms = now_ms();
+        }
+
         // Accept new peers (with soft inbound rate cap) - IPv4
         if (srv_ != MIQ_INVALID_SOCK && srv_idx_v4 < fds.size() && (fds[srv_idx_v4].revents & POLL_RD)) {
             sockaddr_in ca{};
@@ -3085,13 +3108,14 @@ void P2P::loop(){
                 if (!ps.rx.empty()) rx_track_start(s);
                 if (ps.rx.size() > MIQ_P2P_MAX_BUFSZ) {
                     if (ibd_or_fetch_active(ps, now_ms())) {
-                        // While syncing, peers can legitimately backlog. Trim safely instead of disconnecting.
-                        log_warn("P2P: oversize buffer from " + ps.ip + " during sync -> trimming buffer (no drop)");
-                        ps.rx.clear();
-                        rx_clear_start(s);
+                        log_warn("P2P: oversize buffer from " + ps.ip + " during sync -> trimming oldest bytes");
+                        const size_t keep = MIQ_P2P_MAX_BUFSZ / 2;
+                        if (ps.rx.size() > keep) {
+                            ps.rx.erase(ps.rx.begin(), ps.rx.end() - (ptrdiff_t)keep);
+                        }
+                        // Keep the parse deadline running; do not clear start.
                         auto itg0 = g_gate.find(s);
-                        if (itg0 != g_gate.end()) itg0->second.rx_bytes = 0;
-                        // keep connection; allow more bytes next tick
+                        if (itg0 != g_gate.end()) itg0->second.rx_bytes = ps.rx.size();
                         continue;
                     } else {
                         log_warn("P2P: oversize buffer from " + ps.ip + " -> banning & dropping");
