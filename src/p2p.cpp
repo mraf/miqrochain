@@ -2874,7 +2874,9 @@ void P2P::loop(){
             }
           }
         }
-  
+
+        trickle_flush();
+      
         // --- build pollfd list (SNAPSHOT of peers_) ---
         std::lock_guard<std::mutex> lk(g_peers_mu);
         std::vector<PollFD> fds;
