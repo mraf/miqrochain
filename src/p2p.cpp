@@ -717,6 +717,23 @@ static std::unordered_map<Sock,bool> g_hdr_flip;
 static std::unordered_map<Sock,int> g_peer_stalls;        // # of detected stalls
 static std::unordered_map<Sock,int64_t> g_last_hdr_ok_ms; // time of last accepted headers
 
+static std::unordered_map<Sock,int64_t> g_peer_last_fetch_ms;    // last time peer sent us headers/blocks
+static std::unordered_map<Sock,int64_t> g_peer_last_request_ms;  // last time peer requested headers/blocks from us
+static inline bool ibd_or_fetch_active(const miq::PeerState& ps, int64_t nowms) {
+    const Sock s = (Sock)ps.sock;
+    const bool inflight =
+        ps.syncing ||
+        !ps.inflight_blocks.empty() ||
+        ps.inflight_index > 0 ||
+        ps.inflight_hdr_batches > 0 ||
+        ps.sent_getheaders;
+    const int64_t f = (g_peer_last_fetch_ms.count(s)    ? g_peer_last_fetch_ms.at(s)    : 0);
+    const int64_t r = (g_peer_last_request_ms.count(s)  ? g_peer_last_request_ms.at(s)  : 0);
+    const int64_t kWindow = 5 * 60 * 1000; // 5 minutes grace
+    // Also grant grace while global headers IBD hasn't finished.
+    return inflight || (f && (nowms - f) < kWindow) || (r && (nowms - r) < kWindow) || !g_logged_headers_done;
+}
+
 static bool g_seed_mode = false;
 static inline int miq_outbound_target(){
     return g_seed_mode ? MIQ_SEED_MODE_OUTBOUND_TARGET : MIQ_OUTBOUND_TARGET;
@@ -932,6 +949,8 @@ static inline void gate_on_close(Sock fd){
     g_cmd_rl.erase(fd); // NEW: clean up per-socket rate-limiter windows
     g_inflight_block_ts.erase(fd); // also drop any inflight block timers for this socket
     g_hdr_flip.erase(fd);
+    g_peer_last_fetch_ms.erase(fd);
+    g_peer_last_request_ms.erase(fd);
 }
 [[maybe_unused]] static inline bool gate_on_bytes(Sock fd, size_t add){
     auto it = g_gate.find(fd);
@@ -1341,7 +1360,9 @@ bool P2P::check_rate(PeerState& ps, const char* family, double cost, int64_t now
     rc.last_ms = now_ms;
 
     if (tokens + 1e-9 < cost) {
-        if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
+        if (!ibd_or_fetch_active(ps, now_ms)) {
+            if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
+        }
         rc.buckets[fam] = tokens;
         return false;
     }
@@ -1384,7 +1405,9 @@ bool P2P::check_rate(PeerState& ps,
     }
 
     if (count >= burst) {
-        if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
+        if (!ibd_or_fetch_active(ps, now_ms)) {
+            if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
+        }
         return false;
     }
 
@@ -1647,6 +1670,12 @@ void P2P::bump_ban(PeerState& ps, const std::string& ip, const char* reason, int
     // Do not ban localhost or whitelisted peers (never hairpin-ban loopback).
     if (is_loopback(ip) || is_whitelisted_ip(ip)) {
         P2P_TRACE(std::string("skip-ban loopback/whitelist ip=") + ip + " reason=" + (reason?reason:""));
+        return;
+    }
+
+    if (ibd_or_fetch_active(ps, now_ms)) {
+        P2P_TRACE(std::string("no-ban (sync-active) ip=") + ip + " reason=" + (reason?reason:""));
+        schedule_close((Sock)ps.sock);
         return;
     }
     
@@ -2231,7 +2260,9 @@ void P2P::handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload){
     ps.last_addr_ms = t;
 
     if (!check_rate(ps, "addr", std::max(1.0, (double)(payload.size()/64u)), t)) {
-        bump_ban(ps, ps.ip, "addr-flood", t);
+        if (!ibd_or_fetch_active(ps, t)) {
+            bump_ban(ps, ps.ip, "addr-flood", t);
+        }
         return;
     }
 
@@ -2262,7 +2293,11 @@ void P2P::handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload){
         ++accepted;
     }
     if (accepted == 0) {
-        if (++ps.mis > 30) bump_ban(ps, ps.ip, "addr-empty", now_ms());
+        if (!ibd_or_fetch_active(ps, now_ms())) {
+            if (++ps.mis > 30) bump_ban(ps, ps.ip, "addr-empty", now_ms());
+        } else {
+            ++ps.mis;
+        }
     }
 }
 
@@ -3010,8 +3045,12 @@ void P2P::loop(){
                 ps.rx.insert(ps.rx.end(), buf, buf + n);
                 if (!ps.rx.empty()) rx_track_start(s);
                 if (ps.rx.size() > MIQ_P2P_MAX_BUFSZ) {
-                    log_warn("P2P: oversize buffer from " + ps.ip + " -> banning & dropping");
-                    bump_ban(ps, ps.ip, "oversize-buffer", now_ms());
+                    if (!ibd_or_fetch_active(ps, now_ms())) {
+                        log_warn("P2P: oversize buffer from " + ps.ip + " -> banning & dropping");
+                        bump_ban(ps, ps.ip, "oversize-buffer", now_ms());
+                    } else {
+                        log_warn("P2P: oversize buffer from " + ps.ip + " during sync -> dropping without ban");
+                    }
                     dead.push_back(s);
                     continue;
                 }
@@ -3022,10 +3061,15 @@ void P2P::loop(){
                     size_t off_before = off;
                     bool ok = decode_msg(ps.rx, off, m);
                     if (ok && m.payload.size() > MIQ_MSG_HARD_MAX) {
-                        log_warn("P2P: message over hard max (" + std::to_string(m.payload.size()) + " bytes) from " + ps.ip);
-                        bump_ban(ps, ps.ip, "oversize-message", now_ms());
+                        if (!ibd_or_fetch_active(ps, now_ms())) {
+                            log_warn("P2P: message over hard max (" + std::to_string(m.payload.size()) + " bytes) from " + ps.ip);
+                            bump_ban(ps, ps.ip, "oversize-message", now_ms());
+                        } else {
+                            log_warn("P2P: message over hard max during sync from " + ps.ip + " -> dropping without ban");
+                        }
                         dead.push_back(s);
                         break;
+                      }
                     }
                     if (!ok) break;
                     // FIXED: only drop if decoder made no forward progress (0 bytes).
@@ -3076,8 +3120,11 @@ void P2P::loop(){
                         if (next > (uint64_t)MIQ_P2P_INV_WINDOW_CAP + 1) next = (uint64_t)MIQ_P2P_INV_WINDOW_CAP + 1;
                         ps.inv_in_window = (uint32_t)next;
                         if (ps.inv_in_window > MIQ_P2P_INV_WINDOW_CAP) {
-                            if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "inv-window-overflow", tnow);
+                            if (!ibd_or_fetch_active(ps, tnow)) {
+                                if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "inv-window-overflow", tnow);
+                            }
                             return false;
+                          }
                         }
                         return true;
                     };
@@ -3192,7 +3239,9 @@ void P2P::loop(){
 
                     } else if (cmd == "invb") {
                         if (!check_rate(ps, "inv", 0.5, now_ms())) {
-                            bump_ban(ps, ps.ip, "inv-flood", now_ms());
+                            if (!ibd_or_fetch_active(ps, now_ms())) {
+                                bump_ban(ps, ps.ip, "inv-flood", now_ms());
+                            }
                             continue;
                         }
                         if (m.payload.size() == 32) {
@@ -3205,6 +3254,7 @@ void P2P::loop(){
                         }
 
                     } else if (cmd == "getb") {
+                        g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
                         if (m.payload.size() == 32) {
                             Block b;
                             if (chain_.get_block_by_hash(m.payload, b)) {
@@ -3214,6 +3264,7 @@ void P2P::loop(){
                         }
 
                     } else if (cmd == "getbi") {
+                        g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
                         if (m.payload.size() == 8) {
                             uint64_t idx64 = 0;
                             for (int i=0;i<8;i++) idx64 |= ((uint64_t)m.payload[i]) << (8*i);
@@ -3225,8 +3276,11 @@ void P2P::loop(){
                         }
 
                     } else if (cmd == "block") {
+                        g_peer_last_fetch_ms[(Sock)ps.sock] = now_ms();
                         if (!rate_consume_block(ps, m.payload.size())) {
-                            if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "block-rate", now_ms());
+                            if (!ibd_or_fetch_active(ps, now_ms())) {
+                                if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "block-rate", now_ms());
+                            }
                             continue;
                         }
                         if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
@@ -3303,7 +3357,9 @@ void P2P::loop(){
                       
                     } else if (cmd == "invtx") {
                         if (!check_rate(ps, "inv", 0.25, now_ms())) {
-                            bump_ban(ps, ps.ip, "inv-flood", now_ms());
+                            if (!ibd_or_fetch_active(ps, now_ms())) {
+                                bump_ban(ps, ps.ip, "inv-flood", now_ms());
+                            }
                             continue;
                         }
                         if (m.payload.size() == 32) {
@@ -3329,7 +3385,9 @@ void P2P::loop(){
 
                     } else if (cmd == "tx") {
                         if (!rate_consume_tx(ps, m.payload.size())) {
-                            if ((ps.banscore += 3) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "tx-rate", now_ms());
+                            if (!ibd_or_fetch_active(ps, now_ms())) {
+                                if ((ps.banscore += 3) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "tx-rate", now_ms());
+                            }
                             continue;
                         }
                         Transaction tx;
@@ -3396,7 +3454,11 @@ void P2P::loop(){
                                     for (auto& kvp : peers_) trickle_enqueue(kvp.first, txidv);
                                 }
                             } else if (!err.empty()) {
-                                if (++ps.mis > 25) bump_ban(ps, ps.ip, "tx-invalid", now_ms());
+                                if (!ibd_or_fetch_active(ps, now_ms())) {
+                                    if (++ps.mis > 25) bump_ban(ps, ps.ip, "tx-invalid", now_ms());
+                                } else {
+                                    ++ps.mis; // track but do not ban during sync
+                                }
                             }
                         }
 
@@ -3417,7 +3479,7 @@ void P2P::loop(){
 
 #if MIQ_ENABLE_HEADERS_FIRST
                     } else if (cmd == "getheaders") {
-                        // Parse incoming locator/stop
+                        g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
                         std::vector<std::vector<uint8_t>> locator;
                         std::vector<uint8_t> stop;
                         if (!parse_getheaders_payload(m.payload, locator, stop)) {
@@ -3441,6 +3503,7 @@ void P2P::loop(){
                         (void)send_or_close(s, msg);
 
                     } else if (cmd == "headers") {
+                        g_peer_last_fetch_ms[(Sock)ps.sock] = now_ms();
                         std::vector<BlockHeader> hs;
                         if (!parse_headers_payload(m.payload, hs)) {
                             if (++ps.mis > 10) { dead.push_back(s); }
@@ -3577,7 +3640,9 @@ void P2P::loop(){
                             eff_deadline *= 4; // be lenient while catching up
                         }
                         if (now_ms() - it0->second > eff_deadline) {
-                            bump_ban(ps, ps.ip, "slowloris/parse-timeout", now_ms());
+                            if (!ibd_or_fetch_active(ps, now_ms())) {
+                                bump_ban(ps, ps.ip, "slowloris/parse-timeout", now_ms());
+                            }
                             dead.push_back(s);
                             continue;
                         }
