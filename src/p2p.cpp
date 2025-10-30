@@ -2237,25 +2237,30 @@ void P2P::start_sync_with_peer(PeerState& ps){
         auto pl2 = build_getheaders_payload(locator, stop);
         auto m2  = encode_msg("getheaders", pl2);
         int pushed = 0;
-        while (can_accept_hdr_batch(ps, now_ms()) && check_rate(ps, "hdr", 1.0, now_ms()) && pushed < 4) {
+        while (can_accept_hdr_batch(ps, now_ms()) &&
+               check_rate(ps, "hdr", 1.0, now_ms()) &&
+               pushed < 4) {
             ps.sent_getheaders = true;
             (void)send_or_close(ps.sock, m2);
             ps.inflight_hdr_batches++;
             g_last_hdr_req_ms[(Sock)ps.sock] = now_ms();
             ps.last_hdr_batch_done_ms        = now_ms();
-          ++pushed;
+            ++pushed;
         }
+        if (!g_logged_headers_started) {
+            g_logged_headers_started = true;
+            log_info("[IBD] headers phase started");
         }
-        if (!g_logged_headers_started) { g_logged_headers_started = true; log_info("[IBD] headers phase started"); }
 #endif
         return;
-void P2P::start_sync_with_peer(PeerState& ps){
+    }
+    // Index-capable: pipeline indices immediately.
     ps.syncing = true;
     ps.inflight_index = 0;
     ps.next_index = chain_.height() + 1;
     fill_index_pipeline(ps);
 }
-  
+
 void P2P::fill_index_pipeline(PeerState& ps){
     const uint32_t pipe = (uint32_t)MIQ_INDEX_PIPELINE;
     if (!peer_is_index_capable((Sock)ps.sock)) return;
@@ -2264,7 +2269,6 @@ void P2P::fill_index_pipeline(PeerState& ps){
         request_block_index(ps, idx);
         ps.inflight_index++;
     }
-  }
 }
 
 void P2P::request_block_index(PeerState& ps, uint64_t index){
