@@ -2140,7 +2140,6 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
     if (tui && can_tui) tui->mark_step_started("Peer handshake (verack)");
     {
         const uint64_t hs_t0 = now_ms();
-        bool seed_noted = true;
         const uint64_t handshake_deadline_ms =
             we_are_seed ? (hs_t0 + 5 * 60 * 1000) : (hs_t0 + kHandshakeTimeoutMs);
         if (we_are_seed) {
@@ -2157,7 +2156,6 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                                           chain.height(),
                                           0, "headers", seed_host_cstr(), false);
                 }
-                seed_noted = true;
                 break; // proceed to IBD
             }
             // keep nudging the seed if needed
