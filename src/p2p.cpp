@@ -1334,7 +1334,7 @@ bool P2P::check_rate(PeerState& ps, const char* key) {
 }
 
 // === Per-family token bucket (cost tokens per event) ========================
-bool P2P::check_rate(PeerState& ps, const char* family, double cost, int64_t now_ms)
+bool P2P::check_rate(PeerState& ps, const char* family, double cost, int64_t tnow)
 {
     if (!family) family = "misc";
     if (cost < 0) cost = 0;
@@ -1351,17 +1351,17 @@ bool P2P::check_rate(PeerState& ps, const char* family, double cost, int64_t now
 
     // Refill and charge tokens.
     auto& rc = ps.rate;
-    if (rc.last_ms == 0) rc.last_ms = now_ms;
-    const double elapsed = (now_ms - rc.last_ms) / 1000.0;
+    if (rc.last_ms == 0) rc.last_ms = tnow;
+    const double elapsed = (tnow - rc.last_ms) / 1000.0;
     double tokens = rc.buckets[fam]; // 0 if missing
 
     if (elapsed > 0) {
         tokens = std::min(burst, tokens + per_sec * elapsed);
     }
-    rc.last_ms = now_ms;
+    rc.last_ms = tnow;
 
     if (tokens + 1e-9 < cost) {
-        if (!ps.whitelisted && !ibd_or_fetch_active(ps, miq::now_ms())) {
+        if (!ps.whitelisted && !ibd_or_fetch_active(ps, tnow)) {
             if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
         }
         rc.buckets[fam] = tokens;
@@ -1862,6 +1862,7 @@ void P2P::stop(){
     g_hdr_flip.clear();
     g_peer_stalls.clear();
     g_last_hdr_ok_ms.clear();
+}
 
 // === outbound connect helpers ===============================================
 
