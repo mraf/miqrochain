@@ -755,8 +755,7 @@ static MIQ_MAYBE_UNUSED bool unsolicited_drop(miq::PeerState& ps, const char* wh
         return true;
     }
     if (what && std::strcmp(what,"tx")==0) {
-        if (ps.syncing || !g_logged_headers_done) return false;
-        return ps.inflight_tx.find(keyHex) == ps.inflight_tx.end();
+        return false;
     }
     // Otherwise allow (normal steady-state relay)
     return false;
@@ -1003,7 +1002,8 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
         } else {
             if (!g.got_version) {
                 if (miq_safe_preverack_cmd(cmd)) {
-                    // safe pre-version traffic is fine; liveness already refreshed
+                    // Safe pre-version traffic → count as liveness so we don't trip verack timeout.
+                    g.hs_last_ms = now_ms();
                     return false;
                 } else {
                     g.banscore += 10;
@@ -1013,6 +1013,8 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
             }
             if (!g.got_verack){
                 if (!miq_safe_preverack_cmd(cmd)) { return false; /* ignore silently */ }
+                // Safe pre-verack traffic also counts as liveness.
+                g.hs_last_ms = now_ms();
                 // Never penalize safe pre-verack getheaders/headers; drop-count only other safe cmds.
                 if (!g.is_loopback && cmd != "getheaders" && cmd != "headers") {
                     int &cnt = g_preverack_counts[fd];
@@ -1359,7 +1361,7 @@ bool P2P::check_rate(PeerState& ps, const char* family, double cost, int64_t now
     rc.last_ms = now_ms;
 
     if (tokens + 1e-9 < cost) {
-        if (!ibd_or_fetch_active(ps, now_ms)) {
+        if (!ps.whitelisted && !ibd_or_fetch_active(ps, now_ms())) {
             if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
         }
         rc.buckets[fam] = tokens;
@@ -1404,7 +1406,7 @@ bool P2P::check_rate(PeerState& ps,
     }
 
     if (count >= burst) {
-        if (!ibd_or_fetch_active(ps, now_ms())) {
+        if (!ps.whitelisted && !ibd_or_fetch_active(ps, now_ms())) {
             if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
         }
         return false;
@@ -1935,6 +1937,13 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     ps.version = 0;
     ps.features = 0;
     ps.whitelisted = false;
+    ps.total_blocks_received = 0;
+    ps.total_block_delivery_time_ms = 0;
+    ps.avg_block_delivery_ms = 30000; // sane initial expectation (30s)
+    ps.successful_deliveries = 0;
+    ps.failed_deliveries = 0;
+    ps.health_score = 1.0;
+    ps.last_block_received_ms = 0;
     peers_[s] = ps;
 
     g_trickle_last_ms[s] = 0;
@@ -2022,6 +2031,13 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     ps.version = 0;
     ps.features = 0;
     ps.whitelisted = false;
+    ps.total_blocks_received = 0;
+    ps.total_block_delivery_time_ms = 0;
+    ps.avg_block_delivery_ms = 30000;
+    ps.successful_deliveries = 0;
+    ps.failed_deliveries = 0;
+    ps.health_score = 1.0;
+    ps.last_block_received_ms = 0;
     peers_[c] = ps;
 
     g_trickle_last_ms[c] = 0;
@@ -2556,6 +2572,13 @@ void P2P::loop(){
                          ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
                          ps.inflight_hdr_batches = 0; ps.last_hdr_batch_done_ms = 0; ps.sent_getheaders = false;
                          ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
+                         ps.total_blocks_received = 0;
+                         ps.total_block_delivery_time_ms = 0;
+                         ps.avg_block_delivery_ms = 30000;
+                         ps.successful_deliveries = 0;
+                         ps.failed_deliveries = 0;
+                         ps.health_score = 1.0;
+                         ps.last_block_received_ms = 0;
                          { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
                          g_trickle_last_ms[s] = 0;
                          log_info("P2P: outbound (addrman) " + ps.ip);
@@ -2604,6 +2627,13 @@ void P2P::loop(){
                                 ps.last_refill_ms = ps.last_ms;
                                 ps.inflight_hdr_batches = 0; ps.last_hdr_batch_done_ms = 0; ps.sent_getheaders = false;
                                 ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
+                                ps.total_blocks_received = 0;
+                                ps.total_block_delivery_time_ms = 0;
+                                ps.avg_block_delivery_ms = 30000;
+                                ps.successful_deliveries = 0;
+                                ps.failed_deliveries = 0;
+                                ps.health_score = 1.0;
+                                ps.last_block_received_ms = 0;
                                 { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
                                 g_trickle_last_ms[s] = 0;
 
@@ -2641,6 +2671,13 @@ void P2P::loop(){
                                     ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
                                     ps.inflight_hdr_batches = 0; ps.last_hdr_batch_done_ms = 0; ps.sent_getheaders = false;
                                     ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
+                                    ps.total_blocks_received = 0;
+                                    ps.total_block_delivery_time_ms = 0;
+                                    ps.avg_block_delivery_ms = 30000;
+                                    ps.successful_deliveries = 0;
+                                    ps.failed_deliveries = 0;
+                                    ps.health_score = 1.0;
+                                    ps.last_block_received_ms = 0;
                                     { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s]=ps; g_outbounds.insert(s); }
                                     g_trickle_last_ms[s] = 0;
                                     log_info("P2P: feeler " + dotted);
@@ -3072,11 +3109,13 @@ void P2P::loop(){
                         if (!ibd_or_fetch_active(ps, now_ms())) {
                             log_warn("P2P: message over hard max (" + std::to_string(m.payload.size()) + " bytes) from " + ps.ip);
                             bump_ban(ps, ps.ip, "oversize-message", now_ms());
+                            dead.push_back(s);
+                            break;
                         } else {
-                            log_warn("P2P: message over hard max during sync from " + ps.ip + " -> dropping without ban");
+                            // During IBD be lenient: skip this frame, keep the session alive.
+                            log_warn("P2P: message over hard max during sync from " + ps.ip + " -> ignoring frame without drop");
+                            continue;
                         }
-                        dead.push_back(s);
-                        break;
                     }
                   
                     size_t advanced = (off > off_before) ? (off - off_before) : 0;
