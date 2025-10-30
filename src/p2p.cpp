@@ -1361,7 +1361,7 @@ bool P2P::check_rate(PeerState& ps, const char* family, double cost, int64_t now
     rc.last_ms = now_ms;
 
     if (tokens + 1e-9 < cost) {
-        if (!ps.whitelisted && !ibd_or_fetch_active(ps, now_ms())) {
+        if (!ps.whitelisted && !ibd_or_fetch_active(ps, miq::now_ms())) {
             if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
         }
         rc.buckets[fam] = tokens;
