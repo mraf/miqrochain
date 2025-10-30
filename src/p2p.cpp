@@ -1404,7 +1404,7 @@ bool P2P::check_rate(PeerState& ps,
     }
 
     if (count >= burst) {
-        if (!ibd_or_fetch_active(ps, now_ms)) {
+        if (!ibd_or_fetch_active(ps, now_ms())) {
             if (ps.banscore < MIQ_P2P_MAX_BANSCORE) ps.banscore += 1;
         }
         return false;
