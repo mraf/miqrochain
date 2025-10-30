@@ -56,7 +56,7 @@
 #define MIQ_P2P_TRACE 1
 #endif
 #if MIQ_P2P_TRACE
-  #define P2P_TRACE(msg) do { miq::log_info(std::string("[TRACE] ") + (msg)); } while(0)
+  #define P2P_TRACE(msg) do { ::miq::log_info(std::string("[TRACE] ") + (msg)); } while(0)
 #else
   #define P2P_TRACE(msg) do {} while(0)
 #endif
@@ -1850,7 +1850,6 @@ void P2P::stop(){
 #endif
 }
 
-namespace miq {
 static inline void reset_runtime_queues() {
     g_outbounds.clear();
     g_force_close.clear();
