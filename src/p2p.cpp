@@ -11,6 +11,7 @@
 #include "base58check.h"    // Base58Check address display (miner logs)
 
 #include <chrono>
+#include <deque>
 #include <tuple>
 #include <cstring>
 #include <fcntl.h>
@@ -805,6 +806,40 @@ namespace {
 
 namespace {
   std::unordered_set<std::string> g_global_inflight_blocks; // any peer -> requested block-hash
+}
+
+namespace {
+  static std::unordered_map<Sock, std::unordered_map<uint64_t,int64_t>> g_inflight_index_ts;
+  static std::unordered_map<Sock, std::deque<uint64_t>> g_inflight_index_order;
+  static int64_t g_stall_retry_ms = MIQ_P2P_STALL_RETRY_MS; // runtime-tunable via env
+}
+
+static inline int64_t adaptive_index_timeout_ms(const miq::PeerState& ps){
+    // Base on observed block delivery; halve it for indices (headers+lookup are lighter).
+    int64_t base = std::max<int64_t>(5000, ps.avg_block_delivery_ms / 2);
+    // Healthier peers get tighter timeouts, weaker peers looser.
+    double health = std::min(1.0, std::max(0.0, ps.health_score)); // clamp
+    double health_mul = 2.0 - health; // 1.0..2.0
+    // During IBD or explicit index sync, allow more slack.
+    double ibd_mul = (!g_logged_headers_done || ps.syncing) ? 2.0 : 1.2;
+    int64_t t = (int64_t)(base * health_mul * ibd_mul);
+    int64_t max_t = (!g_logged_headers_done || ps.syncing) ? 120000 : 30000; // 120s IBD, 30s steady
+    return std::max<int64_t>(5000, std::min<int64_t>(t, max_t));
+}
+
+static inline void clear_fulfilled_indices_up_to_height(size_t new_h){
+    for (auto &kv : g_inflight_index_ts){
+        Sock s = kv.first;
+        auto &byidx = kv.second;
+        auto &dq = g_inflight_index_order[s];
+        // Remove from timestamp map any indices we must already have received
+        for (auto it = byidx.begin(); it != byidx.end(); ){
+            if (it->first <= (uint64_t)new_h) it = byidx.erase(it);
+            else ++it;
+        }
+        // Trim the front of the oldest-first deque
+        while (!dq.empty() && dq.front() <= (uint64_t)new_h) dq.pop_front();
+    }
 }
 
 namespace {
@@ -1742,7 +1777,8 @@ bool P2P::start(uint16_t port){
 
     g_last_progress_ms = now_ms();
     g_last_progress_height = chain_.height();
-    g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
+    g_stall_retry_ms = (int64_t)env_u64("MIQ_P2P_STALL_RETRY_MS", (uint64_t)MIQ_P2P_STALL_RETRY_MS);
+    g_next_stall_probe_ms = g_last_progress_ms + g_stall_retry_ms;
 
     std::string ext_ip;
     {
@@ -1863,6 +1899,8 @@ static inline void reset_runtime_queues() {
     g_hdr_flip.clear();
     g_peer_stalls.clear();
     g_last_hdr_ok_ms.clear();
+    g_inflight_index_ts.clear();
+    g_inflight_index_order.clear();
 }
 
 // === outbound connect helpers ===============================================
@@ -2170,7 +2208,11 @@ void P2P::request_block_index(PeerState& ps, uint64_t index){
     uint8_t p[8];
     for (int i=0;i<8;i++) p[i] = (uint8_t)((index >> (8*i)) & 0xFF);
     auto msg = encode_msg("getbi", std::vector<uint8_t>(p, p+8));
-    (void)send_or_close(ps.sock, msg);
+    if (send_or_close(ps.sock, msg)) {
+        // Track inflight timestamp and ordering per-peer for oldest-first retries
+        g_inflight_index_ts[(Sock)ps.sock][index] = now_ms();
+        g_inflight_index_order[(Sock)ps.sock].push_back(index);
+    }
 }
 
 void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
@@ -2468,6 +2510,7 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
         broadcast_inv_block(bh);
         try_connect_orphans(hexkey(bh));
+        clear_fulfilled_indices_up_to_height(chain_.height());
         g_last_progress_ms = now_ms();
         g_last_progress_height = chain_.height();
     } else {
@@ -2718,7 +2761,7 @@ void P2P::loop(){
             if (h > g_last_progress_height) {
                 g_last_progress_height = h;
                 g_last_progress_ms = tnow;
-                g_next_stall_probe_ms = tnow + MIQ_P2P_STALL_RETRY_MS;
+                g_next_stall_probe_ms = tnow + g_stall_retry_ms;
             } else if (tnow >= g_next_stall_probe_ms && !peers_.empty()) {
                 // Stall detected: height hasn't increased for MIQ_P2P_STALL_RETRY_MS
                 int64_t stall_duration_ms = tnow - g_last_progress_ms;
@@ -2780,11 +2823,11 @@ void P2P::loop(){
                     }
                 }
 #endif
-                g_next_stall_probe_ms = tnow + MIQ_P2P_STALL_RETRY_MS;
+                g_next_stall_probe_ms = tnow + g_stall_retry_ms;
             } else if (tnow >= g_next_stall_probe_ms && peers_.empty()) {
                 // No peers connected during stall
                 log_warn("P2P: stall detected with NO PEERS connected (height=" + std::to_string(h) + ") - attempting to reconnect");
-                g_next_stall_probe_ms = tnow + MIQ_P2P_STALL_RETRY_MS;
+                g_next_stall_probe_ms = tnow + g_stall_retry_ms;
             }
         }
         
@@ -2888,6 +2931,75 @@ void P2P::loop(){
                   break; // successfully queued with this peer
                 }
               }
+            }
+          }
+        }
+
+        +        {
+          const int64_t tnow = now_ms();
+          // Oldest-first per-peer: check deque front(s) only each tick, bounded effort
+          struct Exp { Sock s; uint64_t idx; int64_t ts; };
+          std::vector<Exp> expired_idx;
+          expired_idx.reserve(64);
+
+          for (auto &kv : g_inflight_index_order){
+            Sock s = kv.first;
+            auto &dq = kv.second;
+            if (dq.empty()) continue;
+            auto pit = peers_.find(s);
+            if (pit == peers_.end()) continue;
+            miq::PeerState &ps = pit->second;
+
+            int checked = 0;
+            while (!dq.empty() && checked < 8){
+              uint64_t idx = dq.front();
+              auto itts = g_inflight_index_ts[s].find(idx);
+              if (itts == g_inflight_index_ts[s].end()){
+                dq.pop_front();
+                continue;
+              }
+              int64_t ts = itts->second;
+              if (tnow - ts > adaptive_index_timeout_ms(ps)){
+                expired_idx.push_back({s, idx, ts});
+                dq.pop_front();
+                g_inflight_index_ts[s].erase(idx);
+                if (ps.inflight_index > 0) ps.inflight_index--; // free a slot on original peer
+              } else {
+                break; // front is still within timeout window
+              }
+              ++checked;
+              if ((int)expired_idx.size() >= 64) break;
+            }
+            if ((int)expired_idx.size() >= 64) break;
+          }
+
+          // Re-issue timed-out indices to healthier peers, round-robin by index
+          for (const auto &e : expired_idx){
+            // Build candidate set excluding original socket
+            std::vector<std::pair<Sock,double>> scored;
+            for (auto &kvp : peers_){
+              if (kvp.first == e.s) continue;
+              if (!kvp.second.verack_ok) continue;
+              scored.emplace_back(kvp.first, kvp.second.health_score);
+            }
+            Sock target = MIQ_INVALID_SOCK;
+            if (!scored.empty()){
+              std::sort(scored.begin(), scored.end(),
+                        [](const auto&a,const auto&b){ return a.second > b.second; });
+              std::vector<Sock> socks; socks.reserve(scored.size());
+              for (auto &p: scored) socks.push_back(p.first);
+              target = rr_pick_peer_for_key(miq_idx_key(e.idx), socks);
+            } else {
+              target = e.s; // fallback: retry same peer if no alternatives
+            }
+            auto itT = peers_.find(target);
+            if (itT == peers_.end()) continue;
+            uint8_t p8[8]; for (int i=0;i<8;i++) p8[i] = (uint8_t)((e.idx>>(8*i))&0xFF);
+            auto msg = encode_msg("getbi", std::vector<uint8_t>(p8,p8+8));
+            if (send_or_close(target, msg)){
+              g_inflight_index_ts[target][e.idx] = now_ms();
+              g_inflight_index_order[target].push_back(e.idx);
+              itT->second.inflight_index++;
             }
           }
         }
@@ -3616,7 +3728,7 @@ void P2P::loop(){
 
                         {
                             bool zero_progress = (!at_tip) && (accepted == 0) &&
-                                (now_ms() - g_last_progress_ms) > (int64_t)MIQ_P2P_STALL_RETRY_MS;
+                                (now_ms() - g_last_progress_ms) > g_stall_retry_ms;
                             if (zero_progress) {
                                 int &z = g_zero_hdr_batches[s];
                                 z++;
@@ -3766,7 +3878,7 @@ void P2P::loop(){
                 }
               if (!ps.syncing && !g_logged_headers_done) {
                     int64_t last_ok = g_last_hdr_ok_ms.count(s) ? g_last_hdr_ok_ms[s] : 0;
-                    if (last_ok && (tnow - last_ok) > (int64_t)(MIQ_P2P_STALL_RETRY_MS * 4) && !is_lb) {
+                    if (last_ok && (tnow - last_ok) > (int64_t)(g_stall_retry_ms * 4) && !is_lb) {
                         log_warn("P2P: deprioritizing header-stalled peer " + ps.ip);
                         g_peer_stalls[s]++;
                         if (g_peer_stalls[s] >= MIQ_P2P_BAD_PEER_MAX_STALLS) dead.push_back(s);
