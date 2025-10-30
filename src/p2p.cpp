@@ -1850,6 +1850,8 @@ void P2P::stop(){
 #endif
 }
 
+namespace miq {
+static inline void reset_runtime_queues() {
     g_outbounds.clear();
     g_force_close.clear();
     g_rr_next_idx.clear();
@@ -2536,6 +2538,7 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
 // ============================================================================
 
 void P2P::loop(){
+    reset_runtime_queues();
     int64_t last_addr_save_ms = now_ms();
     int64_t last_ban_purge_ms = last_addr_save_ms;
     int64_t last_dial_ms = now_ms();
