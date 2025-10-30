@@ -750,7 +750,7 @@ static MIQ_MAYBE_UNUSED bool unsolicited_drop(miq::PeerState& ps, const char* wh
     if (what && std::strcmp(what,"block")==0) {
         if (ps.inflight_blocks.find(keyHex) != ps.inflight_blocks.end()) return false;
         if (g_global_inflight_blocks.find(keyHex) != g_global_inflight_blocks.end()) return false;
-        if (ps.syncing) return false;'
+        if (ps.syncing) return false;
         if (!g_logged_headers_done) return false;
         return true;
     }
@@ -3681,18 +3681,18 @@ void P2P::loop(){
                     ps.last_ping_ms = tnow;
                     ps.awaiting_pong = true;
                 } else if (ps.awaiting_pong) {
-                    // During IBD/sync, give peers 6x more time to respond (90s instead of 15s)
-                    // Seeds are often busy sending blocks and may be slow to respond to pings
-                    int64_t eff_pong_timeout = MIQ_P2P_PONG_TIMEOUT_MS * ((ps.syncing || !g_logged_headers_done) ? 6 : 1);
-                    if (!is_lb && !(ps.syncing || !g_logged_headers_done)) {
+                    int64_t eff_pong_timeout = MIQ_P2P_PONG_TIMEOUT_MS *
+                                               ((ps.syncing || !g_logged_headers_done) ? 6 : 1);
+                    if ((tnow - ps.last_ping_ms) > eff_pong_timeout) {
+                        if (!is_lb) {
                             P2P_TRACE("close pong-timeout");
                             dead.push_back(s);
+                            continue; // proceed to close handling for this peer
                         } else {
-                            // lenient path
+                            // Lenient path for localhost tools/wallets: don't drop, just reset the ping cycle.
                             ps.awaiting_pong = false;
-                            ps.last_ping_ms = tnow;
-                            // small backoff to avoid hammering ping on busy seeds
-                            ps.last_ping_ms += 5000;
+                            // Small backoff to avoid hammering busy peers.
+                            ps.last_ping_ms = tnow + 5000;
                         }
                     }
                 }
