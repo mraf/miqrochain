@@ -2249,14 +2249,16 @@ void P2P::start_sync_with_peer(PeerState& ps){
         if (!g_logged_headers_started) { g_logged_headers_started = true; log_info("[IBD] headers phase started"); }
 #endif
         return;
+#if
     }
-    // Default: by-index pipeline on capable peers.
     ps.syncing = true;
     ps.inflight_index = 0;
     ps.next_index = chain_.height() + 1;  
     fill_index_pipeline(ps);
 }
-
+#endif
+namespace miq {
+void P2P::fill_index_pipeline(PeerState& ps){
 void P2P::fill_index_pipeline(PeerState& ps){
     const uint32_t pipe = (uint32_t)MIQ_INDEX_PIPELINE;
     if (!peer_is_index_capable((Sock)ps.sock)) return;
@@ -2265,6 +2267,7 @@ void P2P::fill_index_pipeline(PeerState& ps){
         request_block_index(ps, idx);
         ps.inflight_index++;
     }
+  }
 }
 
 void P2P::request_block_index(PeerState& ps, uint64_t index){
