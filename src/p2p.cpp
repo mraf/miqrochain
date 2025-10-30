@@ -972,8 +972,6 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
     if (it == g_gate.end()) return false;
     auto& g = it->second;
 
-    g.hs_last_ms = now_ms();
-    // Handshake watchdog based on last activity (not raw connect time).
     if (!g.got_verack) {
         int64_t idle = now_ms() - g.hs_last_ms;   // will be small if traffic is flowing
         if (idle > HANDSHAKE_MS) {
@@ -991,6 +989,7 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
         if (cmd == "version"){
             if (!g.got_version){
                 g.got_version = true;
+                g.hs_last_ms = now_ms();
                 should_send_verack = true;
                 g_preverack_counts.erase(fd);
                 g.hs_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -999,6 +998,7 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
         } else if (cmd == "verack"){
             g.got_verack = true;
             g_preverack_counts.erase(fd);
+            g.hs_last_ms = now_ms();
             g.hs_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 Clock::now().time_since_epoch()).count();
         } else {
@@ -1590,7 +1590,8 @@ bool P2P::parse_ipv4(const std::string& dotted, uint32_t& be_ip){
 }
 bool P2P::ipv4_is_public(uint32_t be_ip){
     uint8_t A = uint8_t(be_ip>>24), B = uint8_t(be_ip>>16);
-    uint8_t C = uint8_t(be_ip>>8),  D MIQ_MAYBE_UNUSED = uint8_t(be_ip>>0);
+    uint8_t C = uint8_t(be_ip>>8);
+    MIQ_MAYBE_UNUSED uint8_t D = uint8_t(be_ip>>0);
     (void)D;
     if (A == 0 || A == 10 || A == 127) return false;
     if (A == 169 && B == 254) return false;
@@ -3060,7 +3061,8 @@ void P2P::loop(){
                 while (true) {
                     size_t off_before = off;
                     bool ok = decode_msg(ps.rx, off, m);
-                    if (ok && m.payload.size() > MIQ_MSG_HARD_MAX) {
+                    if (!ok) break;
+                    if (m.payload.size() > MIQ_MSG_HARD_MAX) {
                         if (!ibd_or_fetch_active(ps, now_ms())) {
                             log_warn("P2P: message over hard max (" + std::to_string(m.payload.size()) + " bytes) from " + ps.ip);
                             bump_ban(ps, ps.ip, "oversize-message", now_ms());
@@ -3069,10 +3071,8 @@ void P2P::loop(){
                         }
                         dead.push_back(s);
                         break;
-                      }
                     }
-                    if (!ok) break;
-                    // FIXED: only drop if decoder made no forward progress (0 bytes).
+                  
                     size_t advanced = (off > off_before) ? (off - off_before) : 0;
                     if (advanced == 0) {
                         miq::log_warn("P2P: decoded frame made no progress; waiting for more data");
@@ -3124,7 +3124,6 @@ void P2P::loop(){
                                 if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "inv-window-overflow", tnow);
                             }
                             return false;
-                          }
                         }
                         return true;
                     };
