@@ -748,15 +748,14 @@ static MIQ_MAYBE_UNUSED bool unsolicited_drop(miq::PeerState& ps, const char* wh
     if (!ps.verack_ok) return true;
     // During IBD, accept only if inflight has an entry for this object
     if (what && std::strcmp(what,"block")==0) {
-        // 1) Accept if THIS peer has it inflight…
         if (ps.inflight_blocks.find(keyHex) != ps.inflight_blocks.end()) return false;
-        // 2) …or ANY peer requested it (parents can arrive from other peers)
         if (g_global_inflight_blocks.find(keyHex) != g_global_inflight_blocks.end()) return false;
-        // 3) …or we are in index-sync mode (getbi replies have no hash pre-tracked)
-        if (ps.syncing) return false;
+        if (ps.syncing) return false;'
+        if (!g_logged_headers_done) return false;
         return true;
     }
     if (what && std::strcmp(what,"tx")==0) {
+        if (ps.syncing || !g_logged_headers_done) return false;
         return ps.inflight_tx.find(keyHex) == ps.inflight_tx.end();
     }
     // Otherwise allow (normal steady-state relay)
@@ -3046,14 +3045,21 @@ void P2P::loop(){
                 ps.rx.insert(ps.rx.end(), buf, buf + n);
                 if (!ps.rx.empty()) rx_track_start(s);
                 if (ps.rx.size() > MIQ_P2P_MAX_BUFSZ) {
-                    if (!ibd_or_fetch_active(ps, now_ms())) {
+                    if (ibd_or_fetch_active(ps, now_ms())) {
+                        // While syncing, peers can legitimately backlog. Trim safely instead of disconnecting.
+                        log_warn("P2P: oversize buffer from " + ps.ip + " during sync -> trimming buffer (no drop)");
+                        ps.rx.clear();
+                        rx_clear_start(s);
+                        auto itg0 = g_gate.find(s);
+                        if (itg0 != g_gate.end()) itg0->second.rx_bytes = 0;
+                        // keep connection; allow more bytes next tick
+                        continue;
+                    } else {
                         log_warn("P2P: oversize buffer from " + ps.ip + " -> banning & dropping");
                         bump_ban(ps, ps.ip, "oversize-buffer", now_ms());
-                    } else {
-                        log_warn("P2P: oversize buffer from " + ps.ip + " during sync -> dropping without ban");
+                        dead.push_back(s);
+                        continue;
                     }
-                    dead.push_back(s);
-                    continue;
                 }
 
                 size_t off = 0;
@@ -3678,13 +3684,15 @@ void P2P::loop(){
                     // During IBD/sync, give peers 6x more time to respond (90s instead of 15s)
                     // Seeds are often busy sending blocks and may be slow to respond to pings
                     int64_t eff_pong_timeout = MIQ_P2P_PONG_TIMEOUT_MS * ((ps.syncing || !g_logged_headers_done) ? 6 : 1);
-                    if ((tnow - ps.last_ping_ms) > eff_pong_timeout) {
-                        if (!is_lb) {
+                    if (!is_lb && !(ps.syncing || !g_logged_headers_done)) {
                             P2P_TRACE("close pong-timeout");
                             dead.push_back(s);
                         } else {
+                            // lenient path
                             ps.awaiting_pong = false;
                             ps.last_ping_ms = tnow;
+                            // small backoff to avoid hammering ping on busy seeds
+                            ps.last_ping_ms += 5000;
                         }
                     }
                 }
@@ -3785,6 +3793,41 @@ void P2P::loop(){
         }
         // ---- Guarded removals (single, consistent path) --------------------
         for (Sock s : dead) {
+            auto it_peers_count = peers_.size();
+            auto it_preview = peers_.find(s);
+            if (it_preview != peers_.end()) {
+                // If this is our last live peer and we’re still syncing, don’t kill it;
+                // keep the network moving and be patient instead.
+                bool ibd_active_globally = (!g_logged_headers_done);
+                bool ibd_active_peer     = it_preview->second.syncing;
+                if (it_peers_count == 1 && (ibd_active_globally || ibd_active_peer)) {
+                    log_warn("P2P: keeping last syncing peer alive (avoid total stall) ip=" + it_preview->second.ip);
+                    // Reset ping/handshake timers to give it fresh headroom
+                    auto g = g_gate.find(s);
+                    if (g != g_gate.end()) g->second.hs_last_ms = now_ms();
+                    it_preview->second.awaiting_pong = false;
+                    it_preview->second.last_ping_ms  = now_ms();
+                    continue; // skip close
+                }
+            }
+
+            trickle_flush();
+
+        // Periodically persist address sets (legacy + addrman)
+        {
+            int64_t tnow = now_ms();
+            if (tnow - last_addr_save_ms > (int64_t)MIQ_ADDR_SAVE_INTERVAL_MS) {
+                save_addrs_to_disk(datadir_, addrv4_);
+#if MIQ_ENABLE_ADDRMAN
+                std::string err;
+                if (!g_addrman.save(g_addrman_path, err)) {
+                    log_warn("P2P: addrman periodic save failed: " + err);
+                }
+#endif
+                last_addr_save_ms = tnow;
+            }
+        }
+  
             gate_on_close(s);
             auto it = peers_.find(s);
             if (it != peers_.end()) {
@@ -3793,6 +3836,42 @@ void P2P::loop(){
                 size_t inflight = it->second.inflight_blocks.size();
                 bool was_syncing = it->second.syncing;
                 std::string ip = it->second.ip;
+                if (inflight > 0) {
+                    std::vector<std::string> keys;
+                    keys.reserve(it->second.inflight_blocks.size());
+                    for (const auto& k : it->second.inflight_blocks) keys.push_back(k);
+                    // erase peer-local timers & global inflight
+                    for (const auto& k : keys) {
+                        g_global_inflight_blocks.erase(k);
+                        g_inflight_block_ts[s].erase(k);
+                    }
+                    // Prepare candidate peers sorted by health (desc)
+                    std::vector<std::pair<Sock,double>> cands;
+                    for (const auto& kv2 : peers_) {
+                        if (kv2.first == s) continue;
+                        if (!kv2.second.verack_ok) continue;
+                        cands.emplace_back(kv2.first, kv2.second.health_score);
+                    }
+                    std::sort(cands.begin(), cands.end(),
+                              [](const auto& a, const auto& b){ return a.second > b.second; });
+                    std::vector<Sock> cand_socks; cand_socks.reserve(cands.size());
+                    for (auto& p : cands) cand_socks.push_back(p.first);
+                    // Helper: hex->bytes
+                    auto unhex32 = [](const std::string& k)->std::vector<uint8_t>{
+                        std::vector<uint8_t> h(32);
+                        auto v = [](char c)->int{ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return 10+(c-'a'); if(c>='A'&&c<='F')return 10+(c-'A'); return 0; };
+                        for (size_t i=0;i<32;i++) h[i] = (uint8_t)((v(k[2*i])<<4)|v(k[2*i+1]));
+                        return h;
+                    };
+                    for (const auto& k : keys) {
+                        if (cand_socks.empty()) break;
+                        Sock t = rr_pick_peer_for_key(k, cand_socks);
+                        auto itT = peers_.find(t);
+                        if (itT != peers_.end()) {
+                            request_block_hash(itT->second, unhex32(k));
+                        }
+                    }
+                }
 
                 if (inflight > 0 || was_syncing) {
                     log_info("P2P: disconnecting peer " + ip + " (inflight_blocks=" + std::to_string(inflight) + ", syncing=" + (was_syncing ? "yes" : "no") + ", remaining_peers=" + std::to_string(peers_.size() - 1) + ")");
