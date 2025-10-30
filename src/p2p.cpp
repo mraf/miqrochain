@@ -2935,7 +2935,7 @@ void P2P::loop(){
           }
         }
 
-        +        {
+          {
           const int64_t tnow = now_ms();
           // Oldest-first per-peer: check deque front(s) only each tick, bounded effort
           struct Exp { Sock s; uint64_t idx; int64_t ts; };
