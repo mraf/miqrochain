@@ -799,7 +799,7 @@ static inline void maybe_send_feefilter(miq::PeerState& ps){
     const uint64_t mrf = local_min_relay_kb();
     std::vector<uint8_t> pl(8);
     for (int i=0;i<8;i++) pl[i] = (uint8_t)((mrf >> (8*i)) & 0xFF);
-    auto msg = encode_msg("feefilter", pl);
+    auto msg = miq::encode_msg("feefilter", pl);
     if (send_or_close(ps.sock, msg)) {
         set_peer_feefilter((Sock)ps.sock, mrf);
     }
