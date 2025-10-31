@@ -356,6 +356,8 @@
   #define CLOSESOCK(s) close(s)
 #endif
 
+std::atomic<bool> g_sync_wants_active{false};
+
 namespace {
     static std::mutex g_peer_stalls_mu;
     static std::unordered_map<Sock, int> g_peer_stalls;
@@ -840,8 +842,6 @@ static inline int miq_outbound_target(){
 namespace {
 extern std::unordered_set<std::string> g_global_inflight_blocks;
 }
-
-namespace { extern std::atomic<bool> g_sync_wants_active; }
 
 static std::unordered_map<Sock, bool> g_peer_index_capable; // default true; false => headers-only
 
