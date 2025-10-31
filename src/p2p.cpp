@@ -817,7 +817,6 @@ static std::unordered_map<Sock,int64_t> g_last_hdr_ok_ms; // time of last accept
 static std::unordered_map<Sock,int64_t> g_peer_last_fetch_ms;    // last time peer sent us headers/blocks
 static std::unordered_map<Sock,int64_t> g_peer_last_request_ms;  // last time peer requested headers/blocks from us
 static inline bool ibd_or_fetch_active(const miq::PeerState& ps, int64_t nowms) {
-    extern std::atomic<bool> g_sync_wants_active;
     const Sock s = (Sock)ps.sock;
     const bool inflight =
         ps.syncing ||
@@ -842,9 +841,7 @@ namespace {
 extern std::unordered_set<std::string> g_global_inflight_blocks;
 }
 
-namespace {
-std::atomic<bool> g_sync_wants_active{false};
-}
+namespace { extern std::atomic<bool> g_sync_wants_active; }
 
 static std::unordered_map<Sock, bool> g_peer_index_capable; // default true; false => headers-only
 
