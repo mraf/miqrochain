@@ -3065,7 +3065,8 @@ void P2P::loop(){
                     }
                 }
                 g_next_stall_probe_ms = tnow + g_stall_retry_ms;
-            } else if (tnow >= g_next_stall_probe_ms && peers_.empty()) {
+            }
+            if (tnow >= g_next_stall_probe_ms && peers_.empty()) {
                 // No peers connected during stall
                 log_warn("P2P: stall detected with NO PEERS connected (height=" + std::to_string(h) + ") - attempting to reconnect");
                 g_next_stall_probe_ms = tnow + g_stall_retry_ms;
