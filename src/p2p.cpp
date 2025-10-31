@@ -372,6 +372,16 @@ namespace {
   static std::mutex g_peer_parse_stalls_mu;
   static inline std::uintptr_t sock_key(Sock s) { return (std::uintptr_t)s; }
   static std::unordered_map<std::uintptr_t, int> g_peer_parse_stalls;  // key by live socket
+  static std::mutex g_peer_stalls_mu;
+  static std::unordered_map<Sock, int> g_peer_stalls;
+
+  static inline void inc_peer_stall(Sock s) {
+    std::lock_guard<std::mutex> lk(g_peer_stalls_mu);
+    g_peer_stalls[s]++; 
+  }
+  static inline void clear_peer_stall(Sock s) {
+    std::lock_guard<std::mutex> lk(g_peer_stalls_mu); g_peer_stalls.erase(s);
+  }
 }
 static inline void miq_set_cloexec(Sock s) {
 #ifndef _WIN32
@@ -4104,7 +4114,7 @@ void P2P::loop(){
                                     ps.next_index = chain_.height() + 1;  
                                     fill_index_pipeline(ps);
                                     z = 0;
-                                    g_peer_stalls[(Sock)s]++;
+                                    inc_peer_stall((Sock)s);
                                     if (g_peer_stalls[(Sock)s] >= MIQ_P2P_BAD_PEER_MAX_STALLS && !is_loopback(ps.ip)) {
                                         // disconnect persistently stalling peer (keeps the network moving)
                                         log_warn("P2P: disconnecting persistently stalling peer " + ps.ip);
@@ -4245,7 +4255,7 @@ void P2P::loop(){
                     int64_t last_ok = g_last_hdr_ok_ms.count(s) ? g_last_hdr_ok_ms[s] : 0;
                     if (last_ok && (tnow - last_ok) > (int64_t)(g_stall_retry_ms * 4) && !is_lb) {
                         log_warn("P2P: deprioritizing header-stalled peer " + ps.ip);
-                        g_peer_stalls[s]++;
+                        inc_peer_stall(s);
                         if (g_peer_stalls[s] >= MIQ_P2P_BAD_PEER_MAX_STALLS) dead.push_back(s);
                     }
                 }
@@ -4429,7 +4439,7 @@ void P2P::loop(){
             peers_.erase(s);
             g_outbounds.erase(s);
             g_zero_hdr_batches.erase(s);
-            g_peer_stalls.erase(s);
+            clear_peer_stall(s);
             g_last_hdr_ok_ms.erase(s);
             g_preverack_counts.erase(s);
             g_trickle_last_ms.erase(s);
@@ -4506,29 +4516,22 @@ void P2P::loop(){
     }
 #endif
 }
-std::vector<PeerSnapshot> P2P::snapshot_peers() const {
-    std::vector<PeerSnapshot> out;
-    out.reserve(peers_.size());
+std::vector<P2P::PeerSnapshot> P2P::snapshot_peers() const {
     std::lock_guard<std::mutex> lk(g_peers_mu);
+    std::vector<P2P::PeerSnapshot> out;
+    out.reserve(peers_.size());
     for (const auto& kv : peers_) {
         const auto& ps = kv.second;
         PeerSnapshot s;
-        s.ip            = ps.ip;
-        s.verack_ok     = ps.verack_ok;
-        s.awaiting_pong = ps.awaiting_pong;
-        s.mis           = ps.mis;
-        s.next_index    = ps.next_index;
-        s.syncing       = ps.syncing;
-        s.last_seen_ms  = static_cast<double>(now_ms() - ps.last_ms);
-        s.blk_tokens    = ps.blk_tokens;
-        s.tx_tokens     = ps.tx_tokens;
-        s.rx_buf        = ps.rx.size();
-        s.inflight      = ps.inflight_tx.size();
+        s.ip              = ps.ip;
+        s.verack_ok       = ps.verack_ok;
+        s.banscore        = ps.banscore;
+        s.health_score    = ps.health_score;
+        s.inflight_blocks = static_cast<uint32_t>(ps.inflight_blocks.size());
+        s.inflight_index  = ps.inflight_index;
+        s.last_ms         = static_cast<uint64_t>(ps.last_ms);
         out.push_back(std::move(s));
     }
-}
-    std::vector<PeerSnapshot> out;
-    // Intentionally minimal; extend filling logic if PeerSnapshot carries fields you want.
     return out;
 }
 }
