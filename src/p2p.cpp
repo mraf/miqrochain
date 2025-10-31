@@ -4506,6 +4506,7 @@ void P2P::loop(){
     }
 #endif
 }
+}
 std::vector<PeerSnapshot> P2P::snapshot_peers() const {
     std::vector<PeerSnapshot> out;
     out.reserve(peers_.size());
@@ -4526,7 +4527,6 @@ std::vector<PeerSnapshot> P2P::snapshot_peers() const {
         s.inflight      = ps.inflight_tx.size();
         out.push_back(std::move(s));
     }
-}
     std::vector<PeerSnapshot> out;
     // Intentionally minimal; extend filling logic if PeerSnapshot carries fields you want.
     return out;
