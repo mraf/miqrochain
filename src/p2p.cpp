@@ -618,6 +618,8 @@ static inline void rx_clear_start(Sock fd){
     g_rx_started_ms.erase(fd);
 }
 
+static inline int64_t now_ms();
+
 static inline void enforce_rx_parse_deadline(miq::PeerState& ps, Sock s){
     auto it = g_rx_started_ms.find(s);
     if (it == g_rx_started_ms.end()) return;
@@ -776,7 +778,6 @@ static std::unordered_map<std::string, std::pair<int64_t,int64_t>> g_seed_backof
 static std::unordered_map<Sock,int> g_zero_hdr_batches;
 static std::unordered_map<Sock,bool> g_hdr_flip;
 
-static std::unordered_map<Sock,int> g_peer_stalls;        // # of detected stalls
 static std::unordered_map<Sock,int64_t> g_last_hdr_ok_ms; // time of last accepted headers
 
 static std::unordered_map<Sock,int64_t> g_peer_last_fetch_ms;    // last time peer sent us headers/blocks
