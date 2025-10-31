@@ -600,6 +600,11 @@ static std::unordered_map<Sock,
 static std::unordered_map<uint64_t,int64_t> g_last_idx_probe_ms;
 static std::unordered_map<uint64_t,int64_t> g_last_wait_log_ms;
 static std::unordered_map<Sock, int64_t> g_rx_started_ms;
+static inline int64_t now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+namespace { static inline void schedule_close(Sock s); }
 static inline void rx_track_start(Sock fd){
     if (g_rx_started_ms.find(fd)==g_rx_started_ms.end())
         g_rx_started_ms[fd] = [](){
@@ -1419,31 +1424,6 @@ static inline std::string miq_idx_key(uint64_t idx) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "IDX_%016llx", (unsigned long long)idx);
     return std::string(buf);
-}
-}
-
-namespace {
-// Monotonic milliseconds (steady clock)
-static inline int64_t now_ms() {
-    using namespace std::chrono;
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-// Per-socket stall counters (used by enforce_rx_parse_deadline)
-static std::unordered_map<Sock, int> g_peer_stalls;
-static std::mutex g_peer_stalls_mu;
-
-// Best-effort graceful close when a peer violates deadlines
-static inline void schedule_close(Sock s) {
-#ifdef _WIN32
-    ::shutdown(s, SD_BOTH);
-    ::closesocket(s);
-#else
-    ::shutdown(s, SHUT_RDWR);
-    ::close(s);
-#endif
 }
 }
 
