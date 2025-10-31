@@ -32,11 +32,6 @@
 #include <cstdint>
 #include <climits>
 
-namespace {
-    static std::mutex g_peer_stalls_mu;
-    static std::unordered_map<std::uintptr_t, int> g_peer_stalls;
-}
-
 #ifndef _WIN32
 #include <netinet/tcp.h>
 #endif
@@ -158,6 +153,10 @@ namespace {
   #else
     #define MIQ_ENABLE_HEADERS_FIRST 1
   #endif
+#endif
+
+#ifndef MIQ_INDEX_PIPELINE
+#define MIQ_INDEX_PIPELINE 64
 #endif
 
 #ifdef __has_include
@@ -355,6 +354,11 @@ namespace {
   #define MIQ_INVALID_SOCK (-1)
   #define CLOSESOCK(s) close(s)
 #endif
+
+namespace {
+  static std::mutex g_peer_stalls_mu;
+  static std::unordered_map<Sock, int> g_peer_stalls;  // key by live socket
+}
 
 static inline void miq_set_cloexec(Sock s) {
 #ifndef _WIN32
@@ -642,9 +646,8 @@ static inline void enforce_rx_parse_deadline(miq::PeerState& ps, Sock s){
             }
         }
         // Steady-state or nothing to trim: count a stall and potentially drop.
-        const std::uintptr_t key = static_cast<std::uintptr_t>(s);
         std::lock_guard<std::mutex> lk(g_peer_stalls_mu);
-        int &st = g_peer_stalls[key];
+        int &st = g_peer_stalls[s];
         st++;
         rx_clear_start(s);
         if (st >= MIQ_P2P_BAD_PEER_MAX_STALLS) {
@@ -908,7 +911,7 @@ namespace {
 
 static inline bool peer_is_index_capable(Sock s) {
     auto it = g_peer_index_capable.find(s);
-    if (it == g_peer_index_capable.end()) return false;
+    if (it == g_peer_index_capable.end()) return true;   // <— changed default
     return it->second;
 }
 
@@ -2096,6 +2099,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     ps.health_score = 1.0;
     ps.last_block_received_ms = 0;
     peers_[s] = ps;
+    g_peer_index_capable[s] = true;
 
     g_trickle_last_ms[s] = 0;
 
@@ -2190,6 +2194,7 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     ps.health_score = 1.0;
     ps.last_block_received_ms = 0;
     peers_[c] = ps;
+    g_peer_index_capable[c] = true;
 
     g_trickle_last_ms[c] = 0;
 
@@ -2773,6 +2778,7 @@ void P2P::loop(){
                          ps.health_score = 1.0;
                          ps.last_block_received_ms = 0;
                          { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
+                         g_peer_index_capable[s] = true; // optimistic until version says otherwise
                          g_trickle_last_ms[s] = 0;
                          log_info("P2P: outbound (addrman) " + ps.ip);
                          miq_set_keepalive(s);
@@ -2827,7 +2833,8 @@ void P2P::loop(){
                                 ps.failed_deliveries = 0;
                                 ps.health_score = 1.0;
                                 ps.last_block_received_ms = 0;
-                                { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
+                                { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s]=ps; g_outbounds.insert(s); }
+                                g_peer_index_capable[s] = true; // optimistic default
                                 g_trickle_last_ms[s] = 0;
 
                                 log_info("P2P: outbound to known " + ps.ip);
@@ -3612,7 +3619,7 @@ void P2P::loop(){
                         }
                         ps.version  = peer_ver;
                         ps.features = peer_services;
-                        g_peer_index_capable[(Sock)s] = ( (peer_services & MIQ_FEAT_INDEX_BY_HEIGHT) != 0 );
+                        g_peer_index_capable[(Sock)s] = ((peer_services & MIQ_FEAT_INDEX_BY_HEIGHT) != 0);
                         if (ps.version > 0 && ps.version < min_peer_version_) {
                             log_warn(std::string("P2P: dropping old peer ") + ps.ip);
                             dead.push_back(s);
@@ -3745,7 +3752,6 @@ void P2P::loop(){
                                 fill_index_pipeline(ps);
                             }
                         } else {
-                            // Malformed/empty payload; keep the pipeline moving with a fan-out.
                             const size_t base_cap = caps_.max_blocks ? caps_.max_blocks
                                                                       : (!g_logged_headers_done ? (size_t)2048 : (size_t)256);
                             std::vector<std::vector<uint8_t>> want2;
