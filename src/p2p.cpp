@@ -3721,9 +3721,9 @@ void P2P::loop(){
                         }
                         auto ffmsg = encode_msg("feefilter", ff);
                         (void)send_or_close(s, ffmsg);
-                        for (int i=0;i<8;i++) plff[i] = (uint8_t)((mrf >> (8*i)) & 0xFF);
-                        auto ff = encode_msg("feefilter", plff);
-                        (void)send_or_close(s, ff);
+                        for (int i=0;i<8;i++) ff[i] = (uint8_t)((mrf >> (8*i)) & 0xFF);
+                        auto msg_ff = encode_msg("feefilter", ff);
+                        (void)send_or_close(s, msg_ff);
                     };
   
                     if (cmd == "version") {
@@ -3751,7 +3751,7 @@ void P2P::loop(){
                             }
                         }
                         
-                      };
+                        }
                         try_finish_handshake();
                       
                     } else if (cmd == "verack") {
