@@ -369,10 +369,10 @@
 #endif
 
 namespace {
-  static std::mutex g_peer_stalls_mu;
-  static std::unordered_map<Sock, int> g_peer_stalls;  // key by live socket
+  static std::mutex g_peer_parse_stalls_mu;
+  static inline std::uintptr_t sock_key(Sock s) { return (std::uintptr_t)s; }
+  static std::unordered_map<std::uintptr_t, int> g_peer_parse_stalls;  // key by live socket
 }
-
 static inline void miq_set_cloexec(Sock s) {
 #ifndef _WIN32
     int flags = fcntl(s, F_GETFD, 0);
@@ -665,8 +665,8 @@ static inline void enforce_rx_parse_deadline(miq::PeerState& ps, Sock s){
             }
         }
         // Steady-state or nothing to trim: count a stall and potentially drop.
-        std::lock_guard<std::mutex> lk(g_peer_stalls_mu);
-        int &st = g_peer_stalls[s];
+        std::lock_guard<std::mutex> lk(g_peer_parse_stalls_mu);
+        int &st = g_peer_parse_stalls[sock_key(s)];
         st++;
         rx_clear_start(s);
         if (st >= MIQ_P2P_BAD_PEER_MAX_STALLS) {
@@ -2021,7 +2021,7 @@ static inline void reset_runtime_queues() {
     g_last_hdr_req_ms.clear();
     g_zero_hdr_batches.clear();
     g_hdr_flip.clear();
-    g_peer_stalls.clear();
+    g_peer_parse_stalls.clear();
     g_last_hdr_ok_ms.clear();
     g_inflight_index_ts.clear();
     g_inflight_index_order.clear();
