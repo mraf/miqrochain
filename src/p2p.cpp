@@ -209,6 +209,19 @@
 #define MIQ_HEADERS_EMPTY_LIMIT 8
 #endif
 
+#ifndef MIQ_STRICT_ORDER_IBD
+#define MIQ_STRICT_ORDER_IBD 1
+#endif
+#ifndef MIQ_STRICT_ORDER_PIPELINE
+#define MIQ_STRICT_ORDER_PIPELINE 1   /* strictly 1-inflight during IBD */
+#endif
+#ifndef MIQ_PRIMARY_TIMEOUTS_BEFORE_SWITCH
+#define MIQ_PRIMARY_TIMEOUTS_BEFORE_SWITCH 5  /* how many adaptive timeouts until we rotate */
+#endif
+#ifndef MIQ_PRIMARY_PING_GRACE_MS
+#define MIQ_PRIMARY_PING_GRACE_MS (2 * MIQ_P2P_PONG_TIMEOUT_MS) /* extra grace for primary */
+#endif
+
 #ifndef MIQ_RATE_BLOCK_BPS
 #define MIQ_RATE_BLOCK_BPS (1024u * 1024u)
 #endif
@@ -594,6 +607,12 @@ static uint16_t g_listen_port = 0;
 static int64_t g_last_progress_ms = 0;
 static size_t  g_last_progress_height = 0;
 static int64_t g_next_stall_probe_ms = 0;
+
+static Sock     g_ibd_primary_peer = MIQ_INVALID_SOCK;
+static bool     g_ibd_order_mode   = (MIQ_STRICT_ORDER_IBD != 0);
+static uint64_t g_ibd_next_index   = 0;         // next index we plan to request (strict mode)
+static int      g_ibd_primary_timeouts = 0;     // consecutive adaptive timeouts on primary
+static int64_t  g_ibd_last_progress_ms_strict = 0;
 
 // Simple trickle queues per-peer (sock -> txid queue and last flush ms)
 static std::unordered_map<Sock, std::vector<std::vector<uint8_t>>> g_trickle_q;
@@ -1880,6 +1899,11 @@ bool P2P::start(uint16_t port){
     g_stall_retry_ms = (int64_t)env_u64("MIQ_P2P_STALL_RETRY_MS", (uint64_t)MIQ_P2P_STALL_RETRY_MS);
     g_next_stall_probe_ms = g_last_progress_ms + g_stall_retry_ms;
 
+    g_ibd_primary_peer = MIQ_INVALID_SOCK;
+    g_ibd_primary_timeouts = 0;
+    g_ibd_next_index = 0;
+    g_ibd_last_progress_ms_strict = now_ms();
+
     std::string ext_ip;
     {
         miq::TryOpenP2PPort(port, &ext_ip);
@@ -2320,7 +2344,20 @@ void P2P::start_sync_with_peer(PeerState& ps){
 #endif
         return;
     }
-    // Index-capable: pipeline indices immediately.
+    {
+        std::vector<std::vector<uint8_t>> want;
+        chain_.next_block_fetch_targets(want, 1);
+        const bool at_tip = want.empty();
+        if (g_ibd_order_mode && !at_tip) {
+            if (g_ibd_primary_peer == MIQ_INVALID_SOCK) {
+                g_ibd_primary_peer = (Sock)ps.sock;
+                g_ibd_next_index   = (uint64_t)chain_.height() + 1;
+                g_ibd_primary_timeouts = 0;
+                g_ibd_last_progress_ms_strict = now_ms();
+                log_info("P2P: strict-order IBD primary pinned to " + ps.ip);
+            }
+        }
+    }
     ps.syncing = true;
     ps.inflight_index = 0;
     ps.next_index = chain_.height() + 1;
@@ -2330,6 +2367,21 @@ void P2P::start_sync_with_peer(PeerState& ps){
 void P2P::fill_index_pipeline(PeerState& ps){
     const uint32_t pipe = (uint32_t)MIQ_INDEX_PIPELINE;
     if (!peer_is_index_capable((Sock)ps.sock)) return;
+
+    // Strict-ordered IBD: only the pinned primary fetches, 1 inflight, strictly next index.
+    if (g_ibd_order_mode && g_ibd_primary_peer != MIQ_INVALID_SOCK) {
+        if ((Sock)ps.sock != g_ibd_primary_peer) return; // only primary fetches
+        // recompute next strictly from chain height
+        const uint64_t must_idx = (uint64_t)chain_.height() + 1;
+        if (ps.inflight_index >= MIQ_STRICT_ORDER_PIPELINE) return;
+        if (g_ibd_next_index < must_idx) g_ibd_next_index = must_idx;
+        request_block_index(ps, g_ibd_next_index);
+        ps.inflight_index++;
+        g_ibd_next_index++;
+        return;
+    }
+
+    // Normal wide pipeline
     while (ps.inflight_index < pipe) {
         uint64_t idx = ps.next_index++;
         request_block_index(ps, idx);
@@ -2649,6 +2701,11 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             chain_.next_block_fetch_targets(want_tmp, (size_t)32);
             bool at_tip = want_tmp.empty();
             maybe_mark_headers_done(at_tip);
+            if (g_ibd_order_mode && at_tip) {
+                log_info("P2P: strict-order IBD complete (at tip) — returning to normal multi-peer scheduling");
+                g_ibd_order_mode = false;
+                g_ibd_primary_peer = MIQ_INVALID_SOCK;
+            }
         }
 #endif
     } else {
@@ -2940,6 +2997,7 @@ void P2P::loop(){
                     // Don’t stop headers; we run both until completion.
                     g_ibd_headers_started_ms = tnow; // reset timer to avoid spamming
                 }
+                if (!(g_ibd_order_mode && g_ibd_primary_peer != MIQ_INVALID_SOCK)) {
                 std::vector<std::vector<uint8_t>> locator;
                 chain_.build_locator(locator);
                 std::vector<std::vector<uint8_t>> loc_rev = locator;
@@ -2981,6 +3039,7 @@ void P2P::loop(){
                 }
 #endif
                     {
+                    if (!(g_ibd_order_mode && g_ibd_primary_peer != MIQ_INVALID_SOCK)) {
                     std::vector<std::vector<uint8_t>> want3;
                     chain_.next_block_fetch_targets(want3, (size_t)128);
                     if (!want3.empty()) {
@@ -3097,7 +3156,40 @@ void P2P::loop(){
               cands.push_back(p.first);
             }
 
-            // Round-robin pick per-hash; try a few candidates until one accepts
+            // Strict-ordered IBD: retry with the same primary unless it repeatedly times out.
+            if (g_ibd_order_mode && g_ibd_primary_peer != MIQ_INVALID_SOCK && s_exp == g_ibd_primary_peer) {
+              g_ibd_primary_timeouts++;
+              // Hex back to bytes
+              std::vector<uint8_t> h(32);
+              auto hexv = [](char c)->int{ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return 10+(c-'a'); if(c>='A'&&c<='F')return 10+(c-'A'); return 0; };
+              for (size_t i=0;i<32;i++) h[i] = (uint8_t)((hexv(k[2*i])<<4) | hexv(k[2*i+1]));
+              if (g_ibd_primary_timeouts < MIQ_PRIMARY_TIMEOUTS_BEFORE_SWITCH) {
+                // Retry on the same primary
+                auto itPrim = peers_.find(g_ibd_primary_peer);
+                if (itPrim != peers_.end()) {
+                  request_block_hash(itPrim->second, h);
+                }
+                continue;
+              }
+              // Switch primary to the healthiest peer
+              g_ibd_primary_timeouts = 0;
+              Sock best = MIQ_INVALID_SOCK; double bestScore = -1.0;
+              for (auto &kv2 : peers_) {
+                if (kv2.first == g_ibd_primary_peer) continue;
+                if (!kv2.second.verack_ok) continue;
+                if (kv2.second.health_score > bestScore) { bestScore = kv2.second.health_score; best = kv2.first; }
+              }
+              if (best != MIQ_INVALID_SOCK) {
+                log_warn("P2P: strict-order IBD switching primary from " + itp->second.ip + " to " + peers_[best].ip);
+                g_ibd_primary_peer = best;
+                g_ibd_next_index   = (uint64_t)chain_.height() + 1;
+              }
+              // Retry with (new) primary immediately
+              auto itPrim2 = peers_.find(g_ibd_primary_peer);
+              if (itPrim2 != peers_.end()) request_block_hash(itPrim2->second, h);
+              continue;
+            }
+           
             // Prioritize healthier peers by trying them first
             if (!cands.empty()) {
               size_t attempts = std::min<size_t>(cands.size(), 4);
@@ -3227,9 +3319,16 @@ void P2P::loop(){
                     }
                 }
                 // drop if pong overdue
-                if (ps.awaiting_pong && (tnow - ps.last_ping_ms) > (int64_t)MIQ_P2P_PONG_TIMEOUT_MS) {
+                int64_t pong_deadline = (int64_t)MIQ_P2P_PONG_TIMEOUT_MS;
+                if (g_ibd_order_mode && (Sock)ps.sock == g_ibd_primary_peer)
+                    pong_deadline = (int64_t)MIQ_PRIMARY_PING_GRACE_MS;
+                if (ps.awaiting_pong && (tnow - ps.last_ping_ms) > pong_deadline) {
                     log_warn(std::string("P2P: ping timeout from ")+ps.ip);
-                    to_close.push_back(ps.sock);
+                    if (g_ibd_order_mode && (Sock)ps.sock == g_ibd_primary_peer) {
+                        ps.awaiting_pong = false; // allow re-ping immediately
+                    } else {
+                        to_close.push_back(ps.sock);
+                    }
                 }
             }
             for (Sock s : to_close) {
@@ -3726,28 +3825,39 @@ void P2P::loop(){
                             // accept/process
                             handle_incoming_block(s, m.payload);
 
-                            // After any processed block, opportunistically fan-out more wants across peers.
-                            const size_t base_cap = caps_.max_blocks ? caps_.max_blocks
-                                                                      : (!g_logged_headers_done ? (size_t)128 : (size_t)32);
-                            std::vector<std::vector<uint8_t>> want2;
-                            chain_.next_block_fetch_targets(want2, base_cap);
-                            if (!want2.empty()) {
-                                std::vector<Sock> cands;
-                                // NOTE: g_peers_mu is already locked by the outer scope at line 2685
-                                for (auto& kvp : peers_) if (kvp.second.verack_ok) cands.push_back(kvp.first);
-                                if (cands.empty()) cands.push_back(s); // fallback to current peer
-                                for (const auto& h2 : want2) {
-                                    const std::string key2 = hexkey(h2);
-                                    if (g_global_inflight_blocks.count(key2)) continue;
-                                    // Skip blocks that are already stored as orphans
-                                    if (orphans_.count(key2)) continue;
-                                    Sock t = rr_pick_peer_for_key(key2, cands);
-                                    auto itT = peers_.find(t);
-                                    if (itT != peers_.end()) request_block_hash(itT->second, h2);
+                            if (g_ibd_order_mode && g_ibd_primary_peer != MIQ_INVALID_SOCK) {
+                                if (s == g_ibd_primary_peer) {
+                                    g_ibd_last_progress_ms_strict = now_ms();
+                                    // ask precisely for the next index, single inflight
+                                    auto itP = peers_.find(s);
+                                    if (itP != peers_.end()) {
+                                        auto &pps = itP->second;
+                                        if (pps.inflight_index > 0) pps.inflight_index--; // free the slot
+                                        fill_index_pipeline(pps);  // will request height+1 only
+                                    }
+                                }
+                            } else {
+                                // Normal (non-strict) opportunistic fan-out
+                                const size_t base_cap = caps_.max_blocks ? caps_.max_blocks
+                                                                          : (!g_logged_headers_done ? (size_t)128 : (size_t)32);
+                                std::vector<std::vector<uint8_t>> want2;
+                                chain_.next_block_fetch_targets(want2, base_cap);
+                                if (!want2.empty()) {
+                                    std::vector<Sock> cands;
+                                    for (auto& kvp : peers_) if (kvp.second.verack_ok) cands.push_back(kvp.first);
+                                    if (cands.empty()) cands.push_back(s);
+                                    for (const auto& h2 : want2) {
+                                        const std::string key2 = hexkey(h2);
+                                        if (g_global_inflight_blocks.count(key2)) continue;
+                                        if (orphans_.count(key2)) continue;
+                                        Sock t = rr_pick_peer_for_key(key2, cands);
+                                        auto itT = peers_.find(t);
+                                        if (itT != peers_.end()) request_block_hash(itT->second, h2);
+                                    }
                                 }
                             }
 
-                            if (ps.syncing) {
+                            if (ps.syncing && !(g_ibd_order_mode && g_ibd_primary_peer != MIQ_INVALID_SOCK)) {
                                 if (ps.inflight_index > 0) ps.inflight_index--;
                                 fill_index_pipeline(ps);
                             }
