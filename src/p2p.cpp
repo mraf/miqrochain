@@ -4526,6 +4526,7 @@ std::vector<PeerSnapshot> P2P::snapshot_peers() const {
         s.inflight      = ps.inflight_tx.size();
         out.push_back(std::move(s));
     }
+}
     return out;
 }
 }
