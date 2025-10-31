@@ -3037,7 +3037,8 @@ void P2P::loop(){
                         if (++probes >= 2) break;
                     }
                 }
-#endif
+            }
+#endif              
                     {
                     if (!(g_ibd_order_mode && g_ibd_primary_peer != MIQ_INVALID_SOCK)) {
                     std::vector<std::vector<uint8_t>> want3;
