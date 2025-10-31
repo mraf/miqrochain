@@ -192,6 +192,12 @@
 #ifndef MIQ_PARSE_DEADLINE_MS
 #define MIQ_PARSE_DEADLINE_MS 45000             /* per-frame parse deadline (ms) */
 #endif
+#ifndef MIQ_PARSE_STUCK_MS
+#define MIQ_PARSE_STUCK_MS (MIQ_PARSE_DEADLINE_MS + 10000) /* extra slack before remediation */
+#endif
+#ifndef MIQ_RX_TRIM_CHUNK
+#define MIQ_RX_TRIM_CHUNK (64u * 1024u)         /* trim in 64 KiB slices when stuck */
+#endif
 #ifndef MIQ_P2P_BAD_PEER_MAX_STALLS
 #define MIQ_P2P_BAD_PEER_MAX_STALLS 3           /* disconnect peers that stall repeatedly */
 #endif
@@ -570,6 +576,7 @@ static const int    HANDSHAKE_MS  = MIQ_P2P_VERACK_TIMEOUT_MS;
 // IBD phase logging flags
 static bool g_logged_headers_started = false;
 static bool g_logged_headers_done    = false;
+static int64_t g_ibd_headers_started_ms = 0;
 
 // Global listen port for outbound dials (set in start())
 static uint16_t g_listen_port = 0;
@@ -603,6 +610,41 @@ static inline void rx_track_start(Sock fd){
 }
 static inline void rx_clear_start(Sock fd){
     g_rx_started_ms.erase(fd);
+}
+
+static inline void enforce_rx_parse_deadline(miq::PeerState& ps, Sock s){
+    auto it = g_rx_started_ms.find(s);
+    if (it == g_rx_started_ms.end()) return;
+    const int64_t t0 = it->second;
+    const int64_t now = now_ms();
+    if (now - t0 < (int64_t)MIQ_PARSE_STUCK_MS) return;
+
+    // We are stuck parsing this buffer for too long.
+    if (!ps.rx.empty()) {
+        if (!ps.verack_ok || !g_logged_headers_done) {
+            // During handshake/IBD be lenient: trim a chunk from the front, keep session.
+            const size_t trim = std::min<size_t>(ps.rx.size(), (size_t)MIQ_RX_TRIM_CHUNK);
+            if (trim > 0) {
+                ps.rx.erase(ps.rx.begin(), ps.rx.begin() + (ptrdiff_t)trim);
+                rx_track_start(s); // restart the timer from now
+                miq::log_warn("P2P: trimmed stuck RX buffer during sync from " + ps.ip +
+                              " bytes=" + std::to_string(trim) +
+                              " remain=" + std::to_string(ps.rx.size()));
+                return;
+            }
+        }
+        // Steady-state or nothing to trim: count a stall and potentially drop.
+        int &st = g_peer_stalls[s];
+        st++;
+        rx_clear_start(s);
+        if (st >= MIQ_P2P_BAD_PEER_MAX_STALLS) {
+            miq::log_warn("P2P: closing stalled peer (parse deadline) " + ps.ip);
+            schedule_close(s);
+        } else {
+            miq::log_warn("P2P: parse deadline hit (stall " + std::to_string(st) + "/"
+                          + std::to_string(MIQ_P2P_BAD_PEER_MAX_STALLS) + ") from " + ps.ip);
+        }
+    }
 }
 
 namespace {
@@ -765,6 +807,7 @@ static inline void maybe_mark_headers_done(bool at_tip) {
         if (++g_headers_tip_confirmed >= 2) {
             g_logged_headers_done = true;
             miq::log_info(std::string("[IBD] headers phase done"));
+            g_ibd_headers_started_ms = 0;
         }
     } else {
         g_headers_tip_confirmed = 0;
@@ -2250,6 +2293,7 @@ void P2P::start_sync_with_peer(PeerState& ps){
         if (!g_logged_headers_started) {
             g_logged_headers_started = true;
             log_info("[IBD] headers phase started");
+            if (!g_ibd_headers_started_ms) g_ibd_headers_started_ms = now_ms();
         }
 #endif
         return;
@@ -2855,6 +2899,23 @@ void P2P::loop(){
                     }
                 }
 #if MIQ_ENABLE_HEADERS_FIRST
+                if (g_logged_headers_started && !g_logged_headers_done &&
+                    g_ibd_headers_started_ms > 0 &&
+                    (tnow - g_ibd_headers_started_ms) > (int64_t)MIQ_IBD_FALLBACK_AFTER_MS)
+                {
+                    log_warn("[IBD] headers phase exceeded fallback threshold; enabling index-by-height pipeline on capable peers");
+                    for (auto &kvp : peers_) {
+                        auto &pps = kvp.second;
+                        if (!pps.verack_ok) continue;
+                        if (!peer_is_index_capable((Sock)pps.sock)) continue;
+                        pps.syncing = true;
+                        pps.inflight_index = 0;
+                        pps.next_index = chain_.height() + 1;
+                        fill_index_pipeline(pps);
+                    }
+                    // Don’t stop headers; we run both until completion.
+                    g_ibd_headers_started_ms = tnow; // reset timer to avoid spamming
+                }
                 std::vector<std::vector<uint8_t>> locator;
                 chain_.build_locator(locator);
                 std::vector<std::vector<uint8_t>> loc_rev = locator;
@@ -3362,6 +3423,7 @@ void P2P::loop(){
                 int n = miq_recv(s, buf, sizeof(buf));
                 if (n <= 0) {
                     if (n < 0) { P2P_TRACE("close read<0"); dead.push_back(s); }
+                    enforce_rx_parse_deadline(ps, s);
                     continue;
                 }
 
@@ -3410,6 +3472,7 @@ void P2P::loop(){
                     size_t advanced = (off > off_before) ? (off - off_before) : 0;
                     if (advanced == 0) {
                         miq::log_warn("P2P: decoded frame made no progress; waiting for more data");
+                        enforce_rx_parse_deadline(ps, s);
                         break; // do not drop; allow more bytes to arrive
                     }
                     // Incremental compaction to avoid temporary oversize before final trim.
@@ -3499,7 +3562,11 @@ void P2P::loop(){
                                 g_last_hdr_req_ms[(Sock)s] = now_ms();
                                 ps.last_hdr_batch_done_ms  = now_ms();
                             }
-                            if (!g_logged_headers_started) { g_logged_headers_started = true; log_info("[IBD] headers phase started"); }
+                            if (!g_logged_headers_started) {
+                                g_logged_headers_started = true;
+                                log_info("[IBD] headers phase started");
+                                if (!g_ibd_headers_started_ms) g_ibd_headers_started_ms = now_ms();
+                            }
                         } else
 #endif
                         {
@@ -3856,6 +3923,25 @@ void P2P::loop(){
                             }
                         }
                         if (used_reverse) { g_hdr_flip[s] = true; }
+
+                        if (hs.empty() || accepted == 0) {
+                            int &z = g_zero_hdr_batches[s];
+                            if (++z >= MIQ_HEADERS_EMPTY_LIMIT) {
+                                z = 0;
+                                g_hdr_flip[s] = !g_hdr_flip[s]; // try the other orientation next
+                                // If peer supports index-by-height, kick that pipeline too.
+                                if (peer_is_index_capable(s)) {
+                                    ps.syncing = true;
+                                    ps.inflight_index = 0;
+                                    ps.next_index = chain_.height() + 1;
+                                    fill_index_pipeline(ps);
+                                    log_warn("P2P: headers made no progress repeatedly from " + ps.ip +
+                                             " → enabling index-by-height fallback");
+                                }
+                            }
+                        } else {
+                            g_zero_hdr_batches[s] = 0;
+                        }
 
                         std::vector<std::vector<uint8_t>> want;
                         chain_.next_block_fetch_targets(want, caps_.max_blocks ? caps_.max_blocks : (size_t)64);
