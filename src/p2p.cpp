@@ -3595,11 +3595,11 @@ void P2P::loop(){
 
                         // Ask for addresses + publish our fee filter
                         maybe_send_getaddr(ps);
-                        uint64_t mrf = local_min_relay_kb();
+                        const uint64_t mrf = local_min_relay_kb();
                         std::vector<uint8_t> plff(8);
                         for (int i=0;i<8;i++) plff[i] = (uint8_t)((mrf >> (8*i)) & 0xFF);
-                        auto ff = encode_msg("feefilter", plff);
-                        (void)send_or_close(s, ff);
+                        auto ff_msg = encode_msg("feefilter", plff);
+                        (void)send_or_close(s, ff_msg);
                     };
   
                     if (cmd == "version") {
@@ -3648,6 +3648,44 @@ void P2P::loop(){
 
                     } else if (cmd == "pong") {
                         ps.awaiting_pong = false;
+#if MIQ_ENABLE_HEADERS_FIRST
+                    } else if (cmd == "headers") {
+                        // Free a header slot and keep pipelining while within caps.
+                        std::vector<BlockHeader> hs;
+                        if (!parse_headers_payload(m.payload, hs)) {
+                            if (++ps.mis > 10) { dead.push_back(s); }
+                            continue;
+                        }
+                        g_peer_last_fetch_ms[(Sock)ps.sock] = now_ms();
+                        g_last_hdr_ok_ms[(Sock)ps.sock]     = now_ms();
+                        if (ps.inflight_hdr_batches > 0) ps.inflight_hdr_batches--;
+                        if (hs.empty()) {
+                            // Empty batch => likely tip reached for this peer.
+                            maybe_mark_headers_done(true);
+                        } else {
+                            maybe_mark_headers_done(false);
+                            // Ask for more (gentle pipelining)
+                            int pushed = 0;
+                            std::vector<std::vector<uint8_t>> locator;
+                            chain_.build_locator(locator);
+                            if (g_hdr_flip[(Sock)ps.sock]) {
+                                for (auto& h : locator) std::reverse(h.begin(), h.end());
+                            }
+                            std::vector<uint8_t> stop(32, 0);
+                            auto pl2 = build_getheaders_payload(locator, stop);
+                            auto m2  = encode_msg("getheaders", pl2);
+                            while (can_accept_hdr_batch(ps, now_ms()) &&
+                                   check_rate(ps, "hdr", 1.0, now_ms()) &&
+                                   pushed < 2) {
+                                ps.sent_getheaders = true;
+                                (void)send_or_close(s, m2);
+                                ps.inflight_hdr_batches++;
+                                g_last_hdr_req_ms[(Sock)ps.sock] = now_ms();
+                                ps.last_hdr_batch_done_ms        = now_ms();
+                                ++pushed;
+                            }
+                        }
+#endif
 
                     } else if (cmd == "invb") {
                         if (!check_rate(ps, "inv", 0.5, now_ms())) {
