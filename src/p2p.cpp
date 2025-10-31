@@ -4527,6 +4527,8 @@ std::vector<PeerSnapshot> P2P::snapshot_peers() const {
         out.push_back(std::move(s));
     }
 }
+    std::vector<PeerSnapshot> out;
+    // Intentionally minimal; extend filling logic if PeerSnapshot carries fields you want.
     return out;
 }
 }
