@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <utility>
 #include <mutex>
-#include <chrono>
 
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
@@ -34,11 +33,6 @@
 #include "mempool.h"
 
 namespace miq {
-
-inline int64_t now_ms() {
-    using namespace std::chrono;
-    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
-}
 
 // === Optional hardening knobs (can be overridden at compile time) ============
 #ifndef MIQ_P2P_INV_WINDOW_MS
