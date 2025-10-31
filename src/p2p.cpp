@@ -31,6 +31,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <climits>
+#include <atomic>
 
 namespace {
     static std::mutex g_peer_stalls_mu;
@@ -179,6 +180,10 @@ namespace {
 #  if __has_include("constants.h")
 #    include "constants.h"
 #  endif
+#endif
+
+#ifndef MIQ_INDEX_PIPELINE
+#define MIQ_INDEX_PIPELINE 32
 #endif
 
 #ifndef MAX_BLOCK_SIZE
@@ -783,6 +788,7 @@ static std::unordered_map<Sock,int64_t> g_last_hdr_ok_ms; // time of last accept
 static std::unordered_map<Sock,int64_t> g_peer_last_fetch_ms;    // last time peer sent us headers/blocks
 static std::unordered_map<Sock,int64_t> g_peer_last_request_ms;  // last time peer requested headers/blocks from us
 static inline bool ibd_or_fetch_active(const miq::PeerState& ps, int64_t nowms) {
+    extern std::atomic<bool> g_sync_wants_active;
     const Sock s = (Sock)ps.sock;
     const bool inflight =
         ps.syncing ||
@@ -794,7 +800,8 @@ static inline bool ibd_or_fetch_active(const miq::PeerState& ps, int64_t nowms) 
     const int64_t r = (g_peer_last_request_ms.count(s)  ? g_peer_last_request_ms.at(s)  : 0);
     const int64_t kWindow = 5 * 60 * 1000; // 5 minutes grace
     // Also grant grace while global headers IBD hasn't finished.
-    return inflight || (f && (nowms - f) < kWindow) || (r && (nowms - r) < kWindow) || !g_logged_headers_done;
+    return inflight || (f && (nowms - f) < kWindow) || (r && (nowms - r) < kWindow)
+           || !g_logged_headers_done || g_sync_wants_active.load();
 }
 
 static bool g_seed_mode = false;
@@ -805,6 +812,8 @@ static inline int miq_outbound_target(){
 namespace {
 extern std::unordered_set<std::string> g_global_inflight_blocks;
 }
+
+std::atomic<bool> g_sync_wants_active{false};
 
 static std::unordered_map<Sock, bool> g_peer_index_capable; // default true; false => headers-only
 
@@ -1068,6 +1077,17 @@ static inline void gate_set_loopback(Sock fd, bool is_lb){
 }
 
 static inline void gate_on_close(Sock fd){
+    {
+        auto it = g_inflight_block_ts.find(fd);
+        if (it != g_inflight_block_ts.end()) {
+            for (const auto& kv : it->second) {
+                g_global_inflight_blocks.erase(kv.first);
+            }
+        }
+        g_inflight_block_ts.erase(fd);
+        g_inflight_index_ts.erase(fd);
+        g_inflight_index_order.erase(fd);
+    }
     g_gate.erase(fd);
     g_trickle_q.erase(fd);
     g_trickle_last_ms.erase(fd);
@@ -3230,6 +3250,43 @@ void P2P::loop(){
             }
         }
 
+        {
+            std::vector<std::vector<uint8_t>> want;
+            // During IBD keep a fatter queue; after IBD smaller.
+            const size_t cap = !g_logged_headers_done ? (size_t)256 : (size_t)64;
+            chain_.next_block_fetch_targets(want, cap);
+            g_sync_wants_active.store(!want.empty());
+
+            if (!want.empty() && !peers_.empty()) {
+                // Build candidate peer list, healthiest first.
+                std::vector<std::pair<Sock,double>> scored;
+                scored.reserve(peers_.size());
+                for (auto& kvp : peers_) {
+                    if (!kvp.second.verack_ok) continue;
+                    scored.emplace_back(kvp.first, kvp.second.health_score);
+                }
+                if (scored.empty()) {
+                    for (auto& kvp : peers_) scored.emplace_back(kvp.first, kvp.second.health_score);
+                }
+                std::sort(scored.begin(), scored.end(),
+                          [](const auto& a, const auto& b){ return a.second > b.second; });
+                std::vector<Sock> cands; cands.reserve(scored.size());
+                for (auto& p : scored) cands.push_back(p.first);
+
+                for (const auto& h : want) {
+                    const std::string key = hexkey(h);
+                    // Skip if already globally in-flight (reserved by any peer)
+                    if (g_global_inflight_blocks.count(key)) continue;
+                    Sock t = rr_pick_peer_for_key(key, cands);
+                    if (t == MIQ_INVALID_SOCK) break;
+                    auto itp = peers_.find(t);
+                    if (itp == peers_.end()) continue;
+                    // Request from chosen peer; request_block_hash will mark globals/inflight.
+                    request_block_hash(itp->second, h);
+                }
+            }
+        }
+
         trickle_flush();
       
         // --- build pollfd list (SNAPSHOT of peers_) ---
@@ -3762,6 +3819,7 @@ void P2P::loop(){
                                                                       : (!g_logged_headers_done ? (size_t)128 : (size_t)32);
                             std::vector<std::vector<uint8_t>> want2;
                             chain_.next_block_fetch_targets(want2, base_cap);
+                            g_sync_wants_active.store(!want2.empty());
                             if (!want2.empty()) {
                                 std::vector<Sock> cands;
                                 // NOTE: g_peers_mu is already locked by the outer scope at line 2685
