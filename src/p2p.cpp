@@ -1422,6 +1422,31 @@ static inline std::string miq_idx_key(uint64_t idx) {
 }
 }
 
+namespace {
+// Monotonic milliseconds (steady clock)
+static inline int64_t now_ms() {
+    using namespace std::chrono;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Per-socket stall counters (used by enforce_rx_parse_deadline)
+static std::unordered_map<Sock, int> g_peer_stalls;
+static std::mutex g_peer_stalls_mu;
+
+// Best-effort graceful close when a peer violates deadlines
+static inline void schedule_close(Sock s) {
+#ifdef _WIN32
+    ::shutdown(s, SD_BOTH);
+    ::closesocket(s);
+#else
+    ::shutdown(s, SHUT_RDWR);
+    ::close(s);
+#endif
+}
+}
+
 namespace miq {
 
 bool P2P::check_rate(PeerState& ps, const char* key) {
