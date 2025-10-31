@@ -32,6 +32,11 @@
 #include <cstdint>
 #include <climits>
 
+namespace {
+    static std::mutex g_peer_stalls_mu;
+    static std::unordered_map<std::uintptr_t, int> g_peer_stalls;
+}
+
 #ifndef _WIN32
 #include <netinet/tcp.h>
 #endif
@@ -600,10 +605,6 @@ static std::unordered_map<Sock,
 static std::unordered_map<uint64_t,int64_t> g_last_idx_probe_ms;
 static std::unordered_map<uint64_t,int64_t> g_last_wait_log_ms;
 static std::unordered_map<Sock, int64_t> g_rx_started_ms;
-static inline int64_t now_ms() {
-    using namespace std::chrono;
-    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
-}
 namespace { static inline void schedule_close(Sock s); }
 static inline void rx_track_start(Sock fd){
     if (g_rx_started_ms.find(fd)==g_rx_started_ms.end())
@@ -639,7 +640,9 @@ static inline void enforce_rx_parse_deadline(miq::PeerState& ps, Sock s){
             }
         }
         // Steady-state or nothing to trim: count a stall and potentially drop.
-        int &st = g_peer_stalls[s];
+        const std::uintptr_t key = static_cast<std::uintptr_t>(s);
+        std::lock_guard<std::mutex> lk(g_peer_stalls_mu);
+        int &st = g_peer_stalls[key];
         st++;
         rx_clear_start(s);
         if (st >= MIQ_P2P_BAD_PEER_MAX_STALLS) {
@@ -871,13 +874,21 @@ static inline int64_t wall_ms() {
 #define MIQ_CONNECT_TIMEOUT_MS 5000
 #endif
 
+#if 0
+static inline int64_t now_ms() {
+    using namespace std::chrono;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+#endif
+
 namespace {
   static std::unordered_set<Sock> g_force_close;
   static inline void schedule_close(Sock s){ if (s!=MIQ_INVALID_SOCK) g_force_close.insert(s); }
-
   static std::unordered_set<Sock> g_outbounds;
   static inline size_t outbound_count(){ return g_outbounds.size(); }
 }
+
 
 // Track inflight block request timestamps without touching PeerState layout
 namespace {
