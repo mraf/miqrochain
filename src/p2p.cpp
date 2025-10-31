@@ -651,6 +651,19 @@ static inline void enforce_rx_parse_deadline(miq::PeerState& ps, Sock s){
         std::lock_guard<std::mutex> lk(g_peer_stalls_mu);
         int &st = g_peer_stalls[key];
         st++;
+        // During IBD, never drop for parse stalls; trim and forgive.
+        const bool syncing = ps.syncing || !g_logged_headers_done;
+        if (syncing && st >= MIQ_P2P_BAD_PEER_MAX_STALLS) {
+            miq::log_warn("P2P: parse stall during IBD from " + ps.ip + " — trimming & forgiving (no drop)");
+            // Aggressive trim to shake loose a bad frame; keep the session alive.
+            if (!ps.rx.empty()) {
+                const size_t trim = std::min<size_t>(ps.rx.size(), (size_t)MIQ_RX_TRIM_CHUNK);
+                ps.rx.erase(ps.rx.begin(), ps.rx.begin() + (ptrdiff_t)trim);
+            }
+            st = 0;               // reset stall counter since we forgave this
+            rx_track_start(s);    // restart deadline timer
+            return;
+        }
         rx_clear_start(s);
         if (st >= MIQ_P2P_BAD_PEER_MAX_STALLS) {
             miq::log_warn("P2P: closing stalled peer (parse deadline) " + ps.ip);
@@ -831,6 +844,8 @@ static inline void maybe_mark_headers_done(bool at_tip) {
         g_headers_tip_confirmed = 0;
     }
 }
+
+static bool g_sync_green_logged = false;
 
 static MIQ_MAYBE_UNUSED bool unsolicited_drop(miq::PeerState& ps, const char* what, const std::string& keyHex){
     (void)what; (void)keyHex;
@@ -1830,7 +1845,6 @@ void P2P::bump_ban(PeerState& ps, const std::string& ip, const char* reason, int
 
     if (ibd_or_fetch_active(ps, now_ms)) {
         P2P_TRACE(std::string("no-ban (sync-active) ip=") + ip + " reason=" + (reason?reason:""));
-        schedule_close((Sock)ps.sock);
         return;
     }
     
@@ -3239,10 +3253,23 @@ void P2P::loop(){
                         to_close.push_back(ps.sock);
                     }
                 }
-                // drop if pong overdue
-                if (ps.awaiting_pong && (tnow - ps.last_ping_ms) > (int64_t)MIQ_P2P_PONG_TIMEOUT_MS) {
-                    log_warn(std::string("P2P: ping timeout from ")+ps.ip);
-                    to_close.push_back(ps.sock);
+                int64_t hard_timeout = (int64_t)MIQ_P2P_PONG_TIMEOUT_MS;
+                const bool sync_active = ibd_or_fetch_active(ps, tnow);
+                if (sync_active) hard_timeout *= 4; // 4x window while syncing
+
+                if (ps.awaiting_pong) {
+                    const int64_t waited = tnow - ps.last_ping_ms;
+                    if (waited > hard_timeout) {
+                        log_warn(std::string("P2P: ping timeout from ")+ps.ip + (sync_active?" (IBD)":""));
+                        to_close.push_back(ps.sock);
+                    } else if (waited > (int64_t)MIQ_P2P_PONG_TIMEOUT_MS) {
+                        // Gentle nudge while within extended IBD window: resend ping
+                        uint8_t rnd2[8]; for (int i=0;i<8;i++) rnd2[i] = (uint8_t)(std::rand() & 0xFF);
+                        auto m2 = encode_msg("ping", std::vector<uint8_t>(rnd2, rnd2+8));
+                        if (send_or_close(ps.sock, m2)) {
+                            ps.last_ping_ms = tnow;
+                        }
+                    }
                 }
             }
             for (Sock s : to_close) {
@@ -3284,6 +3311,33 @@ void P2P::loop(){
                     // Request from chosen peer; request_block_hash will mark globals/inflight.
                     request_block_hash(itp->second, h);
                 }
+            }
+        }
+
+        {
+            bool any_want = false;
+            {
+                std::vector<std::vector<uint8_t>> want_chk;
+                chain_.next_block_fetch_targets(want_chk, (size_t)1);
+                any_want = !want_chk.empty();
+            }
+            bool any_inflight = !g_global_inflight_blocks.empty();
+            if (!any_inflight) {
+                for (auto &kvp : peers_) {
+                    if (!kvp.second.inflight_blocks.empty()) { any_inflight = true; break; }
+                    if (kvp.second.inflight_index > 0)      { any_inflight = true; break; }
+                    if (kvp.second.inflight_hdr_batches > 0){ any_inflight = true; break; }
+                }
+            }
+            const bool headers_done = g_logged_headers_done;
+            if (!any_want && !any_inflight && headers_done) {
+                if (!g_sync_green_logged) {
+                    log_info(std::string("[SYNC] ✅ Node is in sync with the network at height=")
+                             + std::to_string(chain_.height()));
+                    g_sync_green_logged = true;
+                }
+            } else {
+                g_sync_green_logged = false;
             }
         }
 
@@ -3470,10 +3524,18 @@ void P2P::loop(){
         // Read/process peers
         std::vector<Sock> dead;
           if (!g_force_close.empty()) {
-            for (Sock s : g_force_close) {
+            // Don’t honor force-close for peers that are helping IBD; keep them alive.
+            std::vector<Sock> tmp(g_force_close.begin(), g_force_close.end());
+            g_force_close.clear();
+            const int64_t tnow = now_ms();
+            for (Sock s : tmp) {
+                auto itp = peers_.find(s);
+                if (itp != peers_.end() && ibd_or_fetch_active(itp->second, tnow)) {
+                    P2P_TRACE("skip scheduled close during IBD for " + itp->second.ip);
+                    continue;
+                }
                 dead.push_back(s);
             }
-            g_force_close.clear();
         }
         for (size_t i = 0; i < peer_fd_order.size(); ++i) {
             if (base + i >= fds.size()) continue;
@@ -3490,6 +3552,85 @@ void P2P::loop(){
                 dead.push_back(s);
                 continue;
             }
+
+            if (!dead.empty()) {
+            // Build a health-sorted candidate list once.
+            std::vector<std::pair<Sock,double>> scored;
+            scored.reserve(peers_.size());
+            for (auto &kvp : peers_) if (std::find(dead.begin(), dead.end(), kvp.first) == dead.end()) {
+                if (!kvp.second.verack_ok) continue;
+                scored.emplace_back(kvp.first, kvp.second.health_score);
+            }
+            std::sort(scored.begin(), scored.end(),
+                      [](const auto&a,const auto&b){ return a.second > b.second; });
+            std::vector<Sock> cands; cands.reserve(scored.size());
+            for (auto &p : scored) cands.push_back(p.first);
+
+            auto hex2raw32 = [](const std::string& k)->std::vector<uint8_t>{
+                std::vector<uint8_t> h(32);
+                auto hv=[](char c)->int{ if(c>='0'&&c<='9')return c-'0';
+                                         if(c>='a'&&c<='f')return 10+(c-'a');
+                                         if(c>='A'&&c<='F')return 10+(c-'A'); return 0; };
+                for (size_t i=0;i<32;i++) h[i] = (uint8_t)((hv(k[2*i])<<4)|hv(k[2*i+1]));
+                return h;
+            };
+
+            for (Sock s_dead : dead) {
+                auto itp = peers_.find(s_dead);
+                if (itp == peers_.end()) continue;
+                PeerState ps_old = itp->second; // copy; we’ll erase soon
+
+                // Re-issue block requests from this peer to others.
+                for (const auto& key : ps_old.inflight_blocks) {
+                    // free global reservation so a new peer can pick it up
+                    g_global_inflight_blocks.erase(key);
+                    // choose a new peer and re-request
+                    if (!cands.empty()) {
+                        Sock target = rr_pick_peer_for_key(key, cands);
+                        auto itT = peers_.find(target);
+                        if (itT != peers_.end()) {
+                            auto raw = hex2raw32(key);
+                            request_block_hash(itT->second, raw);
+                        }
+                    }
+                }
+                // Drop per-socket inflight timestamps for the dead peer.
+                g_inflight_block_ts.erase(s_dead);
+
+                // Re-issue any pending by-index requests from this peer.
+                auto itIdx = g_inflight_index_ts.find(s_dead);
+                if (itIdx != g_inflight_index_ts.end()) {
+                    for (const auto& kv : itIdx->second) {
+                        const uint64_t idx = kv.first;
+                        // pick a new target (health-first)
+                        Sock target = MIQ_INVALID_SOCK;
+                        if (!cands.empty()) {
+                            target = rr_pick_peer_for_key(miq_idx_key(idx), cands);
+                        }
+                        auto itT = peers_.find(target);
+                        if (itT != peers_.end()) {
+                            uint8_t p8[8]; for (int i=0;i<8;i++) p8[i] = (uint8_t)((idx>>(8*i))&0xFF);
+                            auto msg = encode_msg("getbi", std::vector<uint8_t>(p8,p8+8));
+                            if (send_or_close(target, msg)) {
+                                g_inflight_index_ts[target][idx] = now_ms();
+                                g_inflight_index_order[target].push_back(idx);
+                                itT->second.inflight_index++;
+                            }
+                        }
+                    }
+                }
+                g_inflight_index_ts.erase(s_dead);
+                g_inflight_index_order.erase(s_dead);
+
+                // Finally, close & erase the dead peer.
+                gate_on_close(s_dead);
+                CLOSESOCK(s_dead);
+                peers_.erase(itp);
+            }
+            // we handled the closes ourselves; do not let them be processed elsewhere this tick
+            dead.clear();
+        }
+            
             bool ready = (rev & POLL_RD) != 0;
 
             if (ready) {
