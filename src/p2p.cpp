@@ -3714,7 +3714,13 @@ void P2P::loop(){
                         // Ask for addresses + publish our fee filter
                         maybe_send_getaddr(ps);
                         uint64_t mrf = local_min_relay_kb();
-                        std::vector<uint8_t> plff(8);
+                        // feefilter payload: 8-byte little-endian (miqron/kB)
+                        std::vector<uint8_t> ff(8);
+                        for (int i = 0; i < 8; ++i) {
+                            ff[i] = static_cast<uint8_t>((mrf >> (8*i)) & 0xFF);
+                        }
+                        auto ffmsg = encode_msg("feefilter", ff);
+                        (void)send_or_close(s, ffmsg);
                         for (int i=0;i<8;i++) plff[i] = (uint8_t)((mrf >> (8*i)) & 0xFF);
                         auto ff = encode_msg("feefilter", plff);
                         (void)send_or_close(s, ff);
@@ -3744,7 +3750,8 @@ void P2P::loop(){
                                 dead.push_back(s); break;
                             }
                         }
-                      
+                        
+                      };
                         try_finish_handshake();
                       
                     } else if (cmd == "verack") {
@@ -4517,20 +4524,32 @@ void P2P::loop(){
 #endif
 }
 std::vector<P2P::PeerSnapshot> P2P::snapshot_peers() const {
-    std::lock_guard<std::mutex> lk(g_peers_mu);
     std::vector<P2P::PeerSnapshot> out;
-    out.reserve(peers_.size());
-    for (const auto& kv : peers_) {
-        const auto& ps = kv.second;
-        PeerSnapshot s;
-        s.ip              = ps.ip;
-        s.verack_ok       = ps.verack_ok;
-        s.banscore        = ps.banscore;
-        s.health_score    = ps.health_score;
-        s.inflight_blocks = static_cast<uint32_t>(ps.inflight_blocks.size());
-        s.inflight_index  = ps.inflight_index;
-        s.last_ms         = static_cast<uint64_t>(ps.last_ms);
-        out.push_back(std::move(s));
+    // g_peers_mu and g_outbounds live in this TU; we only *read* them here.
+    extern std::mutex g_peers_mu;           // declared above in this file
+    extern std::unordered_map<Sock, PeerState> /*peers_*/; // member accessed via this->peers_
+    // We can’t “extern” the member; use the mutex then read this->peers_ inside the lock.
+    {
+        std::lock_guard<std::mutex> lk(g_peers_mu);
+        out.reserve(peers_.size());
+        for (const auto& kv : peers_) {
+            const Sock fd = kv.first;
+            const PeerState& ps = kv.second;
+            PeerSnapshot s;
+            s.ip                     = ps.ip;
+            // g_outbounds is in an anonymous namespace in this TU; declare here.
+            extern std::unordered_set<Sock> g_outbounds;
+            s.outbound               = (g_outbounds.find(fd) != g_outbounds.end());
+            s.verack_ok              = ps.verack_ok;
+            s.syncing                = ps.syncing;
+            s.inflight_blocks        = static_cast<std::uint32_t>(ps.inflight_blocks.size());
+            s.inflight_index         = ps.inflight_index;
+            s.banscore               = ps.banscore;
+            s.health_score           = ps.health_score;
+            s.avg_block_delivery_ms  = ps.avg_block_delivery_ms;
+            s.last_ms                = ps.last_ms;
+            out.push_back(std::move(s));
+        }
     }
     return out;
 }
