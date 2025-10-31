@@ -4503,7 +4503,6 @@ void P2P::loop(){
         if (!g_addrman.save(g_addrman_path, err)) {
             log_warn("P2P: addrman final save failed: " + err);
         }
-    }
 #endif
 }
 }
@@ -4527,8 +4526,5 @@ std::vector<PeerSnapshot> P2P::snapshot_peers() const {
         s.inflight      = ps.inflight_tx.size();
         out.push_back(std::move(s));
     }
-    std::vector<PeerSnapshot> out;
-    // Intentionally minimal; extend filling logic if PeerSnapshot carries fields you want.
-    return out;
 }
 }
