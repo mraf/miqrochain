@@ -842,7 +842,9 @@ namespace {
 extern std::unordered_set<std::string> g_global_inflight_blocks;
 }
 
+namespace {
 std::atomic<bool> g_sync_wants_active{false};
+}
 
 static std::unordered_map<Sock, bool> g_peer_index_capable; // default true; false => headers-only
 
