@@ -33,11 +33,6 @@
 #include <climits>
 #include <atomic>
 
-namespace {
-    static std::mutex g_peer_stalls_mu;
-    static std::unordered_map<std::uintptr_t, int> g_peer_stalls;
-}
-
 #ifndef _WIN32
 #include <netinet/tcp.h>
 #endif
@@ -361,6 +356,11 @@ namespace {
   #define CLOSESOCK(s) close(s)
 #endif
 
+namespace {
+    static std::mutex g_peer_stalls_mu;
+    static std::unordered_map<Sock, int> g_peer_stalls;
+}
+
 static inline void miq_set_cloexec(Sock s) {
 #ifndef _WIN32
     int flags = fcntl(s, F_GETFD, 0);
@@ -647,9 +647,8 @@ static inline void enforce_rx_parse_deadline(miq::PeerState& ps, Sock s){
             }
         }
         // Steady-state or nothing to trim: count a stall and potentially drop.
-        const std::uintptr_t key = static_cast<std::uintptr_t>(s);
         std::lock_guard<std::mutex> lk(g_peer_stalls_mu);
-        int &st = g_peer_stalls[key];
+        int &st = g_peer_stalls[s];
         st++;
         // During IBD, never drop for parse stalls; trim and forgive.
         const bool syncing = ps.syncing || !g_logged_headers_done;
@@ -787,6 +786,23 @@ static inline void set_peer_feefilter(Sock fd, uint64_t kb){
 static inline uint64_t peer_feefilter_kb(Sock fd){
     auto it = g_peer_minrelay_kb.find(fd);
     return (it==g_peer_minrelay_kb.end()) ? 0ULL : it->second;
+}
+
+#ifndef MIQ_FEEFILTER_INTERVAL_MS
+#define MIQ_FEEFILTER_INTERVAL_MS (10 * 60 * 1000)
+#endif
+static inline void maybe_send_feefilter(miq::PeerState& ps){
+    if (!ps.verack_ok) return;
+    const int64_t now = now_ms();
+    const int64_t last = (g_peer_last_ff_ms.count((Sock)ps.sock) ? g_peer_last_ff_ms[(Sock)ps.sock] : 0);
+    if (last != 0 && (now - last) < (int64_t)MIQ_FEEFILTER_INTERVAL_MS) return;
+    const uint64_t mrf = local_min_relay_kb();
+    std::vector<uint8_t> pl(8);
+    for (int i=0;i<8;i++) pl[i] = (uint8_t)((mrf >> (8*i)) & 0xFF);
+    auto msg = encode_msg("feefilter", pl);
+    if (send_or_close(ps.sock, msg)) {
+        set_peer_feefilter((Sock)ps.sock, mrf);
+    }
 }
 
 // ---- DNS seed backoff (per-host) -------------------------------------------
@@ -932,7 +948,8 @@ namespace {
 
 static inline bool peer_is_index_capable(Sock s) {
     auto it = g_peer_index_capable.find(s);
-    if (it == g_peer_index_capable.end()) return false;
+    // Default to true unless explicitly demoted.
+    if (it == g_peer_index_capable.end()) return true;
     return it->second;
 }
 
@@ -1084,6 +1101,7 @@ static inline void gate_on_connect(Sock fd){
         Clock::now().time_since_epoch()).count();
     g_gate[fd] = pg;
     g_trickle_last_ms[fd] = 0;
+    g_peer_index_capable[fd] = true;
 }
 // NEW: mark the fd as loopback once we know the peer's IP.
 static inline void gate_set_loopback(Sock fd, bool is_lb){
@@ -1117,6 +1135,7 @@ static inline void gate_on_close(Sock fd){
     g_hdr_flip.erase(fd);
     g_peer_last_fetch_ms.erase(fd);
     g_peer_last_request_ms.erase(fd);
+    g_peer_index_capable.erase(fd);
 }
 [[maybe_unused]] static inline bool gate_on_bytes(Sock fd, size_t add){
     auto it = g_gate.find(fd);
@@ -2130,6 +2149,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     ps.health_score = 1.0;
     ps.last_block_received_ms = 0;
     peers_[s] = ps;
+    g_peer_index_capable[s] = true;
 
     g_trickle_last_ms[s] = 0;
 
@@ -2224,6 +2244,7 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     ps.health_score = 1.0;
     ps.last_block_received_ms = 0;
     peers_[c] = ps;
+    g_peer_index_capable[c] = true;
 
     g_trickle_last_ms[c] = 0;
 
@@ -2807,6 +2828,7 @@ void P2P::loop(){
                          ps.health_score = 1.0;
                          ps.last_block_received_ms = 0;
                          { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
+                         g_peer_index_capable[s] = true;
                          g_trickle_last_ms[s] = 0;
                          log_info("P2P: outbound (addrman) " + ps.ip);
                          miq_set_keepalive(s);
@@ -2862,6 +2884,7 @@ void P2P::loop(){
                                 ps.health_score = 1.0;
                                 ps.last_block_received_ms = 0;
                                 { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
+                                g_peer_index_capable[s] = true;
                                 g_trickle_last_ms[s] = 0;
 
                                 log_info("P2P: outbound to known " + ps.ip);
@@ -2906,6 +2929,7 @@ void P2P::loop(){
                                     ps.health_score = 1.0;
                                     ps.last_block_received_ms = 0;
                                     { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s]=ps; g_outbounds.insert(s); }
+                                    g_peer_index_capable[s] = true;
                                     g_trickle_last_ms[s] = 0;
                                     log_info("P2P: feeler " + dotted);
                                     gate_on_connect(s);
@@ -3242,6 +3266,7 @@ void P2P::loop(){
             std::vector<Sock> to_close;
             for (auto &kv : peers_) {
                 auto &ps = kv.second;
+                maybe_send_feefilter(ps);
                 // send ping periodically
                 if (!ps.awaiting_pong && (tnow - ps.last_ping_ms) >= (int64_t)MIQ_P2P_PING_EVERY_MS) {
                     uint8_t rnd[8]; for (int i=0;i<8;i++) rnd[i] = (uint8_t)(std::rand() & 0xFF);
@@ -3719,6 +3744,16 @@ void P2P::loop(){
                         auto verack = encode_msg("verack", {});
                         (void)send_or_close(s, verack);
                         gate_mark_sent_verack(s);
+                    }
+
+                    if (cmd == "version" && m.payload.size() >= 12) {
+                        auto rd_u32le = [](const uint8_t* p){ return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24); };
+                        auto rd_u64le = [](const uint8_t* p){ uint64_t z=0; for(int i=0;i<8;i++) z |= ((uint64_t)p[i]) << (8*i); return z; };
+                        ps.version  = rd_u32le(m.payload.data());
+                        ps.features = rd_u64le(m.payload.data()+4);
+                        // Respect remote capability for index-by-height.
+                        bool remote_index = (ps.features & MIQ_FEAT_INDEX_BY_HEIGHT) != 0;
+                        g_peer_index_capable[(Sock)ps.sock] = remote_index;
                     }
 
                     auto inv_tick = [&](unsigned add)->bool{
