@@ -585,6 +585,15 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
 
     if (best_header_key_.empty()) {
         best_header_key_ = key;
+        // Debug logging for best header updates
+        static int64_t last_best_header_log = 0;
+        int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now - last_best_header_log > 10000) { // Log every 10 seconds
+            log_info("[DEBUG] accept_header: set initial best_header_key_=" + key.substr(0, 16) + "... " +
+                     " height=" + std::to_string(m.height) + " work=" + std::to_string(m.work_sum));
+            last_best_header_log = now;
+        }
     } else {
         const auto& cur = header_index_.at(best_header_key_);
         const auto& neu = header_index_.at(key);
@@ -598,7 +607,20 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
         bool equalish  = std::fabs(neu.work_sum - cur.work_sum) <= e;
 
         if (greater || (equalish && neu.height > cur.height)) {
+            std::string old_key = best_header_key_;
             best_header_key_ = key;
+            // Debug logging for best header updates
+            static int64_t last_best_header_log = 0;
+            int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (now - last_best_header_log > 10000) { // Log every 10 seconds
+                log_info("[DEBUG] accept_header: updated best_header_key_ from=" + old_key.substr(0, 16) + "... " +
+                         " to=" + key.substr(0, 16) + "... new_height=" + std::to_string(neu.height) +
+                         " new_work=" + std::to_string(neu.work_sum) +
+                         " old_height=" + std::to_string(cur.height) +
+                         " old_work=" + std::to_string(cur.work_sum));
+                last_best_header_log = now;
+            }
         }
     }
     return true;
@@ -612,22 +634,68 @@ void Chain::orphan_put(const std::vector<uint8_t>& h, const std::vector<uint8_t>
 void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, size_t max) const {
     MIQ_CHAIN_GUARD();
     out.clear();
-    if (best_header_key_.empty()) return;
+
+    // Debug logging for sync issues
+    static int64_t last_debug_log = 0;
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    bool should_log = (now - last_debug_log > 15000); // Log every 15 seconds
+
+    if (best_header_key_.empty()) {
+        if (should_log) {
+            log_info("[DEBUG] next_block_fetch_targets: best_header_key_ is empty - height=" +
+                     std::to_string(tip_.height) + " header_index_size=" + std::to_string(header_index_.size()));
+            last_debug_log = now;
+        }
+        return;
+    }
 
     std::vector<uint8_t> bh = header_index_.at(best_header_key_).hash;
     std::vector<std::vector<uint8_t>> up, down;
-    if (!find_header_fork(tip_.hash, bh, up, down)) return;
+
+    if (should_log) {
+        log_info("[DEBUG] next_block_fetch_targets: best_header_key_=" + best_header_key_.substr(0, 16) + "... " +
+                 " tip_hash=" + hexstr(tip_.hash) + " best_header_hash=" + hexstr(bh) +
+                 " tip_height=" + std::to_string(tip_.height) +
+                 " header_index_size=" + std::to_string(header_index_.size()));
+    }
+
+    if (!find_header_fork(tip_.hash, bh, up, down)) {
+        if (should_log) {
+            log_info("[DEBUG] next_block_fetch_targets: find_header_fork failed - tip=" + hexstr(tip_.hash) +
+                     " best=" + hexstr(bh));
+            last_debug_log = now;
+        }
+        return;
+    }
 
     // up contains blocks from best_header UP to common ancestor
     // down contains blocks from tip DOWN to common ancestor
     // We want to download blocks from common ancestor UP to best_header
     // So we should use up, but in reverse order (from common ancestor to best_header)
+
+    if (should_log) {
+        log_info("[DEBUG] next_block_fetch_targets: fork found - up_path_size=" + std::to_string(up.size()) +
+                 " down_path_size=" + std::to_string(down.size()));
+        last_debug_log = now;
+    }
+
+    size_t blocks_added = 0;
     for (auto it = up.rbegin(); it != up.rend(); ++it) {
         if (out.size() >= max) break;
         const auto& hh = *it;
         std::vector<uint8_t> tmp;
         bool have_orphan = orphan_get(hh, tmp);
-        if (!have_block(hh) && !have_orphan) out.push_back(hh);
+        bool have_blk = have_block(hh);
+        if (!have_blk && !have_orphan) {
+            out.push_back(hh);
+            blocks_added++;
+        }
+    }
+
+    if (should_log) {
+        log_info("[DEBUG] next_block_fetch_targets: returning " + std::to_string(out.size()) +
+                 " blocks to download (added=" + std::to_string(blocks_added) + " max=" + std::to_string(max) + ")");
     }
 }
 
@@ -639,6 +707,18 @@ bool Chain::find_header_fork(const std::vector<uint8_t>& a,
     path_up_from_b.clear();
     path_down_from_a.clear();
 
+    // Debug logging for fork detection issues
+    static int64_t last_fork_debug_log = 0;
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    bool should_log = (now - last_fork_debug_log > 20000); // Log every 20 seconds
+
+    if (should_log) {
+        log_info("[DEBUG] find_header_fork: a=" + hexstr(a) + " b=" + hexstr(b) +
+                 " tip_height=" + std::to_string(tip_.height) +
+                 " header_index_size=" + std::to_string(header_index_.size()));
+    }
+
     auto getH = [&](const std::vector<uint8_t>& h)->std::optional<HeaderMeta>{
         auto it = header_index_.find(hk(h));
         if (it != header_index_.end()) return it->second;
@@ -648,7 +728,20 @@ bool Chain::find_header_fork(const std::vector<uint8_t>& a,
 
     auto A = getH(a);
     auto B = getH(b);
-    if (!B) return false;
+    if (!B) {
+        if (should_log) {
+            log_info("[DEBUG] find_header_fork: B not found - b=" + hexstr(b) + " (returning false)");
+            last_fork_debug_log = now;
+        }
+        return false;
+    }
+
+    if (should_log) {
+        log_info("[DEBUG] find_header_fork: A=" + (A ? ("height=" + std::to_string(A->height)) : "null") +
+                 " B=height=" + std::to_string(B->height) +
+                 " A_hash=" + (A ? hexstr(A->hash) : "null") +
+                 " B_hash=" + hexstr(B->hash));
+    }
 
     std::vector<uint8_t> x = B->hash;
     std::vector<uint8_t> y = a;
@@ -736,6 +829,14 @@ bool Chain::find_header_fork(const std::vector<uint8_t>& a,
         }
     }
     std::reverse(path_down_from_a.begin(), path_down_from_a.end());
+
+    if (should_log) {
+        log_info("[DEBUG] find_header_fork: SUCCESS - path_up_from_b.size=" + std::to_string(path_up_from_b.size()) +
+                 " path_down_from_a.size=" + std::to_string(path_down_from_a.size()) +
+                 " common_ancestor=" + hexstr(x));
+        last_fork_debug_log = now;
+    }
+
     return true;
 }
 

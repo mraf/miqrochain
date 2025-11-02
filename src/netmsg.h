@@ -13,7 +13,7 @@
 // Prefer modern framed messages on the wire by default.
 // Set to 1 only if you MUST speak legacy to very old peers.
 #ifndef MIQ_WIRE_LEGACY_SEND
-#define MIQ_WIRE_LEGACY_SEND 0
+#define MIQ_WIRE_LEGACY_SEND 1
 #endif
 
 #ifndef MAX_MSG_SIZE

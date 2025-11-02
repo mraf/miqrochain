@@ -1446,32 +1446,95 @@ static std::string miq_miner_from_block(const miq::Block& b) {
 }
 
 // --- NEW: version payload helper (send a real version+services) -------------
-static inline uint32_t miq_local_proto_version() {
-#if defined(MIQ_PROTOCOL_VERSION)
-    return (uint32_t)MIQ_PROTOCOL_VERSION;
-#elif defined(PROTOCOL_VERSION)
-    return (uint32_t)PROTOCOL_VERSION;
-#else
-    return 1u;
-#endif
-}
 static inline void miq_put_u32le(std::vector<uint8_t>& v, uint32_t x){
     v.push_back((uint8_t)((x>>0)&0xff));
     v.push_back((uint8_t)((x>>8)&0xff));
     v.push_back((uint8_t)((x>>16)&0xff));
     v.push_back((uint8_t)((x>>24)&0xff));
 }
+
+// Helper function to create a vector with a single uint32_t in little-endian format
+static inline MIQ_MAYBE_UNUSED std::vector<uint8_t> miq_put_u32le_vec(uint32_t x) {
+    std::vector<uint8_t> v;
+    v.reserve(4);
+    miq_put_u32le(v, x);
+    return v;
+}
+
+// Helper function to create a vector with a single uint64_t in little-endian format (for getbi)
+static inline MIQ_MAYBE_UNUSED std::vector<uint8_t> miq_put_u64le_vec(uint64_t x) {
+    std::vector<uint8_t> v;
+    v.reserve(8);
+    v.push_back((uint8_t)((x>>0)&0xff));
+    v.push_back((uint8_t)((x>>8)&0xff));
+    v.push_back((uint8_t)((x>>16)&0xff));
+    v.push_back((uint8_t)((x>>24)&0xff));
+    v.push_back((uint8_t)((x>>32)&0xff));
+    v.push_back((uint8_t)((x>>40)&0xff));
+    v.push_back((uint8_t)((x>>48)&0xff));
+    v.push_back((uint8_t)((x>>56)&0xff));
+    return v;
+}
 static inline void miq_put_u64le(std::vector<uint8_t>& v, uint64_t x){
     for (int i=0;i<8;i++) v.push_back((uint8_t)((x>>(8*i))&0xff));
 }
 static inline std::vector<uint8_t> miq_build_version_payload() {
-    std::vector<uint8_t> v; v.reserve(12);
-    miq_put_u32le(v, miq_local_proto_version());
+    std::vector<uint8_t> v; v.reserve(128);
+
+    // Use a more compatible protocol version (similar to Bitcoin Core)
+    const uint32_t version = 70015;
+    miq_put_u32le(v, version);
+
+    // Services (features) - try with 0 like wallet for compatibility
     uint64_t svc = 0;
-    svc |= MIQ_FEAT_HEADERS_FIRST;        // headers-first supported
-    svc |= MIQ_FEAT_TX_RELAY;             // tx relay supported
-    svc |= MIQ_FEAT_INDEX_BY_HEIGHT;      // **by-index fetch supported**
+    // svc |= MIQ_FEAT_HEADERS_FIRST;        // headers-first supported
+    // svc |= MIQ_FEAT_TX_RELAY;             // tx relay supported
+    // svc |= MIQ_FEAT_INDEX_BY_HEIGHT;      // **by-index fetch supported**
     miq_put_u64le(v, svc);
+
+    // Timestamp
+    int64_t timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    miq_put_u64le(v, (uint64_t)timestamp);
+
+    // Remote address (addr_recv) - 26 bytes: services(8) + ip(16) + port(2)
+    miq_put_u64le(v, 0); // remote services
+    // IPv4-mapped IPv6 address (::ffff:0.0.0.0)
+    for (int i = 0; i < 10; i++) v.push_back(0x00);
+    v.push_back(0xff); v.push_back(0xff);
+    for (int i = 0; i < 4; i++) v.push_back(0x00); // 0.0.0.0
+    v.push_back(0x26); v.push_back(0x9b); // port 9883 in big-endian
+
+    // Local address (addr_from) - 26 bytes: services(8) + ip(16) + port(2)
+    miq_put_u64le(v, svc); // local services
+    // IPv4-mapped IPv6 address (::ffff:0.0.0.0)
+    for (int i = 0; i < 10; i++) v.push_back(0x00);
+    v.push_back(0xff); v.push_back(0xff);
+    for (int i = 0; i < 4; i++) v.push_back(0x00); // 0.0.0.0
+    v.push_back(0x26); v.push_back(0x9b); // port 9883 in big-endian
+
+    // Nonce (8 bytes)
+    static uint64_t nonce_counter = 0;
+    uint64_t nonce = (uint64_t)timestamp ^ (++nonce_counter);
+    miq_put_u64le(v, nonce);
+
+    // User agent (variable length string)
+    std::string user_agent = "/miqrochain:0.7.0/";
+    if (user_agent.size() < 0xFD) {
+        v.push_back((uint8_t)user_agent.size());
+    } else {
+        v.push_back(0xFD);
+        v.push_back((uint8_t)(user_agent.size() & 0xFF));
+        v.push_back((uint8_t)((user_agent.size() >> 8) & 0xFF));
+    }
+    v.insert(v.end(), user_agent.begin(), user_agent.end());
+
+    // Start height (4 bytes) - we'll use 0 for now
+    miq_put_u32le(v, 0);
+
+    // Relay flag (1 byte)
+    v.push_back(1); // true - we want to receive transaction announcements
+
     return v;
 }
 
@@ -2176,8 +2239,12 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     }
 
     miq_set_keepalive(s);
-    auto msg = encode_msg("version", miq_build_version_payload());
-    (void)send_or_close(s, msg);
+    auto version_payload = miq_build_version_payload();
+    P2P_TRACE("TX " + ps.ip + " cmd=version len=" + std::to_string(version_payload.size()));
+    auto msg = encode_msg("version", version_payload);
+    P2P_TRACE("TX " + ps.ip + " encoded version message len=" + std::to_string(msg.size()));
+    bool sent = send_or_close(s, msg);
+    P2P_TRACE("TX " + ps.ip + " version send result=" + (sent ? "OK" : "FAILED"));
 
     return true;
 }
@@ -2692,6 +2759,43 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
         clear_fulfilled_indices_up_to_height(chain_.height());
         g_last_progress_ms = now_ms();
         g_last_progress_height = chain_.height();
+
+        // SUPER AGGRESSIVE continuation: immediately request more blocks when we receive one
+        // This helps prevent stalling after receiving just a few blocks
+        static int64_t last_continuation_request = 0;
+        int64_t now = now_ms();
+        if (now - last_continuation_request > 500) {  // More frequent requests (every 500ms)
+            last_continuation_request = now;
+
+            // Request next batch of blocks from all capable peers
+            uint32_t current_height = chain_.height();
+
+            // Be more aggressive - request more blocks ahead
+            for (auto& kvp : peers_) {
+                auto& pps = kvp.second;
+                if (!pps.verack_ok) continue;
+                if (!peer_is_index_capable((Sock)pps.sock)) continue;
+
+                // Request next 10 blocks to keep the pipeline full
+                for (uint32_t h = current_height + 1; h <= current_height + 10; h++) {
+                    request_block_index(pps, (uint64_t)h);
+                    P2P_TRACE("TX " + pps.ip + " cmd=getbi height=" + std::to_string(h) + " (continuation)");
+                }
+
+                // Also force the peer to continue syncing
+                pps.syncing = true;
+                if (pps.inflight_index == 0) {
+                    pps.next_index = current_height + 1;
+                    fill_index_pipeline(pps);
+                    P2P_TRACE("TX " + pps.ip + " forced index pipeline refill at height=" + std::to_string(pps.next_index));
+                }
+            }
+
+            miq::log_info("Aggressive continuation: requested blocks " + std::to_string(current_height + 1) +
+                         " to " + std::to_string(current_height + 10) + " from all peers");
+        miq::log_info("NOTE: If blocks beyond " + std::to_string(current_height) + " are not available, " +
+                     "the seed node may have headers but not block data for those heights");
+        }
 #if MIQ_ENABLE_HEADERS_FIRST
         {
             std::vector<std::vector<uint8_t>> want_tmp;
@@ -3308,6 +3412,44 @@ void P2P::loop(){
             chain_.next_block_fetch_targets(want, cap);
             g_sync_wants_active.store(!want.empty());
 
+            // Debug logging for sync issues
+            if (want.empty() && !g_logged_headers_done) {
+                static int64_t last_debug_log = 0;
+                static int64_t last_fallback_activation = 0;
+                int64_t now = now_ms();
+                if (now - last_debug_log > 10000) { // Log every 10 seconds
+                    log_info("[DEBUG] next_block_fetch_targets returned empty during IBD - height=" +
+                             std::to_string(chain_.height()) + " headers_done=" +
+                             (g_logged_headers_done ? "true" : "false"));
+                    last_debug_log = now;
+                }
+
+                // AGGRESSIVE FALLBACK: If next_block_fetch_targets returns empty during IBD,
+                // immediately activate index-by-height sync instead of waiting for timeout
+                if (now - last_fallback_activation > 30000) { // Activate every 30 seconds max
+                    log_warn("[IBD] next_block_fetch_targets empty - activating aggressive index-by-height fallback");
+                    bool activated_any = false;
+                    for (auto &kvp : peers_) {
+                        auto &pps = kvp.second;
+                        if (!pps.verack_ok) continue;
+                        if (!peer_is_index_capable((Sock)pps.sock)) continue;
+                        if (pps.syncing && pps.inflight_index > 0) continue; // Already syncing by index
+
+                        pps.syncing = true;
+                        pps.inflight_index = 0;
+                        pps.next_index = chain_.height() + 1;
+                        fill_index_pipeline(pps);
+                        activated_any = true;
+                        log_info("[IBD] activated index-by-height sync for peer " + pps.ip +
+                                " starting at height " + std::to_string(pps.next_index));
+                    }
+                    if (activated_any) {
+                        last_fallback_activation = now;
+                        g_sync_wants_active.store(true); // Force sync to continue
+                    }
+                }
+            }
+
             if (!want.empty() && !peers_.empty()) {
                 // Build candidate peer list, healthiest first.
                 std::vector<std::pair<Sock,double>> scored;
@@ -3354,7 +3496,111 @@ void P2P::loop(){
                 }
             }
             const bool headers_done = g_logged_headers_done;
-            if (!any_want && !any_inflight && headers_done) {
+
+            // Debug logging for premature sync completion
+            static bool debug_logged = false;
+            if (!any_want && !any_inflight && headers_done && !debug_logged) {
+                log_info("[DEBUG] Sync completion check: any_want=" + std::string(any_want ? "true" : "false") +
+                         " any_inflight=" + std::string(any_inflight ? "true" : "false") +
+                         " headers_done=" + std::string(headers_done ? "true" : "false") +
+                         " height=" + std::to_string(chain_.height()));
+                debug_logged = true;
+            }
+
+            // Improved sync completion logic: check if we have exhausted all sync methods
+            const size_t current_height = chain_.height();
+            bool can_try_index_sync = false;
+            bool has_active_index_sync = false;
+
+            // Check if we have index-capable peers that could provide more blocks
+            for (auto &kvp : peers_) {
+                auto &pps = kvp.second;
+                if (!pps.verack_ok) continue;
+                if (!peer_is_index_capable((Sock)pps.sock)) continue;
+
+                can_try_index_sync = true;
+                if (pps.syncing && pps.inflight_index > 0) {
+                    has_active_index_sync = true;
+                    break;
+                }
+            }
+
+            // Enhanced sync completion logic with aggressive refetch mechanism
+            // Track stall detection for continuous sync
+            static uint32_t last_height_check = 0;
+            static int64_t last_height_time = now_ms();
+            static int64_t last_refetch_time = 0;
+            int64_t now = now_ms();
+
+            // Check for height progress stall - be more aggressive after headers phase
+            bool height_stalled = false;
+            int64_t stall_threshold = headers_done ? 10000 : 30000;  // 10s after headers, 30s before
+
+            if (current_height != last_height_check) {
+                last_height_check = current_height;
+                last_height_time = now;
+            } else if (current_height > 0) {
+                int64_t stall_duration = now - last_height_time;
+                if (stall_duration > stall_threshold) {
+                    height_stalled = true;
+                }
+            }
+
+            // Implement aggressive refetch when stalled
+            int64_t refetch_interval = headers_done ? 5000 : 10000;  // 5s after headers, 10s before
+            if (height_stalled && (now - last_refetch_time > refetch_interval)) {
+                last_refetch_time = now;
+                log_warn("[SYNC] Height stalled at " + std::to_string(current_height) + " for " +
+                        std::to_string((now - last_height_time) / 1000) + "s - forcing refetch");
+
+                // Check if we're in a headers-only state
+                static int64_t last_headers_only_warning = 0;
+                if (headers_done && current_height < 100 && (now - last_headers_only_warning > 30000)) {
+                    last_headers_only_warning = now;
+                    miq::log_warn("[SYNC] ⚠️  Possible headers-only state detected:");
+                    miq::log_warn("  📊 Headers phase completed (indicating ~2000+ blocks exist)");
+                    miq::log_warn("  🔢 But only " + std::to_string(current_height) + " blocks synced");
+                    miq::log_warn("  💾 Seed node may have headers but not block data for higher blocks");
+                    miq::log_warn("  🔄 Will continue retrying periodically...");
+                }
+
+                // Force refetch next blocks from all capable peers
+                bool refetch_sent = false;
+                for (auto& kvp : peers_) {
+                    auto& pps = kvp.second;
+                    if (!pps.verack_ok) continue;
+                    if (!peer_is_index_capable((Sock)pps.sock)) continue;
+
+                    // Request next batch of blocks by index
+                    for (uint32_t h = current_height + 1; h <= current_height + 20; h++) {
+                        request_block_index(pps, (uint64_t)h);
+                        P2P_TRACE("TX " + pps.ip + " cmd=getbi height=" + std::to_string(h) + " (refetch)");
+                    }
+                    refetch_sent = true;
+                }
+
+                if (refetch_sent) {
+                    // Reset stall timer to give refetch a chance
+                    last_height_time = now;
+                }
+            }
+
+            // More conservative sync completion criteria
+            // Don't declare complete if we're at a suspiciously low height
+            bool height_too_low = (current_height < 10000);  // Assume blockchain has more than 10k blocks
+
+            // Only declare sync complete if:
+            // 1. Headers are done AND
+            // 2. No blocks wanted by hash-based sync AND
+            // 3. Nothing in flight AND
+            // 4. Either we have no index-capable peers OR all index-capable peers have tried and failed AND
+            // 5. We're not at a suspiciously low height AND
+            // 6. We haven't stalled recently
+            bool truly_complete = headers_done && !any_want && !any_inflight &&
+                                 (!can_try_index_sync || (current_height > 0 && !has_active_index_sync)) &&
+                                 !height_too_low && !height_stalled;
+
+            if (truly_complete) {
                 if (!g_sync_green_logged) {
                     log_info(std::string("[SYNC] ✅ Node is in sync with the network at height=")
                              + std::to_string(chain_.height()));
@@ -3362,6 +3608,42 @@ void P2P::loop(){
                 }
             } else {
                 g_sync_green_logged = false;
+                debug_logged = false; // Reset debug flag when not in sync
+
+                // If we think we're done but could still try index sync, activate it
+                if (!any_want && !any_inflight && headers_done && can_try_index_sync && !has_active_index_sync) {
+                    static int64_t last_index_activation = 0;
+                    if (now - last_index_activation > 15000) { // Try every 15 seconds
+                        log_warn("[SYNC] Hash-based sync exhausted at height=" + std::to_string(current_height) +
+                                ", activating index-by-height sync as final attempt");
+
+                        // Activate index sync on ALL capable peers for maximum throughput
+                        int activated_peers = 0;
+                        for (auto &kvp : peers_) {
+                            auto &pps = kvp.second;
+                            if (!pps.verack_ok) continue;
+                            if (!peer_is_index_capable((Sock)pps.sock)) continue;
+
+                            // Always reset and reactivate to ensure fresh sync
+                            pps.syncing = true;
+                            pps.inflight_index = 0;
+                            pps.next_index = chain_.height() + 1;
+                            fill_index_pipeline(pps);
+                            log_info("[SYNC] Activated aggressive index sync for peer " + pps.ip +
+                                    " starting at height " + std::to_string(pps.next_index));
+                            activated_peers++;
+                        }
+
+                        if (activated_peers > 0) {
+                            log_info("[SYNC] Activated index sync on " + std::to_string(activated_peers) + " peers");
+                        } else {
+                            log_warn("[SYNC] No index-capable peers available for sync activation");
+                        }
+
+                        last_index_activation = now;
+                        g_sync_wants_active.store(true);
+                    }
+                }
             }
         }
 
@@ -3953,8 +4235,17 @@ void P2P::loop(){
                             Block b;
                             if (chain_.get_block_by_index((size_t)idx64, b)) {
                                 auto raw = ser_block(b);
-                                if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
+                                if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
+                                    send_block(s, raw);
+                                    P2P_TRACE("TX " + ps.ip + " cmd=block height=" + std::to_string(idx64) + " (response to getbi)");
+                                } else {
+                                    P2P_TRACE("SKIP " + ps.ip + " cmd=getbi height=" + std::to_string(idx64) + " (block too large)");
+                                }
+                            } else {
+                                P2P_TRACE("SKIP " + ps.ip + " cmd=getbi height=" + std::to_string(idx64) + " (block not available)");
                             }
+                        } else {
+                            P2P_TRACE("SKIP " + ps.ip + " cmd=getbi (invalid payload size=" + std::to_string(m.payload.size()) + ")");
                         }
 
                     } else if (cmd == "block") {
