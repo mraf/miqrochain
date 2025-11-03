@@ -35,6 +35,8 @@ bool miq::load_config(const std::string& path, Config& out){
         else if(k=="no_mine") out.no_mine = (v=="1"||v=="true");
         else if(k=="miner_threads"){ try{ out.miner_threads = (unsigned)std::stoul(v); }catch(...){} }
         else if(k=="mining_address") out.mining_address = v;
+        else if(k=="p2p_port"){ try{ out.p2p_port = (uint16_t)std::stoul(v); }catch(...){} }
+        else if(k=="rpc_bind") out.rpc_bind = v;
 
         // TLS
         else if(k=="rpc_tls_enable") out.rpc_tls_enable = (v=="1"||v=="true");

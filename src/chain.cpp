@@ -645,6 +645,13 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
         if (should_log) {
             log_info("[DEBUG] next_block_fetch_targets: best_header_key_ is empty - height=" +
                      std::to_string(tip_.height) + " header_index_size=" + std::to_string(header_index_.size()));
+
+            // For seed nodes with blocks but no headers, this is expected - they don't need to fetch anything
+            // The aggressive fallback in P2P will handle block requests by index
+            if (tip_.height > 0) {
+                log_info("[DEBUG] next_block_fetch_targets: seed node has blocks (height=" +
+                         std::to_string(tip_.height) + ") but no header index - this is normal for seed nodes");
+            }
             last_debug_log = now;
         }
         return;
