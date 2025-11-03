@@ -4251,30 +4251,22 @@ void P2P::loop(){
                         }
 
                     } else if (cmd == "getb") {
-            if (m.payload.size() == 32) {
-                Block b;
-                if (chain_.get_block_by_hash(m.payload, b)) {
-                    auto raw = ser_block(b);
-                    // Consume rate tokens on the actual raw block size
-                    if (rate_consume_block(ps, raw.size())) {
-                        if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
-                            send_block(s, raw);
+                        g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
+                        if (m.payload.size() == 32) {
+                            Block b;
+                            if (chain_.get_block_by_hash(m.payload, b)) {
+                                auto raw = ser_block(b);
+                                if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
+                                    send_block(s, raw);
+                                }
+                            } else {
+                                // Immediately tell requester so it can retry elsewhere.
+                                P2P_TRACE("serve getb: block not available; sending notfound");
+                                std::vector<uint8_t> h(m.payload.begin(), m.payload.end());
+                                send_notfound_hash(s, h);
+                            }
                         }
                     }
-                } else {
-                    // Immediately tell requester so it can retry elsewhere.
-                    P2P_TRACE("serve getb: block not available; sending notfound");
-                    std::vector<uint8_t> vd;
-                    vd.reserve(1 + 4 + 32);
-                    vd.push_back(1); // count
-                    uint32_t ht = 2; // tag=2 means block
-                    for (int i=0;i<4;i++) vd.push_back((uint8_t)((ht>>(8*i))&0xFF));
-                    vd.insert(vd.end(), m.payload.begin(), m.payload.end());
-                    auto nf = encode_msg("notfound", vd);
-                    (void)send_or_close(s, nf);
-                }
-            }
-        }
 
                     } else if (cmd == "getbi") {
                         g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
