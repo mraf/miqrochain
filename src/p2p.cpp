@@ -1100,7 +1100,7 @@ static inline void gate_on_connect(Sock fd){
         Clock::now().time_since_epoch()).count();
     g_gate[fd] = pg;
     g_trickle_last_ms[fd] = 0;
-    g_peer_index_capable[fd] = false;
+    g_peer_index_capable[fd] = true;
 }
 // NEW: mark the fd as loopback once we know the peer's IP.
 static inline void gate_set_loopback(Sock fd, bool is_lb){
@@ -2361,36 +2361,6 @@ void P2P::broadcast_inv_tx(const std::vector<uint8_t>& txid){
     if (announce_tx_q_.size() < 8192) announce_tx_q_.push_back(txid);
 }
 
-static inline void send_notfound_hash(Sock s, const std::vector<uint8_t>& h){
-    if (h.size()!=32) return;
-    std::vector<uint8_t> pl; pl.reserve(1+32);
-    pl.push_back(0x01); // tag=hash
-    pl.insert(pl.end(), h.begin(), h.end());
-    auto msg = encode_msg("notfound", pl);
-    (void)send_or_close(s, msg);
-}
-
-static inline void send_notfound_index(Sock s, uint64_t idx){
-    uint8_t pl[1+8]; pl[0] = 0x02; // tag=index
-    for (int i=0;i<8;i++) pl[1+i] = (uint8_t)((idx>>(8*i))&0xFF);
-    auto msg = encode_msg("notfound", std::vector<uint8_t>(pl, pl+sizeof(pl)));
-    (void)send_or_close(s, msg);
-}
-
-// remove an inflight index entry from ts/order for a given peer
-static inline void remove_inflight_index_for_peer(Sock s, uint64_t idx){
-    auto itTs = g_inflight_index_ts.find(s);
-    if (itTs != g_inflight_index_ts.end()){
-        itTs->second.erase(idx);
-    }
-    auto itQ = g_inflight_index_order.find(s);
-    if (itQ != g_inflight_index_order.end()){
-        auto &dq = itQ->second;
-        dq.erase(std::remove(dq.begin(), dq.end(), idx), dq.end());
-    }
-}
-
-
 static void trickle_flush(){
     int64_t tnow = now_ms();
     for (auto& kv : g_trickle_q) {
@@ -2468,10 +2438,8 @@ void P2P::start_sync_with_peer(PeerState& ps){
     // Index-capable: pipeline indices immediately.
     ps.syncing = true;
     ps.inflight_index = 0;
-    const uint64_t resume = chain_.height() + 1;
-    if (ps.next_index < resume) ps.next_index = resume;
+    ps.next_index = chain_.height() + 1;
     fill_index_pipeline(ps);
-    g_sync_wants_active.store(true);
 }
 
 void P2P::fill_index_pipeline(PeerState& ps){
@@ -2962,7 +2930,7 @@ void P2P::loop(){
                          ps.health_score = 1.0;
                          ps.last_block_received_ms = 0;
                          { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
-                         g_peer_index_capable[s] = false;
+                         g_peer_index_capable[s] = true;
                          g_trickle_last_ms[s] = 0;
                          log_info("P2P: outbound (addrman) " + ps.ip);
                          miq_set_keepalive(s);
@@ -3018,7 +2986,7 @@ void P2P::loop(){
                                 ps.health_score = 1.0;
                                 ps.last_block_received_ms = 0;
                                 { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
-                                g_peer_index_capable[s] = false;
+                                g_peer_index_capable[s] = true;
                                 g_trickle_last_ms[s] = 0;
 
                                 log_info("P2P: outbound to known " + ps.ip);
@@ -3063,7 +3031,7 @@ void P2P::loop(){
                                     ps.health_score = 1.0;
                                     ps.last_block_received_ms = 0;
                                     { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s]=ps; g_outbounds.insert(s); }
-                                    g_peer_index_capable[s] = false;
+                                    g_peer_index_capable[s] = true;
                                     g_trickle_last_ms[s] = 0;
                                     log_info("P2P: feeler " + dotted);
                                     gate_on_connect(s);
@@ -4256,17 +4224,9 @@ void P2P::loop(){
                             Block b;
                             if (chain_.get_block_by_hash(m.payload, b)) {
                                 auto raw = ser_block(b);
-                                if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
-                                    send_block(s, raw);
-                                }
-                            } else {
-                                // Immediately tell requester so it can retry elsewhere.
-                                P2P_TRACE("serve getb: block not available; sending notfound");
-                                std::vector<uint8_t> h(m.payload.begin(), m.payload.end());
-                                send_notfound_hash(s, h);
+                                if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) send_block(s, raw);
                             }
                         }
-                    }
 
                     } else if (cmd == "getbi") {
                         g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
@@ -4283,49 +4243,13 @@ void P2P::loop(){
                                     P2P_TRACE("SKIP " + ps.ip + " cmd=getbi height=" + std::to_string(idx64) + " (block too large)");
                                 }
                             } else {
-                                P2P_TRACE("serve getbi: h=" + std::to_string(idx64) + " not available; sending notfound");
-                                send_notfound_index(s, idx64);
+                                P2P_TRACE("SKIP " + ps.ip + " cmd=getbi height=" + std::to_string(idx64) + " (block not available)");
                             }
                         } else {
                             P2P_TRACE("SKIP " + ps.ip + " cmd=getbi (invalid payload size=" + std::to_string(m.payload.size()) + ")");
                         }
 
                     } else if (cmd == "block") {
-                    } else if (cmd == "notfound") {
-                        // tag + payload: 0x01 + 32B hash, or 0x02 + 8B index(LE)
-                        if (!m.payload.empty()){
-                            const uint8_t tag = m.payload[0];
-                            const size_t n   = m.payload.size();
-                            if (tag==0x01 && n==1+32){
-                                std::vector<uint8_t> h(m.payload.begin()+1, m.payload.end());
-                                const std::string key = hexkey(h);
-                                // Clear inflight and rotate RR cursor for this key
-                                ps.inflight_blocks.erase(key);
-                                g_inflight_block_ts[(Sock)s].erase(key);
-                                g_global_inflight_blocks.erase(key);
-                                g_rr_next_idx.erase(key);
-                                // Immediately ask another peer
-                                std::vector<Sock> cands;
-                                for (auto& kvp : peers_) if (kvp.second.verack_ok && kvp.first != s) cands.push_back(kvp.first);
-                                Sock t = rr_pick_peer_for_key(key, cands);
-                                auto itT = peers_.find(t);
-                                if (itT != peers_.end()) {
-                                    request_block_hash(itT->second, h);
-                                }
-                            } else if (tag==0x02 && n==1+8){
-                                uint64_t idx=0; for (int i=0;i<8;i++) idx |= (uint64_t)m.payload[1+i]<<(8*i);
-                                remove_inflight_index_for_peer(s, idx);
-                                if (ps.inflight_index>0) ps.inflight_index--;
-                                g_index_timeouts[s]++;       // track index misses
-                                int active_peers = 0;
-                                for (const auto &kv : peers_) if (kv.second.verack_ok) active_peers++;
-                                const int demote_threshold = (active_peers <= 1) ? 3 : 1;
-                                if (g_index_timeouts[s] >= demote_threshold) {
-                                    g_peer_index_capable[s] = false;   // fall back to hash path for this peer
-                                }
-                                fill_index_pipeline(ps);        // try next heights / other peers immediately
-                            }
-                        }
                         g_peer_last_fetch_ms[(Sock)ps.sock] = now_ms();
                         if (!rate_consume_block(ps, m.payload.size())) {
                             if (!ibd_or_fetch_active(ps, now_ms())) {
