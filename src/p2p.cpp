@@ -4587,11 +4587,6 @@ void P2P::loop(){
                             }
                         }
 
-                        if (!g_logged_headers_done && (!want.empty() || at_tip)) {
-                            g_logged_headers_done = true;
-                            log_info("[IBD] headers phase complete; switching to blocks");
-                        }
-
                         if (ps.inflight_hdr_batches > 0) ps.inflight_hdr_batches--;
                         ps.last_hdr_batch_done_ms = now_ms();
                         if (ps.inflight_hdr_batches == 0) ps.sent_getheaders = false;
