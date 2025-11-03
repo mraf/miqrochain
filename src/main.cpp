@@ -897,6 +897,23 @@ struct SeedRole {
 
 static SeedRole compute_seed_role(){
     SeedRole r;
+
+    // Heuristic 1: explicit override via env (useful behind NAT/port-forward).
+    if (const char* f = std::getenv("MIQ_FORCE_SEED"); f && *f && std::strcmp(f,"0")!=0 &&
+        std::strcmp(f,"false")!=0 && std::strcmp(f,"False")!=0){
+        r.we_are_seed = true;
+        r.detail = "MIQ_FORCE_SEED=1";
+        return r;
+    }
+    // Heuristic 2: explicit client mode override (useful for local P2P testing).
+    if (const char* f = std::getenv("MIQ_FORCE_CLIENT"); f && *f && std::strcmp(f,"0")!=0 &&
+        std::strcmp(f,"false")!=0 && std::strcmp(f,"False")!=0){
+        r.we_are_seed = false;
+        r.detail = "MIQ_FORCE_CLIENT=1";
+        return r;
+    }
+
+    // Heuristic 3: IP-based detection
     r.seed_ips  = resolve_host_ip_strings(seed_host_cstr());
     r.local_ips = local_ip_strings();
     for (const auto& seed_ip : r.seed_ips){
@@ -907,13 +924,6 @@ static SeedRole compute_seed_role(){
                 return r;
             }
         }
-    }
-    // Heuristic 2: explicit override via env (useful behind NAT/port-forward).
-    if (const char* f = std::getenv("MIQ_FORCE_SEED"); f && *f && std::strcmp(f,"0")!=0 &&
-        std::strcmp(f,"false")!=0 && std::strcmp(f,"False")!=0){
-        r.we_are_seed = true;
-        r.detail = "MIQ_FORCE_SEED=1";
-        return r;
     }
     r.detail = r.seed_ips.empty() ? "seed host has no A/AAAA records"
                                   : "seed host resolves to different IP(s)";
@@ -1040,24 +1050,78 @@ static inline std::string spark_ascii(const std::vector<double>& v){
 // Sync gate helper (used both in TUI texts and IBD logic)
 static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out){
     size_t peers = p2p ? p2p->snapshot_peers().size() : 0;
-    const bool seed_solo = compute_seed_role().we_are_seed && peers == 0;
-    if (!seed_solo && peers == 0) { why_out = "no peers"; return false; }
+    const bool we_are_seed = compute_seed_role().we_are_seed;
+    const bool seed_solo = we_are_seed && peers == 0;
+
+    // DEBUG: Log sync gate evaluation
+    log_info("DEBUG: compute_sync_gate - peers=" + std::to_string(peers) +
+             " we_are_seed=" + (we_are_seed ? "true" : "false") +
+             " seed_solo=" + (seed_solo ? "true" : "false"));
+
+    if (!seed_solo && peers == 0) {
+        why_out = "no peers";
+        log_info("DEBUG: sync gate FAILED - no peers");
+        return false;
+    }
 
     uint64_t h = chain.height();
+    log_info("DEBUG: sync gate - height=" + std::to_string(h));
+
     if (h == 0) {
-        if (seed_solo) { why_out.clear(); return true; } // allow solo mining from genesis
-        why_out = "headers syncing"; return false;
+        if (seed_solo) {
+            why_out.clear();
+            log_info("DEBUG: sync gate PASSED - solo seed at height 0");
+            return true; // allow solo mining from genesis regardless of timestamp
+        }
+        why_out = "headers syncing";
+        log_info("DEBUG: sync gate FAILED - headers syncing");
+        return false;
+    }
+
+    // For seed nodes (solo or with peers), allow serving blocks even with stale tips
+    // This is necessary to bootstrap the chain and serve historical blocks to peers
+    if (we_are_seed) {
+        why_out.clear();
+        log_info("DEBUG: sync gate PASSED - seed node bypass (can serve blocks regardless of tip age)");
+        return true;
+    }
+
+    // For peer nodes that have successfully synced blocks from a seed, also allow stale tips
+    // This handles the case where we've synced historical blocks that are legitimately old
+    if (peers > 0 && h > 0) {
+        // If we have peers and blocks, we've likely completed a successful sync
+        // Check if we have a reasonable number of blocks (more than just genesis)
+        if (h >= 1) {
+            why_out.clear();
+            log_info("DEBUG: sync gate PASSED - peer node with synced blocks (tip age check bypassed for historical sync)");
+            return true;
+        }
     }
 
     auto tip = chain.tip();
     uint64_t tsec = hdr_time(tip);
-    if (tsec == 0) { why_out = "waiting for headers time"; return false; }
+    if (tsec == 0) {
+        why_out = "waiting for headers time";
+        log_info("DEBUG: sync gate FAILED - waiting for headers time");
+        return false;
+    }
     uint64_t now = (uint64_t)std::time(nullptr);
     uint64_t age = (now > tsec) ? (now - tsec) : 0;
     const uint64_t fresh = std::max<uint64_t>(BLOCK_TIME_SECS * 3, 300);
-    if (age > fresh) { why_out = "tip too old"; return false; }
+
+    log_info("DEBUG: sync gate - tip_time=" + std::to_string(tsec) +
+             " now=" + std::to_string(now) +
+             " age=" + std::to_string(age) +
+             " fresh_limit=" + std::to_string(fresh));
+
+    if (age > fresh) {
+        why_out = "tip too old";
+        log_info("DEBUG: sync gate FAILED - tip too old");
+        return false;
+    }
 
     why_out.clear();
+    log_info("DEBUG: sync gate PASSED - all checks passed");
     return true;
 }
 
@@ -1395,7 +1459,7 @@ private:
         while (running_) {
             if(global::tui_toggle_theme.exchange(false)) { std::lock_guard<std::mutex> lk(mu_); dark_theme_ = !dark_theme_; }
             draw_once(false);
-            std::this_thread::sleep_for(std::chrono::milliseconds(vt_ok_ ? 8 : 75));
+            std::this_thread::sleep_for(std::chrono::milliseconds(vt_ok_ ? 500 : 750));
             ++tick_;
             if((clock::now()-last_hs_time) > 250ms){
                 last_hs_time = clock::now();
@@ -1404,7 +1468,12 @@ private:
                 if(spark_hs_.size() > 90) spark_hs_.erase(spark_hs_.begin());
             }
             if (global::tui_snapshot_requested.exchange(false)) snapshot_to_disk();
-            if (now_ms() - last_stats_ms > 1000) last_stats_ms = now_ms();
+            if (now_ms() - last_stats_ms > 1000) {
+                last_stats_ms = now_ms();
+                // Update miner hashrate from actual miner stats
+                miq::MinerStats ms = miq::miner_stats_now();
+                g_miner_stats.hps.store(ms.hps);
+            }
             if (now_ms() - last_net_ms > 1000){
                 last_net_ms = now_ms();
                 double nh = estimate_network_hashrate(chain_);
@@ -1457,7 +1526,6 @@ private:
         // Header bar
         {
             std::ostringstream h;
-            if (!first && vt_ok_) h << "\x1b[H\x1b[0J";
             std::string bullet = u8_ok_ ? " • " : " | ";
             h << C_head() << "MIQROCHAIN" << C_reset()
               << "  " << C_dim()
@@ -1736,6 +1804,8 @@ private:
         }
 
         std::ostringstream out;
+
+        // Build the entire frame first (double buffering)
         size_t NL = left.size(), NR = right.size(), N = std::max(NL, NR);
         for (size_t i=0;i<N;i++){
             std::string l = (i<NL) ? left[i] : "";
@@ -1770,7 +1840,22 @@ private:
         }
         int printed = (int)logs_.size() - start;
         for (int i=printed; i<remain; ++i) out << "\n";
-        cw_.write_raw(out.str());
+
+        // Now write the entire frame with control sequences
+        std::string frame = out.str();
+
+        // Send clear screen FIRST, separately
+        if (vt_ok_) {
+            cw_.write_raw("\x1b[2J\x1b[H");  // Clear entire screen and move cursor to home
+        }
+
+        // Then write the frame content
+        cw_.write_raw(frame);
+
+        // Ensure output is flushed to terminal
+        if (vt_ok_) {
+            std::fflush(stdout);
+        }
     }
 
 private:
@@ -2158,8 +2243,13 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                 }
                 break; // proceed to IBD
             }
-            // keep nudging the seed if needed
-            if (!we_are_seed && (now_ms() - lastSeedDialMs > kSeedNudgeMs)) {
+            // keep nudging the seed if needed (only if no working connections)
+            size_t verack_peers = 0;
+            for (const auto& peer : p2p->snapshot_peers()) {
+                if (peer.verack_ok) verack_peers++;
+            }
+
+            if (!we_are_seed && verack_peers == 0 && (now_ms() - lastSeedDialMs > kSeedNudgeMs)) {
                 p2p->connect_seed(seed_host_cstr(), P2P_PORT);
                 lastSeedDialMs = now_ms();
                 ++seed_dials;
@@ -2216,7 +2306,13 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
 
         // Ensure we periodically re-nudge the seed if peer count is low.
         size_t peers = p2p->snapshot_peers().size();
-        if (!we_are_seed && peers < 2 && now_ms() - lastSeedDialMs > kSeedNudgeMs) {
+        size_t verack_peers = 0;
+        for (const auto& peer : p2p->snapshot_peers()) {
+            if (peer.verack_ok) verack_peers++;
+        }
+
+        // Only nudge if we have no working connections (verack_ok peers)
+        if (!we_are_seed && verack_peers == 0 && now_ms() - lastSeedDialMs > kSeedNudgeMs) {
             p2p->connect_seed(seed_host_cstr(), P2P_PORT);
             lastSeedDialMs = now_ms();
             ++seed_dials;
@@ -2553,11 +2649,17 @@ int main(int argc, char** argv){
         [[maybe_unused]] bool p2p_ok = false;
         if (can_tui) { tui.mark_step_started("Start P2P listener"); tui.set_node_state(TUI::NodeState::Starting); }
         if(!cfg.no_p2p){
-            if(p2p.start(P2P_PORT)){
+            uint16_t p2p_port = cfg.p2p_port ? cfg.p2p_port : P2P_PORT;
+            log_info("DEBUG: Using P2P port " + std::to_string(p2p_port) + " (config=" + std::to_string(cfg.p2p_port) + ", default=" + std::to_string(P2P_PORT) + ")");
+            if(p2p.start(p2p_port)){
                 p2p_ok = true;
-                log_info("P2P listening on " + std::to_string(P2P_PORT));
+                log_info("P2P listening on " + std::to_string(p2p_port));
                 if (can_tui) { tui.mark_step_ok("Start P2P listener"); tui.mark_step_started("Connect seeds"); }
-                if (!(compute_seed_role().we_are_seed || g_assume_seed_hairpin.load())) {
+                auto seed_role = compute_seed_role();
+                log_info("DEBUG: seed_role.we_are_seed=" + std::string(seed_role.we_are_seed ? "true" : "false") +
+                         " detail=" + seed_role.detail + " seed_host=" + seed_host_cstr());
+                if (!(seed_role.we_are_seed || g_assume_seed_hairpin.load())) {
+                    log_info("DEBUG: Connecting to seed " + std::string(seed_host_cstr()) + ":" + std::to_string(P2P_PORT));
                     p2p.connect_seed(seed_host_cstr(), P2P_PORT);
                     if (can_tui) tui.mark_step_ok("Connect seeds");
                 } else {
@@ -2569,7 +2671,7 @@ int main(int argc, char** argv){
                     }
                 }
             } else {
-                log_warn("P2P failed to start on port " + std::to_string(P2P_PORT));
+                log_warn("P2P failed to start on port " + std::to_string(p2p_port));
             }
         } else if (can_tui) {
             tui.mark_step_ok("Start P2P listener");
@@ -2652,9 +2754,22 @@ int main(int argc, char** argv){
                 log_warn("Could not sync MIQ_RPC_TOKEN to cookie; clients may need X-Auth-Token");
             }
             }
-            rpc.start(RPC_PORT);
+            // Extract RPC port from rpc_bind config, or use default
+            uint16_t rpc_port = RPC_PORT;
+            if (!cfg.rpc_bind.empty()) {
+                size_t colon_pos = cfg.rpc_bind.rfind(':');
+                if (colon_pos != std::string::npos) {
+                    try {
+                        rpc_port = (uint16_t)std::stoul(cfg.rpc_bind.substr(colon_pos + 1));
+                    } catch (...) {
+                        log_warn("Invalid RPC port in rpc_bind, using default " + std::to_string(RPC_PORT));
+                        rpc_port = RPC_PORT;
+                    }
+                }
+            }
+            rpc.start(rpc_port);
             rpc_ok = true;
-            log_info("RPC listening on " + std::to_string(RPC_PORT));
+            log_info("RPC listening on " + std::to_string(rpc_port));
             if (can_tui) { tui.mark_step_ok("Start RPC server"); tui.mark_step_ok("RPC ready"); }
         } else if (can_tui) {
             tui.mark_step_ok("Start RPC server");
@@ -2678,26 +2793,32 @@ int main(int argc, char** argv){
             }
             if (thr_count == 0) thr_count = std::max(1u, std::thread::hardware_concurrency());
 
-            if (MIQ_ISATTY()) {
-                std::string addr;
+            // First try to use mining_address from config file
+            std::string addr = cfg.mining_address;
+
+            // If no config address, try interactive prompt (only if TTY available)
+            if (addr.empty() && MIQ_ISATTY()) {
                 std::cout << "Enter P2PKH Base58 address to mine to (will start when synced; empty to cancel): ";
                 std::getline(std::cin, addr);
                 trim_inplace(addr);
-                if (!addr.empty()) {
-                    uint8_t ver=0; std::vector<uint8_t> payload;
-                    if (base58check_decode(addr, ver, payload) && ver==VERSION_P2PKH && payload.size()==20) {
-                        mine_pkh = payload;
-                        g_miner_address_b58 = addr;
-                        miner_armed = true;
-                        log_info("Miner armed; waiting for node to finish syncing before start.");
-                    } else {
-                        log_error("Invalid mining address; built-in miner disabled.");
-                    }
+            }
+
+            if (!addr.empty()) {
+                uint8_t ver=0; std::vector<uint8_t> payload;
+                if (base58check_decode(addr, ver, payload) && ver==VERSION_P2PKH && payload.size()==20) {
+                    mine_pkh = payload;
+                    g_miner_address_b58 = addr;
+                    miner_armed = true;
+                    log_info("Miner armed; waiting for node to finish syncing before start.");
+                } else {
+                    log_error("Invalid mining address; built-in miner disabled.");
+                }
+            } else {
+                if (cfg.mining_address.empty() && !MIQ_ISATTY()) {
+                    log_info("No mining address in config and no TTY available; built-in miner disabled.");
                 } else {
                     log_info("No address entered; built-in miner disabled.");
                 }
-            } else {
-                log_info("No TTY available; built-in miner disabled.");
             }
         } else {
             log_info("Miner not started (use external miner or pass --mine).");

@@ -75,8 +75,8 @@ static std::vector<NodeEndpoint> sources_from_env_and_file(const std::string& da
     }
 
     // --- compiled default seeds ---
-    // Your public node:
-    v.push_back(NodeEndpoint{"62.38.73.147", (uint16_t)9834, std::string(), -1});
+    // Your public node (changed to localhost for testing):
+    v.push_back(NodeEndpoint{"127.0.0.1", (uint16_t)9834, std::string(), -1});
     // Always include local as a last resort:
     v.push_back(NodeEndpoint{"127.0.0.1", (uint16_t)RPC_PORT, std::string(), -1});
 

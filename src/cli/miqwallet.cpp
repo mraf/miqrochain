@@ -271,8 +271,8 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
         }
     }
 
-    // 2) Your public node FIRST by default
-    push_unique(seeds, "62.38.73.147", std::to_string(miq::P2P_PORT), seen);
+    // 2) Your public node FIRST by default (changed to localhost for testing)
+    push_unique(seeds, "127.0.0.1", std::to_string(miq::P2P_PORT), seen);
 
     // 3) DNS seeds (constants.h)
     push_unique(seeds, miq::DNS_SEED, std::to_string(miq::P2P_PORT), seen);

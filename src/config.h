@@ -11,6 +11,8 @@ struct Config {
     bool        no_mine = false;
     unsigned    miner_threads = 0;
     std::string mining_address; // kept for future use / compatibility
+    uint16_t    p2p_port = 0;                    // P2P port (0 = use default from constants.h)
+    std::string rpc_bind;                        // RPC bind address (host:port); empty = use default
 
     // === TLS for RPC (via local TLS terminator) ===
     bool        rpc_tls_enable = false;          // enable TLS listener

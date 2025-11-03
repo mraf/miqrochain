@@ -165,8 +165,8 @@ static constexpr const char* GENESIS_RAW_BLOCK_HEX =
     "00000000";         // lock_time
 
 // ---------------------------------------------------------------------
-// Seeds (kept intact)
-static const std::string DNS_SEED = "seed.miqrochain.org";
+// Seeds (temporarily point to local seed for testing)
+static const std::string DNS_SEED = "localseed.test";
 
 // Multi-seed list (add-only). Your node can try these in order.
 static inline const char* const DNS_SEEDS[] = {
