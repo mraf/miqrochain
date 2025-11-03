@@ -1485,11 +1485,10 @@ static inline std::vector<uint8_t> miq_build_version_payload() {
     const uint32_t version = 70015;
     miq_put_u32le(v, version);
 
-    // Services (features) - try with 0 like wallet for compatibility
     uint64_t svc = 0;
-    // svc |= MIQ_FEAT_HEADERS_FIRST;        // headers-first supported
-    // svc |= MIQ_FEAT_TX_RELAY;             // tx relay supported
-    // svc |= MIQ_FEAT_INDEX_BY_HEIGHT;      // **by-index fetch supported**
+    svc |= MIQ_FEAT_HEADERS_FIRST;        // headers-first supported
+    svc |= MIQ_FEAT_TX_RELAY;             // transaction relay supported
+    svc |= MIQ_FEAT_INDEX_BY_HEIGHT;      // by-index fetch supported
     miq_put_u64le(v, svc);
 
     // Timestamp
@@ -4032,9 +4031,9 @@ void P2P::loop(){
                         auto rd_u64le = [](const uint8_t* p){ uint64_t z=0; for(int i=0;i<8;i++) z |= ((uint64_t)p[i]) << (8*i); return z; };
                         ps.version  = rd_u32le(m.payload.data());
                         ps.features = rd_u64le(m.payload.data()+4);
-                        // Respect remote capability for index-by-height.
-                        bool remote_index = (ps.features & MIQ_FEAT_INDEX_BY_HEIGHT) != 0;
-                        g_peer_index_capable[(Sock)ps.sock] = remote_index;
+                        if ((ps.features & MIQ_FEAT_INDEX_BY_HEIGHT) != 0) {
+                            g_peer_index_capable[(Sock)ps.sock] = true;
+                        }
                     }
 
                     auto inv_tick = [&](unsigned add)->bool{
@@ -4126,7 +4125,9 @@ void P2P::loop(){
                         }
                         ps.version  = peer_ver;
                         ps.features = peer_services;
-                        g_peer_index_capable[(Sock)s] = ( (peer_services & MIQ_FEAT_INDEX_BY_HEIGHT) != 0 );
+                        if ( (peer_services & MIQ_FEAT_INDEX_BY_HEIGHT) != 0 ) {
+                            g_peer_index_capable[(Sock)s] = true;
+                        }
                         if (ps.version > 0 && ps.version < min_peer_version_) {
                             log_warn(std::string("P2P: dropping old peer ") + ps.ip);
                             dead.push_back(s);
