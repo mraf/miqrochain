@@ -43,9 +43,10 @@ x86/
 miqro.conf
 miqdata/
 **/bans.txt
+local_tests/
 
 # --- OS junk ---
 .DS_Store
 Thumbs.db
-
+.cookie
 *.patch
