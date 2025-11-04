@@ -429,6 +429,21 @@ Tip Chain::tip() const {
     return tip_;
 }
 
+int64_t Chain::get_header_height(const std::vector<uint8_t>& h) const {
+    MIQ_CHAIN_GUARD();
+
+    auto it = header_index_.find(hk(h));
+    if (it != header_index_.end()) {
+        return static_cast<int64_t>(it->second.height);
+    }
+
+    if (h == tip_.hash) {
+        return static_cast<int64_t>(tip_.height);
+    }
+
+    return -1;
+}
+
 bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
     MIQ_CHAIN_GUARD();
 
