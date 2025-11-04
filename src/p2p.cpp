@@ -181,6 +181,19 @@
 #define MIQ_INDEX_PIPELINE 32
 #endif
 
+#ifndef MIQ_HDR_PIPELINE
+#define MIQ_HDR_PIPELINE 1
+#endif
+#ifndef MIQ_SYNC_SEQUENTIAL_DEFAULT
+#define MIQ_SYNC_SEQUENTIAL_DEFAULT 1
+#endif
+#ifndef MIQ_CONTINUATION_BATCH
+#define MIQ_CONTINUATION_BATCH 1
+#endif
+#ifndef MIQ_SEED_DOMAIN
+#define MIQ_SEED_DOMAIN "seed.miqrochain.org"
+#endif
+
 #ifndef MAX_BLOCK_SIZE
 #define MIQ_FALLBACK_MAX_BLOCK_SZ (32u * 1024u * 1024u)
 #else
@@ -847,6 +860,7 @@ static inline bool ibd_or_fetch_active(const miq::PeerState& ps, int64_t nowms) 
 }
 
 static bool g_seed_mode = false;
+static bool g_sequential_sync = (MIQ_SYNC_SEQUENTIAL_DEFAULT != 0);
 static inline int miq_outbound_target(){
     // For client nodes (MIQ_FORCE_CLIENT=1), limit to 1-2 connections to prevent connection storms
     bool is_client = std::getenv("MIQ_FORCE_CLIENT") != nullptr;
@@ -854,6 +868,12 @@ static inline int miq_outbound_target(){
         return 2; // Allow max 2 connections for client nodes
     }
     return g_seed_mode ? MIQ_SEED_MODE_OUTBOUND_TARGET : MIQ_OUTBOUND_TARGET;
+}
+
+static inline bool hostname_is_seed(){
+    const char* env_host = std::getenv("MIQ_PUBLIC_HOSTNAME");
+    if (env_host && *env_host) return std::string(env_host) == MIQ_SEED_DOMAIN;
+    return false;
 }
 
 namespace {
@@ -2046,6 +2066,10 @@ bool P2P::start(uint16_t port){
       }
     if (!g_seed_mode) {
         g_seed_mode = env_truthy(MIQ_SEED_MODE_ENV);
+    if (const char* seq = std::getenv("MIQ_SEQUENTIAL_SYNC")) {
+        g_sequential_sync = (seq[0]=='1'||seq[0]=='y'||seq[0]=='Y'||seq[0]=='t'||seq[0]=='T');
+    }
+    if (!g_seed_mode && hostname_is_seed()) g_seed_mode = true;
     }
 
     {
@@ -2502,7 +2526,7 @@ void P2P::start_sync_with_peer(PeerState& ps){
 }
 
 void P2P::fill_index_pipeline(PeerState& ps){
-    const uint32_t pipe = (uint32_t)MIQ_INDEX_PIPELINE;
+    const uint32_t pipe = g_sequential_sync ? 1u : (uint32_t)MIQ_INDEX_PIPELINE;
     if (!peer_is_index_capable((Sock)ps.sock)) return;
 
     // SYNC STATE FIX: Ensure next_index is consistent with current chain height
@@ -2534,7 +2558,9 @@ void P2P::request_block_index(PeerState& ps, uint64_t index){
 
 void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     if (h.size()!=32) return;
-    size_t base_default = g_logged_headers_done ? (size_t)128 : (size_t)512;
+    size_t base_default = g_sequential_sync ? (size_t)1
+                                            : (g_logged_headers_done ? (size_t)128 : (size_t)512);
+
   
     const size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : base_default;
     if (!check_rate(ps, "get", 1.0, now_ms())) return;
@@ -4322,7 +4348,7 @@ void P2P::loop(){
                             maybe_mark_headers_done(true);
                         } else {
                             maybe_mark_headers_done(false);
-                            // Ask for more (gentle pipelining)
+
                             int pushed = 0;
                             std::vector<std::vector<uint8_t>> locator;
                             chain_.build_locator(locator);
@@ -4334,7 +4360,7 @@ void P2P::loop(){
                             auto m2  = encode_msg("getheaders", pl2);
                             while (can_accept_hdr_batch(ps, now_ms()) &&
                                    check_rate(ps, "hdr", 1.0, now_ms()) &&
-                                   pushed < 2) {
+                                   pushed < MIQ_HDR_PIPELINE) {
                                 ps.sent_getheaders = true;
                                 (void)send_or_close(s, m2);
                                 ps.inflight_hdr_batches++;
@@ -4395,7 +4421,14 @@ void P2P::loop(){
                                 P2P_TRACE("DEBUG: Found block at index " + std::to_string(idx64) + ", size=" + std::to_string(raw.size()) + " bytes");
                                 if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
                                     send_block(s, raw);
-                                    P2P_TRACE("TX " + ps.ip + " cmd=block height=" + std::to_string(idx64) + " (response to getbi)");
+                                    if (MIQ_CONTINUATION_BATCH >= 1) {
+                                        Block nb;
+                                        if (chain_.get_block_by_index((size_t)(idx64+1), nb)) {
+                                            auto nh = nb.block_hash();
+                                            auto inv = encode_msg("invb", nh);
+                                            (void)send_or_close(s, inv);
+                                        }
+                                    }
                                 } else {
                                     P2P_TRACE("SKIP " + ps.ip + " cmd=getbi height=" + std::to_string(idx64) + " (block too large)");
                                 }
@@ -4438,26 +4471,12 @@ void P2P::loop(){
                             // accept/process
                             handle_incoming_block(s, m.payload);
 
-                            // After any processed block, opportunistically fan-out more wants across peers.
-                            const size_t base_cap = caps_.max_blocks ? caps_.max_blocks
-                                                                      : (!g_logged_headers_done ? (size_t)128 : (size_t)32);
                             std::vector<std::vector<uint8_t>> want2;
-                            chain_.next_block_fetch_targets(want2, base_cap);
+                            chain_.next_block_fetch_targets(want2, /*cap=*/1);
                             g_sync_wants_active.store(!want2.empty());
                             if (!want2.empty()) {
-                                std::vector<Sock> cands;
-                                // NOTE: g_peers_mu is already locked by the outer scope at line 2685
-                                for (auto& kvp : peers_) if (kvp.second.verack_ok) cands.push_back(kvp.first);
-                                if (cands.empty()) cands.push_back(s); // fallback to current peer
-                                for (const auto& h2 : want2) {
-                                    const std::string key2 = hexkey(h2);
-                                    if (g_global_inflight_blocks.count(key2)) continue;
-                                    // Skip blocks that are already stored as orphans
-                                    if (orphans_.count(key2)) continue;
-                                    Sock t = rr_pick_peer_for_key(key2, cands);
-                                    auto itT = peers_.find(t);
-                                    if (itT != peers_.end()) request_block_hash(itT->second, h2);
-                                }
+                                // Stick to the same peer when possible to keep strict ordering.
+                                request_block_hash(ps, want2[0]);
                             }
 
                             if (ps.syncing) {
@@ -4465,26 +4484,9 @@ void P2P::loop(){
                                 fill_index_pipeline(ps);
                             }
                         } else {
-                            // Malformed/empty payload; keep the pipeline moving with a fan-out.
-                            const size_t base_cap = caps_.max_blocks ? caps_.max_blocks
-                                                                      : (!g_logged_headers_done ? (size_t)2048 : (size_t)256);
-                            std::vector<std::vector<uint8_t>> want2;
-                            chain_.next_block_fetch_targets(want2, base_cap);
-                            if (!want2.empty()) {
-                                std::vector<Sock> cands;
-                                // NOTE: g_peers_mu is already locked by the outer scope at line 2685
-                                for (auto& kvp : peers_) if (kvp.second.verack_ok) cands.push_back(kvp.first);
-                                if (cands.empty()) cands.push_back(s); // fallback to current peer
-                                for (const auto& h2 : want2) {
-                                    const std::string key2 = hexkey(h2);
-                                    if (g_global_inflight_blocks.count(key2)) continue;
-                                    // Skip blocks that are already stored as orphans
-                                    if (orphans_.count(key2)) continue;
-                                    Sock t = rr_pick_peer_for_key(key2, cands);
-                                    auto itT = peers_.find(t);
-                                    if (itT != peers_.end()) request_block_hash(itT->second, h2);
-                                }
-                            }
+                            std::vector<std::vector<uint8_t>> want3;
+                            chain_.next_block_fetch_targets(want3, /*cap=*/1);
+                            if (!want3.empty()) request_block_hash(ps, want3[0]);
                         }
                       
                     } else if (cmd == "invtx") {
