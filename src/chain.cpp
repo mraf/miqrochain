@@ -437,9 +437,8 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         // before genesis init
     } else {
         if (!header_exists(h.prev_hash) && h.prev_hash != tip_.hash && !have_block(h.prev_hash)) {
-            err = "unknown parent header";
-            return false;
-        }
+        err = "";
+    }
     }
 
     // Determine MTP & window on the header's own branch
