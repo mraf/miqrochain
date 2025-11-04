@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+include <cstddef>
 #include <vector>
 #include <utility>
 #include <unordered_map>
@@ -77,6 +78,7 @@ public:
 
     // Access tip safely (locks internally)
     Tip tip() const;
+    int64_t get_header_height(const std::vector<uint8_t>& hash) const;
 
     std::vector<std::pair<int64_t,uint32_t>> last_headers(size_t n) const;
 
