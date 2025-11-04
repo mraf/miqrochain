@@ -1349,12 +1349,26 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
             if(hash160(inx.pubkey)!=e.pkh){ err="pkh mismatch"; return false; }
             if(!crypto::ECDSA::verify(inx.pubkey, hash, inx.sig)){ err="bad signature"; return false; }
         #if MIQ_RULE_ENFORCE_LOW_S
-            if (!is_low_s64(inx.sig)) { err="high-S signature"; return false; }
+            if (!is_low_s64(inx.sig)) { err = "high-S signature"; return false; }
         #endif
-
-            if (!leq_max_money(e.value)) { err="utxo>MAX_MONEY"; return false; }
-            if (!add_u64_safe(in, e.value, tmp)) { err="tx in overflow"; return false; }
-            in = tmp;
+            // Verify the signature is valid for this input
+        std::vector<uint8_t> txHash = tx.txid();
+            if (txHash.size() != 32 || inx.sig.size() != 64) { err = "invalid sig size"; return false; }
+            if (!miq::crypto::ECDSA::verify(inx.pubkey, txHash, inx.sig)) {
+                err = "bad signature"; 
+                return false;
+            }  
+    // Verify the public key matches the UTXO's address (HASH160)
+    std::vector<uint8_t> pkHash;
+    miq::hash160(inx.pubkey, pkHash);
+    if (pkHash != e.pkh) {
+        err = "pubkey hash mismatch";
+        return false;
+    }
+    // Sum input values (after signature check to avoid expensive crypto on invalid tx)
+    if (!leq_max_money(e.value)) { err = "utxo>MAX_MONEY"; return false; }
+    if (!add_u64_safe(in, e.value, tmp)) { err = "tx in overflow"; return false; }
+    in = tmp;
         }
         if (!leq_max_money(in)) { err="sum(in)>MAX_MONEY"; return false; }
 
