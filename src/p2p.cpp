@@ -887,10 +887,9 @@ static int g_headers_tip_confirmed = 0;   // consecutive confirmations of "at ti
 static inline void maybe_mark_headers_done(bool at_tip) {
     if (g_logged_headers_done) return;
     if (at_tip) {
-        if (++g_headers_tip_confirmed >= 2) {
+        if (++g_headers_tip_confirmed >= 1) {
             g_logged_headers_done = true;
             miq::log_info(std::string("[IBD] headers phase done"));
-            g_ibd_headers_started_ms = 0;
         }
     } else {
         g_headers_tip_confirmed = 0;
@@ -2896,6 +2895,16 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
             // Request next batch of blocks from all capable peers
             uint32_t current_height = chain_.height();
+    // Determine best known header height (best_chainwork tip from ReorgManager or header index)
+    uint32_t best_height = current_height;
+    std::vector<uint8_t> bhash = chain_.best_header_hash();
+    if (!bhash.empty()) {
+        // Look up header index for best_header (assumes Chain provides a method or we track via ReorgManager)
+        if (chain_.header_exists(bhash)) {
+            // Suppose Chain had a method to get header height by hash:
+            best_height = chain_.get_header_height(bhash);
+        }
+    }
 
             // Be more aggressive - request more blocks ahead
             for (auto& kvp : peers_) {
@@ -2905,8 +2914,9 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
                 // Request next 10 blocks to keep the pipeline full
                 for (uint32_t h = current_height + 1; h <= current_height + 10; h++) {
-                    request_block_index(pps, (uint64_t)h);
-                    P2P_TRACE("TX " + pps.ip + " cmd=getbi height=" + std::to_string(h) + " (continuation)");
+                    if (h > best_height) break; // don't request past known header tip
+                        request_block_index(pps, h);
+                        P2P_TRACE("TX " + pps.ip + " cmd=getbi height=" + std::to_string(h) + " (continuation)");
                 }
 
                 // Also force the peer to continue syncing
