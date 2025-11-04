@@ -1357,9 +1357,7 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
                 err = "bad signature"; 
                 return false;
             }  
-    // Verify the public key matches the UTXO's address (HASH160)
-    std::vector<uint8_t> pkHash;
-    miq::hash160(inx.pubkey, pkHash);
+    std::vector<uint8_t> pkHash = miq::hash160(inx.pubkey);
     if (pkHash != e.pkh) {
         err = "pubkey hash mismatch";
         return false;
