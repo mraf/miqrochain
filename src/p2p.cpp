@@ -979,7 +979,7 @@ namespace {
 namespace {
   static std::unordered_map<Sock, std::unordered_map<uint64_t,int64_t>> g_inflight_index_ts;
   static std::unordered_map<Sock, std::deque<uint64_t>> g_inflight_index_order;
-  static std::unordered_set<uint64_t> g_global_index_inflight;
+  static int64_t g_stall_retry_ms = MIQ_P2P_STALL_RETRY_MS; // runtime-tunable via env
 }
 
 static inline bool peer_is_index_capable(Sock s) {
@@ -2539,56 +2539,20 @@ void P2P::fill_index_pipeline(PeerState& ps){
     }
 
     while (ps.inflight_index < pipe) {
-        if (g_global_index_inflight.count(idx)) {
-            continue;
-        }
-        // Only count as inflight if we actually queued it (send_or_close succeeded).
-        const auto before = g_inflight_index_order[(Sock)ps.sock].size();
+        uint64_t idx = ps.next_index++;
         request_block_index(ps, idx);
-        const auto after  = g_inflight_index_order[(Sock)ps.sock].size();
-        if (after > before) {
-            ps.inflight_index++;
-        }
+        ps.inflight_index++;
     }
 }
-
-void P2P::clear_fulfilled_indices_up_to_height(uint64_t new_h){
-     std::vector<Sock> sockets;
-     { std::lock_guard<std::mutex> lk(g_peers_mu);
-       for (auto& kv : peers_) sockets.push_back(kv.first); }
-     for (auto s : sockets) {
-         auto it = g_inflight_index_ts.find(s);
-         if (it == g_inflight_index_ts.end()) continue;
-         auto& mp = it->second;
-         for (auto it2 = mp.begin(); it2 != mp.end(); ) {
-             if (it2->first <= new_h) it2 = mp.erase(it2);
-             else ++it2;
-         }
-         auto itq = g_inflight_index_order.find(s);
-         if (itq != g_inflight_index_order.end()) {
-             auto& q = itq->second;
-             while (!q.empty() && q.front() <= new_h) q.pop_front();
-         }
-     }
 
 void P2P::request_block_index(PeerState& ps, uint64_t index){
     uint8_t p[8];
     for (int i=0;i<8;i++) p[i] = (uint8_t)((index >> (8*i)) & 0xFF);
-    if (g_global_index_inflight.count(index)) return;
-    std::vector<uint8_t> pl(8); for (int i=0;i<8;i++) pl[i]=(uint8_t)((index>>(8*i))&0xFF);
-    auto m = encode_msg("getbi", pl);
-    if (send_or_close(ps.sock, m)) {
+    auto msg = encode_msg("getbi", std::vector<uint8_t>(p, p+8));
+    if (send_or_close(ps.sock, msg)) {
+        // Track inflight timestamp and ordering per-peer for oldest-first retries
         g_inflight_index_ts[(Sock)ps.sock][index] = now_ms();
         g_inflight_index_order[(Sock)ps.sock].push_back(index);
-        g_global_index_inflight.insert(index);
-    }
-  if (!g_global_index_inflight.empty()) {
-        std::vector<uint64_t> done;
-        done.reserve(g_global_index_inflight.size());
-        for (uint64_t h : g_global_index_inflight) {
-            if (h <= new_h) done.push_back(h);
-        }
-        for (uint64_t h : done) g_global_index_inflight.erase(h);
     }
 }
 
@@ -4507,26 +4471,22 @@ void P2P::loop(){
                             // accept/process
                             handle_incoming_block(s, m.payload);
 
-                            if (!ps.syncing) {
-                                // hash-mode continuation (only when not in index sync)
-                                std::vector<std::vector<uint8_t>> want2;
-                                chain_.next_block_fetch_targets(want2, /*cap=*/1);
-                                g_sync_wants_active.store(!want2.empty());
-                                if (!want2.empty()) {
-                                    // Keep strict ordering by sticking to same peer where possible
-                                    request_block_hash(ps, want2[0]);
-                                }
-                            } else {
-                                // index-mode continuation
+                            std::vector<std::vector<uint8_t>> want2;
+                            chain_.next_block_fetch_targets(want2, /*cap=*/1);
+                            g_sync_wants_active.store(!want2.empty());
+                            if (!want2.empty()) {
+                                // Stick to the same peer when possible to keep strict ordering.
+                                request_block_hash(ps, want2[0]);
+                            }
+
+                            if (ps.syncing) {
                                 if (ps.inflight_index > 0) ps.inflight_index--;
                                 fill_index_pipeline(ps);
                             }
                         } else {
-                            if (!ps.syncing) {
-                                std::vector<std::vector<uint8_t>> want3;
-                                chain_.next_block_fetch_targets(want3, /*cap=*/1);
-                                if (!want3.empty()) request_block_hash(ps, want3[0]);
-                            }
+                            std::vector<std::vector<uint8_t>> want3;
+                            chain_.next_block_fetch_targets(want3, /*cap=*/1);
+                            if (!want3.empty()) request_block_hash(ps, want3[0]);
                         }
                       
                     } else if (cmd == "invtx") {
