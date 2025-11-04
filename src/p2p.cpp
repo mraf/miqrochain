@@ -2902,7 +2902,10 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
         // Look up header index for best_header (assumes Chain provides a method or we track via ReorgManager)
         if (chain_.header_exists(bhash)) {
             // Suppose Chain had a method to get header height by hash:
-            best_height = chain_.get_header_height(bhash);
+            {
+                int64_t hh = chain_.get_header_height(bhash);
+                best_height = (hh >= 0) ? hh : static_cast<int64_t>(chain_.tip().height);
+            }
         }
     }
 
@@ -4037,7 +4040,10 @@ void P2P::loop(){
                 std::vector<uint8_t> h(32);
                 auto hv=[](char c)->int{ if(c>='0'&&c<='9')return c-'0';
                                          if(c>='a'&&c<='f')return 10+(c-'a');
-                                         if(c>='A'&&c<='F')return 10+(c-'A'); return 0; };
+                                         if (c>='A' && c<='F')
+                                             return 10 + (c - 'A');
+                                         return 0;
+                                     };
                 for (size_t i=0;i<32;i++) h[i] = (uint8_t)((hv(k[2*i])<<4)|hv(k[2*i+1]));
                 return h;
             };
