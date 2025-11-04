@@ -4469,7 +4469,42 @@ void P2P::loop(){
                             g_inflight_block_ts[(Sock)s].erase(bh);
                             g_global_inflight_blocks.erase(bh);
                             // accept/process
+                            uint64_t old_height = chain_.height();
                             handle_incoming_block(s, m.payload);
+
+                            if (ps.inflight_index > 0) {
+                                // Identify delivered block index if possible
+                                auto block_hash_vec = hb.block_hash();
+                                uint64_t delivered_idx = 0;
+                                std::vector<uint8_t> idx_hash;
+                                for (auto it = g_inflight_index_ts[(Sock)s].begin(); it != g_inflight_index_ts[(Sock)s].end(); ++it) {
+                                    if (chain_.get_hash_by_index(it->first, idx_hash) && idx_hash == block_hash_vec) {
+                                        delivered_idx = it->first;
+                                        break;
+                                    }
+                                }
+                                if (delivered_idx == 0) {
+                                    uint64_t newHeight = chain_.height();
+                                    if (newHeight > old_height) {
+                                        delivered_idx = old_height + 1;
+                                    } else {
+                                        // Fallback: assume the last requested index
+                                        delivered_idx = (ps.next_index > 0 ? ps.next_index - 1 : 0);
+                                    }
+                                }
+                                if (delivered_idx != 0) {
+                                    auto it_idx = g_inflight_index_ts[(Sock)s].find(delivered_idx);
+                                    if (it_idx != g_inflight_index_ts[(Sock)s].end()) {
+                                        g_inflight_index_ts[(Sock)s].erase(it_idx);
+                                    }
+                                    auto& dq_idx = g_inflight_index_order[(Sock)s];
+                                    auto dq_it = std::find(dq_idx.begin(), dq_idx.end(), delivered_idx);
+                                    if (dq_it != dq_idx.end()) {
+                                        dq_idx.erase(dq_it);
+                                    }
+                                }
+                                ps.inflight_index--;
+                            }
 
                             std::vector<std::vector<uint8_t>> want2;
                             chain_.next_block_fetch_targets(want2, /*cap=*/1);
@@ -4486,7 +4521,24 @@ void P2P::loop(){
                         } else {
                             std::vector<std::vector<uint8_t>> want3;
                             chain_.next_block_fetch_targets(want3, /*cap=*/1);
+                            g_sync_wants_active.store(!want3.empty());
                             if (!want3.empty()) request_block_hash(ps, want3[0]);
+                        uint64_t missing_idx = 0;
+                        std::vector<uint8_t> idx_hash2;
+                        if (!want3.empty()) {
+                            auto missing_hash = want3[0];
+                            for (auto it = g_inflight_index_ts[(Sock)s].begin(); it != g_inflight_index_ts[(Sock)s].end(); ++it) {
+                                if (chain_.get_hash_by_index(it->first, idx_hash2) && idx_hash2 == missing_hash) {
+                                    missing_idx = it->first;
+                                    g_inflight_index_ts[(Sock)s].erase(it);
+                                    break;
+                                }
+                            }
+                        }
+                        if (ps.syncing) {
+                            if (ps.inflight_index > 0) ps.inflight_index--;
+                            fill_index_pipeline(ps);
+                          }  
                         }
                       
                     } else if (cmd == "invtx") {
