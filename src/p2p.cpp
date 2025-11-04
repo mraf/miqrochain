@@ -4079,6 +4079,15 @@ void P2P::loop(){
                 g_inflight_index_ts.erase(s_dead);
                 g_inflight_index_order.erase(s_dead);
 
+                {
+                    auto it_idx = g_inflight_index_ts.find(s_dead);
+                    if (it_idx != g_inflight_index_ts.end()) {
+                        for (const auto &kvh : it_idx->second) {
+                            g_global_index_inflight.erase(kvh.first);
+                        }
+                    }
+                }
+
                 // Finally, close & erase the dead peer.
                 gate_on_close(s_dead);
                 CLOSESOCK(s_dead);
@@ -4952,8 +4961,12 @@ void P2P::loop(){
                     ps.sent_getheaders = false;
                     ps.syncing = true;
                     ps.next_index = chain_.height() + 1;
-                    request_block_index(ps, ps.next_index);
-                    ps.inflight_index++;
+                    {
+                        auto before = g_inflight_index_order[(Sock)ps.sock].size();
+                        request_block_index(ps, ps.next_index);
+                        auto after  = g_inflight_index_order[(Sock)ps.sock].size();
+                        if (after > before) ps.inflight_index++;
+                    }
                 }
             }
 #endif
