@@ -560,6 +560,13 @@ std::vector<uint8_t> Chain::best_header_hash() const {
     return m.hash;
 }
 
+uint64_t Chain::best_header_height() const {
+    MIQ_CHAIN_GUARD();
+    if (best_header_key_.empty()) return tip_.height;
+    const auto& m = header_index_.at(best_header_key_);
+    return m.height;
+}
+
 bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     MIQ_CHAIN_GUARD();
     if (!validate_header(h, err)) return false;

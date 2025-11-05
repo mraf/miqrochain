@@ -88,6 +88,7 @@ public:
     const UTXOSet& utxo() const { return utxo_; }
 
     uint64_t height() const { return tip_.height; }
+    uint64_t best_header_height() const;  // Height of best known header (may be ahead of tip)
     uint64_t subsidy_for_height(uint64_t height) const;
 
     bool get_block_by_index(size_t idx, Block& out) const;
