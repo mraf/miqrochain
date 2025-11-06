@@ -2886,61 +2886,51 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
         g_last_progress_ms = now_ms();
         g_last_progress_height = chain_.height();
 
-        // SUPER AGGRESSIVE continuation: immediately request more blocks when we receive one
-        // This helps prevent stalling after receiving just a few blocks
-        static int64_t last_continuation_request = 0;
-        int64_t now = now_ms();
-        if (now - last_continuation_request > 500) {  // More frequent requests (every 500ms)
-            last_continuation_request = now;
+        // Request next block immediately after accepting one (Bitcoin-style sequential sync)
+        // This is more efficient than batch requests and prevents over-requesting
+        uint32_t current_height = chain_.height();
+        uint32_t next_height = current_height + 1;
 
-            // Request next batch of blocks from all capable peers
-            uint32_t current_height = chain_.height();
-    // Determine best known header height (best_chainwork tip from ReorgManager or header index)
-    uint32_t best_height = current_height;
-    std::vector<uint8_t> bhash = chain_.best_header_hash();
-    if (!bhash.empty()) {
-        // Look up header index for best_header (assumes Chain provides a method or we track via ReorgManager)
-        if (chain_.header_exists(bhash)) {
-            // Suppose Chain had a method to get header height by hash:
-            {
-                int64_t hh = chain_.get_header_height(bhash);
-                best_height = (hh >= 0) ? hh : static_cast<int64_t>(chain_.tip().height);
+        // During IBD, always request the next block from peers
+        // The peer will respond with the block if they have it, or ignore if they don't
+        int requested_count = 0;
+        for (auto& kvp : peers_) {
+            auto& pps = kvp.second;
+            if (!pps.verack_ok) continue;
+            if (!peer_is_index_capable((Sock)pps.sock)) continue;
+
+            // Request only the NEXT block (not a batch)
+            request_block_index(pps, next_height);
+            log_info("TX " + pps.ip + " cmd=getbi height=" + std::to_string(next_height) + " (next block after accept)");
+            requested_count++;
+
+            // Update peer sync state
+            pps.syncing = true;
+            if (pps.inflight_index == 0) {
+                pps.next_index = next_height;
+                fill_index_pipeline(pps);
             }
         }
-    }
 
-            // Be more aggressive - request more blocks ahead
-            for (auto& kvp : peers_) {
-                auto& pps = kvp.second;
-                if (!pps.verack_ok) continue;
-                if (!peer_is_index_capable((Sock)pps.sock)) continue;
-
-                // Request next 10 blocks to keep the pipeline full
-                for (uint32_t h = current_height + 1; h <= current_height + 10; h++) {
-                    if (h > best_height) break; // don't request past known header tip
-                        request_block_index(pps, h);
-                        P2P_TRACE("TX " + pps.ip + " cmd=getbi height=" + std::to_string(h) + " (continuation)");
-                }
-
-                // Also force the peer to continue syncing
-                pps.syncing = true;
-                if (pps.inflight_index == 0) {
-                    pps.next_index = current_height + 1;
-                    fill_index_pipeline(pps);
-                    P2P_TRACE("TX " + pps.ip + " forced index pipeline refill at height=" + std::to_string(pps.next_index));
-                }
-            }
-
-            miq::log_info("Aggressive continuation: requested blocks " + std::to_string(current_height + 1) +
-                         " to " + std::to_string(current_height + 10) + " from all peers");
-        miq::log_info("NOTE: If blocks beyond " + std::to_string(current_height) + " are not available, " +
-                     "the seed node may have headers but not block data for those heights");
+        if (requested_count > 0) {
+            log_info("Requested next block " + std::to_string(next_height) + " after accepting " + std::to_string(current_height));
         }
 #if MIQ_ENABLE_HEADERS_FIRST
         {
             std::vector<std::vector<uint8_t>> want_tmp;
             chain_.next_block_fetch_targets(want_tmp, (size_t)32);
             bool at_tip = want_tmp.empty();
+
+            // DEBUG: Log why we think we're at tip
+            static int64_t last_tip_log = 0;
+            int64_t tip_now = now_ms();
+            if (tip_now - last_tip_log > 5000) {
+                log_info("[DEBUG] After block accept: at_tip=" + std::string(at_tip ? "true" : "false") +
+                        " want_tmp.size()=" + std::to_string(want_tmp.size()) +
+                        " height=" + std::to_string(chain_.height()));
+                last_tip_log = tip_now;
+            }
+
             maybe_mark_headers_done(at_tip);
         }
 #endif
@@ -3017,6 +3007,14 @@ void P2P::loop(){
     int64_t last_dial_ms = now_ms();
 
     while (running_) {
+        // DEBUG: Check running_ flag
+        static int64_t last_running_log = 0;
+        int64_t running_now = now_ms();
+        if (running_now - last_running_log > 1000) {
+            log_info("[DEBUG] while(running_) check: running_=" + std::string(running_ ? "true" : "false"));
+            last_running_log = running_now;
+        }
+
         if ((int)outbound_count() < miq_outbound_target() && g_listen_port != 0) {
             int64_t tnow = now_ms();
             if (tnow - last_dial_ms > MIQ_DIAL_INTERVAL_MS) {
@@ -3698,12 +3696,33 @@ void P2P::loop(){
                 }
             }
 
-            // Implement aggressive refetch when stalled
+            // Implement aggressive refetch when stalled OR proactive pipeline during IBD
             int64_t refetch_interval = headers_done ? 5000 : 10000;  // 5s after headers, 10s before
-            if (height_stalled && (now - last_refetch_time > refetch_interval)) {
-                last_refetch_time = now;
+
+            // DEBUG: Log refetch check
+            static int64_t last_debug_log = 0;
+            if (now - last_debug_log > 1000) {
+                log_info("[DEBUG] Refetch check: now=" + std::to_string(now) + " last_refetch=" + std::to_string(last_refetch_time) +
+                        " diff=" + std::to_string(now - last_refetch_time) + " height=" + std::to_string(current_height));
+                last_debug_log = now;
+            }
+
+            // Use continuous batch pipeline: request next blocks every 200ms
+            // This works both before AND after headers phase
+            bool should_refetch = false;
+            if (now - last_refetch_time > 200) {
+                // Proactive pipeline - keep requesting the next batch of blocks
+                should_refetch = true;
+                log_info("[SYNC] Proactive pipeline: requesting next block (height=" + std::to_string(current_height) + ")");
+            } else if (height_stalled && (now - last_refetch_time > refetch_interval)) {
+                // Stall-based refetch (fallback)
+                should_refetch = true;
                 log_warn("[SYNC] Height stalled at " + std::to_string(current_height) + " for " +
                         std::to_string((now - last_height_time) / 1000) + "s - forcing refetch");
+            }
+
+            if (should_refetch) {
+                last_refetch_time = now;
 
                 // Check if we're in a headers-only state
                 static int64_t last_headers_only_warning = 0;
@@ -3717,16 +3736,20 @@ void P2P::loop(){
                 }
 
                 // Force refetch next blocks from all capable peers
+                // Request 50 blocks at a time (aggressive batch to work around seed issues)
                 bool refetch_sent = false;
                 for (auto& kvp : peers_) {
                     auto& pps = kvp.second;
                     if (!pps.verack_ok) continue;
                     if (!peer_is_index_capable((Sock)pps.sock)) continue;
 
-                    // Request next batch of blocks by index
-                    for (uint32_t h = current_height + 1; h <= current_height + 20; h++) {
+                    // Request next 50 blocks in a batch
+                    // Only log the first and last to reduce log spam
+                    for (uint32_t h = current_height + 1; h <= current_height + 50; h++) {
                         request_block_index(pps, (uint64_t)h);
-                        P2P_TRACE("TX " + pps.ip + " cmd=getbi height=" + std::to_string(h) + " (refetch)");
+                        if (h == current_height + 1 || h == current_height + 50) {
+                            log_info("TX " + pps.ip + " cmd=getbi height=" + std::to_string(h) + " (refetch batch)");
+                        }
                     }
                     refetch_sent = true;
                 }
@@ -3800,7 +3823,15 @@ void P2P::loop(){
         }
 
         trickle_flush();
-      
+
+        // DEBUG: Log P2P loop iteration
+        static int64_t last_loop_log = 0;
+        int64_t loop_now = now_ms();
+        if (loop_now - last_loop_log > 1000) {
+            log_info("[DEBUG] P2P loop iteration at " + std::to_string(loop_now));
+            last_loop_log = loop_now;
+        }
+
         // --- build pollfd list (SNAPSHOT of peers_) ---
         std::lock_guard<std::mutex> lk(g_peers_mu);
         std::vector<PollFD> fds;
@@ -3847,6 +3878,34 @@ void P2P::loop(){
 #else
         int rc = poll(fds.data(), (nfds_t)fds.size(), 200);
 #endif
+
+        // DEBUG: Log poll results if it returns immediately (tight loop detection)
+        static int64_t last_poll_time = 0;
+        static int tight_loop_count = 0;
+        int64_t poll_now = now_ms();
+        if (poll_now - last_poll_time < 50 && rc > 0) {
+            // Poll returned in less than 50ms - might be a tight loop
+            tight_loop_count++;
+            static int64_t last_tight_loop_log = 0;
+            if (poll_now - last_tight_loop_log > 1000) {
+                log_warn("[DEBUG] Poll tight loop detected: rc=" + std::to_string(rc) +
+                        " fds.size=" + std::to_string(fds.size()) +
+                        " time_since_last=" + std::to_string(poll_now - last_poll_time) + "ms" +
+                        " count=" + std::to_string(tight_loop_count));
+                last_tight_loop_log = poll_now;
+            }
+
+            // If we're in a tight loop for too long, force a sleep to prevent CPU burn
+            if (tight_loop_count > 100) {
+                log_warn("[DEBUG] Forcing 100ms sleep to break tight loop");
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                tight_loop_count = 0;
+            }
+        } else {
+            tight_loop_count = 0;
+        }
+        last_poll_time = poll_now;
+
         if (rc < 0) continue;
         {
             int64_t tnow = now_ms();
@@ -4356,6 +4415,40 @@ void P2P::loop(){
                             if (++ps.mis > 10) { dead.push_back(s); }
                             continue;
                         }
+
+                        // DEBUG: Log headers received
+                        log_info("[DEBUG] RX headers from " + ps.ip + " count=" + std::to_string(hs.size()) +
+                                " payload_size=" + std::to_string(m.payload.size()));
+
+                        // ACCEPT HEADERS INTO CHAIN
+                        size_t accepted = 0;
+                        bool used_reverse = false;
+                        std::string herr;
+                        for (const auto& h : hs) {
+                            if (chain_.accept_header(h, herr)) {
+                                accepted++;
+                            } else {
+                                // Client-side endianness tolerance: retry with reversed 32B fields
+                                BlockHeader hr = h;
+                                std::reverse(hr.prev_hash.begin(),   hr.prev_hash.end());
+                                std::reverse(hr.merkle_root.begin(), hr.merkle_root.end());
+                                if (chain_.accept_header(hr, herr)) {
+                                    accepted++;
+                                    used_reverse = true;
+                                }
+                            }
+                        }
+                        if (used_reverse) { g_hdr_flip[s] = true; }
+
+                        if (accepted > 0) {
+                            log_info("P2P: headers from " + ps.ip + " n=" + std::to_string(hs.size()) + " accepted=" + std::to_string(accepted));
+                            g_last_progress_ms = now_ms();
+                            g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
+                        } else if (hs.size() > 0) {
+                            log_warn("[DEBUG] Headers REJECTED from " + ps.ip + " n=" + std::to_string(hs.size()) +
+                                    " accepted=0 error=" + herr);
+                        }
+
                         g_peer_last_fetch_ms[(Sock)ps.sock] = now_ms();
                         g_last_hdr_ok_ms[(Sock)ps.sock]     = now_ms();
                         if (ps.inflight_hdr_batches > 0) ps.inflight_hdr_batches--;
@@ -4388,18 +4481,28 @@ void P2P::loop(){
 #endif
 
                     } else if (cmd == "invb") {
-                        if (!check_rate(ps, "inv", 0.5, now_ms())) {
-                            if (!ibd_or_fetch_active(ps, now_ms())) {
-                                bump_ban(ps, ps.ip, "inv-flood", now_ms());
-                            }
+                        // During IBD, allow higher rate of invb messages (don't rate limit)
+                        bool is_ibd = ibd_or_fetch_active(ps, now_ms());
+                        if (!is_ibd && !check_rate(ps, "inv", 0.5, now_ms())) {
+                            log_info("DEBUG: invb rate-limited from " + ps.ip);
+                            bump_ban(ps, ps.ip, "inv-flood", now_ms());
                             continue;
                         }
                         if (m.payload.size() == 32) {
-                            if (!inv_tick(1)) { continue; }
+                            if (!inv_tick(1)) {
+                                log_info("DEBUG: invb inv_tick failed from " + ps.ip);
+                                continue;
+                            }
                             auto k = hexkey(m.payload);
-                            if (!remember_inv(k)) { continue; }
+                            if (!remember_inv(k)) {
+                                log_info("DEBUG: invb duplicate (already seen) hash=" + k.substr(0, 16) + "... from " + ps.ip);
+                                continue;
+                            }
                             if (!chain_.have_block(m.payload)) {
+                                log_info("DEBUG: invb requesting block hash=" + k.substr(0, 16) + "... from " + ps.ip);
                                 request_block_hash(ps, m.payload);
+                            } else {
+                                log_info("DEBUG: invb already have block hash=" + k.substr(0, 16) + "... from " + ps.ip);
                             }
                         }
 
@@ -4408,6 +4511,21 @@ void P2P::loop(){
                         if (m.payload.size() == 32) {
                             std::string hash_hex = hexkey(m.payload);
                             P2P_TRACE("DEBUG: getb request for hash " + hash_hex + " from " + ps.ip);
+
+                            // During sync, refuse to serve blocks - we're syncing, not serving
+                            // Check if ANY peer is actively syncing (indicates we're still catching up)
+                            bool any_peer_syncing = false;
+                            for (const auto& kvp : peers_) {
+                                if (kvp.second.syncing) {
+                                    any_peer_syncing = true;
+                                    break;
+                                }
+                            }
+                            if (any_peer_syncing) {
+                                P2P_TRACE("DEBUG: Ignoring getb request while syncing (hash=" + hash_hex.substr(0, 16) + "... from " + ps.ip + ")");
+                                continue;
+                            }
+
                             Block b;
                             if (chain_.get_block_by_hash(m.payload, b)) {
                                 auto raw = ser_block(b);
@@ -4431,6 +4549,21 @@ void P2P::loop(){
                             uint64_t idx64 = 0;
                             for (int i=0;i<8;i++) idx64 |= ((uint64_t)m.payload[i]) << (8*i);
                             P2P_TRACE("DEBUG: getbi request for index " + std::to_string(idx64) + " from " + ps.ip);
+
+                            // During sync, refuse to serve blocks - we're syncing, not serving
+                            // Check if ANY peer is actively syncing (indicates we're still catching up)
+                            bool any_peer_syncing = false;
+                            for (const auto& kvp : peers_) {
+                                if (kvp.second.syncing) {
+                                    any_peer_syncing = true;
+                                    break;
+                                }
+                            }
+                            if (any_peer_syncing) {
+                                P2P_TRACE("DEBUG: Ignoring getbi request while syncing (height=" + std::to_string(idx64) + " from " + ps.ip + ")");
+                                continue;
+                            }
+
                             Block b;
                             if (chain_.get_block_by_index((size_t)idx64, b)) {
                                 auto raw = ser_block(b);
@@ -4530,31 +4663,27 @@ void P2P::loop(){
                                 request_block_hash(ps, want2[0]);
                             }
 
-                            if (ps.syncing) {
-                                if (ps.inflight_index > 0) ps.inflight_index--;
-                                fill_index_pipeline(ps);
-                            }
+                            // REMOVED: if (ps.syncing) condition - always refill pipeline after accepting block
+                            if (ps.inflight_index > 0) ps.inflight_index--;
+                            fill_index_pipeline(ps);
                         } else {
                             std::vector<std::vector<uint8_t>> want3;
                             chain_.next_block_fetch_targets(want3, /*cap=*/1);
                             g_sync_wants_active.store(!want3.empty());
                             if (!want3.empty()) request_block_hash(ps, want3[0]);
-                        uint64_t missing_idx = 0;
                         std::vector<uint8_t> idx_hash2;
                         if (!want3.empty()) {
                             auto missing_hash = want3[0];
                             for (auto it = g_inflight_index_ts[(Sock)s].begin(); it != g_inflight_index_ts[(Sock)s].end(); ++it) {
                                 if (chain_.get_hash_by_index(it->first, idx_hash2) && idx_hash2 == missing_hash) {
-                                    missing_idx = it->first;
                                     g_inflight_index_ts[(Sock)s].erase(it);
                                     break;
                                 }
                             }
                         }
-                        if (ps.syncing) {
-                            if (ps.inflight_index > 0) ps.inflight_index--;
-                            fill_index_pipeline(ps);
-                          }  
+                        // REMOVED: if (ps.syncing) condition - always refill pipeline after accepting block
+                        if (ps.inflight_index > 0) ps.inflight_index--;
+                        fill_index_pipeline(ps);
                         }
                       
                     } else if (cmd == "invtx") {
@@ -4759,6 +4888,10 @@ void P2P::loop(){
                             g_last_progress_ms = now_ms();
                             g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
                             g_last_hdr_ok_ms[(Sock)s] = g_last_progress_ms;
+                        } else if (hs.size() > 0) {
+                            // DEBUG: Log when headers are rejected
+                            log_warn("[DEBUG] Headers REJECTED from " + ps.ip + " n=" + std::to_string(hs.size()) +
+                                    " accepted=0 error=" + herr);
                         }
 
                         {
@@ -5048,7 +5181,8 @@ void P2P::loop(){
                     if (g != g_gate.end()) g->second.hs_last_ms = now_ms();
                     it_preview->second.awaiting_pong = false;
                     it_preview->second.last_ping_ms  = now_ms();
-                    continue; // skip close
+                    // DISABLED: continue; // skip close
+                    // This was causing infinite POLLHUP loop - we MUST close dead sockets
                 }
             }
 
@@ -5189,7 +5323,18 @@ void P2P::loop(){
             }
 #endif
         }
+
+        // DEBUG: Log end of P2P loop iteration
+        static int64_t last_end_log = 0;
+        int64_t end_now = now_ms();
+        if (end_now - last_end_log > 1000) {
+            log_info("[DEBUG] P2P loop iteration END at " + std::to_string(end_now));
+            last_end_log = end_now;
+        }
     }
+
+    // DEBUG: Log why while loop exited
+    log_info("[DEBUG] while(running_) loop EXITED! running_=" + std::string(running_ ? "true" : "false"));
 
     save_bans();
     save_addrs_to_disk(datadir_, addrv4_);

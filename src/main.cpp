@@ -1053,28 +1053,19 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out){
     const bool we_are_seed = compute_seed_role().we_are_seed;
     const bool seed_solo = we_are_seed && peers == 0;
 
-    // DEBUG: Log sync gate evaluation
-    log_info("DEBUG: compute_sync_gate - peers=" + std::to_string(peers) +
-             " we_are_seed=" + (we_are_seed ? "true" : "false") +
-             " seed_solo=" + (seed_solo ? "true" : "false"));
-
     if (!seed_solo && peers == 0) {
         why_out = "no peers";
-        log_info("DEBUG: sync gate FAILED - no peers");
         return false;
     }
 
     uint64_t h = chain.height();
-    log_info("DEBUG: sync gate - height=" + std::to_string(h));
 
     if (h == 0) {
         if (seed_solo) {
             why_out.clear();
-            log_info("DEBUG: sync gate PASSED - solo seed at height 0");
             return true; // allow solo mining from genesis regardless of timestamp
         }
         why_out = "headers syncing";
-        log_info("DEBUG: sync gate FAILED - headers syncing");
         return false;
     }
 
@@ -1082,7 +1073,6 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out){
     // This is necessary to bootstrap the chain and serve historical blocks to peers
     if (we_are_seed) {
         why_out.clear();
-        log_info("DEBUG: sync gate PASSED - seed node bypass (can serve blocks regardless of tip age)");
         return true;
     }
 
@@ -1093,7 +1083,6 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out){
         // Check if we have a reasonable number of blocks (more than just genesis)
         if (h >= 1) {
             why_out.clear();
-            log_info("DEBUG: sync gate PASSED - peer node with synced blocks (tip age check bypassed for historical sync)");
             return true;
         }
     }
