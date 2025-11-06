@@ -1037,6 +1037,9 @@ bool Chain::open(const std::string& dir){
     ensure_dir_exists(undo_dir(datadir_));
     (void)load_state();
 
+    // Rebuild header index from blocks if needed (for seed nodes with blocks but no headers)
+    rebuild_header_index_from_blocks();
+
 #if MIQ_HAVE_GCS_FILTERS
     {
         // Filters live under <datadir>/filters
@@ -1160,6 +1163,35 @@ bool Chain::load_state(){
     i += 8;
 
     return true;
+}
+
+void Chain::rebuild_header_index_from_blocks(){
+    MIQ_CHAIN_GUARD();
+
+    // Only rebuild if header index is empty but we have blocks
+    if (!header_index_.empty() || tip_.height == 0) {
+        return;
+    }
+
+    log_info("[DEBUG] Rebuilding header index from " + std::to_string(tip_.height) + " blocks...");
+
+    // Start from genesis (height 0)
+    for (uint64_t h = 0; h <= tip_.height; ++h) {
+        Block blk;
+        if (!get_block_by_index((size_t)h, blk)) {
+            log_warn("[DEBUG] Failed to read block at height " + std::to_string(h) + " during header index rebuild");
+            break;
+        }
+
+        // Add header to index
+        std::string err;
+        if (!accept_header(blk.header, err)) {
+            log_warn("[DEBUG] Failed to accept header at height " + std::to_string(h) + ": " + err);
+            break;
+        }
+    }
+
+    log_info("[DEBUG] Header index rebuild complete. header_index_size=" + std::to_string(header_index_.size()));
 }
 
 uint64_t Chain::subsidy_for_height(uint64_t h) const {
