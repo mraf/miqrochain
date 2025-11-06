@@ -3736,19 +3736,27 @@ void P2P::loop(){
                 }
 
                 // Force refetch next blocks from all capable peers
-                // Request 50 blocks at a time (aggressive batch to work around seed issues)
+                // Request blocks up to the best header height (or 50 blocks if no headers)
                 bool refetch_sent = false;
                 for (auto& kvp : peers_) {
                     auto& pps = kvp.second;
                     if (!pps.verack_ok) continue;
                     if (!peer_is_index_capable((Sock)pps.sock)) continue;
 
-                    // Request next 50 blocks in a batch
-                    // Only log the first and last to reduce log spam
-                    for (uint32_t h = current_height + 1; h <= current_height + 50; h++) {
+                    // Determine how many blocks to request
+                    uint32_t best_hdr_height = chain_.best_header_height();
+                    uint32_t max_height = (best_hdr_height > current_height)
+                        ? best_hdr_height
+                        : current_height + 50;  // Fallback to 50 blocks if no headers ahead
+
+                    // Request blocks up to max_height (or current_height + 50, whichever is smaller)
+                    uint32_t batch_end = std::min((uint32_t)max_height, (uint32_t)(current_height + 50));
+
+                    for (uint32_t h = current_height + 1; h <= batch_end; h++) {
                         request_block_index(pps, (uint64_t)h);
-                        if (h == current_height + 1 || h == current_height + 50) {
-                            log_info("TX " + pps.ip + " cmd=getbi height=" + std::to_string(h) + " (refetch batch)");
+                        if (h == current_height + 1 || h == batch_end) {
+                            log_info("TX " + pps.ip + " cmd=getbi height=" + std::to_string(h) +
+                                    " (refetch batch, best_hdr=" + std::to_string(best_hdr_height) + ")");
                         }
                     }
                     refetch_sent = true;

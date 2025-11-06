@@ -121,6 +121,7 @@ private:
 
     bool save_state();
     bool load_state();
+    void rebuild_header_index_from_blocks();  // Rebuild header index from stored blocks
 
     // key = hk(hash)
     std::unordered_map<std::string, HeaderMeta> header_index_;
