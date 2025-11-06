@@ -4663,9 +4663,9 @@ void P2P::loop(){
                                 request_block_hash(ps, want2[0]);
                             }
 
-                            // REMOVED: if (ps.syncing) condition - always refill pipeline after accepting block
-                            if (ps.inflight_index > 0) ps.inflight_index--;
+                            if (ps.syncing) {
                             fill_index_pipeline(ps);
+                          }
                         } else {
                             std::vector<std::vector<uint8_t>> want3;
                             chain_.next_block_fetch_targets(want3, /*cap=*/1);
@@ -4682,9 +4682,9 @@ void P2P::loop(){
                             }
                         }
                         // REMOVED: if (ps.syncing) condition - always refill pipeline after accepting block
-                        if (ps.inflight_index > 0) ps.inflight_index--;
+                        if (ps.syncing) {
                         fill_index_pipeline(ps);
-                        }
+                      }
                       
                     } else if (cmd == "invtx") {
                         if (!check_rate(ps, "inv", 0.25, now_ms())) {
