@@ -151,6 +151,9 @@ struct PeerState {
     // Exponential backoff for reconnection
     int64_t connection_failures{0};             // Consecutive connection failures
     int64_t next_retry_ms{0};                   // Don't retry before this time
+
+    // Track peer's block availability
+    uint64_t peer_tip_height{0};                // Highest block height peer has successfully sent us
 };
 
 // Lightweight read-only snapshot for RPC/UI
