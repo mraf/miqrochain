@@ -2898,12 +2898,16 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             auto& pps = kvp.second;
             if (!pps.verack_ok) continue;
             if (!peer_is_index_capable((Sock)pps.sock)) continue;
-
+            if (pps.peer_tip_height > 0 && next_height > pps.peer_tip_height) {
+                P2P_TRACE("DEBUG: Not requesting block " + std::to_string(next_height) + 
+                          " from " + pps.ip + " (at peer's tip)");
+                continue;
+            }
             // Request only the NEXT block (not a batch)
             request_block_index(pps, next_height);
-            log_info("TX " + pps.ip + " cmd=getbi height=" + std::to_string(next_height) + " (next block after accept)");
+            log_info("TX " + pps.ip + " cmd=getbi height=" + std::to_string(next_height) + 
+                     " (next block after accept)");
             requested_count++;
-
             // Update peer sync state
             pps.syncing = true;
             if (pps.inflight_index == 0) {
@@ -3650,13 +3654,20 @@ void P2P::loop(){
             // Debug logging for premature sync completion
             static bool debug_logged = false;
             if (!any_want && !any_inflight && headers_done && !debug_logged) {
-                log_info("[DEBUG] Sync completion check: any_want=" + std::string(any_want ? "true" : "false") +
-                         " any_inflight=" + std::string(any_inflight ? "true" : "false") +
-                         " headers_done=" + std::string(headers_done ? "true" : "false") +
-                         " height=" + std::to_string(chain_.height()));
-                debug_logged = true;
+                 log_info("[DEBUG] Sync completion check: any_want=" + std::string(any_want ? "true" : "false") +
+                          " any_inflight=" + std::string(any_inflight ? "true" : "false") +
+                          " headers_done=" + std::string(headers_done ? "true" : "false") +
+                          " height=" + std::to_string(chain_.height()));
+                 debug_logged = true;
             }
-
+            if (!any_want && !any_inflight && headers_done && !g_sync_green_logged) {
+                 g_sync_green_logged = true;
+                 log_info("P2P: fully synchronized (height=" + std::to_string(chain_.height()) + ")");
+                 for (auto &kvp : peers_) {
+                     kvp.second.syncing = false;
+                     kvp.second.inflight_index = 0;
+                 }
+            }
             // Improved sync completion logic: check if we have exhausted all sync methods
             const size_t current_height = chain_.height();
             bool can_try_index_sync = false;
@@ -4381,8 +4392,8 @@ void P2P::loop(){
                         }
                         ps.version  = peer_ver;
                         ps.features = peer_services;
-                        if ( (peer_services & MIQ_FEAT_INDEX_BY_HEIGHT) != 0 ) {
-                            g_peer_index_capable[(Sock)s] = true;
+                        if ((peer_services & MIQ_FEAT_INDEX_BY_HEIGHT) != 0) {
+                             g_peer_index_capable[(Sock)s] = true;
                         }
                         if (ps.version > 0 && ps.version < min_peer_version_) {
                             log_warn(std::string("P2P: dropping old peer ") + ps.ip);
@@ -4396,9 +4407,42 @@ void P2P::loop(){
                                 log_warn(std::string("P2P: dropping peer missing required features ") + ps.ip);
                                 dead.push_back(s); break;
                             }
+                    }
+
+                    if (m.payload.size() >= 80) {
+                        size_t pos = 80;
+                        if (pos < m.payload.size()) {
+                            uint64_t ua_len = m.payload[pos++];
+                            uint64_t ua_size;
+                            if (ua_len < 0xFD) {
+                                ua_size = ua_len;
+                            } else if (ua_len == 0xFD && pos + 2 <= m.payload.size()) {
+                                ua_size = (uint64_t)m.payload[pos] | ((uint64_t)m.payload[pos + 1] << 8);
+                                pos += 2;
+                            } else if (ua_len == 0xFE && pos + 4 <= m.payload.size()) {
+                                ua_size = (uint64_t)m.payload[pos] | ((uint64_t)m.payload[pos + 1] << 8) 
+                                          | ((uint64_t)m.payload[pos + 2] << 16) | ((uint64_t)m.payload[pos + 3] << 24);
+                                pos += 4;
+                            } else if (ua_len == 0xFF && pos + 8 <= m.payload.size()) {
+                                ua_size = 0;
+                                for (int i = 0; i < 8; ++i) {
+                                    ua_size |= ((uint64_t)m.payload[pos + i]) << (8 * i);
+                                }
+                                pos += 8;
+                            } else {
+                                ua_size = 0;
+                            }
+                            if (pos + ua_size + 4 <= m.payload.size()) {
+                                uint32_t announced_height = 0;
+                                announced_height |= (uint32_t)m.payload[pos + ua_size];
+                                announced_height |= (uint32_t)m.payload[pos + ua_size + 1] << 8;
+                                announced_height |= (uint32_t)m.payload[pos + ua_size + 2] << 16;
+                                announced_height |= (uint32_t)m.payload[pos + ua_size + 3] << 24;
+                                ps.peer_tip_height = announced_height;
+                            }
                         }
-                      
-                        try_finish_handshake();
+                    }
+                    try_finish_handshake();
                       
                     } else if (cmd == "verack") {
                         P2P_TRACE("RX " + ps.ip + " cmd=verack - handshake completing");
