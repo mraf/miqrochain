@@ -3749,6 +3749,11 @@ void P2P::loop(){
                         ? best_hdr_height
                         : current_height + 50;  // Fallback to 50 blocks if no headers ahead
 
+                    // Cap to peer's known tip height: don't request beyond what peer has sent us
+                    if (pps.peer_tip_height > 0 && pps.peer_tip_height > current_height) {
+                        max_height = std::min((uint32_t)max_height, (uint32_t)pps.peer_tip_height);
+                    }
+
                     // Request blocks up to max_height (or current_height + 50, whichever is smaller)
                     uint32_t batch_end = std::min((uint32_t)max_height, (uint32_t)(current_height + 50));
 
@@ -4625,6 +4630,13 @@ void P2P::loop(){
                             ps.inflight_blocks.erase(bh);
                             g_inflight_block_ts[(Sock)s].erase(bh);
                             g_global_inflight_blocks.erase(bh);
+
+                            // Track peer's tip height: update when we receive a block
+                            uint64_t new_height = chain_.height() + 1;  // Assume this block will be accepted
+                            if (new_height > ps.peer_tip_height) {
+                                ps.peer_tip_height = new_height;
+                            }
+
                             // accept/process
                             uint64_t old_height = chain_.height();
                             handle_incoming_block(s, m.payload);

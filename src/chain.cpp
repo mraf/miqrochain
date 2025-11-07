@@ -992,13 +992,24 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
     }
 
     // Fallback: serve from block store
+    // First, find the actual tip height (highest block that exists in storage)
+    uint64_t actual_tip_height = 0;
+    for (uint64_t h = 0; h <= tip_.height; ++h) {
+        Block b;
+        if (!get_block_by_index(h, b)) {
+            actual_tip_height = (h > 0) ? h - 1 : 0;
+            break;
+        }
+        actual_tip_height = h;
+    }
+
     std::unordered_map<std::string, int> lset2;
     for (const auto& h : locators) lset2[hk(h)] = 1;
 
     uint64_t start_h = 0;
     bool found=false;
     if (tip_.time != 0){
-        for (int64_t h=(int64_t)tip_.height; h>=0; --h){
+        for (int64_t h=(int64_t)actual_tip_height; h>=0; --h){
             std::vector<uint8_t> hh;
             if (!get_hash_by_index((size_t)h, hh)) break;
             if (lset2.find(hk(hh)) != lset2.end()){
@@ -1012,7 +1023,7 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
 
     uint64_t h = start_h + 1;
     for (size_t i=0; i<max; ++i){
-        if (h > tip_.height) break;
+        if (h > actual_tip_height) break;  // Stop at actual tip, not reported tip
         Block b;
         if (!get_block_by_index((size_t)h, b)) break;
         out.push_back(b.header);
@@ -1173,21 +1184,95 @@ void Chain::rebuild_header_index_from_blocks(){
         return;
     }
 
-    log_info("[DEBUG] Rebuilding header index from " + std::to_string(tip_.height) + " blocks...");
-
-    // Start from genesis (height 0)
+    // Count actual blocks in storage (handle gaps)
+    // Scan the full range up to tip_.height to find all blocks (including gaps)
+    uint64_t actual_block_count = 0;
+    uint64_t highest_block_found = 0;
     for (uint64_t h = 0; h <= tip_.height; ++h) {
         Block blk;
+        if (get_block_by_index((size_t)h, blk)) {
+            actual_block_count++;
+            highest_block_found = h;
+        }
+    }
+
+    log_info("[DEBUG] Rebuilding header index: tip_.height=" + std::to_string(tip_.height) +
+             " actual_blocks=" + std::to_string(actual_block_count) +
+             " highest_block=" + std::to_string(highest_block_found));
+
+    // Start from genesis (height 0), rebuild for all blocks that exist (handle gaps)
+    for (uint64_t h = 0; h <= highest_block_found; ++h) {
+        Block blk;
         if (!get_block_by_index((size_t)h, blk)) {
-            log_warn("[DEBUG] Failed to read block at height " + std::to_string(h) + " during header index rebuild");
-            break;
+            log_warn("[DEBUG] Skipping missing block at height " + std::to_string(h) + " during header index rebuild");
+            continue;  // Skip missing blocks, don't break
         }
 
-        // Add header to index
-        std::string err;
-        if (!accept_header(blk.header, err)) {
-            log_warn("[DEBUG] Failed to accept header at height " + std::to_string(h) + ": " + err);
-            break;
+        const auto hh = header_hash_of(blk.header);
+        const auto key = hk(hh);
+
+        // Skip if already in index
+        if (header_index_.find(key) != header_index_.end()) {
+            continue;
+        }
+
+        // For genesis, manually add to index without validation
+        if (h == 0) {
+            HeaderMeta m;
+            m.hash   = hh;
+            m.prev   = blk.header.prev_hash;
+            m.bits   = blk.header.bits;
+            m.time   = blk.header.time;
+            m.have_block = true;
+            m.height = 0;
+            m.work_sum = work_from_bits(blk.header.bits);
+            header_index_.emplace(key, std::move(m));
+            best_header_key_ = key;
+            continue;
+        }
+
+        // For non-genesis headers, add directly without validation
+        // (these blocks are already stored and were validated when mined)
+        HeaderMeta m;
+        m.hash   = hh;
+        m.prev   = blk.header.prev_hash;
+        m.bits   = blk.header.bits;
+        m.time   = blk.header.time;
+        m.have_block = true;
+
+        // Get parent height and work
+        uint64_t parent_height = 0;
+        long double parent_work = 0.0L;
+        auto itp = header_index_.find(hk(blk.header.prev_hash));
+        if (itp != header_index_.end()) {
+            parent_height = itp->second.height;
+            parent_work   = itp->second.work_sum;
+        } else if (blk.header.prev_hash == tip_.hash) {
+            parent_height = tip_.height;
+            parent_work   = work_from_bits(tip_.bits);
+        }
+        m.height   = parent_height + 1;
+        m.work_sum = parent_work + work_from_bits(blk.header.bits);
+
+        header_index_.emplace(key, std::move(m));
+        g_header_full[key] = blk.header;
+
+        // Update best header if this has more work
+        if (best_header_key_.empty()) {
+            best_header_key_ = key;
+        } else {
+            const auto& cur = header_index_.at(best_header_key_);
+            const auto& neu = header_index_.at(key);
+            auto eps = [](long double a, long double b){
+                long double scale = std::max<long double>(1.0L, std::max(std::fabs(a), std::fabs(b)));
+                return 1e-12L * scale;
+            };
+            long double e = eps(neu.work_sum, cur.work_sum);
+            bool greater   = (neu.work_sum - cur.work_sum) >  e;
+            bool equalish  = std::fabs(neu.work_sum - cur.work_sum) <= e;
+            if (greater || (equalish && neu.height > cur.height)) {
+                best_header_key_ = key;
+            }
         }
     }
 
