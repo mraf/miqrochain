@@ -3292,13 +3292,30 @@ void P2P::loop(){
                             for (auto& kvp : peers_) cands.push_back(kvp.first);
                         }
                         for (const auto& h2 : want3) {
-                            const std::string key2 = hexkey(h2);
-                            if (g_global_inflight_blocks.count(key2)) continue;
-                            if (orphans_.count(key2)) continue;
-                            Sock t = rr_pick_peer_for_key(key2, cands);
-                            auto itT = peers_.find(t);
-                            if (itT != peers_.end()) request_block_hash(itT->second, h2);
+                        const std::string key2 = hexkey(h2);
+                          if (g_global_inflight_blocks.count(key2) || orphans_.count(key2))
+                          continue;
+                        int64_t hdr_height2 = chain_.get_header_height(h2);
+                        std::vector<Sock> filtered;
+                          if (hdr_height2 >= 0) {
+                            for (Sock cs : cands) {
+                            auto pit = peers_.find(cs);
+                            if (pit == peers_.end()) continue;
+                            uint64_t peer_height = pit->second.peer_tip_height;
+                          if (peer_height > 0 && peer_height < (uint64_t)hdr_height2)
+                            continue;
+                            filtered.push_back(cs);
+                          }
+                        } else {
+                          filtered = cands;
+                          }
+                          if (filtered.empty()) filtered = cands;
+                          Sock t = rr_pick_peer_for_key(key2, filtered);
+                          auto itT = peers_.find(t);
+                          if (itT != peers_.end()) {
+                          request_block_hash(itT->second, h2);
                         }
+                      }
                     }
                 }
                 g_next_stall_probe_ms = tnow + g_stall_retry_ms;
@@ -4728,8 +4745,10 @@ void P2P::loop(){
                             }
 
                             // REMOVED: if (ps.syncing) condition - always refill pipeline after accepting block
-                            if (ps.inflight_index > 0) ps.inflight_index--;
-                            fill_index_pipeline(ps);
+                            if (ps.syncing) {
+                                 if (ps.inflight_index > 0) ps.inflight_index--;
+                                 fill_index_pipeline(ps);
+                             }
                         } else {
                             std::vector<std::vector<uint8_t>> want3;
                             chain_.next_block_fetch_targets(want3, /*cap=*/1);
@@ -4745,10 +4764,10 @@ void P2P::loop(){
                                 }
                             }
                         }
-                        // REMOVED: if (ps.syncing) condition - always refill pipeline after accepting block
-                        if (ps.inflight_index > 0) ps.inflight_index--;
-                        fill_index_pipeline(ps);
-                        }
+                        if (ps.syncing) {
+                             if (ps.inflight_index > 0) ps.inflight_index--;
+                             fill_index_pipeline(ps);
+                         }
                       
                     } else if (cmd == "invtx") {
                         if (!check_rate(ps, "inv", 0.25, now_ms())) {
@@ -5001,14 +5020,30 @@ void P2P::loop(){
                             for (auto& kvx : peers_) if (kvx.second.verack_ok) cands.push_back(kvx.first);
                             if (cands.empty()) cands.push_back((Sock)ps.sock);
                             for (const auto& w : want) {
-                                const std::string key = hexkey(w);
-                                if (g_global_inflight_blocks.count(key)) continue;
-                                // Skip blocks that are already stored as orphans
-                                if (orphans_.count(key)) continue;
-                                Sock t = rr_pick_peer_for_key(key, cands);
-                                auto itT = peers_.find(t);
-                                if (itT != peers_.end()) request_block_hash(itT->second, w);
-                            }
+        const std::string key = hexkey(w);
+        if (g_global_inflight_blocks.count(key) || orphans_.count(key))
+            continue;
+        int64_t hdr_height = chain_.get_header_height(w);
+        std::vector<Sock> cands_block;
+        if (hdr_height >= 0) {
+            for (Sock cs : cands) {
+                auto pit = peers_.find(cs);
+                if (pit == peers_.end()) continue;
+                uint64_t peer_height = pit->second.peer_tip_height;
+                if (peer_height > 0 && peer_height < (uint64_t)hdr_height)
+                    continue;
+                cands_block.push_back(cs);
+            }
+        } else {
+            cands_block = cands;
+        }
+        if (cands_block.empty()) cands_block = cands;
+        Sock t = rr_pick_peer_for_key(key, cands_block);
+        auto itT = peers_.find(t);
+        if (itT != peers_.end()) {
+            request_block_hash(itT->second, w);
+        }
+    }
                         }
 
                         if (ps.inflight_hdr_batches > 0) ps.inflight_hdr_batches--;
