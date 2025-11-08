@@ -9,7 +9,7 @@ A compact, experimental blockchain node written in modern C++.
 ## Quick Facts
 
 - **P2P port:** `9883` (TCP)
-- **RPC port:** `9833` (JSON-RPC over HTTP)
+- **RPC port:** `9834` (JSON-RPC over HTTP)
 - **Default daemons:** `miqrod` (node), `miqwallet` (WIP)
 - **Build:** CMake + C++17
 - **Status:** Experimental (not production-ready)
