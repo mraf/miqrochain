@@ -4748,7 +4748,7 @@ void P2P::loop(){
                             if (ps.syncing) {
                                  if (ps.inflight_index > 0) ps.inflight_index--;
                                  fill_index_pipeline(ps);
-                             }
+                          }
                         } else {
                             std::vector<std::vector<uint8_t>> want3;
                             chain_.next_block_fetch_targets(want3, /*cap=*/1);
@@ -4765,11 +4765,11 @@ void P2P::loop(){
                             }
                         }
                         if (ps.syncing) {
-                             if (ps.inflight_index > 0) ps.inflight_index--;
-                             fill_index_pipeline(ps);
-                         }
-                      
-                    } else if (cmd == "invtx") {
+                      if (ps.inflight_index > 0) ps.inflight_index--;
+                      fill_index_pipeline(ps);
+                  }
+             }
+         } else if (cmd == "invtx") {
                         if (!check_rate(ps, "inv", 0.25, now_ms())) {
                             if (!ibd_or_fetch_active(ps, now_ms())) {
                                 bump_ban(ps, ps.ip, "inv-flood", now_ms());
