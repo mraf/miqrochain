@@ -2903,22 +2903,11 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
                           " from " + pps.ip + " (at peer's tip)");
                 continue;
             }
-            // Request only the NEXT block (not a batch)
-            request_block_index(pps, next_height);
-            log_info("TX " + pps.ip + " cmd=getbi height=" + std::to_string(next_height) + 
-                     " (next block after accept)");
-            requested_count++;
-            // Update peer sync state
-            pps.syncing = true;
-            if (pps.inflight_index == 0) {
-                pps.next_index = next_height;
-                fill_index_pipeline(pps);
-            }
+            if (pps.peer_tip_height == 0 || next_height <= pps.peer_tip_height) {
+            fill_index_pipeline(pps);
+          }
         }
 
-        if (requested_count > 0) {
-            log_info("Requested next block " + std::to_string(next_height) + " after accepting " + std::to_string(current_height));
-        }
 #if MIQ_ENABLE_HEADERS_FIRST
         {
             std::vector<std::vector<uint8_t>> want_tmp;
@@ -3738,7 +3727,7 @@ void P2P::loop(){
             // Use continuous batch pipeline: request next blocks every 200ms
             // This works both before AND after headers phase
             bool should_refetch = false;
-            if (now - last_refetch_time > 200) {
+            if (g_sequential_sync && (now - last_refetch_time > 200)) {
                 // Proactive pipeline - keep requesting the next batch of blocks
                 should_refetch = true;
                 log_info("[SYNC] Proactive pipeline: requesting next block (height=" + std::to_string(current_height) + ")");
@@ -4586,29 +4575,14 @@ void P2P::loop(){
                             std::string hash_hex = hexkey(m.payload);
                             P2P_TRACE("DEBUG: getb request for hash " + hash_hex + " from " + ps.ip);
 
-                            // During sync, refuse to serve blocks - we're syncing, not serving
-                            // Check if ANY peer is actively syncing (indicates we're still catching up)
-                            bool any_peer_syncing = false;
-                            for (const auto& kvp : peers_) {
-                                if (kvp.second.syncing) {
-                                    any_peer_syncing = true;
-                                    break;
-                                }
-                            }
-                            if (any_peer_syncing) {
-                                P2P_TRACE("DEBUG: Ignoring getb request while syncing (hash=" + hash_hex.substr(0, 16) + "... from " + ps.ip + ")");
-                                continue;
-                            }
-
                             Block b;
                             if (chain_.get_block_by_hash(m.payload, b)) {
                                 auto raw = ser_block(b);
                                 P2P_TRACE("DEBUG: Found block by hash " + hash_hex + ", size=" + std::to_string(raw.size()) + " bytes");
-                                if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
-                                    P2P_TRACE("DEBUG: Sending block " + hash_hex + " to " + ps.ip);
+                                if (raw.size() <= MIQ_FALLBACK_MAX_MSG_SIZE) {
                                     send_block(s, raw);
                                 } else {
-                                    P2P_TRACE("DEBUG: Block " + hash_hex + " too large (" + std::to_string(raw.size()) + " > " + std::to_string(MIQ_FALLBACK_MAX_BLOCK_SZ) + ")");
+                                    P2P_TRACE("DEBUG: Block " + hash_hex + " too large (" + std::to_string(raw.size()) + " > " + std::to_string(MIQ_FALLBACK_MAX_MSG_SIZE) + ")");
                                 }
                             } else {
                                 P2P_TRACE("DEBUG: Block not found by hash " + hash_hex);
@@ -4616,42 +4590,20 @@ void P2P::loop(){
                         } else {
                             P2P_TRACE("DEBUG: getb invalid payload size " + std::to_string(m.payload.size()) + " (expected 32)");
                         }
-
-                    } else if (cmd == "getbi") {
+                    }
+                    else if (cmd == "getbi") {
                         g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
                         if (m.payload.size() == 8) {
                             uint64_t idx64 = 0;
                             for (int i=0;i<8;i++) idx64 |= ((uint64_t)m.payload[i]) << (8*i);
                             P2P_TRACE("DEBUG: getbi request for index " + std::to_string(idx64) + " from " + ps.ip);
 
-                            // During sync, refuse to serve blocks - we're syncing, not serving
-                            // Check if ANY peer is actively syncing (indicates we're still catching up)
-                            bool any_peer_syncing = false;
-                            for (const auto& kvp : peers_) {
-                                if (kvp.second.syncing) {
-                                    any_peer_syncing = true;
-                                    break;
-                                }
-                            }
-                            if (any_peer_syncing) {
-                                P2P_TRACE("DEBUG: Ignoring getbi request while syncing (height=" + std::to_string(idx64) + " from " + ps.ip + ")");
-                                continue;
-                            }
-
                             Block b;
                             if (chain_.get_block_by_index((size_t)idx64, b)) {
                                 auto raw = ser_block(b);
                                 P2P_TRACE("DEBUG: Found block at index " + std::to_string(idx64) + ", size=" + std::to_string(raw.size()) + " bytes");
-                                if (raw.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
+                                if (raw.size() <= MIQ_FALLBACK_MAX_MSG_SIZE) {
                                     send_block(s, raw);
-                                    if (MIQ_CONTINUATION_BATCH >= 1) {
-                                        Block nb;
-                                        if (chain_.get_block_by_index((size_t)(idx64+1), nb)) {
-                                            auto nh = nb.block_hash();
-                                            auto inv = encode_msg("invb", nh);
-                                            (void)send_or_close(s, inv);
-                                        }
-                                    }
                                 } else {
                                     P2P_TRACE("SKIP " + ps.ip + " cmd=getbi height=" + std::to_string(idx64) + " (block too large)");
                                 }
