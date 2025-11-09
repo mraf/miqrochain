@@ -1009,6 +1009,81 @@ static inline int64_t adaptive_index_timeout_ms(const miq::PeerState& ps){
     return std::max<int64_t>(5000, std::min<int64_t>(t, max_t));
 }
 
+// ============================================================================
+// Peer Reputation & Adaptive Batching System
+// ============================================================================
+
+// Calculate reputation score based on delivery success rate and speed
+static inline void update_peer_reputation(miq::PeerState& ps) {
+    int64_t total_deliveries = ps.blocks_delivered_successfully + ps.blocks_failed_delivery;
+    if (total_deliveries == 0) {
+        ps.reputation_score = 1.0;  // New peers start with perfect score
+        return;
+    }
+
+    // Success rate component (0.0 to 1.0)
+    double success_rate = (double)ps.blocks_delivered_successfully / (double)total_deliveries;
+
+    // Speed component: compare against baseline (30s)
+    double speed_factor = 1.0;
+    if (ps.total_blocks_received > 0) {
+        int64_t avg_delivery = ps.total_block_delivery_time_ms / ps.total_blocks_received;
+        // Peers faster than 10s get bonus, slower than 60s get penalty
+        if (avg_delivery < 10000) {
+            speed_factor = 1.2;  // 20% bonus for fast peers
+        } else if (avg_delivery > 60000) {
+            speed_factor = 0.7;  // 30% penalty for slow peers
+        } else {
+            // Linear interpolation between 10s and 60s
+            speed_factor = 1.0 - ((avg_delivery - 10000) / 50000.0) * 0.3;
+        }
+    }
+
+    // Combine: 70% success rate, 30% speed
+    ps.reputation_score = (success_rate * 0.7 + speed_factor * 0.3);
+    ps.reputation_score = std::max(0.0, std::min(1.0, ps.reputation_score));
+}
+
+// Calculate adaptive batch size based on peer reputation and network conditions
+static inline uint32_t calculate_adaptive_batch_size(const miq::PeerState& ps) {
+    // Adjust based on reputation score
+    // Excellent peers (0.9+): 32 blocks
+    // Good peers (0.7-0.9): 24 blocks
+    // Average peers (0.5-0.7): 16 blocks
+    // Poor peers (<0.5): 8 blocks
+
+    double rep = ps.reputation_score;
+    uint32_t batch_size;
+
+    if (rep >= 0.9) {
+        batch_size = 32;
+    } else if (rep >= 0.7) {
+        batch_size = 24;
+    } else if (rep >= 0.5) {
+        batch_size = 16;
+    } else {
+        batch_size = 8;
+    }
+
+    // During IBD, be more aggressive with good peers
+    if (!g_logged_headers_done && rep >= 0.8) {
+        batch_size = std::min(64u, batch_size * 2);
+    }
+
+    return batch_size;
+}
+
+// Update adaptive batch size for a peer
+static inline void update_adaptive_batch_size(miq::PeerState& ps) {
+    uint32_t new_batch = calculate_adaptive_batch_size(ps);
+    if (new_batch != ps.adaptive_batch_size) {
+        P2P_TRACE("DEBUG: Adaptive batch size for " + ps.ip + " changed from " +
+                  std::to_string(ps.adaptive_batch_size) + " to " + std::to_string(new_batch) +
+                  " (reputation=" + std::to_string(ps.reputation_score) + ")");
+        ps.adaptive_batch_size = new_batch;
+    }
+}
+
 static inline void clear_fulfilled_indices_up_to_height(size_t new_h){
     for (auto &kv : g_inflight_index_ts){
         Sock s = kv.first;
@@ -2297,8 +2372,8 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     ps.total_blocks_received = 0;
     ps.total_block_delivery_time_ms = 0;
     ps.avg_block_delivery_ms = 30000; // sane initial expectation (30s)
-    ps.successful_deliveries = 0;
-    ps.failed_deliveries = 0;
+    ps.blocks_delivered_successfully = 0;
+    ps.blocks_failed_delivery = 0;
     ps.health_score = 1.0;
     ps.last_block_received_ms = 0;
     peers_[s] = ps;
@@ -2395,8 +2470,8 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     ps.total_blocks_received = 0;
     ps.total_block_delivery_time_ms = 0;
     ps.avg_block_delivery_ms = 30000;
-    ps.successful_deliveries = 0;
-    ps.failed_deliveries = 0;
+    ps.blocks_delivered_successfully = 0;
+    ps.blocks_failed_delivery = 0;
     ps.health_score = 1.0;
     ps.last_block_received_ms = 0;
     peers_[c] = ps;
@@ -2534,7 +2609,19 @@ void P2P::start_sync_with_peer(PeerState& ps){
 }
 
 void P2P::fill_index_pipeline(PeerState& ps){
-    const uint32_t pipe = g_sequential_sync ? 1u : (uint32_t)MIQ_INDEX_PIPELINE;
+    // Use adaptive pipeline size based on peer reputation
+    uint32_t pipe;
+    if (g_sequential_sync) {
+        pipe = 1u;
+    } else {
+        // Update reputation and adaptive batch size
+        update_peer_reputation(ps);
+        update_adaptive_batch_size(ps);
+
+        // Use adaptive batch size, but cap at MIQ_INDEX_PIPELINE
+        pipe = std::min(ps.adaptive_batch_size, (uint32_t)MIQ_INDEX_PIPELINE);
+    }
+
     if (!peer_is_index_capable((Sock)ps.sock)) return;
 
     // SYNC STATE FIX: Ensure next_index is consistent with current chain height
@@ -2807,7 +2894,7 @@ static void update_peer_performance(PeerState& ps, const std::string& block_hex,
             ps.total_blocks_received++;
             ps.total_block_delivery_time_ms += delivery_time;
             ps.last_block_received_ms = now_ms;
-            ps.successful_deliveries++;
+            ps.blocks_delivered_successfully++;
 
             // Calculate exponential moving average (EMA) with alpha=0.2
             // This gives more weight to recent deliveries
@@ -2819,8 +2906,8 @@ static void update_peer_performance(PeerState& ps, const std::string& block_hex,
 
             // Update health score (0.0 = bad, 1.0 = good)
             // Based on success rate and delivery speed
-            double success_rate = (double)ps.successful_deliveries /
-                                 (ps.successful_deliveries + ps.failed_deliveries + 1);
+            double success_rate = (double)ps.blocks_delivered_successfully /
+                                 (ps.blocks_delivered_successfully + ps.blocks_failed_delivery + 1);
             double speed_factor = std::min(1.0, 30000.0 / std::max(1000.0, (double)ps.avg_block_delivery_ms));
             ps.health_score = 0.7 * success_rate + 0.3 * speed_factor;
         }
@@ -3095,8 +3182,8 @@ void P2P::loop(){
                          ps.total_blocks_received = 0;
                          ps.total_block_delivery_time_ms = 0;
                          ps.avg_block_delivery_ms = 30000;
-                         ps.successful_deliveries = 0;
-                         ps.failed_deliveries = 0;
+                         ps.blocks_delivered_successfully = 0;
+                         ps.blocks_failed_delivery = 0;
                          ps.health_score = 1.0;
                          ps.last_block_received_ms = 0;
                          { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
@@ -3151,8 +3238,8 @@ void P2P::loop(){
                                 ps.total_blocks_received = 0;
                                 ps.total_block_delivery_time_ms = 0;
                                 ps.avg_block_delivery_ms = 30000;
-                                ps.successful_deliveries = 0;
-                                ps.failed_deliveries = 0;
+                                ps.blocks_delivered_successfully = 0;
+                                ps.blocks_failed_delivery = 0;
                                 ps.health_score = 1.0;
                                 ps.last_block_received_ms = 0;
                                 { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
@@ -3196,8 +3283,8 @@ void P2P::loop(){
                                     ps.total_blocks_received = 0;
                                     ps.total_block_delivery_time_ms = 0;
                                     ps.avg_block_delivery_ms = 30000;
-                                    ps.successful_deliveries = 0;
-                                    ps.failed_deliveries = 0;
+                                    ps.blocks_delivered_successfully = 0;
+                                    ps.blocks_failed_delivery = 0;
                                     ps.health_score = 1.0;
                                     ps.last_block_received_ms = 0;
                                     { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s]=ps; g_outbounds.insert(s); }
@@ -3393,7 +3480,7 @@ void P2P::loop(){
               if (tnow - kv.second > adaptive_timeout) {
                 expired.emplace_back(bySock.first, kv.first);
                 // Track failed delivery for health score
-                ps.failed_deliveries++;
+                ps.blocks_failed_delivery++;
                 ps.health_score = std::max(0.1, ps.health_score * 0.9); // Decay health on timeout
               }
             }
@@ -3652,15 +3739,16 @@ void P2P::loop(){
             }
 
             if (!want.empty() && !peers_.empty()) {
-                // Build candidate peer list, healthiest first.
+                // Build candidate peer list, sorted by reputation score (best first)
                 std::vector<std::pair<Sock,double>> scored;
                 scored.reserve(peers_.size());
                 for (auto& kvp : peers_) {
                     if (!kvp.second.verack_ok) continue;
-                    scored.emplace_back(kvp.first, kvp.second.health_score);
+                    // Use reputation_score for smarter peer selection
+                    scored.emplace_back(kvp.first, kvp.second.reputation_score);
                 }
                 if (scored.empty()) {
-                    for (auto& kvp : peers_) scored.emplace_back(kvp.first, kvp.second.health_score);
+                    for (auto& kvp : peers_) scored.emplace_back(kvp.first, kvp.second.reputation_score);
                 }
                 std::sort(scored.begin(), scored.end(),
                           [](const auto& a, const auto& b){ return a.second > b.second; });
@@ -3800,33 +3888,37 @@ void P2P::loop(){
                     miq::log_warn("  🔄 Will continue retrying periodically...");
                 }
 
-                // Force refetch next blocks from all capable peers
-                // Request blocks up to the best header height (or 50 blocks if no headers)
+                // Force refetch next blocks from all capable peers with adaptive batching
                 bool refetch_sent = false;
                 for (auto& kvp : peers_) {
                     auto& pps = kvp.second;
                     if (!pps.verack_ok) continue;
                     if (!peer_is_index_capable((Sock)pps.sock)) continue;
 
-                    // Determine how many blocks to request
+                    // Update peer reputation and adaptive batch size
+                    update_peer_reputation(pps);
+                    update_adaptive_batch_size(pps);
+
+                    // Determine how many blocks to request (adaptive based on peer reputation)
                     uint32_t best_hdr_height = chain_.best_header_height();
                     uint32_t max_height = (best_hdr_height > current_height)
                         ? best_hdr_height
-                        : current_height + 50;  // Fallback to 50 blocks if no headers ahead
+                        : current_height + pps.adaptive_batch_size;  // Use adaptive batch size
 
                     // Cap to peer's known tip height: don't request beyond what peer has sent us
                     if (pps.peer_tip_height > 0 && pps.peer_tip_height > current_height) {
                         max_height = std::min((uint32_t)max_height, (uint32_t)pps.peer_tip_height);
                     }
 
-                    // Request blocks up to max_height (or current_height + 50, whichever is smaller)
-                    uint32_t batch_end = std::min((uint32_t)max_height, (uint32_t)(current_height + 50));
+                    // Request blocks up to max_height (or current_height + adaptive_batch_size, whichever is smaller)
+                    uint32_t batch_end = std::min((uint32_t)max_height, (uint32_t)(current_height + pps.adaptive_batch_size));
 
                     for (uint32_t h = current_height + 1; h <= batch_end; h++) {
                         request_block_index(pps, (uint64_t)h);
                         if (h == current_height + 1 || h == batch_end) {
                             log_info("TX " + pps.ip + " cmd=getbi height=" + std::to_string(h) +
-                                    " (refetch batch, best_hdr=" + std::to_string(best_hdr_height) + ")");
+                                    " (adaptive batch=" + std::to_string(pps.adaptive_batch_size) +
+                                    ", rep=" + std::to_string(pps.reputation_score) + ")");
                         }
                     }
                     refetch_sent = true;
@@ -4698,9 +4790,21 @@ void P2P::loop(){
                                 ps.peer_tip_height = new_height;
                             }
 
+                            // Track block delivery time for reputation scoring
+                            int64_t now_ms_val = now_ms();
+                            int64_t delivery_time_ms = 0;
+
                             // accept/process
                             uint64_t old_height = chain_.height();
                             handle_incoming_block(s, m.payload);
+
+                            // Update reputation: track successful delivery
+                            int64_t after_ms = now_ms();
+                            delivery_time_ms = after_ms - now_ms_val;
+                            ps.blocks_delivered_successfully++;
+                            ps.total_block_delivery_time_ms += delivery_time_ms;
+                            ps.total_blocks_received++;
+                            ps.total_block_bytes_received += m.payload.size();
 
                             if (ps.inflight_index > 0) {
                                 // Identify delivered block index if possible
@@ -5175,6 +5279,9 @@ void P2P::loop(){
                         (g_last_idx_probe_ms.count(oldest_inflight) ? g_last_idx_probe_ms[oldest_inflight] : 0);
 
                     if (tnow - last_probe >= (int64_t)MIQ_P2P_STALL_RETRY_MS) {
+                        // Track failed delivery (timeout) for reputation scoring
+                        ps.blocks_failed_delivery++;
+
                         // Re-request the same *oldest* index on this peer (retry only; do NOT inflate inflight count).
                         request_block_index(ps, oldest_inflight);
                         g_last_idx_probe_ms[oldest_inflight] = tnow;

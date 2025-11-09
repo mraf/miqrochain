@@ -136,19 +136,27 @@ struct PeerState {
     // Per-family token buckets
     RateCounters rate;
 
-    // === Adaptive timeout tracking ===
-    // Track block delivery performance for adaptive timeouts
+    // === Peer Reputation & Adaptive Batching ===
+    // Reputation metrics
+    int64_t blocks_delivered_successfully{0};   // Blocks successfully received
+    int64_t blocks_failed_delivery{0};          // Blocks that timed out or failed
     int64_t total_blocks_received{0};           // Total blocks received from this peer
-    int64_t total_block_delivery_time_ms{0};    // Sum of all delivery times
+    int64_t total_block_bytes_received{0};      // Total bytes of blocks received
+    int64_t total_block_delivery_time_ms{0};    // Sum of delivery times for averaging
+    double reputation_score{1.0};               // 0.0 (bad) to 1.0 (excellent)
+    double health_score{1.0};                   // 0.0 (bad) to 1.0 (good) - legacy field
+
+    // Adaptive batching
+    uint32_t adaptive_batch_size{16};           // Current batch size (adapts based on performance)
+    int64_t last_batch_completion_ms{0};        // When last batch completed
+    int64_t last_batch_duration_ms{0};          // How long last batch took
+
+    // Timeout tracking
+    int64_t avg_block_delivery_ms{30000};       // Running average delivery time (default 30s)
+    int64_t max_timeout_ms{60000};              // Maximum timeout for this peer
     int64_t last_block_received_ms{0};          // Timestamp of last block received
-    int64_t avg_block_delivery_ms{30000};       // Running average (default 30s)
 
     // Connection health tracking
-    int64_t successful_deliveries{0};           // Blocks delivered successfully
-    int64_t failed_deliveries{0};               // Blocks that timed out
-    double health_score{1.0};                   // 0.0 (bad) to 1.0 (good)
-
-    // Exponential backoff for reconnection
     int64_t connection_failures{0};             // Consecutive connection failures
     int64_t next_retry_ms{0};                   // Don't retry before this time
 
