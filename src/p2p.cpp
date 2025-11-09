@@ -696,6 +696,12 @@ namespace {
 // Hardened: loop on partial sends
 static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
     if (!data || len == 0) return true;
+#ifndef _WIN32
+    {
+        int flag = 1;
+        (void)setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    }
+#endif
     size_t sent = 0;
     const int kMaxSpinMs = 2000; // upper bound total wait per call
     int waited_ms = 0;
@@ -747,11 +753,6 @@ static inline bool miq_send(Sock s, const std::vector<uint8_t>& v){
 
 static inline bool send_or_close(Sock s, const std::vector<uint8_t>& v){
   if (miq_send(s, v)) {
-    // Force flush the socket buffer to ensure immediate delivery
-    #ifndef _WIN32
-    int flag = 1;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-    #endif
     return true;
   }
   schedule_close(s);
@@ -939,11 +940,6 @@ static inline bool miq_safe_preverack_cmd(const std::string& cmd) {
 
 static inline bool env_truthy(const char* name){
     const char* v = std::getenv(name); return v && *v && (v[0]=='1'||v[0]=='y'||v[0]=='Y'||v[0]=='t'||v[0]=='T');
-}
-
-static inline int64_t now_ms() {
-    using namespace std::chrono;
-    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
 static inline int64_t wall_ms() {
@@ -1582,27 +1578,24 @@ static inline std::vector<uint8_t> miq_build_version_payload() {
     uint64_t nonce = (uint64_t)timestamp ^ (++nonce_counter);
     miq_put_u64le(v, nonce);
 
-    // User agent (variable length string)
     std::string user_agent = "/miqrochain:0.7.0/";
     if (user_agent.size() < 0xFD) {
+        // varstr: length (1 byte) + bytes
         v.push_back((uint8_t)user_agent.size());
+        v.insert(v.end(), user_agent.begin(), user_agent.end());
     } else {
+        // varstr: 0xFD + uint16 length (LE) + bytes
         v.push_back(0xFD);
         v.push_back((uint8_t)(user_agent.size() & 0xFF));
         v.push_back((uint8_t)((user_agent.size() >> 8) & 0xFF));
         v.insert(v.end(), user_agent.begin(), user_agent.end());
     }
 
-     uint32_t height = /* chain_.height() or similar */ 0;
-     miq_put_u32le(v, height);
-     v.push_back(1);
-
-    // Start height (4 bytes) - we'll use 0 for now
+    // Start height (4 bytes) – if chain height isn't available here, send 0
     miq_put_u32le(v, 0);
 
     // Relay flag (1 byte)
-    v.push_back(1); // true - we want to receive transaction announcements
-
+    v.push_back(1); // true: receive tx announcements
     return v;
 }
 
@@ -2400,7 +2393,7 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     ps.health_score = 1.0;
     ps.last_block_received_ms = 0;
     peers_[c] = ps;
-    g_peer_index_capable[c] = true;
+    g_peer_index_capable[c] = false;
 
     g_trickle_last_ms[c] = 0;
 
