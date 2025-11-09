@@ -4924,7 +4924,7 @@ void P2P::loop(){
 
                         std::vector<std::vector<uint8_t>> want;
                         chain_.next_block_fetch_targets(want, caps_.max_blocks ? caps_.max_blocks : (size_t)64);
-                        bool at_tip = (hs.empty()) || ((hs.size() < kHdrBatchMax) && want.empty());
+                        bool at_tip = (hs.empty()) || ((hs.size() < kHdrBatchMax) && (chain_.best_header_height() > chain_.height()) && want.empty());
 
                         if (accepted > 0) {
                             log_info("P2P: headers from " + ps.ip + " n=" + std::to_string(hs.size()) + " accepted=" + std::to_string(accepted));
