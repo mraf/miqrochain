@@ -70,18 +70,7 @@ else()
     set(LEVELDB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(LEVELDB_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-    # Disable -Werror for LevelDB to avoid build failures on warnings
-    set(CMAKE_CXX_FLAGS_BACKUP "${CMAKE_CXX_FLAGS}")
-    set(CMAKE_C_FLAGS_BACKUP "${CMAKE_C_FLAGS}")
-    # Remove -Werror from flags for LevelDB build
-    string(REPLACE "-Werror" "" CMAKE_CXX_FLAGS_NO_ERROR "${CMAKE_CXX_FLAGS}")
-    string(REPLACE "-Werror" "" CMAKE_C_FLAGS_NO_ERROR "${CMAKE_C_FLAGS}")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS_NO_ERROR} -Wno-error -Wno-unused-but-set-variable")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS_NO_ERROR} -Wno-error -Wno-unused-but-set-variable")
     FetchContent_MakeAvailable(leveldb_src)
-    # Restore original flags
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS_BACKUP}")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS_BACKUP}")
     if(NOT TARGET LevelDB::LevelDB)
       add_library(LevelDB::LevelDB ALIAS leveldb)
     endif()
