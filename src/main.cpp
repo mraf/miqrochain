@@ -1080,10 +1080,12 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
     // This handles the case where we've synced historical blocks that are legitimately old
     if (peers > 0) {
         uint64_t best = chain.best_header_height();
-        if (h > 0 && h >= best) {
+        if (h >= best) {
             why_out.clear();
             return true;
         }
+        why_out = "syncing blocks";
+        return false;
     }
 
     auto tip = chain.tip();
