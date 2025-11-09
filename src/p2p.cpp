@@ -373,7 +373,14 @@ std::atomic<bool> g_sync_wants_active{false};
 
 namespace {
     static std::mutex g_peer_stalls_mu;
-    static std::unordered_map<Sock, int> g_peer_stalls;
+    static std::unordered_map<std::uintptr_t, int> g_peer_stalls;
+
+    // Single authoritative monotonic ms clock used by rate limiters / stall guards / snapshots.
+    static inline int64_t now_ms() {
+        using namespace std::chrono;
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
 }
 
 static inline void miq_set_cloexec(Sock s) {
