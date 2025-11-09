@@ -886,6 +886,11 @@ static int g_headers_tip_confirmed = 0;   // consecutive confirmations of "at ti
 
 static inline void maybe_mark_headers_done(bool at_tip) {
     if (g_logged_headers_done) return;
+    if (!g_logged_headers_started) {
+        // Keep waiting: we haven't engaged the headers phase, so don't flip the global IBD flag yet.
+        g_headers_tip_confirmed = 0;
+        return;
+    }
     if (at_tip) {
         if (++g_headers_tip_confirmed >= 1) {
             g_logged_headers_done = true;
@@ -2926,15 +2931,25 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
         {
             std::vector<std::vector<uint8_t>> want_tmp;
             chain_.next_block_fetch_targets(want_tmp, (size_t)32);
-            bool at_tip = want_tmp.empty();
+            uint64_t max_peer_tip = chain_.height();
+            {
+                // g_peers_mu is held by the caller context in this path.
+                for (auto &kvp : peers_) {
+                    const auto &pps = kvp.second;
+                    if (!pps.verack_ok) continue;
+                    if (pps.peer_tip_height > max_peer_tip) max_peer_tip = pps.peer_tip_height;
+                }
+            }
+            bool at_tip = want_tmp.empty() && (chain_.height() >= max_peer_tip);
 
             // DEBUG: Log why we think we're at tip
             static int64_t last_tip_log = 0;
             int64_t tip_now = now_ms();
             if (tip_now - last_tip_log > 5000) {
                 log_info("[DEBUG] After block accept: at_tip=" + std::string(at_tip ? "true" : "false") +
-                        " want_tmp.size()=" + std::to_string(want_tmp.size()) +
-                        " height=" + std::to_string(chain_.height()));
+                         " want_tmp.size()=" + std::to_string(want_tmp.size()) +
+                         " height=" + std::to_string(chain_.height()) +
+                         " max_peer_tip=" + std::to_string(max_peer_tip));
                 last_tip_log = tip_now;
             }
 
