@@ -2893,7 +2893,6 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
         // During IBD, always request the next block from peers
         // The peer will respond with the block if they have it, or ignore if they don't
-        int requested_count = 0;
         for (auto& kvp : peers_) {
             auto& pps = kvp.second;
             if (!pps.verack_ok) continue;
@@ -3291,9 +3290,11 @@ void P2P::loop(){
                             auto pit = peers_.find(cs);
                             if (pit == peers_.end()) continue;
                             uint64_t peer_height = pit->second.peer_tip_height;
-                          if (peer_height > 0 && peer_height < (uint64_t)hdr_height2)
-                            continue;
-                            filtered.push_back(cs);
+                          if (peer_height > 0 && peer_height < (uint64_t)hdr_height2) {
+                             continue;
+                           }
+                           filtered.push_back(cs);
+
                           }
                         } else {
                           filtered = cands;
