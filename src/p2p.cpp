@@ -2648,12 +2648,6 @@ void P2P::request_block_index(PeerState& ps, uint64_t index){
         // and we're significantly ahead, then skip the request
         uint64_t our_height = chain_.height();
         uint64_t reasonable_gap = 10; // Allow for some new blocks the peer might have received/mined
-
-        if (index > ps.peer_tip_height + reasonable_gap && our_height > ps.peer_tip_height + 50) {
-            // This peer is significantly behind us and we're requesting blocks way beyond their known tip
-            // This is likely the wasteful 50-block spam scenario
-            return;
-        }
     }
 
     uint8_t p[8];
@@ -5563,6 +5557,7 @@ std::vector<PeerSnapshot> P2P::snapshot_peers() const {
         s.tx_tokens     = ps.tx_tokens;
         s.rx_buf        = ps.rx.size();
         s.inflight      = ps.inflight_tx.size();
+        s.peer_tip      = ps.peer_tip_height;
         out.push_back(std::move(s));
     }
     return out;
