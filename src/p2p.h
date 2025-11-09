@@ -177,6 +177,7 @@ struct PeerSnapshot {
     uint64_t     tx_tokens;
     size_t       rx_buf;
     size_t       inflight;
+    uint64_t     peer_tip;
 };
 
 class P2P {
