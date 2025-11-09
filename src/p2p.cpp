@@ -4293,12 +4293,6 @@ void P2P::loop(){
                             gate_mark_sent_verack(s);
                         }
 
-                        // Send our own version message to complete the handshake
-                        auto version_msg = encode_msg("version", miq_build_version_payload());
-                        bool version_sent = send_or_close(s, version_msg);
-                        P2P_TRACE("TX " + ps.ip + " cmd=version len=" + std::to_string(miq_build_version_payload().size()) + " result=" + (version_sent ? "OK" : "FAILED") + " (inbound response)");
-                    }
-
                     if (cmd == "version" && m.payload.size() >= 12) {
                         auto rd_u32le = [](const uint8_t* p){ return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24); };
                         auto rd_u64le = [](const uint8_t* p){ uint64_t z=0; for(int i=0;i<8;i++) z |= ((uint64_t)p[i]) << (8*i); return z; };
@@ -4696,11 +4690,9 @@ void P2P::loop(){
                                 request_block_hash(ps, want2[0]);
                             }
 
-                            // REMOVED: if (ps.syncing) condition - always refill pipeline after accepting block
-                            if (ps.syncing) {
-                                 if (ps.inflight_index > 0) ps.inflight_index--;
-                                 fill_index_pipeline(ps);
-                          }
+                            if (ps.inflight_index > 0) ps.inflight_index--;
+                            fill_index_pipeline(ps);
+                          
                         } else {
                             std::vector<std::vector<uint8_t>> want3;
                             chain_.next_block_fetch_targets(want3, /*cap=*/1);
@@ -4716,10 +4708,9 @@ void P2P::loop(){
                                 }
                             }
                         }
-                        if (ps.syncing) {
-                      if (ps.inflight_index > 0) ps.inflight_index--;
-                      fill_index_pipeline(ps);
-                  }
+                          
+                        if (ps.inflight_index > 0) ps.inflight_index--;
+                        fill_index_pipeline(ps);
              }
          } else if (cmd == "invtx") {
                         if (!check_rate(ps, "inv", 0.25, now_ms())) {
