@@ -2545,6 +2545,21 @@ void P2P::fill_index_pipeline(PeerState& ps){
 }
 
 void P2P::request_block_index(PeerState& ps, uint64_t index){
+    // Smart logic: Don't request blocks that are clearly beyond what the peer can have
+    // But allow requests for blocks that might be new (peer could have mined/received new blocks)
+    if (ps.peer_tip_height > 0) {
+        // If we're requesting a block that's way beyond the peer's known tip (more than a reasonable gap),
+        // and we're significantly ahead, then skip the request
+        uint64_t our_height = chain_.height();
+        uint64_t reasonable_gap = 10; // Allow for some new blocks the peer might have received/mined
+
+        if (index > ps.peer_tip_height + reasonable_gap && our_height > ps.peer_tip_height + 50) {
+            // This peer is significantly behind us and we're requesting blocks way beyond their known tip
+            // This is likely the wasteful 50-block spam scenario
+            return;
+        }
+    }
+
     uint8_t p[8];
     for (int i=0;i<8;i++) p[i] = (uint8_t)((index >> (8*i)) & 0xFF);
     auto msg = encode_msg("getbi", std::vector<uint8_t>(p, p+8));
