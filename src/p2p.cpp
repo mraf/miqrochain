@@ -4293,6 +4293,7 @@ void P2P::loop(){
                         if (verack_sent) {
                             gate_mark_sent_verack(s);
                         }
+                    }
 
                     if (cmd == "version" && m.payload.size() >= 12) {
                         auto rd_u32le = [](const uint8_t* p){ return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24); };
