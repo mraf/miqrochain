@@ -1079,13 +1079,20 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
     // For peer nodes that have successfully synced blocks from a seed, also allow stale tips
     // This handles the case where we've synced historical blocks that are legitimately old
     if (peers > 0) {
-        uint64_t best = chain.best_header_height();
-        if (h >= best) {
+        // Only finish sync once we've reached all known blocks from peers
+        uint64_t max_peer_tip = 0;
+        // Gather each peer's advertised tip height
+        auto peer_list = p2p->snapshot_peers();
+        for (const auto& pr : peer_list) {
+            max_peer_tip = std::max(max_peer_tip, pr.peer_tip);
+        }
+        if (h >= max_peer_tip) {
             why_out.clear();
             return true;
+        } else {
+            why_out = "syncing blocks";
+            return false;
         }
-        why_out = "syncing blocks";
-        return false;
     }
 
     auto tip = chain.tip();
