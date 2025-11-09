@@ -1048,7 +1048,7 @@ static inline std::string spark_ascii(const std::vector<double>& v){
 }
 
 // Sync gate helper (used both in TUI texts and IBD logic)
-static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out){
+static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
     size_t peers = p2p ? p2p->snapshot_peers().size() : 0;
     const bool we_are_seed = compute_seed_role().we_are_seed;
     const bool seed_solo = we_are_seed && peers == 0;
@@ -1078,10 +1078,9 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out){
 
     // For peer nodes that have successfully synced blocks from a seed, also allow stale tips
     // This handles the case where we've synced historical blocks that are legitimately old
-    if (peers > 0 && h > 0) {
-        // If we have peers and blocks, we've likely completed a successful sync
-        // Check if we have a reasonable number of blocks (more than just genesis)
-        if (h >= 1) {
+    if (peers > 0) {
+        uint64_t best = chain.best_header_height();
+        if (h > 0 && h >= best) {
             why_out.clear();
             return true;
         }
