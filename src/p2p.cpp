@@ -2917,9 +2917,13 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             auto& pps = kvp.second;
             if (!pps.verack_ok) continue;
             if (!peer_is_index_capable((Sock)pps.sock)) continue;
-            if (pps.peer_tip_height > 0 && next_height > pps.peer_tip_height) {
-                P2P_TRACE("DEBUG: Not requesting block " + std::to_string(next_height) + 
-                          " from " + pps.ip + " (at peer's tip)");
+            uint32_t best_hdr_height = chain_.best_header_height();
+            uint64_t peer_or_hdr_tip = (pps.peer_tip_height > 0)
+                ? std::max<uint64_t>(pps.peer_tip_height, best_hdr_height)
+                : (uint64_t)best_hdr_height;
+            if (peer_or_hdr_tip > 0 && next_height > peer_or_hdr_tip) {
+                P2P_TRACE("DEBUG: Not requesting block " + std::to_string(next_height) +
+                          " from " + pps.ip + " (beyond peer/header tip)");
                 continue;
             }
             if (pps.peer_tip_height == 0 || next_height <= pps.peer_tip_height) {
@@ -3217,7 +3221,9 @@ void P2P::loop(){
                 g_last_progress_height = h;
                 g_last_progress_ms = tnow;
                 g_next_stall_probe_ms = tnow + g_stall_retry_ms;
-            } else if (tnow >= g_next_stall_probe_ms && !peers_.empty()) {
+            } else if (tnow >= g_next_stall_probe_ms &&
+                       std::any_of(peers_.begin(), peers_.end(),
+                                   [](const auto& kv){ return kv.second.verack_ok; })) {
                 // Stall detected: height hasn't increased for MIQ_P2P_STALL_RETRY_MS
                 int64_t stall_duration_ms = tnow - g_last_progress_ms;
                 log_info("P2P: stall detected - no height progress for " + std::to_string(stall_duration_ms / 1000) + "s (height=" + std::to_string(h) + ", peers=" + std::to_string(peers_.size()) + ")");
@@ -4533,6 +4539,11 @@ void P2P::loop(){
                             log_info("P2P: headers from " + ps.ip + " n=" + std::to_string(hs.size()) + " accepted=" + std::to_string(accepted));
                             g_last_progress_ms = now_ms();
                             g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
+                            // Use received headers to raise our estimate of this peer's tip.
+                            {
+                                uint32_t bhh = chain_.best_header_height();
+                                if (bhh > ps.peer_tip_height) ps.peer_tip_height = bhh;
+                            }
                         } else if (hs.size() > 0) {
                             log_warn("[DEBUG] Headers REJECTED from " + ps.ip + " n=" + std::to_string(hs.size()) +
                                     " accepted=0 error=" + herr);
