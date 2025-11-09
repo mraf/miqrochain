@@ -1590,8 +1590,12 @@ static inline std::vector<uint8_t> miq_build_version_payload() {
         v.push_back(0xFD);
         v.push_back((uint8_t)(user_agent.size() & 0xFF));
         v.push_back((uint8_t)((user_agent.size() >> 8) & 0xFF));
+        v.insert(v.end(), user_agent.begin(), user_agent.end());
     }
-    v.insert(v.end(), user_agent.begin(), user_agent.end());
+
+     uint32_t height = /* chain_.height() or similar */ 0;
+     miq_put_u32le(v, height);
+     v.push_back(1);
 
     // Start height (4 bytes) - we'll use 0 for now
     miq_put_u32le(v, 0);
@@ -3743,6 +3747,13 @@ void P2P::loop(){
             if (current_height != last_height_check) {
                 last_height_check = current_height;
                 last_height_time = now;
+                {
+                    bool have_peer=false;
+                    for (auto& kv : peers_) {
+                        if (kv.second.verack_ok) { have_peer=true; break; }
+                    }
+                    if (!have_peer) continue;
+                }
             } else if (current_height > 0) {
                 int64_t stall_duration = now - last_height_time;
                 if (stall_duration > stall_threshold) {
