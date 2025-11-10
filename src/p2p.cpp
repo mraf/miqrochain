@@ -185,7 +185,7 @@
 #define MIQ_HDR_PIPELINE 1
 #endif
 #ifndef MIQ_SYNC_SEQUENTIAL_DEFAULT
-#define MIQ_SYNC_SEQUENTIAL_DEFAULT 1
+#define MIQ_SYNC_SEQUENTIAL_DEFAULT 0
 #endif
 #ifndef MIQ_CONTINUATION_BATCH
 #define MIQ_CONTINUATION_BATCH 1
@@ -2659,7 +2659,6 @@ void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
 
   
     const size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : base_default;
-    if (!check_rate(ps, "get", 1.0, now_ms())) return;
     if (ps.inflight_blocks.size() >= max_inflight_blocks) return;
     const std::string key = hexkey(h);
     if (g_global_inflight_blocks.count(key)) return;
@@ -3671,7 +3670,7 @@ void P2P::loop(){
         {
             std::vector<std::vector<uint8_t>> want;
             // During IBD keep a fatter queue; after IBD smaller.
-            const size_t cap = !g_logged_headers_done ? (size_t)256 : (size_t)64;
+            const size_t cap = 256;
             chain_.next_block_fetch_targets(want, cap);
             g_sync_wants_active.store(!want.empty());
 
