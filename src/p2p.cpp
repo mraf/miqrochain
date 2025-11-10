@@ -2572,7 +2572,7 @@ void P2P::send_tx(Sock sock, const std::vector<uint8_t>& raw){
 }
 
 void P2P::start_sync_with_peer(PeerState& ps){
-    if (!peer_is_index_capable((Sock)ps.sock)) {
+    if (!peer_is_index_capable((Sock)ps.sock) || ps.peer_tip_height <= 1) {
 #if MIQ_ENABLE_HEADERS_FIRST
         std::vector<std::vector<uint8_t>> locator;
         chain_.build_locator(locator);
@@ -2645,6 +2645,11 @@ void P2P::request_block_index(PeerState& ps, uint64_t index){
     // But allow requests for blocks that might be new (peer could have mined/received new blocks)
     if (ps.peer_tip_height > 0) {
         // If we're requesting a block that's way beyond the peer's known tip (more than a reasonable gap),
+        uint64_t our_height = chain_.height();
+        uint64_t reasonable_gap = 10; // allow some slack
+        if (index > ps.peer_tip_height + reasonable_gap && our_height > ps.peer_tip_height) {
+            return; // skip over-sized request
+        }
         // and we're significantly ahead, then skip the request
         uint64_t our_height = chain_.height();
         uint64_t reasonable_gap = 10; // Allow for some new blocks the peer might have received/mined
@@ -4477,7 +4482,7 @@ void P2P::loop(){
 
 #if MIQ_ENABLE_HEADERS_FIRST
                         const bool peer_supports_headers = (ps.features & (1ull<<0)) != 0;
-                        const bool try_headers = peer_supports_headers || (MIQ_TRY_HEADERS_ANYWAY != 0);
+                        const bool try_headers = peer_supports_headers || (MIQ_TRY_HEADERS_ANYWAY != 0) || (ps.peer_tip_height <= 1);
                         if (try_headers) {
                             std::vector<std::vector<uint8_t>> locator;
                             chain_.build_locator(locator);
