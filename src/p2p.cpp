@@ -178,7 +178,7 @@
 #endif
 
 #ifndef MIQ_INDEX_PIPELINE
-#define MIQ_INDEX_PIPELINE 32
+#define MIQ_INDEX_PIPELINE 64
 #endif
 
 #ifndef MIQ_HDR_PIPELINE
