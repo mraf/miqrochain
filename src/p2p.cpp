@@ -1065,9 +1065,8 @@ static inline uint32_t calculate_adaptive_batch_size(const miq::PeerState& ps) {
         batch_size = 8;
     }
 
-    // During IBD, be more aggressive with good peers
-    if (!g_logged_headers_done && rep >= 0.8) {
-        batch_size = std::min(64u, batch_size * 2);
+   if (!g_logged_headers_done && rep >= 0.8) {
+        batch_size = std::min(256u, batch_size * 2);
     }
 
     return batch_size;
