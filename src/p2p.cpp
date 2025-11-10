@@ -2653,10 +2653,8 @@ void P2P::request_block_index(PeerState& ps, uint64_t index){
 
 void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     if (h.size()!=32) return;
-    size_t base_default = g_sequential_sync ? (size_t)1
-                                            : (g_logged_headers_done ? (size_t)128 : (size_t)512);
-
   
+    size_t base_default = g_sequential_sync ? (size_t)1 : (size_t)256;
     const size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : base_default;
     if (ps.inflight_blocks.size() >= max_inflight_blocks) return;
     const std::string key = hexkey(h);
