@@ -2650,9 +2650,6 @@ void P2P::request_block_index(PeerState& ps, uint64_t index){
         if (index > ps.peer_tip_height + reasonable_gap && our_height > ps.peer_tip_height) {
             return; // skip over-sized request
         }
-        // and we're significantly ahead, then skip the request
-        uint64_t our_height = chain_.height();
-        uint64_t reasonable_gap = 10; // Allow for some new blocks the peer might have received/mined
     }
 
     uint8_t p[8];
