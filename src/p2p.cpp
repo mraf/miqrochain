@@ -1228,7 +1228,7 @@ static inline void gate_on_connect(Sock fd){
         Clock::now().time_since_epoch()).count();
     g_gate[fd] = pg;
     g_trickle_last_ms[fd] = 0;
-    g_peer_index_capable[fd] = true;
+    g_peer_index_capable[fd] = false;
 }
 // NEW: mark the fd as loopback once we know the peer's IP.
 static inline void gate_set_loopback(Sock fd, bool is_lb){
@@ -2376,7 +2376,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     ps.health_score = 1.0;
     ps.last_block_received_ms = 0;
     peers_[s] = ps;
-    g_peer_index_capable[s] = true;
+    g_peer_index_capable[s] = false;
 
     g_trickle_last_ms[s] = 0;
 
@@ -3173,7 +3173,7 @@ void P2P::loop(){
                          ps.health_score = 1.0;
                          ps.last_block_received_ms = 0;
                          { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
-                         g_peer_index_capable[s] = true;
+                         g_peer_index_capable[s] = false;
                          g_trickle_last_ms[s] = 0;
                          log_info("P2P: outbound (addrman) " + ps.ip);
                          miq_set_keepalive(s);
@@ -3229,7 +3229,7 @@ void P2P::loop(){
                                 ps.health_score = 1.0;
                                 ps.last_block_received_ms = 0;
                                 { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
-                                g_peer_index_capable[s] = true;
+                                g_peer_index_capable[s] = false;
                                 g_trickle_last_ms[s] = 0;
 
                                 log_info("P2P: outbound to known " + ps.ip);
@@ -3274,7 +3274,7 @@ void P2P::loop(){
                                     ps.health_score = 1.0;
                                     ps.last_block_received_ms = 0;
                                     { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s]=ps; g_outbounds.insert(s); }
-                                    g_peer_index_capable[s] = true;
+                                    g_peer_index_capable[s] = false;
                                     g_trickle_last_ms[s] = 0;
                                     log_info("P2P: feeler " + dotted);
                                     gate_on_connect(s);
