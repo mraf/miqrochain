@@ -50,3 +50,4 @@ local_tests/
 Thumbs.db
 .cookie
 *.patch
+.env
