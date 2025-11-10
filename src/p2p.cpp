@@ -1621,7 +1621,7 @@ static inline MIQ_MAYBE_UNUSED std::vector<uint8_t> miq_put_u64le_vec(uint64_t x
 static inline void miq_put_u64le(std::vector<uint8_t>& v, uint64_t x){
     for (int i=0;i<8;i++) v.push_back((uint8_t)((x>>(8*i))&0xff));
 }
-static inline std::vector<uint8_t> miq_build_version_payload() {
+static inline std::vector<uint8_t> miq_build_version_payload(uint32_t start_height) {
     std::vector<uint8_t> v; v.reserve(128);
 
     // Use a more compatible protocol version (similar to Bitcoin Core)
@@ -1673,8 +1673,7 @@ static inline std::vector<uint8_t> miq_build_version_payload() {
         v.insert(v.end(), user_agent.begin(), user_agent.end());
     }
 
-    // Start height (4 bytes) – if chain height isn't available here, send 0
-    miq_put_u32le(v, 0);
+    miq_put_u32le(v, start_height);
 
     // Relay flag (1 byte)
     v.push_back(1); // true: receive tx announcements
@@ -2405,7 +2404,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     }
 
     miq_set_keepalive(s);
-    auto version_payload = miq_build_version_payload();
+    auto version_payload = miq_build_version_payload((uint32_t)chain_.height());
     P2P_TRACE("TX " + ps.ip + " cmd=version len=" + std::to_string(version_payload.size()));
     auto msg = encode_msg("version", version_payload);
     bool sent = send_or_close(s, msg);
@@ -2496,7 +2495,7 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
         gate_set_loopback(c, is_loopback_be(be_ip));
     }
 
-    auto msg = encode_msg("version", miq_build_version_payload());
+    auto msg = encode_msg("version", miq_build_version_payload((uint32_t)chain_.height()));
     (void)send_or_close(c, msg);
 }
 
@@ -3180,7 +3179,7 @@ void P2P::loop(){
                          miq_set_keepalive(s);
                          gate_on_connect(s);
                          if (is_v4) gate_set_loopback(s, is_loopback_be(be_ip));
-                         auto msg = encode_msg("version", miq_build_version_payload());
+                         auto msg = encode_msg("version", miq_build_version_payload((uint32_t)chain_.height()));
                          (void)send_or_close(s, msg);
                          dialed = true;
                      } else {
@@ -3237,7 +3236,7 @@ void P2P::loop(){
                                 gate_on_connect(s);
                                 miq_set_keepalive(s);
                                 gate_set_loopback(s, is_loopback_be(pick));
-                                auto msg = encode_msg("version", miq_build_version_payload());
+                                auto msg = encode_msg("version", miq_build_version_payload((uint32_t)chain_.height()));
                                 (void)send_or_close(s, msg);
                             }
                         }
@@ -3281,7 +3280,7 @@ void P2P::loop(){
                                     gate_on_connect(s);
                                     miq_set_keepalive(s);
                                     gate_set_loopback(s, is_loopback_be(be_ip));
-                                    auto msg = encode_msg("version", miq_build_version_payload());
+                                    auto msg = encode_msg("version", miq_build_version_payload((uint32_t)chain_.height()));
                                     (void)send_or_close(s, msg);
                                 }
                             }
