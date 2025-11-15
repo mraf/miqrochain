@@ -847,6 +847,8 @@ static std::unordered_map<std::string, std::pair<int64_t,int64_t>> g_seed_backof
 static std::unordered_map<Sock,int> g_zero_hdr_batches;
 static std::unordered_map<Sock,bool> g_hdr_flip;
 
+static miq::Chain* g_chain_ptr = nullptr;
+
 static std::unordered_map<Sock,int64_t> g_last_hdr_ok_ms; // time of last accepted headers
 
 static std::unordered_map<Sock,int64_t> g_peer_last_fetch_ms;    // last time peer sent us headers/blocks
@@ -870,11 +872,6 @@ static inline bool ibd_or_fetch_active(const miq::PeerState& ps, int64_t nowms) 
 static bool g_seed_mode = false;
 static bool g_sequential_sync = (MIQ_SYNC_SEQUENTIAL_DEFAULT != 0);
 static inline int miq_outbound_target(){
-    // For client nodes (MIQ_FORCE_CLIENT=1), limit to 1-2 connections to prevent connection storms
-    bool is_client = std::getenv("MIQ_FORCE_CLIENT") != nullptr;
-    if (is_client) {
-        return 2; // Allow max 2 connections for client nodes
-    }
     return g_seed_mode ? MIQ_SEED_MODE_OUTBOUND_TARGET : MIQ_OUTBOUND_TARGET;
 }
 
@@ -895,12 +892,17 @@ static int g_headers_tip_confirmed = 0;   // consecutive confirmations of "at ti
 static inline void maybe_mark_headers_done(bool at_tip) {
     if (g_logged_headers_done) return;
     if (!g_logged_headers_started) {
-        // Keep waiting: we haven't engaged the headers phase, so don't flip the global IBD flag yet.
         g_headers_tip_confirmed = 0;
         return;
     }
+
+    if (g_chain_ptr && g_chain_ptr->height() < 100) {
+        g_headers_tip_confirmed = 0;
+        return;
+    }
+    
     if (at_tip) {
-        if (++g_headers_tip_confirmed >= 1) {
+        if (++g_headers_tip_confirmed >= 3) {
             g_logged_headers_done = true;
             miq::log_info(std::string("[IBD] headers phase done"));
         }
@@ -1101,9 +1103,18 @@ static inline void clear_fulfilled_indices_up_to_height(size_t new_h){
         // Trim the front of the oldest-first deque
         while (!dq.empty() && dq.front() <= (uint64_t)new_h) dq.pop_front();
 
-        // SYNC STATE FIX: Adjust inflight_index counter for cleared requests
-        // Note: We can't access peers_ from this static function, so this will be handled
-        // in the calling code where peers_ is accessible
+        }
+    
+    // Return number of cleared items per socket for caller to adjust counters
+    static std::unordered_map<Sock, uint32_t> cleared_counts;
+    cleared_counts.clear();
+    for (const auto& kv : g_inflight_index_ts) {
+        Sock s = kv.first;
+        for (const auto& idx_ts : kv.second) {
+            if (idx_ts.first <= (uint64_t)new_h) {
+                cleared_counts[s]++;
+            }
+        }
     }
 }
 
@@ -2089,7 +2100,9 @@ bool P2P::start(uint16_t port){
 #ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
-
+    
+    g_chain_ptr = &chain_;
+    
     g_logged_headers_started = false;
     g_logged_headers_done    = false;
     g_global_inflight_blocks.clear();
@@ -2953,6 +2966,16 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
         uint64_t new_height = chain_.height();
         for (auto& kvp : peers_) {
             PeerState& peer = kvp.second;
+
+            if (peer.next_index <= new_height) {
+                uint64_t old_next = peer.next_index;
+                peer.next_index = new_height + 1;
+                if (old_next > 0 && old_next != peer.next_index) {
+                    P2P_TRACE("Corrected peer " + peer.ip + " next_index from " + 
+                              std::to_string(old_next) + " to " + std::to_string(peer.next_index));
+                }
+            }
+          
             if (peer.syncing && peer.next_index <= new_height) {
                 peer.next_index = new_height + 1;
                 P2P_TRACE("DEBUG: Updated peer " + peer.ip + " next_index to " +
@@ -3858,6 +3881,24 @@ void P2P::loop(){
 
             if (should_refetch) {
                 last_refetch_time = now;
+
+                if (g_logged_headers_done && current_height < chain_.best_header_height()) {
+                    for (auto& kvp : peers_) {
+                        auto& pps = kvp.second;
+                        if (!pps.verack_ok) continue;
+                        if (!peer_is_index_capable((Sock)pps.sock)) continue;
+                        
+                        if (!pps.syncing) {
+                            pps.syncing = true;
+                            pps.inflight_index = 0;
+                            pps.next_index = current_height + 1;
+                            fill_index_pipeline(pps);
+                            log_info("[SYNC] Activated index sync on " + pps.ip + 
+                                   " to catch up to header tip (current=" + std::to_string(current_height) + 
+                                   " header_tip=" + std::to_string(chain_.best_header_height()) + ")");
+                        }
+                    }
+                }
 
                 // Check if we're in a headers-only state
                 static int64_t last_headers_only_warning = 0;
@@ -5343,28 +5384,6 @@ void P2P::loop(){
         for (Sock s : dead) {
             auto it_peers_count = peers_.size();
             auto it_preview = peers_.find(s);
-            if (it_preview != peers_.end()) {
-                // If this is our last live peer and we’re still syncing, don’t kill it;
-                // keep the network moving and be patient instead.
-                bool ibd_active_globally = (!g_logged_headers_done);
-                bool ibd_active_peer     = it_preview->second.syncing;
-                if (it_peers_count == 1 && (ibd_active_globally || ibd_active_peer)) {
-                    // Rate limit this warning to prevent log spam
-                    static int64_t last_keep_alive_log = 0;
-                    int64_t now = now_ms();
-                    if (now - last_keep_alive_log > 5000) { // Log at most every 5 seconds
-                        log_warn("P2P: keeping last syncing peer alive (avoid total stall) ip=" + it_preview->second.ip);
-                        last_keep_alive_log = now;
-                    }
-                    // Reset ping/handshake timers to give it fresh headroom
-                    auto g = g_gate.find(s);
-                    if (g != g_gate.end()) g->second.hs_last_ms = now_ms();
-                    it_preview->second.awaiting_pong = false;
-                    it_preview->second.last_ping_ms  = now_ms();
-                    // DISABLED: continue; // skip close
-                    // This was causing infinite POLLHUP loop - we MUST close dead sockets
-                }
-            }
 
             trickle_flush();
 
