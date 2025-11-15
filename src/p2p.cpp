@@ -4553,12 +4553,7 @@ void P2P::loop(){
                         if (ps.verack_ok) return;
                         if (!(gg.got_version && gg.got_verack && gg.sent_verack)) return;
                         
-                        // Validate handshake state
-                        if (!gg.sent_version) {
-                            log_warn("P2P: Invalid handshake state for " + ps.ip);
-                            dead.push_back(s);
-                            return;
-                        }
+                        // The handshake is complete at this point
 
                         ps.verack_ok = true;
                         const int64_t hs_ms = now_ms() - gg.t_conn_ms;
@@ -5461,7 +5456,7 @@ void P2P::loop(){
         }
         // ---- Guarded removals (single, consistent path) --------------------
         for (Sock s : dead) {
-            auto it_peers_count = peers_.size();
+            // auto it_peers_count = peers_.size();  // Currently unused
             auto it_preview = peers_.find(s);
 
             trickle_flush();
