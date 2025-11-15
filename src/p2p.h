@@ -153,6 +153,18 @@ struct PeerState {
 
     // Timeout tracking
     int64_t avg_block_delivery_ms{30000};       // Running average delivery time (default 30s)
+    
+    // Connection quality tracking (FIX: added for better sync management)
+    int64_t last_activity_ms{0};                // Last meaningful activity
+    uint32_t blocks_served{0};                  // Blocks we've sent to this peer
+    uint32_t headers_served{0};                 // Headers we've sent to this peer
+    int64_t connected_ms{0};                    // When connection was established
+    int64_t last_useful_ms{0};                  // Last time peer provided useful data
+    uint32_t blocks_sent{0};                    // Blocks sent to this peer
+    uint32_t blocks_received{0};                // Blocks received from this peer
+    uint32_t headers_received{0};               // Headers received from this peer
+    bool is_syncing{false};                     // Is this peer currently syncing from us
+    std::vector<uint8_t> best_known_tip;        // Best block hash we know this peer has
     int64_t max_timeout_ms{60000};              // Maximum timeout for this peer
     int64_t last_block_received_ms{0};          // Timestamp of last block received
 
