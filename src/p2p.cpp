@@ -2078,6 +2078,10 @@ void P2P::bump_ban(PeerState& ps, const std::string& ip, const char* reason, int
 
     if (ibd_or_fetch_active(ps, now_ms)) {
         P2P_TRACE(std::string("no-ban (sync-active) ip=") + ip + " reason=" + (reason?reason:""));
+        // Still disconnect bad peers during sync, just don't ban them
+        if (reason && (std::strstr(reason, "bad") || std::strstr(reason, "invalid"))) {
+            schedule_close((Sock)ps.sock);
+        }
         return;
     }
     
@@ -2126,6 +2130,27 @@ bool P2P::start(uint16_t port){
         } else {
             log_info("P2P: addrman load: " + err);
         }
+        
+        // Initialize with seed nodes if addrman is empty
+        if (g_addrman.size() == 0) {
+            log_info("P2P: addrman empty, adding hardcoded seeds");
+            std::vector<miq::SeedEndpoint> seeds;
+            if (miq::resolve_dns_seeds(seeds, P2P_PORT, true)) {
+                for (const auto& s : seeds) {
+                    uint32_t be_ip;
+                    if (parse_ipv4(s.ip, be_ip) && ipv4_is_public(be_ip)) {
+                        miq::NetAddr na;
+                        na.host = s.ip;
+                        na.port = s.port > 0 ? s.port : P2P_PORT;
+                        na.is_ipv6 = false;
+                        na.tried = false;
+                        g_addrman.add(na, true);
+                    }
+                }
+                log_info("P2P: added " + std::to_string(g_addrman.size()) + " seed addresses");
+            }
+        }
+        
         g_last_addrman_save = now_ms();
         g_next_feeler_ms    = now_ms() + MIQ_FEELER_INTERVAL_MS;
     }
@@ -3693,6 +3718,16 @@ void P2P::loop(){
             const size_t cap = 256;
             chain_.next_block_fetch_targets(want, cap);
             g_sync_wants_active.store(!want.empty());
+            
+            // Request genesis block if we're completely empty
+            if (want.empty() && chain_.height() == 0 && chain_.best_header_height() == 0) {
+                // Request genesis from peers
+                std::vector<uint8_t> genesis_hash(32, 0);
+                if (!chain_.have_block(genesis_hash)) {
+                    want.push_back(genesis_hash);
+                    log_info("[SYNC] Requesting genesis block for initial sync");
+                }
+            }
 
             // Debug logging for sync issues
             if (want.empty() && !g_logged_headers_done) {
@@ -3716,10 +3751,28 @@ void P2P::loop(){
                     last_debug_log = now;
                 }
 
-                // AGGRESSIVE FALLBACK: DISABLED - causes connection storms
-                // The aggressive fallback was causing rapid reconnection attempts that hit rate limits
-                // Instead, rely on normal IBD timeout and retry mechanisms
-                if (false && !we_are_seed && now - last_fallback_activation > 30000) { // DISABLED
+                // Enhanced fallback: request headers from all connected peers
+                if (!we_are_seed && now - last_fallback_activation > MIQ_IBD_FALLBACK_AFTER_MS) {
+                    last_fallback_activation = now;
+                    log_info("[SYNC] Activating enhanced synchronization fallback");
+                    
+                    // Request headers from all connected peers
+                    for (auto& kv : peers_) {
+                        auto& ps = kv.second;
+                        if (!ps.verack_ok) continue;
+                        
+                        // Request headers
+                        std::vector<std::vector<uint8_t>> locator;
+                        chain_.build_locator(locator);
+                        std::vector<uint8_t> stop(32, 0);
+                        auto pl = build_getheaders_payload(locator, stop);
+                        auto msg = encode_msg("getheaders", pl);
+                        if (send_or_close(ps.sock, msg)) {
+                            ps.sent_getheaders = true;
+                            log_info("[SYNC] Requested headers from " + ps.ip);
+                        }
+                    }
+                    
                     log_warn("[IBD] next_block_fetch_targets empty - activating aggressive index-by-height fallback");
                     bool activated_any = false;
                     for (auto &kvp : peers_) {
@@ -4499,6 +4552,13 @@ void P2P::loop(){
                         auto& gg = itg2->second;
                         if (ps.verack_ok) return;
                         if (!(gg.got_version && gg.got_verack && gg.sent_verack)) return;
+                        
+                        // Validate handshake state
+                        if (!gg.sent_version) {
+                            log_warn("P2P: Invalid handshake state for " + ps.ip);
+                            dead.push_back(s);
+                            return;
+                        }
 
                         ps.verack_ok = true;
                         const int64_t hs_ms = now_ms() - gg.t_conn_ms;
@@ -4507,6 +4567,25 @@ void P2P::loop(){
 #if MIQ_ENABLE_HEADERS_FIRST
                         const bool peer_supports_headers = (ps.features & (1ull<<0)) != 0;
                         const bool try_headers = peer_supports_headers || (MIQ_TRY_HEADERS_ANYWAY != 0) || (ps.peer_tip_height <= 1);
+                        
+                        // Force header sync for new nodes
+                        if (chain_.best_header_height() == 0) {
+                            log_info("[SYNC] New node detected, forcing header sync");
+                        }
+                        
+                        // Share our chain tip with new peer
+                        if (chain_.height() > 0) {
+                            std::vector<uint8_t> tip_hash = chain_.tip_hash();
+                            std::vector<uint8_t> inv_payload;
+                            inv_payload.push_back(1);  // count
+                            inv_payload.push_back(2);  // type (MSG_BLOCK)
+                            inv_payload.insert(inv_payload.end(), tip_hash.begin(), tip_hash.end());
+                            auto inv_msg = encode_msg("inv", inv_payload);
+                            if (send_or_close(s, inv_msg)) {
+                                log_info("[SYNC] Shared tip with new peer " + ps.ip);
+                            }
+                        }
+                        
                         if (try_headers) {
                             std::vector<std::vector<uint8_t>> locator;
                             chain_.build_locator(locator);
