@@ -452,8 +452,9 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         // before genesis init
     } else {
         if (!header_exists(h.prev_hash) && h.prev_hash != tip_.hash && !have_block(h.prev_hash)) {
-        err = "";
-    }
+        err = "parent header not found";
+            return false;
+        }
     }
 
     // Determine MTP & window on the header's own branch
@@ -569,10 +570,23 @@ uint64_t Chain::best_header_height() const {
 
 bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     MIQ_CHAIN_GUARD();
-    if (!validate_header(h, err)) return false;
 
     const auto hh = header_hash_of(h);
     const auto key = hk(hh);
+
+    if (header_index_.find(key) != header_index_.end()) {
+        g_header_full[key] = h;
+        return true;
+    }
+    
+    // Check if we have the full block on disk
+    if (have_block(hh)) {
+        // We have the block, accept the header without validation
+        // This helps with restarting nodes that have blocks but lost header index
+    } else {
+        // Validate the header if we don't have the block
+        if (!validate_header(h, err)) return false;
+    }
 
     // If we already know this header, ensure full header cached too.
     auto itExisting = header_index_.find(key);
@@ -596,7 +610,18 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
         parent_work   = itp->second.work_sum;
     } else if (h.prev_hash == tip_.hash) {
         parent_height = tip_.height;
-        parent_work   = work_from_bits(tip_.bits);  // FIX: set parent_work for genesis chain
+        parent_work = 0.0L;
+        // Walk back from tip to genesis to calculate total work
+        std::vector<uint8_t> cur_hash = tip_.hash;
+        uint64_t cur_height = tip_.height;
+        while (cur_height > 0) {
+            Block b;
+            if (get_block_by_hash(cur_hash, b)) {
+                parent_work += work_from_bits(b.header.bits);
+                cur_hash = b.header.prev_hash;
+                cur_height--;
+            } else break;
+        }
     }
     m.height   = parent_height + 1;
     m.work_sum = parent_work + work_from_bits(h.bits);
@@ -656,6 +681,10 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
     MIQ_CHAIN_GUARD();
     out.clear();
 
+    if (max > 2000) {
+        max = 2000;
+    }
+
     // Debug logging for sync issues
     static int64_t last_debug_log = 0;
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -676,6 +705,15 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
             last_debug_log = now;
         }
         return;
+    }
+
+    if (best_header_key_.empty() && tip_.height > 0) {
+        log_info("[FIX] Attempting to rebuild header index from blocks");
+        rebuild_header_index_from_blocks();
+        if (best_header_key_.empty()) {
+            log_warn("[FIX] Could not rebuild header index");
+            return;
+        }
     }
 
     std::vector<uint8_t> bh = header_index_.at(best_header_key_).hash;
@@ -1327,6 +1365,15 @@ bool Chain::init_genesis(const Block& g){
 
 bool Chain::verify_block(const Block& b, std::string& err) const{
     MIQ_CHAIN_GUARD();
+
+    if (b.txs.empty()) {
+        err = "block has no transactions";
+        return false;
+    }
+    
+    // Verify computed hash matches
+    auto computed_hash = b.block_hash();
+  
     if(b.header.prev_hash != tip_.hash){ err="bad prev hash"; return false; }
 
     // MTP
@@ -1664,6 +1711,28 @@ bool Chain::disconnect_tip_once(std::string& err){
 
 bool Chain::submit_block(const Block& b, std::string& err){
     MIQ_CHAIN_GUARD();
+
+    const auto hh = b.block_hash();
+    const auto key = hk(hh);
+    
+    // Check if we already have this block
+    if (have_block(hh)) {
+        // Already have it, ensure header is in index
+        if (header_index_.find(key) == header_index_.end()) {
+            std::string header_err;
+            accept_header(b.header, header_err);
+        }
+        return true;
+    }
+    
+    // Add header to index if not present
+    if (header_index_.find(key) == header_index_.end()) {
+        std::string header_err;
+        if (!accept_header(b.header, header_err)) {
+            log_warn("Failed to accept header during block submission: " + header_err);
+        }
+    }
+  
     if (!verify_block(b, err)) return false;
 
     if (have_block(b.block_hash())) return true;
