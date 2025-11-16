@@ -4845,11 +4845,10 @@ void P2P::loop(){
                             g_inflight_block_ts[(Sock)s].erase(bh);
                             g_global_inflight_blocks.erase(bh);
 
-                            // Track peer's tip height: update when we receive a block
-                            uint64_t new_height = chain_.height() + 1;  // Assume this block will be accepted
-                            if (new_height > ps.peer_tip_height) {
-                                ps.peer_tip_height = new_height;
-                            }
+                            // NOTE: Don't update peer_tip_height here - it should only be set from
+                            // the version message or headers, not from individual blocks.
+                            // Setting it here causes false "syncing blocks" status when the peer
+                            // sends us a block that hasn't been accepted yet.
 
                             // Track block delivery time for reputation scoring
                             int64_t now_ms_val = now_ms();
