@@ -43,28 +43,45 @@ enum class LogCategory {
 };
 
 struct LogMetrics {
-    std::atomic<uint64_t> total_messages{0};
-    std::atomic<uint64_t> dropped_messages{0};
-    std::atomic<uint64_t> bytes_written{0};
-    std::atomic<uint64_t> rotations{0};
-    std::chrono::steady_clock::time_point start_time;
-    
-    LogMetrics() : start_time(std::chrono::steady_clock::now()) {}
-    
-    std::string GetStats() const {
-        auto now = std::chrono::steady_clock::now();
-        auto uptime = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
-        
-        std::stringstream ss;
-        ss << "Log Statistics:\n"
-           << "  Total Messages: " << total_messages.load() << "\n"
-           << "  Dropped Messages: " << dropped_messages.load() << "\n"
-           << "  Bytes Written: " << FormatBytes(bytes_written.load()) << "\n"
-           << "  File Rotations: " << rotations.load() << "\n"
-           << "  Uptime: " << uptime << " seconds\n"
-           << "  Messages/sec: " << (uptime > 0 ? total_messages.load() / uptime : 0);
-        return ss.str();
+    std::atomic<std::uint64_t> lines_trace{0};
+    std::atomic<std::uint64_t> lines_debug{0};
+    std::atomic<std::uint64_t> lines_info{0};
+    std::atomic<std::uint64_t> lines_warn{0};
+    std::atomic<std::uint64_t> lines_error{0};
+
+    LogMetrics() = default;
+
+    // Explicit copy constructor – needed because std::atomic is non-copyable by default
+    LogMetrics(const LogMetrics& other) {
+        lines_trace.store(other.lines_trace.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+        lines_debug.store(other.lines_debug.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+        lines_info.store(other.lines_info.load(std::memory_order_relaxed),
+                         std::memory_order_relaxed);
+        lines_warn.store(other.lines_warn.load(std::memory_order_relaxed),
+                         std::memory_order_relaxed);
+        lines_error.store(other.lines_error.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
     }
+
+    LogMetrics& operator=(const LogMetrics& other) {
+        if (this != &other) {
+            lines_trace.store(other.lines_trace.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+            lines_debug.store(other.lines_debug.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+            lines_info.store(other.lines_info.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+            lines_warn.store(other.lines_warn.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+            lines_error.store(other.lines_error.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+        }
+        return *this;
+    }
+};
+
     
 private:
     static std::string FormatBytes(uint64_t bytes) {
@@ -234,6 +251,9 @@ public:
     void Flush();
     void Rotate();
     LogMetrics GetMetrics() const { return metrics_; }
+    
+    static Logger& Instance();
+    
     std::string GetStats() const { return metrics_.GetStats(); }
     void Shutdown();
     
@@ -317,5 +337,8 @@ public:
 
 #define LOG_TIMER(cat, op) miq::LogTimer _timer_##__LINE__(cat, op)
 #define LOG_TIMER_LEVEL(cat, op, level) miq::LogTimer _timer_##__LINE__(cat, op, level)
+
+void log_info(const std::string& msg);
+void log_error(const std::string& msg);
 
 }
