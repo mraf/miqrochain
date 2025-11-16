@@ -758,6 +758,7 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
     }
 
     size_t blocks_skipped = 0;
+    size_t blocks_added = 0;
     for (auto it = up.rbegin(); it != up.rend(); ++it) {
         if (out.size() >= max) break;
         const auto& hh = *it;
@@ -774,7 +775,8 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
         // OPTIMIZATION: If we have the first few blocks, skip ahead to find missing ones
         if (blocks_skipped > 10 && blocks_added == 0) {
             // Skip ahead more aggressively to find missing blocks
-            auto skip_count = std::min((size_t)100, up.rend() - it - 1);
+            auto remaining = up.rend() - it - 1;
+            auto skip_count = std::min((size_t)100, (size_t)(remaining > 0 ? remaining : 0));
             it += skip_count;
             if (should_log) {
                 log_info("[DEBUG] Skipping ahead " + std::to_string(skip_count) + " blocks to find missing ones");
