@@ -1,4 +1,4 @@
-#include "log_enhanced.h"
+#include "log.h"
 #include <iostream>
 #include <iomanip>
 #include <sstream>
