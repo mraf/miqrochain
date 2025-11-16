@@ -696,7 +696,7 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
     static int64_t last_debug_log = 0;
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    bool should_log = (now - last_debug_log > 15000); // Log every 15 seconds
+    bool should_log = (now - last_debug_log > 5000);
 
     if (best_header_key_.empty()) {
         if (should_log) {
@@ -713,7 +713,13 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
         }
         
         // If we have blocks but no header index, try to rebuild it
-        if (tip_.height > 0) {
+        if (tip_.height > 0 && header_index_.empty()) {
+            // Return empty - P2P will handle this via index-based sync
+            return;
+        }
+        
+        // Special case: if we're at genesis and need the next block
+        if (tip_.height == 0 && header_index_.empty()) {
             log_info("[FIX] Attempting to rebuild header index from blocks");
             // Note: rebuild_header_index_from_blocks() needs to be called elsewhere as this is const
             // But we log the need for it here
@@ -751,7 +757,7 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
         last_debug_log = now;
     }
 
-    size_t blocks_added = 0;
+    size_t blocks_skipped = 0;
     for (auto it = up.rbegin(); it != up.rend(); ++it) {
         if (out.size() >= max) break;
         const auto& hh = *it;
@@ -761,12 +767,25 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
         if (!have_blk && !have_orphan) {
             out.push_back(hh);
             blocks_added++;
+            } else {
+            blocks_skipped++;
+        }
+        
+        // OPTIMIZATION: If we have the first few blocks, skip ahead to find missing ones
+        if (blocks_skipped > 10 && blocks_added == 0) {
+            // Skip ahead more aggressively to find missing blocks
+            auto skip_count = std::min((size_t)100, up.rend() - it - 1);
+            it += skip_count;
+            if (should_log) {
+                log_info("[DEBUG] Skipping ahead " + std::to_string(skip_count) + " blocks to find missing ones");
+            }
         }
     }
 
     if (should_log) {
         log_info("[DEBUG] next_block_fetch_targets: returning " + std::to_string(out.size()) +
-                 " blocks to download (added=" + std::to_string(blocks_added) + " max=" + std::to_string(max) + ")");
+                 " blocks to download (added=" + std::to_string(blocks_added) + 
+                 " skipped=" + std::to_string(blocks_skipped) + " max=" + std::to_string(max) + ")");
     }
 }
 
