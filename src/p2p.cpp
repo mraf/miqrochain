@@ -178,17 +178,17 @@
 #endif
 
 #ifndef MIQ_INDEX_PIPELINE
-#define MIQ_INDEX_PIPELINE 64
+#define MIQ_INDEX_PIPELINE 128
 #endif
 
 #ifndef MIQ_HDR_PIPELINE
-#define MIQ_HDR_PIPELINE 1
+#define MIQ_HDR_PIPELINE 8
 #endif
 #ifndef MIQ_SYNC_SEQUENTIAL_DEFAULT
 #define MIQ_SYNC_SEQUENTIAL_DEFAULT 0
 #endif
 #ifndef MIQ_CONTINUATION_BATCH
-#define MIQ_CONTINUATION_BATCH 1
+#define MIQ_CONTINUATION_BATCH 32
 #endif
 #ifndef MIQ_SEED_DOMAIN
 #define MIQ_SEED_DOMAIN "seed.miqrochain.org"
@@ -2648,7 +2648,7 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // Use adaptive pipeline size based on peer reputation
     uint32_t pipe;
     if (g_sequential_sync) {
-        pipe = 1u;
+        pipe = 4u;
     } else {
         // Update reputation and adaptive batch size
         update_peer_reputation(ps);
@@ -2670,9 +2670,18 @@ void P2P::fill_index_pipeline(PeerState& ps){
     }
 
     while (ps.inflight_index < pipe) {
+        uint64_t header_tip = chain_.best_header_height();
+        if (header_tip > 0 && ps.next_index > header_tip) {
+            P2P_TRACE("DEBUG: fill_index_pipeline stopping at header tip " + std::to_string(header_tip));
+            break;
+        }
+        
         uint64_t idx = ps.next_index++;
         request_block_index(ps, idx);
         ps.inflight_index++;
+        
+        P2P_TRACE("DEBUG: Requested block index " + std::to_string(idx) + " (inflight=" + std::to_string(ps.inflight_index) + ")");
+      
     }
 }
 
@@ -3888,7 +3897,7 @@ void P2P::loop(){
 
             // Check for height progress stall - be more aggressive after headers phase
             bool height_stalled = false;
-            int64_t stall_threshold = headers_done ? 10000 : 30000;  // 10s after headers, 30s before
+            int64_t stall_threshold = headers_done ? 5000 : 15000;  // 5s after headers, 15s before (was 10s/30s)
 
             if (current_height != last_height_check) {
                 last_height_check = current_height;
@@ -3908,7 +3917,7 @@ void P2P::loop(){
             }
 
             // Implement aggressive refetch when stalled OR proactive pipeline during IBD
-            int64_t refetch_interval = headers_done ? 5000 : 10000;  // 5s after headers, 10s before
+            int64_t refetch_interval = headers_done ? 2000 : 5000;  // 2s after headers, 5s before (was 5s/10s)
 
             // DEBUG: Log refetch check
             static int64_t last_debug_log = 0;
@@ -3921,7 +3930,7 @@ void P2P::loop(){
             // Use continuous batch pipeline: request next blocks every 200ms
             // This works both before AND after headers phase
             bool should_refetch = false;
-            if (g_sequential_sync && (now - last_refetch_time > 200)) {
+            if (now - last_refetch_time > 100) {  // 100ms instead of 200ms
                 // Proactive pipeline - keep requesting the next batch of blocks
                 should_refetch = true;
                 log_info("[SYNC] Proactive pipeline: requesting next block (height=" + std::to_string(current_height) + ")");
@@ -3945,7 +3954,12 @@ void P2P::loop(){
                             pps.syncing = true;
                             pps.inflight_index = 0;
                             pps.next_index = current_height + 1;
+                            if (pps.next_index <= current_height) {
+                                pps.next_index = current_height + 1;
+                            }
                             fill_index_pipeline(pps);
+                            log_info("[SYNC] Filled pipeline for " + pps.ip + 
+                                   " with " + std::to_string(pps.inflight_index) + " requests");
                             log_info("[SYNC] Activated index sync on " + pps.ip + 
                                    " to catch up to header tip (current=" + std::to_string(current_height) + 
                                    " header_tip=" + std::to_string(chain_.best_header_height()) + ")");
@@ -3977,10 +3991,10 @@ void P2P::loop(){
 
                     // Determine how many blocks to request (adaptive based on peer reputation)
                     uint32_t best_hdr_height = chain_.best_header_height();
-                    uint32_t max_height = (best_hdr_height > current_height)
+                    uint32_t max_height = (best_hdr_height > current_height + 32)
                         ? best_hdr_height
-                        : current_height + pps.adaptive_batch_size;  // Use adaptive batch size
-
+                        : current_height + std::max(pps.adaptive_batch_size, (uint32_t)32);
+                  
                     // Cap to peer's known tip height: don't request beyond what peer has sent us
                     if (pps.peer_tip_height > 0 && pps.peer_tip_height > current_height) {
                         max_height = std::min((uint32_t)max_height, (uint32_t)pps.peer_tip_height);
@@ -4935,6 +4949,23 @@ void P2P::loop(){
                                     }
                                 }
                                 ps.inflight_index--;
+                                if (ps.syncing && ps.inflight_index < MIQ_INDEX_PIPELINE / 2) {
+                                    fill_index_pipeline(ps);
+                                    P2P_TRACE("DEBUG: Refilled pipeline after block delivery (inflight=" + 
+                                            std::to_string(ps.inflight_index) + ")");
+                                }
+                            }
+
+                            uint64_t new_chain_height = chain_.height();
+                            if (new_chain_height > old_height) {
+                                log_info("[SYNC] Block accepted, new height=" + std::to_string(new_chain_height));
+                                
+                                // Update next_index for all syncing peers to prevent re-requesting same block
+                                for (auto& kvp : peers_) {
+                                    if (kvp.second.syncing && kvp.second.next_index <= new_chain_height) {
+                                        kvp.second.next_index = new_chain_height + 1;
+                                    }
+                                }
                             }
 
                             std::vector<std::vector<uint8_t>> want2;
@@ -4943,6 +4974,22 @@ void P2P::loop(){
                             if (!want2.empty()) {
                                 // Stick to the same peer when possible to keep strict ordering.
                                 request_block_hash(ps, want2[0]);
+                            }
+
+                            if (ps.syncing && chain_.best_header_height() > new_chain_height) {
+                                if (ps.inflight_index == 0) {
+                                    // Pipeline is empty, refill immediately
+                                    ps.next_index = new_chain_height + 1;
+                                    fill_index_pipeline(ps);
+                                    P2P_TRACE("DEBUG: Pipeline was empty, refilled (height=" + std::to_string(new_chain_height) + 
+                                            ", headers=" + std::to_string(chain_.best_header_height()) + ")");
+                                } else if (ps.inflight_index < MIQ_INDEX_PIPELINE / 4) {
+                                    // Pipeline is low, top it up
+                                    fill_index_pipeline(ps);
+                                    P2P_TRACE("DEBUG: Proactively topping up pipeline (height=" + std::to_string(new_chain_height) + 
+                                            ", headers=" + std::to_string(chain_.best_header_height()) + 
+                                            ", inflight=" + std::to_string(ps.inflight_index) + ")");
+                                }
                             }
                           
                         } else {
