@@ -1,7 +1,6 @@
 #pragma once
-// PRODUCTION-GRADE P2P NETWORKING HEADER
-// Enhanced with circuit breakers, connection pooling, health monitoring,
-// automatic recovery, and comprehensive error handling for 99.9% uptime
+// PRODUCTION-GRADE P2P NETWORKING - Miqrochain
+// Complete drop-in replacement with integrated production features
 // Version: 1.0.0-production
 
 #include <thread>
@@ -11,6 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <deque>
+#include <queue>
 #include <cstdint>
 #include <utility>
 #include <mutex>
@@ -18,7 +18,8 @@
 #include <condition_variable>
 #include <chrono>
 #include <memory>
-#include <optional>
+#include <functional>
+#include <limits>
 
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
@@ -31,74 +32,27 @@
   #ifndef socklen_t
     using socklen_t = int;
   #endif
-  using Sock = SOCKET;          // unified socket type on Windows
+  using Sock = SOCKET;
 #else
   #include <netinet/in.h>
   #include <arpa/inet.h>
   #include <sys/socket.h>
   #include <unistd.h>
-  using Sock = int;             // unified socket type on POSIX
+  using Sock = int;
 #endif
 
 #include "mempool.h"
 
 namespace miq {
 
-// === PRODUCTION CONFIGURATION (environment-based tuning) ====================
-struct P2PConfig {
-    // Connection Management
-    size_t max_inbound{125};
-    size_t max_outbound{8};
-    size_t max_connections{150};
-    size_t connection_timeout_ms{5000};
-    size_t handshake_timeout_ms{10000};
-    size_t idle_timeout_ms{900000};  // 15 minutes
-    
-    // Retry & Backoff
-    size_t initial_retry_delay_ms{1000};
-    size_t max_retry_delay_ms{300000};  // 5 minutes
-    double retry_backoff_multiplier{2.0};
-    size_t max_retry_attempts{10};
-    double retry_jitter{0.25};  // ±25% jitter
-    
-    // Circuit Breaker
-    size_t circuit_breaker_threshold{5};
-    size_t circuit_breaker_timeout_ms{60000};
-    double circuit_breaker_success_rate{0.6};
-    size_t circuit_breaker_sample_size{20};
-    
-    // Rate Limiting
-    size_t rate_limit_window_ms{10000};
-    size_t rate_limit_max_requests{100};
-    bool adaptive_rate_limiting{true};
-    double rate_limit_burst_factor{2.0};
-    
-    // Health Monitoring
-    size_t health_check_interval_ms{30000};
-    size_t health_check_timeout_ms{5000};
-    size_t health_failure_threshold{3};
-    double health_score_threshold{0.5};
-    
-    // Connection Pool
-    size_t connection_pool_min{5};
-    size_t connection_pool_max{20};
-    size_t connection_pool_idle_timeout_ms{300000};
-    bool connection_pool_validation{true};
-    
-    // Socket Options
-    size_t socket_send_buffer{262144};  // 256KB
-    size_t socket_recv_buffer{262144};  // 256KB
-    bool tcp_nodelay{true};
-    bool tcp_keepalive{true};
-    int tcp_keepalive_time{60};
-    int tcp_keepalive_interval{10};
-    int tcp_keepalive_probes{6};
-    
-    // Load from environment
-    static P2PConfig from_env();
-};
+// Forward declarations
+class Chain;
+class CircuitBreaker;
+class ConnectionPool;
+struct HealthMetrics;
+struct P2PConfig;
 
-// === Circuit Breaker for Connection Reliability =============================
+// === Circuit Breaker Pattern ================================================
 class CircuitBreaker {
 public:
     enum State { CLOSED, OPEN, HALF_OPEN };
@@ -112,7 +66,7 @@ public:
     void record_failure();
     State get_state() const;
     double get_success_rate() const;
-    size_t get_failure_count() const;
+    size_t get_failure_count() const { return failure_count_; }
     void reset();
     
 private:
@@ -130,43 +84,59 @@ private:
     size_t sample_size_{20};
 };
 
-// === Connection Pool for Resource Efficiency ================================
-class ConnectionPool {
-public:
-    struct PooledConnection {
-        Sock socket;
-        std::string address;
-        uint16_t port;
-        std::chrono::steady_clock::time_point created_at;
-        std::chrono::steady_clock::time_point last_used;
-        std::atomic<bool> in_use{false};
-        std::shared_ptr<CircuitBreaker> circuit_breaker;
-        size_t use_count{0};
-        bool is_healthy{true};
-    };
+// === Health Metrics ==========================================================
+struct HealthMetrics {
+    double min_latency_ms{std::numeric_limits<double>::max()};
+    double max_latency_ms{0};
+    double avg_latency_ms{0};
+    double jitter_ms{0};
+    std::deque<double> latency_samples;
     
-    explicit ConnectionPool(const P2PConfig& config);
-    ~ConnectionPool();
+    double upload_bps{0};
+    double download_bps{0};
+    std::atomic<size_t> bytes_sent{0};
+    std::atomic<size_t> bytes_received{0};
     
-    std::shared_ptr<PooledConnection> acquire(const std::string& address, uint16_t port);
-    void release(std::shared_ptr<PooledConnection> conn);
-    void remove_unhealthy();
-    size_t size() const;
-    size_t available() const;
+    std::atomic<size_t> successful_requests{0};
+    std::atomic<size_t> failed_requests{0};
+    double packet_loss_rate{0};
     
-private:
-    mutable std::shared_mutex mutex_;
-    std::vector<std::shared_ptr<PooledConnection>> pool_;
-    P2PConfig config_;
-    std::condition_variable_any pool_cv_;
+    std::chrono::steady_clock::time_point last_check;
+    std::chrono::steady_clock::time_point last_activity;
     
-    std::shared_ptr<PooledConnection> create_connection(const std::string& address, uint16_t port);
-    bool validate_connection(PooledConnection& conn);
-    void close_connection(PooledConnection& conn);
+    double calculate_health_score() const;
+    void update_latency(double latency_ms);
+    void update_throughput(size_t bytes, bool upload);
 };
 
-// === Enhanced Hardening Configuration =======================================
+// === Configuration ===========================================================
+struct P2PConfig {
+    size_t max_inbound{125};
+    size_t max_outbound{8};
+    size_t max_connections{150};
+    size_t connection_timeout_ms{5000};
+    size_t handshake_timeout_ms{10000};
+    size_t idle_timeout_ms{900000};
+    
+    size_t initial_retry_delay_ms{1000};
+    size_t max_retry_delay_ms{300000};
+    double retry_backoff_multiplier{2.0};
+    size_t max_retry_attempts{10};
+    double retry_jitter{0.25};
+    
+    size_t circuit_breaker_threshold{5};
+    size_t circuit_breaker_timeout_ms{60000};
+    double circuit_breaker_success_rate{0.6};
+    
+    size_t health_check_interval_ms{30000};
+    double health_score_threshold{0.5};
+    
+    bool adaptive_rate_limiting{true};
+    
+    static P2PConfig from_env();
+};
 
+// === Hardening knobs ========================================================
 #ifndef MIQ_P2P_INV_WINDOW_MS
 #define MIQ_P2P_INV_WINDOW_MS 10000
 #endif
@@ -195,55 +165,25 @@ private:
 #define MIQ_P2P_MAX_BANSCORE 100
 #endif
 
-class Chain; // fwd
-
+// === Core Data Structures ===================================================
 struct OrphanRec {
     std::vector<uint8_t> hash;
     std::vector<uint8_t> prev;
     std::vector<uint8_t> raw;
 };
 
-// === Health Metrics for Connection Monitoring ===============================
-struct HealthMetrics {
-    // Latency tracking
-    double min_latency_ms{0};
-    double max_latency_ms{0};
-    double avg_latency_ms{0};
-    double jitter_ms{0};
-    std::deque<double> latency_samples;
-    
-    // Throughput tracking
-    double upload_bps{0};
-    double download_bps{0};
-    
-    // Reliability tracking
-    size_t successful_requests{0};
-    size_t failed_requests{0};
-    double packet_loss_rate{0};
-    
-    // Timestamps
-    std::chrono::steady_clock::time_point last_check;
-    std::chrono::steady_clock::time_point last_activity;
-    
-    // Calculate composite health score (0.0 to 1.0)
-    double calculate_health_score() const;
-    void update_latency(double latency_ms);
-    void update_throughput(size_t bytes, bool upload);
-};
-
-// === Enhanced Rate Limiting with Adaptive Thresholds ========================
 struct RateCounters {
     int64_t last_ms{0};
-    std::unordered_map<std::string, double> buckets;  // family -> tokens
+    std::unordered_map<std::string, double> buckets;
     std::unordered_map<std::string, double> adaptive_limits;
 };
 
 struct PeerState {
-    // headers-first (reserved/current use)
+    // Headers-first
     bool     sent_getheaders{false};
     int64_t  last_headers_ms{0};
 
-    // identity/socket
+    // Socket
 #ifdef _WIN32
     Sock     sock{INVALID_SOCKET};
 #else
@@ -251,119 +191,102 @@ struct PeerState {
 #endif
     std::string ip;
 
-    // misc tracking
-    std::string peer_id;  // PRODUCTION: Unique peer identifier
-    std::shared_ptr<CircuitBreaker> circuit_breaker;  // PRODUCTION: Per-peer circuit breaker
-    HealthMetrics health_metrics;  // PRODUCTION: Health monitoring
-    std::chrono::steady_clock::time_point connected_at;  // PRODUCTION: Connection time
-    std::atomic<bool> is_closing{false};  // PRODUCTION: Graceful shutdown flag
-    std::mutex send_mutex;  // PRODUCTION: Thread-safe sending
-    std::deque<std::vector<uint8_t>> send_queue;  // PRODUCTION: Async send queue
-    std::atomic<size_t> bytes_sent{0};  // PRODUCTION: Metrics
-    std::atomic<size_t> bytes_received{0};  // PRODUCTION: Metrics
+    // Basic tracking
     int         mis{0};
     int64_t     last_ms{0};
 
-    // sync
+    // Sync state
     bool        syncing{false};
     uint64_t    next_index{0};
     uint32_t    inflight_index{0};
 
-    // per-peer RX buffer & liveness
+    // RX buffer & liveness
     std::vector<uint8_t> rx;
     bool        verack_ok{false};
     int64_t     last_ping_ms{0};
     bool        awaiting_pong{false};
     int         banscore{0};
 
-    // rate-limit tokens
+    // Rate limiting
     uint64_t    blk_tokens{0};
     uint64_t    tx_tokens{0};
     int64_t     last_refill_ms{0};
 
-    // addr throttling
+    // Address throttling
     int64_t     last_addr_ms{0};
 
-    // tx relay
+    // TX relay
     std::unordered_set<std::string> inflight_tx;
 
-    // block/header inflight tracking
+    // Block/header tracking
     std::unordered_set<std::string> inflight_blocks;
     int                              inflight_hdr_batches{0};
     int64_t                          last_hdr_batch_done_ms{0};
 
-    // version/features gating & whitelist flags
+    // Version & features
     uint32_t    version{0};
     uint64_t    features{0};
     bool        whitelisted{false};
 
-    // INV/ADDR throttling state
+    // INV/ADDR throttling
     int64_t     inv_win_start_ms{0};
     uint32_t    inv_in_window{0};
     int64_t     last_getaddr_ms{0};
     std::unordered_set<std::string> recent_inv_keys;
 
-    // Per-family token buckets
+    // Rate counters
     RateCounters rate;
 
-    // === Peer Reputation & Adaptive Batching ===
-    // Reputation metrics
-    int64_t blocks_delivered_successfully{0};   // Blocks successfully received
-    int64_t blocks_failed_delivery{0};          // Blocks that timed out or failed
-    int64_t total_blocks_received{0};           // Total blocks received from this peer
-    int64_t total_block_bytes_received{0};      // Total bytes of blocks received
-    int64_t total_block_delivery_time_ms{0};    // Sum of delivery times for averaging
-    double reputation_score{1.0};               // 0.0 (bad) to 1.0 (excellent)
-    double health_score{1.0};                   // 0.0 (bad) to 1.0 (good) - legacy field
+    // Reputation & adaptive batching
+    int64_t blocks_delivered_successfully{0};
+    int64_t blocks_failed_delivery{0};
+    int64_t total_blocks_received{0};
+    int64_t total_block_bytes_received{0};
+    int64_t total_block_delivery_time_ms{0};
+    double reputation_score{1.0};
+    double health_score{1.0};
 
-    // Adaptive batching
-    uint32_t adaptive_batch_size{16};           // Current batch size (adapts based on performance)
-    int64_t last_batch_completion_ms{0};        // When last batch completed
-    int64_t last_batch_duration_ms{0};          // How long last batch took
+    uint32_t adaptive_batch_size{16};
+    int64_t last_batch_completion_ms{0};
+    int64_t last_batch_duration_ms{0};
 
-    // Timeout tracking
-    int64_t avg_block_delivery_ms{30000};       // Running average delivery time (default 30s)
+    int64_t avg_block_delivery_ms{30000};
+
+    // Connection quality
+    int64_t last_activity_ms{0};
+    uint32_t blocks_served{0};
+    uint32_t headers_served{0};
+    int64_t connected_ms{0};
+    int64_t last_useful_ms{0};
+    uint32_t blocks_sent{0};
+    uint32_t blocks_received{0};
+    uint32_t headers_received{0};
+    bool is_syncing{false};
+    std::vector<uint8_t> best_known_tip;
+    int64_t max_timeout_ms{60000};
+    int64_t last_block_received_ms{0};
+
+    int64_t connection_failures{0};
+    int64_t next_retry_ms{0};
+
+    uint64_t peer_tip_height{0};
     
-    // Connection quality tracking (FIX: added for better sync management)
-    int64_t last_activity_ms{0};                // Last meaningful activity
-    uint32_t blocks_served{0};                  // Blocks we've sent to this peer
-    uint32_t headers_served{0};                 // Headers we've sent to this peer
-    int64_t connected_ms{0};                    // When connection was established
-    int64_t last_useful_ms{0};                  // Last time peer provided useful data
-    uint32_t blocks_sent{0};                    // Blocks sent to this peer
-    uint32_t blocks_received{0};                // Blocks received from this peer
-    uint32_t headers_received{0};               // Headers received from this peer
-    bool is_syncing{false};                     // Is this peer currently syncing from us
-    std::vector<uint8_t> best_known_tip;        // Best block hash we know this peer has
-    int64_t max_timeout_ms{60000};              // Maximum timeout for this peer
-    int64_t last_block_received_ms{0};          // Timestamp of last block received
-
-    // Connection health tracking
-    int64_t connection_failures{0};             // Consecutive connection failures
-    int64_t next_retry_ms{0};                   // Don't retry before this time
-
-    // Track peer's block availability
-    uint64_t peer_tip_height{0};                // Highest block height peer has successfully sent us
-    // PRODUCTION: Enhanced connection management
+    // PRODUCTION: Enhanced fields
+    std::string peer_id;
+    std::shared_ptr<CircuitBreaker> circuit_breaker;
+    HealthMetrics health_metrics;
+    std::chrono::steady_clock::time_point connected_at;
+    std::atomic<bool> is_closing{false};
+    
     enum ConnectionState {
-        CONNECTING,
-        HANDSHAKING,
-        CONNECTED,
-        DISCONNECTING,
-        DISCONNECTED
+        CONNECTING, HANDSHAKING, CONNECTED, DISCONNECTING, DISCONNECTED
     } connection_state{CONNECTING};
     
-    // PRODUCTION: Retry strategy
     size_t retry_count{0};
-    std::chrono::steady_clock::time_point next_retry;
-    
-    // PRODUCTION: Message validation
-    size_t invalid_message_count{0};
-    size_t protocol_violation_count{0};
-    std::chrono::steady_clock::time_point last_valid_message;
+    std::atomic<size_t> invalid_message_count{0};
+    std::atomic<size_t> protocol_violation_count{0};
 };
 
-// Lightweight read-only snapshot for RPC/UI
 struct PeerSnapshot {
     std::string  ip;
     bool         verack_ok;
@@ -377,66 +300,56 @@ struct PeerSnapshot {
     size_t       rx_buf;
     size_t       inflight;
     uint64_t     peer_tip;
+    std::string  peer_id;
+    double       health_score_val;
 };
 
+// === Main P2P Class ==========================================================
 class P2P {
 public:
     explicit P2P(Chain& c);
     ~P2P();
 
-    // Optional mempool hookup
+    // Mempool hookup
     inline void set_mempool(Mempool* mp) { mempool_ = mp; }
     inline Mempool*       mempool()       { return mempool_; }
     inline const Mempool* mempool() const { return mempool_; }
 
-    // key-based helper ("invb","getb", etc.)
+    // Rate checking
     bool check_rate(PeerState& ps, const char* key);
+    bool check_rate(PeerState& ps, const char* family, const char* name,
+                    uint32_t burst, uint32_t window_ms);
+    bool check_rate(PeerState& ps, const char* family, double cost, int64_t now_ms);
 
-    // explicit family:name helper
-    bool check_rate(PeerState& ps,
-                    const char* family,
-                    const char* name,
-                    uint32_t burst,
-                    uint32_t window_ms);
-
-    // token-bucket by family (cost per event)
-    bool check_rate(PeerState& ps,
-                    const char* family,
-                    double cost,
-                    int64_t now_ms);
-
+    // Core operations
     bool start(uint16_t port);
     void stop();
-
-    // Outbound connect to a seed (hostname or IP)
     bool connect_seed(const std::string& host, uint16_t port);
 
-    // Broadcast inventory
+    // Broadcasting
     void announce_block_async(const std::vector<uint8_t>& h);
     void broadcast_inv_block(const std::vector<uint8_t>& h);
     void broadcast_inv_tx(const std::vector<uint8_t>& txid);
 
-    // datadir for bans/peers
+    // Configuration
     inline void set_datadir(const std::string& d) { datadir_ = d; }
-
-    // tiny, local and fast hex for keys
     std::string hexkey(const std::vector<uint8_t>& h);
 
-    // Read-only stats
+    // Stats
     size_t connection_count() const { return peers_.size(); }
     std::vector<PeerSnapshot> snapshot_peers() const;
 
-    // runtime tuning knobs
+    // Tuning
     struct InflightCaps { size_t max_txs{256}; size_t max_blocks{256}; };
     inline void set_inflight_caps(size_t max_txs, size_t max_blocks) {
-        caps_.max_txs   = max_txs;
-        caps_.max_blocks= max_blocks;
+        caps_.max_txs = max_txs;
+        caps_.max_blocks = max_blocks;
     }
     inline void set_min_peer_version(uint32_t v) { min_peer_version_ = v; }
     inline void set_feature_required(uint64_t mask) { required_features_mask_ = mask; }
     inline void set_msg_deadlines_ms(int64_t ms) { msg_deadline_ms_ = ms; }
 
-    // whitelist setter (IPv4/CIDR)
+    // Whitelist
     inline void set_whitelist(const std::vector<std::string>& entries) {
         whitelist_ips_.clear();
         whitelist_cidrs_.clear();
@@ -450,33 +363,32 @@ public:
                 uint32_t be_ip = 0;
                 if (!parse_ipv4(host, be_ip)) continue;
                 int b = 0;
-                for (char ch : bits) { if (ch<'0'||ch>'9'){ b=-1; break; } b = b*10 + (ch-'0'); }
+                for (char ch : bits) { 
+                    if (ch<'0'||ch>'9'){ b=-1; break; } 
+                    b = b*10 + (ch-'0'); 
+                }
                 if (b < 0 || b > 32) continue;
                 uint32_t ip_host = ntohl(be_ip);
                 struct Cidr c;
                 c.bits = (uint8_t)b;
-                c.net  = (b==0) ? 0u : (ip_host & (~uint32_t(0) << (32-b)));
+                c.net = (b==0) ? 0u : (ip_host & (~uint32_t(0) << (32-b)));
                 whitelist_cidrs_.push_back(c);
             }
         }
     }
-// PRODUCTION: Configuration management
+    
+    // PRODUCTION: Configuration & health
     void set_config(const P2PConfig& config) { config_ = config; }
     const P2PConfig& get_config() const { return config_; }
-    
-    // PRODUCTION: Health monitoring
     HealthMetrics get_network_health() const;
-    std::unordered_map<std::string, HealthMetrics> get_peer_health() const;
 
 private:
-    P2PConfig config_;  // PRODUCTION: Configuration
-    std::unique_ptr<ConnectionPool> connection_pool_;  // PRODUCTION: Connection pooling
-    // tx relay (basic)
+    // TX relay
     void request_tx(PeerState& ps, const std::vector<uint8_t>& txid);
     void send_tx(Sock sock, const std::vector<uint8_t>& raw);
     void send_block(Sock s, const std::vector<uint8_t>& raw);
 
-    // Small caches
+    // Caches
     mutable std::mutex announce_mu_;
     std::vector<std::vector<uint8_t>> announce_blocks_q_;
     mutable std::mutex announce_tx_mu_;
@@ -485,6 +397,7 @@ private:
     std::unordered_map<std::string, std::vector<uint8_t>> tx_store_;
     std::deque<std::string> tx_order_;
 
+    // Core members
     Mempool* mempool_{nullptr};
     Chain& chain_;
     std::thread th_;
@@ -494,14 +407,14 @@ private:
 #else
     Sock srv_{-1};
 #endif
-    std::unordered_map<Sock, PeerState> peers_; // keyed by Sock everywhere
+    std::unordered_map<Sock, PeerState> peers_;
     std::unordered_set<std::string> banned_;
     std::string datadir_{"./miqdata"};
 
-    // address manager: IPv4s in network byte order
+    // Address manager
     std::unordered_set<uint32_t> addrv4_;
 
-    // orphan manager
+    // Orphan manager
     std::unordered_map<std::string, OrphanRec> orphans_;
     std::unordered_map<std::string, std::vector<std::string>> orphan_children_;
     std::deque<std::string> orphan_order_;
@@ -509,12 +422,12 @@ private:
     size_t orphan_bytes_limit_{0};
     size_t orphan_count_limit_{0};
 
-    // inbound rate gating
+    // Rate gating
     int64_t  inbound_win_start_ms_{0};
     uint32_t inbound_accepts_in_window_{0};
 
-    // timed bans + whitelist + feature gates
-    std::unordered_map<std::string,int64_t> timed_bans_; // ip -> expiry_ms
+    // Bans & whitelist
+    std::unordered_map<std::string,int64_t> timed_bans_;
     int64_t  default_ban_ms_{MIQ_P2P_BAN_MS};
     uint32_t min_peer_version_{0};
     uint64_t required_features_mask_{0};
@@ -522,9 +435,9 @@ private:
 
     struct Cidr { uint32_t net; uint8_t bits; };
     std::unordered_set<std::string> whitelist_ips_;
-    std::vector<Cidr>               whitelist_cidrs_;
+    std::vector<Cidr> whitelist_cidrs_;
 
-    // per-family pacing config
+    // Rate config
     struct FamilyRate { double per_sec; double burst; };
     std::unordered_map<std::string, FamilyRate> rate_cfg_{
         {"get",  {20.0,  40.0}},
@@ -534,32 +447,42 @@ private:
 
     InflightCaps caps_{};
 
-    // PRODUCTION: Circuit breakers per endpoint
+    // PRODUCTION: Enhanced members
+    P2PConfig config_;
     mutable std::mutex circuit_breakers_mutex_;
     std::unordered_map<std::string, std::shared_ptr<CircuitBreaker>> circuit_breakers_;
-    
-    // PRODUCTION: Health monitoring thread
     std::thread health_monitor_thread_;
     std::atomic<bool> health_monitor_running_{false};
+    
+    struct NetworkMetrics {
+        std::atomic<size_t> total_bytes_sent{0};
+        std::atomic<size_t> total_bytes_received{0};
+        std::atomic<size_t> total_connections{0};
+        std::atomic<size_t> failed_connections{0};
+        std::atomic<size_t> active_connections{0};
+        std::chrono::steady_clock::time_point start_time;
+    } metrics_;
+
+    // Core functions
     void loop();
     void handle_new_peer(Sock c, const std::string& ip);
     void load_bans();
     void save_bans();
-        void bump_ban(PeerState& ps, const std::string& ip, const char* reason, int64_t now_ms);
+    void bump_ban(PeerState& ps, const std::string& ip, const char* reason, int64_t now_ms);
 
-    // sync & block serving
+    // Sync & blocks
     void start_sync_with_peer(PeerState& ps);
     void request_block_index(PeerState& ps, uint64_t index);
     void fill_index_pipeline(PeerState& ps);
     void request_block_hash(PeerState& ps, const std::vector<uint8_t>& h);
     void handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw);
 
-    // rate-limit helpers
+    // Rate limiting
     void rate_refill(PeerState& ps, int64_t now);
     bool rate_consume_block(PeerState& ps, size_t nbytes);
     bool rate_consume_tx(PeerState& ps, size_t nbytes);
 
-    // addr handling
+    // Address handling
     void maybe_send_getaddr(PeerState& ps);
     void send_addr_snapshot(PeerState& ps);
     void handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload);
@@ -568,13 +491,26 @@ private:
     bool parse_ipv4(const std::string& dotted, uint32_t& be_ip);
     bool ipv4_is_public(uint32_t be_ip);
 
-    // orphan handlers
+    // Orphan handlers
     void evict_orphans_if_needed();
     void remove_orphan_by_hex(const std::string& child_hex);
     void try_connect_orphans(const std::string& parent_hex);
 
-    // ================== Inline helpers required by p2p.cpp ===================
+    // PRODUCTION: Enhanced functions
+    void health_monitor_loop();
+    void check_peer_health(PeerState& ps);
+    void handle_unhealthy_peer(PeerState& ps);
+    bool should_reconnect(const PeerState& ps) const;
+    void graceful_disconnect(Sock s, const std::string& reason);
+    void flush_peer_send_queue(PeerState& ps);
+    void schedule_reconnection(const std::string& ip, uint16_t port, size_t delay_ms);
+    std::shared_ptr<CircuitBreaker> get_circuit_breaker(const std::string& endpoint);
+    bool validate_message(const std::string& cmd, const std::vector<uint8_t>& payload);
+    bool check_adaptive_rate_limit(PeerState& ps, const std::string& cmd);
+    void check_stalled_connections();
+    std::string generate_peer_id();
 
+    // Inline helpers
     inline bool is_ip_banned(const std::string& ip, int64_t now_ms) const {
         if (is_loopback(ip) || is_whitelisted_ip(ip)) return false;
         auto it = timed_bans_.find(ip);
@@ -630,38 +566,6 @@ private:
         if (now_ms - ps.last_hdr_batch_done_ms < MIQ_P2P_HDR_BATCH_SPACING_MS) return false;
         return true;
     }
-bool handle_socket_error(Sock s, int error_code);
-    void schedule_reconnection(const std::string& ip, uint16_t port, size_t delay_ms);
-    bool should_reconnect(const PeerState& ps) const;
-    void update_peer_health(PeerState& ps, bool success, double latency_ms = 0);
-    
-    // PRODUCTION: Connection pool management
-    std::shared_ptr<ConnectionPool::PooledConnection> acquire_connection(const std::string& ip, uint16_t port);
-    void release_connection(std::shared_ptr<ConnectionPool::PooledConnection> conn);
-    
-    // PRODUCTION: Circuit breaker management
-    std::shared_ptr<CircuitBreaker> get_circuit_breaker(const std::string& endpoint);
-    void update_circuit_breaker(const std::string& endpoint, bool success);
-    
-    // PRODUCTION: Health monitoring
-    void health_monitor_loop();
-    void check_peer_health(PeerState& ps);
-    void handle_unhealthy_peer(PeerState& ps);
-    
-    // PRODUCTION: Graceful shutdown
-    void graceful_disconnect(Sock s, const std::string& reason);
-    void flush_send_queues();
-    
-    // PRODUCTION: Metrics collection
-    struct NetworkMetrics {
-        std::atomic<size_t> total_bytes_sent{0};
-        std::atomic<size_t> total_bytes_received{0};
-        std::atomic<size_t> total_connections{0};
-        std::atomic<size_t> failed_connections{0};
-        std::atomic<size_t> active_connections{0};
-        std::chrono::steady_clock::time_point start_time;
-    } metrics_;
-    
 };
 
 }
