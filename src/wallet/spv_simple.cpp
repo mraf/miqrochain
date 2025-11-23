@@ -236,10 +236,11 @@ static bool parse_block_collect(const std::vector<uint8_t>& raw,
     out_txs.clear();
 
     // --- MIQ compact (primary) ---
+    // MIQ header is 88 bytes: version(4) + prev_hash(32) + merkle_root(32) + time(8) + bits(4) + nonce(8)
     {
         R r(raw);
-        if(!r.need(80)) return false;
-        r.skip(80);
+        if(!r.need(88)) return false;
+        r.skip(88);
 
         if(!r.need(4)) return false;
         uint32_t txcnt = rd_u32_le(r.p + r.pos); r.pos += 4;

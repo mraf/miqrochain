@@ -714,7 +714,7 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
             // Coinbase input
             TxIn cb_in;
             cb_in.prev.txid = std::vector<uint8_t>(32, 0); // Null txid for coinbase
-            cb_in.prev.vout = 0xffffffff;
+            cb_in.prev.vout = 0;  // MIQ uses 0, not 0xffffffff
             // Script sig contains extranonce (empty sig/pubkey for coinbase)
             cb_in.sig.clear();
             cb_in.pubkey.clear();
@@ -867,7 +867,7 @@ StratumJob StratumServer::create_job() {
     put_u32_le(coinb1_bytes, 1);  // input count
     put_u32_le(coinb1_bytes, 32); // prev.txid length
     for (int i = 0; i < 32; i++) coinb1_bytes.push_back(0); // prev.txid (zeros for coinbase)
-    put_u32_le(coinb1_bytes, 0xffffffff); // prev.vout (0xffffffff for coinbase)
+    put_u32_le(coinb1_bytes, 0); // prev.vout (MIQ uses 0, not 0xffffffff)
 
     job.coinb1 = hex_encode(coinb1_bytes);
 
