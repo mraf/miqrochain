@@ -500,9 +500,11 @@ std::string RpcService::handle(const std::string& body){
 
             miq::HdWallet w(seed, meta);
 
-            // Collect PKHs (same ranges as listutxos)
+            // Collect PKHs - scan from index 0 up to and including next index
+            // This ensures we find funds even if wallet was just created
             auto collect_pkh_for_range = [&](bool change, uint32_t n, std::vector<std::array<uint8_t,20>>& out){
-                for (uint32_t i=0;i<n;i++){
+                // Scan at least the first address (index 0) plus all used addresses up to n
+                for (uint32_t i = 0; i <= n; i++){
                     std::vector<uint8_t> priv, pub;
                     if (!w.DerivePrivPub(meta.account, change?1u:0u, i, priv, pub)) continue;
                     auto h = hash160(pub);
@@ -1257,11 +1259,117 @@ std::string RpcService::handle(const std::string& body){
             std::vector<uint8_t> seed;
             if(!miq::HdWallet::MnemonicToSeed(mnemonic, mpass, seed)) return err("mnemonic->seed failed");
 
+            // Scan for used addresses with BIP44 gap limit of 20
             miq::HdAccountMeta meta; meta.account=0; meta.next_recv=0; meta.next_change=0;
+            miq::HdWallet w(seed, meta);
+
+            constexpr uint32_t GAP_LIMIT = 20;
+            constexpr uint32_t MAX_SCAN = 1000; // safety cap
+
+            // Scan receive addresses (chain 0)
+            uint32_t gap_recv = 0;
+            for (uint32_t i = 0; i < MAX_SCAN && gap_recv < GAP_LIMIT; ++i) {
+                std::vector<uint8_t> priv, pub;
+                if (!w.DerivePrivPub(meta.account, 0, i, priv, pub)) break;
+                auto pkh = hash160(pub);
+                auto utxos = chain_.utxo().list_for_pkh(pkh);
+                if (!utxos.empty()) {
+                    meta.next_recv = i + 1;
+                    gap_recv = 0;
+                } else {
+                    ++gap_recv;
+                }
+            }
+
+            // Scan change addresses (chain 1)
+            uint32_t gap_change = 0;
+            for (uint32_t i = 0; i < MAX_SCAN && gap_change < GAP_LIMIT; ++i) {
+                std::vector<uint8_t> priv, pub;
+                if (!w.DerivePrivPub(meta.account, 1, i, priv, pub)) break;
+                auto pkh = hash160(pub);
+                auto utxos = chain_.utxo().list_for_pkh(pkh);
+                if (!utxos.empty()) {
+                    meta.next_change = i + 1;
+                    gap_change = 0;
+                } else {
+                    ++gap_change;
+                }
+            }
+
             std::string e;
             if(!SaveHdWallet(wdir, seed, meta, wpass, e)) return err(e);
 
-            return "\"ok\"";
+            std::map<std::string,JNode> o;
+            o["status"] = jstr("ok");
+            o["addresses_scanned_recv"] = jnum((double)(meta.next_recv + GAP_LIMIT));
+            o["addresses_scanned_change"] = jnum((double)(meta.next_change + GAP_LIMIT));
+            o["next_recv_index"] = jnum((double)meta.next_recv);
+            o["next_change_index"] = jnum((double)meta.next_change);
+            JNode out; out.v = o; return json_dump(out);
+        }
+
+        // --- scanaddresses (rescan wallet addresses for UTXOs) ---
+        if (method == "scanaddresses") {
+            std::string wdir = default_wallet_file();
+            if(!wdir.empty()){
+                size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
+            } else {
+                wdir = "wallets/default";
+            }
+
+            std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
+            std::string pass = get_wallet_pass_or_cached();
+            if(!LoadHdWallet(wdir, seed, meta, pass, e)) return err(e);
+
+            miq::HdWallet w(seed, meta);
+
+            constexpr uint32_t GAP_LIMIT = 20;
+            constexpr uint32_t MAX_SCAN = 1000;
+
+            uint32_t old_recv = meta.next_recv;
+            uint32_t old_change = meta.next_change;
+
+            // Scan receive addresses starting from current index
+            uint32_t gap_recv = 0;
+            for (uint32_t i = meta.next_recv; i < MAX_SCAN && gap_recv < GAP_LIMIT; ++i) {
+                std::vector<uint8_t> priv, pub;
+                if (!w.DerivePrivPub(meta.account, 0, i, priv, pub)) break;
+                auto pkh = hash160(pub);
+                auto utxos = chain_.utxo().list_for_pkh(pkh);
+                if (!utxos.empty()) {
+                    meta.next_recv = i + 1;
+                    gap_recv = 0;
+                } else {
+                    ++gap_recv;
+                }
+            }
+
+            // Scan change addresses
+            uint32_t gap_change = 0;
+            for (uint32_t i = meta.next_change; i < MAX_SCAN && gap_change < GAP_LIMIT; ++i) {
+                std::vector<uint8_t> priv, pub;
+                if (!w.DerivePrivPub(meta.account, 1, i, priv, pub)) break;
+                auto pkh = hash160(pub);
+                auto utxos = chain_.utxo().list_for_pkh(pkh);
+                if (!utxos.empty()) {
+                    meta.next_change = i + 1;
+                    gap_change = 0;
+                } else {
+                    ++gap_change;
+                }
+            }
+
+            // Save updated meta
+            if (meta.next_recv != old_recv || meta.next_change != old_change) {
+                if(!SaveHdWallet(wdir, seed, meta, pass, e)) return err(e);
+            }
+
+            std::map<std::string,JNode> o;
+            o["next_recv_index"] = jnum((double)meta.next_recv);
+            o["next_change_index"] = jnum((double)meta.next_change);
+            o["new_recv_found"] = jnum((double)(meta.next_recv - old_recv));
+            o["new_change_found"] = jnum((double)(meta.next_change - old_change));
+            JNode out; out.v = o; return json_dump(out);
         }
 
         // --- walletinfo ---
@@ -1422,7 +1530,8 @@ std::string RpcService::handle(const std::string& body){
             if(!LoadHdWallet(wdir, seed, meta, pass, e)) return err(e);
 
             miq::HdWallet w(seed, meta);
-            int n = (want>0) ? std::min<int>(want, (int)meta.next_recv) : (int)meta.next_recv;
+            // Include at least address 0 plus all used addresses
+            int n = (want>0) ? std::min<int>(want, (int)meta.next_recv + 1) : (int)meta.next_recv + 1;
 
             std::vector<JNode> arr;
             for (int i=0;i<n;i++){
@@ -1449,8 +1558,9 @@ std::string RpcService::handle(const std::string& body){
 
             const uint64_t curH = chain_.tip().height;
 
+            // Scan from index 0 up to and including the next index
             auto collect_pkh_for_range = [&](bool change, uint32_t n, std::vector<std::array<uint8_t,20>>& out){
-                for (uint32_t i=0;i<n;i++){
+                for (uint32_t i = 0; i <= n; i++){
                     std::vector<uint8_t> priv, pub;
                     if (!w.DerivePrivPub(meta.account, change?1u:0u, i, priv, pub)) continue;
                     auto h = hash160(pub);
