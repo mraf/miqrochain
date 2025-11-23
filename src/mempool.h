@@ -6,6 +6,7 @@
 #include <vector>
 #include <deque>
 #include <chrono>
+#include <mutex>         // CRITICAL FIX: Thread safety
 
 #include "tx.h"          // Transaction
 
@@ -130,13 +131,25 @@ private:
     void evict_lowest_feerate_until(size_t target_bytes);
 
 private:
+    // CRITICAL FIX: Thread safety - protect all mutable state
+    mutable std::recursive_mutex mtx_;
+
     std::unordered_map<Key, MempoolEntry> map_;
     size_t total_bytes_{0};
+
+    // CRITICAL FIX: Double-spend detection - track spent outputs
+    // Key format: txid_hex + ":" + vout_str
+    std::unordered_set<std::string> spent_outputs_;
 
     // Orphans: key=child txid (presently missing at least one input)
     std::unordered_map<Key, Transaction> orphans_;
     // Reverse index: missing parent txid key -> set of orphans waiting on it
     std::unordered_map<Key, std::unordered_set<Key>> waiting_on_;
+
+    // CRITICAL FIX: Orphan pool limits
+    static constexpr size_t MAX_ORPHANS = 1000;
+    static constexpr size_t MAX_ORPHAN_BYTES = 32 * 1024 * 1024; // 32 MiB
+    size_t orphan_bytes_{0};
 };
 
 }

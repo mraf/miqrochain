@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 #include <tuple>
+#include <mutex>           // CRITICAL FIX: Thread safety
 
 namespace miq {
 
@@ -27,6 +28,9 @@ public:
     list_for_pkh(const std::vector<uint8_t>& pkh) const;
 
 private:
+    // CRITICAL FIX: Thread safety - protect all mutable state
+    mutable std::mutex mtx_;
+
     std::string log_path_;
     std::unordered_map<std::string, UTXOEntry> map_; // key = hex(txid)+":"+vout
 

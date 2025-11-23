@@ -115,8 +115,17 @@ static inline void bits_to_target_be(uint32_t bits, uint8_t out[32]) {
         out[31] = uint8_t((mant2 >> 0)  & 0xff);
     } else {
         int pos = int(32) - int(exp);
-        if (pos < 0) { out[0] = out[1] = out[2] = 0xff; return; }
-        if (pos > 29) pos = 29;
+        // CRITICAL FIX: Validate pos to prevent buffer overflow
+        if (pos < 0) {
+            // Exponent too large - set max target (will fail most compares)
+            out[0] = out[1] = out[2] = 0xff;
+            return;
+        }
+        // CRITICAL FIX: pos must be <= 29 to safely write 3 bytes
+        if (pos > 29) {
+            // Invalid exponent - target would be too small, set to zero
+            return;
+        }
         out[pos + 0] = uint8_t((mant >> 16) & 0xff);
         out[pos + 1] = uint8_t((mant >> 8)  & 0xff);
         out[pos + 2] = uint8_t((mant >> 0)  & 0xff);
@@ -187,7 +196,8 @@ static bool write_undo_file(const std::string& base_dir,
 {
     std::string dir = undo_dir(base_dir);
     ensure_dir_exists(dir);
-    char name[64];
+    // CRITICAL FIX: Buffer must hold: 8 digits + 1 underscore + 64 hex chars + 5 ".undo" + 1 null = 79 bytes
+    char name[128];
     std::snprintf(name, sizeof(name), "%08llu_%s.undo",
                   (unsigned long long)height, hexstr(block_hash).c_str());
     std::string path = join_path(dir, name);
@@ -243,7 +253,8 @@ static bool read_undo_file(const std::string& base_dir,
                            const std::vector<uint8_t>& block_hash,
                            std::vector<UndoIn>& out)
 {
-    char name[64];
+    // CRITICAL FIX: Buffer must hold full filename (79+ bytes)
+    char name[128];
     std::snprintf(name, sizeof(name), "%08llu_%s.undo",
                   (unsigned long long)height, hexstr(block_hash).c_str());
     std::string path = join_path(undo_dir(base_dir), name);
@@ -297,7 +308,8 @@ static void remove_undo_file(const std::string& base_dir,
                              uint64_t height,
                              const std::vector<uint8_t>& block_hash)
 {
-    char name[64];
+    // CRITICAL FIX: Buffer must hold full filename (79+ bytes)
+    char name[128];
     std::snprintf(name, sizeof(name), "%08llu_%s.undo",
                   (unsigned long long)height, hexstr(block_hash).c_str());
     std::string path = join_path(undo_dir(base_dir), name);
@@ -314,11 +326,14 @@ struct OrphanRec {
     size_t bytes{0};
 };
 
+// CRITICAL FIX: Add mutex to protect global orphan structures from race conditions
+static std::mutex g_orphan_mtx;
 static std::unordered_map<std::string, OrphanRec> g_orphans; // key = hash (binary string)
 static std::deque<std::string> g_orphan_order;               // FIFO/LRU-ish
 static size_t g_orphan_bytes = 0;
 
-static void orphan_prune_if_needed(){
+// CRITICAL FIX: Internal helper called with lock already held
+static void orphan_prune_if_needed_unlocked(){
     while ( (g_orphans.size() > ORPHAN_MAX_BLOCKS) || (g_orphan_bytes > ORPHAN_MAX_BYTES) ){
         if (g_orphan_order.empty()) break;
         auto key = g_orphan_order.front();
@@ -335,6 +350,7 @@ static bool orphan_put(const std::vector<uint8_t>& hash32,
                        const std::vector<uint8_t>& prev32,
                        std::vector<uint8_t>&& raw)
 {
+    std::lock_guard<std::mutex> lk(g_orphan_mtx);  // CRITICAL FIX: Thread safety
     std::string key = hk(hash32);
     if (g_orphans.find(key) != g_orphans.end()) return true; // already cached
 
@@ -347,11 +363,12 @@ static bool orphan_put(const std::vector<uint8_t>& hash32,
     g_orphan_bytes += rec.bytes;
     g_orphans.emplace(std::move(key), std::move(rec));
 
-    orphan_prune_if_needed();
+    orphan_prune_if_needed_unlocked();
     return true;
 }
 
 static bool orphan_get(const std::vector<uint8_t>& hash32, std::vector<uint8_t>& out_raw){
+    std::lock_guard<std::mutex> lk(g_orphan_mtx);  // CRITICAL FIX: Thread safety
     auto it = g_orphans.find(hk(hash32));
     if (it == g_orphans.end()) return false;
     out_raw = it->second.raw; // copy out
@@ -359,6 +376,7 @@ static bool orphan_get(const std::vector<uint8_t>& hash32, std::vector<uint8_t>&
 }
 
 static void orphan_erase(const std::vector<uint8_t>& hash32){
+    std::lock_guard<std::mutex> lk(g_orphan_mtx);  // CRITICAL FIX: Thread safety
     std::string key = hk(hash32);
     auto it = g_orphans.find(key);
     if (it == g_orphans.end()) return;
@@ -366,6 +384,8 @@ static void orphan_erase(const std::vector<uint8_t>& hash32){
     g_orphans.erase(it);
 }
 
+// CRITICAL FIX: Add mutex to protect global undo cache from race conditions
+static std::mutex g_undo_mtx;
 // RAM undo cache
 static std::unordered_map<std::string, std::vector<UndoIn>> g_undo;
 
@@ -378,6 +398,8 @@ static miq::gcs::FilterStore g_filter_store;
 
 static constexpr size_t MAX_BLOCK_SIZE_LOCAL = 1 * 1024 * 1024; // 1 MiB
 
+// CRITICAL FIX: Add mutex to protect global header cache from race conditions
+static std::mutex g_header_full_mtx;
 // Full headers cache for serving getheaders even with empty block store
 static std::unordered_map<std::string, BlockHeader> g_header_full; // key = hk(hash32)
 

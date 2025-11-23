@@ -33,11 +33,12 @@ std::string UTXOKV::k_utxo(const std::vector<uint8_t>& txid, uint32_t vout){
 }
 
 std::string UTXOKV::ser_entry(const UTXOEntry& e){
-    // value(8) | height(4) | coinbase(1) | pkh_len(1) | pkh
+    // CRITICAL FIX: height is uint64_t, store as 8 bytes not 4
+    // value(8) | height(8) | coinbase(1) | pkh_len(1) | pkh
     std::string v;
-    v.reserve(8+4+2+e.pkh.size());
+    v.reserve(8+8+2+e.pkh.size());
     put_u64le(v, e.value);
-    put_u32le(v, e.height);
+    put_u64le(v, e.height);  // CRITICAL FIX: Use 64-bit for height
     v.push_back(e.coinbase ? '\x01' : '\x00');
     v.push_back(static_cast<char>(e.pkh.size()));
     if(!e.pkh.empty())
@@ -46,10 +47,11 @@ std::string UTXOKV::ser_entry(const UTXOEntry& e){
 }
 
 bool UTXOKV::deser_entry(const std::string& vbuf, UTXOEntry& e){
-    if(vbuf.size() < 8+4+2) return false;
+    // CRITICAL FIX: Updated to match 64-bit height format
+    if(vbuf.size() < 8+8+2) return false;  // value(8) + height(8) + coinbase(1) + pkh_len(1)
     const char* p = vbuf.data();
     e.value = get_u64le(p); p+=8;
-    e.height = get_u32le(p); p+=4;
+    e.height = get_u64le(p); p+=8;  // CRITICAL FIX: Read 64-bit height
     e.coinbase = (*p++ != 0);
     uint8_t n = uint8_t(*p++);
     if (size_t(p - vbuf.data()) + n != vbuf.size()) return false;
