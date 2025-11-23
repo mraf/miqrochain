@@ -180,8 +180,9 @@ static std::string default_cookie_path(){
     if(home && *home) return std::string(home) + "/.miqrochain/.cookie";
     return "./.cookie";
 #else
+    // Linux: use lowercase .miqrochain to match node's data directory
     const char* xdg = std::getenv("XDG_DATA_HOME");
-    if (xdg && *xdg) return std::string(xdg) + "/Miqrochain/.cookie";
+    if (xdg && *xdg) return std::string(xdg) + "/miqrochain/.cookie";
     const char* home = std::getenv("HOME");
     if(home && *home) return std::string(home) + "/.miqrochain/.cookie";
     return "./.cookie";
@@ -542,6 +543,23 @@ static bool rpc_getblockhash(const std::string& host, uint16_t port, const std::
 static bool rpc_getblock_time_bits(const std::string& host, uint16_t port, const std::string& auth,
                                    const std::string& hh, long long& out_time, uint32_t& out_bits);
 
+// Diagnostic helper to identify RPC connection issues
+static std::string diagnose_rpc_failure(const std::string& host, uint16_t port, const std::string& auth, const HttpResp& r){
+    if(r.code == 0) return "Connection failed - node not running or wrong port";
+    if(r.code == 401 || r.code == 403) {
+        if(auth.empty()) return "Auth required but no token provided - check cookie file or --token";
+        return "Auth failed (401/403) - token may be incorrect or expired";
+    }
+    if(r.code == 404) return "RPC method not found - node may be outdated";
+    if(r.code >= 500) return "Server error - node may be overloaded or crashed";
+    if(json_has_error(r.body)) {
+        std::string errMsg;
+        if(json_find_string(r.body, "error", errMsg)) return "RPC error: " + errMsg;
+        return "RPC returned error in body";
+    }
+    return "Unknown failure (code=" + std::to_string(r.code) + ")";
+}
+
 static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::string& auth, TipInfo& out){
     // Fast path: dedicated RPC (if present)
     {
@@ -558,6 +576,13 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
                 out.bits = sanitize_bits((uint32_t)b);
                 out.time = (int64_t)t;
                 return true;
+            }
+        }
+        // Log diagnostic info on failure
+        if(r.code != 200){
+            static int diag_count = 0;
+            if(++diag_count <= 3){ // Only log first few failures
+                log_line("RPC gettipinfo failed: " + diagnose_rpc_failure(host, port, auth, r));
             }
         }
     }
@@ -1273,7 +1298,7 @@ inline void build_block(u32 W16[16],
                         u64 nonce_le, uint blk_idx, uint nblks)
 {
   u8 B[64];
-  u64 L = (u64)prefix_len + 4u;
+  u64 L = (u64)prefix_len + 8u;  // CRITICAL FIX: 8-byte nonce
   u64 Lbits = L * 8u;
 
   for(int i=0;i<64;i++){
@@ -1281,10 +1306,10 @@ inline void build_block(u32 W16[16],
     u8 v = 0;
     if(off < (u64)prefix_len){
       v = prefix[off];
-    } else if(off < (u64)prefix_len + 4u){
+    } else if(off < (u64)prefix_len + 8u){  // CRITICAL FIX: 8-byte nonce
       uint j = (uint)(off - (u64)prefix_len);
       v = (u8)((nonce_le >> (8u*j)) & 0xffu);
-    } else if(off == (u64)prefix_len + 4u){
+    } else if(off == (u64)prefix_len + 8u){  // CRITICAL FIX: padding after 8-byte nonce
       v = 0x80u;
     } else {
       u64 last_block_start = (u64)(nblks*64u);
@@ -1306,7 +1331,7 @@ inline void build_block(u32 W16[16],
 }
 
 inline void sha256d_any(u8 out[32], __constant u8* prefix, uint prefix_len, u64 nonce_le){
-  u64 L = (u64)prefix_len + 4u;
+  u64 L = (u64)prefix_len + 8u;  // CRITICAL FIX: 8-byte nonce
   uint nblks = (uint)((L + 1u + 8u + 63u)/64u);
   SHA256 S; sha256_init(&S);
   for(uint b=0;b<nblks;b++){
@@ -2029,8 +2054,15 @@ int main(int argc, char** argv){
         if(token.empty()){
             if(const char* t = std::getenv("MIQ_RPC_TOKEN")) token = t;
             if(token.empty()){
+                std::string cookie_path = default_cookie_path();
                 std::string cookie;
-                if(read_all_file(default_cookie_path(), cookie)) token = cookie;
+                if(read_all_file(cookie_path, cookie)) {
+                    token = cookie;
+                    std::fprintf(stderr, "[auth] Using cookie from: %s\n", cookie_path.c_str());
+                } else {
+                    std::fprintf(stderr, "[auth] WARNING: Cookie not found at: %s\n", cookie_path.c_str());
+                    std::fprintf(stderr, "[auth] Ensure node is running or use --token=TOKEN\n");
+                }
             }
         }
         if(const char* aenv = std::getenv("MIQ_ADDRESS")){
@@ -2715,15 +2747,26 @@ int main(int argc, char** argv){
                     ui.last_submit_when = std::chrono::steady_clock::now();
                 }
             } else {
-                std::lock_guard<std::mutex> lk(ui.mtx);
-                std::ostringstream m; m << C("31;1") << "submit REJECTED / RPC failed" << R();
-                if (!err_body.empty()) {
-                    std::string msg;
-                    if (json_find_string(err_body, "error", msg)) m << ": " << msg;
+                // Submission failed - log and add delay before retrying
+                {
+                    std::lock_guard<std::mutex> lk(ui.mtx);
+                    std::ostringstream m; m << C("31;1") << "submit REJECTED / RPC failed" << R();
+                    if (!err_body.empty()) {
+                        std::string msg;
+                        if (json_find_string(err_body, "error", msg)) m << ": " << msg;
+                        else m << " body=" << err_body.substr(0, 200);
+                    }
+                    ui.last_submit_msg = m.str();
+                    ui.last_submit_when = std::chrono::steady_clock::now();
+                    log_line("submit rejected / rpc failed: " + err_body.substr(0, 200));
                 }
-                ui.last_submit_msg = m.str();
-                ui.last_submit_when = std::chrono::steady_clock::now();
-                log_line("submit rejected / rpc failed");
+
+                // CRITICAL: Delay before retrying to prevent spinning on same block
+                // This gives the network time to propagate and prevents CPU burn
+                for(int i = 0; i < 30 && ui.running.load(); ++i) miq_sleep_ms(100);
+
+                // Increment RPC error counter for diagnostics
+                ui.rpc_errors.fetch_add(1);
             }
         }
 
