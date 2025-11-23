@@ -17,18 +17,31 @@ struct UTXOEntry;        // defined in utxo.h / utxo_kv.h
 struct Block;            // defined in block.h
 class  UTXOSet;          // defined in utxo.h
 
+// =============================================================================
+// PRODUCTION-GRADE MEMPOOL CONFIGURATION
+// =============================================================================
+
 // Tunables (can be overridden via -D or constants.h if you expose them there)
 #ifndef MIQ_MEMPOOL_MAX_BYTES
-#define MIQ_MEMPOOL_MAX_BYTES (64u * 1024u * 1024u) // 64 MiB
+#define MIQ_MEMPOOL_MAX_BYTES (300u * 1024u * 1024u) // 300 MiB production
 #endif
 #ifndef MIQ_MEMPOOL_MAX_ANCESTORS
-#define MIQ_MEMPOOL_MAX_ANCESTORS 25
+#define MIQ_MEMPOOL_MAX_ANCESTORS 50  // Production: deeper chains
 #endif
 #ifndef MIQ_MEMPOOL_MAX_DESCENDANTS
-#define MIQ_MEMPOOL_MAX_DESCENDANTS 25
+#define MIQ_MEMPOOL_MAX_DESCENDANTS 50  // Production: more descendants
 #endif
 #ifndef MIQ_MEMPOOL_TX_EXPIRY_SECS
 #define MIQ_MEMPOOL_TX_EXPIRY_SECS (14u * 24u * 60u * 60u) // 14 days
+#endif
+#ifndef MIQ_MEMPOOL_MIN_RELAY_FEE
+#define MIQ_MEMPOOL_MIN_RELAY_FEE 1  // 1 sat/byte minimum
+#endif
+#ifndef MIQ_MEMPOOL_INCREMENTAL_FEE
+#define MIQ_MEMPOOL_INCREMENTAL_FEE 1  // 1 sat/byte for RBF bump
+#endif
+#ifndef MIQ_MEMPOOL_RBF_ENABLED
+#define MIQ_MEMPOOL_RBF_ENABLED 1  // Enable Replace-By-Fee
 #endif
 
 // Lightweight UTXO view interface (Chain passes its UTXO backend)
@@ -53,14 +66,38 @@ struct MempoolEntry {
     uint64_t    fee{0};
     double      fee_rate{0.0}; // sat/byte
     int64_t     added_ms{0};
+
     // Graph links
     std::unordered_set<std::string> parents;   // txid keys of parents in mempool
     std::unordered_set<std::string> children;  // txid keys of direct children in mempool
+
     // Aggregate limits
     size_t ancestor_count{0};
     size_t ancestor_size{0};
     size_t descendant_count{0};
     size_t descendant_size{0};
+
+    // Production enhancements
+    uint64_t    ancestor_fee{0};      // Total ancestor fees (for CPFP)
+    uint64_t    descendant_fee{0};    // Total descendant fees
+    double      modified_fee_rate{0.0}; // Fee rate including CPFP bonus
+    uint32_t    height_entered{0};    // Block height when entered mempool
+    bool        replaceable{true};    // BIP-125 RBF signaling
+    uint32_t    time_in_mempool{0};   // Seconds in mempool
+
+    // Mining score (higher = more likely to be mined)
+    double mining_score() const {
+        // CPFP-aware: use the better of individual or package rate
+        return std::max(fee_rate, modified_fee_rate);
+    }
+};
+
+// Fee estimation bucket for production-grade fee estimation
+struct FeeEstimateBucket {
+    double low_priority{1.0};    // sat/byte for 6+ blocks
+    double medium_priority{2.0}; // sat/byte for 2-6 blocks
+    double high_priority{5.0};   // sat/byte for next block
+    int64_t last_updated_ms{0};
 };
 
 class Mempool {
@@ -96,11 +133,51 @@ public:
     std::vector<Transaction> collect(size_t max) const;
 
     // For miner (SFINAE target): take a size-capped parents-first snapshot
-    void snapshot(std::vector<Transaction>& out) const;                       // <-- added
-    void collect_for_block(std::vector<Transaction>& out, size_t max_bytes) const; // <-- added
+    void snapshot(std::vector<Transaction>& out) const;
+    void collect_for_block(std::vector<Transaction>& out, size_t max_bytes) const;
 
     // For P2P serving (ids only)
     std::vector<std::vector<uint8_t>> txids() const;
+
+    // === PRODUCTION-GRADE ENHANCEMENTS ===
+
+    // Fee estimation (returns sat/byte for target confirmation)
+    double estimate_fee(int target_blocks) const;
+    FeeEstimateBucket get_fee_estimates() const;
+    void update_fee_estimates(uint32_t height);
+
+    // RBF (Replace-By-Fee) support
+    bool accept_replacement(const Transaction& tx, const UTXOView& utxo,
+                           uint32_t height, std::string& err);
+    bool is_rbf_candidate(const Transaction& tx) const;
+
+    // CPFP (Child-Pays-For-Parent) support
+    void update_cpfp_scores();
+    double get_package_fee_rate(const std::vector<uint8_t>& txid) const;
+
+    // Production statistics
+    struct MempoolStats {
+        size_t tx_count{0};
+        size_t bytes_used{0};
+        size_t orphan_count{0};
+        size_t orphan_bytes{0};
+        double min_fee_rate{0.0};
+        double max_fee_rate{0.0};
+        double avg_fee_rate{0.0};
+        double median_fee_rate{0.0};
+        uint64_t total_fees{0};
+        int64_t avg_age_ms{0};
+    };
+    MempoolStats get_stats() const;
+
+    // Get transaction by txid
+    bool get_transaction(const std::vector<uint8_t>& txid, Transaction& out) const;
+
+    // Check if inputs are spent in mempool
+    bool has_spent_input(const std::vector<uint8_t>& txid, uint32_t vout) const;
+
+    // Memory usage details
+    size_t dynamic_memory_usage() const;
 
 private:
     using Key = std::string; // binary-safe txid key
@@ -147,9 +224,31 @@ private:
     std::unordered_map<Key, std::unordered_set<Key>> waiting_on_;
 
     // CRITICAL FIX: Orphan pool limits
-    static constexpr size_t MAX_ORPHANS = 1000;
-    static constexpr size_t MAX_ORPHAN_BYTES = 32 * 1024 * 1024; // 32 MiB
+    static constexpr size_t MAX_ORPHANS = 10000;  // Production: 10x more
+    static constexpr size_t MAX_ORPHAN_BYTES = 64 * 1024 * 1024; // 64 MiB production
     size_t orphan_bytes_{0};
+
+    // === PRODUCTION FEE ESTIMATION ===
+    FeeEstimateBucket fee_estimates_;
+
+    // Fee rate histogram for estimation (buckets: 1, 2, 5, 10, 20, 50, 100+ sat/byte)
+    std::vector<std::pair<double, size_t>> fee_histogram_;  // (feerate, count)
+
+    // Track confirmed transactions for fee estimation
+    struct ConfirmedTxData {
+        double fee_rate;
+        int blocks_to_confirm;
+        int64_t timestamp_ms;
+    };
+    std::deque<ConfirmedTxData> confirmed_history_;
+    static constexpr size_t MAX_CONFIRMED_HISTORY = 10000;
+
+    // RBF tracking
+    std::unordered_map<Key, uint64_t> replacement_count_;  // txid -> times replaced
+
+    // Helper for RBF validation
+    bool validate_rbf_rules(const Transaction& new_tx, const MempoolEntry& old_entry,
+                           uint64_t new_fee, std::string& err) const;
 };
 
-}
+}  // namespace miq

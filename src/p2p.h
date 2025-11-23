@@ -39,73 +39,100 @@ namespace miq {
     class ThreadPool;
 }
 
+// =============================================================================
+// PRODUCTION-GRADE P2P NETWORK CONFIGURATION
+// Optimized for millions of users and high reliability
+// =============================================================================
+
 // === Connection limits and resource management ===
 #ifndef MIQ_MAX_INBOUND_CONNECTIONS
-#define MIQ_MAX_INBOUND_CONNECTIONS 117
+#define MIQ_MAX_INBOUND_CONNECTIONS 125  // Production: more inbound for serving
 #endif
 #ifndef MIQ_MAX_OUTBOUND_CONNECTIONS
-#define MIQ_MAX_OUTBOUND_CONNECTIONS 8
+#define MIQ_MAX_OUTBOUND_CONNECTIONS 12  // Production: more outbound for reliability
 #endif
 #ifndef MIQ_MAX_FEELER_CONNECTIONS
-#define MIQ_MAX_FEELER_CONNECTIONS 1
+#define MIQ_MAX_FEELER_CONNECTIONS 2  // Production: parallel feelers
 #endif
 #ifndef MIQ_MAX_CONNECTIONS
 #define MIQ_MAX_CONNECTIONS (MIQ_MAX_INBOUND_CONNECTIONS + MIQ_MAX_OUTBOUND_CONNECTIONS + MIQ_MAX_FEELER_CONNECTIONS)
 #endif
 #ifndef MIQ_PER_PEER_RX_BUFFER_LIMIT
-#define MIQ_PER_PEER_RX_BUFFER_LIMIT (5 * 1024 * 1024)  // 5MB per peer
+#define MIQ_PER_PEER_RX_BUFFER_LIMIT (8 * 1024 * 1024)  // 8MB per peer
 #endif
 #ifndef MIQ_TOTAL_RX_BUFFER_LIMIT
-#define MIQ_TOTAL_RX_BUFFER_LIMIT (100 * 1024 * 1024)  // 100MB total
+#define MIQ_TOTAL_RX_BUFFER_LIMIT (200 * 1024 * 1024)  // 200MB total
 #endif
 #ifndef MIQ_MAX_SAME_IP_CONNECTIONS
-#define MIQ_MAX_SAME_IP_CONNECTIONS 4
+#define MIQ_MAX_SAME_IP_CONNECTIONS 3  // Stricter per-IP limit
 #endif
 #ifndef MIQ_MAX_SUBNET24_CONNECTIONS
-#define MIQ_MAX_SUBNET24_CONNECTIONS 8
+#define MIQ_MAX_SUBNET24_CONNECTIONS 6  // Stricter subnet limit
 #endif
 #ifndef MIQ_CONNECTION_BACKOFF_BASE_MS
-#define MIQ_CONNECTION_BACKOFF_BASE_MS 60000  // 1 minute base backoff
+#define MIQ_CONNECTION_BACKOFF_BASE_MS 30000  // 30 second base backoff
 #endif
 #ifndef MIQ_CONNECTION_BACKOFF_MAX_MS
-#define MIQ_CONNECTION_BACKOFF_MAX_MS (24 * 60 * 60 * 1000)  // 24 hours max
+#define MIQ_CONNECTION_BACKOFF_MAX_MS (12 * 60 * 60 * 1000)  // 12 hours max
 #endif
 #ifndef MIQ_PEER_ROTATION_INTERVAL_MS
-#define MIQ_PEER_ROTATION_INTERVAL_MS (30 * 60 * 1000)  // 30 minutes
+#define MIQ_PEER_ROTATION_INTERVAL_MS (20 * 60 * 1000)  // 20 minutes
 #endif
 #ifndef MIQ_EVICTION_BATCH_SIZE
-#define MIQ_EVICTION_BATCH_SIZE 4
+#define MIQ_EVICTION_BATCH_SIZE 8  // Evict more at once
+#endif
+
+// === Production network health thresholds ===
+#ifndef MIQ_MIN_OUTBOUND_CONNECTIONS
+#define MIQ_MIN_OUTBOUND_CONNECTIONS 4  // Minimum for healthy operation
+#endif
+#ifndef MIQ_PING_TIMEOUT_MS
+#define MIQ_PING_TIMEOUT_MS 60000  // 60 second ping timeout
+#endif
+#ifndef MIQ_STALL_TIMEOUT_MS
+#define MIQ_STALL_TIMEOUT_MS 120000  // 2 minute stall timeout
 #endif
 
 namespace miq {
 
-// === Optional hardening knobs (can be overridden at compile time) ============
+// === Production hardening knobs (optimized for scale and security) ============
 #ifndef MIQ_P2P_INV_WINDOW_MS
-#define MIQ_P2P_INV_WINDOW_MS 10000
+#define MIQ_P2P_INV_WINDOW_MS 8000  // Tighter window
 #endif
 #ifndef MIQ_P2P_INV_WINDOW_CAP
-#define MIQ_P2P_INV_WINDOW_CAP 500
+#define MIQ_P2P_INV_WINDOW_CAP 1000  // Higher cap for busier network
 #endif
 #ifndef MIQ_P2P_GETADDR_INTERVAL_MS
-#define MIQ_P2P_GETADDR_INTERVAL_MS 120000
+#define MIQ_P2P_GETADDR_INTERVAL_MS 90000  // 90 seconds
 #endif
 #ifndef MIQ_P2P_ADDR_BATCH_CAP
-#define MIQ_P2P_ADDR_BATCH_CAP 1000
+#define MIQ_P2P_ADDR_BATCH_CAP 1500  // More addresses per batch
 #endif
 #ifndef MIQ_P2P_NEW_INBOUND_CAP_PER_MIN
-#define MIQ_P2P_NEW_INBOUND_CAP_PER_MIN 60
+#define MIQ_P2P_NEW_INBOUND_CAP_PER_MIN 100  // More inbound for high traffic
 #endif
 #ifndef MIQ_P2P_BAN_MS
-#define MIQ_P2P_BAN_MS (60LL*60LL*1000LL)
+#define MIQ_P2P_BAN_MS (24LL*60LL*60LL*1000LL)  // 24 hour ban
 #endif
 #ifndef MIQ_P2P_MSG_DEADLINE_MS
-#define MIQ_P2P_MSG_DEADLINE_MS 15000
+#define MIQ_P2P_MSG_DEADLINE_MS 20000  // 20 second deadline
 #endif
 #ifndef MIQ_P2P_HDR_BATCH_SPACING_MS
-#define MIQ_P2P_HDR_BATCH_SPACING_MS 200
+#define MIQ_P2P_HDR_BATCH_SPACING_MS 100  // Faster header batching
 #endif
 #ifndef MIQ_P2P_MAX_BANSCORE
 #define MIQ_P2P_MAX_BANSCORE 100
+#endif
+
+// === Production IBD (Initial Block Download) optimization ===
+#ifndef MIQ_IBD_PARALLEL_DOWNLOADS
+#define MIQ_IBD_PARALLEL_DOWNLOADS 16  // Parallel block downloads
+#endif
+#ifndef MIQ_IBD_STALL_TIMEOUT_MS
+#define MIQ_IBD_STALL_TIMEOUT_MS 60000  // 60 second stall
+#endif
+#ifndef MIQ_BLOCKS_ONLY_MODE_THRESHOLD
+#define MIQ_BLOCKS_ONLY_MODE_THRESHOLD 144  // 144 blocks behind = blocks-only
 #endif
 
 struct NetGroup {
