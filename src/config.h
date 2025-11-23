@@ -20,6 +20,12 @@ struct Config {
     std::string rpc_tls_cert;                    // server cert chain (PEM)
     std::string rpc_tls_key;                     // server private key (PEM)
     std::string rpc_tls_client_ca;               // optional client-auth CA (PEM); empty = no client auth
+
+    // === Stratum mining pool server ===
+    bool        stratum_enable = false;          // enable Stratum pool server
+    uint16_t    stratum_port = 3333;             // Stratum port
+    double      stratum_difficulty = 1.0;        // default mining difficulty
+    bool        stratum_vardiff = true;          // enable variable difficulty
 };
 
 // Simple key=value loader. Unknown keys are ignored. Returns false if file not found.

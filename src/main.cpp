@@ -32,6 +32,7 @@
 #include "tls_proxy.h"
 #include "ibd_monitor.h"
 #include "utxo_kv.h"
+#include "stratum/stratum_server.h"
 
 #if __has_include("reindex_utxo.h")
 #  include "reindex_utxo.h"
@@ -219,6 +220,9 @@ struct MinerStats {
 } g_miner_stats;
 
 static std::string g_miner_address_b58; // display mined-to address
+
+// Global Stratum server pointer for block notifications
+static std::atomic<StratumServer*> g_stratum_server{nullptr};
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║                           Telemetry buffers                                ║
@@ -2077,6 +2081,10 @@ static void miner_worker(Chain* chain, Mempool* mempool, P2P* p2p,
                     if (!global::shutdown_requested.load() && p2p) {
                         p2p->announce_block_async(b.block_hash());
                     }
+                    // Notify Stratum server of new block for job refresh
+                    if (auto* ss = g_stratum_server.load()) {
+                        ss->notify_new_block();
+                    }
                 } else {
                     g_miner_stats.rejected.fetch_add(1);
                     log_warn(std::string("mined block rejected: ") + err);
@@ -2772,6 +2780,40 @@ int main(int argc, char** argv){
             tui.mark_step_ok("Start RPC server");
             tui.mark_step_ok("RPC ready");
             rpc_ok = true;
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Stratum mining pool server (optional)
+        // ─────────────────────────────────────────────────────────────────────
+        std::unique_ptr<StratumServer> stratum_server;
+        if (cfg.stratum_enable) {
+            if (can_tui) tui.mark_step_started("Start Stratum server");
+            stratum_server = std::make_unique<StratumServer>(chain, mempool);
+            stratum_server->set_port(cfg.stratum_port);
+            stratum_server->set_default_difficulty(cfg.stratum_difficulty);
+            stratum_server->set_vardiff_enabled(cfg.stratum_vardiff);
+
+            // Set reward address from mining_address config
+            if (!cfg.mining_address.empty()) {
+                uint8_t ver = 0;
+                std::vector<uint8_t> payload;
+                if (base58check_decode(cfg.mining_address, ver, payload) &&
+                    ver == VERSION_P2PKH && payload.size() == 20) {
+                    stratum_server->set_reward_address(payload);
+                } else {
+                    log_warn("Invalid mining_address for Stratum; pool coinbase will use empty PKH");
+                }
+            }
+
+            if (stratum_server->start()) {
+                g_stratum_server.store(stratum_server.get());
+                log_info("Stratum pool server listening on port " + std::to_string(cfg.stratum_port));
+                if (can_tui) tui.mark_step_ok("Start Stratum server");
+            } else {
+                log_error("Stratum server failed to start on port " + std::to_string(cfg.stratum_port));
+                if (can_tui) tui.mark_step_fail("Start Stratum server");
+                stratum_server.reset();
+            }
         }
 
         // Prepare built-in miner (address prompt), but DO NOT start until synced.

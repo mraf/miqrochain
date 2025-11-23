@@ -1656,11 +1656,11 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
     b.header.merkle_root = merkle_from(b.txs);
 
     std::vector<uint8_t> header_prefix;
-    header_prefix.reserve(4+32+32+4+4);
+    header_prefix.reserve(4+32+32+8+4);  // FIXED: 8 bytes for time
     put_u32_le(header_prefix, b.header.version);
     header_prefix.insert(header_prefix.end(), b.header.prev_hash.begin(),   b.header.prev_hash.end());
     header_prefix.insert(header_prefix.end(), b.header.merkle_root.begin(), b.header.merkle_root.end());
-    put_u32_le(header_prefix, (uint32_t)b.header.time);
+    put_u64_le(header_prefix, (uint64_t)b.header.time);  // FIXED: use 8-byte time
     put_u32_le(header_prefix, b.header.bits);
     const size_t nonce_off = header_prefix.size();
 
@@ -1673,7 +1673,7 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
 #endif
 
     std::vector<uint8_t> hdr = header_prefix;
-    hdr.resize(header_prefix.size() + 4);
+    hdr.resize(header_prefix.size() + 8);  // FIXED: 8 bytes for nonce
     uint8_t* nonce_ptr = hdr.data() + nonce_off;
     (void)nonce_ptr;
 
@@ -1701,24 +1701,26 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
             uint8_t h[8][32];
 
         #if !defined(MIQ_POW_SALT)
-            uint8_t le4[8][4];
-            store_u32_le(le4[0], (uint32_t)n0); dsha256_from_base(base1, le4[0], 4, h[0]);
-            store_u32_le(le4[1], (uint32_t)n1); dsha256_from_base(base1, le4[1], 4, h[1]);
-            store_u32_le(le4[2], (uint32_t)n2); dsha256_from_base(base1, le4[2], 4, h[2]);
-            store_u32_le(le4[3], (uint32_t)n3); dsha256_from_base(base1, le4[3], 4, h[3]);
-            store_u32_le(le4[4], (uint32_t)n4); dsha256_from_base(base1, le4[4], 4, h[4]);
-            store_u32_le(le4[5], (uint32_t)n5); dsha256_from_base(base1, le4[5], 4, h[5]);
-            store_u32_le(le4[6], (uint32_t)n6); dsha256_from_base(base1, le4[6], 4, h[6]);
-            store_u32_le(le4[7], (uint32_t)n7); dsha256_from_base(base1, le4[7], 4, h[7]);
+            // FIXED: Use 8-byte nonces to match main miner format
+            uint8_t le8[8][8];
+            store_u64_le(le8[0], n0); dsha256_from_base(base1, le8[0], 8, h[0]);
+            store_u64_le(le8[1], n1); dsha256_from_base(base1, le8[1], 8, h[1]);
+            store_u64_le(le8[2], n2); dsha256_from_base(base1, le8[2], 8, h[2]);
+            store_u64_le(le8[3], n3); dsha256_from_base(base1, le8[3], 8, h[3]);
+            store_u64_le(le8[4], n4); dsha256_from_base(base1, le8[4], 8, h[4]);
+            store_u64_le(le8[5], n5); dsha256_from_base(base1, le8[5], 8, h[5]);
+            store_u64_le(le8[6], n6); dsha256_from_base(base1, le8[6], 8, h[6]);
+            store_u64_le(le8[7], n7); dsha256_from_base(base1, le8[7], 8, h[7]);
         #else
-            store_u32_le(nonce_ptr, (uint32_t)n0); { auto hv = salted_header_hash(hdr); std::memcpy(h[0], hv.data(), 32); }
-            store_u32_le(nonce_ptr, (uint32_t)n1); { auto hv = salted_header_hash(hdr); std::memcpy(h[1], hv.data(), 32); }
-            store_u32_le(nonce_ptr, (uint32_t)n2); { auto hv = salted_header_hash(hdr); std::memcpy(h[2], hv.data(), 32); }
-            store_u32_le(nonce_ptr, (uint32_t)n3); { auto hv = salted_header_hash(hdr); std::memcpy(h[3], hv.data(), 32); }
-            store_u32_le(nonce_ptr, (uint32_t)n4); { auto hv = salted_header_hash(hdr); std::memcpy(h[4], hv.data(), 32); }
-            store_u32_le(nonce_ptr, (uint32_t)n5); { auto hv = salted_header_hash(hdr); std::memcpy(h[5], hv.data(), 32); }
-            store_u32_le(nonce_ptr, (uint32_t)n6); { auto hv = salted_header_hash(hdr); std::memcpy(h[6], hv.data(), 32); }
-            store_u32_le(nonce_ptr, (uint32_t)n7); { auto hv = salted_header_hash(hdr); std::memcpy(h[7], hv.data(), 32); }
+            // FIXED: Use 8-byte nonces for salted hash path
+            store_u64_le(nonce_ptr, n0); { auto hv = salted_header_hash(hdr); std::memcpy(h[0], hv.data(), 32); }
+            store_u64_le(nonce_ptr, n1); { auto hv = salted_header_hash(hdr); std::memcpy(h[1], hv.data(), 32); }
+            store_u64_le(nonce_ptr, n2); { auto hv = salted_header_hash(hdr); std::memcpy(h[2], hv.data(), 32); }
+            store_u64_le(nonce_ptr, n3); { auto hv = salted_header_hash(hdr); std::memcpy(h[3], hv.data(), 32); }
+            store_u64_le(nonce_ptr, n4); { auto hv = salted_header_hash(hdr); std::memcpy(h[4], hv.data(), 32); }
+            store_u64_le(nonce_ptr, n5); { auto hv = salted_header_hash(hdr); std::memcpy(h[5], hv.data(), 32); }
+            store_u64_le(nonce_ptr, n6); { auto hv = salted_header_hash(hdr); std::memcpy(h[6], hv.data(), 32); }
+            store_u64_le(nonce_ptr, n7); { auto hv = salted_header_hash(hdr); std::memcpy(h[7], hv.data(), 32); }
         #endif
 
             if(meets_target_be_raw(h[0], bits)){ b.header.nonce=n0; *out_block=b; found->store(true); break; }
@@ -2293,13 +2295,14 @@ int main(int argc, char** argv){
         meter.detach();
 
 #if defined(MIQ_ENABLE_OPENCL)
+        // FIXED: Use 8-byte time to match main miner format (total 80 bytes)
         [[maybe_unused]] auto build_header_prefix80 = [](const BlockHeader& H, const std::vector<uint8_t>& merkle)->std::vector<uint8_t>{
             std::vector<uint8_t> p;
-            p.reserve(76);
+            p.reserve(80);  // 4+32+32+8+4 = 80 bytes
             put_u32_le(p, H.version);
             p.insert(p.end(), H.prev_hash.begin(), H.prev_hash.end());
             p.insert(p.end(), merkle.begin(), merkle.end());
-            put_u32_le(p, (uint32_t)H.time);
+            put_u64_le(p, (uint64_t)H.time);  // 8 bytes
             put_u32_le(p, H.bits);
             return p;
         };
@@ -2421,28 +2424,29 @@ int main(int argc, char** argv){
 #if defined(MIQ_ENABLE_OPENCL)
             if (gpu_enabled) {
                 std::string gerr;
-                std::vector<uint8_t> prefix76 = 
+                // FIXED: Use 8-byte time to match main miner format (80 bytes total)
+                std::vector<uint8_t> prefix80 =
                     [&](){
-                        std::vector<uint8_t> p; 
-                        p.reserve(76);
+                        std::vector<uint8_t> p;
+                        p.reserve(80);  // 4+32+32+8+4 = 80
                         put_u32_le(p, b.header.version);
                         p.insert(p.end(), b.header.prev_hash.begin(), b.header.prev_hash.end());
                         p.insert(p.end(), b.header.merkle_root.begin(), b.header.merkle_root.end());
-                        put_u32_le(p, (uint32_t)b.header.time);
+                        put_u64_le(p, (uint64_t)b.header.time);  // 8 bytes
                         put_u32_le(p, b.header.bits);
                         return p;
                     }();
                 std::vector<uint8_t> gpuprefix;
                 if(salt_pos == SaltPos::PRE && !salt_bytes.empty()){
-                    gpuprefix.reserve(salt_bytes.size()+prefix76.size());
+                    gpuprefix.reserve(salt_bytes.size()+prefix80.size());
                     gpuprefix.insert(gpuprefix.end(), salt_bytes.begin(), salt_bytes.end());
-                    gpuprefix.insert(gpuprefix.end(), prefix76.begin(), prefix76.end());
+                    gpuprefix.insert(gpuprefix.end(), prefix80.begin(), prefix80.end());
                 } else if(salt_pos == SaltPos::POST && !salt_bytes.empty()){
-                    gpuprefix.reserve(prefix76.size()+salt_bytes.size());
-                    gpuprefix.insert(gpuprefix.end(), prefix76.begin(), prefix76.end());
+                    gpuprefix.reserve(prefix80.size()+salt_bytes.size());
+                    gpuprefix.insert(gpuprefix.end(), prefix80.begin(), prefix80.end());
                     gpuprefix.insert(gpuprefix.end(), salt_bytes.begin(), salt_bytes.end());
                 } else {
-                    gpuprefix = prefix76;
+                    gpuprefix = prefix80;
                 }
 
                 if (!gpu.set_job(gpuprefix, target_be, &gerr)) {
