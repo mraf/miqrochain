@@ -221,6 +221,8 @@ set(MIQ_CORE_SOURCES_NO_NAT
     src/ibd_monitor.h src/ibd_monitor.cpp
     src/wallet_encryptor.cpp
     src/crypto/secure_random.cpp
+    src/stratum/stratum_server.h src/stratum/stratum_server.cpp
+    src/filters/bloom.h src/filters/bloom.cpp
 )
 
 add_library(miqcore STATIC ${MIQ_CORE_SOURCES_NO_NAT})
