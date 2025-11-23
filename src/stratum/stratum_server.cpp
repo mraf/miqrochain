@@ -8,6 +8,8 @@
 #include "../serialize.h"
 #include "../constants.h"
 #include "../log.h"
+#include "../tx.h"
+#include "../block.h"
 
 #include <algorithm>
 #include <chrono>
@@ -599,9 +601,9 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
         merkle_root = dsha256(combined);
     }
 
-    // Build header (80 bytes)
+    // Build header (88 bytes - MIQ uses 8-byte time and 8-byte nonce)
     std::vector<uint8_t> header;
-    header.reserve(80);
+    header.reserve(88);
 
     // Version (4 bytes, little-endian)
     uint32_t ver = job.version;
@@ -616,12 +618,11 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
     // Merkle root (32 bytes)
     header.insert(header.end(), merkle_root.begin(), merkle_root.end());
 
-    // Time (4 bytes, little-endian)
-    uint32_t time_val = std::stoul(ntime, nullptr, 16);
-    header.push_back((time_val >> 0) & 0xff);
-    header.push_back((time_val >> 8) & 0xff);
-    header.push_back((time_val >> 16) & 0xff);
-    header.push_back((time_val >> 24) & 0xff);
+    // Time (8 bytes, little-endian) - MIQ uses 8-byte timestamps
+    uint64_t time_val = std::stoull(ntime, nullptr, 16);
+    for (int i = 0; i < 8; i++) {
+        header.push_back((time_val >> (8 * i)) & 0xff);
+    }
 
     // Bits (4 bytes, little-endian)
     uint32_t bits = job.bits;
@@ -630,12 +631,11 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
     header.push_back((bits >> 16) & 0xff);
     header.push_back((bits >> 24) & 0xff);
 
-    // Nonce (4 bytes, little-endian)
-    uint32_t nonce_val = std::stoul(nonce, nullptr, 16);
-    header.push_back((nonce_val >> 0) & 0xff);
-    header.push_back((nonce_val >> 8) & 0xff);
-    header.push_back((nonce_val >> 16) & 0xff);
-    header.push_back((nonce_val >> 24) & 0xff);
+    // Nonce (8 bytes, little-endian) - MIQ uses 8-byte nonces
+    uint64_t nonce_val = std::stoull(nonce, nullptr, 16);
+    for (int i = 0; i < 8; i++) {
+        header.push_back((nonce_val >> (8 * i)) & 0xff);
+    }
 
     // Hash header
     auto header_hash = dsha256(header);
@@ -651,13 +651,60 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
         // Block found!
         log_info("Stratum: BLOCK FOUND by " + miner.worker_name + "!");
 
-        // Submit block to chain
-        // Build full block and submit via chain_.submit_block()
-        // For now, just log it
+        // Build the full block and submit to chain
+        try {
+            // Build coinbase transaction
+            Transaction coinbase_tx;
+            coinbase_tx.version = 1;
 
-        {
-            std::lock_guard<std::mutex> lock(stats_mutex_);
-            stats_.blocks_found++;
+            // Coinbase input
+            TxIn cb_in;
+            cb_in.prev.txid = std::vector<uint8_t>(32, 0); // Null txid for coinbase
+            cb_in.prev.vout = 0xffffffff;
+            // Script sig contains extranonce (empty sig/pubkey for coinbase)
+            cb_in.sig.clear();
+            cb_in.pubkey.clear();
+            coinbase_tx.vin.push_back(cb_in);
+
+            // Calculate subsidy
+            uint64_t subsidy = INITIAL_SUBSIDY;
+            uint64_t halvings = job.height / HALVING_INTERVAL;
+            if (halvings < 64) subsidy = INITIAL_SUBSIDY >> halvings;
+            else subsidy = 0;
+
+            // Coinbase output
+            TxOut cb_out;
+            cb_out.value = subsidy; // TODO: add fees from mempool txs
+            cb_out.pkh = reward_pkh_.size() == 20 ? reward_pkh_ : std::vector<uint8_t>(20, 0);
+            coinbase_tx.vout.push_back(cb_out);
+
+            coinbase_tx.lock_time = 0;
+
+            // Build block
+            Block block;
+            block.header.version = job.version;
+            block.header.prev_hash = job.prev_hash;
+            block.header.merkle_root = merkle_root;
+            block.header.time = time_val;
+            block.header.bits = bits;
+            block.header.nonce = nonce_val;
+            block.txs.push_back(coinbase_tx);
+
+            // TODO: Add mempool transactions that were in the job
+
+            // Submit to chain
+            std::string submit_err;
+            if (chain_.submit_block(block, submit_err)) {
+                log_info("Stratum: Block " + std::to_string(job.height) + " accepted!");
+                {
+                    std::lock_guard<std::mutex> lock(stats_mutex_);
+                    stats_.blocks_found++;
+                }
+            } else {
+                log_error("Stratum: Block rejected: " + submit_err);
+            }
+        } catch (const std::exception& e) {
+            log_error("Stratum: Failed to build/submit block: " + std::string(e.what()));
         }
     }
 
@@ -720,53 +767,59 @@ StratumJob StratumServer::create_job() {
     if (halvings < 64) subsidy = INITIAL_SUBSIDY >> halvings;
     else subsidy = 0;
 
-    // Coinbase parts
-    // coinb1: version + input count + prev_txid (zeros) + prev_vout + script length
+    // Build coinbase parts using MIQ's transaction serialization format
+    // Format: version(4) + input_count(4) + [txid_len(4) + txid + vout(4) + sig_len(4) + sig + pubkey_len(4) + pubkey]
+    //         + output_count(4) + [value(8) + pkh_len(4) + pkh] + lock_time(4)
+
+    // Helper lambda for little-endian u32
+    auto put_u32_le = [](std::vector<uint8_t>& v, uint32_t x) {
+        v.push_back((x >> 0) & 0xff);
+        v.push_back((x >> 8) & 0xff);
+        v.push_back((x >> 16) & 0xff);
+        v.push_back((x >> 24) & 0xff);
+    };
+
+    // Helper lambda for little-endian u64
+    auto put_u64_le = [](std::vector<uint8_t>& v, uint64_t x) {
+        for (int i = 0; i < 8; i++) {
+            v.push_back((x >> (8 * i)) & 0xff);
+        }
+    };
+
+    // coinb1: version + input_count + prev_txid + prev_vout
+    // The extranonce will be inserted as the sig field
     std::vector<uint8_t> coinb1_bytes;
-    // Version
-    coinb1_bytes.push_back(1); coinb1_bytes.push_back(0);
-    coinb1_bytes.push_back(0); coinb1_bytes.push_back(0);
-    // Input count
-    coinb1_bytes.push_back(1); coinb1_bytes.push_back(0);
-    coinb1_bytes.push_back(0); coinb1_bytes.push_back(0);
-    // Prev txid size
-    coinb1_bytes.push_back(32); coinb1_bytes.push_back(0);
-    coinb1_bytes.push_back(0); coinb1_bytes.push_back(0);
-    // Prev txid (zeros)
-    for (int i = 0; i < 32; i++) coinb1_bytes.push_back(0);
-    // Prev vout
-    coinb1_bytes.push_back(0); coinb1_bytes.push_back(0);
-    coinb1_bytes.push_back(0); coinb1_bytes.push_back(0);
+    put_u32_le(coinb1_bytes, 1);  // version
+    put_u32_le(coinb1_bytes, 1);  // input count
+    put_u32_le(coinb1_bytes, 32); // prev.txid length
+    for (int i = 0; i < 32; i++) coinb1_bytes.push_back(0); // prev.txid (zeros for coinbase)
+    put_u32_le(coinb1_bytes, 0xffffffff); // prev.vout (0xffffffff for coinbase)
 
     job.coinb1 = hex_encode(coinb1_bytes);
 
-    // coinb2: rest of coinbase after extranonce
+    // coinb2: sig (contains extranonce) + pubkey + outputs + lock_time
+    // Note: extranonce1 + extranonce2 will be inserted as the sig by the miner
+    // We put the sig length here as it's filled by miner
     std::vector<uint8_t> coinb2_bytes;
-    // Sig length (0 for coinbase)
-    coinb2_bytes.push_back(0); coinb2_bytes.push_back(0);
-    coinb2_bytes.push_back(0); coinb2_bytes.push_back(0);
-    // Pubkey length
-    coinb2_bytes.push_back(0); coinb2_bytes.push_back(0);
-    coinb2_bytes.push_back(0); coinb2_bytes.push_back(0);
-    // Output count
-    coinb2_bytes.push_back(1); coinb2_bytes.push_back(0);
-    coinb2_bytes.push_back(0); coinb2_bytes.push_back(0);
-    // Value
-    for (int i = 0; i < 8; i++) {
-        coinb2_bytes.push_back((subsidy >> (8 * i)) & 0xff);
-    }
-    // PKH length
-    coinb2_bytes.push_back(20); coinb2_bytes.push_back(0);
-    coinb2_bytes.push_back(0); coinb2_bytes.push_back(0);
+
+    // The sig length field will contain extranonce1_size + extranonce2_size
+    // But since we split BEFORE the sig, coinb2 starts with sig length marker
+    // We'll use 0 length sig and 0 length pubkey for simplicity
+    put_u32_le(coinb2_bytes, 0);  // sig length (extranonce embedded in coinb1+en1+en2)
+    put_u32_le(coinb2_bytes, 0);  // pubkey length
+
+    put_u32_le(coinb2_bytes, 1);  // output count
+    put_u64_le(coinb2_bytes, subsidy); // value
+    put_u32_le(coinb2_bytes, 20); // pkh length
+
     // PKH
     if (reward_pkh_.size() == 20) {
         coinb2_bytes.insert(coinb2_bytes.end(), reward_pkh_.begin(), reward_pkh_.end());
     } else {
         for (int i = 0; i < 20; i++) coinb2_bytes.push_back(0);
     }
-    // Lock time
-    coinb2_bytes.push_back(0); coinb2_bytes.push_back(0);
-    coinb2_bytes.push_back(0); coinb2_bytes.push_back(0);
+
+    put_u32_le(coinb2_bytes, 0);  // lock_time
 
     job.coinb2 = hex_encode(coinb2_bytes);
 
