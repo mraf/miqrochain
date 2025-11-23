@@ -2495,6 +2495,7 @@ int main(int argc, char** argv){
         while (ui.running.load()) {
             MinerTemplate tpl;
             if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
+                ui.node_reachable.store(false);
                 std::ostringstream m;
                 m << C("31;1") << "CANNOT MINE: Node not responding at " << rpc_host << ":" << rpc_port << R() << "\n";
                 m << C("33") << "  Ensure miqrochain node is running with RPC enabled\n";
@@ -2504,6 +2505,9 @@ int main(int argc, char** argv){
                 for(int i=0;i<20 && ui.running.load(); ++i) miq_sleep_ms(100);
                 continue;
             }
+
+            // Successfully got template - node is reachable
+            ui.node_reachable.store(true);
 
             if (tpl.prev_hash.size() != 32) {
                 log_line("template rejected: prev_hash size invalid");

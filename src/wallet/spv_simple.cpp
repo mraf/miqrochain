@@ -484,6 +484,27 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     // 6) fast PKH lookup
     std::unordered_set<std::vector<uint8_t>, VecHash> pkhset(pkhs.begin(), pkhs.end());
 
+    // 6b) Re-filter cached UTXOs against current wallet's PKHs
+    // This ensures that when switching wallets, we don't show UTXOs from other wallets
+    {
+        std::vector<UtxoLite> filtered_view;
+        filtered_view.reserve(view.size());
+        for(const auto& u : view){
+            if(pkhset.find(u.pkh) != pkhset.end()){
+                filtered_view.push_back(u);
+            }
+        }
+        if(filtered_view.size() != view.size()){
+            // Cache contained UTXOs from different wallet, rebuild index
+            view = std::move(filtered_view);
+            idx.clear();
+            idx.reserve(view.size() * 2 + 16);
+            for(size_t i = 0; i < view.size(); ++i){
+                idx[key_of(view[i].txid, view[i].vout)] = i;
+            }
+        }
+    }
+
     auto add_out = [&](const std::vector<uint8_t>& txid_le, uint32_t vout,
                        uint64_t value, const std::vector<uint8_t>& pkh,
                        uint32_t height, bool coinbase)
@@ -628,14 +649,15 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     save_state(opt.cache_dir, newst);
     save_utxo_cache(opt.cache_dir, view);
 
-    // 9) post-filter: require ≥1 conf for all outputs
+    // 9) post-filter: require ≥1 conf AND match wallet PKHs
     // NOTE: We return immature coinbase so wallet can display them as "Immature" balance
     // The wallet will filter them from spendable but show them in the UI
     std::vector<UtxoLite> finalv; finalv.reserve(view.size());
     for(const auto& u : view){
         uint32_t conf = (u.height <= tip_height) ? (tip_height - u.height + 1) : 0;
         if(conf < 1) continue;
-        // Don't filter immature coinbase - let wallet display them as immature balance
+        // Only include UTXOs that belong to this wallet's addresses
+        if(pkhset.find(u.pkh) == pkhset.end()) continue;
         finalv.push_back(u);
     }
 
