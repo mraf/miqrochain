@@ -596,6 +596,13 @@ struct WalletBalance {
     uint64_t approx_tip_h{0};
 };
 
+// Helper to safely add with overflow check
+static inline bool safe_add(uint64_t& sum, uint64_t val) {
+    if (val > UINT64_MAX - sum) return false; // would overflow
+    sum += val;
+    return true;
+}
+
 static WalletBalance compute_balance(const std::vector<miq::UtxoLite>& utxos,
                                      const std::set<OutpointKey>& pending)
 {
@@ -603,7 +610,10 @@ static WalletBalance compute_balance(const std::vector<miq::UtxoLite>& utxos,
     for(const auto& u : utxos) wb.approx_tip_h = std::max<uint64_t>(wb.approx_tip_h, u.height);
 
     for(const auto& u: utxos){
-        wb.total += u.value;
+        // Overflow protection - cap at max value
+        if (!safe_add(wb.total, u.value)) {
+            wb.total = UINT64_MAX;
+        }
         bool is_immature = false;
         if(u.coinbase){
             uint64_t mature_h = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
@@ -611,9 +621,15 @@ static WalletBalance compute_balance(const std::vector<miq::UtxoLite>& utxos,
         }
         OutpointKey k{ miq::to_hex(u.txid), u.vout };
         bool held = (pending.find(k) != pending.end());
-        if(is_immature) wb.immature += u.value;
-        else if(held)   wb.pending_hold += u.value;
-        else            wb.spendable += u.value;
+        if(is_immature) {
+            if (!safe_add(wb.immature, u.value)) wb.immature = UINT64_MAX;
+        }
+        else if(held) {
+            if (!safe_add(wb.pending_hold, u.value)) wb.pending_hold = UINT64_MAX;
+        }
+        else {
+            if (!safe_add(wb.spendable, u.value)) wb.spendable = UINT64_MAX;
+        }
     }
     return wb;
 }
