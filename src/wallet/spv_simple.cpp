@@ -529,6 +529,8 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     const size_t   MAX_VIEW_SIZE = env_u32("MIQ_MAX_UTXO_VIEW_SIZE", 100000); // Max UTXOs in memory
     uint32_t chunk_count = 0;
     uint32_t blocks_processed = 0;
+    const size_t total_blocks = blocks.size();
+    const uint32_t PROGRESS_EVERY = env_u32("MIQ_PROGRESS_EVERY", 100); // Show progress every N blocks
 
     for(const auto& bh : blocks){
         const auto& hash_le = bh.first;
@@ -574,6 +576,13 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
 
         blocks_processed++;
 
+        // Show progress periodically
+        if(blocks_processed % PROGRESS_EVERY == 0 || blocks_processed == total_blocks){
+            fprintf(stderr, "\r  Scanning: %u/%zu blocks (height %u), %zu UTXOs found...",
+                    blocks_processed, total_blocks, height, view.size());
+            fflush(stderr);
+        }
+
         // Progressive cache flushing to prevent memory overflow
         if(blocks_processed % FLUSH_EVERY == 0){
             // Save intermediate state
@@ -607,6 +616,12 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     }
 
     p2p.close();
+
+    // Clear progress line
+    if(blocks_processed > 0){
+        fprintf(stderr, "\r  Scan complete: %u blocks processed, %zu UTXOs found\n",
+                blocks_processed, view.size());
+    }
 
     // 8) save checkpoint at the tip we just synced to
     CacheState newst; newst.scanned_upto = tip_height;
