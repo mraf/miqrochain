@@ -1774,6 +1774,120 @@ static bool pack_template(const MinerTemplate& tpl,
     return true;
 }
 
+// ===== Stratum client for pool mining ========================================
+struct StratumJob {
+    std::string job_id;
+    std::vector<uint8_t> prev_hash;
+    std::string coinbase1;
+    std::string coinbase2;
+    std::vector<std::string> merkle_branch;
+    uint32_t version;
+    uint32_t bits;
+    uint32_t time;
+    bool clean;
+};
+
+class StratumClient {
+public:
+    std::string host;
+    uint16_t port;
+    std::string worker;
+    std::string password;
+    socket_t sock = -1;
+    std::atomic<bool> connected{false};
+    std::mutex mtx;
+    std::string extranonce1;
+    uint32_t extranonce2_size = 4;
+    StratumJob current_job;
+    std::atomic<uint64_t> job_id_counter{0};
+    uint64_t last_submit_id = 0;
+
+    bool connect_to_pool() {
+        addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
+        addrinfo* res = nullptr;
+        char ps[16]; std::snprintf(ps, sizeof(ps), "%u", (unsigned)port);
+        if (getaddrinfo(host.c_str(), ps, &hints, &res) != 0) return false;
+
+        for (addrinfo* ai = res; ai; ai = ai->ai_next) {
+            sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+            if (sock < 0) continue;
+            set_socket_timeouts(sock, 10000, 30000);
+            if (::connect(sock, ai->ai_addr, ai->ai_addrlen) == 0) break;
+            miq_closesocket(sock); sock = -1;
+        }
+        freeaddrinfo(res);
+        if (sock < 0) return false;
+        connected.store(true);
+        return true;
+    }
+
+    bool send_json(const std::string& json) {
+        std::string msg = json + "\n";
+        return ::send(sock, msg.c_str(), msg.size(), 0) > 0;
+    }
+
+    std::string recv_line() {
+        std::string line;
+        char c;
+        while (::recv(sock, &c, 1, 0) == 1) {
+            if (c == '\n') break;
+            line += c;
+        }
+        return line;
+    }
+
+    bool subscribe() {
+        std::ostringstream ss;
+        ss << "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"miqminer/1.0\"]}";
+        if (!send_json(ss.str())) return false;
+
+        std::string resp = recv_line();
+        // Parse extranonce1 and extranonce2_size from response
+        size_t en1_pos = resp.find("\"");
+        if (en1_pos != std::string::npos) {
+            // Simple extraction - in production would use proper JSON parsing
+            size_t start = resp.find("[\"");
+            if (start != std::string::npos) {
+                start += 2;
+                size_t end = resp.find("\"", start);
+                if (end != std::string::npos) {
+                    extranonce1 = resp.substr(start, end - start);
+                }
+            }
+        }
+        return !extranonce1.empty();
+    }
+
+    bool authorize() {
+        std::ostringstream ss;
+        ss << "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\""
+           << worker << "\",\"" << password << "\"]}";
+        if (!send_json(ss.str())) return false;
+
+        std::string resp = recv_line();
+        return resp.find("true") != std::string::npos;
+    }
+
+    bool submit_share(const std::string& job_id, const std::string& extranonce2,
+                      const std::string& ntime, const std::string& nonce) {
+        std::lock_guard<std::mutex> lk(mtx);
+        last_submit_id = ++job_id_counter;
+        std::ostringstream ss;
+        ss << "{\"id\":" << last_submit_id << ",\"method\":\"mining.submit\",\"params\":[\""
+           << worker << "\",\"" << job_id << "\",\"" << extranonce2 << "\",\""
+           << ntime << "\",\"" << nonce << "\"]}";
+        return send_json(ss.str());
+    }
+
+    void disconnect() {
+        if (sock >= 0) {
+            miq_closesocket(sock);
+            sock = -1;
+        }
+        connected.store(false);
+    }
+};
+
 // ===== usage =================================================================
 static void usage(){
     std::cout <<
@@ -1781,6 +1895,7 @@ static void usage(){
     "Usage:\n"
     "  miqminer_rpc [--rpc=host:port] [--token=TOKEN] [--threads=N]\n"
     "               [--address=Base58P2PKH] [--no-ansi]\n"
+    "               [--pool=host:port] [--worker=name] [--pool-pass=x]\n"
     "               [--priority=high|normal] [--affinity=on|off]\n"
     "               [--smooth=SECONDS]\n"
     "               [--gpu=on|off] [--gpu-platform=IDX] [--gpu-device=IDX]\n"
@@ -1789,7 +1904,8 @@ static void usage(){
     "Notes:\n"
     "  - Token from --token, MIQ_RPC_TOKEN, or datadir/.cookie\n"
     "  - Default threads: 6 (override with --threads)\n"
-    "  - GPU requires build with -DMIQ_ENABLE_OPENCL and OpenCL runtime installed\n";
+    "  - GPU requires build with -DMIQ_ENABLE_OPENCL and OpenCL runtime installed\n"
+    "  - Pool mining: use --pool=host:port --worker=addr.worker --pool-pass=x\n";
 }
 
 // ===== graceful shutdown =====================================================
@@ -1840,10 +1956,26 @@ int main(int argc, char** argv){
         std::vector<uint8_t> salt_bytes;
         SaltPos salt_pos = SaltPos::NONE;
 
+        // Pool mining options
+        std::string pool_host;
+        uint16_t pool_port = 0;
+        std::string pool_worker;
+        std::string pool_pass = "x";
+        bool pool_mode = false;
+
         for(int i=1;i<argc;i++){
             std::string a(argv[i]);
             if(a=="--help"||a=="-h"){ usage(); return 0; }
-            else if(a.rfind("--rpc=",0)==0){
+            else if(a.rfind("--pool=",0)==0){
+                std::string hp = a.substr(7); size_t c = hp.find(':');
+                if(c==std::string::npos){ std::fprintf(stderr,"Bad --pool=host:port\n"); return 2; }
+                pool_host = hp.substr(0,c); pool_port = (uint16_t)std::stoi(hp.substr(c+1));
+                pool_mode = true;
+            } else if(a.rfind("--worker=",0)==0){
+                pool_worker = a.substr(9);
+            } else if(a.rfind("--pool-pass=",0)==0){
+                pool_pass = a.substr(12);
+            } else if(a.rfind("--rpc=",0)==0){
                 std::string hp = a.substr(6); size_t c = hp.find(':');
                 if(c==std::string::npos){ std::fprintf(stderr,"Bad --rpc=host:port\n"); return 2; }
                 rpc_host = hp.substr(0,c); rpc_port = (uint16_t)std::stoi(hp.substr(c+1));
