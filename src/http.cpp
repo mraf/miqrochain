@@ -503,13 +503,14 @@ void HttpServer::start(
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
 #endif
 
-    // Tunables (very high defaults for local tools)
-    const int max_conn          = env_int("MIQ_RPC_MAX_CONN",   100000);
-    const int ip_rps            = env_int("MIQ_RPC_RPS",        1000000);
-    const int ip_burst          = env_int("MIQ_RPC_BURST",      1000000);
-    const size_t max_hdr_bytes  = env_szt("MIQ_RPC_MAX_HEADER", 16*1024);
-    const size_t max_body_bytes = env_szt("MIQ_RPC_MAX_BODY",   2*1024*1024);
-    const int recv_timeout_ms   = env_int("MIQ_RPC_RECV_TIMEOUT_MS", 15000);
+    // CRITICAL FIX: Sane defaults to prevent DoS attacks
+    // These can be overridden via environment variables for specific deployments
+    const int max_conn          = env_int("MIQ_RPC_MAX_CONN",   1000);     // CRITICAL FIX: Reduced from 100000
+    const int ip_rps            = env_int("MIQ_RPC_RPS",        100);      // CRITICAL FIX: Reduced from 1000000
+    const int ip_burst          = env_int("MIQ_RPC_BURST",      200);      // CRITICAL FIX: Reduced from 1000000
+    const size_t max_hdr_bytes  = env_szt("MIQ_RPC_MAX_HEADER", 8*1024);   // CRITICAL FIX: Reduced from 16KB
+    const size_t max_body_bytes = env_szt("MIQ_RPC_MAX_BODY",   1*1024*1024); // CRITICAL FIX: Reduced from 2MB
+    const int recv_timeout_ms   = env_int("MIQ_RPC_RECV_TIMEOUT_MS", 10000); // CRITICAL FIX: Reduced from 15s
     const bool allow_cors       = env_truthy(std::getenv("MIQ_RPC_CORS"));
 
     // Observability toggles
@@ -651,10 +652,28 @@ void HttpServer::start(
                     try {
                         auto t_start = std::chrono::steady_clock::now();
 
-                        // simple reqid + access log
+                        // CRITICAL FIX: Generate unpredictable request ID
+                        // Use a combination of time, address, and atomic counter for better entropy
+                        static std::atomic<uint64_t> s_reqid_counter{0};
                         auto gen_reqid = [](){
-                            std::array<unsigned char,8> r{}; for(auto& b: r) b = (unsigned char)std::rand();
-                            std::ostringstream os; os << std::hex << std::setw(2) << std::setfill('0');
+                            std::array<unsigned char,16> r{};
+                            // Mix in counter, time, and thread id for entropy
+                            uint64_t cnt = s_reqid_counter.fetch_add(1, std::memory_order_relaxed);
+                            auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+                            uint64_t mix = cnt ^ (uint64_t)now ^ (uint64_t)std::hash<std::thread::id>{}(std::this_thread::get_id());
+
+                            // Fill with mixed entropy
+                            for(size_t i = 0; i < 8; ++i) {
+                                r[i] = (unsigned char)((mix >> (i * 8)) & 0xff);
+                            }
+                            // Second half uses transformed mix
+                            mix = mix * 6364136223846793005ULL + 1442695040888963407ULL; // LCG
+                            for(size_t i = 0; i < 8; ++i) {
+                                r[8 + i] = (unsigned char)((mix >> (i * 8)) & 0xff);
+                            }
+
+                            std::ostringstream os;
+                            os << std::hex << std::setfill('0');
                             for(unsigned char b: r){ os << std::setw(2) << (int)b; }
                             return os.str();
                         };

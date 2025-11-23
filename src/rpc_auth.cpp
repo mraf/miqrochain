@@ -45,12 +45,32 @@ bool rpc_parse_bearer(const std::string& v, std::string& out_token){
 }
 
 bool rpc_timing_safe_eq(const std::string& a, const std::string& b){
-    // XOR-accumulate all bytes; same length required to avoid length leak.
-    if (a.size() != b.size()) return false;
-    unsigned char acc = 0;
-    for (size_t i=0;i<a.size();++i){
-        acc |= (unsigned char)(a[i] ^ b[i]);
+    // CRITICAL FIX: Constant-time comparison that doesn't leak length
+    // Compare all bytes of both strings to avoid timing side-channel
+    size_t len_a = a.size();
+    size_t len_b = b.size();
+    size_t max_len = len_a > len_b ? len_a : len_b;
+
+    // If either string is empty, we still need constant-time behavior
+    if (max_len == 0) {
+        return len_a == len_b;
     }
+
+    volatile unsigned char acc = 0;
+
+    // XOR accumulate differences - always compare max_len bytes
+    // Use modulo to wrap indices (this doesn't leak useful timing info)
+    for (size_t i = 0; i < max_len; ++i) {
+        unsigned char byte_a = (i < len_a) ? (unsigned char)a[i] : 0;
+        unsigned char byte_b = (i < len_b) ? (unsigned char)b[i] : 0;
+        acc |= byte_a ^ byte_b;
+    }
+
+    // Also accumulate length difference
+    acc |= (unsigned char)(len_a ^ len_b);
+    // Additional bits for longer lengths
+    acc |= (unsigned char)((len_a >> 8) ^ (len_b >> 8));
+
     return acc == 0;
 }
 

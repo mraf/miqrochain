@@ -12,12 +12,23 @@ static inline uint64_t get_u64(const std::vector<uint8_t>& v, size_t i){ uint64_
 static inline void put_bytes(std::vector<uint8_t>& v, const std::vector<uint8_t>& b){ v.insert(v.end(), b.begin(), b.end()); }
 static inline void put_var(std::vector<uint8_t>& v, const std::vector<uint8_t>& b){ put_u32(v, (uint32_t)b.size()); put_bytes(v, b); }
 
+// CRITICAL FIX: Maximum limits to prevent DoS
+static constexpr uint32_t MAX_VAR_SIZE = 4 * 1024 * 1024;  // 4 MiB max for variable fields
+static constexpr uint32_t MAX_TX_COUNT = 100000;           // Max transactions per block
+static constexpr uint32_t MAX_VIN_COUNT = 10000;           // Max inputs per transaction
+static constexpr uint32_t MAX_VOUT_COUNT = 10000;          // Max outputs per transaction
+
 static inline bool get_var(const std::vector<uint8_t>& v, size_t& i, std::vector<uint8_t>& out){
     if (i + 4 > v.size()) return false;
     uint32_t sz = get_u32(v, i);
     i += 4;
 
-    if (i + sz > v.size()) return false;
+    // CRITICAL FIX: Bounds validation to prevent DoS
+    if (sz > MAX_VAR_SIZE) return false;
+
+    // CRITICAL FIX: Safe overflow check - prevents integer overflow on 32-bit systems
+    if (sz > v.size() || i > v.size() - sz) return false;
+
     out.assign(v.begin() + i, v.begin() + i + sz);
     i += sz;
     return true;
@@ -53,6 +64,9 @@ bool deser_tx(const std::vector<uint8_t>& b, Transaction& tx){
     uint32_t nin = get_u32(b, i);
     i += 4;
 
+    // CRITICAL FIX: Limit input count to prevent DoS
+    if (nin > MAX_VIN_COUNT) return false;
+
     tx.vin.clear();
     tx.vin.reserve(nin);
     for(uint32_t k=0;k<nin;k++){
@@ -71,6 +85,9 @@ bool deser_tx(const std::vector<uint8_t>& b, Transaction& tx){
     if (i + 4 > b.size()) return false;
     uint32_t nout = get_u32(b, i);
     i += 4;
+
+    // CRITICAL FIX: Limit output count to prevent DoS
+    if (nout > MAX_VOUT_COUNT) return false;
 
     tx.vout.clear();
     tx.vout.reserve(nout);
@@ -149,6 +166,9 @@ bool deser_block(const std::vector<uint8_t>& b, Block& out){
     uint32_t ntx = get_u32(b, i);
     i += 4;
 
+    // CRITICAL FIX: Limit transaction count to prevent DoS
+    if (ntx > MAX_TX_COUNT) return false;
+
     out.txs.clear();
     out.txs.reserve(ntx);
     for(uint32_t k=0;k<ntx;k++){
@@ -156,7 +176,8 @@ bool deser_block(const std::vector<uint8_t>& b, Block& out){
         uint32_t sz = get_u32(b, i);
         i += 4;
 
-        if (i + sz > b.size()) return false;
+        // CRITICAL FIX: Safe overflow check - prevents integer overflow on 32-bit systems
+        if (sz > b.size() || i > b.size() - sz) return false;
 
         Transaction tx;
         std::vector<uint8_t> span(b.begin() + i, b.begin() + i + sz);

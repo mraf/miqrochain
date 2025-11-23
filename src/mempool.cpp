@@ -72,6 +72,22 @@ bool Mempool::validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView
         return false;
     }
 
+    // CRITICAL FIX: Check for duplicate inputs within the same transaction
+    std::unordered_set<std::string> seen_inputs;
+    for (const auto& in : tx.vin) {
+        std::string input_key = key_from_vec(in.prev.txid) + ":" + std::to_string(in.prev.vout);
+        if (!seen_inputs.insert(input_key).second) {
+            err = "duplicate input";
+            return false;
+        }
+
+        // CRITICAL FIX: Check for double-spend against mempool
+        if (spent_outputs_.count(input_key) > 0) {
+            err = "double-spend";
+            return false;
+        }
+    }
+
     // Prepare sighash: blank sig/pubkey for all inputs, serialize, double-SHA256
     Transaction sighash_tx = tx;
     for (auto& i : sighash_tx.vin) { i.sig.clear(); i.pubkey.clear(); }
@@ -195,6 +211,13 @@ void Mempool::link_child_to_parents(const Key& child, const std::vector<TxIn>& v
 void Mempool::unlink_entry(const Key& kk){
     auto it = map_.find(kk);
     if (it == map_.end()) return;
+
+    // CRITICAL FIX: Remove spent outputs when transaction is removed
+    for (const auto& in : it->second.tx.vin) {
+        std::string input_key = key_from_vec(in.prev.txid) + ":" + std::to_string(in.prev.vout);
+        spent_outputs_.erase(input_key);
+    }
+
     // Remove child link from all parents
     for (const auto& pk : it->second.parents) {
         auto pit = map_.find(pk);
@@ -220,6 +243,14 @@ bool Mempool::enforce_limits_and_insert(const Transaction& tx, uint64_t fee, std
     e.fee_rate = sz ? (double)fee / (double)sz : 0.0;
     e.added_ms = now_ms();
 
+    // CRITICAL FIX: Track spent outputs for double-spend detection
+    std::vector<std::string> spent_keys;
+    for (const auto& in : tx.vin) {
+        std::string input_key = key_from_vec(in.prev.txid) + ":" + std::to_string(in.prev.vout);
+        spent_keys.push_back(input_key);
+        spent_outputs_.insert(input_key);
+    }
+
     // Temporarily stage it to compute ancestry limits
     map_.emplace(kk, std::move(e));
     total_bytes_ += sz;
@@ -235,6 +266,8 @@ bool Mempool::enforce_limits_and_insert(const Transaction& tx, uint64_t fee, std
         unlink_entry(kk);
         map_.erase(kk);
         total_bytes_ -= sz;
+        // CRITICAL FIX: Rollback spent outputs on failure
+        for (const auto& sk : spent_keys) spent_outputs_.erase(sk);
         return false;
     }
     if (dc > MIQ_MEMPOOL_MAX_DESCENDANTS) {
@@ -242,6 +275,8 @@ bool Mempool::enforce_limits_and_insert(const Transaction& tx, uint64_t fee, std
         unlink_entry(kk);
         map_.erase(kk);
         total_bytes_ -= sz;
+        // CRITICAL FIX: Rollback spent outputs on failure
+        for (const auto& sk : spent_keys) spent_outputs_.erase(sk);
         return false;
     }
 
@@ -249,11 +284,13 @@ bool Mempool::enforce_limits_and_insert(const Transaction& tx, uint64_t fee, std
     if (total_bytes_ > MIQ_MEMPOOL_MAX_BYTES) {
         evict_lowest_feerate_until(MIQ_MEMPOOL_MAX_BYTES);
         if (total_bytes_ > MIQ_MEMPOOL_MAX_BYTES) {
-            // Couldn’t make space (fee too low)
+            // Couldn't make space (fee too low)
             err = "mempool full (low feerate)";
             unlink_entry(kk);
             map_.erase(kk);
             total_bytes_ -= sz;
+            // CRITICAL FIX: Rollback spent outputs on failure
+            for (const auto& sk : spent_keys) spent_outputs_.erase(sk);
             return false;
         }
     }
@@ -261,12 +298,23 @@ bool Mempool::enforce_limits_and_insert(const Transaction& tx, uint64_t fee, std
     return true;
 }
 
+// CRITICAL FIX: Maximum transaction size limit
+static constexpr size_t MIQ_MAX_TX_SIZE = 4 * 1024 * 1024; // 4 MiB
+
 // Generic accept
 bool Mempool::accept(const Transaction& tx, const UTXOView& utxo, uint32_t height, std::string& err){
+    std::lock_guard<std::recursive_mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
     (void)height; // reserved for future height-based rules
 
     // Quick dup check
     if (exists(tx.txid())) return true;
+
+    // CRITICAL FIX: Validate transaction size before expensive operations
+    const size_t sz = est_tx_size(tx);
+    if (sz > MIQ_MAX_TX_SIZE) {
+        err = "transaction too large";
+        return false;
+    }
 
     // Calculate fee; if missing inputs, store as orphan
     uint64_t fee = 0;
@@ -285,7 +333,6 @@ bool Mempool::accept(const Transaction& tx, const UTXOView& utxo, uint32_t heigh
     if (fee > (uint64_t)MAX_MONEY) { err="fee>MAX_MONEY"; return false; }
 
     // Min relay fee policy (no behavior change if MIN_RELAY_FEE_RATE isn't defined)
-    const size_t sz = est_tx_size(tx);
     const uint64_t minfee = min_fee_for_size_bytes(sz);
     if (fee < minfee) { err = "insufficient fee"; return false; }
 
@@ -388,11 +435,13 @@ void Mempool::evict_lowest_feerate_until(size_t target_bytes){
 }
 
 void Mempool::trim_to_size(size_t max_bytes){
+    std::lock_guard<std::recursive_mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
     if (total_bytes_ <= max_bytes) return;
     evict_lowest_feerate_until(max_bytes);
 }
 
 void Mempool::maintenance(){
+    std::lock_guard<std::recursive_mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
     // Expire very old entries
     int64_t cutoff = now_ms() - (int64_t)MIQ_MEMPOOL_TX_EXPIRY_SECS * 1000;
     std::vector<Key> expired;
@@ -405,10 +454,11 @@ void Mempool::maintenance(){
         map_.erase(kx);
     }
     // Trim to size (in case)
-    trim_to_size(MIQ_MEMPOOL_MAX_BYTES);
+    evict_lowest_feerate_until(MIQ_MEMPOOL_MAX_BYTES);
 }
 
 void Mempool::on_block_connect(const Block& b){
+    std::lock_guard<std::recursive_mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
     // Remove all txs that were confirmed and any in-mempool conflicts
     // (coinbase is never in mempool)
     for (size_t i=1; i<b.txs.size(); ++i){
@@ -443,6 +493,7 @@ void Mempool::on_block_connect(const Block& b){
 }
 
 void Mempool::on_block_disconnect(const Block& b, const UTXOView& utxo, uint32_t height){
+    std::lock_guard<std::recursive_mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
     // Try to re-accept all non-coinbase txs in block order
     for (size_t i=1; i<b.txs.size(); ++i){
         const auto& tx = b.txs[i];
@@ -456,6 +507,7 @@ void Mempool::on_block_disconnect(const Block& b, const UTXOSet& utxo, uint32_t 
 }
 
 std::vector<Transaction> Mempool::collect(size_t max) const{
+    std::lock_guard<std::recursive_mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
     // Parents-first, highest feerate preference.
     // Strategy: greedy passes—each pass select the best-fee tx whose parents
     // are either not in mempool or already selected.

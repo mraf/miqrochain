@@ -6,11 +6,12 @@
 
 namespace miq {
 
-static inline uint8_t unhex_nibble(char c) {
-    if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+// CRITICAL FIX: Return -1 on invalid character instead of silent 0
+static inline int unhex_nibble(char c) {
+    if (c >= '0' && c <= '9') return static_cast<int>(c - '0');
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(10 + (c - 'a'));
-    return 0;
+    if (c >= 'a' && c <= 'f') return static_cast<int>(10 + (c - 'a'));
+    return -1;  // CRITICAL FIX: Return error indicator instead of 0
 }
 
 std::vector<uint8_t> from_hex(const std::string& h) {
@@ -18,8 +19,10 @@ std::vector<uint8_t> from_hex(const std::string& h) {
     if (n % 2 != 0) return {};
     std::vector<uint8_t> out(n / 2);
     for (size_t i = 0, j = 0; i < n; i += 2, ++j) {
-        const uint8_t hi = unhex_nibble(h[i]);
-        const uint8_t lo = unhex_nibble(h[i + 1]);
+        const int hi = unhex_nibble(h[i]);
+        const int lo = unhex_nibble(h[i + 1]);
+        // CRITICAL FIX: Reject invalid hex characters instead of silent corruption
+        if (hi < 0 || lo < 0) return {};  // Return empty vector on invalid input
         out[j] = static_cast<uint8_t>((hi << 4) | lo);
     }
     return out;

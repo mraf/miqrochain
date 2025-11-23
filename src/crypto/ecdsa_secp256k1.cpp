@@ -369,12 +369,36 @@ static U256 rfc6979(const U256& x, const U256& z, const U256& n){
     }
 }
 
+// HIGH FIX: Secure memory clearing helper
+static void secure_clear(void* ptr, size_t len) {
+    volatile unsigned char* p = static_cast<volatile unsigned char*>(ptr);
+    while (len--) *p++ = 0;
+}
+
 // ===== built-in Secp256k1 (deterministic signatures) =====
 bool Secp256k1::generate_priv(std::vector<uint8_t>& out32){
-    std::random_device rd; out32.resize(32);
-    for(auto&i:out32) i=(uint8_t)rd();
-    if(out32[0]==0) out32[0]=1;
-    return true;
+    std::random_device rd;
+    out32.resize(32);
+
+    // HIGH FIX: Retry until we get a valid private key (0 < d < N)
+    // This ensures cryptographic validity, not just non-zero first byte
+    for (int attempts = 0; attempts < 256; ++attempts) {
+        for (auto& i : out32) i = (uint8_t)rd();
+
+        U256 d = U256_from_be(out32.data());
+
+        // Check: private key must be in range (0, N)
+        // d must not be zero and must be less than N
+        if (!U256_is_zero(d) && U256_cmp(d, N) < 0) {
+            return true;
+        }
+        // Invalid key generated, retry
+    }
+
+    // Failed to generate valid key after 256 attempts (astronomically unlikely)
+    secure_clear(out32.data(), out32.size());
+    out32.clear();
+    return false;
 }
 
 bool Secp256k1::derive_pub_uncompressed(const std::vector<uint8_t>& priv, std::vector<uint8_t>& out64){
