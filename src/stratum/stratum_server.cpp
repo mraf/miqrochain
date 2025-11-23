@@ -888,7 +888,7 @@ void StratumServer::update_vardiff(StratumMiner& miner) {
     double new_diff = miner.difficulty * ratio;
 
     // Clamp to limits
-    new_diff = std::max(min_difficulty_, std::min(max_difficulty_, new_diff));
+    new_diff = (std::max)(min_difficulty_, (std::min)(max_difficulty_, new_diff));
 
     // Only change if significant (>10% change)
     if (std::abs(new_diff - miner.difficulty) / miner.difficulty > 0.1) {
