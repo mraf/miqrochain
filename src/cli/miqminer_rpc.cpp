@@ -1248,7 +1248,7 @@ typedef struct { u32 h[8]; } SHA256;
 
 inline void sha256_init(SHA256* s){
   s->h[0]=0x6a09e667; s->h[1]=0xbb67ae85; s->h[2]=0x3c6ef372; s->h[3]=0xa54ff53a;
-  s->h[4]=0x510e527f; s->h[5]=0x9b05688; s->h[6]=0x1f83d9ab; s->h[7]=0x5be0cd19;
+  s->h[4]=0x510e527f; s->h[5]=0x9b05688c; s->h[6]=0x1f83d9ab; s->h[7]=0x5be0cd19;
 }
 
 inline void sha256_compress(SHA256* S, const u32 Winit[16]){
