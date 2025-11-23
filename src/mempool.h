@@ -88,7 +88,8 @@ struct MempoolEntry {
     // Mining score (higher = more likely to be mined)
     double mining_score() const {
         // CPFP-aware: use the better of individual or package rate
-        return std::max(fee_rate, modified_fee_rate);
+        // Note: Using (std::max) with parentheses to avoid Windows max macro conflict
+        return (std::max)(fee_rate, modified_fee_rate);
     }
 };
 
