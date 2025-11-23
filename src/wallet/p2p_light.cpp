@@ -680,6 +680,11 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
     const size_t kMaxLoops = 2048;
     size_t loops = 0;
 
+    // Track progress to detect stalls
+    size_t last_count = 0;
+    int stall_count = 0;
+    const int kMaxStalls = 5;
+
     while(true){
         if (++loops > kMaxLoops) {
             err = "headers sync aborted (too many rounds without convergence)";
@@ -713,6 +718,17 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
             if(header_hashes_le_.empty() || !std::equal(header_hashes_le_.back().begin(), header_hashes_le_.back().end(), h.begin())){
                 header_hashes_le_.push_back(std::move(h));
             }
+        }
+
+        // Check for stalls (no progress)
+        if(header_hashes_le_.size() == last_count){
+            if(++stall_count >= kMaxStalls){
+                err = "headers sync stalled (no progress after " + std::to_string(kMaxStalls) + " attempts)";
+                return false;
+            }
+        } else {
+            stall_count = 0;
+            last_count = header_hashes_le_.size();
         }
 
         // New locator = last hash (simple linear advance)
@@ -897,17 +913,37 @@ bool P2PLight::match_recent_blocks(const std::vector<std::vector<uint8_t>>& /*pk
                                    std::string& err)
 {
     matched.clear();
-    (void)err;
 
     // Ensure we have headers
     uint32_t tip=0; std::vector<uint8_t> tip_hash;
     if(!get_best_header(tip, tip_hash, err)) return false;
 
+    // Validate header cache is populated
+    if(header_hashes_le_.empty()){
+        err = "header cache is empty after sync";
+        return false;
+    }
+
+    // Clamp range to available headers
     if(to_height > tip) to_height = tip;
     if(from_height > to_height) return true; // empty window
 
+    // Additional safety: ensure we don't exceed vector bounds
+    size_t max_idx = header_hashes_le_.size() - 1;
+    if(to_height > (uint32_t)max_idx) to_height = (uint32_t)max_idx;
+    if(from_height > to_height) return true;
+
+    // Reserve space for efficiency
+    matched.reserve(to_height - from_height + 1);
+
     for(uint32_t h = from_height; h <= to_height; ++h){
-        matched.emplace_back(header_hashes_le_[h], h);
+        if(h < header_hashes_le_.size()){
+            matched.emplace_back(header_hashes_le_[h], h);
+        } else {
+            // Should not happen due to bounds check above, but be safe
+            err = "internal error: height " + std::to_string(h) + " exceeds header cache";
+            return false;
+        }
     }
     return true;
 }
@@ -1255,14 +1291,43 @@ bool P2PLight::read_exact(void* buf, size_t len, std::string& err){
 bool P2PLight::write_all(const void* buf, size_t len, std::string& err){
     const uint8_t* p = (const uint8_t*)buf;
     size_t sent = 0;
+    int retry_count = 0;
+    const int max_retries = 3;
+
     while (sent < len){
 #ifdef _WIN32
         int n = send((SOCKET)sock_, (const char*)p + (int)sent, (int)(len - (int)sent), 0);
+        if (n == 0) {
+            err = "send failed (connection closed)";
+            return false;
+        }
+        if (n < 0) {
+            int e = WSAGetLastError();
+            if ((e == WSAEWOULDBLOCK || e == WSAETIMEDOUT) && retry_count++ < max_retries) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            err = "send failed (WSA error " + std::to_string(e) + ")";
+            return false;
+        }
 #else
         ssize_t n = send(sock_, p + sent, len - sent, 0);
+        if (n == 0) {
+            err = "send failed (connection closed)";
+            return false;
+        }
+        if (n < 0) {
+            int e = errno;
+            if ((e == EAGAIN || e == EWOULDBLOCK) && retry_count++ < max_retries) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            err = "send failed (errno " + std::to_string(e) + ")";
+            return false;
+        }
 #endif
-        if (n <= 0) { err = "send failed"; return false; }
         sent += (size_t)n;
+        retry_count = 0; // Reset on success
     }
     return true;
 }
