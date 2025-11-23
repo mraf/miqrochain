@@ -533,7 +533,7 @@ std::string RpcService::handle(const std::string& body){
         }
 
         if(method=="version"){
-            JNode n; n.v = std::string("miqrochain-rpc/1");
+            JNode n; n.v = std::string("miqrochain-rpc/1.0.0");
             return json_dump(n);
         }
 

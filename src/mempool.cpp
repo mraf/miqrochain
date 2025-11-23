@@ -359,7 +359,55 @@ bool Mempool::accept(const Transaction& tx, const UTXOSet& utxo, uint32_t height
 void Mempool::add_orphan(const Transaction& tx){
     Key ck = k(tx.txid());
     if (orphans_.find(ck) != orphans_.end()) return;
+
+    // CRITICAL FIX: Enforce orphan pool limits to prevent DoS
+    size_t tx_size = est_tx_size(tx);
+
+    // Check count limit
+    if (orphans_.size() >= MAX_ORPHANS) {
+        // Evict oldest orphan (FIFO-ish: just remove the first one)
+        if (!orphans_.empty()) {
+            auto oldest = orphans_.begin();
+            size_t old_size = est_tx_size(oldest->second);
+            // Clean up waiting_on_ entries for the evicted orphan
+            for (const auto& in : oldest->second.vin) {
+                Key pk = k(in.prev.txid);
+                auto wit = waiting_on_.find(pk);
+                if (wit != waiting_on_.end()) {
+                    wit->second.erase(oldest->first);
+                    if (wit->second.empty()) waiting_on_.erase(wit);
+                }
+            }
+            orphan_bytes_ -= old_size;
+            orphans_.erase(oldest);
+        }
+    }
+
+    // Check byte limit
+    while (orphan_bytes_ + tx_size > MAX_ORPHAN_BYTES && !orphans_.empty()) {
+        auto oldest = orphans_.begin();
+        size_t old_size = est_tx_size(oldest->second);
+        // Clean up waiting_on_ entries
+        for (const auto& in : oldest->second.vin) {
+            Key pk = k(in.prev.txid);
+            auto wit = waiting_on_.find(pk);
+            if (wit != waiting_on_.end()) {
+                wit->second.erase(oldest->first);
+                if (wit->second.empty()) waiting_on_.erase(wit);
+            }
+        }
+        orphan_bytes_ -= old_size;
+        orphans_.erase(oldest);
+    }
+
+    // If still over limit after evictions, reject this orphan
+    if (orphan_bytes_ + tx_size > MAX_ORPHAN_BYTES) {
+        return; // Silently drop - this is acceptable for orphans
+    }
+
     orphans_.emplace(ck, tx);
+    orphan_bytes_ += tx_size;
+
     for (const auto& in : tx.vin){
         Key pk = k(in.prev.txid);
         waiting_on_[pk].insert(ck);
@@ -369,6 +417,15 @@ void Mempool::add_orphan(const Transaction& tx){
 void Mempool::remove_orphan(const Key& ck){
     auto it = orphans_.find(ck);
     if (it == orphans_.end()) return;
+
+    // CRITICAL FIX: Track orphan bytes when removing
+    size_t tx_size = est_tx_size(it->second);
+    if (orphan_bytes_ >= tx_size) {
+        orphan_bytes_ -= tx_size;
+    } else {
+        orphan_bytes_ = 0; // Safety: prevent underflow
+    }
+
     for (const auto& in : it->second.vin){
         Key pk = k(in.prev.txid);
         auto wit = waiting_on_.find(pk);
