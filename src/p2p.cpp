@@ -2532,8 +2532,19 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
         gate_set_loopback(c, is_loopback_be(be_ip));
     }
 
-    auto msg = encode_msg("version", miq_build_version_payload((uint32_t)chain_.height()));
-    (void)send_or_close(c, msg);
+    auto payload = miq_build_version_payload((uint32_t)chain_.height());
+    auto msg = encode_msg("version", payload);
+    if (msg.empty()) {
+        log_warn("P2P: failed to encode version message for " + ip + " (payload size=" + std::to_string(payload.size()) + ")");
+        schedule_close(c);
+        return;
+    }
+    bool sent = send_or_close(c, msg);
+    if (!sent) {
+        log_warn("P2P: failed to send version to " + ip);
+    } else {
+        P2P_TRACE("TX " + ip + " cmd=version len=" + std::to_string(payload.size()));
+    }
 }
 
 void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
