@@ -139,10 +139,10 @@ static std::atomic<bool> g_assume_seed_hairpin{false};
 // ─────────────────────────────────────────────────────────────────────────────
 // Versions
 #ifndef MIQ_VERSION_MAJOR
-#define MIQ_VERSION_MAJOR 0
+#define MIQ_VERSION_MAJOR 1
 #endif
 #ifndef MIQ_VERSION_MINOR
-#define MIQ_VERSION_MINOR 7
+#define MIQ_VERSION_MINOR 0
 #endif
 #ifndef MIQ_VERSION_PATCH
 #define MIQ_VERSION_PATCH 0
