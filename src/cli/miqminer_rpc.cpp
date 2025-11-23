@@ -1298,7 +1298,7 @@ inline void build_block(u32 W16[16],
                         u64 nonce_le, uint blk_idx, uint nblks)
 {
   u8 B[64];
-  u64 L = (u64)prefix_len + 4u;
+  u64 L = (u64)prefix_len + 8u;  // CRITICAL FIX: 8-byte nonce
   u64 Lbits = L * 8u;
 
   for(int i=0;i<64;i++){
@@ -1306,10 +1306,10 @@ inline void build_block(u32 W16[16],
     u8 v = 0;
     if(off < (u64)prefix_len){
       v = prefix[off];
-    } else if(off < (u64)prefix_len + 4u){
+    } else if(off < (u64)prefix_len + 8u){  // CRITICAL FIX: 8-byte nonce
       uint j = (uint)(off - (u64)prefix_len);
       v = (u8)((nonce_le >> (8u*j)) & 0xffu);
-    } else if(off == (u64)prefix_len + 4u){
+    } else if(off == (u64)prefix_len + 8u){  // CRITICAL FIX: padding after 8-byte nonce
       v = 0x80u;
     } else {
       u64 last_block_start = (u64)(nblks*64u);
@@ -1331,7 +1331,7 @@ inline void build_block(u32 W16[16],
 }
 
 inline void sha256d_any(u8 out[32], __constant u8* prefix, uint prefix_len, u64 nonce_le){
-  u64 L = (u64)prefix_len + 4u;
+  u64 L = (u64)prefix_len + 8u;  // CRITICAL FIX: 8-byte nonce
   uint nblks = (uint)((L + 1u + 8u + 63u)/64u);
   SHA256 S; sha256_init(&S);
   for(uint b=0;b<nblks;b++){
