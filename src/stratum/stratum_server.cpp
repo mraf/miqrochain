@@ -249,6 +249,39 @@ void StratumServer::accept_loop() {
         inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, INET_ADDRSTRLEN);
         std::string ip(ip_str);
 
+        // Check connection limits
+        {
+            std::lock_guard<std::mutex> lock(miners_mutex_);
+
+            // Check total miner limit
+            if (miners_.size() >= MAX_MINERS) {
+                log_warn("Stratum: Connection rejected - max miners reached (" + std::to_string(MAX_MINERS) + ")");
+#ifdef _WIN32
+                closesocket(client);
+#else
+                close(client);
+#endif
+                continue;
+            }
+
+            // Check per-IP limit
+            size_t ip_count = 0;
+            for (const auto& kv : miners_) {
+                if (kv.second.ip == ip) {
+                    ip_count++;
+                }
+            }
+            if (ip_count >= MAX_PER_IP) {
+                log_warn("Stratum: Connection rejected from " + ip + " - max per-IP reached (" + std::to_string(MAX_PER_IP) + ")");
+#ifdef _WIN32
+                closesocket(client);
+#else
+                close(client);
+#endif
+                continue;
+            }
+        }
+
         // Set non-blocking
 #ifdef _WIN32
         u_long mode = 1;
@@ -274,7 +307,7 @@ void StratumServer::accept_loop() {
             miners_[client] = std::move(miner);
         }
 
-        log_info("Stratum: New miner connected from " + ip);
+        log_info("Stratum: New miner connected from " + ip + " (total: " + std::to_string(miners_.size()) + ")");
     }
 }
 
@@ -316,18 +349,23 @@ void StratumServer::work_loop() {
         for (StratumSock sock : to_process) {
             std::lock_guard<std::mutex> lock(miners_mutex_);
             auto it = miners_.find(sock);
-            if (it != miners_.end()) {
-                handle_miner_data(it->second);
+            if (it == miners_.end()) continue;
 
-                // Check for timeout (2 minutes of inactivity)
-                if (now - it->second.last_activity_ms > 120000) {
-                    disconnect_miner(sock, "timeout");
-                }
+            handle_miner_data(it->second);
 
-                // Update vardiff
-                if (vardiff_enabled_ && it->second.authorized) {
-                    update_vardiff(it->second);
-                }
+            // Re-check iterator validity after handle_miner_data (may have disconnected)
+            it = miners_.find(sock);
+            if (it == miners_.end()) continue;
+
+            // Check for timeout (2 minutes of inactivity)
+            if (now - it->second.last_activity_ms > 120000) {
+                disconnect_miner(sock, "timeout");
+                continue; // Iterator invalidated
+            }
+
+            // Update vardiff
+            if (vardiff_enabled_ && it->second.authorized) {
+                update_vardiff(it->second);
             }
         }
 
@@ -415,7 +453,11 @@ void StratumServer::process_message(StratumMiner& miner, const std::string& line
             if (line[pos] == '"') {
                 std::string id_str;
                 parse_json_string(line, pos, id_str);
-                id = std::stoull(id_str);
+                try {
+                    id = std::stoull(id_str);
+                } catch (...) {
+                    id = 0;
+                }
             } else {
                 int64_t num;
                 parse_json_number(line, pos, num);
@@ -619,7 +661,13 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
     header.insert(header.end(), merkle_root.begin(), merkle_root.end());
 
     // Time (8 bytes, little-endian) - MIQ uses 8-byte timestamps
-    uint64_t time_val = std::stoull(ntime, nullptr, 16);
+    uint64_t time_val;
+    try {
+        time_val = std::stoull(ntime, nullptr, 16);
+    } catch (...) {
+        error = "Invalid ntime format";
+        return false;
+    }
     for (int i = 0; i < 8; i++) {
         header.push_back((time_val >> (8 * i)) & 0xff);
     }
@@ -632,7 +680,13 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
     header.push_back((bits >> 24) & 0xff);
 
     // Nonce (8 bytes, little-endian) - MIQ uses 8-byte nonces
-    uint64_t nonce_val = std::stoull(nonce, nullptr, 16);
+    uint64_t nonce_val;
+    try {
+        nonce_val = std::stoull(nonce, nullptr, 16);
+    } catch (...) {
+        error = "Invalid nonce format";
+        return false;
+    }
     for (int i = 0; i < 8; i++) {
         header.push_back((nonce_val >> (8 * i)) & 0xff);
     }
@@ -712,37 +766,57 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
 }
 
 bool StratumServer::check_pow(const std::vector<uint8_t>& header_hash, uint32_t bits, double difficulty) {
-    // Calculate target from bits
+    // Calculate target from bits (Bitcoin compact format)
     uint32_t exp = bits >> 24;
     uint32_t mant = bits & 0x007fffff;
 
-    // Compare hash against target (hash must be < target)
-    // For share difficulty, we scale the target by the difficulty factor
-
-    // Simple check: compare leading zeros
-    // A more proper implementation would do full big-integer comparison
-    (void)exp;
-    (void)mant;
-    (void)difficulty;
-
-    // For now, accept all shares (proper implementation would compare hash < target/difficulty)
-    // Reverse hash for comparison (Bitcoin-style little-endian)
-    size_t leading_zeros = 0;
-    for (int i = 31; i >= 0; i--) {
-        if (header_hash[i] == 0) {
-            leading_zeros += 8;
-        } else {
-            int lz = 0;
-            uint8_t b = header_hash[i];
-            while ((b & 0x80) == 0 && lz < 8) { lz++; b <<= 1; }
-            leading_zeros += lz;
-            break;
+    // Expand compact target to 256-bit
+    std::vector<uint8_t> target(32, 0);
+    if (exp <= 3) {
+        uint32_t val = mant >> (8 * (3 - exp));
+        target[0] = val & 0xff;
+        if (exp >= 1) target[1] = (val >> 8) & 0xff;
+        if (exp >= 2) target[2] = (val >> 16) & 0xff;
+    } else {
+        size_t offset = exp - 3;
+        if (offset < 32) {
+            target[offset] = mant & 0xff;
+            if (offset + 1 < 32) target[offset + 1] = (mant >> 8) & 0xff;
+            if (offset + 2 < 32) target[offset + 2] = (mant >> 16) & 0xff;
         }
     }
 
-    // Minimum leading zeros based on difficulty
-    size_t required_zeros = (size_t)(std::log2(difficulty) + 16);
-    return leading_zeros >= required_zeros;
+    // Scale target by difficulty factor (share_target = network_target * difficulty)
+    // For share validation, we allow hashes up to target/difficulty
+    // So we compare: hash < target / difficulty
+    // Which is equivalent to: hash * difficulty < target
+
+    // For simplicity, scale the target down by difficulty
+    // We'll use a 256-bit division approximation
+    if (difficulty > 1.0) {
+        // Divide target by difficulty (shift right by log2(difficulty) bits approximately)
+        int shift_bits = (int)(std::log2(difficulty));
+        if (shift_bits > 0 && shift_bits < 256) {
+            int byte_shift = shift_bits / 8;
+            int bit_shift = shift_bits % 8;
+            std::vector<uint8_t> scaled_target(32, 0);
+            for (int i = byte_shift; i < 32; i++) {
+                scaled_target[i - byte_shift] = target[i] >> bit_shift;
+                if (bit_shift > 0 && i + 1 < 32) {
+                    scaled_target[i - byte_shift] |= target[i + 1] << (8 - bit_shift);
+                }
+            }
+            target = scaled_target;
+        }
+    }
+
+    // Compare hash < target (both in little-endian)
+    // Hash bytes are already little-endian, compare from high byte to low
+    for (int i = 31; i >= 0; i--) {
+        if (header_hash[i] < target[i]) return true;
+        if (header_hash[i] > target[i]) return false;
+    }
+    return true; // Equal, accept
 }
 
 StratumJob StratumServer::create_job() {
@@ -920,13 +994,40 @@ void StratumServer::disconnect_miner(StratumSock sock, const std::string& reason
 }
 
 bool StratumServer::send_json(StratumMiner& miner, const std::string& json) {
+    size_t total_sent = 0;
+    size_t remaining = json.size();
+    const char* data = json.c_str();
+
+    while (remaining > 0) {
 #ifdef _WIN32
-    int sent = send(miner.sock, json.c_str(), (int)json.size(), 0);
-    return sent == (int)json.size();
+        int sent = send(miner.sock, data + total_sent, (int)remaining, 0);
+        if (sent == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) {
+                // Non-blocking socket, retry after brief pause
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            return false;
+        }
 #else
-    ssize_t sent = send(miner.sock, json.c_str(), json.size(), 0);
-    return sent == (ssize_t)json.size();
+        ssize_t sent = send(miner.sock, data + total_sent, remaining, 0);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Non-blocking socket, retry after brief pause
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            return false;
+        }
 #endif
+        if (sent == 0) {
+            return false; // Connection closed
+        }
+        total_sent += sent;
+        remaining -= sent;
+    }
+    return true;
 }
 
 void StratumServer::send_result(StratumMiner& miner, uint64_t id, const std::string& result) {

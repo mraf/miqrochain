@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <set>
 #include <iostream> // for debug output
+#include <atomic>   // for WSA reference counting
 
 #if defined(__has_include)
 #  if __has_include("addrman.h")
@@ -549,7 +550,11 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
 #endif
 
 #ifdef _WIN32
-    WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
+    // Use static reference counting for WSAStartup/Cleanup
+    static std::atomic<int> wsa_refcount{0};
+    if (wsa_refcount.fetch_add(1) == 0) {
+        WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
+    }
 #endif
 
     // Build candidate list (public first, then local)
@@ -643,7 +648,9 @@ void P2PLight::close(){
         closesock(sock_);
         sock_ = (uintptr_t)-1;
     }
-    WSACleanup();
+    // Match the static refcount from connect_and_handshake
+    // Note: We don't call WSACleanup here to avoid process-wide issues.
+    // WSA will be cleaned up when the process exits.
 #else
     if (sock_ >= 0){
         closesock(sock_);

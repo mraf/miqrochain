@@ -170,6 +170,14 @@ void Miner::stop(){
     if (th_.joinable()) th_.join();
 }
 
+void Miner::pause(){
+    paused_ = true;
+}
+
+void Miner::resume(){
+    paused_ = false;
+}
+
 // Build coinbase paying only subsidy (fees are optional and safe to omit)
 static Transaction make_coinbase_for(Chain& chain,
                                      const std::vector<uint8_t>& pkh20)
@@ -296,10 +304,11 @@ bool Miner::pow_loop(Block& b, uint32_t bits){
             uint64_t nonce = base_nonce + (uint64_t)t;
 
             while (!found.load(std::memory_order_relaxed)) {
-                // abort conditions: deadline or tip changed or external stop
+                // abort conditions: deadline or tip changed or external stop or paused
                 if (abort.load(std::memory_order_relaxed)) break;
                 if (std::chrono::steady_clock::now() > job_deadline) break;
                 if (!running_.load(std::memory_order_relaxed)) break;
+                if (paused_.load(std::memory_order_relaxed)) break;
                 if (chain_.tip().hash != tip_hash_start) break;
 
                 store_u64_le(nonce_ptr, nonce);
@@ -464,6 +473,12 @@ Block mine_block(const std::vector<uint8_t>& prev_hash,
 void Miner::run(){
     log_info("miner: started");
     while (running_) {
+        // Check for pause state
+        if (paused_.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
         Block b;
         uint32_t bits = 0;
 

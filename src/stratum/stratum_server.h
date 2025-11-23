@@ -129,6 +129,10 @@ private:
     bool vardiff_enabled_{true};
     int vardiff_target_secs_{10};
 
+    // Connection limits
+    static constexpr size_t MAX_MINERS = 10000;
+    static constexpr size_t MAX_PER_IP = 10;
+
     // State
     std::atomic<bool> running_{false};
     StratumSock listen_sock_{STRATUM_INVALID_SOCKET};
