@@ -12,12 +12,13 @@
 namespace miq {
 
 // Log levels (production-grade)
+// Note: Using ERR instead of ERROR to avoid conflict with Windows ERROR macro
 enum class LogLevel : int {
     TRACE = 0,    // Extremely verbose
     DEBUG = 1,    // Debug information
     INFO = 2,     // General information
     WARN = 3,     // Warnings
-    ERROR = 4,    // Errors
+    ERR = 4,      // Errors (named ERR to avoid Windows macro conflict)
     FATAL = 5,    // Fatal errors
     NONE = 6      // Disable all logging
 };
@@ -91,7 +92,7 @@ void log_fatal(LogCategory cat, const std::string& s);
 } while(0)
 
 #define MIQ_LOG_ERROR(cat, msg) do { \
-    if (miq::log_get_level() <= miq::LogLevel::ERROR && \
+    if (miq::log_get_level() <= miq::LogLevel::ERR && \
         (miq::log_get_categories() & static_cast<uint32_t>(cat))) { \
         miq::log_error(cat, msg); \
     } \
