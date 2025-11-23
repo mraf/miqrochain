@@ -10,7 +10,7 @@ struct P2POpts {
     std::string port;            // e.g. "9833"
     std::string user_agent;      // e.g. "/miqwallet:0.1/"
     uint32_t    start_height{0};
-    int         io_timeout_ms{10000};
+    int         io_timeout_ms{5000};  // 5s timeout for faster seed iteration
     bool        send_verack{true}; // keep true; node expects verack timing
 };
 
