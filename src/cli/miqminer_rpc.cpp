@@ -2331,9 +2331,12 @@ int main(int argc, char** argv){
         while (ui.running.load()) {
             MinerTemplate tpl;
             if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
-                std::ostringstream m; m << C("31;1") << "template error — check RPC token or node" << R();
+                std::ostringstream m;
+                m << C("31;1") << "CANNOT MINE: Node not responding at " << rpc_host << ":" << rpc_port << R() << "\n";
+                m << C("33") << "  Ensure miqrochain node is running with RPC enabled\n";
+                m << "  Check: 1) Node running  2) RPC port " << rpc_port << "  3) Token/cookie" << R();
                 { std::lock_guard<std::mutex> lk(ui.mtx); ui.last_submit_msg = m.str(); ui.last_submit_when = std::chrono::steady_clock::now(); }
-                log_line("template error (getminertemplate failed)");
+                log_line("template error: node not responding at " + rpc_host + ":" + std::to_string(rpc_port));
                 for(int i=0;i<20 && ui.running.load(); ++i) miq_sleep_ms(100);
                 continue;
             }

@@ -304,10 +304,16 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
         }
     }
 
-    // 2) Your public node FIRST by default
+    // 2) LOCALHOST FIRST - critical for local miners to see their own blocks
+    // This ensures wallet can connect to local node before trying remote seeds
+    if (!env_truthy("MIQ_NO_LOCAL_PRIORITY")) {
+        push_unique(seeds, "127.0.0.1", std::to_string(miq::P2P_PORT), seen);
+    }
+
+    // 3) Your public node as fallback
     push_unique(seeds, "62.38.73.147", std::to_string(miq::P2P_PORT), seen);
 
-    // 3) DNS seeds (constants.h)
+    // 4) DNS seeds (constants.h)
     push_unique(seeds, miq::DNS_SEED, std::to_string(miq::P2P_PORT), seen);
     for(size_t i=0;i<miq::DNS_SEEDS_COUNT;i++){
         push_unique(seeds, miq::DNS_SEEDS[i], std::to_string(miq::P2P_PORT), seen);
@@ -690,9 +696,12 @@ static bool wallet_session(const std::string& cli_host,
         std::cout << "Scanning " << pkhs.size() << " addresses across " << seeds.size() << " seed(s)\n";
         std::vector<miq::UtxoLite> utxos; std::string used_seed, err;
         if(!spv_collect_any_seed(seeds, pkhs, spv_win, utxos, used_seed, err)){
-            std::cout << "\nSPV failed:\n" << err << "\n";
-            std::cout << "\nTIP: If running on same machine as node, try:\n";
-            std::cout << "  miqwallet --p2pseed=127.0.0.1\n";
+            std::cout << "\nSPV connection failed:\n" << err << "\n";
+            std::cout << "\n*** TROUBLESHOOTING ***\n";
+            std::cout << "  1. Ensure miqrochain node is running on localhost (port " << miq::P2P_PORT << ")\n";
+            std::cout << "  2. If mining locally, your mined blocks must be on the node you connect to\n";
+            std::cout << "  3. To force localhost: miqwallet --p2pseed=127.0.0.1:" << miq::P2P_PORT << "\n";
+            std::cout << "  4. If using remote node, ensure it has synced your mined blocks\n";
             used_seed = "<no-conn>";
         }
 
