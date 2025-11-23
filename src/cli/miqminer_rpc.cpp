@@ -988,6 +988,7 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
 // ===== coinbase/merkle =======================================================
 static Transaction make_coinbase(uint64_t height, uint64_t fees, const std::vector<uint8_t>& pkh){
     Transaction cbt;
+    // MIQ coinbase convention: prev.vout = 0 (differs from Bitcoin's 0xffffffff)
     TxIn in; in.prev.txid = std::vector<uint8_t>(32,0); in.prev.vout = 0;
 
     uint64_t rnd = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
