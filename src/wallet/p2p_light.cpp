@@ -14,6 +14,7 @@
 #include <sstream>
 #include <cstdlib>
 #include <set>
+#include <iostream> // for debug output
 
 #if defined(__has_include)
 #  if __has_include("addrman.h")
@@ -589,21 +590,45 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
 #endif
 
     // Version/verack handshake (with tolerance + fallback)
-    if(!send_version(err))      { close(); return false; }
+    // Debug: show socket descriptor for diagnostics
+    bool verbose_debug = (std::getenv("MIQ_DEBUG_P2P") != nullptr);
+    if (verbose_debug) {
+#ifdef _WIN32
+        std::cerr << "[DEBUG] Socket fd=" << sock_ << ", timeout=" << o_.io_timeout_ms << "ms\n";
+#else
+        std::cerr << "[DEBUG] Socket fd=" << sock_ << ", timeout=" << o_.io_timeout_ms << "ms\n";
+#endif
+    }
+
+    if(!send_version(err)) {
+        if (verbose_debug) std::cerr << "[DEBUG] send_version failed: " << err << "\n";
+        close(); return false;
+    }
+    if (verbose_debug) std::cerr << "[DEBUG] sent version message\n";
 
     if (o_.send_verack) {
         std::vector<uint8_t> empty;
-        if(!send_msg("verack", empty, err)) { close(); return false; }
+        if(!send_msg("verack", empty, err)) {
+            if (verbose_debug) std::cerr << "[DEBUG] send verack failed: " << err << "\n";
+            close(); return false;
+        }
+        if (verbose_debug) std::cerr << "[DEBUG] sent verack message\n";
     }
 
+    if (verbose_debug) std::cerr << "[DEBUG] waiting for peer verack...\n";
     if(!read_until_verack(err)) {
+        if (verbose_debug) std::cerr << "[DEBUG] first read_until_verack failed: " << err << "\n";
         // Fallback path: try once with an empty "version" for quirky peers.
         std::vector<uint8_t> empty;
         std::string e2;
         (void)send_msg("version", empty, e2);
         if (o_.send_verack) (void)send_msg("verack", empty, e2);
-        if(!read_until_verack(err)) { close(); return false; }
+        if(!read_until_verack(err)) {
+            if (verbose_debug) std::cerr << "[DEBUG] fallback read_until_verack failed: " << err << "\n";
+            close(); return false;
+        }
     }
+    if (verbose_debug) std::cerr << "[DEBUG] handshake completed successfully\n";
 
     // Opportunistic getaddr (let node trickle peers to wallet addrman)
     { std::string e2; (void)send_getaddr(e2); }
@@ -1189,10 +1214,39 @@ bool P2PLight::read_exact(void* buf, size_t len, std::string& err){
     while (got < len){
 #ifdef _WIN32
         int n = recv((SOCKET)sock_, (char*)p + (int)got, (int)(len - (int)got), 0);
+        if (n == 0) {
+            err = "recv failed (connection closed by peer)";
+            return false;
+        }
+        if (n < 0) {
+            int e = WSAGetLastError();
+            if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) {
+                err = "recv failed (timeout)";
+            } else {
+                err = "recv failed (WSA error " + std::to_string(e) + ")";
+            }
+            return false;
+        }
 #else
         ssize_t n = recv(sock_, p + got, len - got, 0);
+        if (n == 0) {
+            err = "recv failed (connection closed by peer)";
+            return false;
+        }
+        if (n < 0) {
+            int e = errno;
+            if (e == EAGAIN || e == EWOULDBLOCK) {
+                err = "recv failed (timeout)";
+            } else if (e == ECONNRESET) {
+                err = "recv failed (connection reset)";
+            } else if (e == ENOTCONN) {
+                err = "recv failed (not connected)";
+            } else {
+                err = "recv failed (errno " + std::to_string(e) + ")";
+            }
+            return false;
+        }
 #endif
-        if (n <= 0) { err = "recv failed"; return false; }
         got += (size_t)n;
     }
     return true;
