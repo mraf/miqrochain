@@ -500,11 +500,15 @@ std::string RpcService::handle(const std::string& body){
 
             miq::HdWallet w(seed, meta);
 
-            // Collect PKHs - scan from index 0 up to and including next index
-            // This ensures we find funds even if wallet was just created
+            // BIP44 gap limit - scan beyond recorded next index to find externally-used addresses
+            constexpr uint32_t GAP_LIMIT = 20;
+
+            // Collect PKHs - scan from index 0 up to next index PLUS gap limit
+            // This ensures we find funds even if addresses were used externally (e.g., by miner)
             auto collect_pkh_for_range = [&](bool change, uint32_t n, std::vector<std::array<uint8_t,20>>& out){
-                // Scan at least the first address (index 0) plus all used addresses up to n
-                for (uint32_t i = 0; i <= n; i++){
+                // Scan from 0 to n + GAP_LIMIT to discover any externally-used addresses
+                uint32_t scan_limit = n + GAP_LIMIT;
+                for (uint32_t i = 0; i <= scan_limit; i++){
                     std::vector<uint8_t> priv, pub;
                     if (!w.DerivePrivPub(meta.account, change?1u:0u, i, priv, pub)) continue;
                     auto h = hash160(pub);
@@ -1558,9 +1562,13 @@ std::string RpcService::handle(const std::string& body){
 
             const uint64_t curH = chain_.tip().height;
 
-            // Scan from index 0 up to and including the next index
+            // BIP44 gap limit for discovering externally-used addresses
+            constexpr uint32_t GAP_LIMIT = 20;
+
+            // Scan from index 0 up to next index PLUS gap limit
             auto collect_pkh_for_range = [&](bool change, uint32_t n, std::vector<std::array<uint8_t,20>>& out){
-                for (uint32_t i = 0; i <= n; i++){
+                uint32_t scan_limit = n + GAP_LIMIT;
+                for (uint32_t i = 0; i <= scan_limit; i++){
                     std::vector<uint8_t> priv, pub;
                     if (!w.DerivePrivPub(meta.account, change?1u:0u, i, priv, pub)) continue;
                     auto h = hash160(pub);
@@ -1654,6 +1662,9 @@ std::string RpcService::handle(const std::string& body){
             miq::HdWallet w(seed, meta);
             const uint64_t curH = chain_.tip().height;
 
+            // BIP44 gap limit for discovering externally-used addresses
+            constexpr uint32_t GAP_LIMIT = 20;
+
             struct OwnedUtxo {
                 std::vector<uint8_t> txid; uint32_t vout; UTXOEntry e;
                 std::vector<uint8_t> priv; std::vector<uint8_t> pub; std::vector<uint8_t> pkh;
@@ -1665,7 +1676,8 @@ std::string RpcService::handle(const std::string& body){
             uint64_t soonest_mature_h = std::numeric_limits<uint64_t>::max();
 
             auto maybe_push = [&](uint32_t chain, uint32_t limit){
-                for (uint32_t i = 0; i < limit + 1; ++i) { // include current "next" (fresh)
+                // Scan up to limit + GAP_LIMIT to find externally-used addresses
+                for (uint32_t i = 0; i <= limit + GAP_LIMIT; ++i) {
                     std::vector<uint8_t> priv, pub;
                     if (!w.DerivePrivPub(meta.account, chain, i, priv, pub)) continue;
                     auto pkh = hash160(pub);
