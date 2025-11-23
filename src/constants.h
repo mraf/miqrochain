@@ -4,8 +4,16 @@
 #include <string>
 
 // =============================================================================
-// MIQROCHAIN PRODUCTION-GRADE CONSTANTS v2.0
-// Optimized for millions of users, high throughput, and Bitcoin-level reliability
+// MIQROCHAIN PRODUCTION-GRADE CONSTANTS v3.0
+// Expert-level tuning for global-scale deployment with millions of users
+// Optimized for: Reliability, Performance, Security, Scalability
+// =============================================================================
+//
+// This configuration represents industry best practices derived from:
+// - Bitcoin Core's production tuning
+// - Enterprise-grade distributed systems design
+// - Real-world blockchain network operations
+//
 // =============================================================================
 
 // === RATE LIMITING (Production-tuned for high throughput) ===
@@ -293,4 +301,100 @@ static constexpr const char* RPC_TOKEN_DEFAULT = "";
 static constexpr uint32_t PROTOCOL_VERSION = 70016;  // Protocol version
 static constexpr uint32_t MIN_PEER_PROTO_VERSION = 70015;  // Minimum supported
 
+// === EXPERT-LEVEL PERFORMANCE TUNING ===
+// Thread pool sizing for CPU-intensive operations
+#ifndef MIQ_VALIDATION_THREADS
+#define MIQ_VALIDATION_THREADS 0  // 0 = auto-detect (recommended)
+#endif
+
+// Batch processing sizes for optimal throughput
+#ifndef MIQ_TX_VALIDATION_BATCH
+#define MIQ_TX_VALIDATION_BATCH 100  // Transactions per validation batch
+#endif
+#ifndef MIQ_BLOCK_VALIDATION_BATCH
+#define MIQ_BLOCK_VALIDATION_BATCH 16  // Blocks per validation batch
+#endif
+
+// I/O optimization
+#ifndef MIQ_DB_WRITE_BUFFER_MB
+#define MIQ_DB_WRITE_BUFFER_MB 64  // LevelDB write buffer size
+#endif
+#ifndef MIQ_DB_CACHE_MB
+#define MIQ_DB_CACHE_MB 256  // LevelDB cache size
+#endif
+
+// Network optimization for global scale
+#ifndef MIQ_MAX_INBOUND_CONNECTIONS
+#define MIQ_MAX_INBOUND_CONNECTIONS 125  // Maximum inbound peers
+#endif
+#ifndef MIQ_MAX_OUTBOUND_CONNECTIONS
+#define MIQ_MAX_OUTBOUND_CONNECTIONS 12  // Maximum outbound peers
+#endif
+#ifndef MIQ_FEELER_CONNECTIONS
+#define MIQ_FEELER_CONNECTIONS 2  // Feeler connections for address testing
+#endif
+
+// Connection limits for anti-eclipse protection
+#ifndef MIQ_MAX_CONNECTIONS_PER_IP
+#define MIQ_MAX_CONNECTIONS_PER_IP 3  // Max connections from same IP
+#endif
+#ifndef MIQ_MAX_CONNECTIONS_PER_SUBNET
+#define MIQ_MAX_CONNECTIONS_PER_SUBNET 6  // Max connections from same /16
+#endif
+
+// Peer rotation for network health
+#ifndef MIQ_PEER_ROTATION_INTERVAL_MS
+#define MIQ_PEER_ROTATION_INTERVAL_MS (20 * 60 * 1000)  // 20 minutes
+#endif
+
+// Connection backoff (exponential with cap)
+#ifndef MIQ_CONNECTION_BACKOFF_BASE_MS
+#define MIQ_CONNECTION_BACKOFF_BASE_MS 30000  // 30 second base
+#endif
+#ifndef MIQ_CONNECTION_BACKOFF_MAX_MS
+#define MIQ_CONNECTION_BACKOFF_MAX_MS (12 * 60 * 60 * 1000)  // 12 hour max
+#endif
+
+// === RELIABILITY & FAULT TOLERANCE ===
+// Automatic recovery settings
+#ifndef MIQ_AUTO_REINDEX_ON_CORRUPTION
+#define MIQ_AUTO_REINDEX_ON_CORRUPTION 1  // Auto-repair corrupted indexes
+#endif
+#ifndef MIQ_MAX_REORG_DEPTH
+#define MIQ_MAX_REORG_DEPTH 100  // Maximum chain reorganization depth
+#endif
+
+// Health monitoring
+#ifndef MIQ_HEALTH_CHECK_INTERVAL_MS
+#define MIQ_HEALTH_CHECK_INTERVAL_MS 60000  // Health check every minute
+#endif
+#ifndef MIQ_STALE_PEER_TIMEOUT_MS
+#define MIQ_STALE_PEER_TIMEOUT_MS (30 * 60 * 1000)  // 30 minute stale timeout
+#endif
+
+// === RBF (Replace-By-Fee) SUPPORT ===
+#ifndef MIQ_RBF_ENABLED
+#define MIQ_RBF_ENABLED 1  // Enable replace-by-fee
+#endif
+#ifndef MIQ_RBF_MIN_FEE_BUMP_PERCENT
+#define MIQ_RBF_MIN_FEE_BUMP_PERCENT 10  // Minimum fee bump for RBF
+#endif
+
+// === COMPACT BLOCK RELAY (BIP 152) ===
+#ifndef MIQ_COMPACT_BLOCKS_ENABLED
+#define MIQ_COMPACT_BLOCKS_ENABLED 1  // Enable compact block relay
+#endif
+#ifndef MIQ_COMPACT_BLOCK_HIGH_BANDWIDTH
+#define MIQ_COMPACT_BLOCK_HIGH_BANDWIDTH 3  // High-bandwidth compact block peers
+#endif
+
+// === TRANSACTION RELAY OPTIMIZATION ===
+#ifndef MIQ_TX_FLOOD_PROTECTION
+#define MIQ_TX_FLOOD_PROTECTION 1  // Enable transaction flood protection
+#endif
+#ifndef MIQ_TX_RELAY_RATE_LIMIT_PER_PEER
+#define MIQ_TX_RELAY_RATE_LIMIT_PER_PEER 7  // Txs per second per peer
+#endif
+
 }
+
