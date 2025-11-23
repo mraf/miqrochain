@@ -44,6 +44,12 @@ bool miq::load_config(const std::string& path, Config& out){
         else if(k=="rpc_tls_cert")   out.rpc_tls_cert   = v;
         else if(k=="rpc_tls_key")    out.rpc_tls_key    = v;
         else if(k=="rpc_tls_client_ca") out.rpc_tls_client_ca = v;
+
+        // Stratum mining pool
+        else if(k=="stratum_enable") out.stratum_enable = (v=="1"||v=="true");
+        else if(k=="stratum_port"){ try{ out.stratum_port = (uint16_t)std::stoul(v); }catch(...){} }
+        else if(k=="stratum_difficulty"){ try{ out.stratum_difficulty = std::stod(v); }catch(...){} }
+        else if(k=="stratum_vardiff") out.stratum_vardiff = (v=="1"||v=="true");
     }
     return true;
 }

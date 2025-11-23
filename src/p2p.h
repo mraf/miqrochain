@@ -314,6 +314,16 @@ struct PeerState {
     // Flow control
     size_t send_queue_bytes{0};
     static constexpr size_t MAX_SEND_QUEUE_BYTES = 1 * 1024 * 1024;  // 1MB
+
+    // BIP130 sendheaders support
+    bool prefer_headers{false};  // Peer prefers headers over inv for blocks
+    bool sent_sendheaders{false}; // We've sent sendheaders to this peer
+
+    // BIP152 Compact blocks support
+    bool compact_blocks_enabled{false};  // Peer supports compact blocks
+    bool compact_high_bandwidth{false};  // High-bandwidth compact block mode
+    uint64_t compact_version{0};         // Compact block version (1 or 2)
+    std::vector<uint8_t> last_compact_block_hash; // Last compact block sent/received
 };
 
 // Lightweight read-only snapshot for RPC/UI
@@ -379,6 +389,22 @@ public:
     void announce_block_async(const std::vector<uint8_t>& h);
     void broadcast_inv_block(const std::vector<uint8_t>& h);
     void broadcast_inv_tx(const std::vector<uint8_t>& txid);
+
+    // BIP130 sendheaders support
+    void send_sendheaders(PeerState& ps);
+    void broadcast_header(const std::vector<uint8_t>& header_data);
+
+    // BIP152 Compact blocks support
+    void send_sendcmpct(PeerState& ps, bool high_bandwidth, uint64_t version);
+    void send_cmpctblock(PeerState& ps, const std::vector<uint8_t>& block_hash);
+    void send_getblocktxn(PeerState& ps, const std::vector<uint8_t>& block_hash,
+                          const std::vector<uint16_t>& indexes);
+    void handle_compact_block(PeerState& ps, const std::vector<uint8_t>& payload);
+
+    // BIP37 Bloom filter support
+    void handle_filterload(PeerState& ps, const std::vector<uint8_t>& payload);
+    void handle_filteradd(PeerState& ps, const std::vector<uint8_t>& payload);
+    void handle_filterclear(PeerState& ps);
 
     // datadir for bans/peers
     inline void set_datadir(const std::string& d) { datadir_ = d; }
