@@ -481,9 +481,13 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     };
 
     // 7) stream blocks, update view — chunked + paced to protect the node
+    // IMPROVED: Added streaming with progressive cache flushing and memory limits
     const uint32_t MAX_PER_CHUNK = env_u32("MIQ_MAX_BLOCKS_PER_CHUNK", 64);
     const uint32_t SLEEP_MS      = env_u32("MIQ_SLEEP_BETWEEN_CHUNKS_MS", 50);
+    const uint32_t FLUSH_EVERY   = env_u32("MIQ_FLUSH_CACHE_EVERY", 500); // Flush every N blocks
+    const size_t   MAX_VIEW_SIZE = env_u32("MIQ_MAX_UTXO_VIEW_SIZE", 100000); // Max UTXOs in memory
     uint32_t chunk_count = 0;
+    uint32_t blocks_processed = 0;
 
     for(const auto& bh : blocks){
         const auto& hash_le = bh.first;
@@ -495,14 +499,45 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
         std::vector<TxParsed> txs;
         if(!parse_block_collect(raw, txs)){ err = "failed to parse block @" + std::to_string(height); p2p.close(); return false; }
 
+        // Process deletions first (spends)
         for(const auto& tx : txs){
             for(const auto& in : tx.vin) del_in(in.prev_txid, in.vout);
         }
+
+        // Then process additions (new outputs)
         for(const auto& tx : txs){
             for(uint32_t i=0;i<(uint32_t)tx.vout.size(); ++i){
                 const auto& o = tx.vout[i];
                 if(o.pkh.size()==20) add_out(tx.txid_le, i, o.value, o.pkh, height, tx.coinbase);
             }
+        }
+
+        blocks_processed++;
+
+        // Progressive cache flushing to prevent memory overflow
+        if(blocks_processed % FLUSH_EVERY == 0){
+            // Save intermediate state
+            CacheState tempst; tempst.scanned_upto = height;
+            save_state(opt.cache_dir, tempst);
+            save_utxo_cache(opt.cache_dir, view);
+        }
+
+        // Memory pressure check: if UTXO set is too large, compact it
+        if(view.size() > MAX_VIEW_SIZE){
+            // Rebuild index to remove any stale entries
+            std::vector<UtxoLite> compacted;
+            compacted.reserve(view.size());
+            idx.clear();
+            idx.reserve(view.size() + 16);
+
+            for(size_t i = 0; i < view.size(); ++i){
+                // Only keep UTXOs that match our watched PKHs
+                if(pkhset.find(view[i].pkh) != pkhset.end()){
+                    idx[key_of(view[i].txid, view[i].vout)] = compacted.size();
+                    compacted.push_back(std::move(view[i]));
+                }
+            }
+            view = std::move(compacted);
         }
 
         if(++chunk_count >= MAX_PER_CHUNK){

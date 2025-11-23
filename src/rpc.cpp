@@ -15,6 +15,7 @@
 #include "base58check.h"
 #include "hash160.h"
 #include "utxo.h"          // UTXOEntry & list_for_pkh
+#include "difficulty.h"    // MIQ_RETARGET_INTERVAL & epoch_next_bits
 
 #include <sstream>
 #include <array>
@@ -475,8 +476,8 @@ std::string RpcService::handle(const std::string& body){
                 "createhdwallet","restorehdwallet","walletinfo","getnewaddress","deriveaddressat",
                 "walletunlock","walletlock","getwalletinfo","listaddresses","listutxos",
                 "sendfromhd","getaddressutxos","getbalance",
-                "getminertemplate",
-                "submitblock","submitrawblock","sendrawblock" // NEW
+                "getblocktemplate","getminertemplate", // Mining pool support
+                "submitblock","submitrawblock","sendrawblock"
                 // (getibdinfo exists but not listed here to keep help stable)
             };
             std::vector<JNode> v;
@@ -688,6 +689,174 @@ std::string RpcService::handle(const std::string& body){
             o["time"]     = jnum((double)tip.time);
             o["hash"]     = jstr(to_hex(tip.hash));
             JNode out; out.v = o; return json_dump(out);
+        }
+
+        // ---------- BIP22 GETBLOCKTEMPLATE (for pool mining) ----------
+        if (method == "getblocktemplate") {
+            // BIP22 compliant getblocktemplate implementation
+            auto tip = chain_.tip();
+
+            // Parse optional params for capabilities/mode
+            bool longpoll = false;
+            std::string mode = "template";
+            if (!params.empty() && std::holds_alternative<std::map<std::string, JNode>>(params[0].v)) {
+                auto& p = std::get<std::map<std::string, JNode>>(params[0].v);
+                if (p.count("mode") && std::holds_alternative<std::string>(p.at("mode").v)) {
+                    mode = std::get<std::string>(p.at("mode").v);
+                }
+                if (p.count("longpollid") && std::holds_alternative<std::string>(p.at("longpollid").v)) {
+                    longpoll = true;
+                }
+            }
+
+            // Handle submit mode
+            if (mode == "submit") {
+                return err("use submitblock RPC for block submission");
+            }
+
+            // Compute the next block's bits (retarget-aware)
+            uint32_t next_bits = tip.bits;
+            try {
+                auto last = chain_.last_headers(MIQ_RETARGET_INTERVAL);
+                next_bits = miq::epoch_next_bits(
+                    last,
+                    BLOCK_TIME_SECS,
+                    GENESIS_BITS,
+                    tip.height + 1,
+                    MIQ_RETARGET_INTERVAL
+                );
+            } catch(...) {}
+
+            // Compute MTP for mintime
+            int64_t mtp = tip.time;
+            try {
+                auto hdrs = chain_.last_headers(11);
+                if (!hdrs.empty()) {
+                    std::vector<int64_t> ts; ts.reserve(hdrs.size());
+                    for (auto& p : hdrs) ts.push_back(p.first);
+                    std::sort(ts.begin(), ts.end());
+                    mtp = ts[ts.size()/2];
+                }
+            } catch(...) {}
+            const int64_t mintime = mtp + 1;
+            const int64_t curtime = std::max<int64_t>(static_cast<int64_t>(time(nullptr)), mintime);
+
+            // Build coinbase value (subsidy + fees)
+            uint64_t subsidy = INITIAL_SUBSIDY;
+            uint64_t halvings = (tip.height + 1) / HALVING_INTERVAL;
+            if (halvings < 64) subsidy = INITIAL_SUBSIDY >> halvings;
+            else subsidy = 0;
+
+            // Collect mempool transactions
+            auto txs_vec = mempool_.collect(5000);
+            std::vector<JNode> tx_arr;
+            uint64_t total_fees = 0;
+
+            for (const auto& tx : txs_vec) {
+                auto raw = ser_tx(tx);
+                uint32_t vsize = (uint32_t)raw.size();
+                uint64_t in_sum = 0, out_sum = 0;
+
+                // Calculate fee
+                for (const auto& in : tx.vin) {
+                    UTXOEntry e;
+                    if (chain_.utxo().get(in.prev.txid, in.prev.vout, e)) {
+                        in_sum += e.value;
+                    }
+                }
+                for (const auto& o : tx.vout) out_sum += o.value;
+                uint64_t fee = (in_sum > out_sum) ? (in_sum - out_sum) : 0;
+                total_fees += fee;
+
+                // BIP22 transaction format
+                std::map<std::string, JNode> txobj;
+                txobj["data"] = jstr(to_hex(raw));
+                txobj["txid"] = jstr(to_hex(tx.txid()));
+                txobj["hash"] = jstr(to_hex(tx.txid())); // No segwit, same as txid
+                txobj["fee"] = jnum((double)fee);
+                txobj["sigops"] = jnum((double)(tx.vin.size())); // Simplified
+                txobj["weight"] = jnum((double)(vsize * 4)); // No segwit
+
+                // Dependencies
+                std::vector<JNode> deps;
+                JNode dd; dd.v = deps;
+                txobj["depends"] = dd;
+
+                JNode txnode; txnode.v = txobj;
+                tx_arr.push_back(txnode);
+            }
+
+            // Build target from bits (big-endian for BIP22)
+            uint8_t target_be[32]; std::memset(target_be, 0, 32);
+            {
+                const uint32_t exp  = next_bits >> 24;
+                const uint32_t mant = next_bits & 0x007fffff;
+                if (mant) {
+                    if (exp <= 3) {
+                        uint32_t mant2 = mant >> (8 * (3 - exp));
+                        target_be[29] = uint8_t((mant2 >> 16) & 0xff);
+                        target_be[30] = uint8_t((mant2 >>  8) & 0xff);
+                        target_be[31] = uint8_t((mant2 >>  0) & 0xff);
+                    } else {
+                        int pos = int(32) - int(exp);
+                        if (pos < 0) { target_be[0]=target_be[1]=target_be[2]=0xff; }
+                        else {
+                            if (pos > 29) pos = 29;
+                            target_be[pos+0] = uint8_t((mant >> 16) & 0xff);
+                            target_be[pos+1] = uint8_t((mant >>  8) & 0xff);
+                            target_be[pos+2] = uint8_t((mant >>  0) & 0xff);
+                        }
+                    }
+                }
+            }
+
+            // Build BIP22 response
+            std::map<std::string, JNode> result;
+            result["version"] = jnum(1.0);
+            result["previousblockhash"] = jstr(to_hex(tip.hash));
+
+            // Transactions array
+            JNode txs_node; txs_node.v = tx_arr;
+            result["transactions"] = txs_node;
+
+            // Coinbase-related
+            result["coinbasevalue"] = jnum((double)(subsidy + total_fees));
+
+            // Target & bits
+            result["target"] = jstr(to_hex(std::vector<uint8_t>(target_be, target_be+32)));
+            char bits_hex[9]; std::snprintf(bits_hex, sizeof(bits_hex), "%08x", next_bits);
+            result["bits"] = jstr(std::string(bits_hex));
+
+            // Times
+            result["curtime"] = jnum((double)curtime);
+            result["mintime"] = jnum((double)mintime);
+
+            // Mutable fields (BIP22)
+            std::vector<JNode> mutable_arr;
+            mutable_arr.push_back(jstr("time"));
+            mutable_arr.push_back(jstr("transactions"));
+            mutable_arr.push_back(jstr("prevblock"));
+            JNode mut_node; mut_node.v = mutable_arr;
+            result["mutable"] = mut_node;
+
+            // Other BIP22 fields
+            result["height"] = jnum((double)(tip.height + 1));
+            result["sigoplimit"] = jnum(80000.0);
+            result["sizelimit"] = jnum((double)(4 * 1024 * 1024));
+            result["weightlimit"] = jnum((double)(4 * 1024 * 1024 * 4));
+
+            // Longpoll ID (tip hash for change detection)
+            result["longpollid"] = jstr(to_hex(tip.hash) + std::to_string(tip.height));
+
+            // Capabilities
+            std::vector<JNode> caps;
+            caps.push_back(jstr("proposal"));
+            caps.push_back(jstr("longpoll"));
+            JNode caps_node; caps_node.v = caps;
+            result["capabilities"] = caps_node;
+
+            JNode out; out.v = result;
+            return json_dump(out);
         }
 
         // ---------- MINER TEMPLATE (for external miners) ----------
