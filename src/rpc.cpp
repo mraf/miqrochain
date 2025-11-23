@@ -500,9 +500,11 @@ std::string RpcService::handle(const std::string& body){
 
             miq::HdWallet w(seed, meta);
 
-            // Collect PKHs (same ranges as listutxos)
+            // Collect PKHs - scan from index 0 up to and including next index
+            // This ensures we find funds even if wallet was just created
             auto collect_pkh_for_range = [&](bool change, uint32_t n, std::vector<std::array<uint8_t,20>>& out){
-                for (uint32_t i=0;i<n;i++){
+                // Scan at least the first address (index 0) plus all used addresses up to n
+                for (uint32_t i = 0; i <= n; i++){
                     std::vector<uint8_t> priv, pub;
                     if (!w.DerivePrivPub(meta.account, change?1u:0u, i, priv, pub)) continue;
                     auto h = hash160(pub);
@@ -1528,7 +1530,8 @@ std::string RpcService::handle(const std::string& body){
             if(!LoadHdWallet(wdir, seed, meta, pass, e)) return err(e);
 
             miq::HdWallet w(seed, meta);
-            int n = (want>0) ? std::min<int>(want, (int)meta.next_recv) : (int)meta.next_recv;
+            // Include at least address 0 plus all used addresses
+            int n = (want>0) ? std::min<int>(want, (int)meta.next_recv + 1) : (int)meta.next_recv + 1;
 
             std::vector<JNode> arr;
             for (int i=0;i<n;i++){
@@ -1555,8 +1558,9 @@ std::string RpcService::handle(const std::string& body){
 
             const uint64_t curH = chain_.tip().height;
 
+            // Scan from index 0 up to and including the next index
             auto collect_pkh_for_range = [&](bool change, uint32_t n, std::vector<std::array<uint8_t,20>>& out){
-                for (uint32_t i=0;i<n;i++){
+                for (uint32_t i = 0; i <= n; i++){
                     std::vector<uint8_t> priv, pub;
                     if (!w.DerivePrivPub(meta.account, change?1u:0u, i, priv, pub)) continue;
                     auto h = hash160(pub);
