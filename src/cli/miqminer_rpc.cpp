@@ -421,18 +421,26 @@ static std::string dechunk_if_needed(const std::string& raw){
     return raw.substr(0, hdr_end+4) + out;
 }
 
+// CRITICAL FIX: Initialize Winsock once at startup, not per-request
+#if defined(_WIN32)
+static void winsock_ensure() {
+    static bool inited = false;
+    if (!inited) {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2,2), &wsa) == 0) inited = true;
+    }
+}
+#else
+static void winsock_ensure() {}
+#endif
+
 static bool http_post(const std::string& host, uint16_t port, const std::string& path,
                       const std::string& auth_token, const std::string& json, HttpResp& out)
 {
-#if defined(_WIN32)
-    WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
-#endif
+    winsock_ensure();
     addrinfo hints{}; hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_STREAM;
     addrinfo* res=nullptr; char ps[16]; std::snprintf(ps,sizeof(ps), "%u", (unsigned)port);
     if(getaddrinfo(host.c_str(), ps, &hints, &res)!=0) {
-#if defined(_WIN32)
-        WSACleanup();
-#endif
         return false;
     }
     socket_t s =
@@ -457,7 +465,7 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
     }
     freeaddrinfo(res);
 #if defined(_WIN32)
-    if(s==INVALID_SOCKET){ WSACleanup(); return false; }
+    if(s==INVALID_SOCKET) return false;
 #else
     if(s<0) return false;
 #endif
@@ -478,7 +486,7 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
     while(off < data.size()){
 #if defined(_WIN32)
         int n = send(s, data.data()+off, (int)(data.size()-off), 0);
-        if(n<=0){ miq_closesocket(s); WSACleanup(); return false; }
+        if(n<=0){ miq_closesocket(s); return false; }
 #else
         int n = ::send(s, data.data()+off, (int)(data.size()-off), 0);
         if(n<=0){ miq_closesocket(s); return false; }
@@ -497,9 +505,6 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
         resp.append(buf, (size_t)n);
     }
     miq_closesocket(s);
-#if defined(_WIN32)
-    WSACleanup();
-#endif
 
     // Handle chunked transfer (harden)
     std::string resp2 = dechunk_if_needed(resp);
