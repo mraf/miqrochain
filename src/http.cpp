@@ -157,7 +157,14 @@ static std::unordered_set<std::string> default_safe_methods(){
         "getblockcount","gettipinfo","getblockhash","getblock","getrawblock",
         "getrawmempool","getpeerinfo","getminerstats","getconnectioncount",
         "validateaddress","decoderawtx","estimatemediantime","getdifficulty",
-        "getchaintips","ping","uptime","help","version","getblockchaininfo"
+        "getchaintips","ping","uptime","help","version","getblockchaininfo",
+        // Mining methods (safe on loopback for local miners)
+        "getminertemplate","getblocktemplate","submitblock","submitrawblock",
+        "sendrawblock","getcoinbaserecipient","getnetworkinfo",
+        // Wallet methods (needed for balance checking and sending)
+        "getbalance","listutxos","listaddresses","sendfromhd","getaddressutxos",
+        "getnewaddress","walletinfo","getwalletinfo","createrawtx","signrawtx",
+        "sendrawtx","decodeaddress","createhdwallet","restorehdwallet","scanaddresses"
     };
 }
 
