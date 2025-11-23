@@ -31,52 +31,50 @@ static inline void put_varbytes(std::vector<uint8_t>& v, const std::vector<uint8
     v.insert(v.end(), b.begin(), b.end());
 }
 
-// Canonical full tx serialization (for TXID): includes signatures.
-// Layout:
+// Canonical full tx serialization (for TXID): MUST match wire format exactly.
+// Layout (identical to serialize.cpp ser_tx):
 //   u32 version
-//   u64 lock_time
 //   u32 vin_count
 //     [ for each input:
-//         32 prev.txid bytes (as stored)
+//         varbytes prev.txid
 //         u32 prev.vout
-//         varbytes pubkey
 //         varbytes sig
+//         varbytes pubkey
 //       ]
 //   u32 vout_count
 //     [ for each output:
 //         u64 value
-//         (note: if outputs carry extra fields, those are not used by consensus
-//                elsewhere in this repo; we hash value only to keep compatibility)
+//         varbytes pkh
 //       ]
+//   u32 lock_time
 static std::vector<uint8_t> ser_tx_canonical(const Transaction& tx) {
     std::vector<uint8_t> out;
-    out.reserve(64 + tx.vin.size() * 96 + tx.vout.size() * 16);
+    out.reserve(64 + tx.vin.size() * 128 + tx.vout.size() * 32);
 
     put_u32_le(out, tx.version);
-    put_u64_le(out, static_cast<uint64_t>(tx.lock_time));
 
     // Inputs
     put_u32_le(out, static_cast<uint32_t>(tx.vin.size()));
     for (const auto& in : tx.vin) {
-        // prev.txid (serialize exactly the stored bytes)
-        out.insert(out.end(), in.prev.txid.begin(), in.prev.txid.end());
+        // prev.txid as length-prefixed bytes (matches ser_tx)
+        put_varbytes(out, in.prev.txid);
         // prev.vout
         put_u32_le(out, static_cast<uint32_t>(in.prev.vout));
-        // pubkey & sig as opaque byte arrays
-        put_varbytes(out, in.pubkey);
+        // sig then pubkey (matches ser_tx order)
         put_varbytes(out, in.sig);
+        put_varbytes(out, in.pubkey);
     }
 
     // Outputs
     put_u32_le(out, static_cast<uint32_t>(tx.vout.size()));
     for (const auto& o : tx.vout) {
         put_u64_le(out, static_cast<uint64_t>(o.value));
-        // If your Output struct has additional consensus fields (e.g., script/PKH) hashed
-        // elsewhere, include them here as varbytes to bind TXID to them. Since the
-        // current repo only uses value in consensus paths we leave this minimal to avoid
-        // breaking other code paths.
-        // Example if you later add: put_varbytes(out, o.script);
+        // CRITICAL: Include pkh to match wire format
+        put_varbytes(out, o.pkh);
     }
+
+    // lock_time at end (matches ser_tx)
+    put_u32_le(out, tx.lock_time);
 
     return out;
 }
