@@ -20,6 +20,19 @@
 
 namespace miq {
 
+// CRITICAL FIX: Initialize Winsock once at startup, not per-call
+#if defined(_WIN32)
+static void winsock_ensure() {
+    static bool inited = false;
+    if (!inited) {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2,2), &wsa) == 0) inited = true;
+    }
+}
+#else
+static void winsock_ensure() {}
+#endif
+
 static bool ga(const char* host,
                uint16_t port,
                std::vector<SeedEndpoint>& out,
@@ -27,10 +40,7 @@ static bool ga(const char* host,
 {
     if (!host || !*host) return false;
 
-#if defined(_WIN32)
-    WSADATA wsa;
-    const bool wsa_ok = (WSAStartup(MAKEWORD(2,2), &wsa) == 0);
-#endif
+    winsock_ensure();
 
     struct addrinfo hints;
     std::memset(&hints, 0, sizeof(hints));
@@ -47,9 +57,6 @@ static bool ga(const char* host,
     struct addrinfo* res = nullptr;
     int rc = ::getaddrinfo(host, port_str, &hints, &res);
     if (rc != 0 || !res) {
-#if defined(_WIN32)
-        if (wsa_ok) WSACleanup();
-#endif
         return false;
     }
 
@@ -84,9 +91,6 @@ static bool ga(const char* host,
     }
 
     ::freeaddrinfo(res);
-#if defined(_WIN32)
-    if (wsa_ok) WSACleanup();
-#endif
     return any;
 }
 
