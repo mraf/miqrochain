@@ -613,12 +613,14 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     save_state(opt.cache_dir, newst);
     save_utxo_cache(opt.cache_dir, view);
 
-    // 9) post-filter: require ≥1 conf for all; coinbases need full maturity
+    // 9) post-filter: require ≥1 conf for all outputs
+    // NOTE: We return immature coinbase so wallet can display them as "Immature" balance
+    // The wallet will filter them from spendable but show them in the UI
     std::vector<UtxoLite> finalv; finalv.reserve(view.size());
     for(const auto& u : view){
         uint32_t conf = (u.height <= tip_height) ? (tip_height - u.height + 1) : 0;
         if(conf < 1) continue;
-        if(u.coinbase && conf < COINBASE_MATURITY) continue;
+        // Don't filter immature coinbase - let wallet display them as immature balance
         finalv.push_back(u);
     }
 
