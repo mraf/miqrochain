@@ -138,11 +138,7 @@ static uint32_t checksum4(const std::vector<uint8_t>& payload){
 }
 static std::string default_port_str(const std::string& port){
     if(!port.empty()) return port;
-#ifdef P2P_PORT
-    return std::to_string((uint16_t)P2P_PORT);
-#else
-    return "9833";
-#endif
+    return std::to_string((uint16_t)miq::P2P_PORT);
 }
 
 // ---- DNS + connect -----------------------------------------------------------
@@ -248,10 +244,8 @@ static std::vector<std::string> gather_default_candidates(const std::string& cli
     }
 #endif
 
-    // default fallback
-    if(seeds.empty()){
-        seeds.push_back("127.0.0.1");
-    }
+    // No default localhost fallback - the caller's seed list should be used
+    // If empty, connection will fail with a clear error
     return seeds;
 }
 
@@ -280,13 +274,14 @@ static bool resolves_to_public_ip(const std::string& host, const std::string& po
     for (auto p = res; p; p = p->ai_next){
         if (p->ai_family == AF_INET){
             const sockaddr_in* a = (const sockaddr_in*)p->ai_addr;
-            uint32_t be = a->sin_addr.s_addr;
-            uint8_t A = uint8_t(be>>24), B = uint8_t(be>>16);
-            if (A==127) { ok=false; continue; }
-            if (A==10)  { ok=false; continue; }
-            if (A==192 && B==168) { ok=false; continue; }
-            if (A==172 && ((uint8_t(be>>20)&0x0F)>=1 && (uint8_t(be>>20)&0x0F)<=15)) { ok=false; continue; }
-            if (A==0 || A>=224) { ok=false; continue; }
+            // Extract bytes in network order (first octet at lowest address)
+            const uint8_t* b = (const uint8_t*)&a->sin_addr;
+            uint8_t A = b[0], B = b[1];
+            if (A==127) { continue; }  // loopback - skip but don't fail
+            if (A==10)  { continue; }  // private 10/8
+            if (A==192 && B==168) { continue; }  // private 192.168/16
+            if (A==172 && B>=16 && B<=31) { continue; }  // private 172.16-31
+            if (A==0 || A>=224) { continue; }  // invalid/multicast
             ok = true; break;
         }
     }
@@ -301,10 +296,20 @@ static std::vector<std::string> build_seed_candidates(const std::string& cli_hos
     std::vector<std::string> out; out.reserve(seeds.size());
     const std::string port = default_port_str(cli_port);
 
+    // Always include CLI-provided host first without filtering
+    // This ensures explicit user-specified hosts are tried
+    if (!cli_host.empty()) {
+        std::string p = cli_port.empty() ? port : cli_port;
+        out.push_back(cli_host + ":" + p);
+    }
+
     for (auto& hp : seeds){
         auto pos = hp.find(':');
         std::string h = (pos==std::string::npos) ? hp : hp.substr(0,pos);
         std::string p = (pos==std::string::npos) ? port : hp.substr(pos+1);
+
+        // Skip if already added as CLI host
+        if (!cli_host.empty() && h == cli_host) continue;
 
         // explicit numeric literals always allowed
         if (is_public_ipv4_literal(h) || is_public_ipv6_literal(h)) { out.push_back(h+":"+p); continue; }
@@ -328,6 +333,16 @@ resolve_and_connect_best(const std::vector<std::string>& candidates,
                          std::string& err,
                          std::string* connected_host=nullptr)
 {
+    if (candidates.empty()) {
+        err = "no seed nodes available";
+        return
+#ifdef _WIN32
+            (uintptr_t)-1
+#else
+            -1
+#endif
+        ;
+    }
     addrinfo hints{}; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
     for (const auto& hp : candidates){
         auto pos = hp.find(':');
@@ -449,15 +464,16 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     std::string used_host;
     sock_ = resolve_and_connect_best(candidates, port, o_.io_timeout_ms, err, &used_host);
 
-    // 2) Smart local fallback
+    // 2) Local fallback ONLY if no explicit host was provided
+    // (don't silently fall back to localhost when user specified a real host)
 #ifdef _WIN32
-    if (sock_ == (uintptr_t)-1 && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
+    if (sock_ == (uintptr_t)-1 && o_.host.empty() && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
         auto fd_local = try_local_fallback(port, o_.io_timeout_ms, &used_host);
         if (fd_local != (uintptr_t)-1) { sock_ = fd_local; err.clear(); }
     }
     if (sock_ == (uintptr_t)-1) return false;
 #else
-    if (sock_ < 0 && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
+    if (sock_ < 0 && o_.host.empty() && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
         auto fd_local = try_local_fallback(port, o_.io_timeout_ms, &used_host);
         if (fd_local >= 0) { sock_ = fd_local; err.clear(); }
     }
