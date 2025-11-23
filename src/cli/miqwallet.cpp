@@ -116,6 +116,14 @@ static std::string default_wallet_dir(){
     return "wallets/default";
 }
 
+// Clear SPV cache to force a fresh rescan from genesis
+static void clear_spv_cache(const std::string& wdir){
+    std::string state_file = join_path(wdir, "spv_state.dat");
+    std::string utxo_file = join_path(wdir, "utxo_cache.dat");
+    std::remove(state_file.c_str());
+    std::remove(utxo_file.c_str());
+}
+
 // -------------------------------------------------------------
 // Pending-spent cache (avoid double-spend while unconfirmed)
 // -------------------------------------------------------------
@@ -653,10 +661,13 @@ static bool wallet_session(const std::string& cli_host,
     const std::string wdir = default_wallet_dir();
 
     // derive a key horizon (GAP lookahead)
+    // Use large gap limit to find all mining rewards even if addresses were used beyond next_*
     struct Key { std::vector<uint8_t> priv, pub, pkh; uint32_t chain, index; };
     std::vector<Key> keys;
     auto add_range = [&](uint32_t chain, uint32_t upto){
-        const uint32_t GAP = (uint32_t)env_u64("MIQ_GAP_LIMIT", 100);
+        // Large default gap (1000) to ensure we find all mined coins
+        // Mining may have used addresses beyond what wallet knows about
+        const uint32_t GAP = (uint32_t)env_u64("MIQ_GAP_LIMIT", 1000);
         for(uint32_t i=0;i<=upto + GAP; ++i){
             Key k; k.chain=chain; k.index=i;
             if(!w.DerivePrivPub(meta.account, chain, i, k.priv, k.pub)) continue;
@@ -685,7 +696,9 @@ static bool wallet_session(const std::string& cli_host,
     }
     std::cout << "\n";
 
-    const uint32_t spv_win = (uint32_t)env_u64("MIQ_SPV_WINDOW", 8000);
+    // SPV window: 0 = scan from genesis (all blocks)
+    // This ensures all mining rewards are found on first run
+    const uint32_t spv_win = (uint32_t)env_u64("MIQ_SPV_WINDOW", 0);
 
     // Load pending-spent cache
     std::set<OutpointKey> pending;
@@ -739,11 +752,35 @@ static bool wallet_session(const std::string& cli_host,
         }
 
         WalletBalance wb = compute_balance(utxos, pending);
-        std::cout << "=== Wallet (" << CHAIN_NAME << ") via " << used_seed << " ===\n";
-        std::cout << "Total:        " << fmt_amount(wb.total)        << " MIQ  (" << wb.total        << ")\n";
-        std::cout << "Spendable:    " << fmt_amount(wb.spendable)    << " MIQ  (" << wb.spendable    << ")\n";
-        std::cout << "Immature:     " << fmt_amount(wb.immature)     << " MIQ  (" << wb.immature     << ")\n";
-        std::cout << "Pending-hold: " << fmt_amount(wb.pending_hold) << " MIQ  (" << wb.pending_hold << ")\n";
+        std::cout << "\n=== Wallet (" << CHAIN_NAME << ") via " << used_seed << " ===\n";
+        std::cout << "UTXOs found:  " << utxos.size() << "\n";
+        std::cout << "Total:        " << fmt_amount(wb.total)        << " MIQ  (" << wb.total        << " miqron)\n";
+        std::cout << "Spendable:    " << fmt_amount(wb.spendable)    << " MIQ  (" << wb.spendable    << " miqron)\n";
+        std::cout << "Immature:     " << fmt_amount(wb.immature)     << " MIQ  (" << wb.immature     << " miqron)\n";
+        std::cout << "Pending-hold: " << fmt_amount(wb.pending_hold) << " MIQ  (" << wb.pending_hold << " miqron)\n";
+
+        // Show breakdown by address (helpful for debugging)
+        if(!utxos.empty() && utxos.size() <= 100){
+            std::unordered_map<std::string, uint64_t> addr_totals;
+            std::unordered_map<std::string, uint32_t> addr_counts;
+            for(const auto& u : utxos){
+                auto it = pkh2ci.find(miq::to_hex(u.pkh));
+                if(it != pkh2ci.end()){
+                    std::string addr;
+                    miq::HdWallet tmp(seed, meta);
+                    if(tmp.GetAddressAt(it->second.second, addr)){
+                        addr_totals[addr] += u.value;
+                        addr_counts[addr]++;
+                    }
+                }
+            }
+            if(!addr_totals.empty()){
+                std::cout << "\nBalance by address:\n";
+                for(const auto& [addr, val] : addr_totals){
+                    std::cout << "  " << addr.substr(0, 12) << "... : " << fmt_amount(val) << " MIQ (" << addr_counts[addr] << " UTXOs)\n";
+                }
+            }
+        }
         return utxos;
     };
 
@@ -941,6 +978,11 @@ static bool flow_load_from_seed(const std::string& cli_host, const std::string& 
     std::string e;
     if(!miq::SaveHdWallet(wdir, seed, meta, wpass, e)){ std::cout << "save failed: " << e << "\n"; return false; }
 
+    // Clear SPV cache to force a fresh full rescan from genesis
+    // This ensures all historical mining rewards are found
+    clear_spv_cache(wdir);
+    std::cout << "SPV cache cleared - will rescan from genesis\n";
+
     miq::HdWallet w(seed, meta);
     std::string addr;
     if(!w.GetNewAddress(addr)) { std::cout << "derive address failed\n"; return false; }
@@ -948,6 +990,38 @@ static bool flow_load_from_seed(const std::string& cli_host, const std::string& 
     std::cout << "First receive address: " << addr << "\n";
 
     return wallet_session(cli_host, cli_port, seed, w.meta(), wpass);
+}
+
+// Load an existing wallet from disk
+static bool flow_load_existing_wallet(const std::string& cli_host, const std::string& cli_port){
+    std::string wdir = default_wallet_dir();
+
+    std::cout << "Wallet encryption passphrase (ENTER for none): ";
+    std::string wpass; std::getline(std::cin, wpass);
+
+    std::vector<uint8_t> seed;
+    miq::HdAccountMeta meta;
+    std::string e;
+    if(!miq::LoadHdWallet(wdir, seed, meta, wpass, e)){
+        std::cout << "Failed to load wallet: " << e << "\n";
+        std::cout << "Wallet directory: " << wdir << "\n";
+        return false;
+    }
+
+    miq::HdWallet w(seed, meta);
+    std::cout << "Wallet loaded successfully!\n";
+    std::cout << "Account: " << meta.account << ", Next recv: " << meta.next_recv << ", Next change: " << meta.next_change << "\n";
+
+    // Show first few addresses
+    std::cout << "Addresses:\n";
+    for(uint32_t i = 0; i <= std::min(meta.next_recv, 5u); ++i){
+        std::string addr;
+        if(w.GetAddressAt(i, addr)){
+            std::cout << "  [" << i << "] " << addr << "\n";
+        }
+    }
+
+    return wallet_session(cli_host, cli_port, seed, meta, wpass);
 }
 
 // -------------------------------------------------------------
@@ -988,12 +1062,22 @@ int main(int argc, char** argv){
 
     for(;;){
         std::cout << "\n=== MIQ Wallet ===\n";
-        std::cout << "1) Create wallet\n";
-        std::cout << "2) Load wallet from seed\n";
+        std::cout << "1) Load existing wallet\n";
+        std::cout << "2) Create new wallet\n";
+        std::cout << "3) Import wallet from seed\n";
+        std::cout << "4) Force rescan from genesis\n";
         std::cout << "q) Quit\n> ";
         std::string c; std::getline(std::cin, c); c=trim(c);
-        if(c=="1"){ (void)flow_create_wallet(cli_host, cli_port); }
-        else if(c=="2"){ (void)flow_load_from_seed(cli_host, cli_port); }
+        if(c=="1"){ (void)flow_load_existing_wallet(cli_host, cli_port); }
+        else if(c=="2"){ (void)flow_create_wallet(cli_host, cli_port); }
+        else if(c=="3"){ (void)flow_load_from_seed(cli_host, cli_port); }
+        else if(c=="4"){
+            // Force rescan by clearing SPV cache
+            std::string wdir = default_wallet_dir();
+            clear_spv_cache(wdir);
+            std::cout << "SPV cache cleared. Next balance check will rescan from genesis.\n";
+            std::cout << "Use option 1 to load wallet and start rescan.\n";
+        }
         else if(c=="q"||c=="Q"||c=="exit") break;
     }
     return 0;
