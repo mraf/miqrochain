@@ -65,6 +65,45 @@
       setsockopt((SOCKET)s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&t, sizeof(t));
       setsockopt((SOCKET)s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&t, sizeof(t));
   }
+  // Connect with timeout on Windows
+  static inline bool connect_with_timeout(uintptr_t s, const sockaddr* addr, int addrlen, int timeout_ms) {
+      if (timeout_ms <= 0) {
+          return connect((SOCKET)s, addr, addrlen) == 0;
+      }
+      // Set non-blocking
+      u_long mode = 1;
+      ioctlsocket((SOCKET)s, FIONBIO, &mode);
+
+      int res = connect((SOCKET)s, addr, addrlen);
+      if (res == 0) {
+          mode = 0; ioctlsocket((SOCKET)s, FIONBIO, &mode);
+          return true;
+      }
+      if (WSAGetLastError() != WSAEWOULDBLOCK) {
+          mode = 0; ioctlsocket((SOCKET)s, FIONBIO, &mode);
+          return false;
+      }
+
+      // Wait for connection with timeout
+      fd_set writefds;
+      FD_ZERO(&writefds);
+      FD_SET((SOCKET)s, &writefds);
+      timeval tv;
+      tv.tv_sec = timeout_ms / 1000;
+      tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+      if (select(0, nullptr, &writefds, nullptr, &tv) <= 0) {
+          mode = 0; ioctlsocket((SOCKET)s, FIONBIO, &mode);
+          return false;
+      }
+
+      // Check if connection succeeded
+      int err = 0;
+      int len = sizeof(err);
+      getsockopt((SOCKET)s, SOL_SOCKET, SO_ERROR, (char*)&err, &len);
+      mode = 0; ioctlsocket((SOCKET)s, FIONBIO, &mode);
+      return err == 0;
+  }
 #else
   #include <sys/types.h>
   #include <sys/socket.h>
@@ -72,6 +111,9 @@
   #include <arpa/inet.h>
   #include <unistd.h>
   #include <signal.h>
+  #include <fcntl.h>
+  #include <errno.h>
+  #include <sys/select.h>
   static inline void closesock(int s){ if(s>=0) ::close(s); }
   static inline void set_timeouts(int s, int ms){
       if(ms <= 0) return;
@@ -80,6 +122,45 @@
       tv.tv_usec = (ms % 1000) * 1000;
       setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
       setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  }
+  // Connect with timeout on Unix
+  static inline bool connect_with_timeout(int s, const sockaddr* addr, socklen_t addrlen, int timeout_ms) {
+      if (timeout_ms <= 0) {
+          return connect(s, addr, addrlen) == 0;
+      }
+      // Set non-blocking
+      int flags = fcntl(s, F_GETFL, 0);
+      fcntl(s, F_SETFL, flags | O_NONBLOCK);
+
+      int res = connect(s, addr, addrlen);
+      if (res == 0) {
+          fcntl(s, F_SETFL, flags);
+          return true;
+      }
+      if (errno != EINPROGRESS) {
+          fcntl(s, F_SETFL, flags);
+          return false;
+      }
+
+      // Wait for connection with timeout
+      fd_set writefds;
+      FD_ZERO(&writefds);
+      FD_SET(s, &writefds);
+      timeval tv;
+      tv.tv_sec = timeout_ms / 1000;
+      tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+      if (select(s + 1, nullptr, &writefds, nullptr, &tv) <= 0) {
+          fcntl(s, F_SETFL, flags);
+          return false;
+      }
+
+      // Check if connection succeeded
+      int err = 0;
+      socklen_t len = sizeof(err);
+      getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len);
+      fcntl(s, F_SETFL, flags);
+      return err == 0;
   }
 #endif
 
@@ -293,7 +374,7 @@ static std::vector<std::string> build_seed_candidates(const std::string& cli_hos
                                                       const std::string& cli_port)
 {
     std::vector<std::string> seeds = gather_default_candidates(cli_host, cli_port);
-    std::vector<std::string> out; out.reserve(seeds.size());
+    std::vector<std::string> out; out.reserve(seeds.size() + 2);
     const std::string port = default_port_str(cli_port);
 
     // Always include CLI-provided host first without filtering
@@ -317,6 +398,20 @@ static std::vector<std::string> build_seed_candidates(const std::string& cli_hos
 
         if (resolves_to_public_ip(h, p)) out.push_back(h+":"+p);
     }
+
+    // ALWAYS add localhost as final fallback for same-machine operation
+    // This ensures wallet works when running alongside the node
+    bool has_localhost = false;
+    for (const auto& hp : out) {
+        if (hp.find("127.0.0.1") != std::string::npos || hp.find("localhost") != std::string::npos) {
+            has_localhost = true;
+            break;
+        }
+    }
+    if (!has_localhost && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
+        out.push_back("127.0.0.1:" + port);
+    }
+
     if (out.empty()) return seeds;
     return out;
 }
@@ -356,8 +451,8 @@ resolve_and_connect_best(const std::vector<std::string>& candidates,
 #ifdef _WIN32
             SOCKET fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if (fd == INVALID_SOCKET) continue;
-            set_timeouts((uintptr_t)fd, timeout_ms);
-            if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) {
+            if (connect_with_timeout((uintptr_t)fd, rp->ai_addr, (int)rp->ai_addrlen, timeout_ms)) {
+                set_timeouts((uintptr_t)fd, timeout_ms);
                 if (connected_host) *connected_host = h;
                 if (res) freeaddrinfo(res);
                 return (uintptr_t)fd;
@@ -366,8 +461,8 @@ resolve_and_connect_best(const std::vector<std::string>& candidates,
 #else
             int fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if (fd < 0) continue;
-            set_timeouts(fd, timeout_ms);
-            if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0) {
+            if (connect_with_timeout(fd, rp->ai_addr, rp->ai_addrlen, timeout_ms)) {
+                set_timeouts(fd, timeout_ms);
                 if (connected_host) *connected_host = h;
                 if (res) freeaddrinfo(res);
                 return fd;
@@ -408,8 +503,8 @@ try_local_fallback(const std::string& port, int timeout_ms, std::string* used_ho
 #ifdef _WIN32
         SOCKET fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (fd == INVALID_SOCKET) continue;
-        set_timeouts((uintptr_t)fd, timeout_ms);
-        if (connect(fd, p->ai_addr, (int)p->ai_addrlen) == 0) {
+        if (connect_with_timeout((uintptr_t)fd, p->ai_addr, (int)p->ai_addrlen, timeout_ms)) {
+            set_timeouts((uintptr_t)fd, timeout_ms);
             if (used_host) *used_host = "127.0.0.1";
             if (res) freeaddrinfo(res);
             return (uintptr_t)fd;
@@ -418,8 +513,8 @@ try_local_fallback(const std::string& port, int timeout_ms, std::string* used_ho
 #else
         int fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (fd < 0) continue;
-        set_timeouts(fd, timeout_ms);
-        if (connect(fd, p->ai_addr, (int)p->ai_addrlen) == 0) {
+        if (connect_with_timeout(fd, p->ai_addr, p->ai_addrlen, timeout_ms)) {
+            set_timeouts(fd, timeout_ms);
             if (used_host) *used_host = "127.0.0.1";
             if (res) freeaddrinfo(res);
             return fd;
@@ -464,16 +559,16 @@ bool P2PLight::connect_and_handshake(const P2POpts& opts, std::string& err){
     std::string used_host;
     sock_ = resolve_and_connect_best(candidates, port, o_.io_timeout_ms, err, &used_host);
 
-    // 2) Local fallback ONLY if no explicit host was provided
-    // (don't silently fall back to localhost when user specified a real host)
+    // 2) Local fallback - ALWAYS try localhost if connection failed
+    // This enables wallet to work on the same machine as the node
 #ifdef _WIN32
-    if (sock_ == (uintptr_t)-1 && o_.host.empty() && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
+    if (sock_ == (uintptr_t)-1 && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
         auto fd_local = try_local_fallback(port, o_.io_timeout_ms, &used_host);
         if (fd_local != (uintptr_t)-1) { sock_ = fd_local; err.clear(); }
     }
     if (sock_ == (uintptr_t)-1) return false;
 #else
-    if (sock_ < 0 && o_.host.empty() && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
+    if (sock_ < 0 && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
         auto fd_local = try_local_fallback(port, o_.io_timeout_ms, &used_host);
         if (fd_local >= 0) { sock_ = fd_local; err.clear(); }
     }

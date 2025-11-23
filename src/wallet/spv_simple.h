@@ -23,6 +23,9 @@ struct SpvOptions {
     // If empty, files are written into the current working directory.
     // Cache files: <cache_dir>/spv_state.dat and <cache_dir>/utxo_cache.dat
     std::string cache_dir; // e.g. "wallets/default"
+
+    // Connection timeout in milliseconds (0 = use default from P2POpts)
+    int timeout_ms = 0;
 };
 
 // Collect UTXOs that pay to any of `pkhs` using only P2P.

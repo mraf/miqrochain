@@ -400,12 +400,18 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     po.host = p2p_host;
     po.port = p2p_port;
     po.user_agent = "/miqwallet-spv:0.5/"; // bumped ua
+    if (opt.timeout_ms > 0) {
+        po.io_timeout_ms = opt.timeout_ms;
+    }
     P2PLight p2p;
     if(!p2p.connect_and_handshake(po, err)) return false;
 
-    // 2) headers -> tip
+    // 2) headers -> tip (this syncs all headers which may take time)
     uint32_t tip_height=0; std::vector<uint8_t> tip_hash_le;
     if(!p2p.get_best_header(tip_height, tip_hash_le, err)){ p2p.close(); return false; }
+
+    // Show progress: tip height
+    // Note: This runs silently to avoid noise, but the caller can show this info
 
     // 3) decide start height from cache (or full/genesis on first run)
     CacheState st{};

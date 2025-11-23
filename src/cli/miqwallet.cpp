@@ -313,12 +313,10 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
         push_unique(seeds, miq::DNS_SEEDS[i], std::to_string(miq::P2P_PORT), seen);
     }
 
-    // 4) NO implicit localhost fallback here (professional default).
-    // If you want to test localhost explicitly: --p2pseed 127.0.0.1  (or MIQ_P2P_SEED=127.0.0.1)
-
     // Final filter: numeric IPs are accepted if public; hostnames must resolve to public.
+    // BUT: also accept localhost/127.0.0.1 for same-machine operation
     std::vector<std::pair<std::string,std::string>> out;
-    out.reserve(seeds.size());
+    out.reserve(seeds.size() + 1);
     for (const auto& hp : seeds){
         const std::string& h = hp.first;
         const std::string& p = hp.second;
@@ -328,8 +326,26 @@ build_seed_candidates(const std::string& cli_host, const std::string& cli_port)
             out.push_back(hp);
             continue;
         }
+        // Accept localhost/loopback explicitly for same-machine operation
+        if (h == "127.0.0.1" || h == "localhost" || h == "::1") {
+            out.push_back(hp);
+            continue;
+        }
         // Hostname path
         if (resolves_to_public_ip(h, p)) out.push_back(hp);
+    }
+
+    // ALWAYS add localhost as final fallback for same-machine operation
+    // This is critical for wallet to work when running alongside the node
+    bool has_localhost = false;
+    for (const auto& hp : out) {
+        if (hp.first == "127.0.0.1" || hp.first == "localhost") {
+            has_localhost = true;
+            break;
+        }
+    }
+    if (!has_localhost && !env_truthy("MIQ_NO_LOCAL_FALLBACK")) {
+        out.emplace_back("127.0.0.1", std::to_string(miq::P2P_PORT));
     }
 
     // Safety: if everything was filtered (e.g., DNS down), keep the original list
@@ -390,6 +406,8 @@ static bool spv_collect_any_seed(const std::vector<std::pair<std::string,std::st
 
     miq::SpvOptions opts{};
     opts.recent_block_window = recent_window;
+    opts.timeout_ms = 5000; // 5 second timeout for faster seed iteration
+    opts.cache_dir = default_wallet_dir(); // Use wallet directory for cache
 
     std::ostringstream diag;
     bool any = false;
@@ -399,20 +417,27 @@ static bool spv_collect_any_seed(const std::vector<std::pair<std::string,std::st
         any = true;
         g_conn_state.record_attempt();
 
-        // Retry each seed with exponential backoff
-        for (int attempt = 0; attempt < wallet_config::MAX_CONNECTION_RETRIES; ++attempt) {
+        // Show which seed we're trying
+        std::cout << "  Trying " << h << ":" << p << "... " << std::flush;
+
+        // Only retry once per seed to avoid long waits
+        const int max_attempts = (h == "127.0.0.1" || h == "localhost") ? 1 : 2;
+
+        for (int attempt = 0; attempt < max_attempts; ++attempt) {
             std::vector<miq::UtxoLite> v;
             std::string e;
 
             if (miq::spv_collect_utxos(h, p, pkhs, opts, v, e)) {
                 // Validate response size
                 if (v.size() > wallet_config::MAX_UTXO_COUNT) {
+                    std::cout << "response too large\n";
                     last_err = "response too large (potential DoS)";
                     continue;
                 }
                 out.swap(v);
                 used_host = h + ":" + p;
                 g_conn_state.record_success();
+                std::cout << "connected! (" << out.size() << " UTXOs)\n";
                 return true;
             }
 
@@ -422,18 +447,20 @@ static bool spv_collect_any_seed(const std::vector<std::pair<std::string,std::st
                                e.find("reset") != std::string::npos ||
                                e.empty());
 
-            if (!should_retry || attempt == wallet_config::MAX_CONNECTION_RETRIES - 1) {
-                diag << "  - " << h << ":" << p << " -> " << (e.empty() ? "connect failed" : e);
+            if (!should_retry || attempt == max_attempts - 1) {
+                std::string err_msg = e.empty() ? "connect failed" : e;
+                std::cout << err_msg << "\n";
+                diag << "  - " << h << ":" << p << " -> " << err_msg;
                 if (attempt > 0) diag << " (after " << (attempt + 1) << " attempts)";
                 diag << "\n";
-                last_err = e.empty() ? "connect failed" : e;
+                last_err = err_msg;
                 g_conn_state.record_failure();
                 break;
             }
 
-            // Exponential backoff before retry
-            int delay = calculate_retry_delay(attempt);
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            // Short delay before retry
+            std::cout << "retrying... " << std::flush;
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
         seed_index++;
     }
@@ -644,9 +671,12 @@ static bool wallet_session(const std::string& cli_host,
 
     auto refresh_and_print = [&]()->std::vector<miq::UtxoLite>{
         std::cout << "\nSyncing (P2P/SPV)…\n";
+        std::cout << "Scanning " << pkhs.size() << " addresses across " << seeds.size() << " seed(s)\n";
         std::vector<miq::UtxoLite> utxos; std::string used_seed, err;
         if(!spv_collect_any_seed(seeds, pkhs, spv_win, utxos, used_seed, err)){
-            std::cout << "SPV failed:\n" << err << "\n";
+            std::cout << "\nSPV failed:\n" << err << "\n";
+            std::cout << "\nTIP: If running on same machine as node, try:\n";
+            std::cout << "  miqwallet --p2pseed=127.0.0.1\n";
             used_seed = "<no-conn>";
         }
 
