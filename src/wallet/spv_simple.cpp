@@ -212,12 +212,13 @@ static bool parse_tx_miq_blockwrapped(R& r, TxParsed& out){
 
     uint32_t lock_time=0; if(!tr.get(&lock_time,4)) return false;
 
-    // coinbase heuristic for MIQ: single input with zero prev hash
+    // coinbase heuristic for MIQ: single input with zero prev hash and vout=0xffffffff
     out.coinbase = false;
     if(in_count==1){
         const auto& in0 = out.vin[0];
         bool allz=true; for(uint8_t b: in0.prev_txid) if(b){ allz=false; break; }
-        if(allz) out.coinbase = true;
+        // Standard coinbase: all-zero prev_txid AND vout=0xffffffff (or 0 for some implementations)
+        if(allz && (in0.vout == 0xffffffffu || in0.vout == 0)) out.coinbase = true;
     }
 
     auto h = dsha256_bytes(r.p + start, tx_size);
@@ -308,6 +309,11 @@ static bool load_state(const std::string& dir, CacheState& st){
     uint32_t want = rd_u32_le(buf.data()+7+4);
     std::vector<uint8_t> body(buf.begin(), buf.begin()+7+4);
     if(csum4(body) != want) return false;
+
+    // Sanity check: height should be reasonable (not 0xFFFFFFFF from corruption)
+    const uint32_t MAX_REASONABLE_HEIGHT = 100000000; // 100M blocks
+    if(height > MAX_REASONABLE_HEIGHT) return false;
+
     st.scanned_upto = height;
     return true;
 }
@@ -340,14 +346,23 @@ static bool load_utxo_cache(const std::string& dir, std::vector<UtxoLite>& out){
     if(std::memcmp(buf.data(), magic, 8)!=0) return false;
     if(buf.size() < 8 + 4 + 4) return false;
     uint32_t cnt = rd_u32_le(buf.data()+8);
+
+    // Sanity check: prevent huge allocations from corrupted files
+    const uint32_t MAX_CACHE_ENTRIES = 10000000; // 10M entries max
+    if(cnt > MAX_CACHE_ENTRIES) return false;
+
     size_t need = 8 + 4 + (size_t)cnt * (32+4+8+20+4+1) + 4;
     if(buf.size() != need) return false;
     uint32_t have = rd_u32_le(buf.data()+need-4);
     std::vector<uint8_t> body(buf.begin(), buf.begin()+need-4);
     if(csum4(body) != have) return false;
 
+    out.reserve(cnt);
     size_t pos = 8 + 4;
     for(uint32_t i=0;i<cnt;i++){
+        // Bounds check before reading
+        if(pos + 32 + 4 + 8 + 20 + 4 + 1 > buf.size()) return false;
+
         UtxoLite u;
         u.txid.assign(buf.begin()+pos, buf.begin()+pos+32); pos+=32;
         u.vout = rd_u32_le(buf.data()+pos); pos+=4;
@@ -410,6 +425,13 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     uint32_t tip_height=0; std::vector<uint8_t> tip_hash_le;
     if(!p2p.get_best_header(tip_height, tip_hash_le, err)){ p2p.close(); return false; }
 
+    // Validate tip hash
+    if(tip_hash_le.size() != 32){
+        err = "invalid tip hash from peer";
+        p2p.close();
+        return false;
+    }
+
     // Show progress: tip height
     // Note: This runs silently to avoid noise, but the caller can show this info
 
@@ -418,8 +440,20 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     const bool have_state = load_state(opt.cache_dir, st);
     uint32_t start_h = 0;
     if(have_state){
-        if(st.scanned_upto < tip_height) start_h = st.scanned_upto + 1;
-        else start_h = tip_height; // nothing to do
+        // Validate cached height against tip
+        if(st.scanned_upto > tip_height){
+            // Chain reorg detected - rescan from before the reorg point
+            // Use a safety margin to handle any reorg
+            const uint32_t reorg_margin = 100;
+            if(tip_height > reorg_margin)
+                start_h = tip_height - reorg_margin;
+            else
+                start_h = 0;
+        } else if(st.scanned_upto < tip_height){
+            start_h = st.scanned_upto + 1;
+        } else {
+            start_h = tip_height; // nothing to do
+        }
     } else {
         // First ever run: if user provided a small window, use it; else go from genesis.
         if(opt.recent_block_window > 0 && opt.recent_block_window < tip_height)
@@ -461,6 +495,7 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     };
 
     auto del_in = [&](const std::vector<uint8_t>& prev_txid, uint32_t vout){
+        // Try both byte orders since txids can be stored in LE or BE
         auto k = key_of(prev_txid, vout);
         auto it = idx.find(k);
         if(it==idx.end()){
@@ -470,9 +505,14 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
         }
         if(it!=idx.end()){
             size_t pos  = it->second;
+            // Bounds check before swap
+            if(view.empty()) return;
             size_t last = view.size()-1;
+            if(pos > last) return; // Safety check
             if(pos!=last){
-                idx[key_of(view[last].txid, view[last].vout)] = pos;
+                // Update index for the element being swapped
+                auto last_key = key_of(view[last].txid, view[last].vout);
+                idx[last_key] = pos;
                 std::swap(view[pos], view[last]);
             }
             view.pop_back();
@@ -493,8 +533,27 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
         const auto& hash_le = bh.first;
         const uint32_t height = bh.second;
 
+        // Validate hash size
+        if(hash_le.size() != 32){
+            err = "invalid block hash size at height " + std::to_string(height);
+            p2p.close();
+            return false;
+        }
+
         std::vector<uint8_t> raw;
-        if(!p2p.get_block_by_hash(hash_le, raw, err)){ p2p.close(); return false; }
+        if(!p2p.get_block_by_hash(hash_le, raw, err)){
+            // Append height info to error for better debugging
+            if(!err.empty()) err += " (at height " + std::to_string(height) + ")";
+            p2p.close();
+            return false;
+        }
+
+        // Validate we got data
+        if(raw.empty()){
+            err = "empty block data at height " + std::to_string(height);
+            p2p.close();
+            return false;
+        }
 
         std::vector<TxParsed> txs;
         if(!parse_block_collect(raw, txs)){ err = "failed to parse block @" + std::to_string(height); p2p.close(); return false; }
