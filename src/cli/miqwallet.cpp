@@ -77,6 +77,53 @@ using miq::COIN;
 namespace ui {
     static bool g_use_colors = true;
 
+    // Detect if terminal supports ANSI escape codes
+    inline bool detect_terminal_colors() {
+#if defined(_WIN32)
+        // On Windows, try to enable VT processing
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (hOut == INVALID_HANDLE_VALUE) return false;
+
+        DWORD mode = 0;
+        if (!GetConsoleMode(hOut, &mode)) return false;
+
+        // Try to enable VT processing
+        if (SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+            return true;
+        }
+
+        // Check for known ANSI-capable terminals
+        const char* term = std::getenv("TERM");
+        const char* wt = std::getenv("WT_SESSION");
+        const char* conemu = std::getenv("ConEmuANSI");
+        if (wt || (conemu && std::strcmp(conemu, "ON") == 0)) return true;
+        if (term && (std::strstr(term, "xterm") || std::strstr(term, "color"))) return true;
+
+        return false;
+#else
+        // On Unix/Linux, check if stdout is a TTY and TERM is set
+        if (!isatty(STDOUT_FILENO)) return false;
+
+        const char* term = std::getenv("TERM");
+        if (!term || !*term) return false;
+
+        // Check for dumb terminal
+        if (std::strcmp(term, "dumb") == 0) return false;
+
+        // Check NO_COLOR environment variable (https://no-color.org/)
+        const char* no_color = std::getenv("NO_COLOR");
+        if (no_color && *no_color) return false;
+
+        // Most modern terminals support ANSI
+        return true;
+#endif
+    }
+
+    // Initialize colors based on terminal detection
+    inline void init_colors() {
+        g_use_colors = detect_terminal_colors();
+    }
+
     // ANSI color codes
     inline std::string reset()   { return g_use_colors ? "\033[0m" : ""; }
     inline std::string bold()    { return g_use_colors ? "\033[1m" : ""; }
@@ -89,7 +136,7 @@ namespace ui {
     inline std::string magenta() { return g_use_colors ? "\033[35m" : ""; }
     inline std::string white()   { return g_use_colors ? "\033[37m" : ""; }
 
-    // Box drawing characters
+    // Box drawing characters (ASCII fallback - works everywhere)
     const char* const BOX_TL = "+";
     const char* const BOX_TR = "+";
     const char* const BOX_BL = "+";
@@ -98,6 +145,150 @@ namespace ui {
     const char* const BOX_V  = "|";
     const char* const BOX_ML = "+";
     const char* const BOX_MR = "+";
+    const char* const BOX_MC = "+";  // Middle cross
+
+    // Enhanced UI components for professional display
+    std::string progress_bar(double percent, int width = 30) {
+        int filled = (int)(percent * width / 100.0);
+        std::string bar = "[";
+        for (int i = 0; i < width; i++) {
+            if (i < filled) bar += "=";
+            else if (i == filled) bar += ">";
+            else bar += " ";
+        }
+        bar += "]";
+        return bar;
+    }
+
+    std::string format_time(int64_t timestamp) {
+        time_t t = (time_t)timestamp;
+        struct tm* tm_info = localtime(&t);
+        char buf[64];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
+        return std::string(buf);
+    }
+
+    std::string format_time_short(int64_t timestamp) {
+        time_t t = (time_t)timestamp;
+        struct tm* tm_info = localtime(&t);
+        char buf[32];
+        strftime(buf, sizeof(buf), "%m/%d %H:%M", tm_info);
+        return std::string(buf);
+    }
+
+    std::string format_time_ago(int64_t timestamp) {
+        int64_t now = (int64_t)time(nullptr);
+        int64_t diff = now - timestamp;
+        if (diff < 60) return std::to_string(diff) + "s ago";
+        if (diff < 3600) return std::to_string(diff / 60) + "m ago";
+        if (diff < 86400) return std::to_string(diff / 3600) + "h ago";
+        return std::to_string(diff / 86400) + "d ago";
+    }
+
+    void print_double_header(const std::string& title, int width = 60) {
+        std::cout << cyan() << bold();
+        std::cout << BOX_TL;
+        for(int i = 0; i < width - 2; i++) std::cout << "=";
+        std::cout << BOX_TR << "\n";
+
+        int padding = (width - 2 - (int)title.size()) / 2;
+        std::cout << BOX_V;
+        for(int i = 0; i < padding; i++) std::cout << " ";
+        std::cout << title;
+        for(int i = 0; i < width - 2 - padding - (int)title.size(); i++) std::cout << " ";
+        std::cout << BOX_V << "\n";
+
+        std::cout << BOX_BL;
+        for(int i = 0; i < width - 2; i++) std::cout << "=";
+        std::cout << BOX_BR << reset() << "\n";
+    }
+
+    void print_table_row(const std::vector<std::pair<std::string, int>>& cols, int total_width = 60) {
+        std::cout << BOX_V;
+        for (const auto& col : cols) {
+            std::string text = col.first;
+            int width = col.second;
+            if ((int)text.size() > width - 2) {
+                text = text.substr(0, width - 5) + "...";
+            }
+            std::cout << " " << std::left << std::setw(width - 2) << text << " ";
+        }
+        std::cout << BOX_V << "\n";
+    }
+
+    void print_table_separator(const std::vector<int>& widths) {
+        std::cout << BOX_ML;
+        for (size_t i = 0; i < widths.size(); i++) {
+            for (int j = 0; j < widths[i]; j++) std::cout << BOX_H;
+            if (i < widths.size() - 1) std::cout << BOX_MC;
+        }
+        std::cout << BOX_MR << "\n";
+    }
+
+    void print_status_line(const std::string& left, const std::string& right, int width = 60) {
+        int space = width - (int)left.size() - (int)right.size() - 4;
+        std::cout << dim() << "[ " << reset() << left;
+        for (int i = 0; i < space; i++) std::cout << " ";
+        std::cout << right << dim() << " ]" << reset() << "\n";
+    }
+
+    // ASCII QR-like code for addresses (simple checkered pattern with address embedded)
+    void print_address_display(const std::string& address, int width = 50) {
+        std::cout << cyan() << bold();
+        std::cout << BOX_TL;
+        for(int i = 0; i < width - 2; i++) std::cout << BOX_H;
+        std::cout << BOX_TR << "\n";
+
+        // Address label
+        std::cout << BOX_V << "  " << dim() << "Receive Address:" << reset() << cyan() << bold();
+        for(int i = 0; i < width - 20; i++) std::cout << " ";
+        std::cout << BOX_V << "\n";
+
+        // Address value (centered)
+        int addr_pad = (width - 2 - (int)address.size()) / 2;
+        std::cout << BOX_V;
+        for(int i = 0; i < addr_pad; i++) std::cout << " ";
+        std::cout << green() << bold() << address << reset() << cyan() << bold();
+        for(int i = 0; i < width - 2 - addr_pad - (int)address.size(); i++) std::cout << " ";
+        std::cout << BOX_V << "\n";
+
+        // Simple visual pattern for easy recognition
+        std::cout << BOX_V << "  ";
+        for(int i = 0; i < width - 6; i++) {
+            unsigned char c = (i < (int)address.size()) ? (unsigned char)address[i] : (unsigned char)i;
+            std::cout << ((c % 2) ? "#" : " ");
+        }
+        std::cout << "  " << BOX_V << "\n";
+
+        std::cout << BOX_BL;
+        for(int i = 0; i < width - 2; i++) std::cout << BOX_H;
+        std::cout << BOX_BR << reset() << "\n";
+    }
+
+    void print_amount_highlight(const std::string& label, const std::string& amount, const std::string& color_fn) {
+        std::cout << "  " << bold() << std::setw(14) << std::left << label << reset();
+        if (color_fn == "green") std::cout << green();
+        else if (color_fn == "cyan") std::cout << cyan();
+        else if (color_fn == "yellow") std::cout << yellow();
+        else if (color_fn == "red") std::cout << red();
+        std::cout << amount << reset() << "\n";
+    }
+
+    void print_menu_item(const std::string& key, const std::string& desc, bool highlight = false) {
+        std::cout << "  ";
+        if (highlight) std::cout << green() << bold();
+        else std::cout << cyan();
+        std::cout << std::setw(3) << key << reset() << "  " << desc << "\n";
+    }
+
+    void clear_screen() {
+        std::cout << "\033[2J\033[H";
+    }
+
+    void print_loading_animation(const std::string& msg, int frame) {
+        const char* spinner[] = {"|", "/", "-", "\\"};
+        std::cout << "\r" << cyan() << "[" << spinner[frame % 4] << "] " << reset() << msg << std::flush;
+    }
 
     void print_header(const std::string& title, int width = 60) {
         std::cout << cyan() << bold();
@@ -133,7 +324,7 @@ namespace ui {
    |_|  |_|___\__\_\    \_/\_/ \__,_|_|_|\___|\__|
 
 )" << reset();
-        std::cout << dim() << "        Professional Cryptocurrency Wallet v1.0" << reset() << "\n\n";
+        std::cout << dim() << "        Professional Cryptocurrency Wallet v2.0" << reset() << "\n\n";
     }
 
     void print_success(const std::string& msg) {
@@ -275,6 +466,207 @@ static void save_pending(const std::string& wdir, const std::set<OutpointKey>& s
     if(!f.good()) return;
     for(const auto& k : st){
         f << k.txid_hex << ":" << k.vout << "\n";
+    }
+}
+
+// =============================================================================
+// TRANSACTION HISTORY - Professional tracking
+// =============================================================================
+struct TxHistoryEntry {
+    std::string txid_hex;
+    int64_t timestamp{0};
+    int64_t amount{0};       // positive = received, negative = sent
+    uint64_t fee{0};
+    uint32_t confirmations{0};
+    std::string direction;   // "sent", "received", "self"
+    std::string to_address;
+    std::string from_address;
+    std::string memo;
+};
+
+static std::string tx_history_path(const std::string& wdir){
+    return join_path(wdir, "tx_history.dat");
+}
+
+static void load_tx_history(const std::string& wdir, std::vector<TxHistoryEntry>& out){
+    out.clear();
+    std::ifstream f(tx_history_path(wdir));
+    if(!f.good()) return;
+    std::string line;
+    while(std::getline(f, line)){
+        if(line.empty() || line[0] == '#') continue;
+        // Format: txid|timestamp|amount|fee|confirmations|direction|to|from|memo
+        std::vector<std::string> parts;
+        size_t start = 0, end = 0;
+        while((end = line.find('|', start)) != std::string::npos){
+            parts.push_back(line.substr(start, end - start));
+            start = end + 1;
+        }
+        parts.push_back(line.substr(start));
+
+        if(parts.size() >= 6){
+            TxHistoryEntry e;
+            e.txid_hex = parts[0];
+            e.timestamp = std::strtoll(parts[1].c_str(), nullptr, 10);
+            e.amount = std::strtoll(parts[2].c_str(), nullptr, 10);
+            e.fee = std::strtoull(parts[3].c_str(), nullptr, 10);
+            e.confirmations = (uint32_t)std::strtoul(parts[4].c_str(), nullptr, 10);
+            e.direction = parts[5];
+            if(parts.size() > 6) e.to_address = parts[6];
+            if(parts.size() > 7) e.from_address = parts[7];
+            if(parts.size() > 8) e.memo = parts[8];
+            out.push_back(e);
+        }
+    }
+    // Sort by timestamp descending (newest first)
+    std::sort(out.begin(), out.end(), [](const TxHistoryEntry& a, const TxHistoryEntry& b){
+        return a.timestamp > b.timestamp;
+    });
+}
+
+static void save_tx_history(const std::string& wdir, const std::vector<TxHistoryEntry>& hist){
+    std::ofstream f(tx_history_path(wdir), std::ios::out | std::ios::trunc);
+    if(!f.good()) return;
+    f << "# MIQ Wallet Transaction History\n";
+    for(const auto& e : hist){
+        f << e.txid_hex << "|" << e.timestamp << "|" << e.amount << "|"
+          << e.fee << "|" << e.confirmations << "|" << e.direction << "|"
+          << e.to_address << "|" << e.from_address << "|" << e.memo << "\n";
+    }
+}
+
+static void add_tx_history(const std::string& wdir, const TxHistoryEntry& entry){
+    std::vector<TxHistoryEntry> hist;
+    load_tx_history(wdir, hist);
+
+    // Check for duplicate
+    for(const auto& e : hist){
+        if(e.txid_hex == entry.txid_hex) return; // Already exists
+    }
+
+    hist.push_back(entry);
+
+    // Keep only last 1000 transactions
+    if(hist.size() > 1000){
+        hist.erase(hist.begin(), hist.begin() + (hist.size() - 1000));
+    }
+
+    save_tx_history(wdir, hist);
+}
+
+// =============================================================================
+// ADDRESS BOOK - Professional contacts management
+// =============================================================================
+struct AddressBookEntry {
+    std::string address;
+    std::string label;
+    std::string notes;
+    int64_t created_at{0};
+    int64_t last_used{0};
+};
+
+static std::string address_book_path(const std::string& wdir){
+    return join_path(wdir, "address_book.dat");
+}
+
+static void load_address_book(const std::string& wdir, std::vector<AddressBookEntry>& out){
+    out.clear();
+    std::ifstream f(address_book_path(wdir));
+    if(!f.good()) return;
+    std::string line;
+    while(std::getline(f, line)){
+        if(line.empty() || line[0] == '#') continue;
+        // Format: address|label|notes|created|last_used
+        std::vector<std::string> parts;
+        size_t start = 0, end = 0;
+        while((end = line.find('|', start)) != std::string::npos){
+            parts.push_back(line.substr(start, end - start));
+            start = end + 1;
+        }
+        parts.push_back(line.substr(start));
+
+        if(parts.size() >= 2){
+            AddressBookEntry e;
+            e.address = parts[0];
+            e.label = parts[1];
+            if(parts.size() > 2) e.notes = parts[2];
+            if(parts.size() > 3) e.created_at = std::strtoll(parts[3].c_str(), nullptr, 10);
+            if(parts.size() > 4) e.last_used = std::strtoll(parts[4].c_str(), nullptr, 10);
+            out.push_back(e);
+        }
+    }
+    // Sort by label
+    std::sort(out.begin(), out.end(), [](const AddressBookEntry& a, const AddressBookEntry& b){
+        return a.label < b.label;
+    });
+}
+
+static void save_address_book(const std::string& wdir, const std::vector<AddressBookEntry>& book){
+    std::ofstream f(address_book_path(wdir), std::ios::out | std::ios::trunc);
+    if(!f.good()) return;
+    f << "# MIQ Wallet Address Book\n";
+    for(const auto& e : book){
+        f << e.address << "|" << e.label << "|" << e.notes << "|"
+          << e.created_at << "|" << e.last_used << "\n";
+    }
+}
+
+static void add_to_address_book(const std::string& wdir, const std::string& address,
+                                const std::string& label, const std::string& notes = ""){
+    std::vector<AddressBookEntry> book;
+    load_address_book(wdir, book);
+
+    // Check for duplicate address
+    for(auto& e : book){
+        if(e.address == address){
+            e.label = label;
+            if(!notes.empty()) e.notes = notes;
+            e.last_used = (int64_t)time(nullptr);
+            save_address_book(wdir, book);
+            return;
+        }
+    }
+
+    AddressBookEntry e;
+    e.address = address;
+    e.label = label;
+    e.notes = notes;
+    e.created_at = (int64_t)time(nullptr);
+    e.last_used = e.created_at;
+    book.push_back(e);
+
+    save_address_book(wdir, book);
+}
+
+// =============================================================================
+// FEE ESTIMATION - Professional fee calculation
+// =============================================================================
+static uint64_t estimate_tx_fee(size_t num_inputs, size_t num_outputs, uint64_t fee_per_byte = 1){
+    // Estimate transaction size:
+    // Base: ~10 bytes (version, locktime, etc.)
+    // Per input: ~148 bytes (outpoint + scriptSig + sequence)
+    // Per output: ~34 bytes (value + scriptPubKey)
+    size_t estimated_size = 10 + (num_inputs * 148) + (num_outputs * 34);
+    return estimated_size * fee_per_byte;
+}
+
+static std::string fee_priority_label(int priority){
+    switch(priority){
+        case 0: return "Economy (1 sat/byte)";
+        case 1: return "Normal (2 sat/byte)";
+        case 2: return "Priority (5 sat/byte)";
+        case 3: return "Urgent (10 sat/byte)";
+        default: return "Custom";
+    }
+}
+
+static uint64_t fee_priority_rate(int priority){
+    switch(priority){
+        case 0: return 1;
+        case 1: return 2;
+        case 2: return 5;
+        case 3: return 10;
+        default: return 1;
     }
 }
 
@@ -759,28 +1151,293 @@ static bool wallet_session(const std::string& cli_host,
         ui::print_separator(50);
         std::cout << "\n";
         std::cout << ui::bold() << "  WALLET MENU" << ui::reset() << "\n\n";
-        std::cout << "  " << ui::cyan() << "1" << ui::reset() << "  View Receive Addresses\n";
-        std::cout << "  " << ui::cyan() << "2" << ui::reset() << "  Send MIQ\n";
-        std::cout << "  " << ui::cyan() << "3" << ui::reset() << "  Generate New Address\n";
-        std::cout << "  " << ui::cyan() << "r" << ui::reset() << "  Refresh Balance\n";
-        std::cout << "  " << ui::cyan() << "q" << ui::reset() << "  Back to Main Menu\n";
+
+        // Primary actions
+        std::cout << ui::dim() << "  Actions:" << ui::reset() << "\n";
+        ui::print_menu_item("1", "View Receive Addresses");
+        ui::print_menu_item("2", "Send MIQ");
+        ui::print_menu_item("3", "Generate New Address");
+
+        // Information
+        std::cout << "\n" << ui::dim() << "  Information:" << ui::reset() << "\n";
+        ui::print_menu_item("4", "Transaction History");
+        ui::print_menu_item("5", "Address Book");
+        ui::print_menu_item("6", "Wallet Info");
+
+        // System
+        std::cout << "\n" << ui::dim() << "  System:" << ui::reset() << "\n";
+        ui::print_menu_item("r", "Refresh Balance");
+        ui::print_menu_item("h", "Help");
+        ui::print_menu_item("q", "Back to Main Menu");
         std::cout << "\n";
 
         std::string c = ui::prompt("Select option: ");
         c = trim(c);
 
         // =================================================================
+        // OPTION 4: Transaction History
+        // =================================================================
+        if(c == "4"){
+            std::cout << "\n";
+            ui::print_double_header("TRANSACTION HISTORY", 60);
+            std::cout << "\n";
+
+            std::vector<TxHistoryEntry> history;
+            load_tx_history(wdir, history);
+
+            if(history.empty()){
+                std::cout << "  " << ui::dim() << "No transactions yet." << ui::reset() << "\n";
+                std::cout << "  " << ui::dim() << "Send or receive MIQ to see transaction history." << ui::reset() << "\n\n";
+            } else {
+                // Show last 20 transactions
+                int show_count = std::min((int)history.size(), 20);
+
+                std::cout << ui::dim() << "  Recent transactions (showing " << show_count << " of "
+                          << history.size() << "):" << ui::reset() << "\n\n";
+
+                for(int i = 0; i < show_count; i++){
+                    const auto& tx = history[i];
+
+                    // Direction indicator
+                    std::string dir_symbol, dir_color;
+                    if(tx.direction == "sent"){
+                        dir_symbol = "[-]";
+                        dir_color = "red";
+                    } else if(tx.direction == "received"){
+                        dir_symbol = "[+]";
+                        dir_color = "green";
+                    } else {
+                        dir_symbol = "[=]";
+                        dir_color = "yellow";
+                    }
+
+                    // Format amount
+                    std::string amt_str;
+                    if(tx.amount >= 0){
+                        amt_str = "+" + fmt_amount_short((uint64_t)tx.amount) + " MIQ";
+                    } else {
+                        amt_str = fmt_amount_short((uint64_t)(-tx.amount)) + " MIQ";
+                    }
+
+                    // Print transaction
+                    std::cout << "  ";
+                    if(dir_color == "red") std::cout << ui::red();
+                    else if(dir_color == "green") std::cout << ui::green();
+                    else std::cout << ui::yellow();
+                    std::cout << dir_symbol << ui::reset();
+
+                    std::cout << " " << ui::dim() << ui::format_time_short(tx.timestamp) << ui::reset();
+                    std::cout << "  " << std::setw(18) << std::right << amt_str;
+
+                    if(tx.confirmations == 0){
+                        std::cout << "  " << ui::yellow() << "(unconfirmed)" << ui::reset();
+                    } else if(tx.confirmations < 6){
+                        std::cout << "  " << ui::dim() << "(" << tx.confirmations << " conf)" << ui::reset();
+                    }
+
+                    std::cout << "\n";
+
+                    // Show address on second line
+                    if(!tx.to_address.empty() && tx.direction == "sent"){
+                        std::cout << "      " << ui::dim() << "To: " << tx.to_address.substr(0, 30)
+                                  << (tx.to_address.size() > 30 ? "..." : "") << ui::reset() << "\n";
+                    }
+                }
+
+                std::cout << "\n  " << ui::dim() << "Press ENTER to return..." << ui::reset();
+                std::string dummy;
+                std::getline(std::cin, dummy);
+            }
+            continue;
+        }
+
+        // =================================================================
+        // OPTION 5: Address Book
+        // =================================================================
+        if(c == "5"){
+            std::cout << "\n";
+            ui::print_double_header("ADDRESS BOOK", 60);
+            std::cout << "\n";
+
+            std::vector<AddressBookEntry> book;
+            load_address_book(wdir, book);
+
+            if(book.empty()){
+                std::cout << "  " << ui::dim() << "Address book is empty." << ui::reset() << "\n\n";
+            } else {
+                for(size_t i = 0; i < book.size(); i++){
+                    const auto& entry = book[i];
+                    std::cout << "  " << ui::cyan() << "[" << (i+1) << "]" << ui::reset()
+                              << " " << ui::bold() << entry.label << ui::reset() << "\n";
+                    std::cout << "      " << ui::dim() << entry.address << ui::reset() << "\n";
+                    if(!entry.notes.empty()){
+                        std::cout << "      " << ui::dim() << "Note: " << entry.notes << ui::reset() << "\n";
+                    }
+                }
+                std::cout << "\n";
+            }
+
+            // Address book submenu
+            std::cout << "  " << ui::cyan() << "a" << ui::reset() << "  Add new contact\n";
+            std::cout << "  " << ui::cyan() << "d" << ui::reset() << "  Delete contact\n";
+            std::cout << "  " << ui::cyan() << "q" << ui::reset() << "  Back\n\n";
+
+            std::string ab_cmd = ui::prompt("Address book action: ");
+            ab_cmd = trim(ab_cmd);
+
+            if(ab_cmd == "a"){
+                std::cout << "\n";
+                std::string new_label = ui::prompt("Contact name: ");
+                new_label = trim(new_label);
+                if(new_label.empty()){
+                    ui::print_error("Name cannot be empty");
+                    continue;
+                }
+
+                std::string new_addr = ui::prompt("Address: ");
+                new_addr = trim(new_addr);
+
+                // Validate address
+                uint8_t ver = 0;
+                std::vector<uint8_t> payload;
+                if(!miq::base58check_decode(new_addr, ver, payload) || ver != miq::VERSION_P2PKH || payload.size() != 20){
+                    ui::print_error("Invalid address format");
+                    continue;
+                }
+
+                std::string notes = ui::prompt("Notes (optional): ");
+                notes = trim(notes);
+
+                add_to_address_book(wdir, new_addr, new_label, notes);
+                ui::print_success("Contact added successfully!");
+            }
+            else if(ab_cmd == "d" && !book.empty()){
+                std::string idx_str = ui::prompt("Contact number to delete: ");
+                int idx = std::atoi(trim(idx_str).c_str()) - 1;
+                if(idx >= 0 && idx < (int)book.size()){
+                    if(ui::confirm("Delete '" + book[idx].label + "'?")){
+                        book.erase(book.begin() + idx);
+                        save_address_book(wdir, book);
+                        ui::print_success("Contact deleted");
+                    }
+                } else {
+                    ui::print_error("Invalid contact number");
+                }
+            }
+            continue;
+        }
+
+        // =================================================================
+        // OPTION 6: Wallet Info
+        // =================================================================
+        if(c == "6"){
+            std::cout << "\n";
+            ui::print_double_header("WALLET INFORMATION", 60);
+            std::cout << "\n";
+
+            std::cout << "  " << ui::bold() << "Wallet Directory:" << ui::reset() << "\n";
+            std::cout << "    " << ui::cyan() << wdir << ui::reset() << "\n\n";
+
+            std::cout << "  " << ui::bold() << "Address Statistics:" << ui::reset() << "\n";
+            std::cout << "    Receive addresses used: " << meta.next_recv << "\n";
+            std::cout << "    Change addresses used:  " << meta.next_change << "\n\n";
+
+            std::cout << "  " << ui::bold() << "UTXO Statistics:" << ui::reset() << "\n";
+            std::cout << "    Total UTXOs: " << utxos.size() << "\n";
+
+            uint64_t min_utxo = UINT64_MAX, max_utxo = 0;
+            for(const auto& u : utxos){
+                min_utxo = std::min(min_utxo, u.value);
+                max_utxo = std::max(max_utxo, u.value);
+            }
+            if(!utxos.empty()){
+                std::cout << "    Smallest UTXO: " << fmt_amount(min_utxo) << " MIQ\n";
+                std::cout << "    Largest UTXO:  " << fmt_amount(max_utxo) << " MIQ\n";
+            }
+
+            std::cout << "\n  " << ui::bold() << "Connected Node:" << ui::reset() << "\n";
+            std::cout << "    " << used_seed << "\n\n";
+
+            std::cout << "  " << ui::dim() << "Press ENTER to return..." << ui::reset();
+            std::string dummy;
+            std::getline(std::cin, dummy);
+            continue;
+        }
+
+        // =================================================================
+        // OPTION h: Help
+        // =================================================================
+        if(c == "h" || c == "H"){
+            std::cout << "\n";
+            ui::print_double_header("WALLET HELP", 60);
+            std::cout << "\n";
+
+            std::cout << ui::bold() << "  Quick Start:" << ui::reset() << "\n";
+            std::cout << "  1. Generate a new address (option 3) to receive MIQ\n";
+            std::cout << "  2. Share this address with others to receive payments\n";
+            std::cout << "  3. Use Send (option 2) to send MIQ to others\n\n";
+
+            std::cout << ui::bold() << "  Security Tips:" << ui::reset() << "\n";
+            std::cout << "  - Always verify the recipient address before sending\n";
+            std::cout << "  - Keep your mnemonic phrase secure and private\n";
+            std::cout << "  - Use strong encryption passphrase for your wallet\n";
+            std::cout << "  - Backup your wallet files regularly\n\n";
+
+            std::cout << ui::bold() << "  Transaction Status:" << ui::reset() << "\n";
+            std::cout << "  - Unconfirmed: Transaction not yet in a block\n";
+            std::cout << "  - 1-5 conf: Recent transaction, not fully confirmed\n";
+            std::cout << "  - 6+ conf: Transaction is considered confirmed\n";
+            std::cout << "  - Immature: Mining rewards, need 100 confirmations\n\n";
+
+            std::cout << ui::bold() << "  Fee Priorities:" << ui::reset() << "\n";
+            std::cout << "  - Economy (1 sat/byte): Cheap, may take longer\n";
+            std::cout << "  - Normal (2 sat/byte): Standard speed\n";
+            std::cout << "  - Priority (5 sat/byte): Faster confirmation\n";
+            std::cout << "  - Urgent (10 sat/byte): Fastest confirmation\n\n";
+
+            std::cout << "  " << ui::dim() << "Press ENTER to return..." << ui::reset();
+            std::string dummy;
+            std::getline(std::cin, dummy);
+            continue;
+        }
+
+        // =================================================================
         // OPTION 1: List Receive Addresses
         // =================================================================
         if(c == "1"){
             std::cout << "\n";
-            ui::print_header("RECEIVE ADDRESSES", 50);
+            ui::print_double_header("RECEIVE ADDRESSES", 50);
             std::cout << "\n";
 
+            // Get primary receive address (current)
+            std::string primary_addr;
+            uint32_t primary_idx = meta.next_recv > 0 ? meta.next_recv - 1 : 0;
+            {
+                auto it = addr_cache.find(primary_idx);
+                if(it != addr_cache.end()){
+                    primary_addr = it->second;
+                } else {
+                    miq::HdWallet tmp(seed, meta);
+                    if(tmp.GetAddressAt(primary_idx, primary_addr)){
+                        addr_cache[primary_idx] = primary_addr;
+                    }
+                }
+            }
+
+            // Show primary address prominently
+            if(!primary_addr.empty()){
+                std::cout << "  " << ui::bold() << "Primary Address:" << ui::reset() << "\n";
+                ui::print_address_display(primary_addr, 48);
+                std::cout << "\n";
+            }
+
+            // Show address history
             int count = std::max(1, (int)meta.next_recv);
             int show = std::min(count, 10);
 
-            for(int i = 0; i < show; i++){
+            std::cout << "  " << ui::bold() << "Address History:" << ui::reset() << "\n\n";
+
+            for(int i = show - 1; i >= 0; i--){
                 std::string addr;
                 auto it = addr_cache.find((uint32_t)i);
                 if(it != addr_cache.end()){
@@ -793,29 +1450,97 @@ static bool wallet_session(const std::string& cli_host,
                 }
 
                 if(!addr.empty()){
-                    std::cout << "  " << ui::dim() << "[" << i << "]" << ui::reset()
-                              << " " << ui::cyan() << addr << ui::reset() << "\n";
+                    bool is_current = (i == (int)primary_idx);
+                    std::cout << "  ";
+                    if(is_current){
+                        std::cout << ui::green() << ">" << ui::reset();
+                    } else {
+                        std::cout << " ";
+                    }
+                    std::cout << ui::dim() << "[" << std::setw(2) << i << "]" << ui::reset();
+
+                    if(is_current){
+                        std::cout << " " << ui::cyan() << ui::bold() << addr << ui::reset();
+                        std::cout << " " << ui::green() << "(current)" << ui::reset();
+                    } else {
+                        std::cout << " " << ui::dim() << addr << ui::reset();
+                    }
+                    std::cout << "\n";
                 }
             }
 
             if(count > show){
                 std::cout << "\n  " << ui::dim() << "(" << (count - show)
-                          << " more addresses)" << ui::reset() << "\n";
+                          << " more addresses available)" << ui::reset() << "\n";
             }
 
-            std::cout << "\n  " << ui::dim() << "Tip: Share these addresses to receive MIQ" << ui::reset() << "\n\n";
+            std::cout << "\n  " << ui::cyan() << "n" << ui::reset() << "  Generate new address\n";
+            std::cout << "  " << ui::cyan() << "c" << ui::reset() << "  Copy primary address to clipboard\n";
+            std::cout << "  " << ui::cyan() << "q" << ui::reset() << "  Back\n\n";
+
+            std::string recv_cmd = ui::prompt("Action: ");
+            recv_cmd = trim(recv_cmd);
+
+            if(recv_cmd == "n"){
+                // Generate new address
+                miq::HdWallet hw(seed, meta);
+                std::string newaddr;
+                if(hw.GetNextAddress(newaddr)){
+                    auto m2 = meta; m2.next_recv++;
+                    std::string e;
+                    if(miq::SaveHdWallet(wdir, seed, m2, pass, e)){
+                        meta = m2;
+                        addr_cache[m2.next_recv - 1] = newaddr;
+                        std::cout << "\n";
+                        ui::print_success("New address generated!");
+                        ui::print_address_display(newaddr, 48);
+                    } else {
+                        ui::print_error("Failed to save: " + e);
+                    }
+                }
+            }
+            else if(recv_cmd == "c" && !primary_addr.empty()){
+                // Note: actual clipboard access would need platform-specific code
+                std::cout << "\n  " << ui::dim() << "Address: " << primary_addr << ui::reset() << "\n";
+                std::cout << "  " << ui::dim() << "(Copy the address above manually)" << ui::reset() << "\n\n";
+            }
         }
         // =================================================================
         // OPTION 2: Send MIQ
         // =================================================================
         else if(c == "2"){
             std::cout << "\n";
-            ui::print_header("SEND MIQ", 50);
+            ui::print_double_header("SEND MIQ", 50);
             std::cout << "\n";
 
-            // Get recipient address
-            std::string to = ui::prompt("Recipient address: ");
-            to = trim(to);
+            // Check address book for quick selection
+            std::vector<AddressBookEntry> book;
+            load_address_book(wdir, book);
+
+            std::string to;
+
+            if(!book.empty()){
+                std::cout << "  " << ui::dim() << "Quick select from address book:" << ui::reset() << "\n";
+                for(size_t i = 0; i < std::min(book.size(), (size_t)5); i++){
+                    std::cout << "    " << ui::cyan() << "[" << (i+1) << "]" << ui::reset()
+                              << " " << book[i].label << "\n";
+                }
+                std::cout << "    " << ui::cyan() << "[0]" << ui::reset() << " Enter address manually\n\n";
+
+                std::string sel = ui::prompt("Select (0 for manual): ");
+                sel = trim(sel);
+                int idx = std::atoi(sel.c_str());
+                if(idx > 0 && idx <= (int)book.size()){
+                    to = book[idx-1].address;
+                    std::cout << "  " << ui::dim() << "Sending to: " << book[idx-1].label << ui::reset() << "\n\n";
+                }
+            }
+
+            // Manual address entry
+            if(to.empty()){
+                to = ui::prompt("Recipient address: ");
+                to = trim(to);
+            }
 
             if(to.empty()){
                 ui::print_error("No address entered");
@@ -834,6 +1559,20 @@ static bool wallet_session(const std::string& cli_host,
             // Get amount
             std::string amt = ui::prompt("Amount (MIQ): ");
             amt = trim(amt);
+
+            // Fee priority selection
+            std::cout << "\n  " << ui::bold() << "Fee Priority:" << ui::reset() << "\n";
+            std::cout << "    " << ui::cyan() << "[0]" << ui::reset() << " Economy - 1 sat/byte (slower)\n";
+            std::cout << "    " << ui::cyan() << "[1]" << ui::reset() << " Normal - 2 sat/byte (recommended)\n";
+            std::cout << "    " << ui::cyan() << "[2]" << ui::reset() << " Priority - 5 sat/byte (faster)\n";
+            std::cout << "    " << ui::cyan() << "[3]" << ui::reset() << " Urgent - 10 sat/byte (fastest)\n\n";
+
+            std::string fee_sel = ui::prompt("Fee priority [1]: ");
+            fee_sel = trim(fee_sel);
+            int fee_priority = fee_sel.empty() ? 1 : std::atoi(fee_sel.c_str());
+            if(fee_priority < 0 || fee_priority > 3) fee_priority = 1;
+
+            uint64_t fee_rate = fee_priority_rate(fee_priority);
 
             uint64_t amount = 0;
             try {
@@ -881,7 +1620,8 @@ static bool wallet_session(const std::string& cli_host,
                     return a.value > b.value;
                 });
 
-            // Select inputs
+            // Select inputs (use selected fee rate)
+            uint64_t fee_rate_kb = fee_rate * 1000;  // Convert sat/byte to sat/kB
             miq::Transaction tx;
             uint64_t in_sum = 0;
             for(const auto& u : spendables){
@@ -890,7 +1630,7 @@ static bool wallet_session(const std::string& cli_host,
                 in.prev.vout = u.vout;
                 tx.vin.push_back(in);
                 in_sum += u.value;
-                uint64_t fee_guess = fee_for(tx.vin.size(), 2, 1000);
+                uint64_t fee_guess = fee_for(tx.vin.size(), 2, fee_rate_kb);
                 if(in_sum >= amount + fee_guess) break;
             }
 
@@ -901,12 +1641,12 @@ static bool wallet_session(const std::string& cli_host,
                 continue;
             }
 
-            // Calculate fee and change
+            // Calculate fee and change using selected fee rate
             uint64_t fee_final = 0, change = 0;
             {
-                auto fee2 = fee_for(tx.vin.size(), 2, 1000);
+                auto fee2 = fee_for(tx.vin.size(), 2, fee_rate_kb);
                 if(in_sum < amount + fee2){
-                    auto fee1 = fee_for(tx.vin.size(), 1, 1000);
+                    auto fee1 = fee_for(tx.vin.size(), 1, fee_rate_kb);
                     if(in_sum < amount + fee1){
                         ui::print_error("Insufficient funds for transaction fee");
                         continue;
@@ -916,9 +1656,9 @@ static bool wallet_session(const std::string& cli_host,
                 } else {
                     fee_final = fee2;
                     change = in_sum - amount - fee_final;
-                    if(change < 1000){
+                    if(change < wallet_config::DUST_THRESHOLD){
                         change = 0;
-                        fee_final = fee_for(tx.vin.size(), 1, 1000);
+                        fee_final = fee_for(tx.vin.size(), 1, fee_rate_kb);
                     }
                 }
             }
@@ -1355,6 +2095,9 @@ static bool flow_load_existing_wallet(const std::string& cli_host, const std::st
 int main(int argc, char** argv){
     std::ios::sync_with_stdio(false);
     winsock_ensure();
+
+    // Initialize colors based on terminal capability detection
+    ui::init_colors();
 
     std::string cli_host;
     std::string cli_port = std::to_string(miq::P2P_PORT);
