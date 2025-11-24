@@ -525,6 +525,69 @@ static void clear_spv_cache(const std::string& wdir){
 }
 
 // =============================================================================
+// WALLET FINGERPRINT - Prevents cache contamination between wallets
+// =============================================================================
+
+// Generate a fingerprint from wallet's first few addresses
+static std::string generate_wallet_fingerprint(const std::vector<std::vector<uint8_t>>& pkhs){
+    if(pkhs.empty()) return "";
+
+    // Use first 5 PKHs to create fingerprint
+    std::vector<uint8_t> data;
+    size_t count = std::min(pkhs.size(), (size_t)5);
+    for(size_t i = 0; i < count; ++i){
+        data.insert(data.end(), pkhs[i].begin(), pkhs[i].end());
+    }
+
+    auto hash = miq::dsha256(data);
+    return miq::to_hex(hash).substr(0, 16);  // First 16 chars
+}
+
+static std::string fingerprint_file_path(const std::string& wdir){
+    return join_path(wdir, "wallet_fingerprint.dat");
+}
+
+static std::string load_cached_fingerprint(const std::string& wdir){
+    std::ifstream f(fingerprint_file_path(wdir));
+    if(!f.good()) return "";
+    std::string fp;
+    std::getline(f, fp);
+    return fp;
+}
+
+static void save_wallet_fingerprint(const std::string& wdir, const std::string& fp){
+    std::ofstream f(fingerprint_file_path(wdir), std::ios::out | std::ios::trunc);
+    if(f.good()) f << fp << "\n";
+}
+
+// Check if cache belongs to current wallet, clear if not
+static void verify_cache_ownership(const std::string& wdir,
+                                    const std::vector<std::vector<uint8_t>>& pkhs){
+    std::string current_fp = generate_wallet_fingerprint(pkhs);
+    std::string cached_fp = load_cached_fingerprint(wdir);
+
+    if(cached_fp.empty()){
+        // No fingerprint - new cache or old format, save current
+        save_wallet_fingerprint(wdir, current_fp);
+        return;
+    }
+
+    if(cached_fp != current_fp){
+        // Different wallet! Clear ALL cached data
+        clear_spv_cache(wdir);
+
+        // Also clear pending spent since it's wallet-specific
+        std::remove(join_path(wdir, "pending_spent.dat").c_str());
+
+        // Save new fingerprint
+        save_wallet_fingerprint(wdir, current_fp);
+
+        // Note: Cache was invalidated due to wallet fingerprint mismatch
+        // This happens when switching between different wallets
+    }
+}
+
+// =============================================================================
 // PENDING-SPENT CACHE
 // =============================================================================
 struct OutpointKey {
@@ -2197,6 +2260,10 @@ static bool wallet_session(const std::string& cli_host,
     for (const auto& k : keys) {
         pkh2ci[miq::to_hex(k.pkh)] = {k.chain, k.index};
     }
+
+    // CRITICAL: Verify cache belongs to this wallet, clear if different wallet
+    // This prevents using another wallet's cached UTXOs
+    verify_cache_ownership(wdir, pkhs);
 
     auto seeds = build_seed_candidates(cli_host, cli_port);
     const uint32_t spv_win = (uint32_t)env_u64("MIQ_SPV_WINDOW", 0);
