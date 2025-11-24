@@ -1,5 +1,6 @@
-// src/miqwallet.cpp - Professional MIQ Wallet CLI
-// Production-grade SPV wallet with enterprise reliability and beautiful UI
+// src/miqwallet.cpp - Professional MIQ Wallet CLI v1.0 Stable
+// Production-grade SPV wallet with enterprise reliability, offline transactions,
+// persistent queue system, and professional PowerShell 5+ compatible UI
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -65,6 +66,16 @@ namespace wallet_config {
     // User experience
     static constexpr int SYNC_PROGRESS_INTERVAL_MS = 500;
     static constexpr int BALANCE_REFRESH_COOLDOWN_MS = 3000;
+
+    // Transaction queue system
+    static constexpr int MAX_QUEUE_SIZE = 1000;
+    static constexpr int AUTO_BROADCAST_INTERVAL_MS = 30000;
+    static constexpr int TX_EXPIRY_HOURS = 72;
+    static constexpr int MAX_BROADCAST_ATTEMPTS = 10;
+
+    // Animation timings (PowerShell 5+ compatible)
+    static constexpr int ANIMATION_FRAME_MS = 100;
+    static constexpr int SPINNER_FRAME_MS = 80;
 }
 
 #include "constants.h"
@@ -304,6 +315,73 @@ namespace ui {
         std::cout << "\r" << cyan() << "[" << spinner[frame % 4] << "] " << reset() << msg << std::flush;
     }
 
+    // Enhanced spinner for PowerShell 5+ (Braille pattern animation)
+    void print_spinner(const std::string& msg, int frame) {
+        // Works well in PowerShell 5+ and modern terminals
+        const char* frames[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+        const char* fallback[] = {"[*   ]", "[ *  ]", "[  * ]", "[   *]", "[  * ]", "[ *  ]"};
+
+        // Use ASCII fallback for better compatibility
+        std::cout << "\r" << cyan() << fallback[frame % 6] << " " << reset() << msg
+                  << std::string(20, ' ') << std::flush;
+    }
+
+    // Animated progress bar
+    void print_animated_progress(const std::string& msg, double percent, int frame) {
+        int width = 25;
+        int filled = (int)(percent * width / 100.0);
+
+        std::cout << "\r  " << msg << " ";
+        std::cout << cyan() << "[";
+
+        for (int i = 0; i < width; i++) {
+            if (i < filled) {
+                std::cout << green() << "=" << reset() << cyan();
+            } else if (i == filled) {
+                // Animated cursor
+                const char* cursors[] = {">", "*", "+", "*"};
+                std::cout << yellow() << cursors[frame % 4] << reset() << cyan();
+            } else {
+                std::cout << dim() << "-" << reset() << cyan();
+            }
+        }
+
+        std::cout << "]" << reset() << " " << std::fixed << std::setprecision(1) << percent << "%"
+                  << std::string(10, ' ') << std::flush;
+    }
+
+    // Network status indicator
+    void print_network_status(bool connected, const std::string& node = "") {
+        if (connected) {
+            std::cout << green() << "[ONLINE]" << reset();
+            if (!node.empty()) {
+                std::cout << dim() << " " << node << reset();
+            }
+        } else {
+            std::cout << red() << "[OFFLINE]" << reset();
+        }
+        std::cout << "\n";
+    }
+
+    // Transaction status badge
+    std::string tx_status_badge(const std::string& status) {
+        if (status == "confirmed") return green() + "[CONFIRMED]" + reset();
+        if (status == "pending") return yellow() + "[PENDING]" + reset();
+        if (status == "queued") return cyan() + "[QUEUED]" + reset();
+        if (status == "failed") return red() + "[FAILED]" + reset();
+        if (status == "expired") return dim() + "[EXPIRED]" + reset();
+        return dim() + "[" + status + "]" + reset();
+    }
+
+    // Pulsing text effect for important messages
+    void print_pulse(const std::string& msg, int frame) {
+        if ((frame / 5) % 2 == 0) {
+            std::cout << bold() << msg << reset();
+        } else {
+            std::cout << msg;
+        }
+    }
+
     void print_header(const std::string& title, int width = 60) {
         std::cout << cyan() << bold();
         std::cout << BOX_TL;
@@ -338,7 +416,8 @@ namespace ui {
    |_|  |_|___\__\_\    \_/\_/ \__,_|_|_|\___|\__|
 
 )" << reset();
-        std::cout << dim() << "        Professional Cryptocurrency Wallet v2.0" << reset() << "\n\n";
+        std::cout << dim() << "        Professional Cryptocurrency Wallet v1.0 Stable" << reset() << "\n";
+        std::cout << dim() << "           Offline Transactions | Persistent Queue" << reset() << "\n\n";
     }
 
     void print_success(const std::string& msg) {
@@ -566,6 +645,215 @@ static void add_tx_history(const std::string& wdir, const TxHistoryEntry& entry)
     }
 
     save_tx_history(wdir, hist);
+}
+
+// =============================================================================
+// QUEUED TRANSACTION - Offline transaction support with persistence
+// =============================================================================
+struct QueuedTransaction {
+    std::string txid_hex;
+    std::vector<uint8_t> raw_tx;
+    int64_t created_at{0};
+    int64_t last_attempt{0};
+    int broadcast_attempts{0};
+    std::string status;  // "queued", "broadcasting", "confirmed", "failed", "expired"
+    std::string to_address;
+    uint64_t amount{0};
+    uint64_t fee{0};
+    std::string memo;
+    std::string error_msg;
+};
+
+static std::string tx_queue_path(const std::string& wdir){
+    return join_path(wdir, "tx_queue.dat");
+}
+
+static void load_tx_queue(const std::string& wdir, std::vector<QueuedTransaction>& out){
+    out.clear();
+    std::ifstream f(tx_queue_path(wdir), std::ios::binary);
+    if(!f.good()) return;
+
+    // Read number of transactions
+    uint32_t count = 0;
+    f.read(reinterpret_cast<char*>(&count), sizeof(count));
+    if(count > wallet_config::MAX_QUEUE_SIZE) count = wallet_config::MAX_QUEUE_SIZE;
+
+    for(uint32_t i = 0; i < count && f.good(); i++){
+        QueuedTransaction tx;
+
+        // Read txid
+        uint32_t txid_len = 0;
+        f.read(reinterpret_cast<char*>(&txid_len), sizeof(txid_len));
+        if(txid_len > 0 && txid_len < 1000){
+            tx.txid_hex.resize(txid_len);
+            f.read(&tx.txid_hex[0], txid_len);
+        }
+
+        // Read raw tx
+        uint32_t raw_len = 0;
+        f.read(reinterpret_cast<char*>(&raw_len), sizeof(raw_len));
+        if(raw_len > 0 && raw_len < 1000000){
+            tx.raw_tx.resize(raw_len);
+            f.read(reinterpret_cast<char*>(tx.raw_tx.data()), raw_len);
+        }
+
+        // Read metadata
+        f.read(reinterpret_cast<char*>(&tx.created_at), sizeof(tx.created_at));
+        f.read(reinterpret_cast<char*>(&tx.last_attempt), sizeof(tx.last_attempt));
+        f.read(reinterpret_cast<char*>(&tx.broadcast_attempts), sizeof(tx.broadcast_attempts));
+
+        // Read status
+        uint32_t status_len = 0;
+        f.read(reinterpret_cast<char*>(&status_len), sizeof(status_len));
+        if(status_len > 0 && status_len < 100){
+            tx.status.resize(status_len);
+            f.read(&tx.status[0], status_len);
+        }
+
+        // Read to_address
+        uint32_t addr_len = 0;
+        f.read(reinterpret_cast<char*>(&addr_len), sizeof(addr_len));
+        if(addr_len > 0 && addr_len < 200){
+            tx.to_address.resize(addr_len);
+            f.read(&tx.to_address[0], addr_len);
+        }
+
+        // Read amount and fee
+        f.read(reinterpret_cast<char*>(&tx.amount), sizeof(tx.amount));
+        f.read(reinterpret_cast<char*>(&tx.fee), sizeof(tx.fee));
+
+        // Read memo
+        uint32_t memo_len = 0;
+        f.read(reinterpret_cast<char*>(&memo_len), sizeof(memo_len));
+        if(memo_len > 0 && memo_len < 1000){
+            tx.memo.resize(memo_len);
+            f.read(&tx.memo[0], memo_len);
+        }
+
+        // Read error message
+        uint32_t err_len = 0;
+        f.read(reinterpret_cast<char*>(&err_len), sizeof(err_len));
+        if(err_len > 0 && err_len < 1000){
+            tx.error_msg.resize(err_len);
+            f.read(&tx.error_msg[0], err_len);
+        }
+
+        if(f.good()){
+            out.push_back(std::move(tx));
+        }
+    }
+}
+
+static void save_tx_queue(const std::string& wdir, const std::vector<QueuedTransaction>& queue){
+    std::ofstream f(tx_queue_path(wdir), std::ios::binary | std::ios::trunc);
+    if(!f.good()) return;
+
+    uint32_t count = (uint32_t)queue.size();
+    f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+
+    for(const auto& tx : queue){
+        // Write txid
+        uint32_t txid_len = (uint32_t)tx.txid_hex.size();
+        f.write(reinterpret_cast<const char*>(&txid_len), sizeof(txid_len));
+        f.write(tx.txid_hex.data(), txid_len);
+
+        // Write raw tx
+        uint32_t raw_len = (uint32_t)tx.raw_tx.size();
+        f.write(reinterpret_cast<const char*>(&raw_len), sizeof(raw_len));
+        f.write(reinterpret_cast<const char*>(tx.raw_tx.data()), raw_len);
+
+        // Write metadata
+        f.write(reinterpret_cast<const char*>(&tx.created_at), sizeof(tx.created_at));
+        f.write(reinterpret_cast<const char*>(&tx.last_attempt), sizeof(tx.last_attempt));
+        f.write(reinterpret_cast<const char*>(&tx.broadcast_attempts), sizeof(tx.broadcast_attempts));
+
+        // Write status
+        uint32_t status_len = (uint32_t)tx.status.size();
+        f.write(reinterpret_cast<const char*>(&status_len), sizeof(status_len));
+        f.write(tx.status.data(), status_len);
+
+        // Write to_address
+        uint32_t addr_len = (uint32_t)tx.to_address.size();
+        f.write(reinterpret_cast<const char*>(&addr_len), sizeof(addr_len));
+        f.write(tx.to_address.data(), addr_len);
+
+        // Write amount and fee
+        f.write(reinterpret_cast<const char*>(&tx.amount), sizeof(tx.amount));
+        f.write(reinterpret_cast<const char*>(&tx.fee), sizeof(tx.fee));
+
+        // Write memo
+        uint32_t memo_len = (uint32_t)tx.memo.size();
+        f.write(reinterpret_cast<const char*>(&memo_len), sizeof(memo_len));
+        f.write(tx.memo.data(), memo_len);
+
+        // Write error message
+        uint32_t err_len = (uint32_t)tx.error_msg.size();
+        f.write(reinterpret_cast<const char*>(&err_len), sizeof(err_len));
+        f.write(tx.error_msg.data(), err_len);
+    }
+}
+
+static void add_to_tx_queue(const std::string& wdir, const QueuedTransaction& tx){
+    std::vector<QueuedTransaction> queue;
+    load_tx_queue(wdir, queue);
+
+    // Check for duplicate
+    for(const auto& q : queue){
+        if(q.txid_hex == tx.txid_hex) return;
+    }
+
+    queue.push_back(tx);
+
+    // Keep only recent transactions (remove expired)
+    int64_t now = (int64_t)time(nullptr);
+    int64_t expiry_seconds = wallet_config::TX_EXPIRY_HOURS * 3600;
+
+    std::vector<QueuedTransaction> filtered;
+    for(const auto& q : queue){
+        if(now - q.created_at < expiry_seconds || q.status == "confirmed"){
+            filtered.push_back(q);
+        }
+    }
+
+    // Limit queue size
+    if(filtered.size() > wallet_config::MAX_QUEUE_SIZE){
+        filtered.erase(filtered.begin(), filtered.begin() + (filtered.size() - wallet_config::MAX_QUEUE_SIZE));
+    }
+
+    save_tx_queue(wdir, filtered);
+}
+
+static void update_tx_queue_status(const std::string& wdir, const std::string& txid_hex,
+                                    const std::string& status, const std::string& error = ""){
+    std::vector<QueuedTransaction> queue;
+    load_tx_queue(wdir, queue);
+
+    for(auto& tx : queue){
+        if(tx.txid_hex == txid_hex){
+            tx.status = status;
+            tx.last_attempt = (int64_t)time(nullptr);
+            if(!error.empty()) tx.error_msg = error;
+            if(status == "broadcasting" || status == "failed"){
+                tx.broadcast_attempts++;
+            }
+            break;
+        }
+    }
+
+    save_tx_queue(wdir, queue);
+}
+
+static int count_pending_in_queue(const std::string& wdir){
+    std::vector<QueuedTransaction> queue;
+    load_tx_queue(wdir, queue);
+
+    int count = 0;
+    for(const auto& tx : queue){
+        if(tx.status == "queued" || tx.status == "broadcasting"){
+            count++;
+        }
+    }
+    return count;
 }
 
 // =============================================================================
@@ -941,6 +1229,106 @@ static bool broadcast_any_seed(
 }
 
 // =============================================================================
+// TRANSACTION QUEUE PROCESSING - Auto-broadcast pending transactions
+// =============================================================================
+static int process_tx_queue(
+    const std::string& wdir,
+    const std::vector<std::pair<std::string,std::string>>& seeds,
+    bool verbose = true)
+{
+    std::vector<QueuedTransaction> queue;
+    load_tx_queue(wdir, queue);
+
+    if(queue.empty()) return 0;
+
+    int broadcasted = 0;
+    int64_t now = (int64_t)time(nullptr);
+
+    for(auto& tx : queue){
+        // Skip if not queued or already too many attempts
+        if(tx.status != "queued" && tx.status != "broadcasting") continue;
+        if(tx.broadcast_attempts >= wallet_config::MAX_BROADCAST_ATTEMPTS){
+            tx.status = "failed";
+            tx.error_msg = "Max broadcast attempts exceeded";
+            continue;
+        }
+
+        // Check expiry
+        int64_t age_hours = (now - tx.created_at) / 3600;
+        if(age_hours >= wallet_config::TX_EXPIRY_HOURS){
+            tx.status = "expired";
+            tx.error_msg = "Transaction expired after " + std::to_string(wallet_config::TX_EXPIRY_HOURS) + " hours";
+            continue;
+        }
+
+        if(verbose){
+            ui::print_spinner("Broadcasting " + tx.txid_hex.substr(0, 8) + "...", tx.broadcast_attempts);
+        }
+
+        tx.status = "broadcasting";
+        tx.last_attempt = now;
+        tx.broadcast_attempts++;
+
+        std::string used_seed, err;
+        if(broadcast_any_seed(seeds, tx.raw_tx, used_seed, err)){
+            tx.status = "confirmed";
+            tx.error_msg = "";
+            broadcasted++;
+
+            if(verbose){
+                ui::clear_line();
+                ui::print_success("Broadcasted: " + tx.txid_hex.substr(0, 16) + "...");
+            }
+
+            // Add to transaction history
+            TxHistoryEntry hist;
+            hist.txid_hex = tx.txid_hex;
+            hist.timestamp = tx.created_at;
+            hist.amount = -(int64_t)tx.amount;
+            hist.fee = tx.fee;
+            hist.confirmations = 0;
+            hist.direction = "sent";
+            hist.to_address = tx.to_address;
+            hist.memo = tx.memo;
+            add_tx_history(wdir, hist);
+        } else {
+            tx.error_msg = err;
+            if(verbose){
+                ui::clear_line();
+                ui::print_warning("Failed: " + tx.txid_hex.substr(0, 16) + "... - " + err);
+            }
+        }
+    }
+
+    save_tx_queue(wdir, queue);
+    return broadcasted;
+}
+
+// Check network connectivity by attempting to connect to any seed
+static bool check_network_status(
+    const std::vector<std::pair<std::string,std::string>>& seeds,
+    std::string& connected_node)
+{
+    for(const auto& [host, port] : seeds){
+        miq::P2PLight p2p;
+        miq::P2POpts opts;
+        opts.host = host;
+        opts.port = port;
+        opts.user_agent = "/miqwallet:1.0/";
+        opts.io_timeout_ms = 5000;  // Quick check
+
+        std::string err;
+        if(p2p.connect_and_handshake(opts, err)){
+            p2p.close();
+            connected_node = host + ":" + port;
+            return true;
+        }
+    }
+    connected_node = "";
+    return false;
+}
+
+// =============================================================================
 // AMOUNT FORMATTING
 // =============================================================================
 static uint64_t parse_amount_miqron(const std::string& s){
@@ -1166,10 +1554,47 @@ static bool wallet_session(const std::string& cli_host,
 
     auto utxos = refresh_and_print();
 
+    // Process any pending transactions on startup
+    {
+        int pending_count = count_pending_in_queue(wdir);
+        if(pending_count > 0){
+            std::cout << "\n";
+            ui::print_info("Found " + std::to_string(pending_count) + " pending transaction(s) in queue");
+            std::cout << "  " << ui::dim() << "Attempting to broadcast..." << ui::reset() << "\n";
+
+            int broadcasted = process_tx_queue(wdir, seeds, true);
+            if(broadcasted > 0){
+                std::cout << "\n";
+                ui::print_success("Successfully broadcasted " + std::to_string(broadcasted) + " transaction(s)");
+            }
+            std::cout << "\n";
+        }
+    }
+
+    // Track network status
+    bool is_online = (last_connected_node != "<offline>" && last_connected_node != "<not connected>");
+
     // Main menu loop
     for(;;){
         ui::print_separator(50);
         std::cout << "\n";
+
+        // Network status indicator
+        std::cout << "  " << ui::bold() << "Status: " << ui::reset();
+        if(is_online){
+            std::cout << ui::green() << "[ONLINE]" << ui::reset();
+            std::cout << ui::dim() << " " << last_connected_node << ui::reset();
+        } else {
+            std::cout << ui::red() << "[OFFLINE]" << ui::reset();
+        }
+
+        // Show pending queue count
+        int queue_count = count_pending_in_queue(wdir);
+        if(queue_count > 0){
+            std::cout << "  " << ui::yellow() << "[" << queue_count << " queued]" << ui::reset();
+        }
+        std::cout << "\n\n";
+
         std::cout << ui::bold() << "  WALLET MENU" << ui::reset() << "\n\n";
 
         // Primary actions
@@ -1183,10 +1608,12 @@ static bool wallet_session(const std::string& cli_host,
         ui::print_menu_item("4", "Transaction History");
         ui::print_menu_item("5", "Address Book");
         ui::print_menu_item("6", "Wallet Info");
+        ui::print_menu_item("7", "Transaction Queue");
 
         // System
         std::cout << "\n" << ui::dim() << "  System:" << ui::reset() << "\n";
         ui::print_menu_item("r", "Refresh Balance");
+        ui::print_menu_item("b", "Broadcast Queue");
         ui::print_menu_item("h", "Help");
         ui::print_menu_item("q", "Back to Main Menu");
         std::cout << "\n";
@@ -1818,13 +2245,9 @@ static bool wallet_session(const std::string& cli_host,
             std::string used_bcast_seed, berr;
             auto seeds_b = build_seed_candidates(cli_host, cli_port);
 
-            if(!broadcast_any_seed(seeds_b, raw, used_bcast_seed, berr)){
-                ui::print_error("Broadcast failed");
-                std::cout << ui::dim() << berr << ui::reset() << "\n\n";
-                continue;
-            }
+            bool broadcast_success = broadcast_any_seed(seeds_b, raw, used_bcast_seed, berr);
 
-            // Update pending cache
+            // Update pending cache regardless of broadcast success
             for(const auto& in : tx.vin){
                 pending.insert(OutpointKey{ miq::to_hex(in.prev.txid), in.prev.vout });
             }
@@ -1842,6 +2265,49 @@ static bool wallet_session(const std::string& cli_host,
                 }
             }
 
+            if(!broadcast_success){
+                // Save transaction to queue for later broadcast
+                QueuedTransaction qtx;
+                qtx.txid_hex = txid_hex;
+                qtx.raw_tx = raw;
+                qtx.created_at = (int64_t)time(nullptr);
+                qtx.last_attempt = qtx.created_at;
+                qtx.broadcast_attempts = 1;
+                qtx.status = "queued";
+                qtx.to_address = to;
+                qtx.amount = amount;
+                qtx.fee = fee_final;
+                qtx.error_msg = berr;
+
+                add_to_tx_queue(wdir, qtx);
+
+                std::cout << "\n";
+                ui::print_warning("Broadcast failed - transaction saved to queue");
+                std::cout << "\n";
+                std::cout << "  " << ui::dim() << "Error:" << ui::reset() << " " << berr << "\n";
+                std::cout << "  " << ui::dim() << "TXID:" << ui::reset() << " " << ui::cyan() << txid_hex << ui::reset() << "\n";
+                std::cout << "\n";
+                std::cout << "  " << ui::green() << "Transaction saved!" << ui::reset() << "\n";
+                std::cout << "  " << ui::dim() << "The transaction has been saved and will be" << ui::reset() << "\n";
+                std::cout << "  " << ui::dim() << "automatically broadcasted when network is available." << ui::reset() << "\n";
+                std::cout << "\n";
+                std::cout << "  " << ui::dim() << "Use 'b' to manually broadcast, or '7' to view queue." << ui::reset() << "\n\n";
+
+                is_online = false;
+                continue;
+            }
+
+            // Add to transaction history
+            TxHistoryEntry hist;
+            hist.txid_hex = txid_hex;
+            hist.timestamp = (int64_t)time(nullptr);
+            hist.amount = -(int64_t)amount;
+            hist.fee = fee_final;
+            hist.confirmations = 0;
+            hist.direction = "sent";
+            hist.to_address = to;
+            add_tx_history(wdir, hist);
+
             // Success!
             std::cout << "\n";
             ui::print_success("Transaction broadcasted successfully!");
@@ -1854,6 +2320,8 @@ static bool wallet_session(const std::string& cli_host,
             }
 
             std::cout << "\n  " << ui::dim() << "Transaction is now pending confirmation" << ui::reset() << "\n\n";
+
+            is_online = true;
 
             // Refresh balance after send
             utxos = refresh_and_print();
@@ -1890,10 +2358,116 @@ static bool wallet_session(const std::string& cli_host,
             std::cout << "\n  " << ui::dim() << "Share this address to receive MIQ" << ui::reset() << "\n\n";
         }
         // =================================================================
+        // OPTION 7: Transaction Queue
+        // =================================================================
+        else if(c == "7"){
+            std::cout << "\n";
+            ui::print_double_header("TRANSACTION QUEUE", 60);
+            std::cout << "\n";
+
+            std::vector<QueuedTransaction> queue;
+            load_tx_queue(wdir, queue);
+
+            if(queue.empty()){
+                std::cout << "  " << ui::dim() << "No transactions in queue." << ui::reset() << "\n";
+                std::cout << "  " << ui::dim() << "Transactions created while offline will appear here." << ui::reset() << "\n\n";
+            } else {
+                std::cout << "  " << ui::dim() << "Transactions in queue: " << queue.size() << ui::reset() << "\n\n";
+
+                // Count by status
+                int queued = 0, confirmed = 0, failed = 0, expired = 0;
+                for(const auto& tx : queue){
+                    if(tx.status == "queued" || tx.status == "broadcasting") queued++;
+                    else if(tx.status == "confirmed") confirmed++;
+                    else if(tx.status == "failed") failed++;
+                    else if(tx.status == "expired") expired++;
+                }
+
+                if(queued > 0)
+                    std::cout << "  " << ui::yellow() << "Pending: " << queued << ui::reset() << "\n";
+                if(confirmed > 0)
+                    std::cout << "  " << ui::green() << "Confirmed: " << confirmed << ui::reset() << "\n";
+                if(failed > 0)
+                    std::cout << "  " << ui::red() << "Failed: " << failed << ui::reset() << "\n";
+                if(expired > 0)
+                    std::cout << "  " << ui::dim() << "Expired: " << expired << ui::reset() << "\n";
+
+                std::cout << "\n";
+
+                // Show recent transactions
+                int show_count = std::min((int)queue.size(), 10);
+                for(int i = 0; i < show_count; i++){
+                    const auto& tx = queue[i];
+
+                    std::cout << "  " << ui::tx_status_badge(tx.status);
+                    std::cout << " " << ui::dim() << tx.txid_hex.substr(0, 16) << "..." << ui::reset();
+                    std::cout << " " << ui::cyan() << fmt_amount_short(tx.amount) << " MIQ" << ui::reset();
+
+                    if(!tx.to_address.empty()){
+                        std::cout << " -> " << ui::dim() << tx.to_address.substr(0, 12) << "..." << ui::reset();
+                    }
+
+                    std::cout << "\n";
+
+                    // Show error if any
+                    if(!tx.error_msg.empty() && tx.status != "confirmed"){
+                        std::cout << "    " << ui::red() << ui::dim() << tx.error_msg << ui::reset() << "\n";
+                    }
+                }
+
+                if((int)queue.size() > show_count){
+                    std::cout << "\n  " << ui::dim() << "(" << (queue.size() - show_count)
+                              << " more transactions)" << ui::reset() << "\n";
+                }
+            }
+
+            std::cout << "\n  " << ui::dim() << "Press ENTER to return..." << ui::reset();
+            std::string dummy;
+            std::getline(std::cin, dummy);
+        }
+        // =================================================================
+        // OPTION b: Broadcast Queue
+        // =================================================================
+        else if(c == "b" || c == "B"){
+            std::cout << "\n";
+            int pending_count = count_pending_in_queue(wdir);
+
+            if(pending_count == 0){
+                ui::print_info("No pending transactions to broadcast");
+                std::cout << "\n";
+            } else {
+                ui::print_info("Broadcasting " + std::to_string(pending_count) + " pending transaction(s)...");
+                std::cout << "\n";
+
+                int broadcasted = process_tx_queue(wdir, seeds, true);
+
+                std::cout << "\n";
+                if(broadcasted > 0){
+                    ui::print_success("Successfully broadcasted " + std::to_string(broadcasted) + " transaction(s)");
+                    is_online = true;
+                } else if(broadcasted == 0 && pending_count > 0){
+                    ui::print_warning("No transactions could be broadcasted");
+                    std::cout << "  " << ui::dim() << "Check network connectivity and try again" << ui::reset() << "\n";
+                }
+                std::cout << "\n";
+            }
+        }
+        // =================================================================
         // OPTION r: Refresh Balance
         // =================================================================
         else if(c == "r" || c == "R"){
             utxos = refresh_and_print();
+            is_online = (last_connected_node != "<offline>" && last_connected_node != "<not connected>");
+
+            // Try to broadcast any pending transactions
+            int pending_count = count_pending_in_queue(wdir);
+            if(pending_count > 0 && is_online){
+                std::cout << "  " << ui::dim() << "Broadcasting " << pending_count << " queued transaction(s)..." << ui::reset() << "\n";
+                int broadcasted = process_tx_queue(wdir, seeds, false);
+                if(broadcasted > 0){
+                    std::cout << "  " << ui::green() << "Broadcasted " << broadcasted << " transaction(s)" << ui::reset() << "\n\n";
+                }
+            }
         }
         // =================================================================
         // OPTION q: Quit
