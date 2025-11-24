@@ -653,10 +653,10 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
     return true;
 }
 
-// HTTP POST with automatic retry and exponential backoff for network errors
+// HTTP POST with automatic retry and exponential backoff for network errors and server errors
 static bool http_post_with_retry(const std::string& host, uint16_t port, const std::string& path,
                                   const std::string& auth_token, const std::string& json, HttpResp& out,
-                                  int max_retries)
+                                  int max_retries, bool retry_on_server_errors = false)
 {
     int delay_ms = 1000;  // Start with 1 second delay
     for (int attempt = 0; attempt <= max_retries; ++attempt) {
@@ -664,8 +664,9 @@ static bool http_post_with_retry(const std::string& host, uint16_t port, const s
             return true;
         }
 
-        // Only retry on network errors (code 0), not on HTTP errors
-        if (out.code != 0 || attempt == max_retries) {
+        // Retry on network errors (code 0) or server errors (5xx) if enabled
+        bool should_retry = (out.code == 0) || (retry_on_server_errors && out.code >= 500);
+        if (!should_retry || attempt == max_retries) {
             return false;
         }
 
@@ -725,10 +726,10 @@ static std::string diagnose_rpc_failure(const std::string& host, uint16_t port, 
 }
 
 static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::string& auth, TipInfo& out){
-    // Fast path: dedicated RPC (if present) with retry for network errors
+    // Fast path: dedicated RPC (if present) with retry for network and server errors
     {
         HttpResp r;
-        if (http_post_with_retry(host, port, "/", auth, rpc_build("gettipinfo","[]"), r, 2)
+        if (http_post_with_retry(host, port, "/", auth, rpc_build("gettipinfo","[]"), r, 2, true)
             && r.code==200 && !json_has_error(r.body)) {
             long long h=0,t=0; uint32_t b=0; std::string hh;
             // Use json_find_hex_or_number_u32 for bits since server returns it as hex string
@@ -754,7 +755,7 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
     // Fallback (portable): getblockchaininfo → bestblockhash/blocks → getblock
     {
         HttpResp r;
-        if (!http_post(host, port, "/", auth, rpc_build("getblockchaininfo","[]"), r)
+        if (!http_post_with_retry(host, port, "/", auth, rpc_build("getblockchaininfo","[]"), r, 2, true)
             || r.code!=200 || json_has_error(r.body)) return false;
         long long blocks=0; std::string besthash;
         (void)json_find_number(r.body, "blocks", blocks);
