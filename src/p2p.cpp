@@ -1017,25 +1017,6 @@ static void remove_file_scope_inflight(const std::string& hash) {
     g_file_scope_inflight_blocks.erase(hash);
 }
 
-static MIQ_MAYBE_UNUSED bool unsolicited_drop(miq::PeerState& ps, const char* what, const std::string& keyHex){
-    (void)what; (void)keyHex;
-    if (!ps.verack_ok) return true;
-    // During IBD, accept only if inflight has an entry for this object
-    if (what && std::strcmp(what,"block")==0) {
-        if (ps.inflight_blocks.find(keyHex) != ps.inflight_blocks.end()) return false;
-        // Use thread-safe accessor for global inflight check
-        if (is_block_inflight(keyHex)) return false;
-        if (ps.syncing) return false;
-        if (!g_logged_headers_done) return false;
-        return true;
-    }
-    if (what && std::strcmp(what,"tx")==0) {
-        return false;
-    }
-    // Otherwise allow (normal steady-state relay)
-    return false;
-}
-
 static std::unordered_map<Sock,int> g_index_timeouts;
 static inline void mark_index_timeout(Sock s){
     int &c = g_index_timeouts[s]; if (++c >= 3) g_peer_index_capable[s] = false;
@@ -1636,9 +1617,6 @@ static inline bool is_loopback_be(uint32_t be_ip){
 static inline bool is_self_be(uint32_t be_ip){
     return g_self_v4.find(be_ip) != g_self_v4.end();
 }
-static MIQ_MAYBE_UNUSED void self_add_be(uint32_t be_ip){
-    g_self_v4.insert(be_ip);
-}
 static void self_add_dotted(const std::string& ip){
     uint32_t be_ip=0;
     if (parse_ipv4_dotted(ip, be_ip)) g_self_v4.insert(be_ip);
@@ -1743,6 +1721,7 @@ static bool is_self_endpoint(Sock fd, uint16_t listen_port){
         const uint32_t peer_be = p->sin_addr.s_addr;
         const uint16_t peer_port = ntohs(p->sin_port);
         const uint16_t local_port = ntohs(l->sin_port);
+        (void)local_port; // Used by P2P_TRACE when enabled
 
         // DEBUG: Log the hairpin check details
         char peer_ip_str[INET_ADDRSTRLEN] = {0};
@@ -2642,6 +2621,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     P2P_TRACE("TX " + ps.ip + " cmd=version len=" + std::to_string(version_payload.size()));
     auto msg = encode_msg("version", version_payload);
     bool sent = send_or_close(s, msg);
+    (void)sent; // Used by P2P_TRACE when enabled
     P2P_TRACE("TX " + ps.ip + " version send result=" + (sent ? "OK" : "FAILED"));
 
     return true;
@@ -2921,6 +2901,7 @@ void P2P::send_block(Sock s, const std::vector<uint8_t>& raw){
     auto msg = encode_msg("block", raw);
     P2P_TRACE("DEBUG: Sending block message, raw_size=" + std::to_string(raw.size()) + " encoded_size=" + std::to_string(msg.size()));
     bool result = send_or_close(s, msg);
+    (void)result; // Used by P2P_TRACE when enabled
     P2P_TRACE("DEBUG: send_block result=" + std::string(result ? "OK" : "FAILED"));
 }
 
