@@ -4240,54 +4240,99 @@ static bool wallet_session(const std::string& cli_host,
 
     // Main menu loop
     for(;;){
-        ui::print_separator(50);
+        // =============================================================
+        // PROFESSIONAL WALLET MENU v3.0
+        // =============================================================
         std::cout << "\n";
+        std::cout << ui::cyan() << ui::bold();
+        std::cout << "  +============================================================+\n";
+        std::cout << "  |                    MIQ WALLET - DASHBOARD                  |\n";
+        std::cout << "  +============================================================+" << ui::reset() << "\n";
 
-        // Network status indicator
-        std::cout << "  " << ui::bold() << "Status: " << ui::reset();
+        // Network status bar
+        std::cout << "  " << ui::dim() << "|" << ui::reset();
+        std::cout << " Status: ";
         if(is_online){
-            std::cout << ui::green() << "[ONLINE]" << ui::reset();
-            std::cout << ui::dim() << " " << last_connected_node << ui::reset();
+            std::cout << ui::green() << ui::bold() << "ONLINE" << ui::reset();
+            std::cout << ui::dim() << " @ " << last_connected_node << ui::reset();
         } else {
-            std::cout << ui::red() << "[OFFLINE]" << ui::reset();
+            std::cout << ui::red() << ui::bold() << "OFFLINE" << ui::reset();
         }
 
         // Show pending queue count
         int queue_count = count_pending_in_queue(wdir);
         if(queue_count > 0){
-            std::cout << "  " << ui::yellow() << "[" << queue_count << " queued]" << ui::reset();
+            std::cout << "  " << ui::yellow() << ui::bold() << "[" << queue_count << " QUEUED]" << ui::reset();
+        }
+
+        // Show pending UTXO holds
+        if(!pending.empty()){
+            std::cout << "  " << ui::magenta() << "[" << pending.size() << " pending]" << ui::reset();
+        }
+        std::cout << "\n";
+        std::cout << ui::dim() << "  +------------------------------------------------------------+" << ui::reset() << "\n\n";
+
+        // Quick balance summary
+        WalletBalance menu_wb = compute_balance(utxos, pending);
+        std::cout << "  " << ui::bold() << ui::green() << "Balance: " << fmt_amount(menu_wb.total) << " MIQ" << ui::reset();
+        if(menu_wb.spendable < menu_wb.total){
+            std::cout << ui::dim() << "  (Available: " << fmt_amount(menu_wb.spendable) << " MIQ)" << ui::reset();
         }
         std::cout << "\n\n";
 
-        std::cout << ui::bold() << "  WALLET MENU" << ui::reset() << "\n\n";
-
-        // Primary actions
-        std::cout << ui::dim() << "  Actions:" << ui::reset() << "\n";
-        ui::print_menu_item("1", "View Receive Addresses");
-        ui::print_menu_item("2", "Send MIQ");
-        ui::print_menu_item("3", "Generate New Address");
-
-        // Information
-        std::cout << "\n" << ui::dim() << "  Information:" << ui::reset() << "\n";
-        ui::print_menu_item("4", "Transaction History");
-        ui::print_menu_item("5", "Address Book");
-        ui::print_menu_item("6", "Wallet Info");
-        ui::print_menu_item("7", "Transaction Queue");
-
-        // Professional Features
-        std::cout << "\n" << ui::dim() << "  Professional:" << ui::reset() << "\n";
-        ui::print_menu_item("8", "Export Transactions");
-        ui::print_menu_item("9", "Wallet Health Check");
-        ui::print_menu_item("0", "Settings & Backup");
-
-        // System
-        std::cout << "\n" << ui::dim() << "  System:" << ui::reset() << "\n";
-        ui::print_menu_item("r", "Refresh Balance");
-        ui::print_menu_item("b", "Broadcast Queue");
-        ui::print_menu_item("d", "Network Diagnostics");
-        ui::print_menu_item("h", "Help");
-        ui::print_menu_item("q", "Back to Main Menu");
+        // =============================================================
+        // SECTION 1: CORE WALLET OPERATIONS
+        // =============================================================
+        std::cout << ui::cyan() << ui::bold() << "  CORE OPERATIONS" << ui::reset() << "\n";
+        std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "1" << ui::reset() << "   Receive MIQ         " << ui::dim() << "View and generate addresses" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "2" << ui::reset() << "   Send MIQ            " << ui::dim() << "Transfer funds to another address" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "3" << ui::reset() << "   New Address         " << ui::dim() << "Generate fresh receive address" << ui::reset() << "\n";
         std::cout << "\n";
+
+        // =============================================================
+        // SECTION 2: TRANSACTIONS & HISTORY
+        // =============================================================
+        std::cout << ui::cyan() << ui::bold() << "  TRANSACTIONS" << ui::reset() << "\n";
+        std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "4" << ui::reset() << "   Transaction History " << ui::dim() << "View all past transactions" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "5" << ui::reset() << "   Address Book        " << ui::dim() << "Manage saved contacts" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "7" << ui::reset() << "   Pending Queue       " << ui::dim() << "View/manage queued transactions" << ui::reset() << "\n";
+        std::cout << "\n";
+
+        // =============================================================
+        // SECTION 3: WALLET MANAGEMENT
+        // =============================================================
+        std::cout << ui::cyan() << ui::bold() << "  WALLET MANAGEMENT" << ui::reset() << "\n";
+        std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "6" << ui::reset() << "   Wallet Info         " << ui::dim() << "View wallet statistics" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "8" << ui::reset() << "   Export Data         " << ui::dim() << "Export transactions CSV/JSON" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "9" << ui::reset() << "   Health Check        " << ui::dim() << "Analyze wallet health & fix issues" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "0" << ui::reset() << "   Settings & Backup   " << ui::dim() << "Configuration and backups" << ui::reset() << "\n";
+        std::cout << "\n";
+
+        // =============================================================
+        // SECTION 4: ADVANCED OPERATIONS
+        // =============================================================
+        std::cout << ui::cyan() << ui::bold() << "  ADVANCED" << ui::reset() << "\n";
+        std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "c" << ui::reset() << "   Consolidate UTXOs   " << ui::dim() << "Reduce fragmentation (combine UTXOs)" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "p" << ui::reset() << "   Release Pending     " << ui::dim() << "Unlock stuck pending UTXOs" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "u" << ui::reset() << "   UTXO Details        " << ui::dim() << "View all UTXOs with full TXIDs" << ui::reset() << "\n";
+        std::cout << "\n";
+
+        // =============================================================
+        // SECTION 5: SYSTEM CONTROLS
+        // =============================================================
+        std::cout << ui::cyan() << ui::bold() << "  SYSTEM" << ui::reset() << "\n";
+        std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "r" << ui::reset() << "   Refresh Balance     " << ui::dim() << "Sync with network" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "b" << ui::reset() << "   Broadcast Queue     " << ui::dim() << "Send all queued transactions" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "d" << ui::reset() << "   Network Diagnostics " << ui::dim() << "Test node connectivity" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "h" << ui::reset() << "   Help                " << ui::dim() << "Usage guide and tips" << ui::reset() << "\n";
+        std::cout << "    " << ui::cyan() << ui::bold() << "q" << ui::reset() << "   Exit Wallet         " << ui::dim() << "Return to main menu" << ui::reset() << "\n";
+        std::cout << "\n";
+        std::cout << ui::dim() << "  ================================================================" << ui::reset() << "\n";
 
         std::string c = ui::prompt("Select option: ");
         c = trim(c);
@@ -5127,72 +5172,147 @@ static bool wallet_session(const std::string& cli_host,
             std::cout << "\n  " << ui::dim() << "Share this address to receive MIQ" << ui::reset() << "\n\n";
         }
         // =================================================================
-        // OPTION 7: Transaction Queue
+        // OPTION 7: Transaction Queue (Enhanced with Full TXIDs)
         // =================================================================
         else if(c == "7"){
             std::cout << "\n";
-            ui::print_double_header("TRANSACTION QUEUE", 60);
-            std::cout << "\n";
+            std::cout << ui::cyan() << ui::bold();
+            std::cout << "  +============================================================+\n";
+            std::cout << "  |                   TRANSACTION QUEUE                        |\n";
+            std::cout << "  +============================================================+" << ui::reset() << "\n\n";
 
             std::vector<QueuedTransaction> queue;
             load_tx_queue(wdir, queue);
 
             if(queue.empty()){
-                std::cout << "  " << ui::dim() << "No transactions in queue." << ui::reset() << "\n";
+                std::cout << "  " << ui::green() << "Queue is empty." << ui::reset() << "\n";
                 std::cout << "  " << ui::dim() << "Transactions created while offline will appear here." << ui::reset() << "\n\n";
-            } else {
-                std::cout << "  " << ui::dim() << "Transactions in queue: " << queue.size() << ui::reset() << "\n\n";
-
-                // Count by status
-                int queued = 0, broadcast = 0, failed = 0, expired = 0;
-                for(const auto& tx : queue){
-                    if(tx.status == "queued" || tx.status == "broadcasting") queued++;
-                    else if(tx.status == "confirmed" || tx.status == "broadcast") broadcast++;
-                    else if(tx.status == "failed") failed++;
-                    else if(tx.status == "expired") expired++;
-                }
-
-                if(queued > 0)
-                    std::cout << "  " << ui::yellow() << "Pending: " << queued << ui::reset() << "\n";
-                if(broadcast > 0)
-                    std::cout << "  " << ui::green() << "Broadcast: " << broadcast << ui::reset() << "\n";
-                if(failed > 0)
-                    std::cout << "  " << ui::red() << "Failed: " << failed << ui::reset() << "\n";
-                if(expired > 0)
-                    std::cout << "  " << ui::dim() << "Expired: " << expired << ui::reset() << "\n";
-
-                std::cout << "\n";
-
-                // Show recent transactions
-                int show_count = std::min((int)queue.size(), 10);
-                for(int i = 0; i < show_count; i++){
-                    const auto& tx = queue[i];
-
-                    std::cout << "  " << ui::tx_status_badge(tx.status);
-                    std::cout << " " << ui::dim() << tx.txid_hex.substr(0, 16) << "..." << ui::reset();
-                    std::cout << " " << ui::cyan() << fmt_amount_short(tx.amount) << " MIQ" << ui::reset();
-
-                    if(!tx.to_address.empty()){
-                        std::cout << " -> " << ui::dim() << tx.to_address.substr(0, 12) << "..." << ui::reset();
-                    }
-
-                    std::cout << "\n";
-
-                    // Show error if any
-                    if(!tx.error_msg.empty() && tx.status != "confirmed" && tx.status != "broadcast"){
-                        std::cout << "    " << ui::red() << ui::dim() << tx.error_msg << ui::reset() << "\n";
-                    }
-                }
-
-                if((int)queue.size() > show_count){
-                    std::cout << "\n  " << ui::dim() << "(" << (queue.size() - show_count)
-                              << " more transactions)" << ui::reset() << "\n";
-                }
+                continue;
             }
 
-            std::cout << "\n  " << ui::dim() << "Press ENTER to return..." << ui::reset();
-            std::string dummy;
-            std::getline(std::cin, dummy);
+            // Count by status
+            int q_pending = 0, q_broadcast = 0, q_failed = 0, q_expired = 0;
+            for(const auto& tx : queue){
+                if(tx.status == "queued" || tx.status == "broadcasting") q_pending++;
+                else if(tx.status == "confirmed" || tx.status == "broadcast") q_broadcast++;
+                else if(tx.status == "failed") q_failed++;
+                else if(tx.status == "expired") q_expired++;
+            }
+
+            // Status summary
+            std::cout << "  " << ui::bold() << "Queue Summary:" << ui::reset() << "\n";
+            std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+            std::cout << "    Total in Queue:   " << queue.size() << "\n";
+            if(q_pending > 0)
+                std::cout << "    Pending:          " << ui::yellow() << q_pending << ui::reset() << "\n";
+            if(q_broadcast > 0)
+                std::cout << "    Broadcast:        " << ui::green() << q_broadcast << ui::reset() << "\n";
+            if(q_failed > 0)
+                std::cout << "    Failed:           " << ui::red() << q_failed << ui::reset() << "\n";
+            if(q_expired > 0)
+                std::cout << "    Expired:          " << ui::dim() << q_expired << ui::reset() << "\n";
+            std::cout << "\n";
+
+            // Paginated transaction list
+            int page = 0;
+            int per_page = 5;
+            int total_pages = ((int)queue.size() + per_page - 1) / per_page;
+
+            while(true){
+                std::cout << ui::cyan() << ui::bold() << "  TRANSACTIONS - Page " << (page + 1) << "/" << total_pages << ui::reset() << "\n";
+                std::cout << ui::dim() << "  ================================================================" << ui::reset() << "\n\n";
+
+                int start = page * per_page;
+                int end = std::min(start + per_page, (int)queue.size());
+
+                for(int i = start; i < end; i++){
+                    const auto& tx = queue[i];
+
+                    std::cout << "  " << ui::dim() << std::setw(3) << (i+1) << ui::reset() << " ";
+                    std::cout << ui::tx_status_badge(tx.status) << "\n";
+
+                    // Full TXID
+                    std::cout << "      " << ui::bold() << "TXID:" << ui::reset() << " " << ui::cyan() << tx.txid_hex << ui::reset() << "\n";
+
+                    // Amount and recipient
+                    std::cout << "      " << ui::bold() << "Amount:" << ui::reset() << " " << ui::green() << fmt_amount(tx.amount) << " MIQ" << ui::reset();
+                    std::cout << " + " << ui::yellow() << fmt_amount(tx.fee) << " fee" << ui::reset() << "\n";
+
+                    if(!tx.to_address.empty()){
+                        std::cout << "      " << ui::bold() << "To:" << ui::reset() << " " << tx.to_address << "\n";
+                    }
+
+                    // Attempts and timing
+                    std::cout << "      " << ui::bold() << "Attempts:" << ui::reset() << " " << tx.broadcast_attempts;
+                    if(tx.created_at > 0){
+                        int64_t age_mins = (time(nullptr) - tx.created_at) / 60;
+                        std::cout << " | " << ui::dim() << "Created " << age_mins << " min ago" << ui::reset();
+                    }
+                    std::cout << "\n";
+
+                    // Error message
+                    if(!tx.error_msg.empty() && tx.status != "confirmed" && tx.status != "broadcast"){
+                        std::cout << "      " << ui::red() << "Error: " << tx.error_msg << ui::reset() << "\n";
+                    }
+
+                    // Memo if any
+                    if(!tx.memo.empty()){
+                        std::cout << "      " << ui::dim() << "Memo: " << tx.memo << ui::reset() << "\n";
+                    }
+                    std::cout << "\n";
+                }
+
+                std::cout << "  " << ui::dim() << "Page " << (page + 1) << "/" << total_pages
+                          << " | Showing " << (end - start) << "/" << queue.size() << " transactions" << ui::reset() << "\n\n";
+
+                std::cout << "  " << ui::cyan() << "n" << ui::reset() << " Next  "
+                          << ui::cyan() << "p" << ui::reset() << " Previous  "
+                          << ui::cyan() << "b" << ui::reset() << " Broadcast all  "
+                          << ui::cyan() << "x" << ui::reset() << " Clear failed  "
+                          << ui::cyan() << "q" << ui::reset() << " Back\n\n";
+
+                std::string nav = ui::prompt("Command: ");
+                nav = trim(nav);
+
+                if(nav == "n" && page < total_pages - 1) page++;
+                else if(nav == "p" && page > 0) page--;
+                else if(nav == "q" || nav == "Q") break;
+                else if(nav == "b" || nav == "B"){
+                    std::cout << "\n";
+                    ui::print_info("Broadcasting pending transactions...");
+                    int broadcasted = process_tx_queue(wdir, seeds, pending, true);
+                    if(broadcasted > 0){
+                        std::cout << "\n";
+                        ui::print_success("Broadcasted " + std::to_string(broadcasted) + " transaction(s)");
+                    }
+                    std::cout << "\n";
+                    // Reload queue
+                    load_tx_queue(wdir, queue);
+                    total_pages = ((int)queue.size() + per_page - 1) / per_page;
+                    if(page >= total_pages) page = std::max(0, total_pages - 1);
+                }
+                else if(nav == "x" || nav == "X"){
+                    // Clear failed/expired
+                    std::vector<QueuedTransaction> active_queue;
+                    for(const auto& tx : queue){
+                        if(tx.status != "failed" && tx.status != "expired"){
+                            active_queue.push_back(tx);
+                        }
+                    }
+                    int removed = (int)queue.size() - (int)active_queue.size();
+                    if(removed > 0){
+                        save_tx_queue(wdir, active_queue);
+                        queue = active_queue;
+                        std::cout << "\n";
+                        ui::print_success("Removed " + std::to_string(removed) + " failed/expired transaction(s)");
+                        std::cout << "\n";
+                        total_pages = ((int)queue.size() + per_page - 1) / per_page;
+                        if(page >= total_pages) page = std::max(0, total_pages - 1);
+                    } else {
+                        std::cout << "\n  " << ui::dim() << "No failed/expired transactions to remove." << ui::reset() << "\n\n";
+                    }
+                }
+            }
         }
         // =================================================================
         // OPTION b: Broadcast Queue
@@ -5297,22 +5417,31 @@ static bool wallet_session(const std::string& cli_host,
             }
         }
         // =================================================================
-        // OPTION 9: Wallet Health Check
+        // OPTION 9: Wallet Health Check (Enhanced with Quick Fixes)
         // =================================================================
         else if(c == "9"){
             std::cout << "\n";
-            ui::print_double_header("WALLET HEALTH CHECK", 60);
-            std::cout << "\n";
+            std::cout << ui::cyan() << ui::bold();
+            std::cout << "  +============================================================+\n";
+            std::cout << "  |                   WALLET HEALTH CHECK                      |\n";
+            std::cout << "  +============================================================+" << ui::reset() << "\n\n";
 
             ui::print_progress("Analyzing wallet health...");
-            std::cout << "\n";
+            std::cout << "\n\n";
 
             // Calculate health metrics
             WalletHealth health = check_wallet_health(utxos, pending, 0);
 
-            // Display overall health score
+            // Display overall health score with visual indicator
             std::string score_color;
             std::string score_label;
+            std::string score_bar;
+            int bar_filled = health.health_score / 5;  // 20 chars total
+            for(int i = 0; i < 20; i++){
+                if(i < bar_filled) score_bar += "█";
+                else score_bar += "░";
+            }
+
             if(health.health_score >= 90){
                 score_color = ui::green();
                 score_label = "EXCELLENT";
@@ -5327,53 +5456,165 @@ static bool wallet_session(const std::string& cli_host,
                 score_label = "NEEDS ATTENTION";
             }
 
-            std::cout << "  " << ui::bold() << "Overall Health Score: " << ui::reset()
-                      << score_color << health.health_score << "/100 (" << score_label << ")"
+            std::cout << "  " << ui::bold() << "Overall Health Score:" << ui::reset() << "\n";
+            std::cout << "  " << score_color << "[" << score_bar << "] "
+                      << health.health_score << "/100 (" << score_label << ")"
                       << ui::reset() << "\n\n";
 
-            // UTXO Analysis
-            std::cout << ui::dim() << "  UTXO Analysis:" << ui::reset() << "\n";
-            ui_pro::print_kv("Total UTXOs:", std::to_string(health.utxo_count), 20);
+            // =============================================================
+            // DETAILED ANALYSIS SECTIONS
+            // =============================================================
+
+            // Section 1: UTXO Analysis
+            std::cout << ui::cyan() << ui::bold() << "  UTXO ANALYSIS" << ui::reset() << "\n";
+            std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+
+            std::cout << "    Total UTXOs:      " << ui::cyan() << health.utxo_count << ui::reset() << "\n";
+            std::cout << "    Total Balance:    " << ui::green() << fmt_amount(health.total_balance) << " MIQ" << ui::reset() << "\n";
 
             if(health.utxo_count > 0){
                 uint64_t avg_utxo = health.total_balance / health.utxo_count;
-                ui_pro::print_kv("Average UTXO:", ui_pro::format_miq_professional(avg_utxo) + " MIQ", 20);
-                ui_pro::print_kv("Largest UTXO:", ui_pro::format_miq_professional(health.largest_utxo) + " MIQ", 20);
-                ui_pro::print_kv("Smallest UTXO:", ui_pro::format_miq_professional(health.smallest_utxo) + " MIQ", 20);
+                std::cout << "    Average UTXO:     " << fmt_amount(avg_utxo) << " MIQ\n";
+                std::cout << "    Largest UTXO:     " << fmt_amount(health.largest_utxo) << " MIQ\n";
+                std::cout << "    Smallest UTXO:    " << fmt_amount(health.smallest_utxo) << " MIQ\n";
             }
 
-            // Dust Analysis
-            std::cout << "\n" << ui::dim() << "  Dust Analysis:" << ui::reset() << "\n";
-            ui_pro::print_kv("Dust UTXOs:", std::to_string(health.dust_count), 20);
-            if(health.dust_count > 0){
-                std::cout << "  " << ui::yellow() << "Recommendation: Consider consolidating dust UTXOs"
-                          << ui::reset() << "\n";
+            // Fragmentation indicator
+            if(health.utxo_count > 50){
+                std::cout << "    Fragmentation:    " << ui::red() << "HIGH" << ui::reset()
+                          << ui::dim() << " (" << health.utxo_count << " UTXOs - consider consolidation)" << ui::reset() << "\n";
+            } else if(health.utxo_count > 20){
+                std::cout << "    Fragmentation:    " << ui::yellow() << "MODERATE" << ui::reset() << "\n";
+            } else {
+                std::cout << "    Fragmentation:    " << ui::green() << "LOW" << ui::reset() << "\n";
             }
-
-            // Pending Transactions
-            if(health.pending_count > 0){
-                std::cout << "\n" << ui::dim() << "  Pending:" << ui::reset() << "\n";
-                ui_pro::print_kv("Pending TXs:", std::to_string(health.pending_count), 20, ui::yellow());
-                std::cout << "  " << ui::dim() << "Pending transactions may be blocking funds"
-                          << ui::reset() << "\n";
-            }
-
-            // Issues and Recommendations
-            if(!health.issues.empty()){
-                std::cout << "\n" << ui::bold() << "  Issues Found:" << ui::reset() << "\n";
-                for(const auto& issue : health.issues){
-                    std::cout << "  " << ui::red() << "* " << issue << ui::reset() << "\n";
-                }
-            }
-
-            if(!health.recommendations.empty()){
-                std::cout << "\n" << ui::bold() << "  Recommendations:" << ui::reset() << "\n";
-                for(const auto& rec : health.recommendations){
-                    std::cout << "  " << ui::cyan() << "-> " << rec << ui::reset() << "\n";
-                }
-            }
-
             std::cout << "\n";
+
+            // Section 2: Dust Analysis
+            std::cout << ui::cyan() << ui::bold() << "  DUST ANALYSIS" << ui::reset() << "\n";
+            std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+
+            int small_utxo_count = 0;
+            uint64_t small_utxo_value = 0;
+            for(const auto& u : utxos){
+                if(u.value < 100000000){  // < 1 MIQ
+                    small_utxo_count++;
+                    small_utxo_value += u.value;
+                }
+            }
+
+            std::cout << "    Dust UTXOs:       " << (health.dust_count > 0 ? ui::yellow() : ui::green())
+                      << health.dust_count << ui::reset() << "\n";
+            std::cout << "    Small UTXOs (<1 MIQ): " << small_utxo_count << " ("
+                      << fmt_amount(small_utxo_value) << " MIQ)\n";
+            std::cout << "\n";
+
+            // Section 3: Pending Transactions
+            std::cout << ui::cyan() << ui::bold() << "  PENDING TRANSACTIONS" << ui::reset() << "\n";
+            std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+
+            if(pending.empty()){
+                std::cout << "    Pending UTXOs:    " << ui::green() << "0" << ui::reset()
+                          << ui::dim() << " (all funds available)" << ui::reset() << "\n";
+            } else {
+                uint64_t pending_value = 0;
+                for(const auto& u : utxos){
+                    OutpointKey k{ miq::to_hex(u.txid), u.vout };
+                    if(pending.find(k) != pending.end()){
+                        pending_value += u.value;
+                    }
+                }
+
+                std::cout << "    Pending UTXOs:    " << ui::yellow() << pending.size() << ui::reset()
+                          << " (" << ui::yellow() << fmt_amount(pending_value) << " MIQ held" << ui::reset() << ")\n";
+            }
+
+            int queue_count = count_pending_in_queue(wdir);
+            if(queue_count > 0){
+                std::cout << "    Queued TXs:       " << ui::yellow() << queue_count << ui::reset()
+                          << ui::dim() << " (awaiting broadcast)" << ui::reset() << "\n";
+            }
+            std::cout << "\n";
+
+            // =============================================================
+            // ISSUES AND QUICK FIXES
+            // =============================================================
+            bool has_issues = false;
+            std::vector<std::pair<std::string, std::string>> quick_fixes;
+
+            if(health.utxo_count > 50){
+                has_issues = true;
+                quick_fixes.push_back({"c", "Consolidate UTXOs to reduce fragmentation"});
+            }
+
+            if(!pending.empty()){
+                has_issues = true;
+                quick_fixes.push_back({"p", "Manage pending UTXOs (release stuck funds)"});
+            }
+
+            if(queue_count > 0){
+                has_issues = true;
+                quick_fixes.push_back({"b", "Broadcast queued transactions"});
+            }
+
+            if(health.dust_count > 0){
+                has_issues = true;
+                quick_fixes.push_back({"c", "Consolidate dust UTXOs"});
+            }
+
+            // Display issues found
+            if(!health.issues.empty()){
+                std::cout << ui::red() << ui::bold() << "  ISSUES FOUND" << ui::reset() << "\n";
+                std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+                for(const auto& issue : health.issues){
+                    std::cout << "    " << ui::red() << "!" << ui::reset() << " " << issue << "\n";
+                }
+                std::cout << "\n";
+            }
+
+            // Display recommendations
+            if(!health.recommendations.empty()){
+                std::cout << ui::yellow() << ui::bold() << "  RECOMMENDATIONS" << ui::reset() << "\n";
+                std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+                for(const auto& rec : health.recommendations){
+                    std::cout << "    " << ui::cyan() << "->" << ui::reset() << " " << rec << "\n";
+                }
+                std::cout << "\n";
+            }
+
+            // Quick fix menu
+            if(!quick_fixes.empty()){
+                std::cout << ui::green() << ui::bold() << "  QUICK FIXES AVAILABLE" << ui::reset() << "\n";
+                std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+
+                // Deduplicate quick fixes
+                std::set<std::string> shown_fixes;
+                for(const auto& [key, desc] : quick_fixes){
+                    if(shown_fixes.find(key) == shown_fixes.end()){
+                        shown_fixes.insert(key);
+                        std::cout << "    " << ui::cyan() << ui::bold() << "[" << key << "]" << ui::reset()
+                                  << " " << desc << "\n";
+                    }
+                }
+                std::cout << "    " << ui::cyan() << ui::bold() << "[q]" << ui::reset() << " Return to menu\n";
+                std::cout << "\n";
+
+                std::string fix_opt = ui::prompt("Apply quick fix (or q to skip): ");
+                fix_opt = trim(fix_opt);
+
+                // Hint for next action
+                if(fix_opt == "c" || fix_opt == "C"){
+                    std::cout << "\n  " << ui::cyan() << "Tip: Use option 'c' from the main menu for UTXO Consolidation" << ui::reset() << "\n\n";
+                } else if(fix_opt == "p" || fix_opt == "P"){
+                    std::cout << "\n  " << ui::cyan() << "Tip: Use option 'p' from the main menu to manage pending UTXOs" << ui::reset() << "\n\n";
+                } else if(fix_opt == "b" || fix_opt == "B"){
+                    std::cout << "\n  " << ui::cyan() << "Tip: Use option 'b' from the main menu to broadcast queued transactions" << ui::reset() << "\n\n";
+                }
+            } else if(health.health_score >= 90){
+                std::cout << "  " << ui::green() << ui::bold() << "Your wallet is in excellent health!" << ui::reset() << "\n";
+                std::cout << "  " << ui::dim() << "No immediate actions required." << ui::reset() << "\n\n";
+            }
+
             log_wallet_event(wdir, "Performed wallet health check - Score: " +
                 std::to_string(health.health_score));
         }
@@ -5578,6 +5819,548 @@ static bool wallet_session(const std::string& cli_host,
             log_wallet_event(wdir, "Ran network diagnostics - " +
                 std::to_string(diag.successful_connections) + "/" +
                 std::to_string(seeds.size()) + " nodes reachable");
+        }
+        // =================================================================
+        // OPTION c: Consolidate UTXOs
+        // =================================================================
+        else if(c == "c" || c == "C"){
+            std::cout << "\n";
+            std::cout << ui::cyan() << ui::bold();
+            std::cout << "  +============================================================+\n";
+            std::cout << "  |                    UTXO CONSOLIDATION                      |\n";
+            std::cout << "  +============================================================+" << ui::reset() << "\n\n";
+
+            // Calculate current fragmentation
+            uint64_t tip_h = 0;
+            for(const auto& u: utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
+
+            std::vector<miq::UtxoLite> spendables;
+            for(const auto& u: utxos){
+                bool immature = false;
+                if(u.coinbase){
+                    uint64_t mh = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
+                    if(tip_h + 1 < mh) immature = true;
+                }
+                OutpointKey k{ miq::to_hex(u.txid), u.vout };
+                if(!immature && pending.find(k) == pending.end())
+                    spendables.push_back(u);
+            }
+
+            if(spendables.empty()){
+                ui::print_warning("No spendable UTXOs available for consolidation");
+                continue;
+            }
+
+            // Show current fragmentation analysis
+            std::cout << "  " << ui::bold() << "Current UTXO Status:" << ui::reset() << "\n";
+            std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+            std::cout << "    Total UTXOs:        " << ui::cyan() << utxos.size() << ui::reset() << "\n";
+            std::cout << "    Spendable UTXOs:    " << ui::green() << spendables.size() << ui::reset() << "\n";
+
+            // Calculate dust count
+            int dust_count = 0;
+            uint64_t dust_total = 0;
+            uint64_t small_count = 0;  // UTXOs < 1 MIQ
+            for(const auto& u : spendables){
+                if(u.value < 10000){ // < 0.0001 MIQ
+                    dust_count++;
+                    dust_total += u.value;
+                } else if(u.value < 100000000){ // < 1 MIQ
+                    small_count++;
+                }
+            }
+
+            if(dust_count > 0){
+                std::cout << "    Dust UTXOs (<0.0001 MIQ): " << ui::yellow() << dust_count << ui::reset()
+                          << " (" << fmt_amount(dust_total) << " MIQ)\n";
+            }
+            if(small_count > 0){
+                std::cout << "    Small UTXOs (<1 MIQ):     " << ui::cyan() << small_count << ui::reset() << "\n";
+            }
+            std::cout << "\n";
+
+            // Check if consolidation is needed
+            if(spendables.size() <= 10){
+                std::cout << "  " << ui::green() << "Your wallet has a healthy number of UTXOs." << ui::reset() << "\n";
+                std::cout << "  " << ui::dim() << "Consolidation is not necessary." << ui::reset() << "\n\n";
+                continue;
+            }
+
+            // Calculate total spendable
+            uint64_t total_spendable = 0;
+            for(const auto& u : spendables) total_spendable += u.value;
+
+            // Recommend consolidation
+            std::cout << "  " << ui::yellow() << ui::bold() << "RECOMMENDATION:" << ui::reset() << "\n";
+            std::cout << "  " << ui::dim() << "Your wallet has " << spendables.size() << " UTXOs. This can cause:" << ui::reset() << "\n";
+            std::cout << "    - Higher transaction fees when spending\n";
+            std::cout << "    - Slower transaction creation\n";
+            std::cout << "    - Reduced privacy\n\n";
+
+            // Show consolidation options
+            std::cout << "  " << ui::bold() << "Consolidation Options:" << ui::reset() << "\n";
+            std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+
+            // Calculate how many UTXOs to consolidate in batches
+            size_t max_inputs = std::min(spendables.size(), (size_t)50);  // Max 50 inputs per tx
+            uint64_t fee_rate = 2;  // Normal rate
+            uint64_t est_fee = fee_for(max_inputs, 1, fee_rate * 1000);
+
+            std::cout << "    " << ui::cyan() << "[1]" << ui::reset() << " Consolidate " << max_inputs << " UTXOs into 1\n";
+            std::cout << "        Estimated fee: " << ui::yellow() << fmt_amount(est_fee) << " MIQ" << ui::reset() << "\n";
+
+            if(spendables.size() > 50){
+                size_t batches = (spendables.size() + 49) / 50;
+                std::cout << "\n    " << ui::cyan() << "[2]" << ui::reset() << " Full consolidation (" << batches << " transactions)\n";
+                std::cout << "        Will consolidate all " << spendables.size() << " UTXOs\n";
+            }
+
+            std::cout << "\n    " << ui::cyan() << "[q]" << ui::reset() << " Cancel\n\n";
+
+            std::string cons_opt = ui::prompt("Select option: ");
+            cons_opt = trim(cons_opt);
+
+            if(cons_opt == "q" || cons_opt == "Q" || cons_opt.empty()){
+                std::cout << "  " << ui::dim() << "Consolidation cancelled." << ui::reset() << "\n\n";
+                continue;
+            }
+
+            if(cons_opt != "1" && cons_opt != "2"){
+                ui::print_error("Invalid option");
+                continue;
+            }
+
+            // Get change address for consolidation (send to self)
+            std::string self_addr;
+            {
+                miq::HdWallet w2(seed, meta);
+                if(!w2.GetNewAddress(self_addr)){
+                    ui::print_error("Failed to generate consolidation address");
+                    continue;
+                }
+                auto new_meta = w2.meta();
+                std::string e;
+                if(miq::SaveHdWallet(wdir, seed, new_meta, pass, e)){
+                    meta = new_meta;
+                }
+            }
+
+            // Decode address
+            uint8_t ver = 0;
+            std::vector<uint8_t> self_pkh;
+            if(!miq::base58check_decode(self_addr, ver, self_pkh)){
+                ui::print_error("Failed to decode self address");
+                continue;
+            }
+
+            // Sort by value ascending (consolidate smallest first)
+            std::stable_sort(spendables.begin(), spendables.end(),
+                [](const miq::UtxoLite& a, const miq::UtxoLite& b){
+                    return a.value < b.value;
+                });
+
+            // Select inputs for consolidation
+            size_t inputs_to_use = std::min(spendables.size(), (size_t)50);
+            uint64_t in_sum = 0;
+            miq::Transaction cons_tx;
+
+            for(size_t i = 0; i < inputs_to_use; ++i){
+                miq::TxIn in;
+                in.prev.txid = spendables[i].txid;
+                in.prev.vout = spendables[i].vout;
+                cons_tx.vin.push_back(in);
+                in_sum += spendables[i].value;
+            }
+
+            // Calculate fee
+            uint64_t cons_fee = fee_for(cons_tx.vin.size(), 1, fee_rate * 1000);
+            if(in_sum <= cons_fee){
+                ui::print_error("Selected UTXOs are too small to cover the fee");
+                continue;
+            }
+
+            uint64_t output_amount = in_sum - cons_fee;
+
+            // Create output
+            miq::TxOut out;
+            out.pkh = self_pkh;
+            out.value = output_amount;
+            cons_tx.vout.push_back(out);
+
+            // Preview
+            std::cout << "\n";
+            std::cout << ui::cyan() << ui::bold();
+            std::cout << "  +------------------------------------------------------------+\n";
+            std::cout << "  |              CONSOLIDATION PREVIEW                         |\n";
+            std::cout << "  +------------------------------------------------------------+" << ui::reset() << "\n";
+            std::cout << "    Inputs:         " << cons_tx.vin.size() << " UTXOs\n";
+            std::cout << "    Input Total:    " << ui::cyan() << fmt_amount(in_sum) << " MIQ" << ui::reset() << "\n";
+            std::cout << "    Fee:            " << ui::yellow() << fmt_amount(cons_fee) << " MIQ" << ui::reset() << "\n";
+            std::cout << "    Output:         " << ui::green() << fmt_amount(output_amount) << " MIQ" << ui::reset() << "\n";
+            std::cout << "    To Address:     " << ui::dim() << self_addr << ui::reset() << "\n\n";
+
+            if(!ui::confirm("Proceed with consolidation?")){
+                std::cout << "  " << ui::dim() << "Consolidation cancelled." << ui::reset() << "\n\n";
+                continue;
+            }
+
+            // Sign transaction
+            ui::print_progress("Signing consolidation transaction...");
+
+            auto sighash = [&](){
+                miq::Transaction t = cons_tx;
+                for(auto& i: t.vin){
+                    i.sig.clear();
+                    i.pubkey.clear();
+                }
+                return miq::dsha256(miq::ser_tx(t));
+            }();
+
+            auto find_key_for_pkh = [&](const std::vector<uint8_t>& pkh)->const Key*{
+                for(const auto& k: keys) if(k.pkh == pkh) return &k;
+                return nullptr;
+            };
+
+            bool sign_failed = false;
+            for(auto& in : cons_tx.vin){
+                const miq::UtxoLite* u = nullptr;
+                for(const auto& x: spendables){
+                    if(x.txid == in.prev.txid && x.vout == in.prev.vout){
+                        u = &x;
+                        break;
+                    }
+                }
+                if(!u){
+                    sign_failed = true;
+                    break;
+                }
+
+                const Key* key = find_key_for_pkh(u->pkh);
+                if(!key){
+                    sign_failed = true;
+                    break;
+                }
+
+                std::vector<uint8_t> sig64;
+                if(!miq::crypto::ECDSA::sign(key->priv, sighash, sig64)){
+                    sign_failed = true;
+                    break;
+                }
+
+                in.sig = sig64;
+                in.pubkey = key->pub;
+            }
+
+            if(sign_failed){
+                ui::clear_line();
+                ui::print_error("Failed to sign consolidation transaction");
+                continue;
+            }
+
+            ui::clear_line();
+
+            // Broadcast
+            auto raw = miq::ser_tx(cons_tx);
+            std::string txid_hex = miq::to_hex(cons_tx.txid());
+            std::string used_bcast_seed, berr;
+
+            // Show broadcast animation
+            std::cout << "\n";
+            for (int frame = 0; frame < 15; frame++) {
+                ui::print_broadcast_animation(frame);
+                std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            }
+            std::cout << "\r" << std::string(60, ' ') << "\r";
+
+            bool broadcast_success = broadcast_any_seed(seeds, raw, used_bcast_seed, berr);
+
+            // Mark inputs as pending
+            for(const auto& in : cons_tx.vin){
+                pending.insert(OutpointKey{ miq::to_hex(in.prev.txid), in.prev.vout });
+            }
+            save_pending(wdir, pending);
+
+            if(broadcast_success){
+                std::cout << "\n";
+                ui::print_success_celebration("Consolidation Complete!");
+                std::cout << "\n";
+                std::cout << "  " << ui::bold() << "Transaction ID:" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << txid_hex << ui::reset() << "\n\n";
+                std::cout << "  Consolidated " << cons_tx.vin.size() << " UTXOs into 1\n";
+                std::cout << "  Saved approximately " << ui::green() << (cons_tx.vin.size() - 1) * 148 << ui::reset() << " bytes on future transactions\n\n";
+
+                // Add to history
+                TxHistoryEntry hist;
+                hist.txid_hex = txid_hex;
+                hist.timestamp = (int64_t)time(nullptr);
+                hist.amount = 0;  // Self-send
+                hist.fee = cons_fee;
+                hist.confirmations = 0;
+                hist.direction = "self";
+                hist.to_address = self_addr;
+                hist.memo = "UTXO Consolidation";
+                add_tx_history(wdir, hist);
+
+                log_wallet_event(wdir, "Consolidated " + std::to_string(cons_tx.vin.size()) +
+                    " UTXOs (txid: " + txid_hex.substr(0, 16) + "...)");
+
+                // Refresh balance
+                utxos = refresh_and_print();
+            } else {
+                ui::print_warning("Broadcast failed - transaction queued");
+                std::cout << "  " << ui::dim() << berr << ui::reset() << "\n\n";
+
+                QueuedTransaction qtx;
+                qtx.txid_hex = txid_hex;
+                qtx.raw_tx = raw;
+                qtx.created_at = (int64_t)time(nullptr);
+                qtx.status = "queued";
+                qtx.to_address = self_addr;
+                qtx.amount = output_amount;
+                qtx.fee = cons_fee;
+                qtx.memo = "UTXO Consolidation";
+                add_to_tx_queue(wdir, qtx);
+            }
+        }
+        // =================================================================
+        // OPTION p: Release Pending UTXOs
+        // =================================================================
+        else if(c == "p" || c == "P"){
+            std::cout << "\n";
+            std::cout << ui::cyan() << ui::bold();
+            std::cout << "  +============================================================+\n";
+            std::cout << "  |                   PENDING UTXO MANAGEMENT                  |\n";
+            std::cout << "  +============================================================+" << ui::reset() << "\n\n";
+
+            if(pending.empty()){
+                std::cout << "  " << ui::green() << "No pending UTXOs." << ui::reset() << "\n";
+                std::cout << "  " << ui::dim() << "All your funds are fully available for spending." << ui::reset() << "\n\n";
+                continue;
+            }
+
+            // Show pending UTXOs
+            std::cout << "  " << ui::yellow() << ui::bold() << "Pending UTXOs: " << pending.size() << ui::reset() << "\n\n";
+            std::cout << "  " << ui::dim() << "These UTXOs are marked as spent in pending transactions." << ui::reset() << "\n";
+            std::cout << "  " << ui::dim() << "If transactions failed or got stuck, you can release them." << ui::reset() << "\n\n";
+
+            // Calculate held amount
+            uint64_t held_amount = 0;
+            for(const auto& u : utxos){
+                OutpointKey k{ miq::to_hex(u.txid), u.vout };
+                if(pending.find(k) != pending.end()){
+                    held_amount += u.value;
+                }
+            }
+
+            std::cout << "  " << ui::bold() << "Amount held by pending:" << ui::reset() << " "
+                      << ui::yellow() << fmt_amount(held_amount) << " MIQ" << ui::reset() << "\n\n";
+
+            // Show pending UTXOs details (limited)
+            std::cout << "  " << ui::bold() << "Pending UTXO Details:" << ui::reset() << "\n";
+            std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+
+            int shown = 0;
+            for(const auto& k : pending){
+                if(shown >= 10) break;
+                // Find corresponding UTXO to get value
+                uint64_t val = 0;
+                for(const auto& u : utxos){
+                    if(miq::to_hex(u.txid) == k.txid_hex && u.vout == k.vout){
+                        val = u.value;
+                        break;
+                    }
+                }
+                std::cout << "    " << ui::dim() << k.txid_hex << ":" << k.vout << ui::reset();
+                if(val > 0){
+                    std::cout << " (" << ui::cyan() << fmt_amount(val) << " MIQ" << ui::reset() << ")";
+                }
+                std::cout << "\n";
+                shown++;
+            }
+            if(pending.size() > 10){
+                std::cout << "    " << ui::dim() << "(" << (pending.size() - 10) << " more...)" << ui::reset() << "\n";
+            }
+            std::cout << "\n";
+
+            // Options
+            std::cout << "  " << ui::bold() << "Options:" << ui::reset() << "\n";
+            std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+            std::cout << "    " << ui::cyan() << "[1]" << ui::reset() << " Release ALL pending UTXOs (use with caution)\n";
+            std::cout << "    " << ui::cyan() << "[2]" << ui::reset() << " Clean up failed/expired transactions only\n";
+            std::cout << "    " << ui::cyan() << "[q]" << ui::reset() << " Cancel\n\n";
+
+            std::string pend_opt = ui::prompt("Select option: ");
+            pend_opt = trim(pend_opt);
+
+            if(pend_opt == "1"){
+                std::cout << "\n";
+                std::cout << "  " << ui::red() << ui::bold() << "WARNING:" << ui::reset() << "\n";
+                std::cout << "  " << ui::yellow() << "This will release ALL pending UTXOs." << ui::reset() << "\n";
+                std::cout << "  " << ui::dim() << "If transactions are still propagating, this could cause" << ui::reset() << "\n";
+                std::cout << "  " << ui::dim() << "double-spend attempts (which will be rejected by nodes)." << ui::reset() << "\n\n";
+
+                std::string confirm_str = ui::prompt("Type 'RELEASE' to confirm: ");
+                if(confirm_str == "RELEASE"){
+                    int released = (int)pending.size();
+                    pending.clear();
+                    save_pending(wdir, pending);
+
+                    std::cout << "\n";
+                    ui::print_success("Released " + std::to_string(released) + " pending UTXO(s)");
+                    std::cout << "  " << ui::dim() << "Your full balance should now be available." << ui::reset() << "\n\n";
+
+                    log_wallet_event(wdir, "Force released " + std::to_string(released) + " pending UTXOs");
+
+                    // Refresh to show updated balance
+                    utxos = refresh_and_print();
+                } else {
+                    std::cout << "  " << ui::dim() << "Operation cancelled." << ui::reset() << "\n\n";
+                }
+            }
+            else if(pend_opt == "2"){
+                // Clean up only failed/expired from queue
+                int cleaned = cleanup_failed_tx_pending(wdir, pending);
+                if(cleaned > 0){
+                    std::cout << "\n";
+                    ui::print_success("Cleaned up " + std::to_string(cleaned) + " failed/expired transaction(s)");
+                    log_wallet_event(wdir, "Cleaned up " + std::to_string(cleaned) + " failed transaction pending UTXOs");
+                } else {
+                    std::cout << "\n  " << ui::dim() << "No failed/expired transactions to clean up." << ui::reset() << "\n\n";
+                }
+            }
+        }
+        // =================================================================
+        // OPTION u: UTXO Details with Full TXIDs
+        // =================================================================
+        else if(c == "u" || c == "U"){
+            std::cout << "\n";
+            std::cout << ui::cyan() << ui::bold();
+            std::cout << "  +============================================================+\n";
+            std::cout << "  |                    UTXO DETAILS                            |\n";
+            std::cout << "  +============================================================+" << ui::reset() << "\n\n";
+
+            if(utxos.empty()){
+                std::cout << "  " << ui::dim() << "No UTXOs found in wallet." << ui::reset() << "\n\n";
+                continue;
+            }
+
+            // Summary
+            std::cout << "  " << ui::bold() << "Summary:" << ui::reset() << "\n";
+            std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
+            std::cout << "    Total UTXOs:     " << ui::cyan() << utxos.size() << ui::reset() << "\n";
+
+            uint64_t total_val = 0;
+            uint64_t min_val = UINT64_MAX;
+            uint64_t max_val = 0;
+            int coinbase_count = 0;
+            int mempool_count = 0;
+
+            for(const auto& u : utxos){
+                total_val += u.value;
+                if(u.value < min_val) min_val = u.value;
+                if(u.value > max_val) max_val = u.value;
+                if(u.coinbase) coinbase_count++;
+                if(u.height == 0) mempool_count++;
+            }
+
+            std::cout << "    Total Value:     " << ui::green() << fmt_amount(total_val) << " MIQ" << ui::reset() << "\n";
+            std::cout << "    Smallest UTXO:   " << fmt_amount(min_val) << " MIQ\n";
+            std::cout << "    Largest UTXO:    " << fmt_amount(max_val) << " MIQ\n";
+            if(coinbase_count > 0){
+                std::cout << "    Coinbase UTXOs:  " << ui::yellow() << coinbase_count << ui::reset() << "\n";
+            }
+            if(mempool_count > 0){
+                std::cout << "    Mempool UTXOs:   " << ui::magenta() << mempool_count << ui::reset() << "\n";
+            }
+            std::cout << "\n";
+
+            // Sorting options
+            std::cout << "  " << ui::bold() << "Sort By:" << ui::reset() << "\n";
+            std::cout << "    " << ui::cyan() << "[1]" << ui::reset() << " Value (largest first)\n";
+            std::cout << "    " << ui::cyan() << "[2]" << ui::reset() << " Value (smallest first)\n";
+            std::cout << "    " << ui::cyan() << "[3]" << ui::reset() << " Height (oldest first)\n";
+            std::cout << "    " << ui::cyan() << "[q]" << ui::reset() << " Back to menu\n\n";
+
+            std::string sort_opt = ui::prompt("Select sort order: ");
+            sort_opt = trim(sort_opt);
+
+            if(sort_opt == "q" || sort_opt == "Q" || sort_opt.empty()){
+                continue;
+            }
+
+            // Create sorted copy
+            std::vector<miq::UtxoLite> sorted_utxos = utxos;
+
+            if(sort_opt == "1"){
+                std::sort(sorted_utxos.begin(), sorted_utxos.end(),
+                    [](const miq::UtxoLite& a, const miq::UtxoLite& b){ return a.value > b.value; });
+            } else if(sort_opt == "2"){
+                std::sort(sorted_utxos.begin(), sorted_utxos.end(),
+                    [](const miq::UtxoLite& a, const miq::UtxoLite& b){ return a.value < b.value; });
+            } else if(sort_opt == "3"){
+                std::sort(sorted_utxos.begin(), sorted_utxos.end(),
+                    [](const miq::UtxoLite& a, const miq::UtxoLite& b){ return a.height < b.height; });
+            }
+
+            // Paginated display
+            int page = 0;
+            int per_page = 10;
+            int total_pages = ((int)sorted_utxos.size() + per_page - 1) / per_page;
+
+            while(true){
+                std::cout << "\n";
+                std::cout << ui::cyan() << ui::bold();
+                std::cout << "  UTXO LIST - Page " << (page + 1) << "/" << total_pages << ui::reset() << "\n";
+                std::cout << ui::dim() << "  ================================================================" << ui::reset() << "\n\n";
+
+                int start = page * per_page;
+                int end = std::min(start + per_page, (int)sorted_utxos.size());
+
+                for(int i = start; i < end; i++){
+                    const auto& u = sorted_utxos[i];
+                    std::string txid_hex = miq::to_hex(u.txid);
+
+                    // Check if pending
+                    OutpointKey k{ txid_hex, u.vout };
+                    bool is_pending = pending.find(k) != pending.end();
+
+                    std::cout << "  " << ui::dim() << std::setw(4) << (i+1) << ui::reset() << " ";
+
+                    // Status indicator
+                    if(is_pending){
+                        std::cout << ui::yellow() << "[PENDING]" << ui::reset() << " ";
+                    } else if(u.coinbase){
+                        std::cout << ui::magenta() << "[COINBASE]" << ui::reset();
+                    } else {
+                        std::cout << ui::green() << "[SPENDABLE]" << ui::reset();
+                    }
+                    std::cout << "\n";
+
+                    // Full TXID
+                    std::cout << "       " << ui::bold() << "TXID:" << ui::reset() << " " << ui::cyan() << txid_hex << ui::reset() << "\n";
+                    std::cout << "       " << ui::bold() << "Vout:" << ui::reset() << " " << u.vout << "\n";
+                    std::cout << "       " << ui::bold() << "Value:" << ui::reset() << " " << ui::green() << fmt_amount(u.value) << " MIQ" << ui::reset() << "\n";
+                    std::cout << "       " << ui::bold() << "Height:" << ui::reset() << " " << (u.height == 0 ? "mempool" : std::to_string(u.height)) << "\n";
+
+                    // Show PKH
+                    std::cout << "       " << ui::bold() << "PKH:" << ui::reset() << " " << ui::dim() << miq::to_hex(u.pkh) << ui::reset() << "\n";
+                    std::cout << "\n";
+                }
+
+                std::cout << "  " << ui::dim() << "Page " << (page + 1) << "/" << total_pages
+                          << " | Showing " << (end - start) << "/" << sorted_utxos.size() << " UTXOs" << ui::reset() << "\n";
+                std::cout << "\n";
+                std::cout << "  " << ui::cyan() << "n" << ui::reset() << " Next page  "
+                          << ui::cyan() << "p" << ui::reset() << " Previous  "
+                          << ui::cyan() << "q" << ui::reset() << " Back to menu\n\n";
+
+                std::string nav = ui::prompt("Command: ");
+                nav = trim(nav);
+
+                if(nav == "n" && page < total_pages - 1) page++;
+                else if(nav == "p" && page > 0) page--;
+                else if(nav == "q" || nav == "Q") break;
+            }
         }
         // =================================================================
         // OPTION q: Quit
