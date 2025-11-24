@@ -3095,6 +3095,333 @@ static void add_to_address_book(const std::string& wdir, const std::string& addr
 }
 
 // =============================================================================
+// PROFESSIONAL TRANSACTION HISTORY v1.0 - Live History & Details
+// =============================================================================
+
+// Enhanced transaction entry with complete details
+struct TxDetailedEntry {
+    std::string txid_hex;
+    int64_t timestamp{0};
+    int64_t amount{0};
+    uint64_t fee{0};
+    uint32_t confirmations{0};
+    std::string direction;
+    std::string to_address;
+    std::string from_address;
+    std::string memo;
+    std::string category;
+    uint32_t block_height{0};
+    size_t tx_size{0};
+    double fee_rate{0.0};
+    std::string status;
+};
+
+// Transaction history filter options
+struct TxHistoryFilter {
+    std::string direction;
+    std::string status;
+    int64_t date_from{0};
+    int64_t date_to{0};
+    uint64_t amount_min{0};
+    uint64_t amount_max{UINT64_MAX};
+    std::string search;
+};
+
+// Transaction history sort options
+enum class TxSortOrder {
+    DATE_DESC,
+    DATE_ASC,
+    AMOUNT_DESC,
+    AMOUNT_ASC,
+    CONFIRMATIONS
+};
+
+// History viewer state
+struct TxHistoryViewState {
+    int page{0};
+    int per_page{12};
+    int total_pages{0};
+    int total_count{0};
+    int selected{-1};
+    TxSortOrder sort_order{TxSortOrder::DATE_DESC};
+    TxHistoryFilter filter;
+};
+
+// Convert basic TxHistoryEntry to detailed entry
+static TxDetailedEntry convert_to_detailed(const TxHistoryEntry& basic) {
+    TxDetailedEntry detailed;
+    detailed.txid_hex = basic.txid_hex;
+    detailed.timestamp = basic.timestamp;
+    detailed.amount = basic.amount;
+    detailed.fee = basic.fee;
+    detailed.confirmations = basic.confirmations;
+    detailed.direction = basic.direction;
+    detailed.to_address = basic.to_address;
+    detailed.from_address = basic.from_address;
+    detailed.memo = basic.memo;
+    detailed.status = basic.confirmations > 0 ? "confirmed" : "pending";
+    detailed.tx_size = 225;
+    if (detailed.fee > 0) {
+        detailed.fee_rate = (double)detailed.fee / detailed.tx_size;
+    }
+    return detailed;
+}
+
+// Filter transactions
+static std::vector<TxDetailedEntry> filter_transactions(
+    const std::vector<TxDetailedEntry>& all,
+    const TxHistoryFilter& filter)
+{
+    std::vector<TxDetailedEntry> result;
+    for (const auto& tx : all) {
+        if (!filter.direction.empty() && tx.direction != filter.direction) continue;
+        if (!filter.status.empty()) {
+            if (filter.status == "confirmed" && tx.confirmations == 0) continue;
+            if (filter.status == "pending" && tx.confirmations > 0) continue;
+        }
+        if (filter.date_from > 0 && tx.timestamp < filter.date_from) continue;
+        if (filter.date_to > 0 && tx.timestamp > filter.date_to) continue;
+        uint64_t abs_amount = tx.amount >= 0 ? (uint64_t)tx.amount : (uint64_t)(-tx.amount);
+        if (abs_amount < filter.amount_min || abs_amount > filter.amount_max) continue;
+        if (!filter.search.empty()) {
+            std::string lower_search = filter.search;
+            for (auto& c : lower_search) c = std::tolower(c);
+            std::string lower_txid = tx.txid_hex;
+            for (auto& c : lower_txid) c = std::tolower(c);
+            bool found = (lower_txid.find(lower_search) != std::string::npos ||
+                         tx.to_address.find(filter.search) != std::string::npos ||
+                         tx.memo.find(filter.search) != std::string::npos);
+            if (!found) continue;
+        }
+        result.push_back(tx);
+    }
+    return result;
+}
+
+// Sort transactions
+static void sort_transactions(std::vector<TxDetailedEntry>& txs, TxSortOrder order) {
+    switch (order) {
+        case TxSortOrder::DATE_DESC:
+            std::sort(txs.begin(), txs.end(), [](const auto& a, const auto& b) {
+                return a.timestamp > b.timestamp;
+            });
+            break;
+        case TxSortOrder::DATE_ASC:
+            std::sort(txs.begin(), txs.end(), [](const auto& a, const auto& b) {
+                return a.timestamp < b.timestamp;
+            });
+            break;
+        case TxSortOrder::AMOUNT_DESC:
+            std::sort(txs.begin(), txs.end(), [](const auto& a, const auto& b) {
+                uint64_t aa = a.amount >= 0 ? (uint64_t)a.amount : (uint64_t)(-a.amount);
+                uint64_t ba = b.amount >= 0 ? (uint64_t)b.amount : (uint64_t)(-b.amount);
+                return aa > ba;
+            });
+            break;
+        case TxSortOrder::AMOUNT_ASC:
+            std::sort(txs.begin(), txs.end(), [](const auto& a, const auto& b) {
+                uint64_t aa = a.amount >= 0 ? (uint64_t)a.amount : (uint64_t)(-a.amount);
+                uint64_t ba = b.amount >= 0 ? (uint64_t)b.amount : (uint64_t)(-b.amount);
+                return aa < ba;
+            });
+            break;
+        case TxSortOrder::CONFIRMATIONS:
+            std::sort(txs.begin(), txs.end(), [](const auto& a, const auto& b) {
+                return a.confirmations < b.confirmations;
+            });
+            break;
+    }
+}
+
+// Confirmation progress bar
+static std::string confirmation_bar(uint32_t confirmations, int width = 6) {
+    std::string bar;
+    if (confirmations == 0) {
+        bar = ui::yellow() + "[";
+        for (int i = 0; i < width; i++) bar += ".";
+        bar += "]" + ui::reset();
+    } else if (confirmations >= 6) {
+        bar = ui::green() + "[";
+        for (int i = 0; i < width; i++) bar += "#";
+        bar += "]" + ui::reset();
+    } else {
+        int filled = (int)(confirmations * width / 6);
+        bar = ui::cyan() + "[";
+        for (int i = 0; i < width; i++) {
+            if (i < filled) bar += "#";
+            else bar += ".";
+        }
+        bar += "]" + ui::reset();
+    }
+    return bar;
+}
+
+// Print single transaction row
+static void print_tx_row(const TxDetailedEntry& tx, int index, bool selected,
+                         const std::vector<AddressBookEntry>& address_book) {
+    if (selected) {
+        std::cout << ui::cyan() << " > " << ui::reset();
+    } else {
+        std::cout << "   ";
+    }
+    std::cout << ui::dim() << std::setw(3) << (index + 1) << ui::reset() << " ";
+    if (tx.direction == "sent") {
+        std::cout << ui::red() << "[-]" << ui::reset();
+    } else if (tx.direction == "received") {
+        std::cout << ui::green() << "[+]" << ui::reset();
+    } else {
+        std::cout << ui::yellow() << "[=]" << ui::reset();
+    }
+    std::cout << " " << ui::dim() << ui::format_time_short(tx.timestamp) << ui::reset();
+    std::string amt_str;
+    if (tx.amount >= 0) {
+        amt_str = "+" + ui_pro::format_miq_professional((uint64_t)tx.amount);
+        std::cout << " " << ui::green() << std::setw(16) << std::right << amt_str << ui::reset();
+    } else {
+        amt_str = "-" + ui_pro::format_miq_professional((uint64_t)(-tx.amount));
+        std::cout << " " << ui::red() << std::setw(16) << std::right << amt_str << ui::reset();
+    }
+    std::cout << " " << confirmation_bar(tx.confirmations);
+    std::string addr = tx.direction == "sent" ? tx.to_address : tx.from_address;
+    std::string label;
+    for (const auto& entry : address_book) {
+        if (entry.address == addr) {
+            label = entry.label;
+            break;
+        }
+    }
+    if (!label.empty()) {
+        std::cout << " " << ui::cyan() << label << ui::reset();
+    } else if (!addr.empty()) {
+        std::cout << " " << ui::dim() << addr.substr(0, 12) << "..." << ui::reset();
+    }
+    if (!tx.memo.empty()) {
+        std::cout << " " << ui::yellow() << "[M]" << ui::reset();
+    }
+    std::cout << "\n";
+}
+
+// Print detailed transaction view
+static void print_tx_details_view(const TxDetailedEntry& tx,
+                                   const std::vector<AddressBookEntry>& address_book) {
+    std::cout << "\n";
+    ui::print_double_header("TRANSACTION DETAILS", 70);
+    std::cout << "\n";
+    std::cout << "  " << ui::bold() << "Basic Information" << ui::reset() << "\n";
+    std::cout << "  " << std::string(66, '-') << "\n";
+    ui_pro::print_kv("Transaction ID:", tx.txid_hex, 18);
+    ui_pro::print_kv("Status:", tx.confirmations > 0 ?
+        (ui::green() + "Confirmed" + ui::reset()) :
+        (ui::yellow() + "Pending" + ui::reset()), 18);
+    ui_pro::print_kv("Direction:",
+        tx.direction == "sent" ? (ui::red() + "Sent" + ui::reset()) :
+        tx.direction == "received" ? (ui::green() + "Received" + ui::reset()) :
+        (ui::yellow() + "Self" + ui::reset()), 18);
+    ui_pro::print_kv("Date/Time:", ui::format_time(tx.timestamp), 18);
+    ui_pro::print_kv("Time Ago:", ui::format_time_ago(tx.timestamp), 18);
+    std::cout << "\n";
+    std::cout << "  " << ui::bold() << "Amount Details" << ui::reset() << "\n";
+    std::cout << "  " << std::string(66, '-') << "\n";
+    if (tx.amount >= 0) {
+        ui_pro::print_kv("Amount:", ui::green() + "+" + ui_pro::format_miq_professional((uint64_t)tx.amount) + " MIQ" + ui::reset(), 18);
+    } else {
+        ui_pro::print_kv("Amount:", ui::red() + "-" + ui_pro::format_miq_professional((uint64_t)(-tx.amount)) + " MIQ" + ui::reset(), 18);
+    }
+    ui_pro::print_kv("Fee:", ui_pro::format_miq_professional(tx.fee) + " MIQ", 18);
+    if (tx.fee_rate > 0) {
+        std::ostringstream fee_rate_ss;
+        fee_rate_ss << std::fixed << std::setprecision(2) << tx.fee_rate << " sat/byte";
+        ui_pro::print_kv("Fee Rate:", fee_rate_ss.str(), 18);
+    }
+    std::cout << "\n";
+    std::cout << "  " << ui::bold() << "Confirmation Status" << ui::reset() << "\n";
+    std::cout << "  " << std::string(66, '-') << "\n";
+    ui_pro::print_kv("Confirmations:", std::to_string(tx.confirmations), 18);
+    std::cout << "  " << ui::dim() << std::setw(18) << std::left << "Progress:" << ui::reset();
+    double conf_percent = tx.confirmations >= 6 ? 100.0 : (tx.confirmations * 100.0 / 6.0);
+    std::cout << ui_pro::draw_progress_bar(conf_percent, 20) << " ";
+    if (tx.confirmations >= 6) {
+        std::cout << ui::green() << "CONFIRMED" << ui::reset();
+    } else if (tx.confirmations > 0) {
+        std::cout << ui::cyan() << tx.confirmations << "/6" << ui::reset();
+    } else {
+        std::cout << ui::yellow() << "PENDING" << ui::reset();
+    }
+    std::cout << "\n\n";
+    std::cout << "  " << ui::bold() << "Addresses" << ui::reset() << "\n";
+    std::cout << "  " << std::string(66, '-') << "\n";
+    auto resolve_label = [&](const std::string& addr) -> std::string {
+        for (const auto& entry : address_book) {
+            if (entry.address == addr) return entry.label;
+        }
+        return "";
+    };
+    if (!tx.to_address.empty()) {
+        std::string to_label = resolve_label(tx.to_address);
+        if (!to_label.empty()) {
+            ui_pro::print_kv("To:", ui::cyan() + to_label + ui::reset(), 18);
+            std::cout << "  " << ui::dim() << std::setw(18) << "" << tx.to_address << ui::reset() << "\n";
+        } else {
+            ui_pro::print_kv("To:", tx.to_address, 18);
+        }
+    }
+    if (!tx.from_address.empty()) {
+        std::string from_label = resolve_label(tx.from_address);
+        if (!from_label.empty()) {
+            ui_pro::print_kv("From:", ui::cyan() + from_label + ui::reset(), 18);
+            std::cout << "  " << ui::dim() << std::setw(18) << "" << tx.from_address << ui::reset() << "\n";
+        } else {
+            ui_pro::print_kv("From:", tx.from_address, 18);
+        }
+    }
+    if (!tx.memo.empty()) {
+        std::cout << "\n";
+        std::cout << "  " << ui::bold() << "Memo" << ui::reset() << "\n";
+        std::cout << "  " << std::string(66, '-') << "\n";
+        std::cout << "  " << ui::yellow() << tx.memo << ui::reset() << "\n";
+    }
+    std::cout << "\n";
+}
+
+// Print transaction statistics
+static void print_tx_statistics(const std::vector<TxDetailedEntry>& txs) {
+    if (txs.empty()) return;
+    uint64_t total_sent = 0, total_received = 0, total_fees = 0;
+    int sent_count = 0, received_count = 0;
+    for (const auto& tx : txs) {
+        if (tx.amount < 0) {
+            total_sent += (uint64_t)(-tx.amount);
+            sent_count++;
+        } else {
+            total_received += (uint64_t)tx.amount;
+            received_count++;
+        }
+        total_fees += tx.fee;
+    }
+    std::cout << "\n";
+    ui::print_double_header("TRANSACTION STATISTICS", 60);
+    std::cout << "\n";
+    std::cout << "  " << ui::bold() << "Summary" << ui::reset() << "\n";
+    std::cout << "  " << std::string(56, '-') << "\n";
+    ui_pro::print_kv("Total Transactions:", std::to_string(txs.size()), 22);
+    ui_pro::print_kv("Sent:", std::to_string(sent_count) + " tx", 22);
+    ui_pro::print_kv("Received:", std::to_string(received_count) + " tx", 22);
+    std::cout << "\n";
+    std::cout << "  " << ui::bold() << "Amounts" << ui::reset() << "\n";
+    std::cout << "  " << std::string(56, '-') << "\n";
+    ui_pro::print_kv("Total Sent:", ui::red() + ui_pro::format_miq_professional(total_sent) + " MIQ" + ui::reset(), 22);
+    ui_pro::print_kv("Total Received:", ui::green() + ui_pro::format_miq_professional(total_received) + " MIQ" + ui::reset(), 22);
+    ui_pro::print_kv("Total Fees Paid:", ui_pro::format_miq_professional(total_fees) + " MIQ", 22);
+    int64_t net = (int64_t)total_received - (int64_t)total_sent - (int64_t)total_fees;
+    if (net >= 0) {
+        ui_pro::print_kv("Net Change:", ui::green() + "+" + ui_pro::format_miq_professional((uint64_t)net) + " MIQ" + ui::reset(), 22);
+    } else {
+        ui_pro::print_kv("Net Change:", ui::red() + "-" + ui_pro::format_miq_professional((uint64_t)(-net)) + " MIQ" + ui::reset(), 22);
+    }
+    std::cout << "\n";
+}
+
+// =============================================================================
 // FEE PRIORITY LABELS
 // =============================================================================
 static std::string fee_priority_label(int priority){
@@ -3859,78 +4186,115 @@ static bool wallet_session(const std::string& cli_host,
         c = trim(c);
 
         // =================================================================
-        // OPTION 4: Transaction History
+        // OPTION 4: Transaction History - Professional Viewer
         // =================================================================
         if(c == "4"){
-            std::cout << "\n";
-            ui::print_double_header("TRANSACTION HISTORY", 60);
-            std::cout << "\n";
+            std::vector<TxHistoryEntry> history_raw;
+            load_tx_history(wdir, history_raw);
+            std::vector<AddressBookEntry> address_book;
+            load_address_book(wdir, address_book);
 
-            std::vector<TxHistoryEntry> history;
-            load_tx_history(wdir, history);
-
-            if(history.empty()){
+            if(history_raw.empty()){
+                std::cout << "\n";
+                ui::print_double_header("TRANSACTION HISTORY", 60);
+                std::cout << "\n";
                 std::cout << "  " << ui::dim() << "No transactions yet." << ui::reset() << "\n";
                 std::cout << "  " << ui::dim() << "Send or receive MIQ to see transaction history." << ui::reset() << "\n\n";
-            } else {
-                // Show last 20 transactions
-                int show_count = std::min((int)history.size(), 20);
+                continue;
+            }
 
-                std::cout << ui::dim() << "  Recent transactions (showing " << show_count << " of "
-                          << history.size() << "):" << ui::reset() << "\n\n";
+            // Convert to detailed entries
+            std::vector<TxDetailedEntry> all_txs;
+            for (const auto& raw : history_raw) {
+                all_txs.push_back(convert_to_detailed(raw));
+            }
 
-                for(int i = 0; i < show_count; i++){
-                    const auto& tx = history[i];
+            TxHistoryViewState view_state;
+            bool history_running = true;
 
-                    // Direction indicator
-                    std::string dir_symbol, dir_color;
-                    if(tx.direction == "sent"){
-                        dir_symbol = "[-]";
-                        dir_color = "red";
-                    } else if(tx.direction == "received"){
-                        dir_symbol = "[+]";
-                        dir_color = "green";
-                    } else {
-                        dir_symbol = "[=]";
-                        dir_color = "yellow";
-                    }
+            while (history_running) {
+                auto filtered = filter_transactions(all_txs, view_state.filter);
+                sort_transactions(filtered, view_state.sort_order);
 
-                    // Format amount
-                    std::string amt_str;
-                    if(tx.amount >= 0){
-                        amt_str = "+" + fmt_amount_short((uint64_t)tx.amount) + " MIQ";
-                    } else {
-                        amt_str = fmt_amount_short((uint64_t)(-tx.amount)) + " MIQ";
-                    }
+                view_state.total_count = (int)filtered.size();
+                view_state.total_pages = (view_state.total_count + view_state.per_page - 1) / view_state.per_page;
+                if (view_state.total_pages == 0) view_state.total_pages = 1;
+                if (view_state.page >= view_state.total_pages) view_state.page = view_state.total_pages - 1;
+                if (view_state.page < 0) view_state.page = 0;
 
-                    // Print transaction
-                    std::cout << "  ";
-                    if(dir_color == "red") std::cout << ui::red();
-                    else if(dir_color == "green") std::cout << ui::green();
-                    else std::cout << ui::yellow();
-                    std::cout << dir_symbol << ui::reset();
+                std::cout << "\n";
+                ui::print_double_header("TRANSACTION HISTORY", 70);
+                std::cout << "\n  " << ui::bold() << "Status: " << ui::reset()
+                          << ui::cyan() << view_state.total_count << ui::reset() << " transactions";
 
-                    std::cout << " " << ui::dim() << ui::format_time_short(tx.timestamp) << ui::reset();
-                    std::cout << "  " << std::setw(18) << std::right << amt_str;
+                if (!view_state.filter.direction.empty()) {
+                    std::cout << " | " << ui::yellow() << "Dir:" << view_state.filter.direction << ui::reset();
+                }
+                if (!view_state.filter.status.empty()) {
+                    std::cout << " | " << ui::yellow() << "Status:" << view_state.filter.status << ui::reset();
+                }
+                if (!view_state.filter.search.empty()) {
+                    std::cout << " | " << ui::yellow() << "Search:\"" << view_state.filter.search << "\"" << ui::reset();
+                }
+                std::cout << "\n";
 
-                    if(tx.confirmations == 0){
-                        std::cout << "  " << ui::yellow() << "(unconfirmed)" << ui::reset();
-                    } else if(tx.confirmations < 6){
-                        std::cout << "  " << ui::dim() << "(" << tx.confirmations << " conf)" << ui::reset();
-                    }
+                std::cout << "\n  " << ui::dim() << "     #   Dir  Date        Amount           Conf   Address" << ui::reset() << "\n";
+                std::cout << "  " << std::string(68, '-') << "\n";
 
-                    std::cout << "\n";
+                int start_idx = view_state.page * view_state.per_page;
+                int end_idx = std::min(start_idx + view_state.per_page, view_state.total_count);
 
-                    // Show address on second line
-                    if(!tx.to_address.empty() && tx.direction == "sent"){
-                        std::cout << "      " << ui::dim() << "To: " << tx.to_address.substr(0, 30)
-                                  << (tx.to_address.size() > 30 ? "..." : "") << ui::reset() << "\n";
+                if (filtered.empty()) {
+                    std::cout << "\n  " << ui::dim() << "No transactions match filters." << ui::reset() << "\n";
+                } else {
+                    for (int i = start_idx; i < end_idx; i++) {
+                        print_tx_row(filtered[i], i, (i == view_state.selected), address_book);
                     }
                 }
 
-                std::cout << "\n  " << ui::dim() << "Press ENTER to return..." << ui::reset();
-                std::string dummy;
-                std::getline(std::cin, dummy);
+                std::cout << "\n  " << ui::dim() << "Page " << (view_state.page + 1) << "/" << view_state.total_pages
+                          << " | " << (end_idx - start_idx) << "/" << view_state.total_count << " shown" << ui::reset() << "\n";
+
+                std::cout << "\n  " << ui::cyan() << "n/p" << ui::reset() << " Page  "
+                          << ui::cyan() << "v" << ui::reset() << " View  "
+                          << ui::cyan() << "fs/fr/fp/fc" << ui::reset() << " Filter  "
+                          << ui::cyan() << "/text" << ui::reset() << " Search  "
+                          << ui::cyan() << "s" << ui::reset() << " Stats  "
+                          << ui::cyan() << "c" << ui::reset() << " Clear  "
+                          << ui::cyan() << "q" << ui::reset() << " Back\n";
+
+                std::string cmd = ui::prompt("Command: ");
+                cmd = trim(cmd);
+
+                if (cmd.empty()) continue;
+                else if (cmd == "q" || cmd == "Q") history_running = false;
+                else if (cmd == "n") { if (view_state.page < view_state.total_pages - 1) view_state.page++; }
+                else if (cmd == "p") { if (view_state.page > 0) view_state.page--; }
+                else if (cmd == "v" && view_state.selected >= 0 && view_state.selected < (int)filtered.size()) {
+                    print_tx_details_view(filtered[view_state.selected], address_book);
+                    std::cout << "  " << ui::dim() << "Press ENTER..." << ui::reset();
+                    std::string d; std::getline(std::cin, d);
+                }
+                else if (cmd == "s") {
+                    print_tx_statistics(filtered);
+                    std::cout << "  " << ui::dim() << "Press ENTER..." << ui::reset();
+                    std::string d; std::getline(std::cin, d);
+                }
+                else if (cmd == "c") { view_state.filter = TxHistoryFilter(); view_state.page = 0; view_state.selected = -1; }
+                else if (cmd == "fs") { view_state.filter.direction = "sent"; view_state.page = 0; }
+                else if (cmd == "fr") { view_state.filter.direction = "received"; view_state.page = 0; }
+                else if (cmd == "fp") { view_state.filter.status = "pending"; view_state.page = 0; }
+                else if (cmd == "fc") { view_state.filter.status = "confirmed"; view_state.page = 0; }
+                else if (cmd[0] == '/') { view_state.filter.search = cmd.substr(1); view_state.page = 0; }
+                else {
+                    try {
+                        int num = std::stoi(cmd);
+                        if (num >= 1 && num <= view_state.total_count) {
+                            view_state.selected = num - 1;
+                            view_state.page = view_state.selected / view_state.per_page;
+                        }
+                    } catch (...) {}
+                }
             }
             continue;
         }
