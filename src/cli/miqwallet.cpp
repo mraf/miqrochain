@@ -4853,6 +4853,24 @@ static bool wallet_session(const std::string& cli_host,
             std::string used_bcast_seed, berr;
             auto seeds_b = build_seed_candidates(cli_host, cli_port);
 
+            // WALLET FIX: Prioritize broadcasting to the same node that provided UTXOs
+            // This ensures transaction inputs are definitely in that node's UTXO set
+            if(last_connected_node != "<offline>" && last_connected_node != "<not connected>"){
+                size_t colon = last_connected_node.find(':');
+                if(colon != std::string::npos){
+                    std::string spv_host = last_connected_node.substr(0, colon);
+                    std::string spv_port = last_connected_node.substr(colon + 1);
+                    // Remove this seed from list if present, then add to front
+                    seeds_b.erase(
+                        std::remove_if(seeds_b.begin(), seeds_b.end(),
+                            [&](const std::pair<std::string,std::string>& s){
+                                return s.first == spv_host && s.second == spv_port;
+                            }),
+                        seeds_b.end());
+                    seeds_b.insert(seeds_b.begin(), {spv_host, spv_port});
+                }
+            }
+
             bool broadcast_success = broadcast_any_seed(seeds_b, raw, used_bcast_seed, berr);
 
             // Update pending cache regardless of broadcast success

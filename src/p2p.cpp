@@ -993,8 +993,25 @@ static inline void maybe_mark_headers_done(bool at_tip) {
 
 static bool g_sync_green_logged = false;
 
-// Forward declaration for thread-safe inflight check
-static inline bool is_block_inflight(const std::string& hash);
+// Thread-safe global inflight tracking at file scope
+// (separate from the more sophisticated SpinLock-based system in the anonymous namespace below)
+static std::mutex g_file_scope_inflight_mu;
+static std::unordered_set<std::string> g_file_scope_inflight_blocks;
+
+static bool is_block_inflight(const std::string& hash) {
+    std::lock_guard<std::mutex> lk(g_file_scope_inflight_mu);
+    return g_file_scope_inflight_blocks.find(hash) != g_file_scope_inflight_blocks.end();
+}
+
+static void add_file_scope_inflight(const std::string& hash) {
+    std::lock_guard<std::mutex> lk(g_file_scope_inflight_mu);
+    g_file_scope_inflight_blocks.insert(hash);
+}
+
+static void remove_file_scope_inflight(const std::string& hash) {
+    std::lock_guard<std::mutex> lk(g_file_scope_inflight_mu);
+    g_file_scope_inflight_blocks.erase(hash);
+}
 
 static MIQ_MAYBE_UNUSED bool unsolicited_drop(miq::PeerState& ps, const char* what, const std::string& keyHex){
     (void)what; (void)keyHex;
@@ -1114,16 +1131,15 @@ public:
     InflightLock& operator=(const InflightLock&) = delete;
 };
 
-// Safe accessors for inflight data
-static inline bool is_block_inflight(const std::string& hash) {
-    InflightLock lk(g_inflight_lock);
-    return g_global_inflight_blocks.find(hash) != g_global_inflight_blocks.end();
-}
+// Note: is_block_inflight is defined at file scope, outside this namespace,
+// so it can be forward-declared and used by unsolicited_drop above.
 
 static inline void mark_block_inflight(const std::string& hash, Sock sock) {
     InflightLock lk(g_inflight_lock);
     g_global_inflight_blocks.insert(hash);
     g_inflight_block_ts[sock][hash] = now_ms();
+    // Also update file-scope set for unsolicited_drop()
+    add_file_scope_inflight(hash);
 }
 
 static inline void clear_block_inflight(const std::string& hash, Sock sock) {
@@ -1133,6 +1149,8 @@ static inline void clear_block_inflight(const std::string& hash, Sock sock) {
     if (it != g_inflight_block_ts.end()) {
         it->second.erase(hash);
     }
+    // Also update file-scope set
+    remove_file_scope_inflight(hash);
 }
 
 static inline void clear_all_inflight_for_sock(Sock sock) {
@@ -1141,6 +1159,8 @@ static inline void clear_all_inflight_for_sock(Sock sock) {
     if (it != g_inflight_block_ts.end()) {
         for (const auto& kv : it->second) {
             g_global_inflight_blocks.erase(kv.first);
+            // Also update file-scope set
+            remove_file_scope_inflight(kv.first);
         }
         g_inflight_block_ts.erase(it);
     }
@@ -5183,14 +5203,20 @@ void P2P::loop(){
                             }
                             bool in_mempool = mempool_ && mempool_->exists(tx.txid());
 
+                            // WALLET FIX: Don't skip orphan transactions
+                            // When tx is accepted as orphan (accepted=true but not in mempool),
+                            // we still need to store it and relay it so it can propagate.
+                            // The previous code had "continue" here which caused wallet txs
+                            // to never propagate if treated as orphans.
                             if (accepted && !in_mempool) {
+                                // Try to fetch missing parent transactions
                                 for (const auto& in : tx.vin) {
                                     UTXOEntry e;
                                     if (!chain_.utxo().get(in.prev.txid, in.prev.vout, e)) {
                                         send_gettx(s, in.prev.txid);
                                     }
                                 }
-                                continue;
+                                // Don't continue - fall through to store and relay the orphan tx
                             }
 
                             if (tx_store_.find(key) == tx_store_.end()) {
