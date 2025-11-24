@@ -170,20 +170,20 @@ static inline void set_title(const std::string& t){
     std::cout << "\x1b]0;" << t << "\x07";
 }
 
-// Professional ASCII banner for Chronen Miner
+// Professional ASCII banner for Chronen Miner (ASCII-safe for PowerShell v5)
 static const char* kChronenMinerBanner[] = {
-"   ██████╗██╗  ██╗██████╗  ██████╗ ███╗   ██╗███████╗███╗   ██╗",
-"  ██╔════╝██║  ██║██╔══██╗██╔═══██╗████╗  ██║██╔════╝████╗  ██║",
-"  ██║     ███████║██████╔╝██║   ██║██╔██╗ ██║█████╗  ██╔██╗ ██║",
-"  ██║     ██╔══██║██╔══██╗██║   ██║██║╚██╗██║██╔══╝  ██║╚██╗██║",
-"  ╚██████╗██║  ██║██║  ██║╚██████╔╝██║ ╚████║███████╗██║ ╚████║",
-"   ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═══╝",
-"                    ███╗   ███╗██╗███╗   ██╗███████╗██████╗     ",
-"                    ████╗ ████║██║████╗  ██║██╔════╝██╔══██╗    ",
-"                    ██╔████╔██║██║██╔██╗ ██║█████╗  ██████╔╝    ",
-"                    ██║╚██╔╝██║██║██║╚██╗██║██╔══╝  ██╔══██╗    ",
-"                    ██║ ╚═╝ ██║██║██║ ╚████║███████╗██║  ██║    ",
-"                    ╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝    ",
+"    _____ _    _ _____   ____  _   _ ______ _   _",
+"   / ____| |  | |  __ \\ / __ \\| \\ | |  ____| \\ | |",
+"  | |    | |__| | |__) | |  | |  \\| | |__  |  \\| |",
+"  | |    |  __  |  _  /| |  | | . ` |  __| | . ` |",
+"  | |____| |  | | | \\ \\| |__| | |\\  | |____| |\\  |",
+"   \\_____|_|  |_|_|  \\_\\\\____/|_| \\_|______|_| \\_|",
+"                  __  __ _____ _   _ ______ _____",
+"                 |  \\/  |_   _| \\ | |  ____|  __ \\",
+"                 | \\  / | | | |  \\| | |__  | |__) |",
+"                 | |\\/| | | | | . ` |  __| |  _  /",
+"                 | |  | |_| |_| |\\  | |____| | \\ \\",
+"                 |_|  |_|_____|_| \\_|______|_|  \\_\\",
 };
 
 // UI Helper: Draw a horizontal line
@@ -224,7 +224,7 @@ static const char* kChronenMinerBanner[] = {
         text = text.substr(0, content_width);
     }
     int padding = content_width - (int)text.size();
-    return "│ " + text + std::string(padding, ' ') + " │";
+    return "| " + text + std::string(padding, ' ') + " |";
 }
 
 // Forward declaration for fmt_hs (defined later in file)
@@ -247,9 +247,9 @@ static std::string fmt_hs_bar(double v, double max_v, int bar_width = 20) {
 // UI Helper: Status indicator with color
 static std::string ui_status(bool ok, const std::string& ok_text, const std::string& fail_text) {
     if (ok) {
-        return C("32;1") + "● " + ok_text + R();
+        return C("32;1") + "* " + ok_text + R();
     } else {
-        return C("31;1") + "○ " + fail_text + R();
+        return C("31;1") + "x " + fail_text + R();
     }
 }
 
@@ -564,7 +564,10 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
     winsock_ensure();
     addrinfo hints{}; hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_STREAM;
     addrinfo* res=nullptr; char ps[16]; std::snprintf(ps,sizeof(ps), "%u", (unsigned)port);
-    if(getaddrinfo(host.c_str(), ps, &hints, &res)!=0) {
+    int gai_err = getaddrinfo(host.c_str(), ps, &hints, &res);
+    if(gai_err != 0) {
+        out.code = 0;
+        out.body = "DNS resolution failed";
         return false;
     }
     socket_t s =
@@ -577,21 +580,29 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
         s = (socket_t)socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 #if defined(_WIN32)
         if(s==INVALID_SOCKET) continue;
-        set_socket_timeouts(s, 7000, 10000);
+        set_socket_timeouts(s, 10000, 15000);  // Increased timeouts for reliability
         if(connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen)==0) break;
         miq_closesocket(s); s = INVALID_SOCKET;
 #else
         if(s<0) continue;
-        set_socket_timeouts(s, 7000, 10000);
+        set_socket_timeouts(s, 10000, 15000);  // Increased timeouts for reliability
         if(connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen)==0) break;
         miq_closesocket(s); s = -1;
 #endif
     }
     freeaddrinfo(res);
 #if defined(_WIN32)
-    if(s==INVALID_SOCKET) return false;
+    if(s==INVALID_SOCKET) {
+        out.code = 0;
+        out.body = "Connection failed - node not reachable";
+        return false;
+    }
 #else
-    if(s<0) return false;
+    if(s<0) {
+        out.code = 0;
+        out.body = "Connection failed - node not reachable";
+        return false;
+    }
 #endif
 
     std::ostringstream req;
@@ -1367,6 +1378,10 @@ static inline std::string center_fit(const std::string& s, size_t width){
 // ===== Intro splash & robust address prompt =================================
 static void enable_virtual_terminal(){
 #if defined(_WIN32)
+    // Set console output to UTF-8 for proper character display
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
     if (h != INVALID_HANDLE_VALUE) { DWORD mode=0; if (GetConsoleMode(h,&mode)) SetConsoleMode(h, mode | 0x0004); }
 #endif
@@ -1434,27 +1449,27 @@ static MiningMode show_mining_mode_menu() {
         s << "  " << C("2") << MIQMINER_VERSION_STRING << " - Professional Mining Software" << R() << "\n\n";
 
         // Menu header
-        s << C("36;1") << "  ══════════════════════════════════════════════════════════════════" << R() << "\n";
+        s << C("36;1") << "  ======================================================================" << R() << "\n";
         s << C("1;4") << "   SELECT MINING MODE" << R() << "\n";
-        s << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n\n";
+        s << C("36") << "  ----------------------------------------------------------------------" << R() << "\n\n";
 
         // Option 1: Solo Mining
         s << "  " << C("33;1") << "[1]" << R() << " " << C("1") << "SOLO MINING" << R() << "\n";
         s << "      " << C("2") << "Mine directly to your own node and receive full block rewards." << R() << "\n";
         s << "      " << C("31;1") << "!" << R() << " " << C("31") << "Running a full node is REQUIRED" << R() << "\n";
-        s << "      " << C("2") << "• Direct RPC connection to local/remote node" << R() << "\n";
-        s << "      " << C("2") << "• Full block reward (no pool fees)" << R() << "\n";
-        s << "      " << C("2") << "• Requires synced blockchain" << R() << "\n\n";
+        s << "      " << C("2") << "- Direct RPC connection to local/remote node" << R() << "\n";
+        s << "      " << C("2") << "- Full block reward (no pool fees)" << R() << "\n";
+        s << "      " << C("2") << "- Requires synced blockchain" << R() << "\n\n";
 
         // Option 2: Pool Mining
         s << "  " << C("36;1") << "[2]" << R() << " " << C("1") << "POOL MINING" << R() << "\n";
         s << "      " << C("2") << "Connect to a mining pool for consistent payouts." << R() << "\n";
-        s << "      " << C("32;1") << "✓" << R() << " " << C("32") << "Running a full node is NOT required" << R() << "\n";
-        s << "      " << C("2") << "• Stratum protocol (stratum+tcp://)" << R() << "\n";
-        s << "      " << C("2") << "• Shared rewards with pool miners" << R() << "\n";
-        s << "      " << C("2") << "• More consistent payouts" << R() << "\n\n";
+        s << "      " << C("32;1") << "*" << R() << " " << C("32") << "Running a full node is NOT required" << R() << "\n";
+        s << "      " << C("2") << "- Stratum protocol (stratum+tcp://)" << R() << "\n";
+        s << "      " << C("2") << "- Shared rewards with pool miners" << R() << "\n";
+        s << "      " << C("2") << "- More consistent payouts" << R() << "\n\n";
 
-        s << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n";
+        s << C("36") << "  ----------------------------------------------------------------------" << R() << "\n";
         s << "  " << C("1") << "Enter your choice [1/2]: " << R() << std::flush;
 
         std::cout << s.str();
@@ -1500,9 +1515,9 @@ static bool show_pool_config_menu(PoolConfig& cfg, const std::string& default_ad
     for(size_t i=0;i<N;i++) std::cout << kChronenMinerBanner[i] << "\n";
     std::cout << R() << "\n";
 
-    std::cout << C("36;1") << "  ══════════════════════════════════════════════════════════════════" << R() << "\n";
+    std::cout << C("36;1") << "  ======================================================================" << R() << "\n";
     std::cout << C("1;4") << "   POOL CONFIGURATION" << R() << "\n";
-    std::cout << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n\n";
+    std::cout << C("36") << "  ----------------------------------------------------------------------" << R() << "\n\n";
 
     // Pool URL
     std::cout << "  " << C("1") << "Pool Address" << R() << " (e.g., pool.example.com:3333)\n";
@@ -1568,14 +1583,14 @@ static bool show_pool_config_menu(PoolConfig& cfg, const std::string& default_ad
     }
 
     // Confirmation
-    std::cout << "\n" << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n";
+    std::cout << "\n" << C("36") << "  ----------------------------------------------------------------------" << R() << "\n";
     std::cout << "  " << C("1") << "Configuration Summary:" << R() << "\n";
     std::cout << "    Pool   : " << C("36") << cfg.host << ":" << cfg.port << R() << "\n";
     std::cout << "    Worker : " << C("33") << cfg.worker << R() << "\n";
     std::cout << "    Pass   : " << C("2") << cfg.password << R() << "\n";
-    std::cout << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n\n";
+    std::cout << C("36") << "  ----------------------------------------------------------------------" << R() << "\n\n";
 
-    std::cout << "  " << C("32;1") << "✓ Configuration complete! Starting pool mining..." << R() << "\n";
+    std::cout << "  " << C("32;1") << "* Configuration complete! Starting pool mining..." << R() << "\n";
     miq_sleep_ms(1000);
 
     return true;
@@ -2159,7 +2174,11 @@ public:
     uint16_t port;
     std::string worker;
     std::string password;
+#if defined(_WIN32)
+    socket_t sock = INVALID_SOCKET;
+#else
     socket_t sock = -1;
+#endif
     std::atomic<bool> connected{false};
     std::mutex mtx;
     std::string extranonce1;
@@ -2172,22 +2191,38 @@ public:
     std::mutex job_mtx;
 
     bool connect_to_pool() {
+        winsock_ensure();
         addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
         addrinfo* res = nullptr;
         char ps[16]; std::snprintf(ps, sizeof(ps), "%u", (unsigned)port);
-        if (getaddrinfo(host.c_str(), ps, &hints, &res) != 0) return false;
+        if (getaddrinfo(host.c_str(), ps, &hints, &res) != 0) {
+            std::fprintf(stderr, "[stratum] DNS resolution failed for %s\n", host.c_str());
+            return false;
+        }
 
         for (addrinfo* ai = res; ai; ai = ai->ai_next) {
             sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+#if defined(_WIN32)
+            if (sock == INVALID_SOCKET) continue;
+#else
             if (sock < 0) continue;
-            set_socket_timeouts(sock, 10000, 30000);
-            if (::connect(sock, ai->ai_addr, ai->ai_addrlen) == 0) break;
-            miq_closesocket(sock); sock = -1;
+#endif
+            set_socket_timeouts(sock, 15000, 30000);  // 15s send, 30s recv
+            if (::connect(sock, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0) {
+                freeaddrinfo(res);
+                connected.store(true);
+                return true;
+            }
+            miq_closesocket(sock);
+#if defined(_WIN32)
+            sock = INVALID_SOCKET;
+#else
+            sock = -1;
+#endif
         }
         freeaddrinfo(res);
-        if (sock < 0) return false;
-        connected.store(true);
-        return true;
+        std::fprintf(stderr, "[stratum] Connection refused by %s:%u\n", host.c_str(), port);
+        return false;
     }
 
     bool send_json(const std::string& json) {
@@ -2340,6 +2375,56 @@ public:
         return resp.find("true") != std::string::npos;
     }
 
+    // Helper to extract array of strings (for merkle_branch)
+    static bool json_array_strings(const std::string& json, int index, std::vector<std::string>& out) {
+        int depth = 0;
+        int current_idx = -1;
+        bool in_string = false;
+        bool in_target_array = false;
+        size_t target_start = 0;
+
+        for (size_t i = 0; i < json.size(); i++) {
+            char c = json[i];
+            if (c == '"' && (i == 0 || json[i-1] != '\\')) {
+                in_string = !in_string;
+            } else if (!in_string) {
+                if (c == '[') {
+                    if (depth == 0) {
+                        current_idx = 0;
+                    } else if (depth == 1 && current_idx == index) {
+                        in_target_array = true;
+                        target_start = i;
+                    }
+                    depth++;
+                } else if (c == ']') {
+                    depth--;
+                    if (in_target_array && depth == 1) {
+                        // Extract the array content
+                        std::string arr = json.substr(target_start, i - target_start + 1);
+                        // Parse strings from this array
+                        out.clear();
+                        bool in_str = false;
+                        size_t str_start = 0;
+                        for (size_t j = 0; j < arr.size(); j++) {
+                            if (arr[j] == '"' && (j == 0 || arr[j-1] != '\\')) {
+                                in_str = !in_str;
+                                if (in_str) {
+                                    str_start = j + 1;
+                                } else {
+                                    out.push_back(arr.substr(str_start, j - str_start));
+                                }
+                            }
+                        }
+                        return true;
+                    }
+                } else if (c == ',' && depth == 1) {
+                    current_idx++;
+                }
+            }
+        }
+        return false;
+    }
+
     // Parse mining.notify job notification
     bool parse_job(const std::string& line) {
         if (line.find("mining.notify") == std::string::npos) return false;
@@ -2357,12 +2442,16 @@ public:
 
         // Parse job parameters: [job_id, prevhash, coinbase1, coinbase2, merkle_branch[], version, nbits, ntime, clean]
         std::string job_id, prev_hash_hex, coinb1, coinb2, version_hex, bits_hex, time_hex;
+        std::vector<std::string> merkle_branch;
 
         if (!json_array_string(params, 0, job_id)) return false;
         if (!json_array_string(params, 1, prev_hash_hex)) return false;
         if (!json_array_string(params, 2, coinb1)) return false;
         if (!json_array_string(params, 3, coinb2)) return false;
-        // Skip merkle_branch[4] for now - we'll handle it simply
+
+        // Parse merkle_branch array at index 4
+        json_array_strings(params, 4, merkle_branch);
+
         if (!json_array_string(params, 5, version_hex)) return false;
         if (!json_array_string(params, 6, bits_hex)) return false;
         if (!json_array_string(params, 7, time_hex)) return false;
@@ -2370,6 +2459,7 @@ public:
         current_job.job_id = job_id;
         current_job.coinbase1 = coinb1;
         current_job.coinbase2 = coinb2;
+        current_job.merkle_branch = merkle_branch;
 
         // Parse hex values
         try {
@@ -2439,10 +2529,17 @@ public:
     }
 
     void disconnect() {
+#if defined(_WIN32)
+        if (sock != INVALID_SOCKET) {
+            miq_closesocket(sock);
+            sock = INVALID_SOCKET;
+        }
+#else
         if (sock >= 0) {
             miq_closesocket(sock);
             sock = -1;
         }
+#endif
         connected.store(false);
         has_job.store(false);
     }
@@ -2451,10 +2548,10 @@ public:
 // ===== usage =================================================================
 static void usage(){
     std::cout <<
-    "╔══════════════════════════════════════════════════════════════════════════╗\n"
-    "║                    " << MIQMINER_VERSION_STRING << "                        ║\n"
-    "║              Professional Cryptocurrency Mining Software                  ║\n"
-    "╚══════════════════════════════════════════════════════════════════════════╝\n\n"
+    "+============================================================================+\n"
+    "|                    " << MIQMINER_VERSION_STRING << "                        |\n"
+    "|              Professional Cryptocurrency Mining Software                  |\n"
+    "+============================================================================+\n\n"
     "Usage:\n"
     "  miqminer [options]\n\n"
     "Mining Modes (interactive selection at startup if not specified):\n"
@@ -2812,14 +2909,14 @@ int main(int argc, char** argv){
                 for(size_t i=0;i<kBannerN;i++) s << kChronenMinerBanner[i] << "\n";
                 s << R() << "\n";
                 s << "  " << C("1") << "Initializing Chronen Miner..." << R() << "\n\n";
-                s << "  " << C("36") << "►" << R() << " RPC Endpoint: " << C("1") << ui.rpc_host << ":" << ui.rpc_port << R() << "\n";
-                s << "  " << C("36") << "►" << R() << " Payout Addr : " << C("33;1") << pkh_to_address(ui.my_pkh) << R() << "\n";
-                s << "  " << C("36") << "►" << R() << " CPU Threads : " << C("1") << (int)threads << R();
+                s << "  " << C("36") << ">" << R() << " RPC Endpoint: " << C("1") << ui.rpc_host << ":" << ui.rpc_port << R() << "\n";
+                s << "  " << C("36") << ">" << R() << " Payout Addr : " << C("33;1") << pkh_to_address(ui.my_pkh) << R() << "\n";
+                s << "  " << C("36") << ">" << R() << " CPU Threads : " << C("1") << (int)threads << R();
                 if(pin_affinity) s << C("2") << " [affinity]" << R();
                 if(high_priority) s << C("2") << " [high-priority]" << R();
                 s << "\n";
 #if defined(MIQ_ENABLE_OPENCL)
-                s << "  " << C("36") << "►" << R() << " GPU Mining  : " << (ui.gpu_available.load() ? (C("32;1") + "ENABLED" + R() + " - " + ui.gpu_device) : (C("2") + "disabled" + R())) << "\n";
+                s << "  " << C("36") << ">" << R() << " GPU Mining  : " << (ui.gpu_available.load() ? (C("32;1") + "ENABLED" + R() + " - " + ui.gpu_device) : (C("2") + "disabled" + R())) << "\n";
 #endif
                 s << "\n  " << C("33") << "Loading dashboard..." << R() << "\n";
                 std::cout << s.str() << std::flush;
@@ -2847,13 +2944,13 @@ int main(int argc, char** argv){
                 // ═══════════════════════════════════════════════════════════════
                 // SECTION 1: NETWORK/POOL STATUS
                 // ═══════════════════════════════════════════════════════════════
-                out << "\n" << C("36;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << "\n" << C("36;1") << "======================================================================" << R() << "\n";
 
                 bool is_pool_mode = ui.pool_mode.load();
 
                 if (is_pool_mode) {
                     out << C("1;4") << " POOL STATUS" << R() << "\n";
-                    out << C("36") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
+                    out << C("36") << "----------------------------------------------------------------------" << R() << "\n";
 
                     // Pool connection status
                     bool connected = ui.node_reachable.load();
@@ -2880,7 +2977,7 @@ int main(int argc, char** argv){
                     }
                 } else {
                     out << C("1;4") << " NETWORK STATUS" << R() << "\n";
-                    out << C("36") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
+                    out << C("36") << "----------------------------------------------------------------------" << R() << "\n";
 
                     // Connection status
                     bool connected = ui.node_reachable.load();
@@ -2906,9 +3003,9 @@ int main(int argc, char** argv){
                 // ═══════════════════════════════════════════════════════════════
                 // SECTION 2: CURRENT MINING JOB
                 // ═══════════════════════════════════════════════════════════════
-                out << "\n" << C("33;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << "\n" << C("33;1") << "======================================================================" << R() << "\n";
                 out << C("1;4") << " CURRENT JOB" << R() << "\n";
-                out << C("33") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
+                out << C("33") << "----------------------------------------------------------------------" << R() << "\n";
 
                 {
                     std::lock_guard<std::mutex> lk(ui.mtx);
@@ -2935,16 +3032,16 @@ int main(int argc, char** argv){
                         }
                     } else {
                         bool conn = ui.node_reachable.load();
-                        out << "  " << C("33") << "⏳ " << (conn ? "Waiting for mining template..." : "Connecting to node...") << R() << "\n";
+                        out << "  " << C("33") << "[...] " << (conn ? "Waiting for mining template..." : "Connecting to node...") << R() << "\n";
                     }
                 }
 
                 // ═══════════════════════════════════════════════════════════════
                 // SECTION 3: PERFORMANCE METRICS
                 // ═══════════════════════════════════════════════════════════════
-                out << "\n" << C("32;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << "\n" << C("32;1") << "======================================================================" << R() << "\n";
                 out << C("1;4") << " PERFORMANCE" << R() << "\n";
-                out << C("32") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
+                out << C("32") << "----------------------------------------------------------------------" << R() << "\n";
 
                 // CPU hashrate with bar
                 double cpu_smooth = ui.hps_smooth.load();
@@ -2981,11 +3078,11 @@ int main(int argc, char** argv){
                 // ═══════════════════════════════════════════════════════════════
                 // SECTION 4: WALLET & REWARDS / POOL SHARES
                 // ═══════════════════════════════════════════════════════════════
-                out << "\n" << C("35;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << "\n" << C("35;1") << "======================================================================" << R() << "\n";
 
                 if (is_pool_mode) {
                     out << C("1;4") << " POOL SHARES" << R() << "\n";
-                    out << C("35") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
+                    out << C("35") << "----------------------------------------------------------------------" << R() << "\n";
 
                     out << "  " << C("1") << "Payout Addr :" << R() << " " << C("33") << pkh_to_address(ui.my_pkh) << R() << "\n";
 
@@ -3025,7 +3122,7 @@ int main(int argc, char** argv){
                     }
                 } else {
                     out << C("1;4") << " WALLET & REWARDS" << R() << "\n";
-                    out << C("35") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
+                    out << C("35") << "----------------------------------------------------------------------" << R() << "\n";
 
                     out << "  " << C("1") << "Payout Addr :" << R() << " " << C("33") << pkh_to_address(ui.my_pkh) << R() << "\n";
 
@@ -3055,9 +3152,9 @@ int main(int argc, char** argv){
                 // ═══════════════════════════════════════════════════════════════
                 // SECTION 5: ACTIVITY LOG
                 // ═══════════════════════════════════════════════════════════════
-                out << "\n" << C("37;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << "\n" << C("37;1") << "======================================================================" << R() << "\n";
                 out << C("1;4") << " ACTIVITY" << R() << "\n";
-                out << C("37") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
+                out << C("37") << "----------------------------------------------------------------------" << R() << "\n";
 
                 {
                     auto age = std::chrono::duration<double>(clock::now() - ui.last_submit_when).count();
@@ -3076,19 +3173,22 @@ int main(int argc, char** argv){
                 // ═══════════════════════════════════════════════════════════════
                 // FOOTER
                 // ═══════════════════════════════════════════════════════════════
-                out << "\n" << C("36") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << "\n" << C("36") << "======================================================================" << R() << "\n";
 
-                // Show uptime
+                // Show uptime and version
                 static auto start_time = clock::now();
                 auto uptime_secs = std::chrono::duration_cast<std::chrono::seconds>(clock::now() - start_time).count();
                 int hours = uptime_secs / 3600;
                 int mins = (uptime_secs % 3600) / 60;
                 int secs = uptime_secs % 60;
 
-                out << "  " << C("2") << "Uptime: ";
+                out << "  " << C("2") << MIQMINER_VERSION_STRING << R();
+                out << "  |  " << C("2") << "Mode: " << R() << C("1");
+                out << (is_pool_mode ? "POOL" : "SOLO");
+                out << R() << "  |  " << C("2") << "Uptime: " << R();
                 if (hours > 0) out << hours << "h ";
-                out << mins << "m " << secs << "s";
-                out << "   |   Press " << C("1") << "Ctrl+C" << R() << C("2") << " to stop mining" << R() << "\n";
+                out << mins << "m " << secs << "s\n";
+                out << "  " << C("2") << "Press " << C("1") << "Ctrl+C" << R() << C("2") << " to stop mining gracefully" << R() << "\n";
 
                 ++spin_idx;
                 std::cout << out.str() << std::flush;
@@ -3695,7 +3795,7 @@ int main(int argc, char** argv){
                 if (last_job_prev_hex != cur_prev_hex) {
                     std::ostringstream msg;
                     msg << C("36;1") << "job accepted: height=" << tpl.height
-                        << " prev=" << ui.cand.prev_hex.substr(0,16) << "…"
+                        << " prev=" << ui.cand.prev_hex.substr(0,16) << "..."
                         << " diff=" << std::fixed << std::setprecision(2) << difficulty_from_bits(tpl.bits)
                         << " txs=" << ui.cand.txs << R();
                     ui.last_submit_msg = msg.str();
@@ -3939,7 +4039,7 @@ int main(int argc, char** argv){
         } // end of solo mining else block
 
         // Final clear/exit
-        std::cout << "\n" << C("33;1") << "Exiting " << MIQMINER_VERSION_STRING << "…" << R() << std::endl;
+        std::cout << "\n" << C("33;1") << "Exiting " << MIQMINER_VERSION_STRING << "..." << R() << std::endl;
         log_line("miner exited cleanly");
         return 0;
 
