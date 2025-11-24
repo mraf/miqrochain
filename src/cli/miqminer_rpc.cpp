@@ -4018,13 +4018,17 @@ int main(int argc, char** argv){
 
             std::string last_job_prev_hex;
             bool was_disconnected = false;
+            int reconnect_backoff_ms = 2000;  // Start with 2 second backoff
+            const int kMinBackoffMs = 2000;
+            const int kMaxBackoffMs = 30000;   // Max 30 seconds between reconnect attempts
             while (ui.running.load()) {
                 MinerTemplate tpl;
             if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
                 ui.node_reachable.store(false);
                 std::ostringstream m;
                 m << C("31;1") << "*** RPC CONNECTION LOST *** "
-                  << "Node not responding at " << rpc_host << ":" << rpc_port << " - Retrying..." << R();
+                  << "Node not responding at " << rpc_host << ":" << rpc_port << " - Retrying in "
+                  << (reconnect_backoff_ms/1000) << "s..." << R();
                 { std::lock_guard<std::mutex> lk(ui.mtx); ui.last_submit_msg = m.str(); ui.last_submit_when = std::chrono::steady_clock::now(); }
 
                 // Only log connection lost message periodically to avoid spam (once every 30 seconds)
@@ -4036,12 +4040,21 @@ int main(int argc, char** argv){
                     last_lost_log = now;
                 }
                 was_disconnected = true;
-                for(int i=0;i<20 && ui.running.load(); ++i) miq_sleep_ms(100);
+
+                // PRODUCTION FIX: Exponential backoff to prevent flooding the server
+                // Start at 2s, double each time up to 30s max
+                for(int i=0; i < reconnect_backoff_ms/50 && ui.running.load(); ++i){
+                    miq_sleep_ms(50);
+                }
+                reconnect_backoff_ms = std::min(kMaxBackoffMs, reconnect_backoff_ms * 3 / 2);  // 1.5x increase
                 continue;
             }
 
             // Successfully got template - node is reachable
             ui.node_reachable.store(true);
+
+            // PRODUCTION FIX: Reset backoff on successful connection
+            reconnect_backoff_ms = kMinBackoffMs;
 
             // Debug: Log when connection is restored after a failure
             if (was_disconnected) {
@@ -4200,10 +4213,13 @@ int main(int argc, char** argv){
                 // Template refresh timeout: abort round after 30 seconds to get fresh template
                 // This ensures timestamps stay valid and new transactions can be included
                 const int kTemplateRefreshMs = 30000;
-                // CRITICAL FIX: Increase polling interval to reduce RPC load on server
-                const int kPollIntervalMs = 1500;  // Check every 1.5 seconds instead of 500ms
+                // PRODUCTION FIX: Adaptive polling with exponential backoff on server overload
+                int poll_interval_ms = 1500;  // Start at 1.5 seconds
+                const int kMinPollIntervalMs = 1500;
+                const int kMaxPollIntervalMs = 10000;  // Max 10 seconds between polls
                 auto round_start = std::chrono::steady_clock::now();
                 int consecutive_failures = 0;
+                int consecutive_503s = 0;
 
                 while(!found.load(std::memory_order_relaxed) && ui.running.load()){
                     // Check for timeout - force template refresh periodically
@@ -4214,41 +4230,60 @@ int main(int argc, char** argv){
                         break;
                     }
 
-                    // CRITICAL FIX: Use lightweight tip check with SHORT 5-second timeout for stale detection
-                    // This prevents connection buildup - with 60s timeout and 1.5s polling, up to 40 connections
-                    // would pile up waiting. With 5s timeout, max 3-4 connections at any time.
-                    // If server is busy/slow, skip this check and try again next cycle
-                    // Don't use heavy retry logic here - that's for the main template fetch
+                    // PRODUCTION FIX: Use lightweight tip check with SHORT timeout
+                    // Single quick attempt - fail fast for stale checks
                     HttpResp r;
                     bool got_tip = false;
-                    // Single quick attempt with short timeout (fail fast for stale checks)
-                    if(http_post_fast(rpc_host, rpc_port, "/", token, rpc_build("gettipinfo","[]"), r, 5000) && r.code == 200){
-                        TipInfo tip_now{};
-                        long long h=0,t=0; uint32_t b=0; std::string hh;
-                        if (json_find_number(r.body,"height",h) &&
-                            json_find_string(r.body,"hash",hh) &&
-                            json_find_hex_or_number_u32(r.body,"bits",b)) {
-                            tip_now.height = (uint64_t)h;
-                            tip_now.hash_hex = hh;
-                            tip_now.bits = b;
-                            got_tip = true;
-                            consecutive_failures = 0;
+                    bool is_server_overloaded = false;
 
-                            // Check if tip has changed (new block found by network)
-                            if(from_hex_s(tip_now.hash_hex) != tpl.prev_hash){
-                                abort_round.store(true);
-                                break;
+                    if(http_post_fast(rpc_host, rpc_port, "/", token, rpc_build("gettipinfo","[]"), r, 5000)){
+                        if(r.code == 200){
+                            TipInfo tip_now{};
+                            long long h=0; uint32_t b=0; std::string hh;
+                            if (json_find_number(r.body,"height",h) &&
+                                json_find_string(r.body,"hash",hh) &&
+                                json_find_hex_or_number_u32(r.body,"bits",b)) {
+                                tip_now.height = (uint64_t)h;
+                                tip_now.hash_hex = hh;
+                                tip_now.bits = b;
+                                got_tip = true;
+                                consecutive_failures = 0;
+                                consecutive_503s = 0;
+                                // PRODUCTION FIX: Gradually reduce poll interval on success
+                                poll_interval_ms = std::max(kMinPollIntervalMs, poll_interval_ms - 200);
+
+                                // Check if tip has changed (new block found by network)
+                                if(from_hex_s(tip_now.hash_hex) != tpl.prev_hash){
+                                    abort_round.store(true);
+                                    break;
+                                }
                             }
+                        } else if(r.code == 503){
+                            // Server overloaded - back off aggressively
+                            is_server_overloaded = true;
+                            consecutive_503s++;
                         }
                     }
 
-                    // CRITICAL FIX: Track failures but don't let them block mining
-                    // If we can't check staleness, mining continues anyway
+                    // PRODUCTION FIX: Adaptive throttling based on server health
                     if(!got_tip){
                         consecutive_failures++;
-                        // After 5 consecutive failures, give the server more time to recover
-                        if(consecutive_failures >= 5){
-                            // Back off extra 2 seconds before next attempt
+
+                        if(is_server_overloaded){
+                            // Server returned 503 - exponential backoff
+                            poll_interval_ms = std::min(kMaxPollIntervalMs,
+                                kMinPollIntervalMs + (consecutive_503s * 1500));
+                            // Extra backoff for severe overload
+                            if(consecutive_503s >= 3){
+                                int backoff_ms = std::min(5000, consecutive_503s * 1000);
+                                for(int i=0; i < backoff_ms/50 && !found.load(std::memory_order_relaxed) &&
+                                    !abort_round.load(std::memory_order_relaxed) && ui.running.load(); ++i){
+                                    miq_sleep_ms(50);
+                                }
+                            }
+                        } else if(consecutive_failures >= 5){
+                            // Network issues - moderate backoff
+                            poll_interval_ms = std::min(kMaxPollIntervalMs, poll_interval_ms + 500);
                             for(int i=0; i<40 && !found.load(std::memory_order_relaxed) &&
                                 !abort_round.load(std::memory_order_relaxed) && ui.running.load(); ++i){
                                 miq_sleep_ms(50);
@@ -4256,8 +4291,8 @@ int main(int argc, char** argv){
                         }
                     }
 
-                    // Sleep for polling interval (split into small chunks for responsive shutdown)
-                    for(int i=0; i < kPollIntervalMs/50 && !found.load(std::memory_order_relaxed) &&
+                    // Sleep for adaptive polling interval (chunked for responsive shutdown)
+                    for(int i=0; i < poll_interval_ms/50 && !found.load(std::memory_order_relaxed) &&
                         !abort_round.load(std::memory_order_relaxed) && ui.running.load(); ++i){
                         miq_sleep_ms(50);
                     }
@@ -4311,11 +4346,11 @@ int main(int argc, char** argv){
 
             if (ok) {
                 // Try confirm acceptance
-                // CRITICAL FIX: Use rpc_gettipinfo_fast to prevent connection flood
-                // Old code: 40 iterations × rpc_gettipinfo (30 retries each) = 1200 potential connections!
-                // New code: 40 iterations × rpc_gettipinfo_fast (1 attempt, 5s timeout) = 40 max connections
+                // PRODUCTION FIX: Use rpc_gettipinfo_fast to prevent connection flood
+                // Reduced iterations from 40 to 20, increased delay from 100ms to 250ms
+                // This gives 5 seconds total confirmation window with only 20 max connections
                 bool confirmed = false;
-                for (int i = 0; i < 40 && ui.running.load(); ++i) {
+                for (int i = 0; i < 20 && ui.running.load(); ++i) {
                     TipInfo t2{};
                     if (rpc_gettipinfo_fast(rpc_host, rpc_port, token, t2)) {
                         if (t2.height == tpl.height &&
@@ -4324,7 +4359,8 @@ int main(int argc, char** argv){
                             break;
                         }
                     }
-                    miq_sleep_ms(100);
+                    // PRODUCTION FIX: Longer delay between confirmation checks
+                    miq_sleep_ms(250);
                 }
 
                 {
