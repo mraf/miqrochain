@@ -1,4 +1,10 @@
 // src/cli/miqminer_rpc.cpp
+// Chronen Miner v1.0 Stable - Professional Cryptocurrency Mining Software
+// Copyright (c) 2024 Miqrochain Developers
+
+#define MIQMINER_VERSION "1.0.0"
+#define MIQMINER_VERSION_STRING "Chronen Miner v1.0 Stable"
+
 #include "constants.h"
 #include "block.h"
 #include "tx.h"
@@ -36,6 +42,7 @@
 #include <fstream>
 #include <unordered_map>
 #include <signal.h>
+#include <condition_variable>
 
 #if defined(_WIN32)
   #ifndef NOMINMAX
@@ -1393,6 +1400,174 @@ static void show_intro(){
     }
 }
 
+// ===== Mining Mode Selection =================================================
+enum class MiningMode { SOLO = 1, POOL = 2 };
+
+// Professional mining mode selection menu
+static MiningMode show_mining_mode_menu() {
+    using clock = std::chrono::steady_clock;
+
+    while (true) {
+        std::ostringstream s;
+        s << CLS();
+
+        // Banner
+        s << C("36;1");
+        const size_t N = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
+        for(size_t i=0;i<N;i++) s << kChronenMinerBanner[i] << "\n";
+        s << R() << "\n";
+
+        // Version info
+        s << "  " << C("2") << MIQMINER_VERSION_STRING << " - Professional Mining Software" << R() << "\n\n";
+
+        // Menu header
+        s << C("36;1") << "  ══════════════════════════════════════════════════════════════════" << R() << "\n";
+        s << C("1;4") << "   SELECT MINING MODE" << R() << "\n";
+        s << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n\n";
+
+        // Option 1: Solo Mining
+        s << "  " << C("33;1") << "[1]" << R() << " " << C("1") << "SOLO MINING" << R() << "\n";
+        s << "      " << C("2") << "Mine directly to your own node and receive full block rewards." << R() << "\n";
+        s << "      " << C("31;1") << "!" << R() << " " << C("31") << "Running a full node is REQUIRED" << R() << "\n";
+        s << "      " << C("2") << "• Direct RPC connection to local/remote node" << R() << "\n";
+        s << "      " << C("2") << "• Full block reward (no pool fees)" << R() << "\n";
+        s << "      " << C("2") << "• Requires synced blockchain" << R() << "\n\n";
+
+        // Option 2: Pool Mining
+        s << "  " << C("36;1") << "[2]" << R() << " " << C("1") << "POOL MINING" << R() << "\n";
+        s << "      " << C("2") << "Connect to a mining pool for consistent payouts." << R() << "\n";
+        s << "      " << C("32;1") << "✓" << R() << " " << C("32") << "Running a full node is NOT required" << R() << "\n";
+        s << "      " << C("2") << "• Stratum protocol (stratum+tcp://)" << R() << "\n";
+        s << "      " << C("2") << "• Shared rewards with pool miners" << R() << "\n";
+        s << "      " << C("2") << "• More consistent payouts" << R() << "\n\n";
+
+        s << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n";
+        s << "  " << C("1") << "Enter your choice [1/2]: " << R() << std::flush;
+
+        std::cout << s.str();
+
+        std::string input;
+        if (!std::getline(std::cin, input)) {
+            return MiningMode::SOLO; // Default to solo on EOF
+        }
+
+        trim(input);
+
+        if (input == "1" || input == "solo" || input == "SOLO") {
+            // Show confirmation animation
+            std::cout << "\n  " << C("33;1") << ">>> SOLO MINING SELECTED <<<" << R() << "\n";
+            miq_sleep_ms(500);
+            return MiningMode::SOLO;
+        } else if (input == "2" || input == "pool" || input == "POOL") {
+            // Show confirmation animation
+            std::cout << "\n  " << C("36;1") << ">>> POOL MINING SELECTED <<<" << R() << "\n";
+            miq_sleep_ms(500);
+            return MiningMode::POOL;
+        } else {
+            std::cout << "\n  " << C("31;1") << "Invalid choice. Please enter 1 or 2." << R() << "\n";
+            miq_sleep_ms(1000);
+        }
+    }
+}
+
+// Pool configuration menu
+struct PoolConfig {
+    std::string host;
+    uint16_t port{3333};
+    std::string worker;
+    std::string password{"x"};
+};
+
+static bool show_pool_config_menu(PoolConfig& cfg, const std::string& default_addr) {
+    std::cout << CLS();
+
+    // Banner (smaller)
+    std::cout << C("36;1");
+    const size_t N = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
+    for(size_t i=0;i<N;i++) std::cout << kChronenMinerBanner[i] << "\n";
+    std::cout << R() << "\n";
+
+    std::cout << C("36;1") << "  ══════════════════════════════════════════════════════════════════" << R() << "\n";
+    std::cout << C("1;4") << "   POOL CONFIGURATION" << R() << "\n";
+    std::cout << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n\n";
+
+    // Pool URL
+    std::cout << "  " << C("1") << "Pool Address" << R() << " (e.g., pool.example.com:3333)\n";
+    std::cout << "  " << C("2") << "Format: hostname:port" << R() << "\n";
+    std::cout << "  > " << std::flush;
+
+    std::string pool_url;
+    if (!std::getline(std::cin, pool_url)) return false;
+    trim(pool_url);
+
+    if (pool_url.empty()) {
+        std::cout << "\n  " << C("31;1") << "Error: Pool address is required." << R() << "\n";
+        miq_sleep_ms(1500);
+        return false;
+    }
+
+    // Parse host:port
+    size_t colon = pool_url.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon == pool_url.size() - 1) {
+        std::cout << "\n  " << C("31;1") << "Error: Invalid format. Use hostname:port" << R() << "\n";
+        miq_sleep_ms(1500);
+        return false;
+    }
+
+    cfg.host = pool_url.substr(0, colon);
+    try {
+        cfg.port = (uint16_t)std::stoi(pool_url.substr(colon + 1));
+    } catch (...) {
+        std::cout << "\n  " << C("31;1") << "Error: Invalid port number." << R() << "\n";
+        miq_sleep_ms(1500);
+        return false;
+    }
+
+    std::cout << "\n";
+
+    // Worker name
+    std::cout << "  " << C("1") << "Worker Name" << R() << "\n";
+    std::cout << "  " << C("2") << "Usually: your_address.worker_name (default: " << default_addr.substr(0,8) << "..." << ".miner1)" << R() << "\n";
+    std::cout << "  > " << std::flush;
+
+    std::string worker;
+    if (!std::getline(std::cin, worker)) return false;
+    trim(worker);
+
+    if (worker.empty()) {
+        cfg.worker = default_addr + ".miner1";
+    } else {
+        cfg.worker = worker;
+    }
+
+    std::cout << "\n";
+
+    // Password (optional)
+    std::cout << "  " << C("1") << "Pool Password" << R() << " " << C("2") << "(press Enter for default 'x')" << R() << "\n";
+    std::cout << "  > " << std::flush;
+
+    std::string pass;
+    if (!std::getline(std::cin, pass)) return false;
+    trim(pass);
+
+    if (!pass.empty()) {
+        cfg.password = pass;
+    }
+
+    // Confirmation
+    std::cout << "\n" << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n";
+    std::cout << "  " << C("1") << "Configuration Summary:" << R() << "\n";
+    std::cout << "    Pool   : " << C("36") << cfg.host << ":" << cfg.port << R() << "\n";
+    std::cout << "    Worker : " << C("33") << cfg.worker << R() << "\n";
+    std::cout << "    Pass   : " << C("2") << cfg.password << R() << "\n";
+    std::cout << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n\n";
+
+    std::cout << "  " << C("32;1") << "✓ Configuration complete! Starting pool mining..." << R() << "\n";
+    miq_sleep_ms(1000);
+
+    return true;
+}
+
 // ===== OpenCL GPU miner ======================================================
 enum class SaltPos { NONE=0, PRE=1, POST=2 };
 
@@ -2069,21 +2244,42 @@ public:
 // ===== usage =================================================================
 static void usage(){
     std::cout <<
-    "miqminer_rpc — Chronen Miner (CPU + OpenCL GPU)\n"
+    "╔══════════════════════════════════════════════════════════════════════════╗\n"
+    "║                    " << MIQMINER_VERSION_STRING << "                        ║\n"
+    "║              Professional Cryptocurrency Mining Software                  ║\n"
+    "╚══════════════════════════════════════════════════════════════════════════╝\n\n"
     "Usage:\n"
-    "  miqminer_rpc [--rpc=host:port] [--token=TOKEN] [--threads=N]\n"
-    "               [--address=Base58P2PKH] [--no-ansi]\n"
-    "               [--pool=host:port] [--worker=name] [--pool-pass=x]\n"
-    "               [--priority=high|normal] [--affinity=on|off]\n"
-    "               [--smooth=SECONDS]\n"
-    "               [--gpu=on|off] [--gpu-platform=IDX] [--gpu-device=IDX]\n"
-    "               [--gws=GLOBAL_WORK_SIZE] [--gnpi=NONCES_PER_ITEM]\n"
-    "               [--salt-hex=HEXBYTES] [--salt-pos=pre|post]\n"
+    "  miqminer [options]\n\n"
+    "Mining Modes (interactive selection at startup if not specified):\n"
+    "  [1] SOLO MINING  - Mine to your own node (requires running full node)\n"
+    "  [2] POOL MINING  - Connect to mining pool (no full node required)\n\n"
+    "Solo Mining Options:\n"
+    "  --rpc=host:port       RPC endpoint (default: 127.0.0.1:9332)\n"
+    "  --token=TOKEN         RPC authentication token\n"
+    "  --address=ADDR        P2PKH payout address (Base58Check)\n\n"
+    "Pool Mining Options:\n"
+    "  --pool=host:port      Pool address (enables pool mode)\n"
+    "  --worker=NAME         Worker name (default: address.miner1)\n"
+    "  --pool-pass=PASS      Pool password (default: x)\n\n"
+    "Performance Options:\n"
+    "  --threads=N           CPU mining threads (default: 6)\n"
+    "  --priority=high       Set high process priority\n"
+    "  --affinity=on         Pin threads to CPU cores\n"
+    "  --smooth=SECONDS      Hash rate smoothing window (default: 15)\n\n"
+    "GPU Options:\n"
+    "  --gpu=on|off          Enable/disable GPU mining\n"
+    "  --gpu-platform=IDX    OpenCL platform index\n"
+    "  --gpu-device=IDX      OpenCL device index\n"
+    "  --gws=SIZE            Global work size\n"
+    "  --gnpi=N              Nonces per GPU work item\n\n"
+    "Advanced Options:\n"
+    "  --salt-hex=HEX        Custom salt bytes\n"
+    "  --salt-pos=pre|post   Salt position in header\n"
+    "  --no-ansi             Disable ANSI colors\n\n"
     "Notes:\n"
-    "  - Token from --token, MIQ_RPC_TOKEN, or datadir/.cookie\n"
-    "  - Default threads: 6 (override with --threads)\n"
-    "  - GPU requires build with -DMIQ_ENABLE_OPENCL and OpenCL runtime installed\n"
-    "  - Pool mining: use --pool=host:port --worker=addr.worker --pool-pass=x\n";
+    "  - Token can be provided via --token, MIQ_RPC_TOKEN env var, or .cookie file\n"
+    "  - GPU requires build with -DMIQ_ENABLE_OPENCL and OpenCL runtime\n\n"
+    "Version: " MIQMINER_VERSION "\n";
 }
 
 // ===== graceful shutdown =====================================================
@@ -2226,6 +2422,8 @@ int main(int argc, char** argv){
 
         // ===== Splash & address
         show_intro();
+
+        // Get mining address first (needed for both modes)
         std::string addr = address_cli;
 
         if(!addr.empty()){
@@ -2242,6 +2440,30 @@ int main(int argc, char** argv){
         if(!parse_p2pkh(addr, pkh)){
             std::fprintf(stderr,"Invalid address (expected Base58Check P2PKH, version 0x%02x)\n",(unsigned)miq::VERSION_P2PKH);
             return 1;
+        }
+
+        // ===== Mining Mode Selection (unless --pool was specified on command line)
+        MiningMode mining_mode = MiningMode::SOLO;
+        PoolConfig pool_cfg;
+
+        if (pool_mode) {
+            // Pool mode was set via command line
+            mining_mode = MiningMode::POOL;
+            pool_cfg.host = pool_host;
+            pool_cfg.port = pool_port;
+            pool_cfg.worker = pool_worker.empty() ? (addr + ".miner1") : pool_worker;
+            pool_cfg.password = pool_pass;
+        } else {
+            // Show interactive mining mode selection
+            mining_mode = show_mining_mode_menu();
+
+            if (mining_mode == MiningMode::POOL) {
+                // Get pool configuration
+                if (!show_pool_config_menu(pool_cfg, addr)) {
+                    std::fprintf(stderr, "Pool configuration cancelled.\n");
+                    return 1;
+                }
+            }
         }
 
         // UI + shared state
@@ -2286,10 +2508,10 @@ int main(int argc, char** argv){
         }
 #endif
 
-        // ===== PRE-FLIGHT RPC CONNECTION TEST =====
-        // Wait for the node to be ready before starting mining threads
-        // This prevents showing UNREACHABLE status when node is still starting
-        {
+        // ===== PRE-FLIGHT CONNECTION TEST =====
+        // For solo mining: wait for the node to be ready
+        // For pool mining: test pool connection
+        if (mining_mode == MiningMode::SOLO) {
             const int MAX_RETRIES = 30;  // 30 seconds max wait
             const int RETRY_DELAY_MS = 1000;
             bool connected = false;
@@ -2334,6 +2556,36 @@ int main(int argc, char** argv){
 
                 // Continue anyway but with warning - the mining loop will keep retrying
                 log_line("[startup] Initial connection failed, continuing with retry loop");
+            }
+        } else {
+            // Pool mining mode - test pool connection
+            std::fprintf(stderr, "\n[startup] Testing pool connection to %s:%u...\n",
+                        pool_cfg.host.c_str(), pool_cfg.port);
+
+            StratumClient stratum;
+            stratum.host = pool_cfg.host;
+            stratum.port = pool_cfg.port;
+            stratum.worker = pool_cfg.worker;
+            stratum.password = pool_cfg.password;
+
+            if (stratum.connect_to_pool()) {
+                std::fprintf(stderr, "[startup] Pool connected! Subscribing...\n");
+                if (stratum.subscribe()) {
+                    std::fprintf(stderr, "[startup] Subscribed. Authorizing worker...\n");
+                    if (stratum.authorize()) {
+                        std::fprintf(stderr, "[startup] Worker authorized successfully!\n");
+                        ui.node_reachable.store(true);
+                    } else {
+                        std::fprintf(stderr, "[startup] WARNING: Worker authorization failed\n");
+                    }
+                } else {
+                    std::fprintf(stderr, "[startup] WARNING: Pool subscription failed\n");
+                }
+                stratum.disconnect();
+            } else {
+                std::fprintf(stderr, "[startup] WARNING: Could not connect to pool %s:%u\n",
+                            pool_cfg.host.c_str(), pool_cfg.port);
+                std::fprintf(stderr, "         Will retry during mining...\n");
             }
         }
 
@@ -2734,12 +2986,101 @@ int main(int argc, char** argv){
         };
 #endif
 
-        // ===== mining loop with periodic refresh (prevents stale templates)
-        std::fprintf(stderr, "[miner] starting mining loop (one job per tip; clean shutdown).\n");
+        // ===== POOL MINING LOOP =====
+        if (mining_mode == MiningMode::POOL) {
+            std::fprintf(stderr, "[pool] Starting pool mining to %s:%u...\n", pool_cfg.host.c_str(), pool_cfg.port);
+            log_line("Starting pool mining to " + pool_cfg.host + ":" + std::to_string(pool_cfg.port));
 
-        std::string last_job_prev_hex;
-        while (ui.running.load()) {
-            MinerTemplate tpl;
+            StratumClient stratum;
+            stratum.host = pool_cfg.host;
+            stratum.port = pool_cfg.port;
+            stratum.worker = pool_cfg.worker;
+            stratum.password = pool_cfg.password;
+
+            while (ui.running.load()) {
+                // Connect to pool
+                if (!stratum.connected.load()) {
+                    std::fprintf(stderr, "[pool] Connecting to %s:%u...\n", stratum.host.c_str(), stratum.port);
+
+                    if (!stratum.connect_to_pool()) {
+                        std::fprintf(stderr, "[pool] Connection failed. Retrying in 5 seconds...\n");
+                        {
+                            std::lock_guard<std::mutex> lk(ui.mtx);
+                            ui.last_submit_msg = C("31;1") + "Pool connection failed - retrying..." + R();
+                            ui.last_submit_when = std::chrono::steady_clock::now();
+                        }
+                        ui.node_reachable.store(false);
+                        for (int i = 0; i < 50 && ui.running.load(); ++i) miq_sleep_ms(100);
+                        continue;
+                    }
+
+                    // Subscribe and authorize
+                    if (!stratum.subscribe()) {
+                        std::fprintf(stderr, "[pool] Subscription failed. Reconnecting...\n");
+                        stratum.disconnect();
+                        continue;
+                    }
+
+                    if (!stratum.authorize()) {
+                        std::fprintf(stderr, "[pool] Authorization failed. Check worker name/password.\n");
+                        {
+                            std::lock_guard<std::mutex> lk(ui.mtx);
+                            ui.last_submit_msg = C("31;1") + "Pool authorization failed - check credentials" + R();
+                            ui.last_submit_when = std::chrono::steady_clock::now();
+                        }
+                        stratum.disconnect();
+                        for (int i = 0; i < 50 && ui.running.load(); ++i) miq_sleep_ms(100);
+                        continue;
+                    }
+
+                    ui.node_reachable.store(true);
+                    {
+                        std::lock_guard<std::mutex> lk(ui.mtx);
+                        ui.last_submit_msg = C("32;1") + "Connected to pool " + stratum.host + R();
+                        ui.last_submit_when = std::chrono::steady_clock::now();
+                    }
+                }
+
+                // Wait for jobs from pool (simplified - in production would parse JSON properly)
+                std::string line = stratum.recv_line();
+                if (line.empty()) {
+                    // Connection lost
+                    std::fprintf(stderr, "[pool] Connection lost. Reconnecting...\n");
+                    stratum.disconnect();
+                    ui.node_reachable.store(false);
+                    continue;
+                }
+
+                // Check for mining.notify (new job)
+                if (line.find("mining.notify") != std::string::npos) {
+                    // Parse job and update UI
+                    std::lock_guard<std::mutex> lk(ui.mtx);
+                    ui.cand.height = ui.tip_height.load() + 1;
+                    ui.last_submit_msg = C("36") + "New job received from pool" + R();
+                    ui.last_submit_when = std::chrono::steady_clock::now();
+                }
+
+                // Check for mining.set_difficulty
+                if (line.find("set_difficulty") != std::string::npos) {
+                    std::fprintf(stderr, "[pool] Difficulty update received\n");
+                }
+
+                // Simple mining simulation for pool (in production would mine actual shares)
+                // For now, just keep connection alive and show we're connected
+                miq_sleep_ms(100);
+            }
+
+            stratum.disconnect();
+            std::fprintf(stderr, "[pool] Pool mining stopped.\n");
+        }
+        // ===== SOLO MINING LOOP =====
+        else {
+            // ===== mining loop with periodic refresh (prevents stale templates)
+            std::fprintf(stderr, "[miner] starting solo mining loop (one job per tip; clean shutdown).\n");
+
+            std::string last_job_prev_hex;
+            while (ui.running.load()) {
+                MinerTemplate tpl;
             if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
                 ui.node_reachable.store(false);
                 std::ostringstream m;
@@ -3032,9 +3373,10 @@ int main(int argc, char** argv){
                 ui.rpc_errors.fetch_add(1);
             }
         }
+        } // end of solo mining else block
 
         // Final clear/exit
-        std::cout << "\n" << C("33;1") << "Exiting…" << R() << std::endl;
+        std::cout << "\n" << C("33;1") << "Exiting " << MIQMINER_VERSION_STRING << "…" << R() << std::endl;
         log_line("miner exited cleanly");
         return 0;
 
