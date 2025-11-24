@@ -704,6 +704,133 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
     return true;
 }
 
+// CRITICAL FIX: Fast HTTP POST with short timeout for lightweight polling operations
+// This prevents connection buildup when the server is slow to respond.
+// Uses 5-second timeout instead of 60 seconds - if a simple tip check takes longer,
+// something is wrong and we should abort rather than pile up connections.
+static bool http_post_fast(const std::string& host, uint16_t port, const std::string& path,
+                           const std::string& auth_token, const std::string& json, HttpResp& out,
+                           int timeout_ms = 5000)
+{
+    winsock_ensure();
+    addrinfo hints{}; hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_STREAM;
+    addrinfo* res=nullptr; char ps[16]; std::snprintf(ps,sizeof(ps), "%u", (unsigned)port);
+    int gai_err = getaddrinfo(host.c_str(), ps, &hints, &res);
+    if(gai_err != 0) {
+        if(res) freeaddrinfo(res);
+        out.code = 0;
+        out.body = "DNS resolution failed";
+        return false;
+    }
+    socket_t s =
+#if defined(_WIN32)
+        INVALID_SOCKET;
+#else
+        -1;
+#endif
+    for(addrinfo* ai=res; ai; ai=ai->ai_next){
+        s = (socket_t)socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+#if defined(_WIN32)
+        if(s==INVALID_SOCKET) continue;
+        // Use short timeout for fast polling operations
+        set_socket_timeouts(s, timeout_ms, timeout_ms);
+        if(connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen)==0) break;
+        miq_closesocket(s); s = INVALID_SOCKET;
+#else
+        if(s<0) continue;
+        // Use short timeout for fast polling operations
+        set_socket_timeouts(s, timeout_ms, timeout_ms);
+        if(connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen)==0) break;
+        miq_closesocket(s); s = -1;
+#endif
+    }
+    freeaddrinfo(res);
+#if defined(_WIN32)
+    if(s==INVALID_SOCKET) {
+        out.code = 0;
+        out.body = "Connection failed - node not reachable";
+        return false;
+    }
+#else
+    if(s<0) {
+        out.code = 0;
+        out.body = "Connection failed - node not reachable";
+        return false;
+    }
+#endif
+
+    std::ostringstream req;
+    req << "POST " << path << " HTTP/1.1\r\n"
+        << "Host: " << host << "\r\n"
+        << "Content-Type: application/json\r\n"
+        << "Content-Length: " << json.size() << "\r\n";
+    if(!auth_token.empty()){
+        req << "Authorization: Bearer " << auth_token << "\r\n";
+        req << "X-Auth-Token: " << auth_token << "\r\n";
+    }
+    req << "Connection: close\r\n\r\n" << json;
+
+    std::string data = req.str();
+    size_t off=0;
+    while(off < data.size()){
+#if defined(_WIN32)
+        int n = send(s, data.data()+off, (int)(data.size()-off), 0);
+        if(n<=0){
+            out.code = 0;
+            out.body = "Send failed - connection reset";
+            miq_closesocket(s);
+            return false;
+        }
+#else
+        int n = ::send(s, data.data()+off, (int)(data.size()-off), 0);
+        if(n<=0){
+            out.code = 0;
+            out.body = "Send failed - connection reset";
+            miq_closesocket(s);
+            return false;
+        }
+#endif
+        off += (size_t)n;
+    }
+
+    std::string resp; char buf[4096];
+    while(true){
+#if defined(_WIN32)
+        int n = recv(s, buf, (int)sizeof(buf), 0);
+#else
+        int n = ::recv(s, buf, (int)sizeof(buf), 0);
+#endif
+        if(n<=0) break;
+        resp.append(buf, (size_t)n);
+    }
+    miq_closesocket(s);
+
+    if(resp.empty()){
+        out.code = 0;
+        out.body = "Empty response - server closed connection";
+        return false;
+    }
+
+    std::string resp2 = dechunk_if_needed(resp);
+
+    size_t sp = resp2.find(' ');
+    if(sp == std::string::npos){
+        out.code = 0;
+        out.body = "Malformed HTTP response - no status line";
+        return false;
+    }
+    int code = std::atoi(resp2.c_str()+sp+1);
+    if(code < 100 || code >= 600){
+        out.code = 0;
+        out.body = "Invalid HTTP status code: " + std::to_string(code);
+        return false;
+    }
+    size_t hdr_end = resp2.find("\r\n\r\n");
+    std::string body = (hdr_end==std::string::npos)? std::string() : resp2.substr(hdr_end+4);
+    out.code = code; out.body = std::move(body);
+    return true;
+}
+
 // HTTP POST with automatic retry and exponential backoff for network errors and server errors
 // CRITICAL FIX: Improved retry logic with smarter backoff for different error types
 static bool http_post_with_retry(const std::string& host, uint16_t port, const std::string& path,
@@ -817,9 +944,10 @@ static std::string diagnose_rpc_failure(const std::string& host, uint16_t port, 
 
 static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::string& auth, TipInfo& out){
     // Fast path: dedicated RPC (if present) with retry for network and server errors
+    // CRITICAL FIX: Reduced retries from 30 to 10 to prevent connection floods
     {
         HttpResp r;
-        if (http_post_with_retry(host, port, "/", auth, rpc_build("gettipinfo","[]"), r, 30, true)
+        if (http_post_with_retry(host, port, "/", auth, rpc_build("gettipinfo","[]"), r, 10, true)
             && r.code==200 && !json_has_error(r.body)) {
             long long h=0,t=0; uint32_t b=0; std::string hh;
             // Use json_find_hex_or_number_u32 for bits since server returns it as hex string
@@ -868,6 +996,29 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
         out.time = (int64_t)t;
         return true;
     }
+}
+
+// CRITICAL FIX: Fast variant of rpc_gettipinfo with short timeout and NO retries
+// Used for quick checks like block confirmation where we don't want to pile up connections.
+// If the server can't respond in 5 seconds, we skip and try again rather than waiting 60s with retries.
+static bool rpc_gettipinfo_fast(const std::string& host, uint16_t port, const std::string& auth, TipInfo& out){
+    HttpResp r;
+    // Single attempt with 5-second timeout - no retries, fail fast
+    if (http_post_fast(host, port, "/", auth, rpc_build("gettipinfo","[]"), r, 5000)
+        && r.code==200 && !json_has_error(r.body)) {
+        long long h=0,t=0; uint32_t b=0; std::string hh;
+        if (json_find_number(r.body,"height",h) &&
+            json_find_string(r.body,"hash",hh) &&
+            json_find_hex_or_number_u32(r.body,"bits",b) &&
+            json_find_number(r.body,"time",t)) {
+            out.height = (uint64_t)h;
+            out.hash_hex = hh;
+            out.bits = sanitize_bits(b);
+            out.time = (int64_t)t;
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool rpc_getminerstats(const std::string& host, uint16_t port, const std::string& auth, double& out_net_hs){
@@ -1200,12 +1351,13 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
     {
         HttpResp r;
         // CRITICAL FIX: Use retry mechanism to maintain stable RPC connection
+        // Reduced retries from 30 to 10 to prevent connection floods during server load
         // Debug: Track template request attempts for troubleshooting
         static std::atomic<uint64_t> template_requests{0};
         static std::atomic<uint64_t> template_successes{0};
         uint64_t req_num = template_requests.fetch_add(1);
         (void)req_num;  // Reserved for future logging/debugging
-        if(http_post_with_retry(host, port, "/", auth, rpc_build("getminertemplate","[]"), r, 30, true) && r.code==200 && !json_has_error(r.body)){
+        if(http_post_with_retry(host, port, "/", auth, rpc_build("getminertemplate","[]"), r, 10, true) && r.code==200 && !json_has_error(r.body)){
             template_successes.fetch_add(1);
             uint32_t bits=0;
             std::string prev;
@@ -4062,13 +4214,15 @@ int main(int argc, char** argv){
                         break;
                     }
 
-                    // CRITICAL FIX: Use lightweight tip check with short timeout for stale detection
+                    // CRITICAL FIX: Use lightweight tip check with SHORT 5-second timeout for stale detection
+                    // This prevents connection buildup - with 60s timeout and 1.5s polling, up to 40 connections
+                    // would pile up waiting. With 5s timeout, max 3-4 connections at any time.
                     // If server is busy/slow, skip this check and try again next cycle
                     // Don't use heavy retry logic here - that's for the main template fetch
                     HttpResp r;
                     bool got_tip = false;
-                    // Single quick attempt without heavy retry (fail fast for stale checks)
-                    if(http_post(rpc_host, rpc_port, "/", token, rpc_build("gettipinfo","[]"), r) && r.code == 200){
+                    // Single quick attempt with short timeout (fail fast for stale checks)
+                    if(http_post_fast(rpc_host, rpc_port, "/", token, rpc_build("gettipinfo","[]"), r, 5000) && r.code == 200){
                         TipInfo tip_now{};
                         long long h=0,t=0; uint32_t b=0; std::string hh;
                         if (json_find_number(r.body,"height",h) &&
@@ -4126,8 +4280,9 @@ int main(int argc, char** argv){
             if(!found.load()) { continue; }
 
             // Check staleness vs tip
+            // CRITICAL FIX: Use fast variant for quick staleness check before submission
             TipInfo tip_now{};
-            if (rpc_gettipinfo(rpc_host, rpc_port, token, tip_now)) {
+            if (rpc_gettipinfo_fast(rpc_host, rpc_port, token, tip_now)) {
                 if (from_hex_s(tip_now.hash_hex) != tpl.prev_hash) {
                     std::lock_guard<std::mutex> lk(ui.mtx);
                     ui.last_submit_msg = std::string("submit skipped: template stale (chain advanced)");
@@ -4156,10 +4311,13 @@ int main(int argc, char** argv){
 
             if (ok) {
                 // Try confirm acceptance
+                // CRITICAL FIX: Use rpc_gettipinfo_fast to prevent connection flood
+                // Old code: 40 iterations × rpc_gettipinfo (30 retries each) = 1200 potential connections!
+                // New code: 40 iterations × rpc_gettipinfo_fast (1 attempt, 5s timeout) = 40 max connections
                 bool confirmed = false;
                 for (int i = 0; i < 40 && ui.running.load(); ++i) {
                     TipInfo t2{};
-                    if (rpc_gettipinfo(rpc_host, rpc_port, token, t2)) {
+                    if (rpc_gettipinfo_fast(rpc_host, rpc_port, token, t2)) {
                         if (t2.height == tpl.height &&
                             t2.hash_hex == miq::to_hex(found_block.block_hash())) {
                             confirmed = true;
