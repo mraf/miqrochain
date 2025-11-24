@@ -642,10 +642,22 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
     while(off < data.size()){
 #if defined(_WIN32)
         int n = send(s, data.data()+off, (int)(data.size()-off), 0);
-        if(n<=0){ miq_closesocket(s); return false; }
+        if(n<=0){
+            // CRITICAL FIX: Set error code before returning to enable proper retry logic
+            out.code = 0;
+            out.body = "Send failed - connection reset";
+            miq_closesocket(s);
+            return false;
+        }
 #else
         int n = ::send(s, data.data()+off, (int)(data.size()-off), 0);
-        if(n<=0){ miq_closesocket(s); return false; }
+        if(n<=0){
+            // CRITICAL FIX: Set error code before returning to enable proper retry logic
+            out.code = 0;
+            out.body = "Send failed - connection reset";
+            miq_closesocket(s);
+            return false;
+        }
 #endif
         off += (size_t)n;
     }
@@ -662,12 +674,30 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
     }
     miq_closesocket(s);
 
+    // CRITICAL FIX: Handle empty response (server closed connection without sending anything)
+    if(resp.empty()){
+        out.code = 0;
+        out.body = "Empty response - server closed connection";
+        return false;
+    }
+
     // Handle chunked transfer (harden)
     std::string resp2 = dechunk_if_needed(resp);
 
     size_t sp = resp2.find(' ');
-    if(sp == std::string::npos) return false;
+    if(sp == std::string::npos){
+        // CRITICAL FIX: Set error code for malformed response
+        out.code = 0;
+        out.body = "Malformed HTTP response - no status line";
+        return false;
+    }
     int code = std::atoi(resp2.c_str()+sp+1);
+    // CRITICAL FIX: Validate HTTP status code is reasonable (100-599)
+    if(code < 100 || code >= 600){
+        out.code = 0;
+        out.body = "Invalid HTTP status code: " + std::to_string(code);
+        return false;
+    }
     size_t hdr_end = resp2.find("\r\n\r\n");
     std::string body = (hdr_end==std::string::npos)? std::string() : resp2.substr(hdr_end+4);
     out.code = code; out.body = std::move(body);
@@ -675,26 +705,51 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
 }
 
 // HTTP POST with automatic retry and exponential backoff for network errors and server errors
+// CRITICAL FIX: Improved retry logic with smarter backoff for different error types
 static bool http_post_with_retry(const std::string& host, uint16_t port, const std::string& path,
                                   const std::string& auth_token, const std::string& json, HttpResp& out,
                                   int max_retries, bool retry_on_server_errors = false)
 {
-    int delay_ms = 1000;  // Start with 1 second delay
+    int delay_ms = 500;  // Start with 500ms for quick recovery from transient issues
+    int consecutive_503s = 0;
+
     for (int attempt = 0; attempt <= max_retries; ++attempt) {
         if (http_post(host, port, path, auth_token, json, out)) {
+            // Success! Reset state for next call
             return true;
         }
 
-        // Retry on network errors (code 0) or server errors (5xx) if enabled
-        bool should_retry = (out.code == 0) || (retry_on_server_errors && out.code >= 500);
+        // Determine if we should retry based on error type
+        bool should_retry = false;
+
+        if(out.code == 0){
+            // Network/connection error - always retry with normal backoff
+            should_retry = true;
+            consecutive_503s = 0;
+        } else if(retry_on_server_errors && out.code == 503){
+            // HTTP 503 Service Unavailable - server is overloaded
+            // Use aggressive initial backoff to let the server recover
+            should_retry = true;
+            consecutive_503s++;
+            // If we see multiple 503s in a row, the server is really struggling
+            // Back off more aggressively: 2s, 4s, 6s, 8s for each consecutive 503
+            if(consecutive_503s > 1){
+                delay_ms = std::max(delay_ms, consecutive_503s * 2000);
+            }
+        } else if(retry_on_server_errors && out.code >= 500){
+            // Other 5xx errors - retry with normal backoff
+            should_retry = true;
+            consecutive_503s = 0;
+        }
+
         if (!should_retry || attempt == max_retries) {
             return false;
         }
 
-        // Exponential backoff with longer delays for mining stability: 1s, 2s, 4s, 8s, 16s, 30s (capped)
-        // This allows the miner to survive temporary node issues without disconnecting
+        // Exponential backoff with longer delays for mining stability
+        // Cap at 10 seconds (was 30s, but too long hurts mining responsiveness)
         miq_sleep_ms(delay_ms);
-        delay_ms = std::min(delay_ms * 2, 30000);  // Cap at 30 seconds for mining resilience
+        delay_ms = std::min(delay_ms * 2, 10000);
     }
     return false;
 }
@@ -731,21 +786,33 @@ static bool rpc_getblock_time_bits(const std::string& host, uint16_t port, const
                                    const std::string& hh, long long& out_time, uint32_t& out_bits);
 
 // Diagnostic helper to identify RPC connection issues
+// CRITICAL FIX: More specific error messages to help diagnose issues
 static std::string diagnose_rpc_failure(const std::string& host, uint16_t port, const std::string& auth, const HttpResp& r){
     (void)host; (void)port;  // Reserved for future diagnostic enhancements
-    if(r.code == 0) return "Connection failed - node not running or wrong port";
+    if(r.code == 0){
+        // Network-level failure - include body for more details
+        if(!r.body.empty() && r.body.size() < 100){
+            return "Connection failed: " + r.body;
+        }
+        return "Connection failed - node not running or wrong port";
+    }
     if(r.code == 401 || r.code == 403) {
         if(auth.empty()) return "Auth required but no token provided - check cookie file or --token";
         return "Auth failed (401/403) - token may be incorrect or expired";
     }
     if(r.code == 404) return "RPC method not found - node may be outdated";
-    if(r.code >= 500) return "Server error - node may be overloaded or crashed";
+    if(r.code == 429) return "Rate limited (429) - too many requests, backing off";
+    if(r.code == 503){
+        // HTTP 503 is returned when server is at max connections
+        return "Server overloaded (503) - node has too many connections, will retry";
+    }
+    if(r.code >= 500) return "Server error (" + std::to_string(r.code) + ") - node may have crashed";
     if(json_has_error(r.body)) {
         std::string errMsg;
         if(json_find_string(r.body, "error", errMsg)) return "RPC error: " + errMsg;
         return "RPC returned error in body";
     }
-    return "Unknown failure (code=" + std::to_string(r.code) + ")";
+    return "Unexpected HTTP " + std::to_string(r.code);
 }
 
 static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::string& auth, TipInfo& out){
@@ -3981,7 +4048,10 @@ int main(int argc, char** argv){
                 // Template refresh timeout: abort round after 30 seconds to get fresh template
                 // This ensures timestamps stay valid and new transactions can be included
                 const int kTemplateRefreshMs = 30000;
+                // CRITICAL FIX: Increase polling interval to reduce RPC load on server
+                const int kPollIntervalMs = 1500;  // Check every 1.5 seconds instead of 500ms
                 auto round_start = std::chrono::steady_clock::now();
+                int consecutive_failures = 0;
 
                 while(!found.load(std::memory_order_relaxed) && ui.running.load()){
                     // Check for timeout - force template refresh periodically
@@ -3992,14 +4062,49 @@ int main(int argc, char** argv){
                         break;
                     }
 
-                    TipInfo tip_now{};
-                    if(rpc_gettipinfo(rpc_host, rpc_port, token, tip_now)){
-                        if(from_hex_s(tip_now.hash_hex) != tpl.prev_hash){
-                            abort_round.store(true);
-                            break;
+                    // CRITICAL FIX: Use lightweight tip check with short timeout for stale detection
+                    // If server is busy/slow, skip this check and try again next cycle
+                    // Don't use heavy retry logic here - that's for the main template fetch
+                    HttpResp r;
+                    bool got_tip = false;
+                    // Single quick attempt without heavy retry (fail fast for stale checks)
+                    if(http_post(rpc_host, rpc_port, "/", token, rpc_build("gettipinfo","[]"), r) && r.code == 200){
+                        TipInfo tip_now{};
+                        long long h=0,t=0; uint32_t b=0; std::string hh;
+                        if (json_find_number(r.body,"height",h) &&
+                            json_find_string(r.body,"hash",hh) &&
+                            json_find_hex_or_number_u32(r.body,"bits",b)) {
+                            tip_now.height = (uint64_t)h;
+                            tip_now.hash_hex = hh;
+                            tip_now.bits = b;
+                            got_tip = true;
+                            consecutive_failures = 0;
+
+                            // Check if tip has changed (new block found by network)
+                            if(from_hex_s(tip_now.hash_hex) != tpl.prev_hash){
+                                abort_round.store(true);
+                                break;
+                            }
                         }
                     }
-                    for(int i=0;i<10 && !found.load(std::memory_order_relaxed) && !abort_round.load(std::memory_order_relaxed) && ui.running.load(); ++i){
+
+                    // CRITICAL FIX: Track failures but don't let them block mining
+                    // If we can't check staleness, mining continues anyway
+                    if(!got_tip){
+                        consecutive_failures++;
+                        // After 5 consecutive failures, give the server more time to recover
+                        if(consecutive_failures >= 5){
+                            // Back off extra 2 seconds before next attempt
+                            for(int i=0; i<40 && !found.load(std::memory_order_relaxed) &&
+                                !abort_round.load(std::memory_order_relaxed) && ui.running.load(); ++i){
+                                miq_sleep_ms(50);
+                            }
+                        }
+                    }
+
+                    // Sleep for polling interval (split into small chunks for responsive shutdown)
+                    for(int i=0; i < kPollIntervalMs/50 && !found.load(std::memory_order_relaxed) &&
+                        !abort_round.load(std::memory_order_relaxed) && ui.running.load(); ++i){
                         miq_sleep_ms(50);
                     }
                 }

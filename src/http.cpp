@@ -641,21 +641,25 @@ void HttpServer::start(
                 sock_t fd = accept(s, (sockaddr*)&cli, &clen);
                 if(fd < 0){ continue; }
 #endif
-                // Hard connection cap
-                int live = ++g_live_conns;
-                if(live > max_conn){
+                // Hard connection cap - CRITICAL FIX: Moved increment AFTER thread creation to prevent leak
+                int live = g_live_conns.load();
+                if(live >= max_conn){
                     const std::string body_rlc = "{\"error\":\"too many connections\"}";
                     send_http_simple(fd, 503, "Service Unavailable", "application/json", body_rlc);
                     closesocket(fd);
-                    --g_live_conns;
                     continue;
                 }
 
-                std::thread([fd, on_json, env_token, bound_loopback, require_always, safe,
-                             ip_rps, ip_burst, max_hdr_bytes, max_body_bytes, recv_timeout_ms,
-                             cli, allow_cors, enable_metrics, metrics_public, enable_healthz, access_log]() {
-                    // Ensure live-conns is decremented exactly once
-                    auto guard = std::unique_ptr<void, void(*)(void*)>(nullptr, [](void*){ --g_live_conns; });
+                // CRITICAL FIX: Wrap thread creation in try-catch to prevent connection count leak
+                // If thread creation fails (resource exhaustion), we must not leak the connection count
+                try {
+                    std::thread([fd, on_json, env_token, bound_loopback, require_always, safe,
+                                 ip_rps, ip_burst, max_hdr_bytes, max_body_bytes, recv_timeout_ms,
+                                 cli, allow_cors, enable_metrics, metrics_public, enable_healthz, access_log]() {
+                        // Increment connection count at start of thread (thread successfully created)
+                        ++g_live_conns;
+                        // Ensure live-conns is decremented exactly once when thread exits
+                        auto guard = std::unique_ptr<void, void(*)(void*)>(nullptr, [](void*){ --g_live_conns; });
                     try {
                         auto t_start = std::chrono::steady_clock::now();
 
@@ -931,7 +935,16 @@ void HttpServer::start(
                         closesocket(fd);
                         return;
                     }
-                }).detach();
+                    }).detach();
+                } catch (const std::exception& e) {
+                    // CRITICAL FIX: Thread creation failed - clean up without leaking connection count
+                    // Note: g_live_conns was NOT incremented yet (it's done inside the thread)
+                    log_error(std::string("HTTP thread creation failed: ") + e.what());
+                    closesocket(fd);
+                } catch (...) {
+                    log_error("HTTP thread creation failed (unknown exception)");
+                    closesocket(fd);
+                }
             }
 
             closesocket(s);
