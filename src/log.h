@@ -127,4 +127,17 @@ void log_init(LogLevel level = LogLevel::INFO,
 // Shutdown logging (flush and close files)
 void log_shutdown();
 
+// Enable/disable async logging mode (for high-throughput scenarios)
+void log_set_async(bool enable);
+
+// Rate limiting helper - returns true if this log call should be suppressed
+bool log_rate_limited(const char* file, int line);
+
+// Rate-limited logging macro - only logs once per second from same source location
+#define MIQ_LOG_RATE_LIMITED(level, msg) do { \
+    if (!miq::log_rate_limited(__FILE__, __LINE__)) { \
+        miq::log_##level(msg); \
+    } \
+} while(0)
+
 }  // namespace miq
