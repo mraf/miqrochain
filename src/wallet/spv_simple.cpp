@@ -170,8 +170,8 @@ static bool parse_tx_miq_blockwrapped(R& r, TxParsed& out){
     if(!r.need(4)) return false;
     uint32_t tx_size = rd_u32_le(r.p + r.pos); r.pos += 4;
 
-    const uint32_t MAX_TX_SIZE = env_u32("MIQ_MAX_TX_SIZE", 900u*1024u); // align with node hint
-    if (tx_size == 0 || tx_size > MAX_TX_SIZE) return false;
+    const uint32_t tx_size_limit = env_u32("MIQ_MAX_TX_SIZE", 900u*1024u); // align with node hint
+    if (tx_size == 0 || tx_size > tx_size_limit) return false;
     if(!r.need(tx_size)) return false;
 
     size_t start = r.tell();

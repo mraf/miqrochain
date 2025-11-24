@@ -751,7 +751,7 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
             if (chain_.submit_block(block, submit_err)) {
                 log_info("Stratum: Block " + std::to_string(job.height) + " accepted!");
                 {
-                    std::lock_guard<std::mutex> lock(stats_mutex_);
+                    std::lock_guard<std::mutex> stats_lock(stats_mutex_);
                     stats_.blocks_found++;
                 }
             } else {

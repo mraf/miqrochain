@@ -691,9 +691,10 @@ static bool http_post_with_retry(const std::string& host, uint16_t port, const s
             return false;
         }
 
-        // Exponential backoff: 1s, 2s, 4s, 8s
+        // Exponential backoff with longer delays for mining stability: 1s, 2s, 4s, 8s, 16s, 30s (capped)
+        // This allows the miner to survive temporary node issues without disconnecting
         miq_sleep_ms(delay_ms);
-        delay_ms = std::min(delay_ms * 2, 8000);  // Cap at 8 seconds
+        delay_ms = std::min(delay_ms * 2, 30000);  // Cap at 30 seconds for mining resilience
     }
     return false;
 }
@@ -731,6 +732,7 @@ static bool rpc_getblock_time_bits(const std::string& host, uint16_t port, const
 
 // Diagnostic helper to identify RPC connection issues
 static std::string diagnose_rpc_failure(const std::string& host, uint16_t port, const std::string& auth, const HttpResp& r){
+    (void)host; (void)port;  // Reserved for future diagnostic enhancements
     if(r.code == 0) return "Connection failed - node not running or wrong port";
     if(r.code == 401 || r.code == 403) {
         if(auth.empty()) return "Auth required but no token provided - check cookie file or --token";
@@ -750,7 +752,7 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
     // Fast path: dedicated RPC (if present) with retry for network and server errors
     {
         HttpResp r;
-        if (http_post_with_retry(host, port, "/", auth, rpc_build("gettipinfo","[]"), r, 2, true)
+        if (http_post_with_retry(host, port, "/", auth, rpc_build("gettipinfo","[]"), r, 30, true)
             && r.code==200 && !json_has_error(r.body)) {
             long long h=0,t=0; uint32_t b=0; std::string hh;
             // Use json_find_hex_or_number_u32 for bits since server returns it as hex string
@@ -765,18 +767,24 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
                 return true;
             }
         }
-        // Log diagnostic info on failure
+        // Log diagnostic info on failure (only log first failure to avoid spam)
         if(r.code != 200){
             static int diag_count = 0;
-            if(++diag_count <= 3){ // Only log first few failures
+            static auto last_diag_time = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_diag_time).count();
+            // Only log first 3 failures OR once every 60 seconds to avoid log spam
+            if(diag_count < 3 || elapsed >= 60){
                 log_line("RPC gettipinfo failed: " + diagnose_rpc_failure(host, port, auth, r));
+                ++diag_count;
+                last_diag_time = now;
             }
         }
     }
     // Fallback (portable): getblockchaininfo → bestblockhash/blocks → getblock
     {
         HttpResp r;
-        if (!http_post_with_retry(host, port, "/", auth, rpc_build("getblockchaininfo","[]"), r, 2, true)
+        if (!http_post_with_retry(host, port, "/", auth, rpc_build("getblockchaininfo","[]"), r, 15, true)
             || r.code!=200 || json_has_error(r.body)) return false;
         long long blocks=0; std::string besthash;
         (void)json_find_number(r.body, "blocks", blocks);
@@ -798,7 +806,7 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
 static bool rpc_getminerstats(const std::string& host, uint16_t port, const std::string& auth, double& out_net_hs){
     HttpResp r;
     // Use retry for reliability during network monitoring
-    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getminerstats","[]"), r, 2, true) || r.code!=200) return false;
+    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getminerstats","[]"), r, 15, true) || r.code!=200) return false;
     if(json_has_error(r.body)) return false;
     if(json_find_double(r.body, "hps", out_net_hs)) return true;
     if(json_find_double(r.body, "network_hash_ps", out_net_hs)) return true;
@@ -808,7 +816,7 @@ static bool rpc_getblockhash(const std::string& host, uint16_t port, const std::
     std::ostringstream ps; ps<<"["<<height<<"]";
     HttpResp r;
     // Use retry for reliability - called frequently by stale monitoring
-    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getblockhash", ps.str()), r, 2, true) || r.code != 200) return false;
+    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getblockhash", ps.str()), r, 15, true) || r.code != 200) return false;
     if(json_has_error(r.body)) return false;
     if(json_find_string(r.body, "result", out)) return true;
     if(json_extract_top_string(r.body, out)) return true;
@@ -819,7 +827,7 @@ static bool rpc_getblock_header_time(const std::string& host, uint16_t port, con
     std::ostringstream ps; ps<<"[\""<<hh<<"\"]";
     HttpResp r;
     // Use retry for reliability
-    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getblock", ps.str()), r, 2, true) || r.code != 200) return false;
+    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getblock", ps.str()), r, 15, true) || r.code != 200) return false;
     if(json_has_error(r.body)) return false;
     long long t=0;
     if(json_find_number(r.body, "time", t)) { out_time=t; return true; }
@@ -831,7 +839,7 @@ static bool rpc_getblock_time_bits(const std::string& host, uint16_t port, const
     std::ostringstream ps; ps<<"[\""<<hh<<"\"]";
     HttpResp r;
     // Use retry for reliability - called frequently by stale monitoring via gettipinfo fallback
-    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getblock", ps.str()), r, 2, true) || r.code != 200) return false;
+    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getblock", ps.str()), r, 15, true) || r.code != 200) return false;
     if(json_has_error(r.body)) return false;
     long long t=0; uint32_t b=0;
     (void)json_find_number(r.body, "time", t);
@@ -856,7 +864,7 @@ static bool rpc_getblock_overview(const std::string& host, uint16_t port, const 
     std::ostringstream ps; ps<<"["<<height<<"]";
     HttpResp r;
     // Use retry for reliability during block scanning
-    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getblock", ps.str()), r, 2, true) || r.code!=200) return false;
+    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getblock", ps.str()), r, 15, true) || r.code!=200) return false;
     if(json_has_error(r.body)) return false;
     std::string hh; long long txs=0;
     if(!json_find_string(r.body, "hash", hh)) return false;
@@ -870,7 +878,7 @@ static bool rpc_getcoinbaserecipient(const std::string& host, uint16_t port, con
     std::ostringstream ps; ps<<"["<<height<<"]";
     HttpResp r;
     // Use retry for reliability during block scanning
-    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getcoinbaserecipient", ps.str()), r, 2, true) || r.code!=200) return false;
+    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getcoinbaserecipient", ps.str()), r, 15, true) || r.code!=200) return false;
     if(json_has_error(r.body)) return false;
     std::string pkh_hex, txid_hex;
     double val_dbl = 0.0;
@@ -906,7 +914,7 @@ static bool rpc_submitblock_verbose(const std::string& host, uint16_t port, cons
     std::ostringstream ps; ps << "[\"" << hexblk << "\"]";
     HttpResp r;
     // CRITICAL FIX: Use retry for block submission to ensure blocks aren't lost due to transient network issues
-    if(!http_post_with_retry(host, port, "/", auth, rpc_build(method, ps.str()), r, 3, true)) return false;
+    if(!http_post_with_retry(host, port, "/", auth, rpc_build(method, ps.str()), r, 15, true)) return false;
     out_body = r.body;
     if(r.code != 200) return false;
     return !json_has_error(r.body);
@@ -958,7 +966,7 @@ static std::string fmt_miq_amount(uint64_t base_units){
     return o.str();
 }
 
-static std::string fmt_miq_whole_dot(uint64_t base_units){
+[[maybe_unused]] static std::string fmt_miq_whole_dot(uint64_t base_units){
     uint64_t whole = base_units / MIQ_COIN_UNITS;
     std::ostringstream o; o << whole << '.';
     return o.str();
@@ -1129,7 +1137,8 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
         static std::atomic<uint64_t> template_requests{0};
         static std::atomic<uint64_t> template_successes{0};
         uint64_t req_num = template_requests.fetch_add(1);
-        if(http_post_with_retry(host, port, "/", auth, rpc_build("getminertemplate","[]"), r, 3, true) && r.code==200 && !json_has_error(r.body)){
+        (void)req_num;  // Reserved for future logging/debugging
+        if(http_post_with_retry(host, port, "/", auth, rpc_build("getminertemplate","[]"), r, 30, true) && r.code==200 && !json_has_error(r.body)){
             template_successes.fetch_add(1);
             uint32_t bits=0;
             std::string prev;
@@ -1162,7 +1171,7 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
     {
         HttpResp r;
         // CRITICAL FIX: Use retry mechanism for getblocktemplate fallback
-        if(http_post_with_retry(host, port, "/", auth, rpc_build("getblocktemplate","[{}]"), r, 3, true) && r.code==200 && !json_has_error(r.body)){
+        if(http_post_with_retry(host, port, "/", auth, rpc_build("getblocktemplate","[{}]"), r, 15, true) && r.code==200 && !json_has_error(r.body)){
             uint32_t bits=0;
             std::string prev;
             long long height=0, curtime=0;
@@ -2264,7 +2273,7 @@ public:
 
     bool send_json(const std::string& json) {
         std::string msg = json + "\n";
-        return ::send(sock, msg.c_str(), msg.size(), 0) > 0;
+        return ::send(sock, msg.c_str(), static_cast<int>(msg.size()), 0) > 0;
     }
 
     std::string recv_line(int timeout_ms = 30000) {
@@ -3217,7 +3226,7 @@ int main(int argc, char** argv){
 
                 // Show uptime and version
                 static auto start_time = clock::now();
-                auto uptime_secs = std::chrono::duration_cast<std::chrono::seconds>(clock::now() - start_time).count();
+                int uptime_secs = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(clock::now() - start_time).count());
                 int hours = uptime_secs / 3600;
                 int mins = (uptime_secs % 3600) / 60;
                 int secs = uptime_secs % 60;
@@ -3798,7 +3807,15 @@ int main(int argc, char** argv){
                 m << C("31;1") << "*** RPC CONNECTION LOST *** "
                   << "Node not responding at " << rpc_host << ":" << rpc_port << " - Retrying..." << R();
                 { std::lock_guard<std::mutex> lk(ui.mtx); ui.last_submit_msg = m.str(); ui.last_submit_when = std::chrono::steady_clock::now(); }
-                log_line("RPC connection lost: node not responding at " + rpc_host + ":" + std::to_string(rpc_port));
+
+                // Only log connection lost message periodically to avoid spam (once every 30 seconds)
+                static auto last_lost_log = std::chrono::steady_clock::now();
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_lost_log).count();
+                if(!was_disconnected || elapsed >= 30){
+                    log_line("RPC connection lost: node not responding at " + rpc_host + ":" + std::to_string(rpc_port));
+                    last_lost_log = now;
+                }
                 was_disconnected = true;
                 for(int i=0;i<20 && ui.running.load(); ++i) miq_sleep_ms(100);
                 continue;

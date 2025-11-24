@@ -48,6 +48,8 @@ static bool wallet_write_bytes(const std::string& path,
     if (!passphrase.empty()) {
         return miq::wallet_encrypt_to_file(path, bytes, passphrase, err);
     }
+#else
+    (void)passphrase;  // Suppress unused parameter warning when encryption is disabled
 #endif
     std::string tmp = path + ".tmp";
     FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -79,6 +81,7 @@ static bool wallet_read_bytes(const std::string& path,
         return miq::wallet_decrypt_from_file(path, out, passphrase, err);
     }
 #else
+    (void)passphrase;  // Suppress unused parameter warning when encryption is disabled
     // If encryption is disabled at build time and file is encrypted, refuse.
     if (is_encrypted_wallet_file(path)) {
         err = "wallet file is encrypted but MIQ_ENABLE_WALLET_ENC=OFF";

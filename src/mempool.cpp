@@ -742,6 +742,7 @@ void Mempool::update_fee_estimates(uint32_t height) {
 bool Mempool::is_rbf_candidate(const Transaction& tx) const {
     // Check if any input signals RBF (sequence < 0xFFFFFFFE)
     for (const auto& in : tx.vin) {
+        (void)in;  // Reserved for future RBF signaling check
         // Check sequence number for RBF signaling
         // In our simple format, we use a convention where replaceable is signaled
         // For now, all transactions are considered replaceable if RBF is enabled

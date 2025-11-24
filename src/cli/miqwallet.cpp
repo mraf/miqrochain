@@ -845,7 +845,7 @@ static bool coin_select_greedy(
 }
 
 // Smart coin selection: tries branch and bound, falls back to greedy
-static bool smart_coin_select(
+[[maybe_unused]] static bool smart_coin_select(
     const std::vector<miq::UtxoLite>& available,
     uint64_t target_value,
     uint64_t fee_rate,
@@ -1067,7 +1067,7 @@ struct FeeEstimate {
     int64_t estimated_time;     // seconds for medium priority
 };
 
-static FeeEstimate get_fee_estimates(){
+[[maybe_unused]] static FeeEstimate get_fee_estimates(){
     // Default fee estimates (can be updated from network)
     FeeEstimate est;
     est.low_priority = 1;
@@ -1077,7 +1077,7 @@ static FeeEstimate get_fee_estimates(){
     return est;
 }
 
-static uint64_t estimate_tx_fee(size_t num_inputs, size_t num_outputs, uint64_t fee_rate){
+[[maybe_unused]] static uint64_t estimate_tx_fee(size_t num_inputs, size_t num_outputs, uint64_t fee_rate){
     // P2PKH transaction size estimation
     // Header: 4 (version) + 4 (locktime) + 1-2 (input count varint) + 1-2 (output count varint) = ~10 bytes
     // Input: 32 (txid) + 4 (vout) + 1 (script len) + ~107 (sig + pubkey) + 4 (sequence) = ~148 bytes
@@ -1091,7 +1091,7 @@ static uint64_t estimate_tx_fee(size_t num_inputs, size_t num_outputs, uint64_t 
 // UTXO CONSOLIDATION
 // =============================================================================
 
-static bool should_consolidate_utxos(const std::vector<miq::UtxoLite>& utxos,
+[[maybe_unused]] static bool should_consolidate_utxos(const std::vector<miq::UtxoLite>& utxos,
                                      uint64_t threshold_count = 100,
                                      uint64_t dust_threshold = 10000){
     if(utxos.size() < threshold_count) return false;
@@ -1106,7 +1106,7 @@ static bool should_consolidate_utxos(const std::vector<miq::UtxoLite>& utxos,
     return dust_count > utxos.size() / 5;
 }
 
-static std::vector<miq::UtxoLite> get_consolidation_candidates(
+[[maybe_unused]] static std::vector<miq::UtxoLite> get_consolidation_candidates(
     const std::vector<miq::UtxoLite>& utxos,
     size_t max_inputs = 50,
     uint64_t min_value = 1000)
@@ -1172,7 +1172,7 @@ static void save_tracked_transaction(const std::string& wdir, const TrackedTrans
       << tx.failure_reason << "\n";
 }
 
-static void load_tracked_transactions(const std::string& wdir,
+[[maybe_unused]] static void load_tracked_transactions(const std::string& wdir,
                                        std::vector<TrackedTransaction>& out){
     out.clear();
     std::ifstream f(tracked_tx_path(wdir));
@@ -1213,7 +1213,7 @@ static void load_tracked_transactions(const std::string& wdir,
 // =============================================================================
 
 // Check for address reuse (privacy concern)
-static bool check_address_reuse(
+[[maybe_unused]] static bool check_address_reuse(
     const std::vector<miq::UtxoLite>& utxos,
     const std::vector<uint8_t>& pkh,
     int& reuse_count)
@@ -1226,7 +1226,7 @@ static bool check_address_reuse(
 }
 
 // Verify transaction signatures
-static bool verify_tx_signatures(const miq::Transaction& tx){
+[[maybe_unused]] static bool verify_tx_signatures(const miq::Transaction& tx){
     for(const auto& in : tx.vin){
         if(in.sig.empty() || in.pubkey.empty()){
             return false;
@@ -1243,7 +1243,7 @@ static bool verify_tx_signatures(const miq::Transaction& tx){
 }
 
 // Check for potential double-spend attempts
-static bool check_double_spend_risk(
+[[maybe_unused]] static bool check_double_spend_risk(
     const miq::Transaction& tx,
     const std::set<OutpointKey>& pending)
 {
@@ -1261,7 +1261,7 @@ static bool check_double_spend_risk(
 // =============================================================================
 
 // Compact UTXO set to reduce memory usage
-static void compact_utxo_set(std::vector<miq::UtxoLite>& utxos){
+[[maybe_unused]] static void compact_utxo_set(std::vector<miq::UtxoLite>& utxos){
     // Remove any invalid entries
     utxos.erase(
         std::remove_if(utxos.begin(), utxos.end(), [](const miq::UtxoLite& u){
@@ -1275,7 +1275,7 @@ static void compact_utxo_set(std::vector<miq::UtxoLite>& utxos){
 }
 
 // Estimate memory usage of UTXO set
-static size_t estimate_utxo_memory(const std::vector<miq::UtxoLite>& utxos){
+[[maybe_unused]] static size_t estimate_utxo_memory(const std::vector<miq::UtxoLite>& utxos){
     // Each UtxoLite: 32 (txid) + 4 (vout) + 8 (value) + 20 (pkh) + 4 (height) + 1 (coinbase)
     // Plus vector overhead
     return utxos.size() * (32 + 4 + 8 + 20 + 4 + 1 + 24);  // ~93 bytes per UTXO
@@ -1326,7 +1326,7 @@ static bool create_wallet_backup(const std::string& wdir, std::string& backup_pa
 static std::atomic<int64_t> g_last_sync_time{0};
 static std::atomic<int> g_sync_count{0};
 
-static bool check_rate_limit(int max_per_minute = 10){
+[[maybe_unused]] static bool check_rate_limit(int max_per_minute = 10){
     int64_t now = (int64_t)time(nullptr);
     int64_t last = g_last_sync_time.load();
 
@@ -1566,7 +1566,7 @@ struct PasswordStrength {
     std::vector<std::string> suggestions;
 };
 
-static PasswordStrength check_password_strength(const std::string& password){
+[[maybe_unused]] static PasswordStrength check_password_strength(const std::string& password){
     PasswordStrength result;
     result.score = 0;
 
@@ -1721,7 +1721,7 @@ static std::string labeled_addresses_path(const std::string& wdir){
     return join_path(wdir, "labeled_addresses.dat");
 }
 
-static void save_labeled_addresses(const std::string& wdir,
+[[maybe_unused]] static void save_labeled_addresses(const std::string& wdir,
                                     const std::vector<LabeledAddress>& addrs){
     std::ofstream f(labeled_addresses_path(wdir), std::ios::out | std::ios::trunc);
     if(!f.good()) return;
@@ -1744,7 +1744,7 @@ static void save_labeled_addresses(const std::string& wdir,
     }
 }
 
-static void load_labeled_addresses(const std::string& wdir,
+[[maybe_unused]] static void load_labeled_addresses(const std::string& wdir,
                                     std::vector<LabeledAddress>& out){
     out.clear();
     std::ifstream f(labeled_addresses_path(wdir));
@@ -1795,7 +1795,7 @@ static std::string memos_file_path(const std::string& wdir){
     return join_path(wdir, "transaction_memos.dat");
 }
 
-static void save_transaction_memo(const std::string& wdir, const TransactionMemo& memo){
+[[maybe_unused]] static void save_transaction_memo(const std::string& wdir, const TransactionMemo& memo){
     std::ofstream f(memos_file_path(wdir), std::ios::app);
     if(!f.good()) return;
 
@@ -1812,7 +1812,7 @@ static void save_transaction_memo(const std::string& wdir, const TransactionMemo
       << memo.created_at << "\n";
 }
 
-static void load_transaction_memos(const std::string& wdir,
+[[maybe_unused]] static void load_transaction_memos(const std::string& wdir,
                                     std::unordered_map<std::string, TransactionMemo>& out){
     out.clear();
     std::ifstream f(memos_file_path(wdir));
@@ -1879,7 +1879,7 @@ static bool export_to_file(const std::string& filepath, const std::string& conte
 
 // Simple QR code representation using ASCII
 // Note: This is a visual representation, not actual QR encoding
-static void display_address_visual(const std::string& address){
+[[maybe_unused]] static void display_address_visual(const std::string& address){
     std::cout << "\n";
     std::cout << "  " << ui::dim() << "Address:" << ui::reset() << "\n";
     std::cout << "  " << ui::cyan() << ui::bold() << address << ui::reset() << "\n\n";
@@ -1949,14 +1949,14 @@ struct FeeRecommendation {
     std::string network_status;
 };
 
-static FeeRecommendation get_fee_recommendation(){
+[[maybe_unused]] static FeeRecommendation get_fee_recommendation(){
     // In a full implementation, this would query mempool status
     FeeRecommendation rec;
     rec.network_status = "Normal";
     return rec;
 }
 
-static std::string format_time_estimate(int64_t seconds){
+[[maybe_unused]] static std::string format_time_estimate(int64_t seconds){
     if(seconds < 60) return std::to_string(seconds) + " seconds";
     if(seconds < 3600) return std::to_string(seconds / 60) + " minutes";
     return std::to_string(seconds / 3600) + " hours";
@@ -1981,7 +1981,7 @@ struct TransactionPlan {
     bool valid{false};
 };
 
-static TransactionPlan plan_transaction(
+[[maybe_unused]] static TransactionPlan plan_transaction(
     const std::vector<miq::UtxoLite>& utxos,
     const std::set<OutpointKey>& pending,
     uint64_t amount,
@@ -2082,7 +2082,7 @@ struct BatchTransactionPlan {
     bool valid{false};
 };
 
-static BatchTransactionPlan plan_batch_transaction(
+[[maybe_unused]] static BatchTransactionPlan plan_batch_transaction(
     const std::vector<miq::UtxoLite>& utxos,
     const std::set<OutpointKey>& pending,
     const std::vector<BatchOutput>& outputs,
@@ -2260,7 +2260,7 @@ static std::string confirmations_file_path(const std::string& wdir){
     return join_path(wdir, "confirmation_tracker.dat");
 }
 
-static void save_confirmation_status(const std::string& wdir,
+[[maybe_unused]] static void save_confirmation_status(const std::string& wdir,
                                       const ConfirmationStatus& status){
     std::ofstream f(confirmations_file_path(wdir), std::ios::app);
     if(!f.good()) return;
@@ -2277,7 +2277,7 @@ static void save_confirmation_status(const std::string& wdir,
 // INPUT VALIDATION UTILITIES
 // =============================================================================
 
-static bool is_valid_amount_string(const std::string& s){
+[[maybe_unused]] static bool is_valid_amount_string(const std::string& s){
     if(s.empty()) return false;
 
     bool has_dot = false;
@@ -2301,7 +2301,7 @@ static bool is_valid_amount_string(const std::string& s){
     return true;
 }
 
-static bool is_valid_fee_rate(uint64_t rate){
+[[maybe_unused]] static bool is_valid_fee_rate(uint64_t rate){
     return rate >= 1 && rate <= 1000;  // 1-1000 sat/byte
 }
 
@@ -2311,7 +2311,7 @@ static bool is_valid_fee_rate(uint64_t rate){
 
 // Note: display_balance_breakdown is defined after WalletBalance struct
 
-static void display_utxo_summary(const std::vector<miq::UtxoLite>& utxos){
+[[maybe_unused]] static void display_utxo_summary(const std::vector<miq::UtxoLite>& utxos){
     if(utxos.empty()){
         std::cout << "  " << ui::dim() << "No UTXOs found" << ui::reset() << "\n";
         return;
@@ -2343,7 +2343,7 @@ static void display_utxo_summary(const std::vector<miq::UtxoLite>& utxos){
     std::cout << "\n";
 }
 
-static void display_transaction_confirmation(const std::string& txid, uint64_t amount,
+[[maybe_unused]] static void display_transaction_confirmation(const std::string& txid, uint64_t amount,
                                               uint64_t fee, const std::string& to_addr){
     std::cout << "\n";
     ui::print_header("CONFIRM TRANSACTION", 55);
@@ -2362,7 +2362,7 @@ static void display_transaction_confirmation(const std::string& txid, uint64_t a
 // ERROR RECOVERY
 // =============================================================================
 
-static void handle_network_error(const std::string& error, int attempt, int max_attempts){
+[[maybe_unused]] static void handle_network_error(const std::string& error, int attempt, int max_attempts){
     std::cout << "\n";
     ui::print_error("Network error: " + error);
 
@@ -2419,7 +2419,7 @@ static std::string config_file_path(const std::string& wdir){
     return join_path(wdir, "wallet_config.dat");
 }
 
-static void save_wallet_config(const std::string& wdir, const WalletConfig& cfg){
+[[maybe_unused]] static void save_wallet_config(const std::string& wdir, const WalletConfig& cfg){
     std::ofstream f(config_file_path(wdir), std::ios::out | std::ios::trunc);
     if(!f.good()) return;
 
@@ -2436,7 +2436,7 @@ static void save_wallet_config(const std::string& wdir, const WalletConfig& cfg)
     f << "verbose_mode=" << (cfg.verbose_mode ? "1" : "0") << "\n";
 }
 
-static void load_wallet_config(const std::string& wdir, WalletConfig& cfg){
+[[maybe_unused]] static void load_wallet_config(const std::string& wdir, WalletConfig& cfg){
     std::ifstream f(config_file_path(wdir));
     if(!f.good()) return;
 
@@ -2480,7 +2480,7 @@ static std::string audit_log_path(const std::string& wdir){
     return join_path(wdir, "audit_log.dat");
 }
 
-static void append_audit_log(const std::string& wdir, const AuditEntry& entry){
+[[maybe_unused]] static void append_audit_log(const std::string& wdir, const AuditEntry& entry){
     std::ofstream f(audit_log_path(wdir), std::ios::app);
     if(!f.good()) return;
 
@@ -2510,7 +2510,7 @@ static std::string metrics_file_path(const std::string& wdir){
     return join_path(wdir, "performance_metrics.log");
 }
 
-static void log_performance_metrics(const std::string& wdir, const PerformanceMetrics& metrics){
+[[maybe_unused]] static void log_performance_metrics(const std::string& wdir, const PerformanceMetrics& metrics){
     std::ofstream f(metrics_file_path(wdir), std::ios::app);
     if(!f.good()) return;
 
@@ -2859,7 +2859,7 @@ static void add_to_tx_queue(const std::string& wdir, const QueuedTransaction& tx
     save_tx_queue(wdir, filtered);
 }
 
-static void update_tx_queue_status(const std::string& wdir, const std::string& txid_hex,
+[[maybe_unused]] static void update_tx_queue_status(const std::string& wdir, const std::string& txid_hex,
                                     const std::string& status, const std::string& error = ""){
     std::vector<QueuedTransaction> queue;
     load_tx_queue(wdir, queue);
@@ -3185,9 +3185,9 @@ static std::vector<TxDetailedEntry> filter_transactions(
         if (abs_amount < filter.amount_min || abs_amount > filter.amount_max) continue;
         if (!filter.search.empty()) {
             std::string lower_search = filter.search;
-            for (auto& c : lower_search) c = std::tolower(c);
+            for (auto& c : lower_search) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             std::string lower_txid = tx.txid_hex;
-            for (auto& c : lower_txid) c = std::tolower(c);
+            for (auto& c : lower_txid) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             bool found = (lower_txid.find(lower_search) != std::string::npos ||
                          tx.to_address.find(filter.search) != std::string::npos ||
                          tx.memo.find(filter.search) != std::string::npos);
@@ -3424,7 +3424,7 @@ static void print_tx_statistics(const std::vector<TxDetailedEntry>& txs) {
 // =============================================================================
 // FEE PRIORITY LABELS
 // =============================================================================
-static std::string fee_priority_label(int priority){
+[[maybe_unused]] static std::string fee_priority_label(int priority){
     switch(priority){
         case 0: return "Economy (1 sat/byte)";
         case 1: return "Normal (2 sat/byte)";
@@ -3803,7 +3803,7 @@ static int process_tx_queue(
 }
 
 // Check network connectivity by attempting to connect to any seed
-static bool check_network_status(
+[[maybe_unused]] static bool check_network_status(
     const std::vector<std::pair<std::string,std::string>>& seeds,
     std::string& connected_node)
 {
@@ -3872,7 +3872,7 @@ struct WalletBalance {
 };
 
 // Display function that uses WalletBalance
-static void display_balance_breakdown(const WalletBalance& wb){
+[[maybe_unused]] static void display_balance_breakdown(const WalletBalance& wb){
     std::cout << "\n";
     ui::print_header("BALANCE BREAKDOWN", 50);
     std::cout << "\n";
@@ -5344,8 +5344,8 @@ static bool wallet_session(const std::string& cli_host,
                 std::cout << "\n";
 
                 std::cout << ui::dim() << "  Current P2P Seeds:" << ui::reset() << "\n";
-                for(const auto& seed : seeds){
-                    std::cout << "  - " << seed.first << ":" << seed.second << "\n";
+                for(const auto& seed_entry : seeds){
+                    std::cout << "  - " << seed_entry.first << ":" << seed_entry.second << "\n";
                 }
                 std::cout << "\n";
 
@@ -5377,8 +5377,8 @@ static bool wallet_session(const std::string& cli_host,
             // Test each seed
             std::cout << ui::dim() << "  Testing P2P connections:" << ui::reset() << "\n\n";
 
-            for(const auto& seed : seeds){
-                std::cout << "  " << seed.first << ":" << seed.second << " ... ";
+            for(const auto& seed_entry : seeds){
+                std::cout << "  " << seed_entry.first << ":" << seed_entry.second << " ... ";
                 std::cout.flush();
 
                 auto start = std::chrono::steady_clock::now();
@@ -5390,7 +5390,7 @@ static bool wallet_session(const std::string& cli_host,
                 std::string err;
 
                 bool success = miq::spv_collect_utxos(
-                    seed.first, seed.second, pkhs, opts, test_utxos, err);
+                    seed_entry.first, seed_entry.second, pkhs, opts, test_utxos, err);
 
                 auto end = std::chrono::steady_clock::now();
                 int latency = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
