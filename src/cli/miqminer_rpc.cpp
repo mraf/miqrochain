@@ -878,7 +878,8 @@ static bool rpc_submitblock_verbose(const std::string& host, uint16_t port, cons
                                     std::string& out_body, const std::string& method, const std::string& hexblk){
     std::ostringstream ps; ps << "[\"" << hexblk << "\"]";
     HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build(method, ps.str()), r)) return false;
+    // CRITICAL FIX: Use retry for block submission to ensure blocks aren't lost due to transient network issues
+    if(!http_post_with_retry(host, port, "/", auth, rpc_build(method, ps.str()), r, 3, true)) return false;
     out_body = r.body;
     if(r.code != 200) return false;
     return !json_has_error(r.body);
@@ -1096,7 +1097,13 @@ static void miq_parse_template_txs(const std::string& body, std::vector<MinerTem
 static bool rpc_getminertemplate(const std::string& host, uint16_t port, const std::string& auth, MinerTemplate& out){
     {
         HttpResp r;
-        if(http_post(host, port, "/", auth, rpc_build("getminertemplate","[]"), r) && r.code==200 && !json_has_error(r.body)){
+        // CRITICAL FIX: Use retry mechanism to maintain stable RPC connection
+        // Debug: Track template request attempts for troubleshooting
+        static std::atomic<uint64_t> template_requests{0};
+        static std::atomic<uint64_t> template_successes{0};
+        uint64_t req_num = template_requests.fetch_add(1);
+        if(http_post_with_retry(host, port, "/", auth, rpc_build("getminertemplate","[]"), r, 3, true) && r.code==200 && !json_has_error(r.body)){
+            template_successes.fetch_add(1);
             uint32_t bits=0;
             std::string prev;
             long long height=0, curtime=0, mintime=0, mbs=0;
@@ -1127,7 +1134,8 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
     }
     {
         HttpResp r;
-        if(http_post(host, port, "/", auth, rpc_build("getblocktemplate","[{}]"), r) && r.code==200 && !json_has_error(r.body)){
+        // CRITICAL FIX: Use retry mechanism for getblocktemplate fallback
+        if(http_post_with_retry(host, port, "/", auth, rpc_build("getblocktemplate","[{}]"), r, 3, true) && r.code==200 && !json_has_error(r.body)){
             uint32_t bits=0;
             std::string prev;
             long long height=0, curtime=0;
@@ -3754,6 +3762,7 @@ int main(int argc, char** argv){
             std::fprintf(stderr, "[miner] starting solo mining loop (one job per tip; clean shutdown).\n");
 
             std::string last_job_prev_hex;
+            bool was_disconnected = false;
             while (ui.running.load()) {
                 MinerTemplate tpl;
             if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
@@ -3763,12 +3772,24 @@ int main(int argc, char** argv){
                   << "Node not responding at " << rpc_host << ":" << rpc_port << " - Retrying..." << R();
                 { std::lock_guard<std::mutex> lk(ui.mtx); ui.last_submit_msg = m.str(); ui.last_submit_when = std::chrono::steady_clock::now(); }
                 log_line("RPC connection lost: node not responding at " + rpc_host + ":" + std::to_string(rpc_port));
+                was_disconnected = true;
                 for(int i=0;i<20 && ui.running.load(); ++i) miq_sleep_ms(100);
                 continue;
             }
 
             // Successfully got template - node is reachable
             ui.node_reachable.store(true);
+
+            // Debug: Log when connection is restored after a failure
+            if (was_disconnected) {
+                std::ostringstream m;
+                m << C("32;1") << "*** RPC CONNECTION RESTORED *** "
+                  << "Successfully reconnected to " << rpc_host << ":" << rpc_port << R();
+                { std::lock_guard<std::mutex> lk(ui.mtx); ui.last_submit_msg = m.str(); ui.last_submit_when = std::chrono::steady_clock::now(); }
+                log_line("RPC connection restored: successfully reconnected to " + rpc_host + ":" + std::to_string(rpc_port));
+                std::fprintf(stderr, "[miner] RPC connection restored to %s:%u\n", rpc_host.c_str(), rpc_port);
+                was_disconnected = false;
+            }
 
             if (tpl.prev_hash.size() != 32) {
                 log_line("template rejected: prev_hash size invalid");
