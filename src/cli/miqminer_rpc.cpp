@@ -2215,10 +2215,10 @@ int main(int argc, char** argv){
             }
 
             if (!connected) {
-                std::fprintf(stderr, "\n" C("31;1").c_str());
+                std::fprintf(stderr, "\n\x1b[31;1m");
                 std::fprintf(stderr, "[ERROR] Could not connect to node at %s:%u after %d seconds\n",
                             rpc_host.c_str(), rpc_port, MAX_RETRIES);
-                std::fprintf(stderr, R().c_str());
+                std::fprintf(stderr, "\x1b[0m");
                 std::fprintf(stderr, "\nPossible causes:\n");
                 std::fprintf(stderr, "  1. Node is not running - start it with: miqrochain --daemon\n");
                 std::fprintf(stderr, "  2. RPC server not enabled - check node configuration\n");

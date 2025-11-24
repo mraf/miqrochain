@@ -27,6 +27,16 @@
 #include <functional>
 #include <regex>
 
+// Platform-specific includes for terminal detection
+#ifdef _WIN32
+  #include <windows.h>
+  #include <io.h>
+  #define isatty _isatty
+  #define STDOUT_FILENO _fileno(stdout)
+#else
+  #include <unistd.h>
+#endif
+
 // =============================================================================
 // PRODUCTION CONSTANTS
 // =============================================================================
@@ -1058,6 +1068,9 @@ static bool wallet_session(const std::string& cli_host,
         }
     }
 
+    // Track last connected node for display
+    std::string last_connected_node = "<not connected>";
+
     // Refresh balance function
     auto refresh_and_print = [&]()->std::vector<miq::UtxoLite>{
         ui::print_info("Syncing wallet with network...");
@@ -1119,6 +1132,9 @@ static bool wallet_session(const std::string& cli_host,
         std::cout << "\n";
         ui::print_header("WALLET BALANCE", 50);
         std::cout << "\n";
+
+        // Update shared variable for other UI sections
+        last_connected_node = used_seed;
 
         std::cout << "  " << ui::dim() << "Connected to: " << ui::reset() << used_seed << "\n";
         std::cout << "  " << ui::dim() << "UTXOs found:  " << ui::reset() << utxos.size() << "\n\n";
@@ -1356,7 +1372,7 @@ static bool wallet_session(const std::string& cli_host,
             }
 
             std::cout << "\n  " << ui::bold() << "Connected Node:" << ui::reset() << "\n";
-            std::cout << "    " << used_seed << "\n\n";
+            std::cout << "    " << last_connected_node << "\n\n";
 
             std::cout << "  " << ui::dim() << "Press ENTER to return..." << ui::reset();
             std::string dummy;
@@ -1485,7 +1501,7 @@ static bool wallet_session(const std::string& cli_host,
                 // Generate new address
                 miq::HdWallet hw(seed, meta);
                 std::string newaddr;
-                if(hw.GetNextAddress(newaddr)){
+                if(hw.GetNewAddress(newaddr)){
                     auto m2 = meta; m2.next_recv++;
                     std::string e;
                     if(miq::SaveHdWallet(wdir, seed, m2, pass, e)){
