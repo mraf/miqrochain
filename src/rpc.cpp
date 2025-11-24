@@ -2,6 +2,7 @@
 #include "hd_wallet.h"
 #include "wallet_store.h"
 #include "rpc.h"
+#include "p2p.h"           // P2P::broadcast_inv_tx for transaction propagation
 #include "sha256.h"
 #include "ibd_monitor.h"
 #include "constants.h"
@@ -1129,6 +1130,12 @@ std::string RpcService::handle(const std::string& body){
 
             auto tip = chain_.tip(); std::string e;
             if(mempool_.accept(tx, chain_.utxo(), static_cast<uint32_t>(tip.height), e)){
+                // CRITICAL FIX: Broadcast transaction to P2P network
+                // Without this, transactions only sit in local mempool and never propagate!
+                if(p2p_) {
+                    std::vector<uint8_t> txid = tx.txid();
+                    p2p_->broadcast_inv_tx(txid);
+                }
                 JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
             } else {
                 return err(e);
@@ -1843,6 +1850,12 @@ std::string RpcService::handle(const std::string& body){
 
             auto tip = chain_.tip(); std::string e;
             if(mempool_.accept(tx, chain_.utxo(), static_cast<uint32_t>(tip.height), e)){
+                // CRITICAL FIX: Broadcast transaction to P2P network
+                // Without this, transactions only sit in local mempool and never propagate!
+                if(p2p_) {
+                    std::vector<uint8_t> txid = tx.txid();
+                    p2p_->broadcast_inv_tx(txid);
+                }
                 if (used_change) {
                     HdAccountMeta newm = w.meta();
                     newm.next_change = meta.next_change + 1;
