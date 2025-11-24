@@ -62,6 +62,9 @@
     DWORD tvs = (DWORD)ms_send, tvr = (DWORD)ms_recv;
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tvs, sizeof(tvs));
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tvr, sizeof(tvr));
+    // Enable TCP keepalive to prevent idle connection drops
+    DWORD keepalive = 1;
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
   }
 #else
   #include <sys/types.h>
@@ -74,6 +77,7 @@
   #include <sys/stat.h>
   #include <sched.h>
   #include <sys/ioctl.h>
+  #include <netinet/tcp.h>  // For TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT
   using socket_t = int;
   #define miq_closesocket ::close
   static void miq_sleep_ms(unsigned ms){ usleep(ms*1000); }
@@ -82,6 +86,22 @@
     struct timeval tvr{ ms_recv/1000, (int)((ms_recv%1000)*1000) };
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tvs, sizeof(tvs));
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tvr, sizeof(tvr));
+    // Enable TCP keepalive to prevent idle connection drops
+    int keepalive = 1;
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+    // Set aggressive keepalive parameters for mining stability
+    #ifdef TCP_KEEPIDLE
+    int keepidle = 10;  // Start sending keepalives after 10 seconds of idle
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    #endif
+    #ifdef TCP_KEEPINTVL
+    int keepintvl = 5;  // Send keepalive every 5 seconds
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    #endif
+    #ifdef TCP_KEEPCNT
+    int keepcnt = 3;  // Drop connection after 3 failed keepalives
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+    #endif
   }
 #endif
 
