@@ -116,6 +116,45 @@ using namespace miq;
 
 // ===== brand & color =========================================================
 static bool g_use_ansi = true;
+
+// Detect if terminal supports ANSI escape codes
+static bool detect_ansi_support() {
+#if defined(_WIN32)
+    // On Windows, check for ConEmu, Windows Terminal, or enable VT processing
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut == INVALID_HANDLE_VALUE) return false;
+
+    DWORD mode = 0;
+    if (!GetConsoleMode(hOut, &mode)) return false;
+
+    // Try to enable VT processing
+    if (SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+        return true;
+    }
+
+    // Check for known terminals
+    const char* term = std::getenv("TERM");
+    const char* wt = std::getenv("WT_SESSION");
+    const char* conemu = std::getenv("ConEmuANSI");
+    if (wt || (conemu && std::strcmp(conemu, "ON") == 0)) return true;
+    if (term && (std::strstr(term, "xterm") || std::strstr(term, "color"))) return true;
+
+    return false;
+#else
+    // On Unix/Linux, check if stdout is a TTY and TERM is set
+    if (!isatty(STDOUT_FILENO)) return false;
+
+    const char* term = std::getenv("TERM");
+    if (!term || !*term) return false;
+
+    // Check for dumb terminal
+    if (std::strcmp(term, "dumb") == 0) return false;
+
+    // Most modern terminals support ANSI
+    return true;
+#endif
+}
+
 static inline std::string C(const char* code){ return g_use_ansi ? std::string("\x1b[")+code+"m" : std::string(); }
 static inline std::string R(){ return g_use_ansi ? std::string("\x1b[0m") : std::string(); }
 static inline const char* CLS(){ return g_use_ansi ? "\x1b[2J\x1b[H" : ""; }
@@ -1208,6 +1247,12 @@ static void enable_virtual_terminal(){
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
     if (h != INVALID_HANDLE_VALUE) { DWORD mode=0; if (GetConsoleMode(h,&mode)) SetConsoleMode(h, mode | 0x0004); }
 #endif
+    // Detect terminal ANSI support and set global flag
+    g_use_ansi = detect_ansi_support();
+
+    // Also check for --no-color flag (will be processed later, but env check here)
+    const char* no_color = std::getenv("NO_COLOR");
+    if (no_color && *no_color) g_use_ansi = false;
 }
 static bool prompt_address_until_valid(std::string& out_addr){
     for(;;){
@@ -2137,6 +2182,57 @@ int main(int argc, char** argv){
             gpu_enabled = false;
         }
 #endif
+
+        // ===== PRE-FLIGHT RPC CONNECTION TEST =====
+        // Wait for the node to be ready before starting mining threads
+        // This prevents showing UNREACHABLE status when node is still starting
+        {
+            const int MAX_RETRIES = 30;  // 30 seconds max wait
+            const int RETRY_DELAY_MS = 1000;
+            bool connected = false;
+
+            std::fprintf(stderr, "\n[startup] Testing RPC connection to %s:%u...\n", rpc_host.c_str(), rpc_port);
+
+            for (int attempt = 1; attempt <= MAX_RETRIES && !connected; ++attempt) {
+                TipInfo tip{};
+                if (rpc_gettipinfo(rpc_host, rpc_port, token, tip)) {
+                    connected = true;
+                    ui.node_reachable.store(true);
+                    ui.tip_height.store(tip.height);
+                    ui.tip_hash_hex = tip.hash_hex;
+                    ui.tip_bits.store(tip.bits);
+                    std::fprintf(stderr, "[startup] Connected! Tip height: %llu\n", (unsigned long long)tip.height);
+                } else {
+                    if (attempt == 1) {
+                        std::fprintf(stderr, "[startup] Node not responding. Waiting for node to start...\n");
+                        std::fprintf(stderr, "         (ensure miqrochain node is running with RPC on port %u)\n", rpc_port);
+                    }
+                    if (attempt % 5 == 0) {
+                        std::fprintf(stderr, "[startup] Still waiting... (attempt %d/%d)\n", attempt, MAX_RETRIES);
+                    }
+                    for (int i = 0; i < 10; ++i) miq_sleep_ms(RETRY_DELAY_MS / 10);
+                }
+            }
+
+            if (!connected) {
+                std::fprintf(stderr, "\n\x1b[31;1m");
+                std::fprintf(stderr, "[ERROR] Could not connect to node at %s:%u after %d seconds\n",
+                            rpc_host.c_str(), rpc_port, MAX_RETRIES);
+                std::fprintf(stderr, "\x1b[0m");
+                std::fprintf(stderr, "\nPossible causes:\n");
+                std::fprintf(stderr, "  1. Node is not running - start it with: miqrochain --daemon\n");
+                std::fprintf(stderr, "  2. RPC server not enabled - check node configuration\n");
+                std::fprintf(stderr, "  3. Wrong port - verify RPC_PORT=%u is correct\n", rpc_port);
+                std::fprintf(stderr, "  4. Firewall blocking local connections\n");
+                if (!token.empty()) {
+                    std::fprintf(stderr, "  5. Auth token may be incorrect or expired\n");
+                }
+                std::fprintf(stderr, "\nRetrying with exponential backoff...\n\n");
+
+                // Continue anyway but with warning - the mining loop will keep retrying
+                log_line("[startup] Initial connection failed, continuing with retry loop");
+            }
+        }
 
         // ===== UI thread (animated dashboard)
         std::thread ui_th([&](){
