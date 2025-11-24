@@ -150,6 +150,32 @@ static std::atomic<bool> g_assume_seed_hairpin{false};
 #endif
 
 // ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                    Professional ASCII Art & Branding                       ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+static const char* kMiqrochainBanner[] = {
+"",
+"  ███╗   ███╗██╗ ██████╗ ██████╗  ██████╗  ██████╗██╗  ██╗ █████╗ ██╗███╗   ██╗",
+"  ████╗ ████║██║██╔═══██╗██╔══██╗██╔═══██╗██╔════╝██║  ██║██╔══██╗██║████╗  ██║",
+"  ██╔████╔██║██║██║   ██║██████╔╝██║   ██║██║     ███████║███████║██║██╔██╗ ██║",
+"  ██║╚██╔╝██║██║██║▄▄ ██║██╔══██╗██║   ██║██║     ██╔══██║██╔══██║██║██║╚██╗██║",
+"  ██║ ╚═╝ ██║██║╚██████╔╝██║  ██║╚██████╔╝╚██████╗██║  ██║██║  ██║██║██║ ╚████║",
+"  ╚═╝     ╚═╝╚═╝ ╚══▀▀═╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝",
+"",
+nullptr
+};
+
+[[maybe_unused]] static const char* kNodeBanner[] = {
+"    ███╗   ██╗ ██████╗ ██████╗ ███████╗",
+"    ████╗  ██║██╔═══██╗██╔══██╗██╔════╝",
+"    ██╔██╗ ██║██║   ██║██║  ██║█████╗  ",
+"    ██║╚██╗██║██║   ██║██║  ██║██╔══╝  ",
+"    ██║ ╚████║╚██████╔╝██████╔╝███████╗",
+"    ╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚══════╝",
+nullptr
+};
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║                         Global state & helpers                            ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 namespace global {
@@ -171,6 +197,20 @@ static HANDLE               lock_handle{NULL};
 static int                  lock_fd{-1};
 #endif
 }
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║                        Network Statistics Tracking                         ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+struct NetworkStats {
+    std::atomic<uint64_t> bytes_sent{0};
+    std::atomic<uint64_t> bytes_recv{0};
+    std::atomic<uint64_t> messages_sent{0};
+    std::atomic<uint64_t> messages_recv{0};
+    std::atomic<uint64_t> blocks_relayed{0};
+    std::atomic<uint64_t> txs_relayed{0};
+    std::atomic<uint64_t> connection_attempts{0};
+    std::atomic<uint64_t> connection_failures{0};
+} g_net_stats;
 
 static std::atomic<bool> g_we_are_seed{false};
 
@@ -726,6 +766,67 @@ static inline std::string fmt_bytes(uint64_t v){
     while (d >= 1024.0 && u < 5){ d /= 1024.0; ++u; }
     std::ostringstream o; o<<std::fixed<<std::setprecision(u?1:0)<<d<<" "<<units[u];
     return o.str();
+}
+
+// Network bytes (decimal for bandwidth)
+static inline std::string fmt_net_bytes(uint64_t v){
+    static const char* units[] = {"B","KB","MB","GB","TB","PB"};
+    double d = (double)v;
+    int u = 0;
+    while (d >= 1000.0 && u < 5){ d /= 1000.0; ++u; }
+    std::ostringstream o; o<<std::fixed<<std::setprecision(u?1:0)<<d<<" "<<units[u];
+    return o.str();
+}
+
+// Human-readable uptime
+static inline std::string fmt_uptime(uint64_t secs){
+    if (secs < 60) {
+        return std::to_string(secs) + "s";
+    } else if (secs < 3600) {
+        uint64_t m = secs / 60;
+        uint64_t s = secs % 60;
+        return std::to_string(m) + "m " + std::to_string(s) + "s";
+    } else if (secs < 86400) {
+        uint64_t h = secs / 3600;
+        uint64_t m = (secs % 3600) / 60;
+        return std::to_string(h) + "h " + std::to_string(m) + "m";
+    } else {
+        uint64_t d = secs / 86400;
+        uint64_t h = (secs % 86400) / 3600;
+        return std::to_string(d) + "d " + std::to_string(h) + "h";
+    }
+}
+
+// Number with thousand separators
+static inline std::string fmt_num(uint64_t n){
+    std::string s = std::to_string(n);
+    int insertPosition = (int)s.length() - 3;
+    while (insertPosition > 0) {
+        s.insert((size_t)insertPosition, ",");
+        insertPosition -= 3;
+    }
+    return s;
+}
+
+// Percentage with color hint
+static inline std::string fmt_pct(double pct, bool use_color = false){
+    std::ostringstream o;
+    o << std::fixed << std::setprecision(1) << pct << "%";
+    return o.str();
+}
+
+// Age string (time since timestamp)
+static inline std::string fmt_age(uint64_t timestamp_s){
+    uint64_t now = (uint64_t)std::time(nullptr);
+    if (timestamp_s == 0 || timestamp_s > now) return "unknown";
+    uint64_t age = now - timestamp_s;
+    return fmt_uptime(age) + " ago";
+}
+
+// Block time estimation
+static inline std::string fmt_block_time(uint64_t blocks, uint64_t target_secs){
+    uint64_t est_secs = blocks * target_secs;
+    return fmt_uptime(est_secs);
 }
 
 // Hashrate pretty-printer
@@ -1524,41 +1625,79 @@ private:
 
         std::vector<std::string> left, right;
 
-        // Header bar
+        // Header bar - Professional branding
         {
             std::ostringstream h;
             std::string bullet = u8_ok_ ? " • " : " | ";
+
+            // Main title with version
             h << C_head() << "MIQROCHAIN" << C_reset()
               << "  " << C_dim()
               << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
-              << bullet << "Chain: " << CHAIN_NAME
-              << bullet << "P2P " << p2p_port_ << bullet << "RPC " << rpc_port_ << C_reset()
-              << "  " << spinner(tick_, u8_ok_) ;
+              << C_reset()
+              << "  " << spinner(tick_, u8_ok_);
             left.push_back(h.str());
+
+            // Network info line
+            std::ostringstream n;
+            n << "  " << C_dim() << "Chain: " << C_reset() << CHAIN_NAME
+              << C_dim() << bullet << "P2P: " << C_reset() << p2p_port_
+              << C_dim() << bullet << "RPC: " << C_reset() << rpc_port_;
+
+            // Show Stratum port if enabled
+            if (auto* ss = g_stratum_server.load()) {
+                n << C_dim() << bullet << "Pool: " << C_reset() << ss->get_port();
+            }
+            left.push_back(n.str());
+
             left.push_back("");
+
+            // Status messages
             if(!banner_.empty()){
                 left.push_back(std::string("  ") + C_info() + banner_ + C_reset());
             }
             if (!hot_message_.empty() && (now_ms() - hot_msg_ts_) < 4000){
                 left.push_back(std::string("  ") + C_warn() + hot_message_ + C_reset());
             }
+
+            // Help hint for new users
+            if (uptime_s_ < 30 && nstate_ == NodeState::Starting) {
+                left.push_back(std::string("  ") + C_dim() + "Press 'q' to quit" + bullet + "'t' toggle theme" + bullet + "'v' verbose mode" + C_reset());
+            }
+
             left.push_back(std::string("  ") + straight_line(leftw-2));
             left.push_back("");
         }
 
-        // System panel
+        // System panel - Enhanced with professional formatting
         {
             left.push_back(std::string(C_bold()) + "System" + C_reset());
             uptime_s_ = (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_tp_).count();
             uint64_t rss = get_rss_bytes();
-            std::ostringstream ln;
-            ln << "  uptime: " << uptime_s_ << "s"
-               << "   rss: " << fmt_bytes(rss)
-               << "   hw-threads: " << std::thread::hardware_concurrency();
-            left.push_back(ln.str());
-            left.push_back(std::string("  theme: ") + (dark_theme_? "dark":"light")
-                          + "   logs: " + (paused_? "paused":"live")
-                          + "   verbose: " + (global::tui_verbose.load()? "yes":"no"));
+
+            // Uptime with human-readable format
+            std::ostringstream ln1;
+            ln1 << "  Uptime: " << C_info() << fmt_uptime(uptime_s_) << C_reset()
+                << "   Memory: " << fmt_bytes(rss)
+                << "   Threads: " << std::thread::hardware_concurrency();
+            left.push_back(ln1.str());
+
+            // Platform and version info
+            std::ostringstream ln2;
+            ln2 << "  Platform: "
+#ifdef _WIN32
+                << "Windows"
+#elif defined(__APPLE__)
+                << "macOS"
+#else
+                << "Linux"
+#endif
+                << "   Theme: " << (dark_theme_ ? "dark" : "light")
+                << "   Verbose: " << (global::tui_verbose.load() ? C_ok() + std::string("yes") + C_reset() : C_dim() + std::string("no") + C_reset());
+            left.push_back(ln2.str());
+
+            // Controls hint
+            left.push_back(std::string("  ") + C_dim() + "[q]uit [t]heme [p]ause [s]nap [v]erbose [r]eload" + C_reset());
             left.push_back("");
         }
 
@@ -1640,48 +1779,79 @@ private:
             }
         }
 
-        // Chain status
+        // Chain status - Enhanced with better formatting
         {
-            left.push_back(std::string(C_bold()) + "Chain" + C_reset());
+            left.push_back(std::string(C_bold()) + "Blockchain" + C_reset());
             uint64_t height = chain_ ? chain_->height() : 0;
             std::string tip_hex;
             long double tip_diff = 0.0L;
             uint64_t tip_age_s = 0;
+            uint64_t tip_timestamp = 0;
             if (chain_) {
                 auto t = chain_->tip();
                 tip_hex = to_hex(t.hash);
                 tip_diff = difficulty_from_bits(hdr_bits(t));
-                uint64_t tsec = hdr_time(t);
-                if (tsec) {
+                tip_timestamp = hdr_time(t);
+                if (tip_timestamp) {
                     uint64_t now = (uint64_t)std::time(nullptr);
-                    tip_age_s = (now > tsec) ? (now - tsec) : 0;
+                    tip_age_s = (now > tip_timestamp) ? (now - tip_timestamp) : 0;
                 }
             }
-            left.push_back(std::string("  height: ") + std::to_string(height)
-                          + "   tip: " + short_hex(tip_hex, 12));
-            left.push_back(std::string("  tip age: ") + std::to_string(tip_age_s) + "s"
-                          + "   difficulty: " + fmt_diff(tip_diff));
-            left.push_back(std::string("  net hashrate: ") + fmt_hs(net_hashrate_));
-            left.push_back(std::string("  trend:        ") + spark_ascii(net_spark_));
-            size_t N = recent_blocks_.size();
-            size_t show = std::min<size_t>(8, N);
-            for (size_t i=0;i<show;i++){
-                const auto& b = recent_blocks_[N-1-i];
-                std::ostringstream ln;
-                ln << "  h=" << b.height
-                   << "  txs=" << (b.tx_count ? std::to_string(b.tx_count) : std::string("?"))
-                   << "  fees=" << (b.fees_known ? std::to_string(b.fees) : std::string("?"))
-                   << "  hash=" << short_hex(b.hash_hex.empty() ? std::string("(?)") : b.hash_hex, 12);
-                if (!b.miner.empty()) ln << "  miner=" << b.miner;
-                left.push_back(ln.str());
+
+            // Height with formatted number
+            std::ostringstream c1;
+            c1 << "  Height: " << C_info() << fmt_num(height) << C_reset()
+               << "   Tip: " << short_hex(tip_hex, 14);
+            left.push_back(c1.str());
+
+            // Tip age with human-readable format
+            std::ostringstream c2;
+            c2 << "  Tip Age: ";
+            if (tip_age_s < 120) {
+                c2 << C_ok() << fmt_uptime(tip_age_s) << C_reset();
+            } else if (tip_age_s < 600) {
+                c2 << C_warn() << fmt_uptime(tip_age_s) << C_reset();
+            } else {
+                c2 << C_err() << fmt_uptime(tip_age_s) << C_reset();
             }
-            if (N==0) left.push_back("  (no blocks yet)");
+            c2 << "   Difficulty: " << fmt_diff(tip_diff);
+            left.push_back(c2.str());
+
+            // Network hashrate and trend
+            left.push_back(std::string("  Network Hashrate: ") + C_info() + fmt_hs(net_hashrate_) + C_reset());
+            left.push_back(std::string("  Hashrate Trend:   ") + spark_ascii(net_spark_));
+
+            // Recent blocks header
+            size_t N = recent_blocks_.size();
+            if (N > 0) {
+                left.push_back(std::string("  ") + C_dim() + "Recent Blocks:" + C_reset());
+                size_t show = std::min<size_t>(6, N);
+                for (size_t i=0;i<show;i++){
+                    const auto& b = recent_blocks_[N-1-i];
+                    std::ostringstream ln;
+                    ln << "    " << C_dim() << "#" << C_reset() << b.height
+                       << "  " << short_hex(b.hash_hex.empty() ? std::string("?") : b.hash_hex, 10)
+                       << "  " << (b.tx_count ? std::to_string(b.tx_count) : std::string("?")) << " txs";
+                    if (b.fees_known) ln << "  " << b.fees << " fees";
+                    if (!b.miner.empty()) {
+                        // Shorten miner address for display
+                        std::string short_miner = b.miner;
+                        if (short_miner.size() > 12) {
+                            short_miner = short_miner.substr(0, 6) + "..." + short_miner.substr(short_miner.size() - 4);
+                        }
+                        ln << "  " << C_dim() << short_miner << C_reset();
+                    }
+                    left.push_back(ln.str());
+                }
+            } else {
+                left.push_back(std::string("  ") + C_dim() + "(awaiting first block)" + C_reset());
+            }
             left.push_back("");
         }
 
         // Right column: Network/Mempool/Miner/Health/Logs
         if (p2p_) {
-            right.push_back(std::string(C_bold()) + "Network" + C_reset());
+            right.push_back(std::string(C_bold()) + "Network Peers" + C_reset());
             auto peers = p2p_->snapshot_peers();
 
             std::stable_sort(peers.begin(), peers.end(), [](const auto& a, const auto& b){
@@ -1693,32 +1863,58 @@ private:
 
             size_t peers_n = peers.size();
             size_t inflight_tx = 0, rxbuf_sum = 0, awaiting_pongs = 0, verack_ok = 0;
-            for (auto& s : peers) { inflight_tx += (size_t)s.inflight; rxbuf_sum += (size_t)s.rx_buf; if (s.awaiting_pong) ++awaiting_pongs; if (s.verack_ok) ++verack_ok; }
-            right.push_back(std::string("  peers: ") + std::to_string(peers_n)
-                            + "   verack_ok: " + std::to_string(verack_ok)
-                            + "   inflight: " + std::to_string(inflight_tx)
-                            + "   rxbuf: " + std::to_string(rxbuf_sum)
-                            + "   pings-waiting: " + std::to_string(awaiting_pongs));
-            std::ostringstream hdr;
-            hdr << "    " << std::left << std::setw(18) << "IP"
-                << " " << std::setw(5) << "ok"
-                << " " << std::setw(8) << "last(ms)"
-                << " " << std::setw(7) << "rx"
-                << " " << std::setw(8) << "inflight";
-            right.push_back(hdr.str());
-            size_t showN = std::min(peers.size(), (size_t)8);
-            for (size_t i=0;i<showN; ++i) {
-                const auto& s = peers[i];
-                std::string ip = s.ip; if ((int)ip.size() > 18) ip = ip.substr(0,15) + "...";
-                std::ostringstream ln;
-                ln << "    " << std::left << std::setw(18) << ip
-                   << " " << std::setw(5) << (s.verack_ok ? (std::string(C_ok()) + "ok" + C_reset()) : (std::string(C_warn()) + ".." + C_reset()))
-                   << " " << std::right << std::setw(8) << (uint64_t)s.last_seen_ms
-                   << " " << std::setw(7) << (uint64_t)s.rx_buf
-                   << " " << std::setw(8) << (uint64_t)s.inflight;
-                right.push_back(ln.str());
+            for (auto& s : peers) {
+                inflight_tx += (size_t)s.inflight;
+                rxbuf_sum += (size_t)s.rx_buf;
+                if (s.awaiting_pong) ++awaiting_pongs;
+                if (s.verack_ok) ++verack_ok;
             }
-            if (peers.size() > showN) right.push_back(std::string("    ... +") + std::to_string(peers.size()-showN) + " more");
+
+            // Summary line with color coding for peer count
+            std::ostringstream sum;
+            sum << "  Connected: ";
+            if (peers_n == 0) {
+                sum << C_err() << "0" << C_reset();
+            } else if (peers_n < 3) {
+                sum << C_warn() << peers_n << C_reset();
+            } else {
+                sum << C_ok() << peers_n << C_reset();
+            }
+            sum << "   Active: " << verack_ok
+                << "   In-flight: " << inflight_tx;
+            right.push_back(sum.str());
+
+            // Buffer status
+            right.push_back(std::string("  RX Buffer: ") + fmt_bytes(rxbuf_sum)
+                          + "   Pings: " + std::to_string(awaiting_pongs));
+
+            // Peer table
+            if (peers_n > 0) {
+                right.push_back(std::string("  ") + C_dim() + "Peer List:" + C_reset());
+                size_t showN = std::min(peers.size(), (size_t)6);
+                for (size_t i=0;i<showN; ++i) {
+                    const auto& s = peers[i];
+                    std::string ip = s.ip;
+                    if ((int)ip.size() > 16) ip = ip.substr(0,13) + "...";
+                    std::ostringstream ln;
+                    ln << "    " << std::left << std::setw(16) << ip << " ";
+                    if (s.verack_ok) {
+                        ln << C_ok() << "OK" << C_reset();
+                    } else {
+                        ln << C_warn() << ".." << C_reset();
+                    }
+                    ln << " rx:" << (uint64_t)s.rx_buf;
+                    if (s.inflight > 0) {
+                        ln << " (" << s.inflight << " pending)";
+                    }
+                    right.push_back(ln.str());
+                }
+                if (peers.size() > showN) {
+                    right.push_back(std::string("    ") + C_dim() + "+ " + std::to_string(peers.size()-showN) + " more peers" + C_reset());
+                }
+            } else {
+                right.push_back(std::string("  ") + C_dim() + "(no peers connected)" + C_reset());
+            }
             right.push_back("");
         }
 
@@ -1731,8 +1927,9 @@ private:
             right.push_back("");
         }
 
+        // Mining panel - Enhanced with better formatting
         {
-            right.push_back(std::string(C_bold()) + "Mining" + C_reset());
+            right.push_back(std::string(C_bold()) + "Local Mining" + C_reset());
             bool active = g_miner_stats.active.load();
             unsigned thr = g_miner_stats.threads.load();
             uint64_t ok  = g_miner_stats.accepted.load();
@@ -1744,40 +1941,119 @@ private:
                     std::chrono::steady_clock::now() - g_miner_stats.start).count();
             }
 
+            // Mining availability status
             std::ostringstream m0;
-            m0 << "  available: " << (mining_gate_available_ ? (std::string(C_ok())+"yes"+C_reset()) :
-                                                       (std::string(C_warn())+"no"+C_reset()));
-            if (!mining_gate_reason_.empty()) m0 << "  (" << mining_gate_reason_ << ")";
+            m0 << "  Status: ";
+            if (mining_gate_available_) {
+                if (active) {
+                    m0 << C_ok() << "MINING" << C_reset() << " (" << thr << " threads)";
+                } else {
+                    m0 << C_ok() << "available" << C_reset();
+                }
+            } else {
+                m0 << C_warn() << "unavailable" << C_reset();
+                if (!mining_gate_reason_.empty()) {
+                    std::string reason = mining_gate_reason_;
+                    if (reason.size() > 30) reason = reason.substr(0, 27) + "...";
+                    m0 << " - " << reason;
+                }
+            }
             right.push_back(m0.str());
 
-            std::ostringstream m1;
-            m1 << "  status: " << (active ? (std::string(C_ok()) + "running" + C_reset()) : (std::string(C_dim()) + "idle" + C_reset()))
-               << "   threads: " << thr
-               << "   ext: " << (g_extminer.alive.load() ? (std::string(C_ok()) + "alive" + C_reset()) : (std::string(C_dim()) + "-" + C_reset()));
-            right.push_back(m1.str());
-
-            if (!g_miner_address_b58.empty()) {
-                right.push_back(std::string("  to: ") + g_miner_address_b58);
+            // External miner detection
+            if (std::getenv("MIQ_MINER_HEARTBEAT")) {
+                std::ostringstream ext;
+                ext << "  External: " << (g_extminer.alive.load() ?
+                    (std::string(C_ok()) + "detected" + C_reset()) :
+                    (std::string(C_dim()) + "not detected" + C_reset()));
+                right.push_back(ext.str());
             }
 
-            std::ostringstream m2; m2 << "  accepted: " << ok << "   rejected: " << rej; right.push_back(m2.str());
-            right.push_back(std::string("  miner hashrate: ") + fmt_hs(hps));
-            right.push_back(std::string("  miner uptime: ") + std::to_string(miner_uptime) + "s");
-            right.push_back(std::string("  miner trend:    ") + spark_ascii(spark_hs_));
-            double share = (net_hashrate_ > 0.0) ? (hps / net_hashrate_) * 100.0 : 0.0;
-            if (share < 0.0) share = 0.0;
-            if (share > 100.0) share = 100.0;
-            std::ostringstream m3; m3 << "  network (est):  " << fmt_hs(net_hashrate_)
-                                      << "   your share: " << std::fixed << std::setprecision(3) << share << "%";
-            right.push_back(m3.str());
-            size_t miners_obs = distinct_miners_recent(64);
-            std::ostringstream m4; m4 << "  miners observed (last 64 blks): " << miners_obs;
-            right.push_back(m4.str());
-            std::ostringstream m5; m5 << "  last ok height: " << g_miner_stats.last_height_ok.load()
-                                      << "   last rx height: " << g_miner_stats.last_height_rx.load();
-            right.push_back(m5.str());
+            // Mining address (shortened for display)
+            if (!g_miner_address_b58.empty()) {
+                std::string addr = g_miner_address_b58;
+                if (addr.size() > 24) {
+                    addr = addr.substr(0, 8) + "..." + addr.substr(addr.size() - 8);
+                }
+                right.push_back(std::string("  Reward To: ") + C_info() + addr + C_reset());
+            }
 
-            right.push_back(std::string("  ") + C_dim() + "* count = distinct coinbase recipients seen by this node" + C_reset());
+            // Performance metrics
+            if (active || ok > 0 || rej > 0) {
+                // Hashrate with trend
+                right.push_back(std::string("  Hashrate: ") + C_info() + fmt_hs(hps) + C_reset());
+                right.push_back(std::string("  Trend:    ") + spark_ascii(spark_hs_));
+
+                // Blocks mined
+                std::ostringstream blocks;
+                blocks << "  Blocks: " << C_ok() << ok << " mined" << C_reset();
+                if (rej > 0) {
+                    blocks << ", " << C_err() << rej << " rejected" << C_reset();
+                }
+                right.push_back(blocks.str());
+
+                // Uptime
+                if (active) {
+                    right.push_back(std::string("  Uptime: ") + fmt_uptime(miner_uptime));
+                }
+
+                // Network share
+                double share = (net_hashrate_ > 0.0) ? (hps / net_hashrate_) * 100.0 : 0.0;
+                if (share < 0.0) share = 0.0;
+                if (share > 100.0) share = 100.0;
+                std::ostringstream sh;
+                sh << "  Network Share: " << std::fixed << std::setprecision(2) << share << "%";
+                right.push_back(sh.str());
+            }
+
+            // Miners observed
+            size_t miners_obs = distinct_miners_recent(64);
+            if (miners_obs > 0) {
+                right.push_back(std::string("  Active Miners: ") + std::to_string(miners_obs) + " (last 64 blocks)");
+            }
+
+            right.push_back("");
+        }
+
+        // Pool Statistics panel (if Stratum server is running) - Enhanced
+        if (auto* ss = g_stratum_server.load()) {
+            right.push_back(std::string(C_bold()) + "Pool Server (Stratum)" + C_reset());
+            auto stats = ss->get_stats();
+
+            // Connection status
+            std::ostringstream p1;
+            p1 << "  Port: " << C_info() << ss->get_port() << C_reset()
+               << "   Miners: ";
+            if (stats.connected_miners == 0) {
+                p1 << C_dim() << "0" << C_reset();
+            } else {
+                p1 << C_ok() << stats.connected_miners << C_reset();
+            }
+            right.push_back(p1.str());
+
+            // Pool performance
+            right.push_back(std::string("  Pool Hashrate: ") + C_info() + fmt_hs(stats.pool_hashrate) + C_reset());
+
+            // Shares
+            std::ostringstream p2;
+            p2 << "  Shares: " << C_ok() << stats.accepted_shares << " accepted" << C_reset();
+            if (stats.rejected_shares > 0) {
+                p2 << ", " << C_err() << stats.rejected_shares << " rejected" << C_reset();
+            }
+            right.push_back(p2.str());
+
+            // Blocks found
+            std::ostringstream p3;
+            p3 << "  Blocks Found: ";
+            if (stats.blocks_found > 0) {
+                p3 << C_ok() << stats.blocks_found << C_reset();
+            } else {
+                p3 << C_dim() << "0" << C_reset();
+            }
+            right.push_back(p3.str());
+
+            // Connection hint
+            right.push_back(std::string("  ") + C_dim() + "Connect miners to this port for pool mining" + C_reset());
             right.push_back("");
         }
 
@@ -2105,22 +2381,30 @@ static void miner_worker(Chain* chain, Mempool* mempool, P2P* p2p,
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 static void print_usage(){
     std::cout
-      << "miqrod (node) options:\n"
-      << "  --conf=<path>                                config file (key=value)\n"
-      << "  --datadir=<path>                             data directory (overrides config)\n"
-      << "  --no-tui                                     disable the Pro TUI (plain logs)\n"
-      << "  --genaddress                                 generate ECDSA-P2PKH address (priv/pk/address)\n"
-      << "  --buildtx <priv_hex> <prev_txid_hex> <vout> <value> <to_address>  (prints txhex)\n"
-      << "  --reindex_utxo                               rebuild chainstate/UTXO from current chain\n"
-      << "  --mine                                       run built-in miner (interactive address prompt; starts when synced)\n"
-      << "  --telemetry                                  write block accepts to telemetry.ndjson in datadir\n"
       << "\n"
-      << "Env:\n"
-      << "  MIQ_NO_TUI=1               disables the TUI; plain logs\n"
-      << "  MIQ_MINER_THREADS          overrides miner thread count\n"
-      << "  MIQ_RPC_TOKEN              if set, HTTP gate token (synced to .cookie on start)\n"
-      << "  MIQ_MINER_HEARTBEAT        path to heartbeat file for external miner presence\n"
-      << "  MIQ_TUI_UTF8=1             OPT-IN: enable fancy Unicode UI on Windows consoles\n";
+      << "Miqrochain Node v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH << "\n"
+      << "\n"
+      << "Usage: miqrod [options]\n"
+      << "\n"
+      << "Options:\n"
+      << "  --conf=<path>        Configuration file (key=value format)\n"
+      << "  --datadir=<path>     Data directory (default: ~/.miqrochain)\n"
+      << "  --no-tui             Plain log output instead of TUI\n"
+      << "  --mine               Enable built-in miner\n"
+      << "  --genaddress         Generate new wallet address\n"
+      << "  --reindex_utxo       Rebuild UTXO from chain data\n"
+      << "  --telemetry          Enable telemetry logging\n"
+      << "  --help               Show this help\n"
+      << "\n"
+      << "Environment:\n"
+      << "  MIQ_NO_TUI=1             Disable TUI\n"
+      << "  MIQ_MINER_THREADS=N      Miner threads (default: auto)\n"
+      << "  MIQ_RPC_TOKEN=<token>    RPC auth token\n"
+      << "  MIQ_SEED_HOST=<host>     Override seed host\n"
+      << "\n"
+      << "Ports:\n"
+      << "  P2P: " << P2P_PORT << "  RPC: " << RPC_PORT << "  Stratum: 3333\n"
+      << "\n";
 }
 static bool is_recognized_arg(const std::string& s){
     if(s.rfind("--conf=",0)==0) return true;
@@ -2478,10 +2762,48 @@ int main(int argc, char** argv){
     const bool can_tui  = want_tui && term::supports_interactive_output();
 
     ConsoleWriter cw;
-    if (u8_ok)
-        cw.write_raw("Starting miqrod…  (Ctrl+C to exit; Ctrl+C twice = force)\n");
-    else
-        cw.write_raw("Starting miqrod...  (Ctrl+C to exit; Ctrl+C twice = force)\n");
+
+    // Startup splash
+    if (can_tui && vt_ok) {
+        cw.write_raw("\x1b[2J\x1b[H");
+
+        // Display banner
+        if (u8_ok) {
+            for (int i = 0; kMiqrochainBanner[i] != nullptr; ++i) {
+                cw.write_raw("\x1b[36m");
+                cw.write_raw(kMiqrochainBanner[i]);
+                cw.write_raw("\x1b[0m\n");
+            }
+        } else {
+            cw.write_raw("\n  MIQROCHAIN NODE\n\n");
+        }
+
+        // Version line
+        std::ostringstream info;
+        info << "  v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
+             << "  |  " << CHAIN_NAME << "  |  ";
+#ifdef _WIN32
+        info << "Windows";
+#elif defined(__APPLE__)
+        info << "macOS";
+#else
+        info << "Linux";
+#endif
+        info << "\n\n";
+        cw.write_raw(info.str());
+
+        // Loading animation
+        cw.write_raw("  Initializing");
+        std::fflush(stdout);
+        for (int i = 0; i < 3; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            cw.write_raw(".");
+            std::fflush(stdout);
+        }
+        cw.write_raw("\n\n");
+    } else {
+        cw.write_raw("Starting miqrod...\n");
+    }
 
     LogCapture capture;
     if (can_tui) capture.start();
@@ -2566,8 +2888,8 @@ int main(int argc, char** argv){
     // TUI start
     if (can_tui) {
         tui.start();
-        tui.set_banner(u8_ok ? "Preparing Miqrochain node…" : "Preparing Miqrochain node...");
-        tui.mark_step_ok("Parse CLI / environment");
+        tui.set_banner("Initializing");
+        tui.mark_step_ok("Parse CLI");
         tui.set_node_state(TUI::NodeState::Starting);
         tui.set_datadir(cfg.datadir.empty()? default_datadir(): cfg.datadir);
     }
@@ -2587,7 +2909,7 @@ int main(int argc, char** argv){
         if (can_tui) {
             tui.mark_step_ok("Load config & choose datadir");
             tui.mark_step_ok("Config/datadir ready");
-            tui.set_banner(std::string("Starting services...   Datadir: ") + cfg.datadir);
+            tui.set_banner("Starting services");
             tui.set_datadir(cfg.datadir);
         }
 
@@ -2700,7 +3022,7 @@ int main(int argc, char** argv){
         if (ibd_ok) {
             if (can_tui) {
                 tui.mark_step_ok("IBD sync phase");
-                tui.set_banner("Initial block download complete. Node is synced.");
+                tui.set_banner("Synced");
                 tui.set_node_state(TUI::NodeState::Running);
                 tui.set_mining_gate(true, "");
             }
@@ -2868,8 +3190,7 @@ int main(int argc, char** argv){
         if (can_tui) {
             const bool ibd_ok_or_solo = ibd_ok || solo_seed_mode(cfg.no_p2p ? nullptr : &p2p);
             if (ibd_ok_or_solo) {
-                tui.set_banner(u8_ok ? "Miqrochain node running — synced & serving peers…" :
-                                       "Miqrochain node running - synced & serving peers...");
+                tui.set_banner("Running");
                 auto role = compute_seed_role();
                 if (role.we_are_seed) {
                     tui.set_banner_append(std::string("SEED: ") + seed_host_cstr());
@@ -2877,8 +3198,7 @@ int main(int argc, char** argv){
                 }
                 tui.set_node_state(TUI::NodeState::Running);
             } else {
-                tui.set_banner(u8_ok ? "Node running — IBD failed (see error). Mining disabled." :
-                                       "Node running - IBD failed (see error). Mining disabled.");
+                tui.set_banner("Degraded - IBD failed");
                 tui.set_node_state(TUI::NodeState::Degraded);
             }
         }
@@ -2957,7 +3277,7 @@ int main(int argc, char** argv){
 
         if (can_tui) {
                 tui.set_node_state(TUI::NodeState::Quitting);
-                tui.set_banner("Shutting down safely...");
+                tui.set_banner("Shutting down");
             }
         log_info("Shutdown requested - stopping services...");
 

@@ -22,10 +22,13 @@ struct Config {
     std::string rpc_tls_client_ca;               // optional client-auth CA (PEM); empty = no client auth
 
     // === Stratum mining pool server ===
-    bool        stratum_enable = false;          // enable Stratum pool server
+    bool        stratum_enable = true;           // enable Stratum pool server (default: ON for v1.0)
     uint16_t    stratum_port = 3333;             // Stratum port
     double      stratum_difficulty = 1.0;        // default mining difficulty
     bool        stratum_vardiff = true;          // enable variable difficulty
+    double      stratum_pool_fee = 1.0;          // pool fee percentage (default: 1%)
+    uint64_t    stratum_min_payout = 1000000;    // minimum payout in base units (0.01 MIQ)
+    bool        stratum_auto_payout = true;      // automatic payouts when balance reached
 };
 
 // Simple key=value loader. Unknown keys are ignored. Returns false if file not found.

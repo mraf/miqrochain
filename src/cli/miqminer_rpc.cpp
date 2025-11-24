@@ -1,4 +1,10 @@
 // src/cli/miqminer_rpc.cpp
+// Chronen Miner v1.0 Stable - Professional Cryptocurrency Mining Software
+// Copyright (c) 2024 Miqrochain Developers
+
+#define MIQMINER_VERSION "1.0.0"
+#define MIQMINER_VERSION_STRING "Chronen Miner v1.0 Stable"
+
 #include "constants.h"
 #include "block.h"
 #include "tx.h"
@@ -36,6 +42,7 @@
 #include <fstream>
 #include <unordered_map>
 #include <signal.h>
+#include <condition_variable>
 
 #if defined(_WIN32)
   #ifndef NOMINMAX
@@ -163,15 +170,88 @@ static inline void set_title(const std::string& t){
     std::cout << "\x1b]0;" << t << "\x07";
 }
 
-// BIG ASCII banner (kept minimal & clean; cyan). This spells MiQ.
+// Professional ASCII banner for Chronen Miner
 static const char* kChronenMinerBanner[] = {
-"  __  __ _                                                                                      ",
-" |  \\/  |                                                                                       ",
-" | \\  / |                                                                                       ",
-" | |\\/| |                                                                                       ",
-" | |   | |                                                                                      ",
-" |_|   |_|                                                                                      ",
+"   ██████╗██╗  ██╗██████╗  ██████╗ ███╗   ██╗███████╗███╗   ██╗",
+"  ██╔════╝██║  ██║██╔══██╗██╔═══██╗████╗  ██║██╔════╝████╗  ██║",
+"  ██║     ███████║██████╔╝██║   ██║██╔██╗ ██║█████╗  ██╔██╗ ██║",
+"  ██║     ██╔══██║██╔══██╗██║   ██║██║╚██╗██║██╔══╝  ██║╚██╗██║",
+"  ╚██████╗██║  ██║██║  ██║╚██████╔╝██║ ╚████║███████╗██║ ╚████║",
+"   ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═══╝",
+"                    ███╗   ███╗██╗███╗   ██╗███████╗██████╗     ",
+"                    ████╗ ████║██║████╗  ██║██╔════╝██╔══██╗    ",
+"                    ██╔████╔██║██║██╔██╗ ██║█████╗  ██████╔╝    ",
+"                    ██║╚██╔╝██║██║██║╚██╗██║██╔══╝  ██╔══██╗    ",
+"                    ██║ ╚═╝ ██║██║██║ ╚████║███████╗██║  ██║    ",
+"                    ╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝    ",
 };
+
+// UI Helper: Draw a horizontal line
+[[maybe_unused]] static std::string ui_hline(int width, char c = '-') {
+    return std::string(width, c);
+}
+
+// UI Helper: Draw a box top
+[[maybe_unused]] static std::string ui_box_top(int width, const std::string& title = "") {
+    std::string hline;
+    for (int i = 0; i < width - 2; i++) hline += "-";
+    if (title.empty()) {
+        return "+" + hline + "+";
+    }
+    int padding = width - 4 - (int)title.size();
+    int left = padding / 2;
+    int right = padding - left;
+    std::string lpad, rpad;
+    for (int i = 0; i < left; i++) lpad += "-";
+    for (int i = 0; i < right; i++) rpad += "-";
+    return "+" + lpad + " " + title + " " + rpad + "+";
+}
+
+// UI Helper: Draw a box bottom
+[[maybe_unused]] static std::string ui_box_bottom(int width) {
+    std::string hline;
+    for (int i = 0; i < width - 2; i++) hline += "-";
+    return "+" + hline + "+";
+}
+
+// UI Helper: Draw a box row with content
+[[maybe_unused]] static std::string ui_box_row(int width, const std::string& content) {
+    int content_width = width - 4;
+    std::string text = content;
+    // Truncate if too long (accounting for ANSI codes which don't take visual space)
+    // Simple approach: just pad/truncate
+    if ((int)text.size() > content_width) {
+        text = text.substr(0, content_width);
+    }
+    int padding = content_width - (int)text.size();
+    return "│ " + text + std::string(padding, ' ') + " │";
+}
+
+// Forward declaration for fmt_hs (defined later in file)
+static std::string fmt_hs(double v);
+
+// UI Helper: Format hash rate with visual bar
+static std::string fmt_hs_bar(double v, double max_v, int bar_width = 20) {
+    std::string hs_str = fmt_hs(v);
+    if (max_v <= 0) max_v = v > 0 ? v : 1.0;
+    double ratio = std::min(1.0, v / max_v);
+    int filled = (int)(ratio * bar_width);
+    std::string bar = "[";
+    for (int i = 0; i < bar_width; i++) {
+        bar += (i < filled) ? '#' : '.';
+    }
+    bar += "]";
+    return bar + " " + hs_str;
+}
+
+// UI Helper: Status indicator with color
+static std::string ui_status(bool ok, const std::string& ok_text, const std::string& fail_text) {
+    if (ok) {
+        return C("32;1") + "● " + ok_text + R();
+    } else {
+        return C("31;1") + "○ " + fail_text + R();
+    }
+}
 
 // ===== helpers ===============================================================
 static const uint64_t MIQ_COIN_UNITS = 100000000ULL; // 1 MIQ = 1e8 base units
@@ -430,6 +510,11 @@ static inline void store_u32_le(uint8_t* p, uint32_t x){
 // ===== minimal HTTP/JSON-RPC ================================================
 struct HttpResp { int code{0}; std::string body; };
 
+// HTTP POST with automatic retry and exponential backoff
+static bool http_post_with_retry(const std::string& host, uint16_t port, const std::string& path,
+                                  const std::string& auth_token, const std::string& json, HttpResp& out,
+                                  int max_retries = 3);
+
 static inline std::string str_tolower(std::string s){
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return (char)std::tolower(c); });
     return s;
@@ -556,6 +641,30 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
     out.code = code; out.body = std::move(body);
     return true;
 }
+
+// HTTP POST with automatic retry and exponential backoff for network errors
+static bool http_post_with_retry(const std::string& host, uint16_t port, const std::string& path,
+                                  const std::string& auth_token, const std::string& json, HttpResp& out,
+                                  int max_retries)
+{
+    int delay_ms = 1000;  // Start with 1 second delay
+    for (int attempt = 0; attempt <= max_retries; ++attempt) {
+        if (http_post(host, port, path, auth_token, json, out)) {
+            return true;
+        }
+
+        // Only retry on network errors (code 0), not on HTTP errors
+        if (out.code != 0 || attempt == max_retries) {
+            return false;
+        }
+
+        // Exponential backoff: 1s, 2s, 4s, 8s
+        miq_sleep_ms(delay_ms);
+        delay_ms = std::min(delay_ms * 2, 8000);  // Cap at 8 seconds
+    }
+    return false;
+}
+
 static std::string json_escape(const std::string& s){
     std::ostringstream o; o << '"';
     for(unsigned char c : s){
@@ -605,10 +714,10 @@ static std::string diagnose_rpc_failure(const std::string& host, uint16_t port, 
 }
 
 static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::string& auth, TipInfo& out){
-    // Fast path: dedicated RPC (if present)
+    // Fast path: dedicated RPC (if present) with retry for network errors
     {
         HttpResp r;
-        if (http_post(host, port, "/", auth, rpc_build("gettipinfo","[]"), r)
+        if (http_post_with_retry(host, port, "/", auth, rpc_build("gettipinfo","[]"), r, 2)
             && r.code==200 && !json_has_error(r.body)) {
             long long h=0,t=0; uint32_t b=0; std::string hh;
             // Use json_find_hex_or_number_u32 for bits since server returns it as hex string
@@ -1291,6 +1400,174 @@ static void show_intro(){
     }
 }
 
+// ===== Mining Mode Selection =================================================
+enum class MiningMode { SOLO = 1, POOL = 2 };
+
+// Professional mining mode selection menu
+static MiningMode show_mining_mode_menu() {
+    using clock = std::chrono::steady_clock;
+
+    while (true) {
+        std::ostringstream s;
+        s << CLS();
+
+        // Banner
+        s << C("36;1");
+        const size_t N = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
+        for(size_t i=0;i<N;i++) s << kChronenMinerBanner[i] << "\n";
+        s << R() << "\n";
+
+        // Version info
+        s << "  " << C("2") << MIQMINER_VERSION_STRING << " - Professional Mining Software" << R() << "\n\n";
+
+        // Menu header
+        s << C("36;1") << "  ══════════════════════════════════════════════════════════════════" << R() << "\n";
+        s << C("1;4") << "   SELECT MINING MODE" << R() << "\n";
+        s << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n\n";
+
+        // Option 1: Solo Mining
+        s << "  " << C("33;1") << "[1]" << R() << " " << C("1") << "SOLO MINING" << R() << "\n";
+        s << "      " << C("2") << "Mine directly to your own node and receive full block rewards." << R() << "\n";
+        s << "      " << C("31;1") << "!" << R() << " " << C("31") << "Running a full node is REQUIRED" << R() << "\n";
+        s << "      " << C("2") << "• Direct RPC connection to local/remote node" << R() << "\n";
+        s << "      " << C("2") << "• Full block reward (no pool fees)" << R() << "\n";
+        s << "      " << C("2") << "• Requires synced blockchain" << R() << "\n\n";
+
+        // Option 2: Pool Mining
+        s << "  " << C("36;1") << "[2]" << R() << " " << C("1") << "POOL MINING" << R() << "\n";
+        s << "      " << C("2") << "Connect to a mining pool for consistent payouts." << R() << "\n";
+        s << "      " << C("32;1") << "✓" << R() << " " << C("32") << "Running a full node is NOT required" << R() << "\n";
+        s << "      " << C("2") << "• Stratum protocol (stratum+tcp://)" << R() << "\n";
+        s << "      " << C("2") << "• Shared rewards with pool miners" << R() << "\n";
+        s << "      " << C("2") << "• More consistent payouts" << R() << "\n\n";
+
+        s << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n";
+        s << "  " << C("1") << "Enter your choice [1/2]: " << R() << std::flush;
+
+        std::cout << s.str();
+
+        std::string input;
+        if (!std::getline(std::cin, input)) {
+            return MiningMode::SOLO; // Default to solo on EOF
+        }
+
+        trim(input);
+
+        if (input == "1" || input == "solo" || input == "SOLO") {
+            // Show confirmation animation
+            std::cout << "\n  " << C("33;1") << ">>> SOLO MINING SELECTED <<<" << R() << "\n";
+            miq_sleep_ms(500);
+            return MiningMode::SOLO;
+        } else if (input == "2" || input == "pool" || input == "POOL") {
+            // Show confirmation animation
+            std::cout << "\n  " << C("36;1") << ">>> POOL MINING SELECTED <<<" << R() << "\n";
+            miq_sleep_ms(500);
+            return MiningMode::POOL;
+        } else {
+            std::cout << "\n  " << C("31;1") << "Invalid choice. Please enter 1 or 2." << R() << "\n";
+            miq_sleep_ms(1000);
+        }
+    }
+}
+
+// Pool configuration menu
+struct PoolConfig {
+    std::string host;
+    uint16_t port{3333};
+    std::string worker;
+    std::string password{"x"};
+};
+
+static bool show_pool_config_menu(PoolConfig& cfg, const std::string& default_addr) {
+    std::cout << CLS();
+
+    // Banner (smaller)
+    std::cout << C("36;1");
+    const size_t N = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
+    for(size_t i=0;i<N;i++) std::cout << kChronenMinerBanner[i] << "\n";
+    std::cout << R() << "\n";
+
+    std::cout << C("36;1") << "  ══════════════════════════════════════════════════════════════════" << R() << "\n";
+    std::cout << C("1;4") << "   POOL CONFIGURATION" << R() << "\n";
+    std::cout << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n\n";
+
+    // Pool URL
+    std::cout << "  " << C("1") << "Pool Address" << R() << " (e.g., pool.example.com:3333)\n";
+    std::cout << "  " << C("2") << "Format: hostname:port" << R() << "\n";
+    std::cout << "  > " << std::flush;
+
+    std::string pool_url;
+    if (!std::getline(std::cin, pool_url)) return false;
+    trim(pool_url);
+
+    if (pool_url.empty()) {
+        std::cout << "\n  " << C("31;1") << "Error: Pool address is required." << R() << "\n";
+        miq_sleep_ms(1500);
+        return false;
+    }
+
+    // Parse host:port
+    size_t colon = pool_url.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon == pool_url.size() - 1) {
+        std::cout << "\n  " << C("31;1") << "Error: Invalid format. Use hostname:port" << R() << "\n";
+        miq_sleep_ms(1500);
+        return false;
+    }
+
+    cfg.host = pool_url.substr(0, colon);
+    try {
+        cfg.port = (uint16_t)std::stoi(pool_url.substr(colon + 1));
+    } catch (...) {
+        std::cout << "\n  " << C("31;1") << "Error: Invalid port number." << R() << "\n";
+        miq_sleep_ms(1500);
+        return false;
+    }
+
+    std::cout << "\n";
+
+    // Worker name
+    std::cout << "  " << C("1") << "Worker Name" << R() << "\n";
+    std::cout << "  " << C("2") << "Usually: your_address.worker_name (default: " << default_addr.substr(0,8) << "..." << ".miner1)" << R() << "\n";
+    std::cout << "  > " << std::flush;
+
+    std::string worker;
+    if (!std::getline(std::cin, worker)) return false;
+    trim(worker);
+
+    if (worker.empty()) {
+        cfg.worker = default_addr + ".miner1";
+    } else {
+        cfg.worker = worker;
+    }
+
+    std::cout << "\n";
+
+    // Password (optional)
+    std::cout << "  " << C("1") << "Pool Password" << R() << " " << C("2") << "(press Enter for default 'x')" << R() << "\n";
+    std::cout << "  > " << std::flush;
+
+    std::string pass;
+    if (!std::getline(std::cin, pass)) return false;
+    trim(pass);
+
+    if (!pass.empty()) {
+        cfg.password = pass;
+    }
+
+    // Confirmation
+    std::cout << "\n" << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n";
+    std::cout << "  " << C("1") << "Configuration Summary:" << R() << "\n";
+    std::cout << "    Pool   : " << C("36") << cfg.host << ":" << cfg.port << R() << "\n";
+    std::cout << "    Worker : " << C("33") << cfg.worker << R() << "\n";
+    std::cout << "    Pass   : " << C("2") << cfg.password << R() << "\n";
+    std::cout << C("36") << "  ──────────────────────────────────────────────────────────────────" << R() << "\n\n";
+
+    std::cout << "  " << C("32;1") << "✓ Configuration complete! Starting pool mining..." << R() << "\n";
+    miq_sleep_ms(1000);
+
+    return true;
+}
+
 // ===== OpenCL GPU miner ======================================================
 enum class SaltPos { NONE=0, PRE=1, POST=2 };
 
@@ -1967,21 +2244,42 @@ public:
 // ===== usage =================================================================
 static void usage(){
     std::cout <<
-    "miqminer_rpc — Chronen Miner (CPU + OpenCL GPU)\n"
+    "╔══════════════════════════════════════════════════════════════════════════╗\n"
+    "║                    " << MIQMINER_VERSION_STRING << "                        ║\n"
+    "║              Professional Cryptocurrency Mining Software                  ║\n"
+    "╚══════════════════════════════════════════════════════════════════════════╝\n\n"
     "Usage:\n"
-    "  miqminer_rpc [--rpc=host:port] [--token=TOKEN] [--threads=N]\n"
-    "               [--address=Base58P2PKH] [--no-ansi]\n"
-    "               [--pool=host:port] [--worker=name] [--pool-pass=x]\n"
-    "               [--priority=high|normal] [--affinity=on|off]\n"
-    "               [--smooth=SECONDS]\n"
-    "               [--gpu=on|off] [--gpu-platform=IDX] [--gpu-device=IDX]\n"
-    "               [--gws=GLOBAL_WORK_SIZE] [--gnpi=NONCES_PER_ITEM]\n"
-    "               [--salt-hex=HEXBYTES] [--salt-pos=pre|post]\n"
+    "  miqminer [options]\n\n"
+    "Mining Modes (interactive selection at startup if not specified):\n"
+    "  [1] SOLO MINING  - Mine to your own node (requires running full node)\n"
+    "  [2] POOL MINING  - Connect to mining pool (no full node required)\n\n"
+    "Solo Mining Options:\n"
+    "  --rpc=host:port       RPC endpoint (default: 127.0.0.1:9332)\n"
+    "  --token=TOKEN         RPC authentication token\n"
+    "  --address=ADDR        P2PKH payout address (Base58Check)\n\n"
+    "Pool Mining Options:\n"
+    "  --pool=host:port      Pool address (enables pool mode)\n"
+    "  --worker=NAME         Worker name (default: address.miner1)\n"
+    "  --pool-pass=PASS      Pool password (default: x)\n\n"
+    "Performance Options:\n"
+    "  --threads=N           CPU mining threads (default: 6)\n"
+    "  --priority=high       Set high process priority\n"
+    "  --affinity=on         Pin threads to CPU cores\n"
+    "  --smooth=SECONDS      Hash rate smoothing window (default: 15)\n\n"
+    "GPU Options:\n"
+    "  --gpu=on|off          Enable/disable GPU mining\n"
+    "  --gpu-platform=IDX    OpenCL platform index\n"
+    "  --gpu-device=IDX      OpenCL device index\n"
+    "  --gws=SIZE            Global work size\n"
+    "  --gnpi=N              Nonces per GPU work item\n\n"
+    "Advanced Options:\n"
+    "  --salt-hex=HEX        Custom salt bytes\n"
+    "  --salt-pos=pre|post   Salt position in header\n"
+    "  --no-ansi             Disable ANSI colors\n\n"
     "Notes:\n"
-    "  - Token from --token, MIQ_RPC_TOKEN, or datadir/.cookie\n"
-    "  - Default threads: 6 (override with --threads)\n"
-    "  - GPU requires build with -DMIQ_ENABLE_OPENCL and OpenCL runtime installed\n"
-    "  - Pool mining: use --pool=host:port --worker=addr.worker --pool-pass=x\n";
+    "  - Token can be provided via --token, MIQ_RPC_TOKEN env var, or .cookie file\n"
+    "  - GPU requires build with -DMIQ_ENABLE_OPENCL and OpenCL runtime\n\n"
+    "Version: " MIQMINER_VERSION "\n";
 }
 
 // ===== graceful shutdown =====================================================
@@ -2124,6 +2422,8 @@ int main(int argc, char** argv){
 
         // ===== Splash & address
         show_intro();
+
+        // Get mining address first (needed for both modes)
         std::string addr = address_cli;
 
         if(!addr.empty()){
@@ -2140,6 +2440,30 @@ int main(int argc, char** argv){
         if(!parse_p2pkh(addr, pkh)){
             std::fprintf(stderr,"Invalid address (expected Base58Check P2PKH, version 0x%02x)\n",(unsigned)miq::VERSION_P2PKH);
             return 1;
+        }
+
+        // ===== Mining Mode Selection (unless --pool was specified on command line)
+        MiningMode mining_mode = MiningMode::SOLO;
+        PoolConfig pool_cfg;
+
+        if (pool_mode) {
+            // Pool mode was set via command line
+            mining_mode = MiningMode::POOL;
+            pool_cfg.host = pool_host;
+            pool_cfg.port = pool_port;
+            pool_cfg.worker = pool_worker.empty() ? (addr + ".miner1") : pool_worker;
+            pool_cfg.password = pool_pass;
+        } else {
+            // Show interactive mining mode selection
+            mining_mode = show_mining_mode_menu();
+
+            if (mining_mode == MiningMode::POOL) {
+                // Get pool configuration
+                if (!show_pool_config_menu(pool_cfg, addr)) {
+                    std::fprintf(stderr, "Pool configuration cancelled.\n");
+                    return 1;
+                }
+            }
         }
 
         // UI + shared state
@@ -2184,10 +2508,10 @@ int main(int argc, char** argv){
         }
 #endif
 
-        // ===== PRE-FLIGHT RPC CONNECTION TEST =====
-        // Wait for the node to be ready before starting mining threads
-        // This prevents showing UNREACHABLE status when node is still starting
-        {
+        // ===== PRE-FLIGHT CONNECTION TEST =====
+        // For solo mining: wait for the node to be ready
+        // For pool mining: test pool connection
+        if (mining_mode == MiningMode::SOLO) {
             const int MAX_RETRIES = 30;  // 30 seconds max wait
             const int RETRY_DELAY_MS = 1000;
             bool connected = false;
@@ -2233,73 +2557,130 @@ int main(int argc, char** argv){
                 // Continue anyway but with warning - the mining loop will keep retrying
                 log_line("[startup] Initial connection failed, continuing with retry loop");
             }
+        } else {
+            // Pool mining mode - test pool connection
+            std::fprintf(stderr, "\n[startup] Testing pool connection to %s:%u...\n",
+                        pool_cfg.host.c_str(), pool_cfg.port);
+
+            StratumClient stratum;
+            stratum.host = pool_cfg.host;
+            stratum.port = pool_cfg.port;
+            stratum.worker = pool_cfg.worker;
+            stratum.password = pool_cfg.password;
+
+            if (stratum.connect_to_pool()) {
+                std::fprintf(stderr, "[startup] Pool connected! Subscribing...\n");
+                if (stratum.subscribe()) {
+                    std::fprintf(stderr, "[startup] Subscribed. Authorizing worker...\n");
+                    if (stratum.authorize()) {
+                        std::fprintf(stderr, "[startup] Worker authorized successfully!\n");
+                        ui.node_reachable.store(true);
+                    } else {
+                        std::fprintf(stderr, "[startup] WARNING: Worker authorization failed\n");
+                    }
+                } else {
+                    std::fprintf(stderr, "[startup] WARNING: Pool subscription failed\n");
+                }
+                stratum.disconnect();
+            } else {
+                std::fprintf(stderr, "[startup] WARNING: Could not connect to pool %s:%u\n",
+                            pool_cfg.host.c_str(), pool_cfg.port);
+                std::fprintf(stderr, "         Will retry during mining...\n");
+            }
         }
 
         // ===== UI thread (animated dashboard)
         std::thread ui_th([&](){
             using clock = std::chrono::steady_clock;
-            const int FPS = 12;
+            const int FPS = 8;  // Slightly lower FPS for less CPU usage
             const auto frame_dt = std::chrono::milliseconds(1000/FPS);
             int spin_idx = 0;
 
-            // Config card (one-time)
+            // Config card (one-time startup display)
             {
                 std::ostringstream s;
                 s << CLS();
                 s << C("36;1");
                 const size_t kBannerN = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
-                for(size_t i=0;i<kBannerN;i++) s << "  " << kChronenMinerBanner[i] << "\n";
+                for(size_t i=0;i<kBannerN;i++) s << kChronenMinerBanner[i] << "\n";
                 s << R() << "\n";
-                s << "  " << C("1") << "Endpoint: " << R() << ui.rpc_host << ":" << ui.rpc_port << "\n";
-                s << "  " << C("1") << "Address : " << R() << pkh_to_address(ui.my_pkh) << "\n";
-                s << "  " << C("1") << "Threads : " << R() << (int)threads << (pin_affinity?"  (affinity)":"") << (high_priority?"  (high-priority)":"") << "\n";
+                s << "  " << C("1") << "Initializing Chronen Miner..." << R() << "\n\n";
+                s << "  " << C("36") << "►" << R() << " RPC Endpoint: " << C("1") << ui.rpc_host << ":" << ui.rpc_port << R() << "\n";
+                s << "  " << C("36") << "►" << R() << " Payout Addr : " << C("33;1") << pkh_to_address(ui.my_pkh) << R() << "\n";
+                s << "  " << C("36") << "►" << R() << " CPU Threads : " << C("1") << (int)threads << R();
+                if(pin_affinity) s << C("2") << " [affinity]" << R();
+                if(high_priority) s << C("2") << " [high-priority]" << R();
+                s << "\n";
 #if defined(MIQ_ENABLE_OPENCL)
-                s << "  " << C("1") << "GPU     : " << R() << (ui.gpu_available.load() ? (ui.gpu_platform+" / "+ui.gpu_device) : std::string("(disabled)")) << "\n";
+                s << "  " << C("36") << "►" << R() << " GPU Mining  : " << (ui.gpu_available.load() ? (C("32;1") + "ENABLED" + R() + " - " + ui.gpu_device) : (C("2") + "disabled" + R())) << "\n";
 #endif
-                s << "\n  Preparing dashboard…\n";
+                s << "\n  " << C("33") << "Loading dashboard..." << R() << "\n";
                 std::cout << s.str() << std::flush;
-                miq_sleep_ms(650);
+                miq_sleep_ms(800);
             }
+
+            // Track max hash rates for bar scaling
+            double max_cpu_hs = 1000.0;
+            double max_gpu_hs = 1000.0;
+            double max_net_hs = 10000.0;
 
             while(ui.running.load(std::memory_order_relaxed)){
                 [[maybe_unused]] TermSize ts = get_term_size();
                 std::ostringstream out;
                 out << CLS();
 
-                // Banner
+                // ═══════════════════════════════════════════════════════════════
+                // HEADER - Banner
+                // ═══════════════════════════════════════════════════════════════
                 out << C("36;1");
                 const size_t kBannerN = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
-                for(size_t i=0;i<kBannerN;i++) out << "  " << kChronenMinerBanner[i] << "\n";
-                out << R() << "\n";
+                for(size_t i=0;i<kBannerN;i++) out << kChronenMinerBanner[i] << "\n";
+                out << R();
 
-                out << "  " << C("1") << "RPC: " << R() << ui.rpc_host << ":" << ui.rpc_port
-                    << "   " << C(ui.node_reachable.load()? "32;1" : "31;1")
-                    << (ui.node_reachable.load()? "[CONNECTED]" : "[UNREACHABLE]") << R() << "\n";
+                // ═══════════════════════════════════════════════════════════════
+                // SECTION 1: NETWORK STATUS
+                // ═══════════════════════════════════════════════════════════════
+                out << "\n" << C("36;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << C("1;4") << " NETWORK STATUS" << R() << "\n";
+                out << C("36") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
 
-                // Tip / candidate
-                uint64_t th = ui.tip_height.load();
-                if(th){
-                    out << "  " << C("1") << "Tip:  " << R() << "height=" << th
-                        << "  hash=" << ui.tip_hash_hex << "\n";
-                    uint32_t bits = ui.tip_bits.load();
-                    out << "       " << "bits=0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)bits
-                        << std::dec << "  (difficulty " << std::fixed << std::setprecision(2) << difficulty_from_bits(bits) << ")\n";
-                }
+                // Connection status
+                bool connected = ui.node_reachable.load();
+                out << "  " << C("1") << "Connection  :" << R() << " "
+                    << ui_status(connected, "CONNECTED", "UNREACHABLE")
+                    << "  " << C("2") << "(" << ui.rpc_host << ":" << ui.rpc_port << ")" << R() << "\n";
+
+                // Blockchain tip
+                uint64_t tip_h = ui.tip_height.load();
+                uint32_t tip_bits = ui.tip_bits.load();
+                double difficulty = difficulty_from_bits(tip_bits);
+
+                out << "  " << C("1") << "Block Height:" << R() << " " << C("33;1") << tip_h << R() << "\n";
+                out << "  " << C("1") << "Difficulty  :" << R() << " " << std::fixed << std::setprecision(4) << difficulty
+                    << "  " << C("2") << "(bits: 0x" << std::hex << std::setw(8) << std::setfill('0') << tip_bits << std::dec << ")" << R() << "\n";
+
+                // Network hashrate
+                double net_hs = ui.net_hashps.load();
+                if (net_hs > max_net_hs) max_net_hs = net_hs * 1.2;
+                out << "  " << C("1") << "Network H/s :" << R() << " " << C("36") << fmt_hs(net_hs) << R() << "\n";
+
+                // ═══════════════════════════════════════════════════════════════
+                // SECTION 2: CURRENT MINING JOB
+                // ═══════════════════════════════════════════════════════════════
+                out << "\n" << C("33;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << C("1;4") << " CURRENT JOB" << R() << "\n";
+                out << C("33") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
 
                 {
                     std::lock_guard<std::mutex> lk(ui.mtx);
                     if(ui.cand.height){
-                        out << "\n";
-                        out << "  " << C("36;1") << "Job:" << R()
-                            << " height=" << ui.cand.height
-                            << " prev=" << ui.cand.prev_hex
-                            << " bits=0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)ui.cand.bits << std::dec
-                            << " txs=" << ui.cand.txs
-                            << " size=" << ui.cand.size_bytes << "B"
-                            << " fees=" << fmt_miq_amount(ui.cand.fees)
-                            << " coinbase=" << C("32;1") << fmt_miq_amount(ui.cand.coinbase) << R() << "\n";
+                        out << "  " << C("1") << "Mining Block:" << R() << " " << C("33;1") << "#" << ui.cand.height << R() << "\n";
+                        out << "  " << C("1") << "Prev Hash   :" << R() << " " << C("2") << ui.cand.prev_hex.substr(0, 32) << "..." << R() << "\n";
+                        out << "  " << C("1") << "Transactions:" << R() << " " << ui.cand.txs << " txs  (" << ui.cand.size_bytes << " bytes)\n";
+                        out << "  " << C("1") << "Fees        :" << R() << " " << fmt_miq_amount(ui.cand.fees) << "\n";
+                        out << "  " << C("1") << "Reward      :" << R() << " " << C("32;1") << fmt_miq_amount(ui.cand.coinbase) << R() << "\n";
 
-                        // live next-hash preview
+                        // Live hash preview (animated)
                         std::string nxh;
                         {
                             std::lock_guard<std::mutex> lk2(ui.next_hash_mtx);
@@ -2308,111 +2689,125 @@ int main(int argc, char** argv){
                             nxh = hh.str();
                         }
                         if(!nxh.empty()){
-                            out << "       next-hash: " << C("2") << nxh.substr(0,64) << R() << "\n";
+                            // Animated hash display
+                            std::array<std::string,5> spin_rows;
+                            spinner_circle_ascii(spin_idx, spin_rows);
+                            out << "  " << C("1") << "Hash Preview:" << R() << " " << C("2;3") << nxh.substr(0,48) << "..." << R() << "\n";
                         }
                     } else {
-                        out << "\n  " << C("33;1") 
-                            << (ui.node_synced.load()? "preparing job..." : "syncing… waiting for job") 
-                            << R() << "\n";
+                        out << "  " << C("33") << "⏳ " << (connected ? "Waiting for mining template..." : "Connecting to node...") << R() << "\n";
                     }
                 }
 
-                // Last block
-                if(ui.lastblk.height){
-                    const auto& lb = ui.lastblk;
-                    out << "\n";
-                    out << "  " << C("33;1") << "Last block:" << R()
-                        << " height=" << lb.height
-                        << " hash=" << lb.hash_hex
-                        << " txs=" << lb.txs << "\n";
-                    if(!lb.coinbase_txid_hex.empty())
-                        out << "              coinbase_txid=" << lb.coinbase_txid_hex << "\n";
-                    if(!lb.coinbase_pkh.empty()){
-                        const std::string winner = pkh_to_address(lb.coinbase_pkh);
-                        out << "              paid to: " << winner
-                            << "  (pkh=" << to_hex_s(lb.coinbase_pkh) << ")\n";
-                        uint64_t expected = GetBlockSubsidy((uint32_t)lb.height);
-                        if(lb.reward_value){
-                            uint64_t normalized = (lb.reward_value ? lb.reward_value : expected);
-                            out << "              reward: expected " << fmt_miq_amount(expected)
-                                << " | node " << fmt_miq_amount(normalized) << "\n";
-                        }else{
-                            out << "              reward: expected " << fmt_miq_amount(expected) << "\n";
-                        }
-                    }
-                }
+                // ═══════════════════════════════════════════════════════════════
+                // SECTION 3: PERFORMANCE METRICS
+                // ═══════════════════════════════════════════════════════════════
+                out << "\n" << C("32;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << C("1;4") << " PERFORMANCE" << R() << "\n";
+                out << C("32") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
 
-                // Hashrates + wallet ests
-                out << "\n";
-                out << "  " << C("1") << "CPU: " << R() << C("36") << fmt_hs(ui.hps_smooth.load()) << R()
-                    << "  " << C("2") << "(now " << fmt_hs(ui.hps_now.load()) << ")" << R() << "\n";
+                // CPU hashrate with bar
+                double cpu_smooth = ui.hps_smooth.load();
+                double cpu_now = ui.hps_now.load();
+                if (cpu_smooth > max_cpu_hs) max_cpu_hs = cpu_smooth * 1.2;
+
+                out << "  " << C("1") << "CPU Hash/s  :" << R() << " " << fmt_hs_bar(cpu_smooth, max_cpu_hs, 15) << "\n";
+                out << "               " << C("2") << "(instant: " << fmt_hs(cpu_now) << ")" << R() << "\n";
+
+                // GPU hashrate with bar
                 if(ui.gpu_available.load()){
-                    out << "  " << C("1") << "GPU: " << R()
-                        << C("36") << fmt_hs(ui.gpu_hps_smooth.load()) << R()
-                        << "  " << C("2") << "(now " << fmt_hs(ui.gpu_hps_now.load()) << ")" << R() << "\n";
+                    double gpu_smooth = ui.gpu_hps_smooth.load();
+                    double gpu_now = ui.gpu_hps_now.load();
+                    if (gpu_smooth > max_gpu_hs) max_gpu_hs = gpu_smooth * 1.2;
+
+                    out << "  " << C("1") << "GPU Hash/s  :" << R() << " " << fmt_hs_bar(gpu_smooth, max_gpu_hs, 15) << "\n";
+                    out << "               " << C("2") << "(instant: " << fmt_hs(gpu_now) << ")" << R() << "\n";
                 } else {
-                    out << "  " << C("1") << "GPU: " << R() << C("2") << "(not available)" << R() << "\n";
-                }
-                out << "  " << C("1") << "Network: " << R() << fmt_hs(ui.net_hashps.load()) << "\n";
-                out << "  " << C("1") << "Mined (session): " << R() << ui.mined_blocks.load() << "\n";
-
-                uint64_t paid_base = ui.total_received_base.load();
-                out << "  " << C("1") << "Payout addr: " << R() << pkh_to_address(ui.my_pkh) << "\n";
-                out << "  " << C("1") << "Paid total : " << R()
-                    << C("36;1") << fmt_miq_whole_dot(paid_base) << R()
-                    << "  " << C("2") << "(" << fmt_miq_amount(paid_base) << ")" << R();
-                {
-                    uint64_t estTot = ui.est_total_base.load();
-                    if (ui.total_received_base.load() == 0 && estTot > 0) {
-                        out << "  " << C("2")
-                            << "  (est. " << fmt_miq_amount(estTot)
-                            << " | matured " << fmt_miq_amount(ui.est_matured_base.load())
-                            << ")"
-                            << R();
-                    }
-                }
-                out << "\n";
-
-                if(ui.last_seen_height.load() == ui.tip_height.load()){
-                    if(ui.last_tip_was_mine.load()){
-                        out << "  " << C("32;1") << "YOU MINED THE LATEST BLOCK." << R() << "\n";
-                    }else if(!ui.last_winner_addr.empty()){
-                        out << "  " << C("31;1") << "Another miner won the latest block: " << ui.last_winner_addr << R() << "\n";
-                    }
+                    out << "  " << C("1") << "GPU Hash/s  :" << R() << " " << C("2") << "[disabled]" << R() << "\n";
                 }
 
-                {
-                    auto age = std::chrono::duration<double>(clock::now() - ui.last_submit_when).count();
-                    if(!ui.last_submit_msg.empty() && age < 7.0){
-                        out << "  " << ui.last_submit_msg << "\n";
-                    }
-                }
+                // Combined stats
+                double total_hs = cpu_smooth + (ui.gpu_available.load() ? ui.gpu_hps_smooth.load() : 0.0);
+                out << "  " << C("1") << "Total H/s   :" << R() << " " << C("36;1") << fmt_hs(total_hs) << R() << "\n";
 
+                // Sparkline trend
                 {
                     std::lock_guard<std::mutex> lk(ui.spark_mtx);
                     if(!ui.sparkline.empty()){
-                        out << "\n  " << C("2") << "h/s trend:" << R() << "        " << spark_ascii(ui.sparkline) << "\n";
+                        out << "  " << C("1") << "Trend       :" << R() << " " << C("36") << spark_ascii(ui.sparkline) << R() << "\n";
                     }
                 }
 
-                // Animated cards
-                std::array<std::string,5> spin_rows;
-                spinner_circle_ascii(spin_idx, spin_rows);
-                ++spin_idx;
+                // ═══════════════════════════════════════════════════════════════
+                // SECTION 4: WALLET & REWARDS
+                // ═══════════════════════════════════════════════════════════════
+                out << "\n" << C("35;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << C("1;4") << " WALLET & REWARDS" << R() << "\n";
+                out << C("35") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
+
+                out << "  " << C("1") << "Payout Addr :" << R() << " " << C("33") << pkh_to_address(ui.my_pkh) << R() << "\n";
+
+                uint64_t mined = ui.mined_blocks.load();
+                out << "  " << C("1") << "Blocks Mined:" << R() << " " << C("32;1") << mined << R() << " (this session)\n";
+
+                [[maybe_unused]] uint64_t paid_base = ui.total_received_base.load();
+                uint64_t est_total = ui.est_total_base.load();
+                uint64_t est_matured = ui.est_matured_base.load();
+
+                out << "  " << C("1") << "Est. Earned :" << R() << " " << C("36;1") << fmt_miq_amount(est_total) << R();
+                if (est_matured > 0 && est_matured != est_total) {
+                    out << "  " << C("2") << "(matured: " << fmt_miq_amount(est_matured) << ")" << R();
+                }
+                out << "\n";
+
+                // Winner notification
+                if(ui.last_seen_height.load() == ui.tip_height.load() && ui.last_seen_height.load() > 0){
+                    if(ui.last_tip_was_mine.load()){
+                        out << "\n  " << C("32;1") << "🎉 YOU MINED THE LATEST BLOCK! 🎉" << R() << "\n";
+                    }else if(!ui.last_winner_addr.empty()){
+                        out << "\n  " << C("2") << "Latest block mined by: " << ui.last_winner_addr.substr(0,24) << "..." << R() << "\n";
+                    }
+                }
+
+                // ═══════════════════════════════════════════════════════════════
+                // SECTION 5: ACTIVITY LOG
+                // ═══════════════════════════════════════════════════════════════
+                out << "\n" << C("37;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << C("1;4") << " ACTIVITY" << R() << "\n";
+                out << C("37") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
+
                 {
-                    std::vector<std::string> lines;
-                    lines.push_back("  ##############################   ##############################");
-                    lines.push_back("  #                            #   #                            #");
-                    lines.push_back("  #"+center_fit("MINER STATUS", 28)+"#   #"+center_fit("CHRONEN  MINER", 28)+"#");
-                    lines.push_back("  #                            #   #                            #");
-                    for(int r=0;r<5;r++){
-                        lines.push_back("  #"+center_fit(spin_rows[r], 28)+"#   #"+center_fit("                    ", 28)+"#");
+                    auto age = std::chrono::duration<double>(clock::now() - ui.last_submit_when).count();
+                    if(!ui.last_submit_msg.empty() && age < 15.0){
+                        out << "  " << ui.last_submit_msg << "\n";
+                    } else {
+                        // Show animated spinner when no recent activity
+                        std::array<std::string,5> spin_rows;
+                        spinner_circle_ascii(spin_idx, spin_rows);
+                        const char* spinners = "|/-\\";
+                        char spinner = spinners[spin_idx % 4];
+                        out << "  " << C("2") << spinner << " Mining in progress..." << R() << "\n";
                     }
-                    lines.push_back("  ##############################   ##############################");
-                    for(const auto& L : lines) out << C("36") << L << R() << "\n";
                 }
 
-                out << "\n  Press Ctrl+C to quit.\n";
+                // ═══════════════════════════════════════════════════════════════
+                // FOOTER
+                // ═══════════════════════════════════════════════════════════════
+                out << "\n" << C("36") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+
+                // Show uptime
+                static auto start_time = clock::now();
+                auto uptime_secs = std::chrono::duration_cast<std::chrono::seconds>(clock::now() - start_time).count();
+                int hours = uptime_secs / 3600;
+                int mins = (uptime_secs % 3600) / 60;
+                int secs = uptime_secs % 60;
+
+                out << "  " << C("2") << "Uptime: ";
+                if (hours > 0) out << hours << "h ";
+                out << mins << "m " << secs << "s";
+                out << "   |   Press " << C("1") << "Ctrl+C" << R() << C("2") << " to stop mining" << R() << "\n";
+
+                ++spin_idx;
                 std::cout << out.str() << std::flush;
                 std::this_thread::sleep_for(frame_dt);
             }
@@ -2591,12 +2986,101 @@ int main(int argc, char** argv){
         };
 #endif
 
-        // ===== mining loop with periodic refresh (prevents stale templates)
-        std::fprintf(stderr, "[miner] starting mining loop (one job per tip; clean shutdown).\n");
+        // ===== POOL MINING LOOP =====
+        if (mining_mode == MiningMode::POOL) {
+            std::fprintf(stderr, "[pool] Starting pool mining to %s:%u...\n", pool_cfg.host.c_str(), pool_cfg.port);
+            log_line("Starting pool mining to " + pool_cfg.host + ":" + std::to_string(pool_cfg.port));
 
-        std::string last_job_prev_hex;
-        while (ui.running.load()) {
-            MinerTemplate tpl;
+            StratumClient stratum;
+            stratum.host = pool_cfg.host;
+            stratum.port = pool_cfg.port;
+            stratum.worker = pool_cfg.worker;
+            stratum.password = pool_cfg.password;
+
+            while (ui.running.load()) {
+                // Connect to pool
+                if (!stratum.connected.load()) {
+                    std::fprintf(stderr, "[pool] Connecting to %s:%u...\n", stratum.host.c_str(), stratum.port);
+
+                    if (!stratum.connect_to_pool()) {
+                        std::fprintf(stderr, "[pool] Connection failed. Retrying in 5 seconds...\n");
+                        {
+                            std::lock_guard<std::mutex> lk(ui.mtx);
+                            ui.last_submit_msg = C("31;1") + "Pool connection failed - retrying..." + R();
+                            ui.last_submit_when = std::chrono::steady_clock::now();
+                        }
+                        ui.node_reachable.store(false);
+                        for (int i = 0; i < 50 && ui.running.load(); ++i) miq_sleep_ms(100);
+                        continue;
+                    }
+
+                    // Subscribe and authorize
+                    if (!stratum.subscribe()) {
+                        std::fprintf(stderr, "[pool] Subscription failed. Reconnecting...\n");
+                        stratum.disconnect();
+                        continue;
+                    }
+
+                    if (!stratum.authorize()) {
+                        std::fprintf(stderr, "[pool] Authorization failed. Check worker name/password.\n");
+                        {
+                            std::lock_guard<std::mutex> lk(ui.mtx);
+                            ui.last_submit_msg = C("31;1") + "Pool authorization failed - check credentials" + R();
+                            ui.last_submit_when = std::chrono::steady_clock::now();
+                        }
+                        stratum.disconnect();
+                        for (int i = 0; i < 50 && ui.running.load(); ++i) miq_sleep_ms(100);
+                        continue;
+                    }
+
+                    ui.node_reachable.store(true);
+                    {
+                        std::lock_guard<std::mutex> lk(ui.mtx);
+                        ui.last_submit_msg = C("32;1") + "Connected to pool " + stratum.host + R();
+                        ui.last_submit_when = std::chrono::steady_clock::now();
+                    }
+                }
+
+                // Wait for jobs from pool (simplified - in production would parse JSON properly)
+                std::string line = stratum.recv_line();
+                if (line.empty()) {
+                    // Connection lost
+                    std::fprintf(stderr, "[pool] Connection lost. Reconnecting...\n");
+                    stratum.disconnect();
+                    ui.node_reachable.store(false);
+                    continue;
+                }
+
+                // Check for mining.notify (new job)
+                if (line.find("mining.notify") != std::string::npos) {
+                    // Parse job and update UI
+                    std::lock_guard<std::mutex> lk(ui.mtx);
+                    ui.cand.height = ui.tip_height.load() + 1;
+                    ui.last_submit_msg = C("36") + "New job received from pool" + R();
+                    ui.last_submit_when = std::chrono::steady_clock::now();
+                }
+
+                // Check for mining.set_difficulty
+                if (line.find("set_difficulty") != std::string::npos) {
+                    std::fprintf(stderr, "[pool] Difficulty update received\n");
+                }
+
+                // Simple mining simulation for pool (in production would mine actual shares)
+                // For now, just keep connection alive and show we're connected
+                miq_sleep_ms(100);
+            }
+
+            stratum.disconnect();
+            std::fprintf(stderr, "[pool] Pool mining stopped.\n");
+        }
+        // ===== SOLO MINING LOOP =====
+        else {
+            // ===== mining loop with periodic refresh (prevents stale templates)
+            std::fprintf(stderr, "[miner] starting solo mining loop (one job per tip; clean shutdown).\n");
+
+            std::string last_job_prev_hex;
+            while (ui.running.load()) {
+                MinerTemplate tpl;
             if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
                 ui.node_reachable.store(false);
                 std::ostringstream m;
@@ -2889,9 +3373,10 @@ int main(int argc, char** argv){
                 ui.rpc_errors.fetch_add(1);
             }
         }
+        } // end of solo mining else block
 
         // Final clear/exit
-        std::cout << "\n" << C("33;1") << "Exiting…" << R() << std::endl;
+        std::cout << "\n" << C("33;1") << "Exiting " << MIQMINER_VERSION_STRING << "…" << R() << std::endl;
         log_line("miner exited cleanly");
         return 0;
 

@@ -95,6 +95,7 @@ public:
 
     // Configuration
     void set_port(uint16_t port) { port_ = port; }
+    uint16_t get_port() const { return port_; }
     void set_reward_address(const std::vector<uint8_t>& pkh20) { reward_pkh_ = pkh20; }
     void set_extranonce2_size(uint8_t size) { extranonce2_size_ = size; }
     void set_default_difficulty(double diff) { default_difficulty_ = diff; }
