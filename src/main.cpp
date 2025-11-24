@@ -3,7 +3,7 @@
   #define _CRT_SECURE_NO_WARNINGS
 #endif
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 // Windows portability flags
 #ifdef _WIN32
   #ifndef NOMINMAX
@@ -11,7 +11,7 @@
   #endif
 #endif
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 // MIQ public headers
 #include "constants.h"
 #include "config.h"
@@ -46,7 +46,7 @@ extern bool ensure_utxo_fully_indexed(Chain&, const std::string&, bool) __attrib
 #  define MIQ_CAN_PROBE_UTXO_REINDEX 0
 #endif
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 // STL
 #include <thread>
 #include <cctype>
@@ -84,7 +84,7 @@ extern bool ensure_utxo_fully_indexed(Chain&, const std::string&, bool) __attrib
 #include <cmath>
 #include <cerrno>
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 // OS headers (guarded)
 #if defined(_WIN32)
   #include <io.h>
@@ -137,7 +137,7 @@ static inline const char* seed_host_cstr(){ return g_seed_host.c_str(); }
 
 static std::atomic<bool> g_assume_seed_hairpin{false};
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------
 // Versions
 #ifndef MIQ_VERSION_MAJOR
 #define MIQ_VERSION_MAJOR 1
@@ -149,35 +149,33 @@ static std::atomic<bool> g_assume_seed_hairpin{false};
 #define MIQ_VERSION_PATCH 0
 #endif
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                    Professional ASCII Art & Branding                       ║
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// +--------- Professional ASCII Art & Branding ----------+
+// |                 MIQROCHAIN BLOCKCHAIN               |
+// +---------+
 
 static const char* kMiqrochainBanner[] = {
 "",
-"  ███╗   ███╗██╗ ██████╗ ██████╗  ██████╗  ██████╗██╗  ██╗ █████╗ ██╗███╗   ██╗",
-"  ████╗ ████║██║██╔═══██╗██╔══██╗██╔═══██╗██╔════╝██║  ██║██╔══██╗██║████╗  ██║",
-"  ██╔████╔██║██║██║   ██║██████╔╝██║   ██║██║     ███████║███████║██║██╔██╗ ██║",
-"  ██║╚██╔╝██║██║██║▄▄ ██║██╔══██╗██║   ██║██║     ██╔══██║██╔══██║██║██║╚██╗██║",
-"  ██║ ╚═╝ ██║██║╚██████╔╝██║  ██║╚██████╔╝╚██████╗██║  ██║██║  ██║██║██║ ╚████║",
-"  ╚═╝     ╚═╝╚═╝ ╚══▀▀═╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝",
+"  __  __ ___ ___  ___   ___  _   _   _  ___  ___ _  _",
+" |  \\/  |_ _/ _ \\| _ \\ / _ \\|_| | |_| |/ _ \\|_ _| \\| |",
+" | |  | || | (_) |   / | (_) | | |   | | (_) | | |  . ` |",
+" | |  | | | |> <  | |  |> _ <| | | |_| |> _ < | | | . ` |",
+" |_|__|_|___| \\_| | |_\\  \\_/ |_|  \\___/| \\_\\_\\|___| |_|\\_|",
+" |_|  |_||___\\___||___\\ \\___/  |___/  \\____/|__|_|_| \\_|",
 "",
 nullptr
 };
 
 [[maybe_unused]] static const char* kNodeBanner[] = {
-"    ███╗   ██╗ ██████╗ ██████╗ ███████╗",
-"    ████╗  ██║██╔═══██╗██╔══██╗██╔════╝",
-"    ██╔██╗ ██║██║   ██║██║  ██║█████╗  ",
-"    ██║╚██╗██║██║   ██║██║  ██║██╔══╝  ",
-"    ██║ ╚████║╚██████╔╝██████╔╝███████╗",
-"    ╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚══════╝",
+"    _ __  ___  ___  ___",
+"   | '_ \\/ _ \\|   \\|   \\",
+"   | | | | (_) | |) | |) |",
+"   |_| |_|\\___/|___/|___/",
 nullptr
 };
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                         Global state & helpers                            ║
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ================================================================
+//                 Global state & helpers
+// ================================================================
 namespace global {
 static std::atomic<bool>    shutdown_requested{false};
 static std::atomic<bool>    shutdown_initiated{false};
@@ -198,9 +196,9 @@ static int                  lock_fd{-1};
 #endif
 }
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                        Network Statistics Tracking                         ║
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ================================================================
+//            Network Statistics Tracking
+// ================================================================
 struct NetworkStats {
     std::atomic<uint64_t> bytes_sent{0};
     std::atomic<uint64_t> bytes_recv{0};
@@ -223,7 +221,7 @@ static inline uint64_t now_s() {
     return (uint64_t)std::time(nullptr);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 // Shutdown request w/ escalation (double signal within 2s => hard exit)
 static void request_shutdown(const char* why){
     bool first = !global::shutdown_initiated.exchange(true);
@@ -245,9 +243,9 @@ static void request_shutdown(const char* why){
     global::last_signal_ms.store(now_ms());
 }
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                              Miner stats                                   ║
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
+// |                              Miner stats                                   |
+// ==================================================================
 struct MinerStats {
     std::atomic<bool> active{false};
     std::atomic<unsigned> threads{0};
@@ -264,9 +262,9 @@ static std::string g_miner_address_b58; // display mined-to address
 // Global Stratum server pointer for block notifications
 static std::atomic<StratumServer*> g_stratum_server{nullptr};
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                           Telemetry buffers                                ║
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
+// |                           Telemetry buffers                                |
+// ==================================================================
 struct BlockSummary {
     uint64_t height{0};
     std::string hash_hex;
@@ -316,9 +314,9 @@ static inline void telemetry_flush_disk(const BlockSummary& b){
     }catch(...){}
 }
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                     External miner heartbeat watch                         ║
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
+// |                     External miner heartbeat watch                         |
+// ==================================================================
 struct ExtMinerWatch {
     std::atomic<bool> alive{false};
     std::atomic<bool> running{false};
@@ -360,9 +358,9 @@ struct ExtMinerWatch {
     }
 } g_extminer;
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
-// ║                       Datadir / PID / Lock helpers                         ║
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
+// |                       Datadir / PID / Lock helpers                         |
+// ==================================================================
 static std::string default_datadir() {
 #ifdef _WIN32
     size_t len = 0; char* v = nullptr;
@@ -535,9 +533,9 @@ static void release_datadir_lock(){
     if (!global::pidfile_path.empty())  std::filesystem::remove(global::pidfile_path, ec);
 }
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ==================================================================
 /*                    Signals / console control / input                       */
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
 static void sighup_handler(int){ global::reload_requested.store(true); }
 static void sigshutdown_handler(int){ request_shutdown("signal"); }
 
@@ -554,9 +552,9 @@ static BOOL WINAPI win_ctrl_handler(DWORD evt){
 }
 #endif
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ==================================================================
 /*                               Resource metrics                              */
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
 static uint64_t get_rss_bytes(){
 #if defined(_WIN32)
     PROCESS_MEMORY_COUNTERS info{};
@@ -580,9 +578,9 @@ static uint64_t get_rss_bytes(){
 #endif
 }
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ==================================================================
 /*                              Terminal utils                                 */
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
 namespace term {
 
 // Basic tty check remains available
@@ -746,9 +744,9 @@ private:
 #endif
 };
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ==================================================================
 /*                              Helper utilities                               */
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
 
 // small truthy helper reused for ASCII fallbacks
 static inline bool env_truthy_local(const char* name){
@@ -873,7 +871,7 @@ static inline std::string bar(int width, double frac, bool /*vt_ok*/, bool u8_ok
     std::string out; out.reserve((size_t)width);
     out.push_back('[');
     if (u8_ok && env_truthy_local("MIQ_TUI_UTF8")){
-        for (int i=0;i<inner;i++) out += (i<full ? "█" : " ");
+        for (int i=0;i<inner;i++) out += (i<full ? "#" : " ");
     } else {
         for (int i=0;i<inner;i++) out.push_back(i<full ? '#' : ' ');
     }
@@ -887,9 +885,9 @@ static inline std::string short_hex(const std::string& h, int keep){
     return h.substr(0,(size_t)half) + ell + h.substr(h.size()-(size_t)(keep-half));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 // Net helpers: resolve host, collect local IPs, compare, and compute seed role
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 
 static inline std::string ip_norm(const std::string& ip){
     if (ip.find('.') != std::string::npos){
@@ -1138,7 +1136,7 @@ static inline std::string spark_ascii(const std::vector<double>& v){
     for (double x : v){ if (x < mn) mn = x; if (x > mx) mx = x; }
     double span = (mx - mn);
     bool fancy = env_truthy_local("MIQ_TUI_UTF8");
-    const char* blocks8 = "▁▂▃▄▅▆▇█"; // 8 glyphs, UTF-8 (3 bytes each)
+    const char* blocks8 = "▁▂▃▄▅▆▇#"; // 8 glyphs, UTF-8 (3 bytes each)
     const char* ascii   = " .:-=+*#%@";
     std::string out; out.reserve(v.size());
     for (double x : v){
@@ -1237,9 +1235,9 @@ static bool any_verack_peer(P2P* p2p){
 }
 
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ==================================================================
 /*                                 Log capture                                 */
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
 class LogCapture {
 public:
     struct Line { std::string text; uint64_t ts_ms; };
@@ -1350,9 +1348,9 @@ private:
     std::deque<Line> lines_;
 };
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ==================================================================
 /*                                Pro TUI 3 Ultra                              */
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
 class TUI {
 public:
     enum class NodeState { Starting, Syncing, Running, Degraded, Quitting };
@@ -1468,7 +1466,7 @@ private:
             "Connect seeds",
             "Peer handshake (verack)",
             "Start IBD monitor",
-            "IBD sync phase",         // <── shown explicitly
+            "IBD sync phase",         // <== shown explicitly
             "Start RPC server",
             "RPC ready"
         };
@@ -2190,9 +2188,9 @@ private:
     std::string mining_gate_reason_;
 };
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ==================================================================
 /*                                Seed Sentinel                                 */
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
 class SeedSentinel {
 public:
     void start(P2P* p2p, TUI* tui){
@@ -2231,18 +2229,18 @@ private:
     std::thread thr_;
 };
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ==================================================================
 /*                          Fatal terminate hook                                */
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
 static void fatal_terminate() noexcept {
     std::fputs("[FATAL] std::terminate() called (background) - initiating shutdown\n", stderr);
     request_shutdown("terminate");
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ==================================================================
 /*                               Miner worker                                   */
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
 static uint64_t sum_coinbase_outputs(const Block& b) {
     if (b.txs.empty()) return 0;
     uint64_t s = 0; for (const auto& o : b.txs[0].vout) s += o.value; return s;
@@ -2376,9 +2374,9 @@ static void miner_worker(Chain* chain, Mempool* mempool, P2P* p2p,
     }
 }
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ==================================================================
 /*                                     CLI                                     */
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
 static void print_usage(){
     std::cout
       << "\n"
@@ -2419,9 +2417,9 @@ static bool is_recognized_arg(const std::string& s){
     return false;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 // IBD helpers — smart start/finish + explicit error on failure
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 static inline bool path_exists_nonempty(const std::string& p){
     std::error_code ec;
     if(!std::filesystem::exists(p, ec)) return false;
@@ -2679,9 +2677,9 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
     return false;
 }
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ==================================================================
 /*                                 IBD Guard                                    */
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
 class IBDGuard {
 public:
     void start(Chain* chain, P2P* p2p, const std::string& datadir, bool can_tui, TUI* tui){
@@ -2728,9 +2726,9 @@ private:
     std::thread thr_;
 };
 
-// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ==================================================================
 /*                                     main                                    */
-// ╚═══════════════════════════════════════════════════════════════════════════╝
+// ==================================================================
 int main(int argc, char** argv){
     std::ios::sync_with_stdio(false);
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -3009,9 +3007,9 @@ int main(int argc, char** argv){
         start_ibd_monitor(&chain, &p2p);
         if (can_tui) tui.mark_step_ok("Start IBD monitor");
 
-        // ─────────────────────────────────────────────────────────────────────
+        // =====================================================================
         // NEW STEP: IBD sync phase (smart start/finish, surfaces real error)
-        // ─────────────────────────────────────────────────────────────────────
+        // =====================================================================
         if (can_tui) {
             // Only show what is known at start; no estimated future height.
             tui.set_ibd_progress(chain.height(), chain.height(), 0, "headers", seed_host_cstr(), false);
@@ -3104,9 +3102,9 @@ int main(int argc, char** argv){
             rpc_ok = true;
         }
 
-        // ─────────────────────────────────────────────────────────────────────
+        // =====================================================================
         // Stratum mining pool server (optional)
-        // ─────────────────────────────────────────────────────────────────────
+        // =====================================================================
         std::unique_ptr<StratumServer> stratum_server;
         if (cfg.stratum_enable) {
             if (can_tui) tui.mark_step_started("Start Stratum server");
