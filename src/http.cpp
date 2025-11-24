@@ -658,8 +658,13 @@ void HttpServer::start(
                                  cli, allow_cors, enable_metrics, metrics_public, enable_healthz, access_log]() {
                         // Increment connection count at start of thread (thread successfully created)
                         ++g_live_conns;
-                        // Ensure live-conns is decremented exactly once when thread exits
-                        auto guard = std::unique_ptr<void, void(*)(void*)>(nullptr, [](void*){ --g_live_conns; });
+                        // CRITICAL FIX: The old guard used nullptr which NEVER called the deleter!
+                        // unique_ptr with nullptr doesn't invoke the deleter on destruction.
+                        // Use a non-null dummy pointer so the deleter IS called when the guard goes out of scope.
+                        auto guard = std::unique_ptr<char, void(*)(char*)>(
+                            reinterpret_cast<char*>(1),  // Non-null dummy pointer
+                            [](char*){ --g_live_conns; } // This WILL be called now
+                        );
                     try {
                         auto t_start = std::chrono::steady_clock::now();
 
