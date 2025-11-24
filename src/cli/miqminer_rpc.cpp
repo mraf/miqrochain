@@ -610,14 +610,15 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
         HttpResp r;
         if (http_post(host, port, "/", auth, rpc_build("gettipinfo","[]"), r)
             && r.code==200 && !json_has_error(r.body)) {
-            long long h=0,b=0,t=0; std::string hh;
+            long long h=0,t=0; uint32_t b=0; std::string hh;
+            // Use json_find_hex_or_number_u32 for bits since server returns it as hex string
             if (json_find_number(r.body,"height",h) &&
                 json_find_string(r.body,"hash",hh) &&
-                json_find_number(r.body,"bits",b) &&
+                json_find_hex_or_number_u32(r.body,"bits",b) &&
                 json_find_number(r.body,"time",t)) {
                 out.height = (uint64_t)h;
                 out.hash_hex = hh;
-                out.bits = sanitize_bits((uint32_t)b);
+                out.bits = sanitize_bits(b);
                 out.time = (int64_t)t;
                 return true;
             }

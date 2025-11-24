@@ -525,6 +525,69 @@ static void clear_spv_cache(const std::string& wdir){
 }
 
 // =============================================================================
+// WALLET FINGERPRINT - Prevents cache contamination between wallets
+// =============================================================================
+
+// Generate a fingerprint from wallet's first few addresses
+static std::string generate_wallet_fingerprint(const std::vector<std::vector<uint8_t>>& pkhs){
+    if(pkhs.empty()) return "";
+
+    // Use first 5 PKHs to create fingerprint
+    std::vector<uint8_t> data;
+    size_t count = std::min(pkhs.size(), (size_t)5);
+    for(size_t i = 0; i < count; ++i){
+        data.insert(data.end(), pkhs[i].begin(), pkhs[i].end());
+    }
+
+    auto hash = miq::dsha256(data);
+    return miq::to_hex(hash).substr(0, 16);  // First 16 chars
+}
+
+static std::string fingerprint_file_path(const std::string& wdir){
+    return join_path(wdir, "wallet_fingerprint.dat");
+}
+
+static std::string load_cached_fingerprint(const std::string& wdir){
+    std::ifstream f(fingerprint_file_path(wdir));
+    if(!f.good()) return "";
+    std::string fp;
+    std::getline(f, fp);
+    return fp;
+}
+
+static void save_wallet_fingerprint(const std::string& wdir, const std::string& fp){
+    std::ofstream f(fingerprint_file_path(wdir), std::ios::out | std::ios::trunc);
+    if(f.good()) f << fp << "\n";
+}
+
+// Check if cache belongs to current wallet, clear if not
+static void verify_cache_ownership(const std::string& wdir,
+                                    const std::vector<std::vector<uint8_t>>& pkhs){
+    std::string current_fp = generate_wallet_fingerprint(pkhs);
+    std::string cached_fp = load_cached_fingerprint(wdir);
+
+    if(cached_fp.empty()){
+        // No fingerprint - new cache or old format, save current
+        save_wallet_fingerprint(wdir, current_fp);
+        return;
+    }
+
+    if(cached_fp != current_fp){
+        // Different wallet! Clear ALL cached data
+        clear_spv_cache(wdir);
+
+        // Also clear pending spent since it's wallet-specific
+        std::remove(join_path(wdir, "pending_spent.dat").c_str());
+
+        // Save new fingerprint
+        save_wallet_fingerprint(wdir, current_fp);
+
+        // Note: Cache was invalidated due to wallet fingerprint mismatch
+        // This happens when switching between different wallets
+    }
+}
+
+// =============================================================================
 // PENDING-SPENT CACHE
 // =============================================================================
 struct OutpointKey {
@@ -539,6 +602,1933 @@ struct OutpointKey {
 static std::string pending_file_path_for_wdir(const std::string& wdir){
     return join_path(wdir, "pending_spent.dat");
 }
+
+// =============================================================================
+// PROFESSIONAL WALLET FEATURES - v2.0 Stable
+// =============================================================================
+
+// Transaction validation result
+struct TxValidationResult {
+    bool valid{false};
+    std::string error;
+    uint64_t total_input{0};
+    uint64_t total_output{0};
+    uint64_t fee{0};
+    size_t size_bytes{0};
+    double fee_rate{0.0};  // sat/byte
+};
+
+// UTXO selection strategies
+enum class CoinSelectionStrategy {
+    OLDEST_FIRST,      // Spend oldest UTXOs first (default)
+    LARGEST_FIRST,     // Spend largest UTXOs first
+    SMALLEST_FIRST,    // Spend smallest UTXOs first (consolidation)
+    MINIMIZE_INPUTS,   // Use fewest inputs possible
+    PRIVACY_OPTIMIZED  // Avoid address reuse patterns
+};
+
+// Network health status
+struct NetworkHealth {
+    bool connected{false};
+    int peer_count{0};
+    uint32_t tip_height{0};
+    int64_t last_block_time{0};
+    double estimated_hashrate{0.0};
+    int mempool_size{0};
+    std::string node_version;
+};
+
+// Wallet statistics
+struct WalletStats {
+    uint64_t total_received{0};
+    uint64_t total_sent{0};
+    uint64_t total_fees_paid{0};
+    uint32_t tx_count{0};
+    uint32_t utxo_count{0};
+    uint32_t address_count{0};
+    int64_t first_activity{0};
+    int64_t last_activity{0};
+    double avg_tx_size{0.0};
+    double avg_fee_rate{0.0};
+};
+
+// Transaction confirmation info
+struct TxConfirmation {
+    std::string txid_hex;
+    uint32_t confirmations{0};
+    uint32_t block_height{0};
+    int64_t block_time{0};
+    bool in_mempool{false};
+    bool double_spent{false};
+};
+
+// Address info for tracking
+struct AddressInfo {
+    std::string address;
+    std::string label;
+    uint32_t chain{0};      // 0=receive, 1=change
+    uint32_t index{0};
+    uint64_t total_received{0};
+    uint64_t total_sent{0};
+    uint32_t tx_count{0};
+    int64_t first_seen{0};
+    int64_t last_seen{0};
+    bool used{false};
+};
+
+// =============================================================================
+// COIN SELECTION ALGORITHMS
+// =============================================================================
+
+// Branch and Bound coin selection for optimal input selection
+static bool coin_select_branch_and_bound(
+    const std::vector<miq::UtxoLite>& available,
+    uint64_t target_value,
+    uint64_t fee_rate,
+    std::vector<size_t>& selected_indices,
+    uint64_t& total_selected,
+    int max_iterations = 100000)
+{
+    if(available.empty()) return false;
+
+    // Sort by value descending for efficiency
+    std::vector<std::pair<uint64_t, size_t>> sorted;
+    sorted.reserve(available.size());
+    for(size_t i = 0; i < available.size(); ++i){
+        sorted.push_back({available[i].value, i});
+    }
+    std::sort(sorted.begin(), sorted.end(),
+        [](const auto& a, const auto& b){ return a.first > b.first; });
+
+    // Estimate fee for single input
+    uint64_t input_fee = fee_rate * 148;  // ~148 bytes per P2PKH input
+    uint64_t output_fee = fee_rate * 34;  // ~34 bytes per output
+    uint64_t base_fee = fee_rate * 10;    // ~10 bytes overhead
+
+    uint64_t target_with_fee = target_value + base_fee + output_fee * 2;
+
+    // Try exact match first
+    std::vector<bool> current(sorted.size(), false);
+    std::vector<bool> best(sorted.size(), false);
+    uint64_t best_waste = UINT64_MAX;
+    uint64_t current_value = 0;
+    int iterations = 0;
+
+    std::function<void(size_t, uint64_t)> search = [&](size_t depth, uint64_t remaining) {
+        if(iterations++ > max_iterations) return;
+
+        uint64_t fees = base_fee + output_fee * 2;
+        for(size_t i = 0; i < depth; ++i){
+            if(current[i]) fees += input_fee;
+        }
+
+        if(current_value >= target_value + fees){
+            uint64_t waste = current_value - target_value - fees;
+            if(waste < best_waste){
+                best_waste = waste;
+                best = current;
+            }
+            return;
+        }
+
+        if(depth >= sorted.size()) return;
+
+        // Calculate remaining available value
+        uint64_t remaining_value = 0;
+        for(size_t i = depth; i < sorted.size(); ++i){
+            remaining_value += sorted[i].first;
+        }
+
+        if(current_value + remaining_value < target_with_fee) return;
+
+        // Include current
+        current[depth] = true;
+        current_value += sorted[depth].first;
+        search(depth + 1, remaining - sorted[depth].first);
+        current[depth] = false;
+        current_value -= sorted[depth].first;
+
+        // Exclude current
+        search(depth + 1, remaining);
+    };
+
+    uint64_t total_available = 0;
+    for(const auto& u : available) total_available += u.value;
+    search(0, total_available);
+
+    if(best_waste == UINT64_MAX){
+        // Branch and bound failed, use greedy
+        return false;
+    }
+
+    selected_indices.clear();
+    total_selected = 0;
+    for(size_t i = 0; i < best.size(); ++i){
+        if(best[i]){
+            selected_indices.push_back(sorted[i].second);
+            total_selected += sorted[i].first;
+        }
+    }
+
+    return !selected_indices.empty();
+}
+
+// Greedy coin selection with strategy
+static bool coin_select_greedy(
+    const std::vector<miq::UtxoLite>& available,
+    uint64_t target_value,
+    uint64_t fee_rate,
+    CoinSelectionStrategy strategy,
+    std::vector<size_t>& selected_indices,
+    uint64_t& total_selected)
+{
+    if(available.empty()) return false;
+
+    // Create sorted indices based on strategy
+    std::vector<size_t> order;
+    order.reserve(available.size());
+    for(size_t i = 0; i < available.size(); ++i) order.push_back(i);
+
+    switch(strategy){
+        case CoinSelectionStrategy::OLDEST_FIRST:
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b){
+                if(available[a].height != available[b].height)
+                    return available[a].height < available[b].height;
+                return available[a].value > available[b].value;
+            });
+            break;
+        case CoinSelectionStrategy::LARGEST_FIRST:
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b){
+                return available[a].value > available[b].value;
+            });
+            break;
+        case CoinSelectionStrategy::SMALLEST_FIRST:
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b){
+                return available[a].value < available[b].value;
+            });
+            break;
+        case CoinSelectionStrategy::MINIMIZE_INPUTS:
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b){
+                return available[a].value > available[b].value;
+            });
+            break;
+        case CoinSelectionStrategy::PRIVACY_OPTIMIZED:
+            // Shuffle for privacy
+            {
+                std::random_device rd;
+                std::mt19937 g(rd());
+                std::shuffle(order.begin(), order.end(), g);
+            }
+            break;
+    }
+
+    selected_indices.clear();
+    total_selected = 0;
+    uint64_t base_fee = fee_rate * 10;
+    uint64_t output_fee = fee_rate * 34;
+    uint64_t input_fee = fee_rate * 148;
+
+    for(size_t idx : order){
+        selected_indices.push_back(idx);
+        total_selected += available[idx].value;
+
+        uint64_t total_fee = base_fee + output_fee * 2 + input_fee * selected_indices.size();
+        if(total_selected >= target_value + total_fee){
+            return true;
+        }
+    }
+
+    // Not enough funds
+    selected_indices.clear();
+    total_selected = 0;
+    return false;
+}
+
+// Smart coin selection: tries branch and bound, falls back to greedy
+static bool smart_coin_select(
+    const std::vector<miq::UtxoLite>& available,
+    uint64_t target_value,
+    uint64_t fee_rate,
+    CoinSelectionStrategy fallback_strategy,
+    std::vector<size_t>& selected_indices,
+    uint64_t& total_selected)
+{
+    // Try branch and bound first for optimal selection
+    if(coin_select_branch_and_bound(available, target_value, fee_rate,
+                                     selected_indices, total_selected)){
+        return true;
+    }
+
+    // Fall back to greedy
+    return coin_select_greedy(available, target_value, fee_rate,
+                              fallback_strategy, selected_indices, total_selected);
+}
+
+// =============================================================================
+// TRANSACTION VALIDATION
+// =============================================================================
+
+static TxValidationResult validate_transaction(
+    const miq::Transaction& tx,
+    const std::vector<miq::UtxoLite>& utxos,
+    uint64_t max_fee = 10000000)  // 0.1 MIQ max fee by default
+{
+    TxValidationResult result;
+
+    // Check basic structure
+    if(tx.vin.empty()){
+        result.error = "Transaction has no inputs";
+        return result;
+    }
+    if(tx.vout.empty()){
+        result.error = "Transaction has no outputs";
+        return result;
+    }
+    if(tx.vin.size() > wallet_config::MAX_TX_INPUTS){
+        result.error = "Too many inputs (" + std::to_string(tx.vin.size()) + ")";
+        return result;
+    }
+    if(tx.vout.size() > wallet_config::MAX_TX_OUTPUTS){
+        result.error = "Too many outputs (" + std::to_string(tx.vout.size()) + ")";
+        return result;
+    }
+
+    // Build UTXO lookup
+    std::unordered_map<std::string, const miq::UtxoLite*> utxo_map;
+    for(const auto& u : utxos){
+        std::string key = miq::to_hex(u.txid) + ":" + std::to_string(u.vout);
+        utxo_map[key] = &u;
+    }
+
+    // Calculate input sum
+    result.total_input = 0;
+    for(const auto& in : tx.vin){
+        std::string key = miq::to_hex(in.prev.txid) + ":" + std::to_string(in.prev.vout);
+        auto it = utxo_map.find(key);
+        if(it == utxo_map.end()){
+            result.error = "Input UTXO not found: " + key.substr(0, 16) + "...";
+            return result;
+        }
+        result.total_input += it->second->value;
+    }
+
+    // Calculate output sum
+    result.total_output = 0;
+    for(const auto& out : tx.vout){
+        if(out.value == 0){
+            result.error = "Output with zero value";
+            return result;
+        }
+        if(out.value < wallet_config::DUST_THRESHOLD){
+            result.error = "Output below dust threshold (" +
+                          std::to_string(out.value) + " < " +
+                          std::to_string(wallet_config::DUST_THRESHOLD) + ")";
+            return result;
+        }
+        result.total_output += out.value;
+    }
+
+    // Check fee
+    if(result.total_input < result.total_output){
+        result.error = "Outputs exceed inputs (negative fee)";
+        return result;
+    }
+    result.fee = result.total_input - result.total_output;
+
+    if(result.fee == 0){
+        result.error = "Zero fee transaction";
+        return result;
+    }
+    if(result.fee > max_fee){
+        result.error = "Fee too high (" + std::to_string(result.fee) + " > " +
+                      std::to_string(max_fee) + ")";
+        return result;
+    }
+
+    // Estimate size and fee rate
+    result.size_bytes = 10 + tx.vin.size() * 148 + tx.vout.size() * 34;
+    result.fee_rate = (double)result.fee / result.size_bytes;
+
+    result.valid = true;
+    return result;
+}
+
+// =============================================================================
+// ADDRESS VALIDATION
+// =============================================================================
+
+static bool validate_address(const std::string& addr, std::string& error){
+    if(addr.empty()){
+        error = "Address is empty";
+        return false;
+    }
+
+    // Check length
+    if(addr.length() < 25 || addr.length() > 35){
+        error = "Invalid address length";
+        return false;
+    }
+
+    // Check base58 characters
+    const char* b58chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    for(char c : addr){
+        if(strchr(b58chars, c) == nullptr){
+            error = "Invalid character in address: " + std::string(1, c);
+            return false;
+        }
+    }
+
+    // Decode and verify checksum
+    uint8_t ver = 0;
+    std::vector<uint8_t> payload;
+    if(!miq::base58check_decode(addr, ver, payload)){
+        error = "Invalid address checksum";
+        return false;
+    }
+
+    // Check version byte
+    if(ver != miq::VERSION_P2PKH){
+        error = "Invalid address version (expected P2PKH)";
+        return false;
+    }
+
+    // Check payload length (should be 20 bytes for hash160)
+    if(payload.size() != 20){
+        error = "Invalid address payload length";
+        return false;
+    }
+
+    return true;
+}
+
+// =============================================================================
+// WALLET STATISTICS
+// =============================================================================
+
+static std::string stats_file_path(const std::string& wdir){
+    return join_path(wdir, "wallet_stats.dat");
+}
+
+static void load_wallet_stats(const std::string& wdir, WalletStats& stats){
+    std::ifstream f(stats_file_path(wdir));
+    if(!f.good()) return;
+
+    std::string line;
+    while(std::getline(f, line)){
+        if(line.empty() || line[0] == '#') continue;
+        size_t eq = line.find('=');
+        if(eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+
+        if(key == "total_received") stats.total_received = std::strtoull(val.c_str(), nullptr, 10);
+        else if(key == "total_sent") stats.total_sent = std::strtoull(val.c_str(), nullptr, 10);
+        else if(key == "total_fees") stats.total_fees_paid = std::strtoull(val.c_str(), nullptr, 10);
+        else if(key == "tx_count") stats.tx_count = (uint32_t)std::strtoul(val.c_str(), nullptr, 10);
+        else if(key == "first_activity") stats.first_activity = std::strtoll(val.c_str(), nullptr, 10);
+        else if(key == "last_activity") stats.last_activity = std::strtoll(val.c_str(), nullptr, 10);
+    }
+}
+
+static void save_wallet_stats(const std::string& wdir, const WalletStats& stats){
+    std::ofstream f(stats_file_path(wdir), std::ios::out | std::ios::trunc);
+    if(!f.good()) return;
+
+    f << "# MIQ Wallet Statistics\n";
+    f << "total_received=" << stats.total_received << "\n";
+    f << "total_sent=" << stats.total_sent << "\n";
+    f << "total_fees=" << stats.total_fees_paid << "\n";
+    f << "tx_count=" << stats.tx_count << "\n";
+    f << "first_activity=" << stats.first_activity << "\n";
+    f << "last_activity=" << stats.last_activity << "\n";
+}
+
+static void update_stats_for_send(const std::string& wdir, uint64_t amount, uint64_t fee){
+    WalletStats stats{};
+    load_wallet_stats(wdir, stats);
+
+    stats.total_sent += amount;
+    stats.total_fees_paid += fee;
+    stats.tx_count++;
+    stats.last_activity = (int64_t)time(nullptr);
+    if(stats.first_activity == 0) stats.first_activity = stats.last_activity;
+
+    save_wallet_stats(wdir, stats);
+}
+
+// =============================================================================
+// FEE ESTIMATION
+// =============================================================================
+
+struct FeeEstimate {
+    uint64_t low_priority;      // sat/byte - next 6 blocks
+    uint64_t medium_priority;   // sat/byte - next 3 blocks
+    uint64_t high_priority;     // sat/byte - next block
+    int64_t estimated_time;     // seconds for medium priority
+};
+
+static FeeEstimate get_fee_estimates(){
+    // Default fee estimates (can be updated from network)
+    FeeEstimate est;
+    est.low_priority = 1;
+    est.medium_priority = 2;
+    est.high_priority = 5;
+    est.estimated_time = 600;  // ~10 minutes
+    return est;
+}
+
+static uint64_t estimate_tx_fee(size_t num_inputs, size_t num_outputs, uint64_t fee_rate){
+    // P2PKH transaction size estimation
+    // Header: 4 (version) + 4 (locktime) + 1-2 (input count varint) + 1-2 (output count varint) = ~10 bytes
+    // Input: 32 (txid) + 4 (vout) + 1 (script len) + ~107 (sig + pubkey) + 4 (sequence) = ~148 bytes
+    // Output: 8 (value) + 1 (script len) + 25 (P2PKH script) = ~34 bytes
+
+    size_t estimated_size = 10 + num_inputs * 148 + num_outputs * 34;
+    return estimated_size * fee_rate;
+}
+
+// =============================================================================
+// UTXO CONSOLIDATION
+// =============================================================================
+
+static bool should_consolidate_utxos(const std::vector<miq::UtxoLite>& utxos,
+                                     uint64_t threshold_count = 100,
+                                     uint64_t dust_threshold = 10000){
+    if(utxos.size() < threshold_count) return false;
+
+    // Count dust UTXOs
+    size_t dust_count = 0;
+    for(const auto& u : utxos){
+        if(u.value < dust_threshold) dust_count++;
+    }
+
+    // Recommend consolidation if >20% are dust
+    return dust_count > utxos.size() / 5;
+}
+
+static std::vector<miq::UtxoLite> get_consolidation_candidates(
+    const std::vector<miq::UtxoLite>& utxos,
+    size_t max_inputs = 50,
+    uint64_t min_value = 1000)
+{
+    std::vector<miq::UtxoLite> candidates;
+    candidates.reserve(std::min(utxos.size(), max_inputs));
+
+    // Sort by value ascending (consolidate smallest first)
+    std::vector<std::pair<uint64_t, size_t>> sorted;
+    for(size_t i = 0; i < utxos.size(); ++i){
+        if(utxos[i].value >= min_value){
+            sorted.push_back({utxos[i].value, i});
+        }
+    }
+    std::sort(sorted.begin(), sorted.end());
+
+    for(size_t i = 0; i < std::min(sorted.size(), max_inputs); ++i){
+        candidates.push_back(utxos[sorted[i].second]);
+    }
+
+    return candidates;
+}
+
+// =============================================================================
+// TRANSACTION TRACKING
+// =============================================================================
+
+struct TrackedTransaction {
+    std::string txid_hex;
+    int64_t created_at{0};
+    int64_t confirmed_at{0};
+    uint32_t block_height{0};
+    uint32_t confirmations{0};
+    uint64_t amount{0};
+    uint64_t fee{0};
+    std::string direction;  // "sent", "received"
+    std::string to_address;
+    std::string memo;
+    bool confirmed{false};
+    bool failed{false};
+    std::string failure_reason;
+};
+
+static std::string tracked_tx_path(const std::string& wdir){
+    return join_path(wdir, "tracked_transactions.dat");
+}
+
+static void save_tracked_transaction(const std::string& wdir, const TrackedTransaction& tx){
+    std::ofstream f(tracked_tx_path(wdir), std::ios::app);
+    if(!f.good()) return;
+
+    f << tx.txid_hex << "|"
+      << tx.created_at << "|"
+      << tx.confirmed_at << "|"
+      << tx.block_height << "|"
+      << tx.amount << "|"
+      << tx.fee << "|"
+      << tx.direction << "|"
+      << tx.to_address << "|"
+      << tx.memo << "|"
+      << (tx.confirmed ? "1" : "0") << "|"
+      << (tx.failed ? "1" : "0") << "|"
+      << tx.failure_reason << "\n";
+}
+
+static void load_tracked_transactions(const std::string& wdir,
+                                       std::vector<TrackedTransaction>& out){
+    out.clear();
+    std::ifstream f(tracked_tx_path(wdir));
+    if(!f.good()) return;
+
+    std::string line;
+    while(std::getline(f, line)){
+        if(line.empty()) continue;
+
+        TrackedTransaction tx;
+        std::vector<std::string> parts;
+        std::istringstream ss(line);
+        std::string part;
+        while(std::getline(ss, part, '|')){
+            parts.push_back(part);
+        }
+
+        if(parts.size() >= 12){
+            tx.txid_hex = parts[0];
+            tx.created_at = std::strtoll(parts[1].c_str(), nullptr, 10);
+            tx.confirmed_at = std::strtoll(parts[2].c_str(), nullptr, 10);
+            tx.block_height = (uint32_t)std::strtoul(parts[3].c_str(), nullptr, 10);
+            tx.amount = std::strtoull(parts[4].c_str(), nullptr, 10);
+            tx.fee = std::strtoull(parts[5].c_str(), nullptr, 10);
+            tx.direction = parts[6];
+            tx.to_address = parts[7];
+            tx.memo = parts[8];
+            tx.confirmed = (parts[9] == "1");
+            tx.failed = (parts[10] == "1");
+            tx.failure_reason = parts[11];
+            out.push_back(tx);
+        }
+    }
+}
+
+// =============================================================================
+// SECURITY FEATURES
+// =============================================================================
+
+// Check for address reuse (privacy concern)
+static bool check_address_reuse(
+    const std::vector<miq::UtxoLite>& utxos,
+    const std::vector<uint8_t>& pkh,
+    int& reuse_count)
+{
+    reuse_count = 0;
+    for(const auto& u : utxos){
+        if(u.pkh == pkh) reuse_count++;
+    }
+    return reuse_count > 1;
+}
+
+// Verify transaction signatures
+static bool verify_tx_signatures(const miq::Transaction& tx){
+    for(const auto& in : tx.vin){
+        if(in.sig.empty() || in.pubkey.empty()){
+            return false;
+        }
+        // Basic signature length checks
+        if(in.sig.size() != 64){  // ECDSA signature is 64 bytes
+            return false;
+        }
+        if(in.pubkey.size() != 33 && in.pubkey.size() != 65){  // Compressed or uncompressed
+            return false;
+        }
+    }
+    return true;
+}
+
+// Check for potential double-spend attempts
+static bool check_double_spend_risk(
+    const miq::Transaction& tx,
+    const std::set<OutpointKey>& pending)
+{
+    for(const auto& in : tx.vin){
+        OutpointKey k{ miq::to_hex(in.prev.txid), in.prev.vout };
+        if(pending.find(k) != pending.end()){
+            return true;  // Input already used in pending tx
+        }
+    }
+    return false;
+}
+
+// =============================================================================
+// MEMORY MANAGEMENT
+// =============================================================================
+
+// Compact UTXO set to reduce memory usage
+static void compact_utxo_set(std::vector<miq::UtxoLite>& utxos){
+    // Remove any invalid entries
+    utxos.erase(
+        std::remove_if(utxos.begin(), utxos.end(), [](const miq::UtxoLite& u){
+            return u.txid.size() != 32 || u.pkh.size() != 20 || u.value == 0;
+        }),
+        utxos.end()
+    );
+
+    // Shrink to fit
+    utxos.shrink_to_fit();
+}
+
+// Estimate memory usage of UTXO set
+static size_t estimate_utxo_memory(const std::vector<miq::UtxoLite>& utxos){
+    // Each UtxoLite: 32 (txid) + 4 (vout) + 8 (value) + 20 (pkh) + 4 (height) + 1 (coinbase)
+    // Plus vector overhead
+    return utxos.size() * (32 + 4 + 8 + 20 + 4 + 1 + 24);  // ~93 bytes per UTXO
+}
+
+// =============================================================================
+// BACKUP AND RESTORE
+// =============================================================================
+
+static std::string backup_file_path(const std::string& wdir, int64_t timestamp){
+    std::ostringstream oss;
+    oss << "wallet_backup_" << timestamp << ".dat";
+    return join_path(wdir, oss.str());
+}
+
+static bool create_wallet_backup(const std::string& wdir, std::string& backup_path, std::string& error){
+    int64_t now = (int64_t)time(nullptr);
+    backup_path = backup_file_path(wdir, now);
+
+    // Read wallet file
+    std::string wallet_file = join_path(wdir, "wallet.dat");
+    std::ifstream in(wallet_file, std::ios::binary);
+    if(!in.good()){
+        error = "Cannot read wallet file";
+        return false;
+    }
+
+    std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)), {});
+    in.close();
+
+    // Write backup
+    std::ofstream out(backup_path, std::ios::binary);
+    if(!out.good()){
+        error = "Cannot create backup file";
+        return false;
+    }
+
+    out.write((const char*)data.data(), data.size());
+    out.close();
+
+    return true;
+}
+
+// =============================================================================
+// RATE LIMITING
+// =============================================================================
+
+static std::atomic<int64_t> g_last_sync_time{0};
+static std::atomic<int> g_sync_count{0};
+
+static bool check_rate_limit(int max_per_minute = 10){
+    int64_t now = (int64_t)time(nullptr);
+    int64_t last = g_last_sync_time.load();
+
+    if(now - last >= 60){
+        g_last_sync_time.store(now);
+        g_sync_count.store(1);
+        return true;
+    }
+
+    int count = g_sync_count.fetch_add(1);
+    return count < max_per_minute;
+}
+
+// =============================================================================
+// LOGGING
+// =============================================================================
+
+static std::string wallet_log_path(const std::string& wdir){
+    return join_path(wdir, "wallet.log");
+}
+
+static void log_wallet_event(const std::string& wdir, const std::string& event){
+    std::ofstream f(wallet_log_path(wdir), std::ios::app);
+    if(!f.good()) return;
+
+    time_t now = time(nullptr);
+    struct tm* tm_info = localtime(&now);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
+
+    f << "[" << buf << "] " << event << "\n";
+}
+
+// =============================================================================
+// PROFESSIONAL WALLET UPGRADE v1.0 - Enterprise Grade Features
+// =============================================================================
+
+// =============================================================================
+// ADVANCED UI SYSTEM - Professional Terminal Interface
+// =============================================================================
+
+namespace ui_pro {
+    // Animation state
+    static std::atomic<bool> g_animation_running{false};
+    static std::atomic<int> g_animation_frame{0};
+
+    // Professional spinner frames (ASCII compatible)
+    static const char* SPINNER_FRAMES[] = {"|", "/", "-", "\\"};
+    static const int SPINNER_FRAME_COUNT = 4;
+
+    // Progress bar styles
+    enum class ProgressStyle {
+        CLASSIC,      // [=====>    ]
+        BLOCKS,       // [▓▓▓▓░░░░░░]
+        DOTS,         // [●●●●○○○○○○]
+        ARROW         // [>>>>>>    ]
+    };
+
+    // Draw a professional progress bar
+    static std::string draw_progress_bar(double percent, int width, ProgressStyle style = ProgressStyle::CLASSIC){
+        int filled = (int)(percent * width / 100.0);
+        std::string bar = "[";
+
+        for(int i = 0; i < width; ++i){
+            if(i < filled){
+                switch(style){
+                    case ProgressStyle::CLASSIC: bar += "="; break;
+                    case ProgressStyle::BLOCKS: bar += "#"; break;
+                    case ProgressStyle::DOTS: bar += "*"; break;
+                    case ProgressStyle::ARROW: bar += ">"; break;
+                }
+            } else if(i == filled && style == ProgressStyle::CLASSIC){
+                bar += ">";
+            } else {
+                switch(style){
+                    case ProgressStyle::CLASSIC: bar += " "; break;
+                    case ProgressStyle::BLOCKS: bar += "-"; break;
+                    case ProgressStyle::DOTS: bar += "."; break;
+                    case ProgressStyle::ARROW: bar += " "; break;
+                }
+            }
+        }
+        bar += "]";
+        return bar;
+    }
+
+    // Format large numbers with commas
+    static std::string format_number(uint64_t n){
+        std::string s = std::to_string(n);
+        int insertPosition = (int)s.length() - 3;
+        while(insertPosition > 0){
+            s.insert(insertPosition, ",");
+            insertPosition -= 3;
+        }
+        return s;
+    }
+
+    // Format amount with proper decimal places and thousands separators
+    static std::string format_miq_professional(uint64_t miqron){
+        uint64_t whole = miqron / 100000000ULL;
+        uint64_t frac = miqron % 100000000ULL;
+
+        std::string whole_str = format_number(whole);
+
+        if(frac == 0){
+            return whole_str + ".00";
+        }
+
+        char frac_str[16];
+        snprintf(frac_str, sizeof(frac_str), "%08llu", (unsigned long long)frac);
+
+        // Trim trailing zeros but keep at least 2 decimal places
+        std::string f = frac_str;
+        while(f.length() > 2 && f.back() == '0') f.pop_back();
+
+        return whole_str + "." + f;
+    }
+
+    // Print a status line with icon
+    static void print_status(const std::string& icon, const std::string& message,
+                             const std::string& color = ""){
+        if(!color.empty()) std::cout << color;
+        std::cout << "  " << icon << " " << message;
+        if(!color.empty()) std::cout << ui::reset();
+        std::cout << "\n";
+    }
+
+    // Print a key-value pair aligned
+    static void print_kv(const std::string& key, const std::string& value,
+                         int key_width = 20, const std::string& value_color = ""){
+        std::cout << "  " << ui::dim() << std::left << std::setw(key_width)
+                  << key << ui::reset();
+        if(!value_color.empty()) std::cout << value_color;
+        std::cout << value;
+        if(!value_color.empty()) std::cout << ui::reset();
+        std::cout << "\n";
+    }
+
+    // Print a boxed message
+    static void print_box(const std::string& title, const std::vector<std::string>& lines,
+                          int width = 60){
+        // Top border
+        std::cout << ui::cyan() << "+";
+        for(int i = 0; i < width - 2; ++i) std::cout << "-";
+        std::cout << "+" << ui::reset() << "\n";
+
+        // Title
+        int padding = (width - 2 - (int)title.length()) / 2;
+        std::cout << ui::cyan() << "|" << ui::reset();
+        for(int i = 0; i < padding; ++i) std::cout << " ";
+        std::cout << ui::bold() << title << ui::reset();
+        for(int i = 0; i < width - 2 - padding - (int)title.length(); ++i) std::cout << " ";
+        std::cout << ui::cyan() << "|" << ui::reset() << "\n";
+
+        // Separator
+        std::cout << ui::cyan() << "+";
+        for(int i = 0; i < width - 2; ++i) std::cout << "-";
+        std::cout << "+" << ui::reset() << "\n";
+
+        // Content
+        for(const auto& line : lines){
+            std::cout << ui::cyan() << "|" << ui::reset() << " ";
+            std::cout << std::left << std::setw(width - 4) << line;
+            std::cout << " " << ui::cyan() << "|" << ui::reset() << "\n";
+        }
+
+        // Bottom border
+        std::cout << ui::cyan() << "+";
+        for(int i = 0; i < width - 2; ++i) std::cout << "-";
+        std::cout << "+" << ui::reset() << "\n";
+    }
+
+    // Print transaction details in a nice format
+    static void print_tx_details(const std::string& txid, uint64_t amount, uint64_t fee,
+                                  const std::string& to_addr, const std::string& status){
+        std::vector<std::string> lines;
+        lines.push_back("TXID: " + txid.substr(0, 32) + "...");
+        lines.push_back("Amount: " + format_miq_professional(amount) + " MIQ");
+        lines.push_back("Fee: " + format_miq_professional(fee) + " MIQ");
+        lines.push_back("To: " + to_addr.substr(0, 34));
+        lines.push_back("Status: " + status);
+        print_box("TRANSACTION DETAILS", lines, 50);
+    }
+
+    // Animated waiting indicator
+    static void show_spinner_once(){
+        int frame = g_animation_frame.fetch_add(1) % SPINNER_FRAME_COUNT;
+        std::cout << "\r  " << SPINNER_FRAMES[frame] << " " << std::flush;
+    }
+}
+
+// =============================================================================
+// SESSION MANAGEMENT - Timeout and Security
+// =============================================================================
+
+struct SessionState {
+    int64_t last_activity{0};
+    int64_t session_start{0};
+    bool locked{false};
+    int failed_attempts{0};
+    std::string session_id;
+
+    void update_activity(){
+        last_activity = (int64_t)time(nullptr);
+    }
+
+    bool is_timed_out(int timeout_seconds = 900) const {  // 15 min default
+        if(timeout_seconds <= 0) return false;
+        return (time(nullptr) - last_activity) > timeout_seconds;
+    }
+
+    void reset(){
+        session_start = time(nullptr);
+        last_activity = session_start;
+        locked = false;
+        failed_attempts = 0;
+
+        // Generate session ID
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(0, 15);
+        const char* hex = "0123456789abcdef";
+        session_id.clear();
+        for(int i = 0; i < 16; ++i){
+            session_id += hex[dis(gen)];
+        }
+    }
+};
+
+// =============================================================================
+// PASSWORD STRENGTH CHECKER
+// =============================================================================
+
+struct PasswordStrength {
+    int score{0};          // 0-100
+    std::string rating;    // "Weak", "Fair", "Good", "Strong", "Very Strong"
+    std::vector<std::string> suggestions;
+};
+
+static PasswordStrength check_password_strength(const std::string& password){
+    PasswordStrength result;
+    result.score = 0;
+
+    if(password.empty()){
+        result.rating = "None";
+        result.suggestions.push_back("Enter a password for security");
+        return result;
+    }
+
+    // Length scoring
+    if(password.length() >= 8) result.score += 20;
+    if(password.length() >= 12) result.score += 10;
+    if(password.length() >= 16) result.score += 10;
+
+    // Character variety
+    bool has_lower = false, has_upper = false, has_digit = false, has_special = false;
+    for(char c : password){
+        if(std::islower(c)) has_lower = true;
+        else if(std::isupper(c)) has_upper = true;
+        else if(std::isdigit(c)) has_digit = true;
+        else has_special = true;
+    }
+
+    if(has_lower) result.score += 15;
+    if(has_upper) result.score += 15;
+    if(has_digit) result.score += 15;
+    if(has_special) result.score += 15;
+
+    // Suggestions
+    if(password.length() < 8){
+        result.suggestions.push_back("Use at least 8 characters");
+    }
+    if(!has_upper){
+        result.suggestions.push_back("Add uppercase letters");
+    }
+    if(!has_digit){
+        result.suggestions.push_back("Add numbers");
+    }
+    if(!has_special){
+        result.suggestions.push_back("Add special characters (!@#$%^&*)");
+    }
+
+    // Rating
+    if(result.score < 30) result.rating = "Weak";
+    else if(result.score < 50) result.rating = "Fair";
+    else if(result.score < 70) result.rating = "Good";
+    else if(result.score < 90) result.rating = "Strong";
+    else result.rating = "Very Strong";
+
+    return result;
+}
+
+// =============================================================================
+// SECURE MEMORY OPERATIONS
+// =============================================================================
+
+// Securely wipe memory
+static void secure_wipe(void* ptr, size_t len){
+    volatile unsigned char* p = (volatile unsigned char*)ptr;
+    while(len--){
+        *p++ = 0;
+    }
+}
+
+// Secure string that wipes on destruction
+class SecureString {
+public:
+    SecureString() = default;
+    SecureString(const std::string& s) : data_(s) {}
+    ~SecureString() { wipe(); }
+
+    void wipe(){
+        if(!data_.empty()){
+            secure_wipe(&data_[0], data_.size());
+            data_.clear();
+        }
+    }
+
+    const std::string& str() const { return data_; }
+    std::string& str() { return data_; }
+    bool empty() const { return data_.empty(); }
+    size_t length() const { return data_.length(); }
+
+private:
+    std::string data_;
+};
+
+// =============================================================================
+// NETWORK DIAGNOSTICS
+// =============================================================================
+
+struct NetworkDiagnostics {
+    bool node_reachable{false};
+    int latency_ms{-1};
+    uint32_t node_height{0};
+    uint32_t our_height{0};
+    int peer_count{0};
+    std::string node_version;
+    std::string network_name;
+    int64_t last_block_time{0};
+    double sync_progress{0.0};
+    std::vector<std::string> errors;
+
+    // Extended diagnostics for multi-node testing
+    int64_t timestamp{0};
+    int successful_connections{0};
+    int failed_connections{0};
+    std::vector<int> latency_samples;
+    int avg_latency_ms{0};
+};
+
+static std::string diagnostics_file_path(const std::string& wdir){
+    return join_path(wdir, "network_diagnostics.log");
+}
+
+static void save_diagnostics(const std::string& wdir, const NetworkDiagnostics& diag){
+    std::ofstream f(diagnostics_file_path(wdir), std::ios::app);
+    if(!f.good()) return;
+
+    time_t now = time(nullptr);
+    struct tm* tm_info = localtime(&now);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
+
+    f << "[" << buf << "] "
+      << "reachable=" << (diag.node_reachable ? "yes" : "no")
+      << " latency=" << diag.latency_ms << "ms"
+      << " height=" << diag.node_height
+      << " peers=" << diag.peer_count
+      << "\n";
+}
+
+// =============================================================================
+// ADDRESS LABELS AND MANAGEMENT
+// =============================================================================
+
+struct LabeledAddress {
+    std::string address;
+    std::string label;
+    std::string category;     // "personal", "business", "exchange", "other"
+    int64_t created_at{0};
+    int64_t last_used{0};
+    uint64_t total_received{0};
+    uint64_t total_sent{0};
+    int tx_count{0};
+    bool is_change{false};
+    bool is_watch_only{false};
+    std::string notes;
+};
+
+static std::string labeled_addresses_path(const std::string& wdir){
+    return join_path(wdir, "labeled_addresses.dat");
+}
+
+static void save_labeled_addresses(const std::string& wdir,
+                                    const std::vector<LabeledAddress>& addrs){
+    std::ofstream f(labeled_addresses_path(wdir), std::ios::out | std::ios::trunc);
+    if(!f.good()) return;
+
+    f << "# MIQ Wallet Labeled Addresses\n";
+    f << "# Format: address|label|category|created|last_used|received|sent|tx_count|is_change|watch_only|notes\n";
+
+    for(const auto& a : addrs){
+        f << a.address << "|"
+          << a.label << "|"
+          << a.category << "|"
+          << a.created_at << "|"
+          << a.last_used << "|"
+          << a.total_received << "|"
+          << a.total_sent << "|"
+          << a.tx_count << "|"
+          << (a.is_change ? "1" : "0") << "|"
+          << (a.is_watch_only ? "1" : "0") << "|"
+          << a.notes << "\n";
+    }
+}
+
+static void load_labeled_addresses(const std::string& wdir,
+                                    std::vector<LabeledAddress>& out){
+    out.clear();
+    std::ifstream f(labeled_addresses_path(wdir));
+    if(!f.good()) return;
+
+    std::string line;
+    while(std::getline(f, line)){
+        if(line.empty() || line[0] == '#') continue;
+
+        std::vector<std::string> parts;
+        std::istringstream ss(line);
+        std::string part;
+        while(std::getline(ss, part, '|')){
+            parts.push_back(part);
+        }
+
+        if(parts.size() >= 11){
+            LabeledAddress a;
+            a.address = parts[0];
+            a.label = parts[1];
+            a.category = parts[2];
+            a.created_at = std::strtoll(parts[3].c_str(), nullptr, 10);
+            a.last_used = std::strtoll(parts[4].c_str(), nullptr, 10);
+            a.total_received = std::strtoull(parts[5].c_str(), nullptr, 10);
+            a.total_sent = std::strtoull(parts[6].c_str(), nullptr, 10);
+            a.tx_count = std::atoi(parts[7].c_str());
+            a.is_change = (parts[8] == "1");
+            a.is_watch_only = (parts[9] == "1");
+            a.notes = parts[10];
+            out.push_back(a);
+        }
+    }
+}
+
+// =============================================================================
+// TRANSACTION MEMO/NOTES SYSTEM
+// =============================================================================
+
+struct TransactionMemo {
+    std::string txid_hex;
+    std::string memo;
+    std::string category;    // "payment", "salary", "gift", "purchase", "other"
+    std::vector<std::string> tags;
+    int64_t created_at{0};
+};
+
+static std::string memos_file_path(const std::string& wdir){
+    return join_path(wdir, "transaction_memos.dat");
+}
+
+static void save_transaction_memo(const std::string& wdir, const TransactionMemo& memo){
+    std::ofstream f(memos_file_path(wdir), std::ios::app);
+    if(!f.good()) return;
+
+    std::string tags_str;
+    for(size_t i = 0; i < memo.tags.size(); ++i){
+        if(i > 0) tags_str += ",";
+        tags_str += memo.tags[i];
+    }
+
+    f << memo.txid_hex << "|"
+      << memo.memo << "|"
+      << memo.category << "|"
+      << tags_str << "|"
+      << memo.created_at << "\n";
+}
+
+static void load_transaction_memos(const std::string& wdir,
+                                    std::unordered_map<std::string, TransactionMemo>& out){
+    out.clear();
+    std::ifstream f(memos_file_path(wdir));
+    if(!f.good()) return;
+
+    std::string line;
+    while(std::getline(f, line)){
+        if(line.empty()) continue;
+
+        std::vector<std::string> parts;
+        std::istringstream ss(line);
+        std::string part;
+        while(std::getline(ss, part, '|')){
+            parts.push_back(part);
+        }
+
+        if(parts.size() >= 5){
+            TransactionMemo m;
+            m.txid_hex = parts[0];
+            m.memo = parts[1];
+            m.category = parts[2];
+
+            // Parse tags
+            std::istringstream tag_ss(parts[3]);
+            std::string tag;
+            while(std::getline(tag_ss, tag, ',')){
+                if(!tag.empty()) m.tags.push_back(tag);
+            }
+
+            m.created_at = std::strtoll(parts[4].c_str(), nullptr, 10);
+            out[m.txid_hex] = m;
+        }
+    }
+}
+
+// =============================================================================
+// EXPORT/IMPORT FUNCTIONALITY
+// =============================================================================
+
+// Export format types
+enum class ExportFormat {
+    CSV,
+    JSON,
+    TXT
+};
+
+// Note: export_transactions_csv and export_transactions_json are defined after TxHistoryEntry struct
+
+static bool export_to_file(const std::string& filepath, const std::string& content,
+                           std::string& error){
+    std::ofstream f(filepath, std::ios::out | std::ios::trunc);
+    if(!f.good()){
+        error = "Cannot create file: " + filepath;
+        return false;
+    }
+    f << content;
+    f.close();
+    return true;
+}
+
+// =============================================================================
+// QR CODE DISPLAY (ASCII Art)
+// =============================================================================
+
+// Simple QR code representation using ASCII
+// Note: This is a visual representation, not actual QR encoding
+static void display_address_visual(const std::string& address){
+    std::cout << "\n";
+    std::cout << "  " << ui::dim() << "Address:" << ui::reset() << "\n";
+    std::cout << "  " << ui::cyan() << ui::bold() << address << ui::reset() << "\n\n";
+
+    // Create a visual box around the address for easy copying
+    int len = (int)address.length();
+    std::cout << "  +" << std::string(len + 2, '-') << "+\n";
+    std::cout << "  | " << address << " |\n";
+    std::cout << "  +" << std::string(len + 2, '-') << "+\n\n";
+
+    std::cout << "  " << ui::dim() << "Scan or copy the address above" << ui::reset() << "\n";
+}
+
+// =============================================================================
+// CHANGE OPTIMIZATION
+// =============================================================================
+
+struct ChangeOptimizationResult {
+    uint64_t change_amount{0};
+    bool should_create_change{false};
+    bool is_exact_match{false};
+    uint64_t dust_absorbed{0};  // Small amounts absorbed into fee
+    std::string recommendation;
+};
+
+static ChangeOptimizationResult optimize_change(uint64_t total_input, uint64_t amount,
+                                                  uint64_t fee, uint64_t dust_threshold = 546){
+    ChangeOptimizationResult result;
+
+    if(total_input < amount + fee){
+        result.recommendation = "Insufficient funds";
+        return result;
+    }
+
+    uint64_t excess = total_input - amount - fee;
+
+    if(excess == 0){
+        result.is_exact_match = true;
+        result.recommendation = "Exact match - no change needed";
+    } else if(excess < dust_threshold){
+        result.dust_absorbed = excess;
+        result.recommendation = "Small excess (" + std::to_string(excess) +
+                               " sat) added to fee to avoid dust";
+    } else {
+        result.should_create_change = true;
+        result.change_amount = excess;
+        result.recommendation = "Change of " + ui_pro::format_miq_professional(excess) +
+                               " MIQ will be returned";
+    }
+
+    return result;
+}
+
+// =============================================================================
+// FEE OPTIMIZATION AND ESTIMATION
+// =============================================================================
+
+struct FeeRecommendation {
+    uint64_t economy_rate{1};       // sat/byte
+    uint64_t normal_rate{2};
+    uint64_t priority_rate{5};
+    uint64_t urgent_rate{10};
+    int64_t estimated_time_economy{3600};    // seconds
+    int64_t estimated_time_normal{1200};
+    int64_t estimated_time_priority{600};
+    int64_t estimated_time_urgent{180};
+    std::string network_status;
+};
+
+static FeeRecommendation get_fee_recommendation(){
+    // In a full implementation, this would query mempool status
+    FeeRecommendation rec;
+    rec.network_status = "Normal";
+    return rec;
+}
+
+static std::string format_time_estimate(int64_t seconds){
+    if(seconds < 60) return std::to_string(seconds) + " seconds";
+    if(seconds < 3600) return std::to_string(seconds / 60) + " minutes";
+    return std::to_string(seconds / 3600) + " hours";
+}
+
+// =============================================================================
+// TRANSACTION BUILDER - Professional Transaction Construction
+// =============================================================================
+
+struct TransactionPlan {
+    std::vector<size_t> input_indices;
+    uint64_t total_input{0};
+    uint64_t amount{0};
+    uint64_t fee{0};
+    uint64_t change{0};
+    bool has_change{false};
+    std::string change_address;
+    std::string to_address;
+    std::string memo;
+    int priority{1};
+    std::string error;
+    bool valid{false};
+};
+
+static TransactionPlan plan_transaction(
+    const std::vector<miq::UtxoLite>& utxos,
+    const std::set<OutpointKey>& pending,
+    uint64_t amount,
+    uint64_t fee_rate,
+    const std::string& to_address,
+    const std::string& change_address,
+    uint32_t tip_height)
+{
+    TransactionPlan plan;
+    plan.amount = amount;
+    plan.to_address = to_address;
+    plan.change_address = change_address;
+
+    // Filter spendable UTXOs
+    std::vector<std::pair<size_t, uint64_t>> spendable;
+    for(size_t i = 0; i < utxos.size(); ++i){
+        const auto& u = utxos[i];
+
+        // Skip immature coinbase
+        if(u.coinbase){
+            uint64_t mature_h = (uint64_t)u.height + 100ULL;
+            if(tip_height + 1 < mature_h) continue;
+        }
+
+        // Skip pending
+        OutpointKey k{ miq::to_hex(u.txid), u.vout };
+        if(pending.find(k) != pending.end()) continue;
+
+        spendable.push_back({i, u.value});
+    }
+
+    if(spendable.empty()){
+        plan.error = "No spendable UTXOs available";
+        return plan;
+    }
+
+    // Sort by value descending for greedy selection
+    std::sort(spendable.begin(), spendable.end(),
+              [](const auto& a, const auto& b){ return a.second > b.second; });
+
+    // Greedy selection
+    plan.total_input = 0;
+    for(const auto& [idx, value] : spendable){
+        plan.input_indices.push_back(idx);
+        plan.total_input += value;
+
+        // Estimate fee with current inputs
+        size_t est_size = 10 + plan.input_indices.size() * 148 + 2 * 34;
+        plan.fee = est_size * fee_rate;
+
+        if(plan.total_input >= amount + plan.fee){
+            break;
+        }
+    }
+
+    if(plan.total_input < amount + plan.fee){
+        plan.error = "Insufficient funds. Need " +
+                     ui_pro::format_miq_professional(amount + plan.fee) +
+                     " MIQ but only have " +
+                     ui_pro::format_miq_professional(plan.total_input) + " MIQ";
+        return plan;
+    }
+
+    // Calculate change
+    uint64_t excess = plan.total_input - amount - plan.fee;
+    if(excess >= 546){  // Dust threshold
+        plan.has_change = true;
+        plan.change = excess;
+    } else {
+        // Add to fee
+        plan.fee += excess;
+    }
+
+    plan.valid = true;
+    return plan;
+}
+
+// =============================================================================
+// BATCH TRANSACTION SUPPORT
+// =============================================================================
+
+struct BatchOutput {
+    std::string address;
+    uint64_t amount{0};
+    std::string label;
+};
+
+struct BatchTransactionPlan {
+    std::vector<size_t> input_indices;
+    std::vector<BatchOutput> outputs;
+    uint64_t total_input{0};
+    uint64_t total_output{0};
+    uint64_t fee{0};
+    uint64_t change{0};
+    bool has_change{false};
+    std::string change_address;
+    std::string error;
+    bool valid{false};
+};
+
+static BatchTransactionPlan plan_batch_transaction(
+    const std::vector<miq::UtxoLite>& utxos,
+    const std::set<OutpointKey>& pending,
+    const std::vector<BatchOutput>& outputs,
+    uint64_t fee_rate,
+    const std::string& change_address,
+    uint32_t tip_height)
+{
+    BatchTransactionPlan plan;
+    plan.outputs = outputs;
+    plan.change_address = change_address;
+
+    // Calculate total output
+    for(const auto& out : outputs){
+        plan.total_output += out.amount;
+    }
+
+    // Filter spendable UTXOs
+    std::vector<std::pair<size_t, uint64_t>> spendable;
+    for(size_t i = 0; i < utxos.size(); ++i){
+        const auto& u = utxos[i];
+        if(u.coinbase && tip_height + 1 < u.height + 100) continue;
+        OutpointKey k{ miq::to_hex(u.txid), u.vout };
+        if(pending.find(k) != pending.end()) continue;
+        spendable.push_back({i, u.value});
+    }
+
+    std::sort(spendable.begin(), spendable.end(),
+              [](const auto& a, const auto& b){ return a.second > b.second; });
+
+    // Select inputs
+    for(const auto& [idx, value] : spendable){
+        plan.input_indices.push_back(idx);
+        plan.total_input += value;
+
+        size_t num_outputs = outputs.size() + 1;  // +1 for potential change
+        size_t est_size = 10 + plan.input_indices.size() * 148 + num_outputs * 34;
+        plan.fee = est_size * fee_rate;
+
+        if(plan.total_input >= plan.total_output + plan.fee){
+            break;
+        }
+    }
+
+    if(plan.total_input < plan.total_output + plan.fee){
+        plan.error = "Insufficient funds for batch transaction";
+        return plan;
+    }
+
+    uint64_t excess = plan.total_input - plan.total_output - plan.fee;
+    if(excess >= 546){
+        plan.has_change = true;
+        plan.change = excess;
+    } else {
+        plan.fee += excess;
+    }
+
+    plan.valid = true;
+    return plan;
+}
+
+// =============================================================================
+// WALLET HEALTH CHECK
+// =============================================================================
+
+struct WalletHealth {
+    bool is_healthy{true};
+    std::vector<std::string> warnings;
+    std::vector<std::string> errors;
+    int utxo_count{0};
+    int dust_utxo_count{0};
+    uint64_t total_balance{0};
+    uint64_t dust_amount{0};
+    bool needs_consolidation{false};
+    bool has_pending_txs{false};
+    int pending_tx_count{0};
+    double fragmentation_score{0.0};  // 0-100, higher = more fragmented
+
+    // Extended health metrics
+    int health_score{100};           // Overall health score 0-100
+    uint64_t largest_utxo{0};
+    uint64_t smallest_utxo{UINT64_MAX};
+    int dust_count{0};
+    int pending_count{0};
+    std::vector<std::string> issues;
+    std::vector<std::string> recommendations;
+};
+
+static WalletHealth check_wallet_health(
+    const std::vector<miq::UtxoLite>& utxos,
+    const std::set<OutpointKey>& pending,
+    uint64_t dust_threshold = 10000)
+{
+    WalletHealth health;
+    health.utxo_count = (int)utxos.size();
+    health.pending_tx_count = (int)pending.size();
+    health.pending_count = (int)pending.size();
+    health.has_pending_txs = !pending.empty();
+
+    for(const auto& u : utxos){
+        health.total_balance += u.value;
+
+        // Track largest/smallest
+        if(u.value > health.largest_utxo) health.largest_utxo = u.value;
+        if(u.value < health.smallest_utxo) health.smallest_utxo = u.value;
+
+        if(u.value < dust_threshold){
+            health.dust_utxo_count++;
+            health.dust_count++;
+            health.dust_amount += u.value;
+        }
+    }
+
+    // Reset smallest if no UTXOs
+    if(utxos.empty()) health.smallest_utxo = 0;
+
+    // Check for issues and build recommendations
+    if(health.utxo_count > 100){
+        health.warnings.push_back("High UTXO count (" + std::to_string(health.utxo_count) +
+                                   ") - consider consolidation");
+        health.issues.push_back("High UTXO fragmentation");
+        health.recommendations.push_back("Consolidate UTXOs to reduce transaction fees");
+        health.needs_consolidation = true;
+        health.health_score -= 15;
+    }
+
+    if(health.dust_utxo_count > 10){
+        health.warnings.push_back("Many dust UTXOs (" + std::to_string(health.dust_utxo_count) +
+                                   ") - wasting fees");
+        health.issues.push_back("Excessive dust UTXOs");
+        health.recommendations.push_back("Consider sweeping dust to a single UTXO");
+        health.health_score -= 10;
+    }
+
+    if(health.pending_tx_count > 5){
+        health.warnings.push_back("Multiple pending transactions (" +
+                                   std::to_string(health.pending_tx_count) + ")");
+        health.issues.push_back("Many unconfirmed transactions");
+        health.recommendations.push_back("Wait for confirmations before sending more");
+        health.health_score -= 10;
+    }
+
+    // Calculate fragmentation score
+    if(health.utxo_count > 0 && health.total_balance > 0){
+        health.fragmentation_score = std::min(100.0,
+            (double)health.utxo_count / 10.0 * 10.0 +
+            (double)health.dust_utxo_count / (double)health.utxo_count * 50.0);
+
+        // Adjust health score based on fragmentation
+        if(health.fragmentation_score > 50) health.health_score -= 5;
+        if(health.fragmentation_score > 75) health.health_score -= 5;
+    }
+
+    // Ensure score stays in valid range
+    health.health_score = std::max(0, std::min(100, health.health_score));
+
+    health.is_healthy = health.errors.empty() && health.warnings.size() <= 1;
+    return health;
+}
+
+// =============================================================================
+// CONFIRMATION TRACKER
+// =============================================================================
+
+struct ConfirmationStatus {
+    std::string txid_hex;
+    uint32_t confirmations{0};
+    uint32_t target_confirmations{6};
+    bool confirmed{false};
+    int64_t first_seen{0};
+    int64_t confirmed_at{0};
+    std::string status_message;
+};
+
+static std::string confirmations_file_path(const std::string& wdir){
+    return join_path(wdir, "confirmation_tracker.dat");
+}
+
+static void save_confirmation_status(const std::string& wdir,
+                                      const ConfirmationStatus& status){
+    std::ofstream f(confirmations_file_path(wdir), std::ios::app);
+    if(!f.good()) return;
+
+    f << status.txid_hex << "|"
+      << status.confirmations << "|"
+      << status.target_confirmations << "|"
+      << (status.confirmed ? "1" : "0") << "|"
+      << status.first_seen << "|"
+      << status.confirmed_at << "\n";
+}
+
+// =============================================================================
+// INPUT VALIDATION UTILITIES
+// =============================================================================
+
+static bool is_valid_amount_string(const std::string& s){
+    if(s.empty()) return false;
+
+    bool has_dot = false;
+    int decimal_places = 0;
+    bool after_dot = false;
+
+    for(size_t i = 0; i < s.length(); ++i){
+        char c = s[i];
+        if(c == '.'){
+            if(has_dot) return false;  // Multiple dots
+            has_dot = true;
+            after_dot = true;
+        } else if(std::isdigit(c)){
+            if(after_dot) decimal_places++;
+        } else {
+            return false;  // Invalid character
+        }
+    }
+
+    if(decimal_places > 8) return false;  // Too many decimal places
+    return true;
+}
+
+static bool is_valid_fee_rate(uint64_t rate){
+    return rate >= 1 && rate <= 1000;  // 1-1000 sat/byte
+}
+
+// =============================================================================
+// DISPLAY UTILITIES
+// =============================================================================
+
+// Note: display_balance_breakdown is defined after WalletBalance struct
+
+static void display_utxo_summary(const std::vector<miq::UtxoLite>& utxos){
+    if(utxos.empty()){
+        std::cout << "  " << ui::dim() << "No UTXOs found" << ui::reset() << "\n";
+        return;
+    }
+
+    uint64_t total = 0;
+    uint64_t min_val = UINT64_MAX;
+    uint64_t max_val = 0;
+    int dust_count = 0;
+
+    for(const auto& u : utxos){
+        total += u.value;
+        min_val = std::min(min_val, u.value);
+        max_val = std::max(max_val, u.value);
+        if(u.value < 10000) dust_count++;
+    }
+
+    double avg_val = (double)total / utxos.size();
+
+    std::cout << "\n";
+    ui_pro::print_kv("UTXO Count:", std::to_string(utxos.size()));
+    ui_pro::print_kv("Total Value:", ui_pro::format_miq_professional(total) + " MIQ");
+    ui_pro::print_kv("Average:", ui_pro::format_miq_professional((uint64_t)avg_val) + " MIQ");
+    ui_pro::print_kv("Smallest:", ui_pro::format_miq_professional(min_val) + " MIQ");
+    ui_pro::print_kv("Largest:", ui_pro::format_miq_professional(max_val) + " MIQ");
+    if(dust_count > 0){
+        ui_pro::print_kv("Dust UTXOs:", std::to_string(dust_count), 20, ui::yellow());
+    }
+    std::cout << "\n";
+}
+
+static void display_transaction_confirmation(const std::string& txid, uint64_t amount,
+                                              uint64_t fee, const std::string& to_addr){
+    std::cout << "\n";
+    ui::print_header("CONFIRM TRANSACTION", 55);
+    std::cout << "\n";
+
+    ui_pro::print_kv("To:", to_addr.substr(0, 34));
+    ui_pro::print_kv("Amount:", ui_pro::format_miq_professional(amount) + " MIQ", 20, ui::cyan());
+    ui_pro::print_kv("Fee:", ui_pro::format_miq_professional(fee) + " MIQ", 20, ui::yellow());
+    ui_pro::print_kv("Total:", ui_pro::format_miq_professional(amount + fee) + " MIQ", 20, ui::bold());
+
+    std::cout << "\n  " << ui::dim() << "TXID: " << txid.substr(0, 32) << "..." << ui::reset() << "\n";
+    std::cout << "\n";
+}
+
+// =============================================================================
+// ERROR RECOVERY
+// =============================================================================
+
+static void handle_network_error(const std::string& error, int attempt, int max_attempts){
+    std::cout << "\n";
+    ui::print_error("Network error: " + error);
+
+    if(attempt < max_attempts){
+        int delay = std::min(1000 * (1 << attempt), 30000);
+        std::cout << "  " << ui::dim() << "Retrying in " << (delay / 1000)
+                  << " seconds... (attempt " << (attempt + 1) << "/" << max_attempts << ")"
+                  << ui::reset() << "\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    } else {
+        std::cout << "  " << ui::dim() << "Max retries reached. Please check:" << ui::reset() << "\n";
+        std::cout << "    - Node is running and synced\n";
+        std::cout << "    - Network connection is stable\n";
+        std::cout << "    - Firewall allows P2P port\n";
+        std::cout << "\n";
+    }
+}
+
+// =============================================================================
+// CONFIGURATION MANAGEMENT
+// =============================================================================
+
+struct WalletConfig {
+    // Display settings
+    bool show_fiat_equivalent{false};
+    std::string fiat_currency{"USD"};
+    int decimal_places{8};
+    bool use_thousands_separator{true};
+
+    // Security settings
+    int session_timeout_minutes{15};
+    bool require_password_for_send{true};
+    int max_failed_attempts{5};
+    bool auto_lock{true};
+
+    // Network settings
+    int connection_timeout_ms{15000};
+    int max_retries{5};
+    std::string preferred_node;
+
+    // Transaction settings
+    int default_fee_priority{1};
+    bool enable_rbf{false};
+    uint64_t dust_threshold{546};
+    int min_confirmations{1};
+
+    // UI settings
+    bool show_animations{true};
+    bool verbose_mode{false};
+    std::string language{"en"};
+};
+
+static std::string config_file_path(const std::string& wdir){
+    return join_path(wdir, "wallet_config.dat");
+}
+
+static void save_wallet_config(const std::string& wdir, const WalletConfig& cfg){
+    std::ofstream f(config_file_path(wdir), std::ios::out | std::ios::trunc);
+    if(!f.good()) return;
+
+    f << "# MIQ Wallet Configuration\n";
+    f << "session_timeout=" << cfg.session_timeout_minutes << "\n";
+    f << "require_password=" << (cfg.require_password_for_send ? "1" : "0") << "\n";
+    f << "max_failed_attempts=" << cfg.max_failed_attempts << "\n";
+    f << "connection_timeout=" << cfg.connection_timeout_ms << "\n";
+    f << "max_retries=" << cfg.max_retries << "\n";
+    f << "default_fee_priority=" << cfg.default_fee_priority << "\n";
+    f << "dust_threshold=" << cfg.dust_threshold << "\n";
+    f << "min_confirmations=" << cfg.min_confirmations << "\n";
+    f << "show_animations=" << (cfg.show_animations ? "1" : "0") << "\n";
+    f << "verbose_mode=" << (cfg.verbose_mode ? "1" : "0") << "\n";
+}
+
+static void load_wallet_config(const std::string& wdir, WalletConfig& cfg){
+    std::ifstream f(config_file_path(wdir));
+    if(!f.good()) return;
+
+    std::string line;
+    while(std::getline(f, line)){
+        if(line.empty() || line[0] == '#') continue;
+        size_t eq = line.find('=');
+        if(eq == std::string::npos) continue;
+
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+
+        if(key == "session_timeout") cfg.session_timeout_minutes = std::atoi(val.c_str());
+        else if(key == "require_password") cfg.require_password_for_send = (val == "1");
+        else if(key == "max_failed_attempts") cfg.max_failed_attempts = std::atoi(val.c_str());
+        else if(key == "connection_timeout") cfg.connection_timeout_ms = std::atoi(val.c_str());
+        else if(key == "max_retries") cfg.max_retries = std::atoi(val.c_str());
+        else if(key == "default_fee_priority") cfg.default_fee_priority = std::atoi(val.c_str());
+        else if(key == "dust_threshold") cfg.dust_threshold = std::strtoull(val.c_str(), nullptr, 10);
+        else if(key == "min_confirmations") cfg.min_confirmations = std::atoi(val.c_str());
+        else if(key == "show_animations") cfg.show_animations = (val == "1");
+        else if(key == "verbose_mode") cfg.verbose_mode = (val == "1");
+    }
+}
+
+// =============================================================================
+// AUDIT LOG - Complete Transaction Audit Trail
+// =============================================================================
+
+struct AuditEntry {
+    int64_t timestamp{0};
+    std::string action;      // "send", "receive", "generate_address", "backup", etc.
+    std::string details;
+    std::string txid_hex;
+    uint64_t amount{0};
+    std::string result;      // "success", "failed", "cancelled"
+    std::string ip_address;  // Node connected to
+};
+
+static std::string audit_log_path(const std::string& wdir){
+    return join_path(wdir, "audit_log.dat");
+}
+
+static void append_audit_log(const std::string& wdir, const AuditEntry& entry){
+    std::ofstream f(audit_log_path(wdir), std::ios::app);
+    if(!f.good()) return;
+
+    f << entry.timestamp << "|"
+      << entry.action << "|"
+      << entry.details << "|"
+      << entry.txid_hex << "|"
+      << entry.amount << "|"
+      << entry.result << "|"
+      << entry.ip_address << "\n";
+}
+
+// =============================================================================
+// PERFORMANCE METRICS
+// =============================================================================
+
+struct PerformanceMetrics {
+    int64_t sync_start_time{0};
+    int64_t sync_end_time{0};
+    int blocks_scanned{0};
+    int utxos_found{0};
+    size_t bytes_downloaded{0};
+    double sync_speed{0.0};  // blocks per second
+};
+
+static std::string metrics_file_path(const std::string& wdir){
+    return join_path(wdir, "performance_metrics.log");
+}
+
+static void log_performance_metrics(const std::string& wdir, const PerformanceMetrics& metrics){
+    std::ofstream f(metrics_file_path(wdir), std::ios::app);
+    if(!f.good()) return;
+
+    int64_t duration = metrics.sync_end_time - metrics.sync_start_time;
+    double speed = duration > 0 ? (double)metrics.blocks_scanned / duration : 0;
+
+    time_t now = time(nullptr);
+    f << now << "|"
+      << metrics.blocks_scanned << "|"
+      << metrics.utxos_found << "|"
+      << metrics.bytes_downloaded << "|"
+      << duration << "|"
+      << speed << "\n";
+}
+
+// =============================================================================
+// END OF PROFESSIONAL WALLET UPGRADE v1.0
+// =============================================================================
 
 static void load_pending(const std::string& wdir, std::set<OutpointKey>& out){
     out.clear();
@@ -576,6 +2566,47 @@ struct TxHistoryEntry {
     std::string from_address;
     std::string memo;
 };
+
+// Export functions that use TxHistoryEntry
+static std::string export_transactions_csv(const std::vector<TxHistoryEntry>& history){
+    std::ostringstream oss;
+    oss << "TXID,Timestamp,Direction,Amount,Fee,To Address,Confirmations\n";
+
+    for(const auto& tx : history){
+        oss << tx.txid_hex << ","
+            << tx.timestamp << ","
+            << tx.direction << ","
+            << tx.amount << ","
+            << tx.fee << ","
+            << tx.to_address << ","
+            << tx.confirmations << "\n";
+    }
+
+    return oss.str();
+}
+
+static std::string export_transactions_json(const std::vector<TxHistoryEntry>& history){
+    std::ostringstream oss;
+    oss << "{\n  \"transactions\": [\n";
+
+    for(size_t i = 0; i < history.size(); ++i){
+        const auto& tx = history[i];
+        oss << "    {\n"
+            << "      \"txid\": \"" << tx.txid_hex << "\",\n"
+            << "      \"timestamp\": " << tx.timestamp << ",\n"
+            << "      \"direction\": \"" << tx.direction << "\",\n"
+            << "      \"amount\": " << tx.amount << ",\n"
+            << "      \"fee\": " << tx.fee << ",\n"
+            << "      \"to_address\": \"" << tx.to_address << "\",\n"
+            << "      \"confirmations\": " << tx.confirmations << "\n"
+            << "    }";
+        if(i < history.size() - 1) oss << ",";
+        oss << "\n";
+    }
+
+    oss << "  ]\n}\n";
+    return oss.str();
+}
 
 static std::string tx_history_path(const std::string& wdir){
     return join_path(wdir, "tx_history.dat");
@@ -941,17 +2972,8 @@ static void add_to_address_book(const std::string& wdir, const std::string& addr
 }
 
 // =============================================================================
-// FEE ESTIMATION - Professional fee calculation
+// FEE PRIORITY LABELS
 // =============================================================================
-static uint64_t estimate_tx_fee(size_t num_inputs, size_t num_outputs, uint64_t fee_per_byte = 1){
-    // Estimate transaction size:
-    // Base: ~10 bytes (version, locktime, etc.)
-    // Per input: ~148 bytes (outpoint + scriptSig + sequence)
-    // Per output: ~34 bytes (value + scriptPubKey)
-    size_t estimated_size = 10 + (num_inputs * 148) + (num_outputs * 34);
-    return estimated_size * fee_per_byte;
-}
-
 static std::string fee_priority_label(int priority){
     switch(priority){
         case 0: return "Economy (1 sat/byte)";
@@ -1128,16 +3150,21 @@ static bool spv_collect_any_seed(
     const std::vector<std::pair<std::string,std::string>>& seeds,
     const std::vector<std::vector<uint8_t>>& pkhs,
     uint32_t window,
+    const std::string& cache_dir,
     std::vector<miq::UtxoLite>& out,
     std::string& used_seed,
     std::string& err_out)
 {
+    // Clear output to prevent accumulation from previous failed attempts
+    out.clear();
+
     for(const auto& [host, port] : seeds){
         std::string seed_str = host + ":" + port;
         ui::print_progress("Connecting to " + seed_str + "...");
 
         miq::SpvOptions opts;
         opts.recent_block_window = window;
+        opts.cache_dir = cache_dir;  // CRITICAL: Set cache directory for proper UTXO caching
 
         int max_attempts = (host == "127.0.0.1") ? 1 : wallet_config::MAX_CONNECTION_RETRIES;
 
@@ -1373,6 +3400,32 @@ struct WalletBalance {
     uint64_t approx_tip_h{0};
 };
 
+// Display function that uses WalletBalance
+static void display_balance_breakdown(const WalletBalance& wb){
+    std::cout << "\n";
+    ui::print_header("BALANCE BREAKDOWN", 50);
+    std::cout << "\n";
+
+    ui_pro::print_kv("Total Balance:",
+                     ui_pro::format_miq_professional(wb.total) + " MIQ", 20, ui::green());
+    ui_pro::print_kv("Spendable:",
+                     ui_pro::format_miq_professional(wb.spendable) + " MIQ", 20, ui::cyan());
+
+    if(wb.immature > 0){
+        ui_pro::print_kv("Immature:",
+                         ui_pro::format_miq_professional(wb.immature) + " MIQ", 20, ui::yellow());
+        std::cout << "  " << ui::dim() << "(Mining rewards need 100 confirmations)" << ui::reset() << "\n";
+    }
+
+    if(wb.pending_hold > 0){
+        ui_pro::print_kv("Pending:",
+                         ui_pro::format_miq_professional(wb.pending_hold) + " MIQ", 20, ui::yellow());
+        std::cout << "  " << ui::dim() << "(Awaiting confirmation)" << ui::reset() << "\n";
+    }
+
+    std::cout << "\n";
+}
+
 static inline bool safe_add(uint64_t& sum, uint64_t val) {
     if (val > UINT64_MAX - sum) return false;
     sum += val;
@@ -1445,6 +3498,10 @@ static bool wallet_session(const std::string& cli_host,
         pkh2ci[miq::to_hex(k.pkh)] = {k.chain, k.index};
     }
 
+    // CRITICAL: Verify cache belongs to this wallet, clear if different wallet
+    // This prevents using another wallet's cached UTXOs
+    verify_cache_ownership(wdir, pkhs);
+
     auto seeds = build_seed_candidates(cli_host, cli_port);
     const uint32_t spv_win = (uint32_t)env_u64("MIQ_SPV_WINDOW", 0);
 
@@ -1470,7 +3527,7 @@ static bool wallet_session(const std::string& cli_host,
         std::vector<miq::UtxoLite> utxos;
         std::string used_seed, err;
 
-        if(!spv_collect_any_seed(seeds, pkhs, spv_win, utxos, used_seed, err)){
+        if(!spv_collect_any_seed(seeds, pkhs, spv_win, wdir, utxos, used_seed, err)){
             std::cout << "\n";
             ui::print_error("Failed to sync with network");
             std::cout << ui::dim() << err << ui::reset() << "\n\n";
@@ -1483,13 +3540,40 @@ static bool wallet_session(const std::string& cli_host,
             used_seed = "<offline>";
         }
 
-        // Prune pending entries
+        // Deduplicate UTXOs to prevent counting issues
+        {
+            std::set<OutpointKey> seen;
+            std::vector<miq::UtxoLite> deduped;
+            deduped.reserve(utxos.size());
+            for(const auto& u : utxos){
+                OutpointKey k{ miq::to_hex(u.txid), u.vout };
+                if(seen.find(k) == seen.end()){
+                    seen.insert(k);
+                    deduped.push_back(u);
+                }
+            }
+            if(deduped.size() != utxos.size()){
+                // Log deduplication for debugging
+                ui::print_warning("Deduplicated " + std::to_string(utxos.size() - deduped.size()) + " duplicate UTXO(s)");
+            }
+            utxos = std::move(deduped);
+        }
+
+        // Prune pending entries that are no longer in current UTXOs (already spent/confirmed)
         {
             std::set<OutpointKey> cur;
             for(const auto& u : utxos) cur.insert(OutpointKey{ miq::to_hex(u.txid), u.vout });
+            size_t before_prune = pending.size();
             for(auto it = pending.begin(); it != pending.end(); ){
                 if(cur.find(*it) == cur.end()) it = pending.erase(it);
                 else ++it;
+            }
+            if(pending.size() != before_prune){
+                // Some pending transactions were confirmed
+                size_t confirmed = before_prune - pending.size();
+                if(confirmed > 0){
+                    ui::print_info(std::to_string(confirmed) + " pending transaction(s) confirmed");
+                }
             }
             save_pending(wdir, pending);
         }
@@ -1610,10 +3694,17 @@ static bool wallet_session(const std::string& cli_host,
         ui::print_menu_item("6", "Wallet Info");
         ui::print_menu_item("7", "Transaction Queue");
 
+        // Professional Features
+        std::cout << "\n" << ui::dim() << "  Professional:" << ui::reset() << "\n";
+        ui::print_menu_item("8", "Export Transactions");
+        ui::print_menu_item("9", "Wallet Health Check");
+        ui::print_menu_item("0", "Settings & Backup");
+
         // System
         std::cout << "\n" << ui::dim() << "  System:" << ui::reset() << "\n";
         ui::print_menu_item("r", "Refresh Balance");
         ui::print_menu_item("b", "Broadcast Queue");
+        ui::print_menu_item("d", "Network Diagnostics");
         ui::print_menu_item("h", "Help");
         ui::print_menu_item("q", "Back to Main Menu");
         std::cout << "\n";
@@ -1994,14 +4085,21 @@ static bool wallet_session(const std::string& cli_host,
                 continue;
             }
 
-            // Validate address
+            // Validate address using comprehensive validation
+            {
+                std::string addr_error;
+                if(!validate_address(to, addr_error)){
+                    ui::print_error("Invalid address: " + addr_error);
+                    std::cout << ui::dim() << "  Must be a valid MIQ address starting with the correct prefix" << ui::reset() << "\n\n";
+                    log_wallet_event(wdir, "Send failed: invalid address - " + addr_error);
+                    continue;
+                }
+            }
+
+            // Decode the validated address
             uint8_t ver = 0;
             std::vector<uint8_t> payload;
-            if(!miq::base58check_decode(to, ver, payload) || ver != miq::VERSION_P2PKH || payload.size() != 20){
-                ui::print_error("Invalid address format");
-                std::cout << ui::dim() << "  Must be a valid MIQ address starting with the correct prefix" << ui::reset() << "\n\n";
-                continue;
-            }
+            miq::base58check_decode(to, ver, payload);
 
             // Get amount
             std::string amt = ui::prompt("Amount (MIQ): ");
@@ -2308,6 +4406,22 @@ static bool wallet_session(const std::string& cli_host,
             hist.to_address = to;
             add_tx_history(wdir, hist);
 
+            // Update wallet statistics
+            update_stats_for_send(wdir, amount, fee_final);
+
+            // Log the transaction
+            log_wallet_event(wdir, "Sent " + fmt_amount(amount) + " MIQ to " + to + " (txid: " + txid_hex.substr(0, 16) + "...)");
+
+            // Track the transaction for confirmation monitoring
+            TrackedTransaction tracked;
+            tracked.txid_hex = txid_hex;
+            tracked.created_at = (int64_t)time(nullptr);
+            tracked.amount = amount;
+            tracked.fee = fee_final;
+            tracked.direction = "sent";
+            tracked.to_address = to;
+            save_tracked_transaction(wdir, tracked);
+
             // Success!
             std::cout << "\n";
             ui::print_success("Transaction broadcasted successfully!");
@@ -2468,6 +4582,343 @@ static bool wallet_session(const std::string& cli_host,
                     std::cout << "  " << ui::green() << "Broadcasted " << broadcasted << " transaction(s)" << ui::reset() << "\n\n";
                 }
             }
+        }
+        // =================================================================
+        // OPTION 8: Export Transactions
+        // =================================================================
+        else if(c == "8"){
+            std::cout << "\n";
+            ui::print_double_header("EXPORT TRANSACTIONS", 60);
+            std::cout << "\n";
+
+            std::vector<TxHistoryEntry> history;
+            load_tx_history(wdir, history);
+
+            if(history.empty()){
+                std::cout << "  " << ui::yellow() << "No transactions to export." << ui::reset() << "\n\n";
+            } else {
+                std::cout << ui::dim() << "  Export format:" << ui::reset() << "\n";
+                ui::print_menu_item("1", "CSV (Spreadsheet compatible)");
+                ui::print_menu_item("2", "JSON (Developer format)");
+                ui::print_menu_item("3", "Cancel");
+                std::cout << "\n";
+
+                std::string fmt = ui::prompt("Select format: ");
+                fmt = trim(fmt);
+
+                if(fmt == "1" || fmt == "2"){
+                    std::string content;
+                    std::string ext;
+
+                    if(fmt == "1"){
+                        content = export_transactions_csv(history);
+                        ext = ".csv";
+                    } else {
+                        content = export_transactions_json(history);
+                        ext = ".json";
+                    }
+
+                    std::string filename = "miqwallet_export_" +
+                        std::to_string(std::time(nullptr)) + ext;
+                    std::string filepath = join_path(wdir, filename);
+
+                    std::string error;
+                    if(export_to_file(filepath, content, error)){
+                        std::cout << "\n  " << ui::green() << "Exported " << history.size()
+                                  << " transactions to:" << ui::reset() << "\n";
+                        std::cout << "  " << ui::cyan() << filepath << ui::reset() << "\n\n";
+
+                        // Log the export
+                        log_wallet_event(wdir, "Exported " + std::to_string(history.size()) +
+                            " transactions to " + filename);
+                    } else {
+                        ui::print_error(error);
+                    }
+                }
+            }
+        }
+        // =================================================================
+        // OPTION 9: Wallet Health Check
+        // =================================================================
+        else if(c == "9"){
+            std::cout << "\n";
+            ui::print_double_header("WALLET HEALTH CHECK", 60);
+            std::cout << "\n";
+
+            ui::print_progress("Analyzing wallet health...");
+            std::cout << "\n";
+
+            // Calculate health metrics
+            WalletHealth health = check_wallet_health(utxos, pending, 0);
+
+            // Display overall health score
+            std::string score_color;
+            std::string score_label;
+            if(health.health_score >= 90){
+                score_color = ui::green();
+                score_label = "EXCELLENT";
+            } else if(health.health_score >= 70){
+                score_color = ui::cyan();
+                score_label = "GOOD";
+            } else if(health.health_score >= 50){
+                score_color = ui::yellow();
+                score_label = "FAIR";
+            } else {
+                score_color = ui::red();
+                score_label = "NEEDS ATTENTION";
+            }
+
+            std::cout << "  " << ui::bold() << "Overall Health Score: " << ui::reset()
+                      << score_color << health.health_score << "/100 (" << score_label << ")"
+                      << ui::reset() << "\n\n";
+
+            // UTXO Analysis
+            std::cout << ui::dim() << "  UTXO Analysis:" << ui::reset() << "\n";
+            ui_pro::print_kv("Total UTXOs:", std::to_string(health.utxo_count), 20);
+
+            if(health.utxo_count > 0){
+                uint64_t avg_utxo = health.total_balance / health.utxo_count;
+                ui_pro::print_kv("Average UTXO:", ui_pro::format_miq_professional(avg_utxo) + " MIQ", 20);
+                ui_pro::print_kv("Largest UTXO:", ui_pro::format_miq_professional(health.largest_utxo) + " MIQ", 20);
+                ui_pro::print_kv("Smallest UTXO:", ui_pro::format_miq_professional(health.smallest_utxo) + " MIQ", 20);
+            }
+
+            // Dust Analysis
+            std::cout << "\n" << ui::dim() << "  Dust Analysis:" << ui::reset() << "\n";
+            ui_pro::print_kv("Dust UTXOs:", std::to_string(health.dust_count), 20);
+            if(health.dust_count > 0){
+                std::cout << "  " << ui::yellow() << "Recommendation: Consider consolidating dust UTXOs"
+                          << ui::reset() << "\n";
+            }
+
+            // Pending Transactions
+            if(health.pending_count > 0){
+                std::cout << "\n" << ui::dim() << "  Pending:" << ui::reset() << "\n";
+                ui_pro::print_kv("Pending TXs:", std::to_string(health.pending_count), 20, ui::yellow());
+                std::cout << "  " << ui::dim() << "Pending transactions may be blocking funds"
+                          << ui::reset() << "\n";
+            }
+
+            // Issues and Recommendations
+            if(!health.issues.empty()){
+                std::cout << "\n" << ui::bold() << "  Issues Found:" << ui::reset() << "\n";
+                for(const auto& issue : health.issues){
+                    std::cout << "  " << ui::red() << "* " << issue << ui::reset() << "\n";
+                }
+            }
+
+            if(!health.recommendations.empty()){
+                std::cout << "\n" << ui::bold() << "  Recommendations:" << ui::reset() << "\n";
+                for(const auto& rec : health.recommendations){
+                    std::cout << "  " << ui::cyan() << "-> " << rec << ui::reset() << "\n";
+                }
+            }
+
+            std::cout << "\n";
+            log_wallet_event(wdir, "Performed wallet health check - Score: " +
+                std::to_string(health.health_score));
+        }
+        // =================================================================
+        // OPTION 0: Settings & Backup
+        // =================================================================
+        else if(c == "0"){
+            std::cout << "\n";
+            ui::print_double_header("SETTINGS & BACKUP", 60);
+            std::cout << "\n";
+
+            std::cout << ui::dim() << "  Options:" << ui::reset() << "\n";
+            ui::print_menu_item("1", "Create Wallet Backup");
+            ui::print_menu_item("2", "View Wallet Info");
+            ui::print_menu_item("3", "Clear Transaction History");
+            ui::print_menu_item("4", "View Audit Log");
+            ui::print_menu_item("5", "Network Settings");
+            ui::print_menu_item("6", "Back");
+            std::cout << "\n";
+
+            std::string opt = ui::prompt("Select option: ");
+            opt = trim(opt);
+
+            if(opt == "1"){
+                // Create backup
+                std::cout << "\n";
+                ui::print_progress("Creating wallet backup...");
+
+                std::string backup_path, error;
+                if(create_wallet_backup(wdir, backup_path, error)){
+                    std::cout << "  " << ui::green() << "Backup created successfully!" << ui::reset() << "\n";
+                    std::cout << "  Location: " << ui::cyan() << backup_path << ui::reset() << "\n\n";
+                    log_wallet_event(wdir, "Created wallet backup: " + backup_path);
+                } else {
+                    ui::print_error(error);
+                }
+            }
+            else if(opt == "2"){
+                // Wallet info
+                std::cout << "\n";
+                ui::print_header("WALLET INFORMATION", 50);
+                std::cout << "\n";
+
+                ui_pro::print_kv("Wallet Directory:", wdir, 20);
+                ui_pro::print_kv("Address Count:", std::to_string(pkhs.size()), 20);
+                ui_pro::print_kv("UTXO Count:", std::to_string(utxos.size()), 20);
+
+                // Calculate total received
+                uint64_t total_balance = 0;
+                for(const auto& u : utxos){
+                    total_balance += u.value;
+                }
+                ui_pro::print_kv("Total Balance:", ui_pro::format_miq_professional(total_balance) + " MIQ", 20);
+
+                // Cache info
+                std::string cache_file = join_path(wdir, "utxo_cache.dat");
+                std::ifstream cache_check(cache_file);
+                if(cache_check.good()){
+                    ui_pro::print_kv("Cache Status:", "Active", 20, ui::green());
+                } else {
+                    ui_pro::print_kv("Cache Status:", "Not found", 20, ui::yellow());
+                }
+
+                std::cout << "\n";
+            }
+            else if(opt == "3"){
+                // Clear history
+                std::cout << "\n  " << ui::yellow() << "WARNING: This will delete all transaction history."
+                          << ui::reset() << "\n";
+                std::string confirm = ui::prompt("Type 'DELETE' to confirm: ");
+
+                if(confirm == "DELETE"){
+                    std::string history_file = tx_history_path(wdir);
+                    std::remove(history_file.c_str());
+                    std::cout << "  " << ui::green() << "Transaction history cleared." << ui::reset() << "\n\n";
+                    log_wallet_event(wdir, "Cleared transaction history");
+                } else {
+                    std::cout << "  " << ui::dim() << "Operation cancelled." << ui::reset() << "\n\n";
+                }
+            }
+            else if(opt == "4"){
+                // View audit log
+                std::cout << "\n";
+                ui::print_header("AUDIT LOG", 50);
+                std::cout << "\n";
+
+                std::string log_file = join_path(wdir, "wallet_events.log");
+                std::ifstream f(log_file);
+                if(!f.good()){
+                    std::cout << "  " << ui::dim() << "No audit log found." << ui::reset() << "\n\n";
+                } else {
+                    std::vector<std::string> lines;
+                    std::string line;
+                    while(std::getline(f, line)){
+                        lines.push_back(line);
+                    }
+
+                    // Show last 20 entries
+                    int start = std::max(0, (int)lines.size() - 20);
+                    std::cout << ui::dim() << "  Recent activity (last "
+                              << std::min(20, (int)lines.size()) << " entries):" << ui::reset() << "\n\n";
+
+                    for(int i = start; i < (int)lines.size(); i++){
+                        std::cout << "  " << lines[i] << "\n";
+                    }
+                    std::cout << "\n";
+                }
+            }
+            else if(opt == "5"){
+                // Network settings
+                std::cout << "\n";
+                ui::print_header("NETWORK SETTINGS", 50);
+                std::cout << "\n";
+
+                std::cout << ui::dim() << "  Current P2P Seeds:" << ui::reset() << "\n";
+                for(const auto& seed : seeds){
+                    std::cout << "  - " << seed.first << ":" << seed.second << "\n";
+                }
+                std::cout << "\n";
+
+                if(is_online){
+                    std::cout << "  Status: " << ui::green() << "Connected" << ui::reset();
+                    if(!last_connected_node.empty()){
+                        std::cout << " to " << last_connected_node;
+                    }
+                    std::cout << "\n\n";
+                } else {
+                    std::cout << "  Status: " << ui::red() << "Offline" << ui::reset() << "\n\n";
+                }
+            }
+        }
+        // =================================================================
+        // OPTION d: Network Diagnostics
+        // =================================================================
+        else if(c == "d" || c == "D"){
+            std::cout << "\n";
+            ui::print_double_header("NETWORK DIAGNOSTICS", 60);
+            std::cout << "\n";
+
+            ui::print_progress("Running network diagnostics...");
+            std::cout << "\n";
+
+            NetworkDiagnostics diag;
+            diag.timestamp = std::time(nullptr);
+
+            // Test each seed
+            std::cout << ui::dim() << "  Testing P2P connections:" << ui::reset() << "\n\n";
+
+            for(const auto& seed : seeds){
+                std::cout << "  " << seed.first << ":" << seed.second << " ... ";
+                std::cout.flush();
+
+                auto start = std::chrono::steady_clock::now();
+
+                // Try to connect
+                miq::SpvOptions opts;
+                opts.timeout_ms = 5000;
+                std::vector<miq::UtxoLite> test_utxos;
+                std::string err;
+
+                bool success = miq::spv_collect_utxos(
+                    seed.first, seed.second, pkhs, opts, test_utxos, err);
+
+                auto end = std::chrono::steady_clock::now();
+                int latency = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    end - start).count();
+
+                if(success){
+                    diag.successful_connections++;
+                    diag.latency_samples.push_back(latency);
+                    std::cout << ui::green() << "OK" << ui::reset()
+                              << " (" << latency << "ms)\n";
+                } else {
+                    diag.failed_connections++;
+                    std::cout << ui::red() << "FAILED" << ui::reset() << "\n";
+                }
+            }
+
+            // Calculate average latency
+            if(!diag.latency_samples.empty()){
+                int sum = 0;
+                for(int l : diag.latency_samples) sum += l;
+                diag.avg_latency_ms = sum / (int)diag.latency_samples.size();
+            }
+
+            // Summary
+            std::cout << "\n" << ui::dim() << "  Summary:" << ui::reset() << "\n";
+            ui_pro::print_kv("Successful:", std::to_string(diag.successful_connections), 20, ui::green());
+            ui_pro::print_kv("Failed:", std::to_string(diag.failed_connections), 20,
+                diag.failed_connections > 0 ? ui::red() : ui::dim());
+
+            if(diag.avg_latency_ms > 0){
+                std::string latency_color = diag.avg_latency_ms < 500 ? ui::green() :
+                    (diag.avg_latency_ms < 2000 ? ui::yellow() : ui::red());
+                ui_pro::print_kv("Avg Latency:", std::to_string(diag.avg_latency_ms) + "ms", 20, latency_color);
+            }
+
+            std::cout << "\n";
+
+            // Save diagnostics
+            save_diagnostics(wdir, diag);
+            log_wallet_event(wdir, "Ran network diagnostics - " +
+                std::to_string(diag.successful_connections) + "/" +
+                std::to_string(seeds.size()) + " nodes reachable");
         }
         // =================================================================
         // OPTION q: Quit
