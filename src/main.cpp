@@ -1631,10 +1631,10 @@ private:
             std::string bullet = u8_ok_ ? " • " : " | ";
 
             // Main title with version
-            h << C_head() << "MIQROCHAIN NODE" << C_reset()
+            h << C_head() << "MIQROCHAIN" << C_reset()
               << "  " << C_dim()
               << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
-              << " Stable" << C_reset()
+              << C_reset()
               << "  " << spinner(tick_, u8_ok_);
             left.push_back(h.str());
 
@@ -2382,49 +2382,28 @@ static void miner_worker(Chain* chain, Mempool* mempool, P2P* p2p,
 static void print_usage(){
     std::cout
       << "\n"
-      << "  ==================================================\n"
-      << "  |      MIQROCHAIN NODE v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH << " - Professional Edition     |\n"
-      << "  ==================================================\n"
+      << "Miqrochain Node v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH << "\n"
       << "\n"
-      << "USAGE:\n"
-      << "  miqrod [OPTIONS]\n"
+      << "Usage: miqrod [options]\n"
       << "\n"
-      << "BASIC OPTIONS:\n"
-      << "  --conf=<path>        Load configuration from file (key=value format)\n"
-      << "  --datadir=<path>     Set data directory (default: ~/.miqrochain)\n"
-      << "  --no-tui             Disable the visual TUI, use plain log output\n"
-      << "  --help               Show this help message\n"
+      << "Options:\n"
+      << "  --conf=<path>        Configuration file (key=value format)\n"
+      << "  --datadir=<path>     Data directory (default: ~/.miqrochain)\n"
+      << "  --no-tui             Plain log output instead of TUI\n"
+      << "  --mine               Enable built-in miner\n"
+      << "  --genaddress         Generate new wallet address\n"
+      << "  --reindex_utxo       Rebuild UTXO from chain data\n"
+      << "  --telemetry          Enable telemetry logging\n"
+      << "  --help               Show this help\n"
       << "\n"
-      << "MINING OPTIONS:\n"
-      << "  --mine               Enable built-in CPU miner (prompts for address)\n"
-      << "                       Mining starts automatically when node is synced\n"
+      << "Environment:\n"
+      << "  MIQ_NO_TUI=1             Disable TUI\n"
+      << "  MIQ_MINER_THREADS=N      Miner threads (default: auto)\n"
+      << "  MIQ_RPC_TOKEN=<token>    RPC auth token\n"
+      << "  MIQ_SEED_HOST=<host>     Override seed host\n"
       << "\n"
-      << "ADVANCED OPTIONS:\n"
-      << "  --genaddress         Generate a new wallet address (prints priv/pub/address)\n"
-      << "  --buildtx            Build a raw transaction from inputs\n"
-      << "                       Args: <priv_hex> <prev_txid> <vout> <value> <to_addr>\n"
-      << "  --reindex_utxo       Rebuild UTXO chainstate from block data\n"
-      << "  --telemetry          Enable block telemetry logging (telemetry.ndjson)\n"
-      << "\n"
-      << "ENVIRONMENT VARIABLES:\n"
-      << "  MIQ_NO_TUI=1             Disable TUI mode\n"
-      << "  MIQ_MINER_THREADS=N      Set miner thread count (default: auto)\n"
-      << "  MIQ_RPC_TOKEN=<token>    Set RPC authentication token\n"
-      << "  MIQ_MINER_HEARTBEAT=<p>  Path for external miner heartbeat file\n"
-      << "  MIQ_TUI_UTF8=1           Enable Unicode display (Windows)\n"
-      << "  MIQ_SEED_HOST=<host>     Override DNS seed host\n"
-      << "\n"
-      << "DEFAULT PORTS:\n"
-      << "  P2P:     " << P2P_PORT << "   (peer-to-peer network)\n"
-      << "  RPC:     " << RPC_PORT << "   (JSON-RPC interface)\n"
-      << "  Stratum: 3333   (pool mining)\n"
-      << "\n"
-      << "EXAMPLES:\n"
-      << "  miqrod --mine                    Start node with built-in miner\n"
-      << "  miqrod --datadir=/data/miq      Use custom data directory\n"
-      << "  miqrod --no-tui                  Run with plain log output\n"
-      << "\n"
-      << "For more information, visit: https://github.com/miqrochain\n"
+      << "Ports:\n"
+      << "  P2P: " << P2P_PORT << "  RPC: " << RPC_PORT << "  Stratum: 3333\n"
       << "\n";
 }
 static bool is_recognized_arg(const std::string& s){
@@ -2784,30 +2763,25 @@ int main(int argc, char** argv){
 
     ConsoleWriter cw;
 
-    // Professional startup splash with ASCII banner
+    // Startup splash
     if (can_tui && vt_ok) {
-        // Clear screen and show banner
         cw.write_raw("\x1b[2J\x1b[H");
 
-        // Display main banner
+        // Display banner
         if (u8_ok) {
             for (int i = 0; kMiqrochainBanner[i] != nullptr; ++i) {
-                cw.write_raw("\x1b[36m"); // Cyan color
+                cw.write_raw("\x1b[36m");
                 cw.write_raw(kMiqrochainBanner[i]);
                 cw.write_raw("\x1b[0m\n");
             }
         } else {
-            cw.write_raw("\n");
-            cw.write_raw("  ==================================================\n");
-            cw.write_raw("  |           M I Q R O C H A I N   N O D E        |\n");
-            cw.write_raw("  ==================================================\n");
-            cw.write_raw("\n");
+            cw.write_raw("\n  MIQROCHAIN NODE\n\n");
         }
 
-        // Version and info line
+        // Version line
         std::ostringstream info;
-        info << "\x1b[1m  Version " << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
-             << " Stable\x1b[0m   |   " << CHAIN_NAME << "   |   ";
+        info << "  v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
+             << "  |  " << CHAIN_NAME << "  |  ";
 #ifdef _WIN32
         info << "Windows";
 #elif defined(__APPLE__)
@@ -2815,24 +2789,20 @@ int main(int argc, char** argv){
 #else
         info << "Linux";
 #endif
-        info << "\n";
+        info << "\n\n";
         cw.write_raw(info.str());
 
-        // Startup message
-        cw.write_raw("\n\x1b[33m  Initializing node...\x1b[0m  (Ctrl+C to exit; Ctrl+C twice = force)\n\n");
-
-        // Brief loading animation
+        // Loading animation
+        cw.write_raw("  Initializing");
+        std::fflush(stdout);
         for (int i = 0; i < 3; ++i) {
-            cw.write_raw("  \x1b[32m*\x1b[0m");
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            cw.write_raw(".");
             std::fflush(stdout);
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
         }
         cw.write_raw("\n\n");
     } else {
-        if (u8_ok)
-            cw.write_raw("Starting miqrod…  (Ctrl+C to exit; Ctrl+C twice = force)\n");
-        else
-            cw.write_raw("Starting miqrod...  (Ctrl+C to exit; Ctrl+C twice = force)\n");
+        cw.write_raw("Starting miqrod...\n");
     }
 
     LogCapture capture;
@@ -2918,8 +2888,8 @@ int main(int argc, char** argv){
     // TUI start
     if (can_tui) {
         tui.start();
-        tui.set_banner(u8_ok ? "Preparing Miqrochain node…" : "Preparing Miqrochain node...");
-        tui.mark_step_ok("Parse CLI / environment");
+        tui.set_banner("Initializing");
+        tui.mark_step_ok("Parse CLI");
         tui.set_node_state(TUI::NodeState::Starting);
         tui.set_datadir(cfg.datadir.empty()? default_datadir(): cfg.datadir);
     }
@@ -2939,7 +2909,7 @@ int main(int argc, char** argv){
         if (can_tui) {
             tui.mark_step_ok("Load config & choose datadir");
             tui.mark_step_ok("Config/datadir ready");
-            tui.set_banner(std::string("Starting services...   Datadir: ") + cfg.datadir);
+            tui.set_banner("Starting services");
             tui.set_datadir(cfg.datadir);
         }
 
@@ -3052,7 +3022,7 @@ int main(int argc, char** argv){
         if (ibd_ok) {
             if (can_tui) {
                 tui.mark_step_ok("IBD sync phase");
-                tui.set_banner("Initial block download complete. Node is synced.");
+                tui.set_banner("Synced");
                 tui.set_node_state(TUI::NodeState::Running);
                 tui.set_mining_gate(true, "");
             }
@@ -3220,8 +3190,7 @@ int main(int argc, char** argv){
         if (can_tui) {
             const bool ibd_ok_or_solo = ibd_ok || solo_seed_mode(cfg.no_p2p ? nullptr : &p2p);
             if (ibd_ok_or_solo) {
-                tui.set_banner(u8_ok ? "Miqrochain node running — synced & serving peers…" :
-                                       "Miqrochain node running - synced & serving peers...");
+                tui.set_banner("Running");
                 auto role = compute_seed_role();
                 if (role.we_are_seed) {
                     tui.set_banner_append(std::string("SEED: ") + seed_host_cstr());
@@ -3229,8 +3198,7 @@ int main(int argc, char** argv){
                 }
                 tui.set_node_state(TUI::NodeState::Running);
             } else {
-                tui.set_banner(u8_ok ? "Node running — IBD failed (see error). Mining disabled." :
-                                       "Node running - IBD failed (see error). Mining disabled.");
+                tui.set_banner("Degraded - IBD failed");
                 tui.set_node_state(TUI::NodeState::Degraded);
             }
         }
@@ -3309,7 +3277,7 @@ int main(int argc, char** argv){
 
         if (can_tui) {
                 tui.set_node_state(TUI::NodeState::Quitting);
-                tui.set_banner("Shutting down safely...");
+                tui.set_banner("Shutting down");
             }
         log_info("Shutdown requested - stopping services...");
 
