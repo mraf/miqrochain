@@ -2552,6 +2552,11 @@ static void save_pending(const std::string& wdir, const std::set<OutpointKey>& s
     }
 }
 
+// Forward declaration for pending management functions (defined after QueuedTransaction)
+static bool remove_inputs_from_pending(const std::string& wdir,
+                                        const std::vector<uint8_t>& raw_tx,
+                                        std::set<OutpointKey>& pending);
+
 // =============================================================================
 // TRANSACTION HISTORY - Professional tracking
 // =============================================================================
@@ -2841,7 +2846,7 @@ static void add_to_tx_queue(const std::string& wdir, const QueuedTransaction& tx
 
     std::vector<QueuedTransaction> filtered;
     for(const auto& q : queue){
-        if(now - q.created_at < expiry_seconds || q.status == "confirmed"){
+        if(now - q.created_at < expiry_seconds || q.status == "confirmed" || q.status == "broadcast"){
             filtered.push_back(q);
         }
     }
@@ -2884,6 +2889,124 @@ static int count_pending_in_queue(const std::string& wdir){
             count++;
         }
     }
+    return count;
+}
+
+// =============================================================================
+// CRITICAL BUG FIX: Remove inputs from pending when transactions fail/expire
+// =============================================================================
+
+// Remove pending entries for all inputs in a raw transaction
+static bool remove_inputs_from_pending(const std::string& wdir,
+                                        const std::vector<uint8_t>& raw_tx,
+                                        std::set<OutpointKey>& pending) {
+    // Deserialize transaction to get inputs
+    miq::Transaction tx;
+    if (!miq::deser_tx(raw_tx, tx)) {
+        return false;  // Could not deserialize
+    }
+
+    bool removed_any = false;
+    for (const auto& in : tx.vin) {
+        OutpointKey k{ miq::to_hex(in.prev.txid), in.prev.vout };
+        auto it = pending.find(k);
+        if (it != pending.end()) {
+            pending.erase(it);
+            removed_any = true;
+        }
+    }
+
+    if (removed_any) {
+        save_pending(wdir, pending);
+    }
+
+    return removed_any;
+}
+
+// Remove pending entries for a transaction by TXID (looks up in queue)
+[[maybe_unused]] static bool remove_tx_inputs_from_pending_by_txid(const std::string& wdir,
+                                                   const std::string& txid_hex,
+                                                   std::set<OutpointKey>& pending) {
+    // Load queue to find the transaction
+    std::vector<QueuedTransaction> queue;
+    load_tx_queue(wdir, queue);
+
+    for (const auto& qtx : queue) {
+        if (qtx.txid_hex == txid_hex && !qtx.raw_tx.empty()) {
+            return remove_inputs_from_pending(wdir, qtx.raw_tx, pending);
+        }
+    }
+    return false;
+}
+
+// Clean up all failed/expired transactions from pending set
+[[maybe_unused]] static int cleanup_failed_tx_pending(const std::string& wdir,
+                                      std::set<OutpointKey>& pending) {
+    std::vector<QueuedTransaction> queue;
+    load_tx_queue(wdir, queue);
+
+    int cleaned = 0;
+    for (const auto& tx : queue) {
+        if ((tx.status == "failed" || tx.status == "expired") && !tx.raw_tx.empty()) {
+            if (remove_inputs_from_pending(wdir, tx.raw_tx, pending)) {
+                cleaned++;
+            }
+        }
+    }
+    return cleaned;
+}
+
+// Cancel a pending transaction and release its inputs
+[[maybe_unused]] static bool cancel_pending_transaction(const std::string& wdir,
+                                        const std::string& txid_hex,
+                                        std::set<OutpointKey>& pending,
+                                        std::string& error) {
+    std::vector<QueuedTransaction> queue;
+    load_tx_queue(wdir, queue);
+
+    // Find and remove the transaction
+    bool found = false;
+    std::vector<uint8_t> raw_tx;
+    std::vector<QueuedTransaction> new_queue;
+
+    for (auto& tx : queue) {
+        if (tx.txid_hex == txid_hex) {
+            found = true;
+            raw_tx = tx.raw_tx;
+
+            // Can only cancel if not already confirmed/broadcast
+            if (tx.status == "confirmed" || tx.status == "broadcast") {
+                error = "Cannot cancel transaction that was already broadcast to network";
+                return false;
+            }
+            // Don't add to new queue - effectively removes it
+        } else {
+            new_queue.push_back(tx);
+        }
+    }
+
+    if (!found) {
+        error = "Transaction not found in queue";
+        return false;
+    }
+
+    // Remove inputs from pending
+    if (!raw_tx.empty()) {
+        remove_inputs_from_pending(wdir, raw_tx, pending);
+    }
+
+    // Save updated queue
+    save_tx_queue(wdir, new_queue);
+
+    return true;
+}
+
+// Force release all pending UTXOs (emergency recovery)
+[[maybe_unused]] static int force_release_all_pending(const std::string& wdir,
+                                      std::set<OutpointKey>& pending) {
+    int count = (int)pending.size();
+    pending.clear();
+    save_pending(wdir, pending);
     return count;
 }
 
@@ -3261,6 +3384,7 @@ static bool broadcast_any_seed(
 static int process_tx_queue(
     const std::string& wdir,
     const std::vector<std::pair<std::string,std::string>>& seeds,
+    std::set<OutpointKey>& pending,
     bool verbose = true)
 {
     std::vector<QueuedTransaction> queue;
@@ -3269,14 +3393,25 @@ static int process_tx_queue(
     if(queue.empty()) return 0;
 
     int broadcasted = 0;
+    int failed_or_expired = 0;
     int64_t now = (int64_t)time(nullptr);
 
     for(auto& tx : queue){
         // Skip if not queued or already too many attempts
         if(tx.status != "queued" && tx.status != "broadcasting") continue;
+
         if(tx.broadcast_attempts >= wallet_config::MAX_BROADCAST_ATTEMPTS){
             tx.status = "failed";
             tx.error_msg = "Max broadcast attempts exceeded";
+
+            // CRITICAL FIX: Release inputs back to spendable pool
+            if(!tx.raw_tx.empty()){
+                remove_inputs_from_pending(wdir, tx.raw_tx, pending);
+                failed_or_expired++;
+                if(verbose){
+                    ui::print_warning("TX " + tx.txid_hex.substr(0, 8) + "... failed - inputs released");
+                }
+            }
             continue;
         }
 
@@ -3285,6 +3420,15 @@ static int process_tx_queue(
         if(age_hours >= wallet_config::TX_EXPIRY_HOURS){
             tx.status = "expired";
             tx.error_msg = "Transaction expired after " + std::to_string(wallet_config::TX_EXPIRY_HOURS) + " hours";
+
+            // CRITICAL FIX: Release inputs back to spendable pool
+            if(!tx.raw_tx.empty()){
+                remove_inputs_from_pending(wdir, tx.raw_tx, pending);
+                failed_or_expired++;
+                if(verbose){
+                    ui::print_warning("TX " + tx.txid_hex.substr(0, 8) + "... expired - inputs released");
+                }
+            }
             continue;
         }
 
@@ -3298,7 +3442,7 @@ static int process_tx_queue(
 
         std::string used_seed, err;
         if(broadcast_any_seed(seeds, tx.raw_tx, used_seed, err)){
-            tx.status = "confirmed";
+            tx.status = "broadcast";  // Changed from "confirmed" - more accurate
             tx.error_msg = "";
             broadcasted++;
 
@@ -3646,10 +3790,12 @@ static bool wallet_session(const std::string& cli_host,
             ui::print_info("Found " + std::to_string(pending_count) + " pending transaction(s) in queue");
             std::cout << "  " << ui::dim() << "Attempting to broadcast..." << ui::reset() << "\n";
 
-            int broadcasted = process_tx_queue(wdir, seeds, true);
+            int broadcasted = process_tx_queue(wdir, seeds, pending, true);
             if(broadcasted > 0){
                 std::cout << "\n";
                 ui::print_success("Successfully broadcasted " + std::to_string(broadcasted) + " transaction(s)");
+                // Refresh balance after cleanup
+                utxos = refresh_and_print();
             }
             std::cout << "\n";
         }
@@ -4489,18 +4635,18 @@ static bool wallet_session(const std::string& cli_host,
                 std::cout << "  " << ui::dim() << "Transactions in queue: " << queue.size() << ui::reset() << "\n\n";
 
                 // Count by status
-                int queued = 0, confirmed = 0, failed = 0, expired = 0;
+                int queued = 0, broadcast = 0, failed = 0, expired = 0;
                 for(const auto& tx : queue){
                     if(tx.status == "queued" || tx.status == "broadcasting") queued++;
-                    else if(tx.status == "confirmed") confirmed++;
+                    else if(tx.status == "confirmed" || tx.status == "broadcast") broadcast++;
                     else if(tx.status == "failed") failed++;
                     else if(tx.status == "expired") expired++;
                 }
 
                 if(queued > 0)
                     std::cout << "  " << ui::yellow() << "Pending: " << queued << ui::reset() << "\n";
-                if(confirmed > 0)
-                    std::cout << "  " << ui::green() << "Confirmed: " << confirmed << ui::reset() << "\n";
+                if(broadcast > 0)
+                    std::cout << "  " << ui::green() << "Broadcast: " << broadcast << ui::reset() << "\n";
                 if(failed > 0)
                     std::cout << "  " << ui::red() << "Failed: " << failed << ui::reset() << "\n";
                 if(expired > 0)
@@ -4524,7 +4670,7 @@ static bool wallet_session(const std::string& cli_host,
                     std::cout << "\n";
 
                     // Show error if any
-                    if(!tx.error_msg.empty() && tx.status != "confirmed"){
+                    if(!tx.error_msg.empty() && tx.status != "confirmed" && tx.status != "broadcast"){
                         std::cout << "    " << ui::red() << ui::dim() << tx.error_msg << ui::reset() << "\n";
                     }
                 }
@@ -4553,12 +4699,14 @@ static bool wallet_session(const std::string& cli_host,
                 ui::print_info("Broadcasting " + std::to_string(pending_count) + " pending transaction(s)...");
                 std::cout << "\n";
 
-                int broadcasted = process_tx_queue(wdir, seeds, true);
+                int broadcasted = process_tx_queue(wdir, seeds, pending, true);
 
                 std::cout << "\n";
                 if(broadcasted > 0){
                     ui::print_success("Successfully broadcasted " + std::to_string(broadcasted) + " transaction(s)");
                     is_online = true;
+                    // Refresh balance after broadcast/cleanup
+                    utxos = refresh_and_print();
                 } else if(broadcasted == 0 && pending_count > 0){
                     ui::print_warning("No transactions could be broadcasted");
                     std::cout << "  " << ui::dim() << "Check network connectivity and try again" << ui::reset() << "\n";
@@ -4577,9 +4725,11 @@ static bool wallet_session(const std::string& cli_host,
             int pending_count = count_pending_in_queue(wdir);
             if(pending_count > 0 && is_online){
                 std::cout << "  " << ui::dim() << "Broadcasting " << pending_count << " queued transaction(s)..." << ui::reset() << "\n";
-                int broadcasted = process_tx_queue(wdir, seeds, false);
+                int broadcasted = process_tx_queue(wdir, seeds, pending, false);
                 if(broadcasted > 0){
                     std::cout << "  " << ui::green() << "Broadcasted " << broadcasted << " transaction(s)" << ui::reset() << "\n\n";
+                    // Refresh balance display
+                    utxos = refresh_and_print();
                 }
             }
         }
