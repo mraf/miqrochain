@@ -1114,12 +1114,12 @@ bool P2PLight::read_until_verack(std::string& err){
             if (!payload.empty() && (payload.size() % 4) == 0){
                 size_t n = payload.size()/4;
                 int added = 0;
-                for(size_t i=0;i<n;i++){
+                for(size_t j=0;j<n;j++){
                     uint32_t be_ip =
-                        (uint32_t(payload[4*i+0])<<24) |
-                        (uint32_t(payload[4*i+1])<<16) |
-                        (uint32_t(payload[4*i+2])<<8 ) |
-                        (uint32_t(payload[4*i+3])<<0 );
+                        (uint32_t(payload[4*j+0])<<24) |
+                        (uint32_t(payload[4*j+1])<<16) |
+                        (uint32_t(payload[4*j+2])<<8 ) |
+                        (uint32_t(payload[4*j+3])<<0 );
                     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = be_ip;
                     char buf[64]={0};
 #ifdef _WIN32

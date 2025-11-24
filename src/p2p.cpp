@@ -67,6 +67,8 @@
 #if !defined(MIQ_MAYBE_UNUSED)
   #if defined(__GNUC__) || defined(__clang__)
     #define MIQ_MAYBE_UNUSED __attribute__((unused))
+  #elif defined(_MSC_VER)
+    #define MIQ_MAYBE_UNUSED [[maybe_unused]]
   #else
     #define MIQ_MAYBE_UNUSED
   #endif
@@ -3040,8 +3042,8 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
         // Request next block immediately after accepting one (Bitcoin-style sequential sync)
         // This is more efficient than batch requests and prevents over-requesting
-        uint32_t current_height = chain_.height();
-        uint32_t next_height = current_height + 1;
+        uint64_t current_height = chain_.height();
+        uint64_t next_height = current_height + 1;
 
         // During IBD, always request the next block from peers
         // The peer will respond with the block if they have it, or ignore if they don't
@@ -3049,7 +3051,7 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             auto& pps = kvp.second;
             if (!pps.verack_ok) continue;
             if (!peer_is_index_capable((Sock)pps.sock)) continue;
-            uint32_t best_hdr_height = chain_.best_header_height();
+            uint64_t best_hdr_height = chain_.best_header_height();
             uint64_t peer_or_hdr_tip = (pps.peer_tip_height > 0)
                 ? std::max<uint64_t>(pps.peer_tip_height, best_hdr_height)
                 : (uint64_t)best_hdr_height;
@@ -3380,7 +3382,7 @@ void P2P::loop(){
                 std::vector<std::vector<uint8_t>> locator;
                 chain_.build_locator(locator);
                 std::vector<std::vector<uint8_t>> loc_rev = locator;
-                for (auto& h : loc_rev) std::reverse(h.begin(), h.end());
+                for (auto& hash : loc_rev) std::reverse(hash.begin(), hash.end());
                 std::vector<uint8_t> stop(32, 0);
                 auto pl_n = build_getheaders_payload(locator, stop);
                 auto pl_f = build_getheaders_payload(loc_rev, stop);
@@ -3862,7 +3864,7 @@ void P2P::loop(){
 
             // Enhanced sync completion logic with aggressive refetch mechanism
             // Track stall detection for continuous sync
-            static uint32_t last_height_check = 0;
+            static uint64_t last_height_check = 0;
             static int64_t last_height_time = now_ms();
             static int64_t last_refetch_time = 0;
             int64_t now = now_ms();
@@ -3950,20 +3952,20 @@ void P2P::loop(){
                         update_adaptive_batch_size(pps);
 
                         // Determine how many blocks to request (adaptive based on peer reputation)
-                        uint32_t best_hdr_height = chain_.best_header_height();
-                        uint32_t max_height = (best_hdr_height > current_height)
+                        uint64_t best_hdr_height = chain_.best_header_height();
+                        uint64_t max_height = (best_hdr_height > current_height)
                             ? best_hdr_height
                             : current_height + pps.adaptive_batch_size;  // Use adaptive batch size
 
                         // Cap to peer's known tip height: don't request beyond what peer has sent us
                         if (pps.peer_tip_height > 0 && pps.peer_tip_height > current_height) {
-                            max_height = std::min((uint32_t)max_height, (uint32_t)pps.peer_tip_height);
+                            max_height = std::min(max_height, (uint64_t)pps.peer_tip_height);
                         }
 
                         // Request blocks up to max_height (or current_height + adaptive_batch_size, whichever is smaller)
-                        uint32_t batch_end = std::min((uint32_t)max_height, (uint32_t)(current_height + pps.adaptive_batch_size));
+                        uint64_t batch_end = std::min(max_height, current_height + pps.adaptive_batch_size);
 
-                        for (uint32_t h = current_height + 1; h <= batch_end; h++) {
+                        for (uint64_t h = current_height + 1; h <= batch_end; h++) {
                             request_block_index(pps, (uint64_t)h);
                             if (h == current_height + 1 || h == batch_end) {
                                 log_info("TX " + pps.ip + " cmd=getbi height=" + std::to_string(h) +
@@ -4366,7 +4368,7 @@ void P2P::loop(){
                         }
                         auto itT = peers_.find(target);
                         if (itT != peers_.end()) {
-                            uint8_t p8[8]; for (int i=0;i<8;i++) p8[i] = (uint8_t)((idx>>(8*i))&0xFF);
+                            uint8_t p8[8]; for (int j=0;j<8;j++) p8[j] = (uint8_t)((idx>>(8*j))&0xFF);
                             auto msg = encode_msg("getbi", std::vector<uint8_t>(p8,p8+8));
                             if (send_or_close(target, msg)) {
                                 g_inflight_index_ts[target][idx] = now_ms();
@@ -4625,7 +4627,7 @@ void P2P::loop(){
                             peer_ver = (int32_t)((uint32_t)m.payload[0] | ((uint32_t)m.payload[1]<<8) | ((uint32_t)m.payload[2]<<16) | ((uint32_t)m.payload[3]<<24));
                         }
                         if (m.payload.size() >= 12) {
-                            for(int i=0;i<8;i++) peer_services |= ((uint64_t)m.payload[4+i]) << (8*i);
+                            for(int j=0;j<8;j++) peer_services |= ((uint64_t)m.payload[4+j]) << (8*j);
                         }
                         ps.version  = peer_ver;
                         ps.features = peer_services;
@@ -4662,8 +4664,8 @@ void P2P::loop(){
                                 pos += 4;
                             } else if (ua_len == 0xFF && pos + 8 <= m.payload.size()) {
                                 ua_size = 0;
-                                for (int i = 0; i < 8; ++i) {
-                                    ua_size |= ((uint64_t)m.payload[pos + i]) << (8 * i);
+                                for (int j = 0; j < 8; ++j) {
+                                    ua_size |= ((uint64_t)m.payload[pos + j]) << (8 * j);
                                 }
                                 pos += 8;
                             } else {
@@ -4736,7 +4738,7 @@ void P2P::loop(){
                             g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
                             // Use received headers to raise our estimate of this peer's tip.
                             {
-                                uint32_t bhh = chain_.best_header_height();
+                                uint64_t bhh = chain_.best_header_height();
                                 if (bhh > ps.peer_tip_height) ps.peer_tip_height = bhh;
                             }
                         } else if (hs.size() > 0) {
@@ -4827,7 +4829,7 @@ void P2P::loop(){
                         g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
                         if (m.payload.size() == 8) {
                             uint64_t idx64 = 0;
-                            for (int i=0;i<8;i++) idx64 |= ((uint64_t)m.payload[i]) << (8*i);
+                            for (int j=0;j<8;j++) idx64 |= ((uint64_t)m.payload[j]) << (8*j);
                             P2P_TRACE("DEBUG: getbi request for index " + std::to_string(idx64) + " from " + ps.ip);
 
                             Block b;
@@ -4902,9 +4904,9 @@ void P2P::loop(){
                                 auto block_hash_vec = hb.block_hash();
                                 uint64_t delivered_idx = 0;
                                 std::vector<uint8_t> idx_hash;
-                                for (auto it = g_inflight_index_ts[(Sock)s].begin(); it != g_inflight_index_ts[(Sock)s].end(); ++it) {
-                                    if (chain_.get_hash_by_index(it->first, idx_hash) && idx_hash == block_hash_vec) {
-                                        delivered_idx = it->first;
+                                for (auto it2 = g_inflight_index_ts[(Sock)s].begin(); it2 != g_inflight_index_ts[(Sock)s].end(); ++it2) {
+                                    if (chain_.get_hash_by_index(it2->first, idx_hash) && idx_hash == block_hash_vec) {
+                                        delivered_idx = it2->first;
                                         break;
                                     }
                                 }
@@ -4947,9 +4949,9 @@ void P2P::loop(){
                         std::vector<uint8_t> idx_hash2;
                         if (!want3.empty()) {
                             auto missing_hash = want3[0];
-                            for (auto it = g_inflight_index_ts[(Sock)s].begin(); it != g_inflight_index_ts[(Sock)s].end(); ++it) {
-                                if (chain_.get_hash_by_index(it->first, idx_hash2) && idx_hash2 == missing_hash) {
-                                    g_inflight_index_ts[(Sock)s].erase(it);
+                            for (auto it2 = g_inflight_index_ts[(Sock)s].begin(); it2 != g_inflight_index_ts[(Sock)s].end(); ++it2) {
+                                if (chain_.get_hash_by_index(it2->first, idx_hash2) && idx_hash2 == missing_hash) {
+                                    g_inflight_index_ts[(Sock)s].erase(it2);
                                     break;
                                 }
                             }
@@ -5005,7 +5007,7 @@ void P2P::loop(){
                             std::string err;
                             bool accepted = true;
                             if (mempool_) {
-                                accepted = mempool_->accept(tx, chain_.utxo(), chain_.height(), err);
+                                accepted = mempool_->accept(tx, chain_.utxo(), static_cast<uint32_t>(chain_.height()), err);
                             }
                             bool in_mempool = mempool_ && mempool_->exists(tx.txid());
 
@@ -5072,7 +5074,7 @@ void P2P::loop(){
                     } else if (cmd == "feefilter") {
                         if (m.payload.size() == 8) {
                             uint64_t kb = 0;
-                            for(int i=0;i<8;i++) kb |= (uint64_t)m.payload[i] << (8*i);
+                            for(int j=0;j<8;j++) kb |= (uint64_t)m.payload[j] << (8*j);
                             set_peer_feefilter(s, kb);
                         } else {
                             if (++ps.mis > 10) { dead.push_back(s); }
@@ -5086,8 +5088,8 @@ void P2P::loop(){
                         if (m.payload.size() >= 9) {
                             bool high_bandwidth = (m.payload[0] != 0);
                             uint64_t version = 0;
-                            for (int i = 0; i < 8; i++) {
-                                version |= (uint64_t)m.payload[1 + i] << (8 * i);
+                            for (int j = 0; j < 8; j++) {
+                                version |= (uint64_t)m.payload[1 + j] << (8 * j);
                             }
                             // We support version 1 and 2
                             if (version == 1 || version == 2) {
@@ -5225,9 +5227,9 @@ void P2P::loop(){
                         if (used_reverse) { g_hdr_flip[s] = true; }
 
                         if (hs.empty() || accepted == 0) {
-                            int &z = g_zero_hdr_batches[s];
-                            if (++z >= MIQ_HEADERS_EMPTY_LIMIT) {
-                                z = 0;
+                            int &zero_count = g_zero_hdr_batches[s];
+                            if (++zero_count >= MIQ_HEADERS_EMPTY_LIMIT) {
+                                zero_count = 0;
                                 g_hdr_flip[s] = !g_hdr_flip[s]; // try the other orientation next
                                 // If peer supports index-by-height, kick that pipeline too.
                                 if (peer_is_index_capable(s)) {
@@ -5261,17 +5263,17 @@ void P2P::loop(){
                             bool zero_progress = (!at_tip) && (accepted == 0) &&
                                 (now_ms() - g_last_progress_ms) > g_stall_retry_ms;
                             if (zero_progress) {
-                                int &z = g_zero_hdr_batches[s];
-                                z++;
+                                int &zero_count = g_zero_hdr_batches[s];
+                                zero_count++;
                                 g_hdr_flip[s] = !g_hdr_flip[s]; // alternate locator orientation next time
-                                if (z >= MIQ_HEADERS_EMPTY_LIMIT) {
+                                if (zero_count >= MIQ_HEADERS_EMPTY_LIMIT) {
                                     log_warn("P2P: no headers progress after 3 full batches; falling back to by-index sync");
                                     ps.banscore = std::min(ps.banscore + 1, MIQ_P2P_MAX_BANSCORE);
                                     ps.syncing = true;
                                     ps.inflight_index = 0;
-                                    ps.next_index = chain_.height() + 1;  
+                                    ps.next_index = chain_.height() + 1;
                                     fill_index_pipeline(ps);
-                                    z = 0;
+                                    zero_count = 0;
                                     g_peer_stalls[(Sock)s]++;
                                     if (g_peer_stalls[(Sock)s] >= MIQ_P2P_BAD_PEER_MAX_STALLS && !is_loopback(ps.ip)) {
                                         // disconnect persistently stalling peer (keeps the network moving)
@@ -5639,7 +5641,7 @@ void P2P::loop(){
         {
             std::vector<std::vector<uint8_t>> todos;
             {
-                std::lock_guard<std::mutex> lk(announce_tx_mu_);
+                std::lock_guard<std::mutex> lk_tx(announce_tx_mu_);
                 if (!announce_tx_q_.empty()) { todos.swap(announce_tx_q_); }
             }
             if (!todos.empty()) {
@@ -5657,7 +5659,7 @@ void P2P::loop(){
         {
             std::vector<std::vector<uint8_t>> todo;
             {
-                std::lock_guard<std::mutex> lk(announce_mu_);
+                std::lock_guard<std::mutex> lk_blk(announce_mu_);
                 if (!announce_blocks_q_.empty()) {
                     todo.swap(announce_blocks_q_);
                 }

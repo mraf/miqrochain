@@ -731,6 +731,7 @@ static bool rpc_getblock_time_bits(const std::string& host, uint16_t port, const
 
 // Diagnostic helper to identify RPC connection issues
 static std::string diagnose_rpc_failure(const std::string& host, uint16_t port, const std::string& auth, const HttpResp& r){
+    (void)host; (void)port;  // Reserved for future diagnostic enhancements
     if(r.code == 0) return "Connection failed - node not running or wrong port";
     if(r.code == 401 || r.code == 403) {
         if(auth.empty()) return "Auth required but no token provided - check cookie file or --token";
@@ -958,7 +959,7 @@ static std::string fmt_miq_amount(uint64_t base_units){
     return o.str();
 }
 
-static std::string fmt_miq_whole_dot(uint64_t base_units){
+[[maybe_unused]] static std::string fmt_miq_whole_dot(uint64_t base_units){
     uint64_t whole = base_units / MIQ_COIN_UNITS;
     std::ostringstream o; o << whole << '.';
     return o.str();
@@ -1129,6 +1130,7 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
         static std::atomic<uint64_t> template_requests{0};
         static std::atomic<uint64_t> template_successes{0};
         uint64_t req_num = template_requests.fetch_add(1);
+        (void)req_num;  // Reserved for future logging/debugging
         if(http_post_with_retry(host, port, "/", auth, rpc_build("getminertemplate","[]"), r, 3, true) && r.code==200 && !json_has_error(r.body)){
             template_successes.fetch_add(1);
             uint32_t bits=0;
@@ -2264,7 +2266,7 @@ public:
 
     bool send_json(const std::string& json) {
         std::string msg = json + "\n";
-        return ::send(sock, msg.c_str(), msg.size(), 0) > 0;
+        return ::send(sock, msg.c_str(), static_cast<int>(msg.size()), 0) > 0;
     }
 
     std::string recv_line(int timeout_ms = 30000) {
@@ -3217,7 +3219,7 @@ int main(int argc, char** argv){
 
                 // Show uptime and version
                 static auto start_time = clock::now();
-                auto uptime_secs = std::chrono::duration_cast<std::chrono::seconds>(clock::now() - start_time).count();
+                int uptime_secs = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(clock::now() - start_time).count());
                 int hours = uptime_secs / 3600;
                 int mins = (uptime_secs % 3600) / 60;
                 int secs = uptime_secs % 60;

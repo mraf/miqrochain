@@ -1,6 +1,8 @@
 #ifdef _MSC_VER
   #pragma execution_character_set("utf-8")
-  #define _CRT_SECURE_NO_WARNINGS
+  #ifndef _CRT_SECURE_NO_WARNINGS
+    #define _CRT_SECURE_NO_WARNINGS
+  #endif
 #endif
 
 // =============================================================================
@@ -536,8 +538,8 @@ static void release_datadir_lock(){
 // ==================================================================
 /*                    Signals / console control / input                       */
 // ==================================================================
-static void sighup_handler(int){ global::reload_requested.store(true); }
-static void sigshutdown_handler(int){ request_shutdown("signal"); }
+[[maybe_unused]] static void sighup_handler(int){ global::reload_requested.store(true); }
+[[maybe_unused]] static void sigshutdown_handler(int){ request_shutdown("signal"); }
 
 #ifdef _WIN32
 static BOOL WINAPI win_ctrl_handler(DWORD evt){
@@ -808,6 +810,7 @@ static inline std::string fmt_num(uint64_t n){
 
 // Percentage with color hint
 static inline std::string fmt_pct(double pct, bool use_color = false){
+    (void)use_color;  // Reserved for future color formatting
     std::ostringstream o;
     o << std::fixed << std::setprecision(1) << pct << "%";
     return o.str();
@@ -1076,15 +1079,29 @@ template<typename H> struct has_nBits_field<H, std::void_t<decltype(std::declval
 
 template<typename H>
 static uint64_t hdr_time(const H& h){
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4702)  // Unreachable code from if constexpr
+#endif
     if constexpr (has_time_field<H>::value) return (uint64_t)h.time;
     if constexpr (has_timestamp_field<H>::value) return (uint64_t)h.timestamp;
     return 0;
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 }
 template<typename H>
 static uint32_t hdr_bits(const H& h){
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4702)  // Unreachable code from if constexpr
+#endif
     if constexpr (has_bits_field<H>::value) return (uint32_t)h.bits;
     if constexpr (has_nBits_field<H>::value) return (uint32_t)h.nBits;
     return (uint32_t)GENESIS_BITS;
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 }
 
 // Difficulty helpers
@@ -1614,6 +1631,7 @@ private:
     }
 
     void draw_once(bool first){
+        (void)first;  // Reserved for future first-draw optimization
         std::lock_guard<std::mutex> lk(mu_);
         int cols, rows; term::get_winsize(cols, rows);
         if (cols < 114) cols = 114;

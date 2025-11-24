@@ -1855,7 +1855,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
     {
         std::vector<uint8_t> fbytes;
         if (miq::gcs::build_block_filter(b, fbytes)) {
-            if (!g_filter_store.put(new_height, new_hash, fbytes)) {
+            if (!g_filter_store.put(static_cast<uint32_t>(new_height), new_hash, fbytes)) {
                 log_warn("FilterStore: put failed for height=" + std::to_string(new_height) +
                          " hash=" + hexstr(new_hash));
             }
