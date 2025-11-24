@@ -8,6 +8,7 @@
 #include <functional>
 #include <cstdint>
 #include <deque>
+#include "tx.h"  // PRODUCTION FIX: For Transaction type in StratumJob
 
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
@@ -43,6 +44,10 @@ struct StratumJob {
     uint32_t time;
     uint64_t height;
     bool clean_jobs;                      // True if new block, clear old jobs
+
+    // PRODUCTION FIX: Store mempool transactions and total fees for proper block building
+    std::vector<Transaction> mempool_txs; // Transactions to include in block
+    uint64_t total_fees{0};              // Total fees from mempool transactions
 };
 
 // Connected miner state

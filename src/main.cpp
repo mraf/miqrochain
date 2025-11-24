@@ -313,7 +313,12 @@ static inline void telemetry_flush_disk(const BlockSummary& b){
           << (b.fees_known ? (std::string(",\"fees\":") + std::to_string(b.fees)) : "")
           << (b.miner.empty()? "" : (std::string(",\"miner\":\"") + b.miner + "\""))
           << "}\n";
-    }catch(...){}
+    } catch(const std::exception& e) {
+        // PRODUCTION FIX: Log telemetry write errors (non-critical but useful for debugging)
+        log_error(std::string("Telemetry write failed: ") + e.what());
+    } catch(...) {
+        log_error("Telemetry write failed with unknown error");
+    }
 }
 
 // ==================================================================
@@ -3313,7 +3318,12 @@ int main(int argc, char** argv){
             if (can_tui) tui.set_shutdown_phase("Stopping IBD/Seed sentinels...", false);
             std::this_thread::sleep_for(std::chrono::milliseconds(30));
             if (can_tui) tui.set_shutdown_phase("Stopping IBD/Seed sentinels...", true);
-        } catch(...) { }
+        } catch(const std::exception& e) {
+            // PRODUCTION FIX: Log shutdown phase errors
+            log_warn(std::string("IBD/Seed sentinel shutdown threw: ") + e.what());
+        } catch(...) {
+            log_warn("IBD/Seed sentinel shutdown threw (unknown)");
+        }
 
         try {
             if (can_tui) tui.set_shutdown_phase("Stopping miner watch...", false);

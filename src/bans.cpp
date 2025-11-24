@@ -54,16 +54,43 @@ bool BanList::load_json(const std::string& path) {
     std::string s; char buf[4096];
     while (size_t n = std::fread(buf,1,sizeof(buf),f)) s.append(buf, n);
     std::fclose(f);
-    // very small parser tolerant to this file’s own format:
+    // PRODUCTION FIX: Safe parser with bounds checking to prevent buffer overflows
     size_t i=0;
+    const size_t slen = s.size();
     while ((i = s.find("{\"ip\":\"", i)) != std::string::npos) {
-        i += 7; size_t j = s.find("\"", i); if (j==std::string::npos) break; std::string ip=s.substr(i,j-i);
-        size_t k = s.find("\"until_ms\":", j); if (k==std::string::npos) break; k += 11;
-        long long until=std::atoll(s.c_str()+k);
-        k = s.find("\"strikes\":", k); if (k==std::string::npos) break; k += 10; int strikes=std::atoi(s.c_str()+k);
-        k = s.find("\"reason\":\"", k); if (k==std::string::npos) break; k += 10; size_t m = s.find("\"", k); std::string reason=s.substr(k,m-k);
+        i += 7;
+        if (i >= slen) break;
+        size_t j = s.find("\"", i);
+        if (j == std::string::npos || j > slen) break;
+        std::string ip = s.substr(i, j - i);
+
+        size_t k = s.find("\"until_ms\":", j);
+        if (k == std::string::npos) break;
+        k += 11;
+        if (k >= slen) break;
+        // Safe number parsing with bounds check
+        long long until = 0;
+        try { until = std::stoll(s.substr(k, s.find_first_not_of("-0123456789", k) - k)); }
+        catch (...) { break; }
+
+        k = s.find("\"strikes\":", k);
+        if (k == std::string::npos) break;
+        k += 10;
+        if (k >= slen) break;
+        int strikes = 0;
+        try { strikes = std::stoi(s.substr(k, s.find_first_not_of("-0123456789", k) - k)); }
+        catch (...) { break; }
+
+        k = s.find("\"reason\":\"", k);
+        if (k == std::string::npos) break;
+        k += 10;
+        if (k >= slen) break;
+        size_t m = s.find("\"", k);
+        if (m == std::string::npos || m > slen) break;
+        std::string reason = s.substr(k, m - k);
+
         m_[ip] = BanEntry{(int64_t)until, strikes, reason};
-        i = m+1;
+        i = m + 1;
     }
     return true;
 }

@@ -734,7 +734,12 @@ std::string RpcService::handle(const std::string& body){
                     tip.height + 1,
                     MIQ_RETARGET_INTERVAL
                 );
-            } catch(...) {}
+            } catch(const std::exception& e) {
+                // PRODUCTION FIX: Log difficulty calculation errors (uses fallback)
+                log_error(std::string("getblocktemplate: epoch_next_bits failed: ") + e.what());
+            } catch(...) {
+                log_error("getblocktemplate: epoch_next_bits failed with unknown error");
+            }
 
             // Compute MTP for mintime
             int64_t mtp = tip.time;
@@ -746,7 +751,12 @@ std::string RpcService::handle(const std::string& body){
                     std::sort(ts.begin(), ts.end());
                     mtp = ts[ts.size()/2];
                 }
-            } catch(...) {}
+            } catch(const std::exception& e) {
+                // PRODUCTION FIX: Log MTP calculation errors (uses fallback)
+                log_error(std::string("getblocktemplate: MTP calculation failed: ") + e.what());
+            } catch(...) {
+                log_error("getblocktemplate: MTP calculation failed with unknown error");
+            }
             const int64_t mintime = mtp + 1;
             const int64_t curtime = std::max<int64_t>(static_cast<int64_t>(time(nullptr)), mintime);
 
@@ -938,7 +948,12 @@ std::string RpcService::handle(const std::string& body){
                     /*next_height=*/ tip.height + 1,
                     /*interval=*/ MIQ_RETARGET_INTERVAL
                 );
-            } catch(...) {}
+            } catch(const std::exception& e) {
+                // PRODUCTION FIX: Log difficulty calculation errors (uses fallback)
+                log_error(std::string("getminertemplate: epoch_next_bits failed: ") + e.what());
+            } catch(...) {
+                log_error("getminertemplate: epoch_next_bits failed with unknown error");
+            }
 
             // --- NEW: compute MTP (median of last 11 header times) and expose mintime ---
             int64_t mtp = tip.time;
@@ -950,7 +965,12 @@ std::string RpcService::handle(const std::string& body){
                     std::sort(ts.begin(), ts.end());
                     mtp = ts[ts.size()/2];
                 }
-            } catch(...) {}
+            } catch(const std::exception& e) {
+                // PRODUCTION FIX: Log MTP calculation errors (uses fallback)
+                log_error(std::string("getminertemplate: MTP calculation failed: ") + e.what());
+            } catch(...) {
+                log_error("getminertemplate: MTP calculation failed with unknown error");
+            }
             const int64_t mintime = mtp + 1;
 
             std::map<std::string, JNode> o;

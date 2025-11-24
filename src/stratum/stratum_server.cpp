@@ -726,9 +726,9 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
             if (halvings < 64) subsidy = INITIAL_SUBSIDY >> halvings;
             else subsidy = 0;
 
-            // Coinbase output
+            // PRODUCTION FIX: Coinbase output with subsidy + fees
             TxOut cb_out;
-            cb_out.value = subsidy; // TODO: add fees from mempool txs
+            cb_out.value = subsidy + job.total_fees;  // Include mempool tx fees
             cb_out.pkh = reward_pkh_.size() == 20 ? reward_pkh_ : std::vector<uint8_t>(20, 0);
             coinbase_tx.vout.push_back(cb_out);
 
@@ -744,7 +744,10 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
             block.header.nonce = nonce_val;
             block.txs.push_back(coinbase_tx);
 
-            // TODO: Add mempool transactions that were in the job
+            // PRODUCTION FIX: Add mempool transactions from the job
+            for (const auto& tx : job.mempool_txs) {
+                block.txs.push_back(tx);
+            }
 
             // Submit to chain
             std::string submit_err;
@@ -832,8 +835,31 @@ StratumJob StratumServer::create_job() {
     job.height = tip.height + 1;
     job.clean_jobs = true;
 
-    // Build coinbase transaction
-    // Simplified: just creates a basic coinbase
+    // PRODUCTION FIX: Collect mempool transactions and calculate fees
+    job.mempool_txs = mempool_.collect(5000); // Up to 5000 transactions
+    job.total_fees = 0;
+
+    for (const auto& tx : job.mempool_txs) {
+        uint64_t in_sum = 0, out_sum = 0;
+
+        // Calculate input sum (query UTXO set for input values)
+        for (const auto& in : tx.vin) {
+            UTXOEntry e;
+            if (chain_.utxo().get(in.prev.txid, in.prev.vout, e)) {
+                in_sum += e.value;
+            }
+        }
+
+        // Calculate output sum
+        for (const auto& o : tx.vout) {
+            out_sum += o.value;
+        }
+
+        // Fee = inputs - outputs (positive value)
+        if (in_sum > out_sum) {
+            job.total_fees += (in_sum - out_sum);
+        }
+    }
 
     // Calculate subsidy
     uint64_t subsidy = INITIAL_SUBSIDY;
@@ -883,7 +909,9 @@ StratumJob StratumServer::create_job() {
     put_u32_le(coinb2_bytes, 0);  // pubkey length
 
     put_u32_le(coinb2_bytes, 1);  // output count
-    put_u64_le(coinb2_bytes, subsidy); // value
+    // PRODUCTION FIX: Include fees in coinbase value (subsidy + fees)
+    uint64_t coinbase_value = subsidy + job.total_fees;
+    put_u64_le(coinb2_bytes, coinbase_value);
     put_u32_le(coinb2_bytes, 20); // pkh length
 
     // PKH
@@ -897,8 +925,47 @@ StratumJob StratumServer::create_job() {
 
     job.coinb2 = hex_encode(coinb2_bytes);
 
-    // Merkle branches (empty for coinbase-only block)
+    // PRODUCTION FIX: Compute merkle branches from mempool transactions
     job.merkle_branches.clear();
+    if (!job.mempool_txs.empty()) {
+        // Compute tx hashes
+        std::vector<std::vector<uint8_t>> tx_hashes;
+        for (const auto& tx : job.mempool_txs) {
+            tx_hashes.push_back(tx.txid());
+        }
+
+        // Build merkle branches for stratum (coinbase is index 0)
+        // The branches are the sibling hashes needed to compute merkle root
+        while (tx_hashes.size() > 0) {
+            if (tx_hashes.size() == 1) {
+                // Only one tx left, it's a branch
+                job.merkle_branches.push_back(hex_encode(tx_hashes[0]));
+                break;
+            }
+
+            // Take the first tx hash as the branch (sibling of coinbase path)
+            job.merkle_branches.push_back(hex_encode(tx_hashes[0]));
+
+            // Combine pairs for next level
+            std::vector<std::vector<uint8_t>> next_level;
+            for (size_t i = 0; i < tx_hashes.size(); i += 2) {
+                if (i + 1 < tx_hashes.size()) {
+                    // Combine two hashes
+                    std::vector<uint8_t> combined;
+                    combined.insert(combined.end(), tx_hashes[i].begin(), tx_hashes[i].end());
+                    combined.insert(combined.end(), tx_hashes[i+1].begin(), tx_hashes[i+1].end());
+                    next_level.push_back(dsha256(combined));
+                } else {
+                    // Odd element, duplicate
+                    std::vector<uint8_t> combined;
+                    combined.insert(combined.end(), tx_hashes[i].begin(), tx_hashes[i].end());
+                    combined.insert(combined.end(), tx_hashes[i].begin(), tx_hashes[i].end());
+                    next_level.push_back(dsha256(combined));
+                }
+            }
+            tx_hashes = next_level;
+        }
+    }
 
     return job;
 }
