@@ -564,7 +564,10 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
     winsock_ensure();
     addrinfo hints{}; hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_STREAM;
     addrinfo* res=nullptr; char ps[16]; std::snprintf(ps,sizeof(ps), "%u", (unsigned)port);
-    if(getaddrinfo(host.c_str(), ps, &hints, &res)!=0) {
+    int gai_err = getaddrinfo(host.c_str(), ps, &hints, &res);
+    if(gai_err != 0) {
+        out.code = 0;
+        out.body = "DNS resolution failed";
         return false;
     }
     socket_t s =
@@ -577,21 +580,29 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
         s = (socket_t)socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 #if defined(_WIN32)
         if(s==INVALID_SOCKET) continue;
-        set_socket_timeouts(s, 7000, 10000);
+        set_socket_timeouts(s, 10000, 15000);  // Increased timeouts for reliability
         if(connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen)==0) break;
         miq_closesocket(s); s = INVALID_SOCKET;
 #else
         if(s<0) continue;
-        set_socket_timeouts(s, 7000, 10000);
+        set_socket_timeouts(s, 10000, 15000);  // Increased timeouts for reliability
         if(connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen)==0) break;
         miq_closesocket(s); s = -1;
 #endif
     }
     freeaddrinfo(res);
 #if defined(_WIN32)
-    if(s==INVALID_SOCKET) return false;
+    if(s==INVALID_SOCKET) {
+        out.code = 0;
+        out.body = "Connection failed - node not reachable";
+        return false;
+    }
 #else
-    if(s<0) return false;
+    if(s<0) {
+        out.code = 0;
+        out.body = "Connection failed - node not reachable";
+        return false;
+    }
 #endif
 
     std::ostringstream req;
@@ -2163,7 +2174,11 @@ public:
     uint16_t port;
     std::string worker;
     std::string password;
+#if defined(_WIN32)
+    socket_t sock = INVALID_SOCKET;
+#else
     socket_t sock = -1;
+#endif
     std::atomic<bool> connected{false};
     std::mutex mtx;
     std::string extranonce1;
@@ -2176,22 +2191,38 @@ public:
     std::mutex job_mtx;
 
     bool connect_to_pool() {
+        winsock_ensure();
         addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
         addrinfo* res = nullptr;
         char ps[16]; std::snprintf(ps, sizeof(ps), "%u", (unsigned)port);
-        if (getaddrinfo(host.c_str(), ps, &hints, &res) != 0) return false;
+        if (getaddrinfo(host.c_str(), ps, &hints, &res) != 0) {
+            std::fprintf(stderr, "[stratum] DNS resolution failed for %s\n", host.c_str());
+            return false;
+        }
 
         for (addrinfo* ai = res; ai; ai = ai->ai_next) {
             sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+#if defined(_WIN32)
+            if (sock == INVALID_SOCKET) continue;
+#else
             if (sock < 0) continue;
-            set_socket_timeouts(sock, 10000, 30000);
-            if (::connect(sock, ai->ai_addr, ai->ai_addrlen) == 0) break;
-            miq_closesocket(sock); sock = -1;
+#endif
+            set_socket_timeouts(sock, 15000, 30000);  // 15s send, 30s recv
+            if (::connect(sock, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0) {
+                freeaddrinfo(res);
+                connected.store(true);
+                return true;
+            }
+            miq_closesocket(sock);
+#if defined(_WIN32)
+            sock = INVALID_SOCKET;
+#else
+            sock = -1;
+#endif
         }
         freeaddrinfo(res);
-        if (sock < 0) return false;
-        connected.store(true);
-        return true;
+        std::fprintf(stderr, "[stratum] Connection refused by %s:%u\n", host.c_str(), port);
+        return false;
     }
 
     bool send_json(const std::string& json) {
@@ -2344,6 +2375,56 @@ public:
         return resp.find("true") != std::string::npos;
     }
 
+    // Helper to extract array of strings (for merkle_branch)
+    static bool json_array_strings(const std::string& json, int index, std::vector<std::string>& out) {
+        int depth = 0;
+        int current_idx = -1;
+        bool in_string = false;
+        bool in_target_array = false;
+        size_t target_start = 0;
+
+        for (size_t i = 0; i < json.size(); i++) {
+            char c = json[i];
+            if (c == '"' && (i == 0 || json[i-1] != '\\')) {
+                in_string = !in_string;
+            } else if (!in_string) {
+                if (c == '[') {
+                    if (depth == 0) {
+                        current_idx = 0;
+                    } else if (depth == 1 && current_idx == index) {
+                        in_target_array = true;
+                        target_start = i;
+                    }
+                    depth++;
+                } else if (c == ']') {
+                    depth--;
+                    if (in_target_array && depth == 1) {
+                        // Extract the array content
+                        std::string arr = json.substr(target_start, i - target_start + 1);
+                        // Parse strings from this array
+                        out.clear();
+                        bool in_str = false;
+                        size_t str_start = 0;
+                        for (size_t j = 0; j < arr.size(); j++) {
+                            if (arr[j] == '"' && (j == 0 || arr[j-1] != '\\')) {
+                                in_str = !in_str;
+                                if (in_str) {
+                                    str_start = j + 1;
+                                } else {
+                                    out.push_back(arr.substr(str_start, j - str_start));
+                                }
+                            }
+                        }
+                        return true;
+                    }
+                } else if (c == ',' && depth == 1) {
+                    current_idx++;
+                }
+            }
+        }
+        return false;
+    }
+
     // Parse mining.notify job notification
     bool parse_job(const std::string& line) {
         if (line.find("mining.notify") == std::string::npos) return false;
@@ -2361,12 +2442,16 @@ public:
 
         // Parse job parameters: [job_id, prevhash, coinbase1, coinbase2, merkle_branch[], version, nbits, ntime, clean]
         std::string job_id, prev_hash_hex, coinb1, coinb2, version_hex, bits_hex, time_hex;
+        std::vector<std::string> merkle_branch;
 
         if (!json_array_string(params, 0, job_id)) return false;
         if (!json_array_string(params, 1, prev_hash_hex)) return false;
         if (!json_array_string(params, 2, coinb1)) return false;
         if (!json_array_string(params, 3, coinb2)) return false;
-        // Skip merkle_branch[4] for now - we'll handle it simply
+
+        // Parse merkle_branch array at index 4
+        json_array_strings(params, 4, merkle_branch);
+
         if (!json_array_string(params, 5, version_hex)) return false;
         if (!json_array_string(params, 6, bits_hex)) return false;
         if (!json_array_string(params, 7, time_hex)) return false;
@@ -2374,6 +2459,7 @@ public:
         current_job.job_id = job_id;
         current_job.coinbase1 = coinb1;
         current_job.coinbase2 = coinb2;
+        current_job.merkle_branch = merkle_branch;
 
         // Parse hex values
         try {
@@ -2443,10 +2529,17 @@ public:
     }
 
     void disconnect() {
+#if defined(_WIN32)
+        if (sock != INVALID_SOCKET) {
+            miq_closesocket(sock);
+            sock = INVALID_SOCKET;
+        }
+#else
         if (sock >= 0) {
             miq_closesocket(sock);
             sock = -1;
         }
+#endif
         connected.store(false);
         has_job.store(false);
     }
@@ -3082,17 +3175,20 @@ int main(int argc, char** argv){
                 // ═══════════════════════════════════════════════════════════════
                 out << "\n" << C("36") << "======================================================================" << R() << "\n";
 
-                // Show uptime
+                // Show uptime and version
                 static auto start_time = clock::now();
                 auto uptime_secs = std::chrono::duration_cast<std::chrono::seconds>(clock::now() - start_time).count();
                 int hours = uptime_secs / 3600;
                 int mins = (uptime_secs % 3600) / 60;
                 int secs = uptime_secs % 60;
 
-                out << "  " << C("2") << "Uptime: ";
+                out << "  " << C("2") << MIQMINER_VERSION_STRING << R();
+                out << "  |  " << C("2") << "Mode: " << R() << C("1");
+                out << (is_pool_mode ? "POOL" : "SOLO");
+                out << R() << "  |  " << C("2") << "Uptime: " << R();
                 if (hours > 0) out << hours << "h ";
-                out << mins << "m " << secs << "s";
-                out << "   |   Press " << C("1") << "Ctrl+C" << R() << C("2") << " to stop mining" << R() << "\n";
+                out << mins << "m " << secs << "s\n";
+                out << "  " << C("2") << "Press " << C("1") << "Ctrl+C" << R() << C("2") << " to stop mining gracefully" << R() << "\n";
 
                 ++spin_idx;
                 std::cout << out.str() << std::flush;
