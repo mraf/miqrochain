@@ -34,6 +34,11 @@
 namespace miq {
 
 // =============================================================================
+// Constants
+// =============================================================================
+static constexpr uint8_t EXTRANONCE1_SIZE = 4;  // 4 bytes (8 hex chars)
+
+// =============================================================================
 // Helper functions
 // =============================================================================
 
@@ -886,27 +891,33 @@ StratumJob StratumServer::create_job() {
         }
     };
 
-    // coinb1: version + input_count + prev_txid + prev_vout
-    // The extranonce will be inserted as the sig field
+    // CRITICAL FIX: Proper coinbase construction for MIQ stratum
+    // MIQ transaction format:
+    // version(4) + input_count(4) + [txid_len(4) + txid(32) + vout(4) + sig_len(4) + sig + pubkey_len(4) + pubkey]
+    //            + output_count(4) + [value(8) + pkh_len(4) + pkh] + lock_time(4)
+    //
+    // For stratum:
+    // coinb1 = version + input_count + txid_len + txid + vout + sig_len
+    // [extranonce1 + extranonce2 inserted here as the sig data]
+    // coinb2 = pubkey_len + pubkey + output_count + outputs + lock_time
+
+    uint32_t total_extranonce_size = EXTRANONCE1_SIZE + extranonce2_size_;
+
     std::vector<uint8_t> coinb1_bytes;
     put_u32_le(coinb1_bytes, 1);  // version
     put_u32_le(coinb1_bytes, 1);  // input count
     put_u32_le(coinb1_bytes, 32); // prev.txid length
     for (int i = 0; i < 32; i++) coinb1_bytes.push_back(0); // prev.txid (zeros for coinbase)
-    put_u32_le(coinb1_bytes, 0); // prev.vout (MIQ uses 0, not 0xffffffff)
+    put_u32_le(coinb1_bytes, 0);  // prev.vout (0 for coinbase)
+    // CRITICAL FIX: sig_len must equal the extranonce size so the miner's extranonce becomes the sig
+    put_u32_le(coinb1_bytes, total_extranonce_size);  // sig length = extranonce1 + extranonce2 bytes
 
     job.coinb1 = hex_encode(coinb1_bytes);
 
-    // coinb2: sig (contains extranonce) + pubkey + outputs + lock_time
-    // Note: extranonce1 + extranonce2 will be inserted as the sig by the miner
-    // We put the sig length here as it's filled by miner
+    // coinb2: pubkey_len + pubkey + outputs + lock_time
+    // The extranonce (sig data) was already accounted for in coinb1's sig_len
     std::vector<uint8_t> coinb2_bytes;
-
-    // The sig length field will contain extranonce1_size + extranonce2_size
-    // But since we split BEFORE the sig, coinb2 starts with sig length marker
-    // We'll use 0 length sig and 0 length pubkey for simplicity
-    put_u32_le(coinb2_bytes, 0);  // sig length (extranonce embedded in coinb1+en1+en2)
-    put_u32_le(coinb2_bytes, 0);  // pubkey length
+    put_u32_le(coinb2_bytes, 0);  // pubkey length (no pubkey for coinbase)
 
     put_u32_le(coinb2_bytes, 1);  // output count
     // PRODUCTION FIX: Include fees in coinbase value (subsidy + fees)

@@ -55,14 +55,49 @@
 #ifndef MIQ_IBD_FALLBACK_AFTER_MS
 #define MIQ_IBD_FALLBACK_AFTER_MS (5 * 60 * 1000)
 #endif
+// ============================================================================
+// PERFORMANCE OPTIMIZATION: P2P Trace disabled by default
+// The previous MIQ_P2P_TRACE=1 caused severe lag due to:
+// 1. String concatenation overhead on EVERY P2P message
+// 2. Mutex contention in the logging system
+// 3. I/O blocking on every trace call
+// Enable with -DMIQ_P2P_TRACE=1 only for debugging
+// ============================================================================
 #ifndef MIQ_P2P_TRACE
-#define MIQ_P2P_TRACE 1
+#define MIQ_P2P_TRACE 0
 #endif
+
+// Rate-limited trace: only logs every N calls (for hot paths)
+#ifndef MIQ_TRACE_RATE_LIMIT
+#define MIQ_TRACE_RATE_LIMIT 1000
+#endif
+
 #if MIQ_P2P_TRACE
+  // Full tracing enabled - use sparingly, causes severe performance degradation
   #define P2P_TRACE(msg) do { ::miq::log_info(std::string("[TRACE] ") + (msg)); } while(0)
+  // Rate-limited trace for hot paths
+  #define P2P_TRACE_RATE(msg) do { \
+    static std::atomic<uint64_t> _trace_cnt{0}; \
+    if (++_trace_cnt % MIQ_TRACE_RATE_LIMIT == 0) { \
+      ::miq::log_info(std::string("[TRACE-SAMPLED] ") + (msg)); \
+    } \
+  } while(0)
 #else
+  // Tracing disabled - zero overhead (macros expand to nothing)
   #define P2P_TRACE(msg) do {} while(0)
+  #define P2P_TRACE_RATE(msg) do {} while(0)
 #endif
+
+// Conditional trace that checks a runtime flag (for selective debugging)
+#ifndef MIQ_RUNTIME_TRACE
+#define MIQ_RUNTIME_TRACE 0
+#endif
+static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
+#define P2P_TRACE_IF(cond, msg) do { \
+  if ((cond) && g_runtime_trace_enabled.load(std::memory_order_relaxed)) { \
+    ::miq::log_info(std::string("[TRACE-COND] ") + (msg)); \
+  } \
+} while(0)
 
 #if !defined(MIQ_MAYBE_UNUSED)
   #if defined(__GNUC__) || defined(__clang__)
@@ -391,6 +426,51 @@ static inline void miq_set_cloexec(Sock s) {
     if (flags >= 0) (void)fcntl(s, F_SETFD, flags | FD_CLOEXEC);
 #else
     (void)s; // no CLOEXEC on winsock
+#endif
+}
+
+// ============================================================================
+// OPTIMIZED SOCKET CONFIGURATION
+// ============================================================================
+// Performance-critical socket settings for P2P networking:
+// - Large recv/send buffers for block transfers (256KB each)
+// - TCP_NODELAY to disable Nagle's algorithm for lower latency
+// - SO_KEEPALIVE with aggressive timeouts for connection health
+// ============================================================================
+
+// Optimal buffer sizes for blockchain P2P (256KB handles large blocks)
+#ifndef MIQ_SOCK_RCVBUF
+#define MIQ_SOCK_RCVBUF (256 * 1024)
+#endif
+#ifndef MIQ_SOCK_SNDBUF
+#define MIQ_SOCK_SNDBUF (256 * 1024)
+#endif
+
+static inline void miq_optimize_socket(Sock s) {
+    // Set larger socket buffers for high-throughput block transfers
+    int rcvbuf = MIQ_SOCK_RCVBUF;
+    int sndbuf = MIQ_SOCK_SNDBUF;
+    (void)setsockopt(s, SOL_SOCKET, SO_RCVBUF,
+                     reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
+    (void)setsockopt(s, SOL_SOCKET, SO_SNDBUF,
+                     reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
+
+    // Disable Nagle's algorithm for lower latency
+    int nodelay = 1;
+    (void)setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
+                     reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+
+#ifdef SO_REUSEADDR
+    int reuse = 1;
+    (void)setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+                     reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+#endif
+
+#ifdef TCP_QUICKACK
+    // Enable TCP_QUICKACK for faster ACKs (Linux-specific)
+    int quickack = 1;
+    (void)setsockopt(s, IPPROTO_TCP, TCP_QUICKACK,
+                     reinterpret_cast<const char*>(&quickack), sizeof(quickack));
 #endif
 }
 
@@ -883,9 +963,7 @@ static inline bool hostname_is_seed(){
     return false;
 }
 
-namespace {
-extern std::unordered_set<std::string> g_global_inflight_blocks;
-}
+// NOTE: g_global_inflight_blocks is now defined in the optimized inflight tracking section below
 
 static std::unordered_map<Sock, bool> g_peer_index_capable; // default true; false => headers-only
 
@@ -915,13 +993,34 @@ static inline void maybe_mark_headers_done(bool at_tip) {
 
 static bool g_sync_green_logged = false;
 
+// Thread-safe global inflight tracking at file scope
+// (separate from the more sophisticated SpinLock-based system in the anonymous namespace below)
+static std::mutex g_file_scope_inflight_mu;
+static std::unordered_set<std::string> g_file_scope_inflight_blocks;
+
+static bool is_block_inflight(const std::string& hash) {
+    std::lock_guard<std::mutex> lk(g_file_scope_inflight_mu);
+    return g_file_scope_inflight_blocks.find(hash) != g_file_scope_inflight_blocks.end();
+}
+
+static void add_file_scope_inflight(const std::string& hash) {
+    std::lock_guard<std::mutex> lk(g_file_scope_inflight_mu);
+    g_file_scope_inflight_blocks.insert(hash);
+}
+
+static void remove_file_scope_inflight(const std::string& hash) {
+    std::lock_guard<std::mutex> lk(g_file_scope_inflight_mu);
+    g_file_scope_inflight_blocks.erase(hash);
+}
+
 static MIQ_MAYBE_UNUSED bool unsolicited_drop(miq::PeerState& ps, const char* what, const std::string& keyHex){
     (void)what; (void)keyHex;
     if (!ps.verack_ok) return true;
     // During IBD, accept only if inflight has an entry for this object
     if (what && std::strcmp(what,"block")==0) {
         if (ps.inflight_blocks.find(keyHex) != ps.inflight_blocks.end()) return false;
-        if (g_global_inflight_blocks.find(keyHex) != g_global_inflight_blocks.end()) return false;
+        // Use thread-safe accessor for global inflight check
+        if (is_block_inflight(keyHex)) return false;
         if (ps.syncing) return false;
         if (!g_logged_headers_done) return false;
         return true;
@@ -978,20 +1077,98 @@ namespace {
 }
 
 
+// ============================================================================
+// OPTIMIZED INFLIGHT TRACKING SYSTEM
+// ============================================================================
+// Thread-safe tracking of in-flight block and index requests.
+// Uses a lightweight spinlock for minimal contention in the P2P hot path.
+// ============================================================================
+
+namespace {
+
+// Lightweight spinlock for inflight data (lower overhead than std::mutex)
+class SpinLock {
+    std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
+public:
+    void lock() noexcept {
+        while (flag_.test_and_set(std::memory_order_acquire)) {
+            // Spin with pause instruction hint for better CPU efficiency
+            #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+                __builtin_ia32_pause();
+            #elif defined(__aarch64__) || defined(_M_ARM64)
+                __asm__ volatile("yield");
+            #else
+                std::this_thread::yield();
+            #endif
+        }
+    }
+    void unlock() noexcept {
+        flag_.clear(std::memory_order_release);
+    }
+};
+
+// Global spinlock protecting all inflight state
+static SpinLock g_inflight_lock;
+
 // Track inflight block request timestamps without touching PeerState layout
-namespace {
-  static std::unordered_map<Sock, std::unordered_map<std::string,int64_t>> g_inflight_block_ts;
+static std::unordered_map<Sock, std::unordered_map<std::string,int64_t>> g_inflight_block_ts;
+
+// Global set of all requested block hashes (across all peers)
+static std::unordered_set<std::string> g_global_inflight_blocks;
+
+// Track inflight index-based requests
+static std::unordered_map<Sock, std::unordered_map<uint64_t,int64_t>> g_inflight_index_ts;
+static std::unordered_map<Sock, std::deque<uint64_t>> g_inflight_index_order;
+static int64_t g_stall_retry_ms = MIQ_P2P_STALL_RETRY_MS;
+
+// RAII lock guard for inflight data
+class InflightLock {
+    SpinLock& lock_;
+public:
+    explicit InflightLock(SpinLock& l) noexcept : lock_(l) { lock_.lock(); }
+    ~InflightLock() noexcept { lock_.unlock(); }
+    InflightLock(const InflightLock&) = delete;
+    InflightLock& operator=(const InflightLock&) = delete;
+};
+
+// Note: is_block_inflight is defined at file scope, outside this namespace,
+// so it can be forward-declared and used by unsolicited_drop above.
+
+static inline void mark_block_inflight(const std::string& hash, Sock sock) {
+    InflightLock lk(g_inflight_lock);
+    g_global_inflight_blocks.insert(hash);
+    g_inflight_block_ts[sock][hash] = now_ms();
+    // Also update file-scope set for unsolicited_drop()
+    add_file_scope_inflight(hash);
 }
 
-namespace {
-  std::unordered_set<std::string> g_global_inflight_blocks; // any peer -> requested block-hash
+static inline void clear_block_inflight(const std::string& hash, Sock sock) {
+    InflightLock lk(g_inflight_lock);
+    g_global_inflight_blocks.erase(hash);
+    auto it = g_inflight_block_ts.find(sock);
+    if (it != g_inflight_block_ts.end()) {
+        it->second.erase(hash);
+    }
+    // Also update file-scope set
+    remove_file_scope_inflight(hash);
 }
 
-namespace {
-  static std::unordered_map<Sock, std::unordered_map<uint64_t,int64_t>> g_inflight_index_ts;
-  static std::unordered_map<Sock, std::deque<uint64_t>> g_inflight_index_order;
-  static int64_t g_stall_retry_ms = MIQ_P2P_STALL_RETRY_MS; // runtime-tunable via env
+static inline void clear_all_inflight_for_sock(Sock sock) {
+    InflightLock lk(g_inflight_lock);
+    auto it = g_inflight_block_ts.find(sock);
+    if (it != g_inflight_block_ts.end()) {
+        for (const auto& kv : it->second) {
+            g_global_inflight_blocks.erase(kv.first);
+            // Also update file-scope set
+            remove_file_scope_inflight(kv.first);
+        }
+        g_inflight_block_ts.erase(it);
+    }
+    g_inflight_index_ts.erase(sock);
+    g_inflight_index_order.erase(sock);
 }
+
+} // namespace
 
 static inline bool peer_is_index_capable(Sock s) {
     auto it = g_peer_index_capable.find(s);
@@ -1153,13 +1330,23 @@ static inline void miq_set_nodelay(Sock s) {
 }
 
 static inline void miq_set_sockbufs(Sock s) {
-    int sz = 1<<20; // 1 MiB
+    // Optimized buffer sizes - use larger buffers for faster block transfers
+    // but not too large to avoid memory bloat with many peers
+    int sz = MIQ_SOCK_RCVBUF; // Use the optimized value defined above
 #if defined(_WIN32)
     (void)setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*)&sz, sizeof(sz));
+    sz = MIQ_SOCK_SNDBUF;
     (void)setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&sz, sizeof(sz));
 #else
     (void)setsockopt(s, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+    sz = MIQ_SOCK_SNDBUF;
     (void)setsockopt(s, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+#endif
+
+#ifdef TCP_QUICKACK
+    // Enable TCP_QUICKACK for faster ACKs on Linux
+    int quickack = 1;
+    (void)setsockopt(s, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
 #endif
 }
 
@@ -3827,15 +4014,17 @@ void P2P::loop(){
             }
             const bool headers_done = g_logged_headers_done;
 
-            // Debug logging for premature sync completion
+            // Debug logging for sync completion - only executes once per session
+            #if MIQ_P2P_TRACE
             static bool debug_logged = false;
             if (!any_want && !any_inflight && headers_done && !debug_logged) {
-                 log_info("[DEBUG] Sync completion check: any_want=" + std::string(any_want ? "true" : "false") +
+                 P2P_TRACE("Sync completion check: any_want=" + std::string(any_want ? "true" : "false") +
                           " any_inflight=" + std::string(any_inflight ? "true" : "false") +
                           " headers_done=" + std::string(headers_done ? "true" : "false") +
                           " height=" + std::to_string(chain_.height()));
                  debug_logged = true;
             }
+            #endif
             if (!any_want && !any_inflight && headers_done && !g_sync_green_logged) {
                  g_sync_green_logged = true;
                  log_info("P2P: fully synchronized (height=" + std::to_string(chain_.height()) + ")");
@@ -4018,7 +4207,9 @@ void P2P::loop(){
                 }
             } else {
                 g_sync_green_logged = false;
+                #if MIQ_P2P_TRACE
                 debug_logged = false; // Reset debug flag when not in sync
+                #endif
 
                 // If we think we're done but could still try index sync, activate it
                 if (!any_want && !any_inflight && headers_done && can_try_index_sync && !has_active_index_sync) {
@@ -4781,26 +4972,27 @@ void P2P::loop(){
                         // During IBD, allow higher rate of invb messages (don't rate limit)
                         bool is_ibd = ibd_or_fetch_active(ps, now_ms());
                         if (!is_ibd && !check_rate(ps, "inv", 0.5, now_ms())) {
-                            log_info("DEBUG: invb rate-limited from " + ps.ip);
+                            // Rate-limited: only log occasionally to avoid log spam
+                            P2P_TRACE_RATE("invb rate-limited from " + ps.ip);
                             bump_ban(ps, ps.ip, "inv-flood", now_ms());
                             continue;
                         }
                         if (m.payload.size() == 32) {
                             if (!inv_tick(1)) {
-                                log_info("DEBUG: invb inv_tick failed from " + ps.ip);
+                                P2P_TRACE_RATE("invb inv_tick failed from " + ps.ip);
                                 continue;
                             }
                             auto k = hexkey(m.payload);
                             if (!remember_inv(k)) {
-                                log_info("DEBUG: invb duplicate (already seen) hash=" + k.substr(0, 16) + "... from " + ps.ip);
+                                // This is extremely common during sync - don't log
                                 continue;
                             }
                             if (!chain_.have_block(m.payload)) {
-                                log_info("DEBUG: invb requesting block hash=" + k.substr(0, 16) + "... from " + ps.ip);
+                                // Only trace, not log - this is hot path
+                                P2P_TRACE("invb requesting block hash=" + k.substr(0, 16) + "... from " + ps.ip);
                                 request_block_hash(ps, m.payload);
-                            } else {
-                                log_info("DEBUG: invb already have block hash=" + k.substr(0, 16) + "... from " + ps.ip);
                             }
+                            // Removed: "already have block" log - too spammy during sync
                         }
 
                     } else if (cmd == "getb") {
@@ -5011,14 +5203,20 @@ void P2P::loop(){
                             }
                             bool in_mempool = mempool_ && mempool_->exists(tx.txid());
 
+                            // WALLET FIX: Don't skip orphan transactions
+                            // When tx is accepted as orphan (accepted=true but not in mempool),
+                            // we still need to store it and relay it so it can propagate.
+                            // The previous code had "continue" here which caused wallet txs
+                            // to never propagate if treated as orphans.
                             if (accepted && !in_mempool) {
+                                // Try to fetch missing parent transactions
                                 for (const auto& in : tx.vin) {
                                     UTXOEntry e;
                                     if (!chain_.utxo().get(in.prev.txid, in.prev.vout, e)) {
                                         send_gettx(s, in.prev.txid);
                                     }
                                 }
-                                continue;
+                                // Don't continue - fall through to store and relay the orphan tx
                             }
 
                             if (tx_store_.find(key) == tx_store_.end()) {

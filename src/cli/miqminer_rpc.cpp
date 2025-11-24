@@ -78,6 +78,7 @@
   #include <sched.h>
   #include <sys/ioctl.h>
   #include <netinet/tcp.h>  // For TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT
+  #include <poll.h>         // For poll() in stratum recv_line
   using socket_t = int;
   #define miq_closesocket ::close
   static void miq_sleep_ms(unsigned ms){ usleep(ms*1000); }
@@ -2455,6 +2456,9 @@ public:
     std::atomic<double> difficulty{1.0};
     std::mutex job_mtx;
 
+    // CRITICAL FIX: Read buffer for handling partial/multiple messages
+    std::string read_buffer;
+
     bool connect_to_pool() {
         winsock_ensure();
         addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
@@ -2495,24 +2499,90 @@ public:
         return ::send(sock, msg.c_str(), static_cast<int>(msg.size()), 0) > 0;
     }
 
+    // CRITICAL FIX: Improved recv_line with proper buffering
     std::string recv_line(int timeout_ms = 30000) {
-        std::string line;
-        char c;
         auto start = std::chrono::steady_clock::now();
+
         while (true) {
+            // Check if we already have a complete line in the buffer
+            size_t newline_pos = read_buffer.find('\n');
+            if (newline_pos != std::string::npos) {
+                std::string line = read_buffer.substr(0, newline_pos);
+                read_buffer.erase(0, newline_pos + 1);
+                // Remove trailing \r if present
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+                return line;
+            }
+
+            // Check timeout
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start).count();
             if (elapsed >= timeout_ms) break;
 
-            int r = ::recv(sock, &c, 1, 0);
-            if (r == 1) {
-                if (c == '\n') break;
-                if (c != '\r') line += c;
-            } else if (r <= 0) {
+            // Read more data into buffer
+            char buf[4096];
+#if defined(_WIN32)
+            // Set socket to non-blocking temporarily for poll-like behavior
+            u_long mode = 1;
+            ioctlsocket(sock, FIONBIO, &mode);
+            int r = ::recv(sock, buf, sizeof(buf) - 1, 0);
+            mode = 0;
+            ioctlsocket(sock, FIONBIO, &mode);
+            if (r == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                if (err == WSAEWOULDBLOCK) {
+                    miq_sleep_ms(10);
+                    continue;
+                }
+                connected.store(false);
+                break;
+            }
+#else
+            // Use poll for non-blocking check
+            struct pollfd pfd;
+            pfd.fd = sock;
+            pfd.events = POLLIN;
+            int poll_result = poll(&pfd, 1, 100); // 100ms poll timeout
+            if (poll_result <= 0) {
+                if (poll_result < 0) {
+                    connected.store(false);
+                    break;
+                }
+                continue; // timeout, loop again
+            }
+            int r = ::recv(sock, buf, sizeof(buf) - 1, 0);
+#endif
+            if (r > 0) {
+                buf[r] = '\0';
+                read_buffer.append(buf, r);
+            } else if (r == 0) {
+                // Connection closed
+                connected.store(false);
+                break;
+            } else {
+#if !defined(_WIN32)
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+#endif
+                connected.store(false);
                 break;
             }
         }
-        return line;
+
+        // Return whatever we have (may be partial or empty)
+        if (!read_buffer.empty()) {
+            size_t newline_pos = read_buffer.find('\n');
+            if (newline_pos != std::string::npos) {
+                std::string line = read_buffer.substr(0, newline_pos);
+                read_buffer.erase(0, newline_pos + 1);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                return line;
+            }
+        }
+        return "";
     }
 
     // Helper to extract string from JSON array by index
@@ -2580,50 +2650,74 @@ public:
         ss << "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"chronen-miner/1.0\"]}";
         if (!send_json(ss.str())) return false;
 
-        std::string resp = recv_line();
-        if (resp.empty()) return false;
+        // CRITICAL FIX: Read ALL pending messages after subscribe
+        // Server sends: subscribe_response, set_difficulty, mining.notify
+        bool got_subscribe_response = false;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
 
-        // Parse result array: [[["mining.notify", "subscription_id"]], extranonce1, extranonce2_size]
-        // Find "result" array
-        size_t result_pos = resp.find("\"result\"");
-        if (result_pos == std::string::npos) return false;
-
-        size_t arr_start = resp.find('[', result_pos);
-        if (arr_start == std::string::npos) return false;
-
-        // Find extranonce1 (first string after the nested array)
-        // Skip past the nested subscription arrays to find extranonce1
-        int depth = 0;
-        size_t i = arr_start;
-        bool found_inner = false;
-
-        for (; i < resp.size(); i++) {
-            if (resp[i] == '[') depth++;
-            else if (resp[i] == ']') {
-                depth--;
-                if (depth == 1 && !found_inner) {
-                    found_inner = true;
-                }
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::string resp = recv_line(1000);
+            if (resp.empty()) {
+                if (!connected.load()) return false;
+                if (got_subscribe_response) break; // Got response, no more data coming
+                continue;
             }
-            else if (resp[i] == '"' && found_inner && depth == 1) {
-                // This should be extranonce1
-                size_t start = i + 1;
-                size_t end = resp.find('"', start);
-                if (end != std::string::npos) {
-                    extranonce1 = resp.substr(start, end - start);
-                    // Find extranonce2_size (number after extranonce1)
-                    size_t num_start = end + 1;
-                    while (num_start < resp.size() && !std::isdigit(resp[num_start])) num_start++;
-                    if (num_start < resp.size()) {
-                        size_t num_end = num_start;
-                        while (num_end < resp.size() && std::isdigit(resp[num_end])) num_end++;
-                        if (num_end > num_start) {
-                            extranonce2_size = (uint32_t)std::stoul(resp.substr(num_start, num_end - num_start));
+
+            // Check for subscribe response
+            if (resp.find("\"result\"") != std::string::npos && resp.find("\"id\":1") != std::string::npos) {
+                // Parse result array: [[["mining.notify", "subscription_id"]], extranonce1, extranonce2_size]
+                size_t result_pos = resp.find("\"result\"");
+                if (result_pos == std::string::npos) continue;
+
+                size_t arr_start = resp.find('[', result_pos);
+                if (arr_start == std::string::npos) continue;
+
+                // Find extranonce1 (first string after the nested array)
+                int depth = 0;
+                size_t i = arr_start;
+                bool found_inner = false;
+
+                for (; i < resp.size(); i++) {
+                    if (resp[i] == '[') depth++;
+                    else if (resp[i] == ']') {
+                        depth--;
+                        if (depth == 1 && !found_inner) {
+                            found_inner = true;
                         }
                     }
-                    break;
+                    else if (resp[i] == '"' && found_inner && depth == 1) {
+                        // This should be extranonce1
+                        size_t start = i + 1;
+                        size_t end = resp.find('"', start);
+                        if (end != std::string::npos) {
+                            extranonce1 = resp.substr(start, end - start);
+                            // Find extranonce2_size (number after extranonce1)
+                            size_t num_start = end + 1;
+                            while (num_start < resp.size() && !std::isdigit(resp[num_start])) num_start++;
+                            if (num_start < resp.size()) {
+                                size_t num_end = num_start;
+                                while (num_end < resp.size() && std::isdigit(resp[num_end])) num_end++;
+                                if (num_end > num_start) {
+                                    extranonce2_size = (uint32_t)std::stoul(resp.substr(num_start, num_end - num_start));
+                                }
+                            }
+                            got_subscribe_response = true;
+                            break;
+                        }
+                    }
                 }
             }
+
+            // CRITICAL FIX: Also process difficulty and job notifications during subscribe
+            if (resp.find("set_difficulty") != std::string::npos) {
+                parse_difficulty(resp);
+            }
+            if (resp.find("mining.notify") != std::string::npos) {
+                parse_job(resp);
+            }
+
+            // If we have the subscribe response and a job, we're done
+            if (got_subscribe_response && has_job.load()) break;
         }
 
         return !extranonce1.empty();
@@ -2635,9 +2729,29 @@ public:
            << worker << "\",\"" << password << "\"]}";
         if (!send_json(ss.str())) return false;
 
-        std::string resp = recv_line();
-        // Look for "result":true
-        return resp.find("true") != std::string::npos;
+        // CRITICAL FIX: Read response with proper handling for additional messages
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::string resp = recv_line(1000);
+            if (resp.empty()) {
+                if (!connected.load()) return false;
+                continue;
+            }
+
+            // Check for authorize response
+            if (resp.find("\"id\":2") != std::string::npos || resp.find("\"id\": 2") != std::string::npos) {
+                return resp.find("true") != std::string::npos;
+            }
+
+            // Also process any difficulty/job notifications that come during authorize
+            if (resp.find("set_difficulty") != std::string::npos) {
+                parse_difficulty(resp);
+            }
+            if (resp.find("mining.notify") != std::string::npos) {
+                parse_job(resp);
+            }
+        }
+        return false;
     }
 
     // Helper to extract array of strings (for merkle_branch)
@@ -2807,6 +2921,7 @@ public:
 #endif
         connected.store(false);
         has_job.store(false);
+        read_buffer.clear(); // CRITICAL FIX: Clear read buffer on disconnect
     }
 };
 
