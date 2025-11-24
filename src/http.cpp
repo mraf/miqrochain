@@ -517,7 +517,7 @@ void HttpServer::start(
     const int ip_burst          = env_int("MIQ_RPC_BURST",      200);      // CRITICAL FIX: Reduced from 1000000
     const size_t max_hdr_bytes  = env_szt("MIQ_RPC_MAX_HEADER", 8*1024);   // CRITICAL FIX: Reduced from 16KB
     const size_t max_body_bytes = env_szt("MIQ_RPC_MAX_BODY",   1*1024*1024); // CRITICAL FIX: Reduced from 2MB
-    const int recv_timeout_ms   = env_int("MIQ_RPC_RECV_TIMEOUT_MS", 10000); // CRITICAL FIX: Reduced from 15s
+    const int recv_timeout_ms   = env_int("MIQ_RPC_RECV_TIMEOUT_MS", 60000); // CRITICAL FIX: Increased to 60s for mining stability
     const bool allow_cors       = env_truthy(std::getenv("MIQ_RPC_CORS"));
 
     // Observability toggles
