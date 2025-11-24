@@ -1,7 +1,8 @@
-// src/miqwallet.cpp - Professional MIQ Wallet CLI v4.0
+// src/miqwallet.cpp - Professional MIQ Wallet CLI v5.0
 // Production-grade SPV wallet with enterprise reliability, offline transactions,
 // persistent queue system, beautiful animations, live confirmation tracking,
-// enhanced dashboard UI, real-time transaction monitoring, and improved UX
+// enhanced dashboard UI, real-time transaction monitoring, improved UX,
+// automatic transaction management, and robust security hardening
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -46,36 +47,49 @@
 // PRODUCTION CONSTANTS
 // =============================================================================
 namespace wallet_config {
-    // Network resilience
-    static constexpr int MAX_CONNECTION_RETRIES = 5;
-    static constexpr int BASE_RETRY_DELAY_MS = 1000;
+    // Network resilience - enhanced for robustness
+    static constexpr int MAX_CONNECTION_RETRIES = 8;
+    static constexpr int BASE_RETRY_DELAY_MS = 500;
     static constexpr int MAX_RETRY_DELAY_MS = 30000;
-    static constexpr int CONNECTION_TIMEOUT_MS = 15000;
-    static constexpr int BROADCAST_TIMEOUT_MS = 10000;
+    static constexpr int CONNECTION_TIMEOUT_MS = 20000;
+    static constexpr int BROADCAST_TIMEOUT_MS = 15000;
 
-    // Security limits
+    // Security limits - hardened
     static constexpr size_t MAX_UTXO_COUNT = 100000;
-    static constexpr size_t MAX_TX_INPUTS = 1000;
-    static constexpr size_t MAX_TX_OUTPUTS = 100;
+    static constexpr size_t MAX_TX_INPUTS = 500;
+    static constexpr size_t MAX_TX_OUTPUTS = 50;
     static constexpr uint64_t MAX_SINGLE_TX_VALUE = 1000000ULL * 100000000ULL;
     static constexpr uint64_t DUST_THRESHOLD = 546;
+    static constexpr uint64_t MIN_RELAY_FEE = 1000;  // Minimum fee for relay
 
     // Memory management
     static constexpr size_t MAX_PENDING_CACHE = 10000;
     static constexpr size_t KEY_DERIVATION_BATCH = 100;
 
-    // User experience
-    static constexpr int SYNC_PROGRESS_INTERVAL_MS = 500;
-    static constexpr int BALANCE_REFRESH_COOLDOWN_MS = 3000;
+    // Live update system
+    static constexpr int LIVE_UPDATE_INTERVAL_MS = 5000;
+    static constexpr int SYNC_PROGRESS_INTERVAL_MS = 200;
+    static constexpr int BALANCE_REFRESH_COOLDOWN_MS = 2000;
+    static constexpr int AUTO_REFRESH_INTERVAL_SEC = 30;
 
-    // Transaction queue system
+    // Transaction queue system - enhanced
     static constexpr int MAX_QUEUE_SIZE = 1000;
-    static constexpr int AUTO_BROADCAST_INTERVAL_MS = 30000;
+    static constexpr int AUTO_BROADCAST_INTERVAL_MS = 15000;
     static constexpr int TX_EXPIRY_HOURS = 72;
-    static constexpr int MAX_BROADCAST_ATTEMPTS = 10;
+    static constexpr int MAX_BROADCAST_ATTEMPTS = 15;
+    static constexpr int CONFIRMATION_TARGET = 6;
 
     // Animation timings (PowerShell 5+ compatible)
-    static constexpr int ANIMATION_FRAME_MS = 100;
+    static constexpr int ANIMATION_FRAME_MS = 80;
+    static constexpr int FAST_ANIMATION_MS = 50;
+    static constexpr int SLOW_ANIMATION_MS = 150;
+
+    // Smart fee estimation
+    static constexpr uint64_t FEE_RATE_ECONOMY = 1;    // 1 sat/byte
+    static constexpr uint64_t FEE_RATE_NORMAL = 2;     // 2 sat/byte
+    static constexpr uint64_t FEE_RATE_PRIORITY = 5;   // 5 sat/byte
+    static constexpr uint64_t FEE_RATE_URGENT = 10;    // 10 sat/byte
+    static constexpr uint64_t FEE_RATE_MAX = 100;      // 100 sat/byte max
     static constexpr int SPINNER_FRAME_MS = 80;
 }
 
@@ -513,8 +527,118 @@ namespace ui {
    |_|  |_|___\__\_\    \_/\_/ \__,_|_|_|\___|\__|
 
 )" << reset();
-        std::cout << green() << bold() << "         Professional Cryptocurrency Wallet v4.0" << reset() << "\n";
-        std::cout << dim() << "   Dashboard View | Live TX Tracking | Full TXID Display | Secure" << reset() << "\n\n";
+        std::cout << green() << bold() << "         Professional Cryptocurrency Wallet v5.0" << reset() << "\n";
+        std::cout << dim() << "    Live Dashboard | Auto-TX | Secure | Full TXID | Robust" << reset() << "\n\n";
+    }
+
+    // =========================================================================
+    // ADVANCED ANIMATION SYSTEM v5.0
+    // =========================================================================
+
+    // Smooth progress bar with percentage
+    void draw_progress_bar(double percent, int width = 40) {
+        int filled = (int)(percent * width / 100.0);
+        std::cout << cyan() << "[" << reset();
+        for (int i = 0; i < width; i++) {
+            if (i < filled) std::cout << green() << "=" << reset();
+            else if (i == filled) std::cout << yellow() << ">" << reset();
+            else std::cout << dim() << "-" << reset();
+        }
+        std::cout << cyan() << "]" << reset();
+        std::cout << " " << std::fixed << std::setprecision(1) << percent << "%";
+    }
+
+    // Live status indicator
+    void draw_live_indicator(bool is_live, int frame) {
+        const char* pulse[] = {"*", "o", "O", "o"};
+        if (is_live) {
+            std::cout << green() << "[" << pulse[frame % 4] << "]" << reset();
+        } else {
+            std::cout << red() << "[x]" << reset();
+        }
+    }
+
+    // Network activity animation
+    void draw_network_activity(int frame) {
+        const char* net[] = {"[<   ]", "[<<  ]", "[<<< ]", "[<<<<]", "[<<<>]", "[<<>>]", "[<>>>]", "[ >>>]", "[  >>]", "[   >]"};
+        std::cout << cyan() << net[frame % 10] << reset();
+    }
+
+    // Transaction processing animation
+    void draw_tx_processing(int frame, const std::string& stage) {
+        const char* proc[] = {"[.......]", "[=......]", "[==.....]", "[===....]", "[====...]", "[=====..]", "[======.]", "[=======]"};
+        std::cout << "\r  " << cyan() << proc[frame % 8] << reset() << " " << stage << std::string(30, ' ') << std::flush;
+    }
+
+    // Success checkmark animation
+    void draw_success_checkmark() {
+        std::cout << "\n";
+        std::cout << green() << bold();
+        std::cout << "      _____\n";
+        std::cout << "     /     \\\n";
+        std::cout << "    |  " << white() << "OK" << green() << "  |\n";
+        std::cout << "     \\_____/\n";
+        std::cout << reset();
+    }
+
+    // Mini success indicator
+    void draw_mini_success(const std::string& msg) {
+        std::cout << green() << bold() << "[OK]" << reset() << " " << msg << "\n";
+    }
+
+    // Mini error indicator
+    void draw_mini_error(const std::string& msg) {
+        std::cout << red() << bold() << "[!!]" << reset() << " " << msg << "\n";
+    }
+
+    // Mini warning indicator
+    void draw_mini_warning(const std::string& msg) {
+        std::cout << yellow() << bold() << "[!]" << reset() << " " << msg << "\n";
+    }
+
+    // Mini info indicator
+    void draw_mini_info(const std::string& msg) {
+        std::cout << cyan() << "[i]" << reset() << " " << msg << "\n";
+    }
+
+    // Animated countdown
+    void draw_countdown(int seconds) {
+        for (int i = seconds; i > 0; i--) {
+            std::cout << "\r  " << yellow() << "[" << i << "]" << reset() << " " << std::flush;
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        std::cout << "\r  " << green() << "[GO]" << reset() << " " << std::flush;
+    }
+
+    // Block confirmation visual
+    void draw_block_confirmations(int current, int target) {
+        std::cout << cyan() << "[" << reset();
+        for (int i = 0; i < target; i++) {
+            if (i < current) {
+                std::cout << green() << "#" << reset();
+            } else {
+                std::cout << dim() << "-" << reset();
+            }
+        }
+        std::cout << cyan() << "]" << reset();
+        std::cout << " " << current << "/" << target;
+        if (current >= target) {
+            std::cout << green() << " CONFIRMED" << reset();
+        }
+    }
+
+    // Live balance display with animation
+    void draw_live_balance(uint64_t balance, bool updated, int frame) {
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(8) << ((double)balance / 100000000.0);
+
+        if (updated) {
+            // Flash animation when balance changes
+            const char* flash[] = {">", ">>", ">>>"};
+            std::cout << green() << flash[frame % 3] << " " << bold() << ss.str() << " MIQ" << reset();
+        } else {
+            std::cout << green() << ss.str() << " MIQ" << reset();
+        }
     }
 
     // =========================================================================
@@ -1348,6 +1472,401 @@ static bool validate_address(const std::string& addr, std::string& error){
     // Check payload length (should be 20 bytes for hash160)
     if(payload.size() != 20){
         error = "Invalid address payload length";
+        return false;
+    }
+
+    return true;
+}
+
+// =============================================================================
+// ROBUST TRANSACTION BUILDER v5.0
+// Automatic input selection, fee calculation, and security validation
+// =============================================================================
+
+struct TransactionBuildResult {
+    bool success{false};
+    std::string error;
+    miq::Transaction tx;
+    uint64_t total_input{0};
+    uint64_t total_output{0};
+    uint64_t fee{0};
+    uint64_t change{0};
+    size_t estimated_size{0};
+    double fee_rate{0};
+    std::vector<size_t> used_input_indices;
+    std::string change_address;
+    bool has_change{false};
+};
+
+struct TransactionBuildRequest {
+    std::string recipient_address;
+    uint64_t amount{0};
+    uint64_t fee_rate{2};  // sat/byte
+    bool allow_unconfirmed{false};
+    bool optimize_for_privacy{false};
+    std::string memo;
+};
+
+// Smart transaction builder with automatic everything
+static TransactionBuildResult build_transaction_smart(
+    const TransactionBuildRequest& req,
+    const std::vector<miq::UtxoLite>& all_utxos,
+    const std::set<OutpointKey>& pending_utxos,
+    const std::vector<uint8_t>& seed,
+    miq::HdAccountMeta& meta,
+    const std::string& wdir,
+    const std::string& pass)
+{
+    TransactionBuildResult result;
+
+    // Security check 1: Validate recipient address
+    std::string addr_err;
+    if(!validate_address(req.recipient_address, addr_err)){
+        result.error = "Invalid recipient address: " + addr_err;
+        return result;
+    }
+
+    // Security check 2: Validate amount
+    if(req.amount == 0){
+        result.error = "Amount must be greater than zero";
+        return result;
+    }
+    if(req.amount < wallet_config::DUST_THRESHOLD){
+        result.error = "Amount below dust threshold (" + std::to_string(wallet_config::DUST_THRESHOLD) + " sat)";
+        return result;
+    }
+    if(req.amount > wallet_config::MAX_SINGLE_TX_VALUE){
+        result.error = "Amount exceeds maximum allowed value";
+        return result;
+    }
+
+    // Security check 3: Validate fee rate
+    uint64_t effective_fee_rate = req.fee_rate;
+    if(effective_fee_rate < 1) effective_fee_rate = 1;
+    if(effective_fee_rate > wallet_config::FEE_RATE_MAX){
+        effective_fee_rate = wallet_config::FEE_RATE_MAX;
+    }
+
+    // Get tip height for maturity calculations
+    uint64_t tip_h = 0;
+    for(const auto& u : all_utxos){
+        if(u.height > tip_h) tip_h = u.height;
+    }
+
+    // Filter to spendable UTXOs only
+    std::vector<miq::UtxoLite> spendables;
+    for(const auto& u : all_utxos){
+        // Check maturity
+        bool is_mature = true;
+        if(u.coinbase){
+            uint64_t maturity_height = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
+            if(tip_h + 1 < maturity_height){
+                is_mature = false;
+            }
+        }
+
+        // Check not in pending set
+        OutpointKey key{ miq::to_hex(u.txid), u.vout };
+        bool is_pending = pending_utxos.find(key) != pending_utxos.end();
+
+        // Check for unconfirmed (height 0) if not allowed
+        bool is_unconfirmed = (u.height == 0);
+        if(is_unconfirmed && !req.allow_unconfirmed){
+            continue;
+        }
+
+        if(is_mature && !is_pending){
+            spendables.push_back(u);
+        }
+    }
+
+    if(spendables.empty()){
+        result.error = "No spendable UTXOs available";
+        return result;
+    }
+
+    // Calculate total spendable
+    uint64_t total_spendable = 0;
+    for(const auto& u : spendables){
+        total_spendable += u.value;
+    }
+
+    // Quick check if we have enough
+    uint64_t min_fee = effective_fee_rate * 200;  // Minimum transaction size
+    if(total_spendable < req.amount + min_fee){
+        result.error = "Insufficient funds. Available: " +
+                       std::to_string(total_spendable / 100000000.0) + " MIQ";
+        return result;
+    }
+
+    // Smart coin selection
+    std::vector<size_t> selected_indices;
+    uint64_t total_selected = 0;
+
+    CoinSelectionStrategy strategy = req.optimize_for_privacy ?
+                                     CoinSelectionStrategy::PRIVACY_OPTIMIZED :
+                                     CoinSelectionStrategy::MINIMIZE_INPUTS;
+
+    bool selection_ok = smart_coin_select(spendables, req.amount, effective_fee_rate,
+                                          strategy, selected_indices, total_selected);
+
+    if(!selection_ok){
+        result.error = "Failed to select sufficient inputs for transaction";
+        return result;
+    }
+
+    // Security check 4: Limit number of inputs
+    if(selected_indices.size() > wallet_config::MAX_TX_INPUTS){
+        result.error = "Transaction would require too many inputs (" +
+                       std::to_string(selected_indices.size()) + ")";
+        return result;
+    }
+
+    // Decode recipient address
+    uint8_t ver = 0;
+    std::vector<uint8_t> recipient_pkh;
+    miq::base58check_decode(req.recipient_address, ver, recipient_pkh);
+
+    // Build transaction
+    miq::Transaction tx;
+    tx.version = 1;
+    tx.lock_time = 0;
+
+    // Add inputs
+    for(size_t idx : selected_indices){
+        miq::TxIn in;
+        in.prev.txid = spendables[idx].txid;
+        in.prev.vout = spendables[idx].vout;
+        tx.vin.push_back(in);
+    }
+
+    // Calculate fee with 2 outputs (recipient + change)
+    size_t tx_size = 10 + tx.vin.size() * 148 + 2 * 34;
+    uint64_t calculated_fee = tx_size * effective_fee_rate;
+
+    // Ensure minimum relay fee
+    if(calculated_fee < wallet_config::MIN_RELAY_FEE){
+        calculated_fee = wallet_config::MIN_RELAY_FEE;
+    }
+
+    // Calculate change
+    uint64_t change_amount = 0;
+    if(total_selected > req.amount + calculated_fee){
+        change_amount = total_selected - req.amount - calculated_fee;
+    }
+
+    // Handle dust change
+    if(change_amount > 0 && change_amount < wallet_config::DUST_THRESHOLD){
+        // Add dust to fee instead of creating tiny change
+        calculated_fee += change_amount;
+        change_amount = 0;
+    }
+
+    // Recalculate for 1-output transaction if no change
+    if(change_amount == 0){
+        tx_size = 10 + tx.vin.size() * 148 + 1 * 34;
+        calculated_fee = tx_size * effective_fee_rate;
+        if(calculated_fee < wallet_config::MIN_RELAY_FEE){
+            calculated_fee = wallet_config::MIN_RELAY_FEE;
+        }
+        // Absorb any remaining into fee
+        if(total_selected > req.amount + calculated_fee){
+            calculated_fee = total_selected - req.amount;
+        }
+    }
+
+    // Final sanity check
+    if(total_selected < req.amount + calculated_fee){
+        result.error = "Insufficient funds after fee calculation";
+        return result;
+    }
+
+    // Create recipient output
+    miq::TxOut recipient_out;
+    recipient_out.value = req.amount;
+    recipient_out.pkh = recipient_pkh;
+    tx.vout.push_back(recipient_out);
+
+    // Create change output if needed
+    if(change_amount >= wallet_config::DUST_THRESHOLD){
+        // Derive change address
+        miq::HdWallet w(seed, meta);
+        std::vector<uint8_t> change_priv, change_pub;
+        if(!w.DerivePrivPub(meta.account, 1, meta.next_change, change_priv, change_pub)){
+            result.error = "Failed to derive change address";
+            return result;
+        }
+
+        std::vector<uint8_t> change_pkh = miq::hash160(change_pub);
+
+        miq::TxOut change_out;
+        change_out.value = change_amount;
+        change_out.pkh = change_pkh;
+        tx.vout.push_back(change_out);
+
+        result.change_address = miq::base58check_encode(miq::VERSION_P2PKH, change_pkh);
+        result.has_change = true;
+        result.change = change_amount;
+    }
+
+    // Final validation
+    if(tx.vout.size() > wallet_config::MAX_TX_OUTPUTS){
+        result.error = "Too many outputs";
+        return result;
+    }
+
+    // Store results
+    result.tx = tx;
+    result.total_input = total_selected;
+    result.total_output = req.amount + change_amount;
+    result.fee = calculated_fee;
+    result.estimated_size = tx_size;
+    result.fee_rate = (double)calculated_fee / tx_size;
+    result.used_input_indices = selected_indices;
+    result.success = true;
+
+    return result;
+}
+
+// Sign a built transaction
+static bool sign_transaction_robust(
+    miq::Transaction& tx,
+    const std::vector<miq::UtxoLite>& spendables,
+    const std::vector<size_t>& input_indices,
+    const std::vector<uint8_t>& seed,
+    const miq::HdAccountMeta& meta,
+    std::string& error)
+{
+    // Generate sighash (same as mempool uses for verification)
+    miq::Transaction sighash_tx = tx;
+    for(auto& in : sighash_tx.vin){
+        in.sig.clear();
+        in.pubkey.clear();
+    }
+    auto sighash = miq::dsha256(miq::ser_tx(sighash_tx));
+
+    // Derive all possible keys (receive + change chains)
+    miq::HdWallet w(seed, meta);
+    std::map<std::string, std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> key_map;
+
+    // Derive receive addresses
+    for(uint32_t i = 0; i <= meta.next_recv + 10; i++){
+        std::vector<uint8_t> priv, pub;
+        if(w.DerivePrivPub(meta.account, 0, i, priv, pub)){
+            auto pkh = miq::hash160(pub);
+            key_map[miq::to_hex(pkh)] = {priv, pub};
+        }
+    }
+
+    // Derive change addresses
+    for(uint32_t i = 0; i <= meta.next_change + 10; i++){
+        std::vector<uint8_t> priv, pub;
+        if(w.DerivePrivPub(meta.account, 1, i, priv, pub)){
+            auto pkh = miq::hash160(pub);
+            key_map[miq::to_hex(pkh)] = {priv, pub};
+        }
+    }
+
+    // Sign each input
+    for(size_t i = 0; i < tx.vin.size(); i++){
+        const miq::UtxoLite& utxo = spendables[input_indices[i]];
+        std::string pkh_hex = miq::to_hex(utxo.pkh);
+
+        auto it = key_map.find(pkh_hex);
+        if(it == key_map.end()){
+            error = "Cannot find key for input " + std::to_string(i);
+            return false;
+        }
+
+        const auto& [priv, pub] = it->second;
+
+        // Sign
+        std::vector<uint8_t> sig;
+        if(!miq::crypto::ECDSA::sign(priv, sighash, sig)){
+            error = "Failed to sign input " + std::to_string(i);
+            return false;
+        }
+
+        // Security check: verify our own signature
+        if(!miq::crypto::ECDSA::verify(pub, sighash, sig)){
+            error = "Signature verification failed for input " + std::to_string(i);
+            return false;
+        }
+
+        tx.vin[i].sig = sig;
+        tx.vin[i].pubkey = pub;
+    }
+
+    return true;
+}
+
+// Verify a signed transaction before broadcast
+static bool verify_transaction_before_broadcast(
+    const miq::Transaction& tx,
+    std::string& error)
+{
+    // Check basic structure
+    if(tx.vin.empty()){
+        error = "Transaction has no inputs";
+        return false;
+    }
+    if(tx.vout.empty()){
+        error = "Transaction has no outputs";
+        return false;
+    }
+
+    // Check all inputs are signed
+    for(size_t i = 0; i < tx.vin.size(); i++){
+        if(tx.vin[i].sig.empty()){
+            error = "Input " + std::to_string(i) + " is not signed";
+            return false;
+        }
+        if(tx.vin[i].pubkey.empty()){
+            error = "Input " + std::to_string(i) + " has no pubkey";
+            return false;
+        }
+        if(tx.vin[i].sig.size() != 64){
+            error = "Input " + std::to_string(i) + " has invalid signature length";
+            return false;
+        }
+        if(tx.vin[i].pubkey.size() != 33 && tx.vin[i].pubkey.size() != 65){
+            error = "Input " + std::to_string(i) + " has invalid pubkey length";
+            return false;
+        }
+    }
+
+    // Verify signatures against sighash
+    miq::Transaction sighash_tx = tx;
+    for(auto& in : sighash_tx.vin){
+        in.sig.clear();
+        in.pubkey.clear();
+    }
+    auto sighash = miq::dsha256(miq::ser_tx(sighash_tx));
+
+    for(size_t i = 0; i < tx.vin.size(); i++){
+        if(!miq::crypto::ECDSA::verify(tx.vin[i].pubkey, sighash, tx.vin[i].sig)){
+            error = "Signature verification failed for input " + std::to_string(i);
+            return false;
+        }
+    }
+
+    // Check outputs
+    uint64_t total_output = 0;
+    for(size_t i = 0; i < tx.vout.size(); i++){
+        if(tx.vout[i].value == 0){
+            error = "Output " + std::to_string(i) + " has zero value";
+            return false;
+        }
+        if(tx.vout[i].pkh.size() != 20){
+            error = "Output " + std::to_string(i) + " has invalid PKH length";
+            return false;
+        }
+        total_output += tx.vout[i].value;
+    }
+
+    // Check for overflow
+    if(total_output > wallet_config::MAX_SINGLE_TX_VALUE){
+        error = "Total output exceeds maximum value";
         return false;
     }
 
