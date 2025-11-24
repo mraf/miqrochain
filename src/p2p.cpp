@@ -3164,8 +3164,13 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             orphan_order_.push_back(child_hex);
             orphan_bytes_ += raw.size();
             evict_orphans_if_needed();
-            log_info("P2P: stored orphan block child=" + child_hex + " parent=" + parent_hex
-                     + " (total_orphans=" + std::to_string(orphans_.size()) + ")");
+            // PERFORMANCE: Throttle orphan logging to avoid spam during sync
+            static int64_t last_orphan_log_ms = 0;
+            int64_t now_orphan_ms = now_ms();
+            if (now_orphan_ms - last_orphan_log_ms > 5000) {  // Log at most every 5 seconds
+                last_orphan_log_ms = now_orphan_ms;
+                log_info("P2P: stored orphan (total=" + std::to_string(orphans_.size()) + ")");
+            }
         }
 
         auto pit = peers_.find(sock);
@@ -3187,9 +3192,20 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
         }
         g_rr_next_idx.erase(hexkey(bh));
 
-        log_info("P2P: accepted block height=" + std::to_string(chain_.height())
-                 + " miner=" + miner
-                 + " from=" + src_ip);
+        // PERFORMANCE: Throttle block acceptance logging during sync (1 per second max)
+        static int64_t last_block_log_ms = 0;
+        static uint64_t blocks_since_log = 0;
+        int64_t now_block_ms = now_ms();
+        blocks_since_log++;
+        if (now_block_ms - last_block_log_ms > 1000) {  // Log at most every 1 second
+            last_block_log_ms = now_block_ms;
+            if (blocks_since_log > 1) {
+                log_info("P2P: accepted " + std::to_string(blocks_since_log) + " blocks, height=" + std::to_string(chain_.height()));
+            } else {
+                log_info("P2P: accepted block height=" + std::to_string(chain_.height()) + " from=" + src_ip);
+            }
+            blocks_since_log = 0;
+        }
 
         broadcast_inv_block(bh);
         try_connect_orphans(hexkey(bh));
@@ -4312,18 +4328,9 @@ void P2P::loop(){
         if (poll_now - last_poll_time < 50 && rc > 0) {
             // Poll returned in less than 50ms - might be a tight loop
             tight_loop_count++;
-            static int64_t last_tight_loop_log = 0;
-            if (poll_now - last_tight_loop_log > 1000) {
-                log_warn("[DEBUG] Poll tight loop detected: rc=" + std::to_string(rc) +
-                        " fds.size=" + std::to_string(fds.size()) +
-                        " time_since_last=" + std::to_string(poll_now - last_poll_time) + "ms" +
-                        " count=" + std::to_string(tight_loop_count));
-                last_tight_loop_log = poll_now;
-            }
 
             // If we're in a tight loop for too long, force a sleep to prevent CPU burn
             if (tight_loop_count > 100) {
-                log_warn("[DEBUG] Forcing 100ms sleep to break tight loop");
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 tight_loop_count = 0;
             }
@@ -4932,7 +4939,16 @@ void P2P::loop(){
                         if (used_reverse) { g_hdr_flip[s] = true; }
 
                         if (accepted > 0) {
-                            log_info("P2P: headers from " + ps.ip + " n=" + std::to_string(hs.size()) + " accepted=" + std::to_string(accepted));
+                            // PERFORMANCE: Throttle headers logging during sync
+                            static int64_t last_hdr_log_ms = 0;
+                            static uint64_t hdrs_since_log = 0;
+                            int64_t now_hdr_ms = now_ms();
+                            hdrs_since_log += accepted;
+                            if (now_hdr_ms - last_hdr_log_ms > 2000) {  // Log at most every 2 seconds
+                                last_hdr_log_ms = now_hdr_ms;
+                                log_info("P2P: headers accepted=" + std::to_string(hdrs_since_log) + " best_height=" + std::to_string(chain_.best_header_height()));
+                                hdrs_since_log = 0;
+                            }
                             g_last_progress_ms = now_ms();
                             g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
                             // Use received headers to raise our estimate of this peer's tip.
@@ -5456,7 +5472,8 @@ void P2P::loop(){
                         bool at_tip = (hs.empty()) || ((hs.size() < kHdrBatchMax) && (chain_.best_header_height() > chain_.height()) && want.empty());
 
                         if (accepted > 0) {
-                            log_info("P2P: headers from " + ps.ip + " n=" + std::to_string(hs.size()) + " accepted=" + std::to_string(accepted));
+                            // PERFORMANCE: Use the static throttle counter from above
+                            // (Headers logging is already throttled by the first branch)
                             g_last_progress_ms = now_ms();
                             g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
                             g_last_hdr_ok_ms[(Sock)s] = g_last_progress_ms;

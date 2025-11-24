@@ -2843,6 +2843,11 @@ public:
         // Parse hex values
         try {
             current_job.prev_hash = from_hex_s(prev_hash_hex);
+            // CRITICAL FIX: Stratum sends prev_hash in reversed byte order (display format)
+            // We must reverse it back to internal little-endian format for block header
+            if (current_job.prev_hash.size() == 32) {
+                std::reverse(current_job.prev_hash.begin(), current_job.prev_hash.end());
+            }
             current_job.version = (uint32_t)std::stoul(version_hex, nullptr, 16);
             current_job.bits = (uint32_t)std::stoul(bits_hex, nullptr, 16);
             current_job.time = (uint32_t)std::stoul(time_hex, nullptr, 16);
