@@ -2327,8 +2327,6 @@ int main(int argc, char** argv){
             uint64_t last_seen_h = 0;
             int tick=0;
             while(ui.running.load()){
-                ui.node_reachable.store(false);
-
                 // Tip + network hashps
                 TipInfo t;
                 if(rpc_gettipinfo(rpc_host, rpc_port, token, t)){
@@ -2407,6 +2405,9 @@ int main(int argc, char** argv){
                             ui.total_received_base.store(est_matured);
                         }
                     }
+                } else {
+                    // RPC call failed - mark node as unreachable
+                    ui.node_reachable.store(false);
                 }
 
                 if((++tick % 10)==0){
@@ -2657,7 +2658,20 @@ int main(int argc, char** argv){
 #endif
 
             std::thread stale_mon([&](){
+                // Template refresh timeout: abort round after 30 seconds to get fresh template
+                // This ensures timestamps stay valid and new transactions can be included
+                const int kTemplateRefreshMs = 30000;
+                auto round_start = std::chrono::steady_clock::now();
+
                 while(!found.load(std::memory_order_relaxed) && ui.running.load()){
+                    // Check for timeout - force template refresh periodically
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - round_start).count();
+                    if(elapsed >= kTemplateRefreshMs){
+                        abort_round.store(true);
+                        break;
+                    }
+
                     TipInfo tip_now{};
                     if(rpc_gettipinfo(rpc_host, rpc_port, token, tip_now)){
                         if(from_hex_s(tip_now.hash_hex) != tpl.prev_hash){
