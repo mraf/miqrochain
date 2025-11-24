@@ -845,12 +845,13 @@ static bool rpc_getcoinbaserecipient(const std::string& host, uint16_t port, con
     HttpResp r;
     if(!http_post(host, port, "/", auth, rpc_build("getcoinbaserecipient", ps.str()), r) || r.code!=200) return false;
     if(json_has_error(r.body)) return false;
-    std::string pkh_hex, txid_hex; long long val=0;
+    std::string pkh_hex, txid_hex;
+    double val_dbl = 0.0;
     if(!json_find_string(r.body, "pkh", pkh_hex)) return false;
-    (void)json_find_number(r.body, "value", val);
+    (void)json_find_double(r.body, "value", val_dbl);
     if(json_find_string(r.body, "txid", txid_hex)) io.coinbase_txid_hex = txid_hex;
     io.coinbase_pkh = from_hex_s(pkh_hex);
-    io.reward_value = (uint64_t)((val<0)?0:val);
+    io.reward_value = (uint64_t)((val_dbl < 0.0) ? 0 : val_dbl);
     return true;
 }
 static double estimate_network_hashps(const std::string& host, uint16_t port, const std::string& auth, uint64_t tip_height, uint32_t bits){

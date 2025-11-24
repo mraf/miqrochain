@@ -563,10 +563,13 @@ std::string RpcService::handle(const std::string& body){
         }
 
         if(method=="getblockchaininfo"){
+            auto tip = chain_.tip();
             JNode n; std::map<std::string,JNode> o;
             JNode a; a.v = std::string(CHAIN_NAME);              o["chain"] = a;
-            JNode h; h.v = (double)chain_.tip().height;          o["height"] = h;
-            JNode d; d.v = (double)Chain::work_from_bits_public(chain_.tip().bits); o["difficulty"] = d;
+            JNode h; h.v = (double)tip.height;                   o["height"] = h;
+            JNode b; b.v = (double)tip.height;                   o["blocks"] = b;  // alias for height
+            JNode hh; hh.v = to_hex(tip.hash);                   o["bestblockhash"] = hh;
+            JNode d; d.v = (double)Chain::work_from_bits_public(tip.bits); o["difficulty"] = d;
             JNode r; r.v = o; return json_dump(r);
         }
 
