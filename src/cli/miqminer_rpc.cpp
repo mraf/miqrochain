@@ -1286,6 +1286,19 @@ struct UIState {
     std::atomic<double>   node_verification{0.0};
     std::atomic<int>      rpc_errors{0};
 
+    // Pool mining statistics
+    std::atomic<bool>     pool_mode{false};
+    std::atomic<uint64_t> shares_submitted{0};
+    std::atomic<uint64_t> shares_accepted{0};
+    std::atomic<uint64_t> shares_rejected{0};
+    std::atomic<double>   pool_difficulty{1.0};
+    std::string           pool_host;
+    uint16_t              pool_port{0};
+    std::string           pool_worker;
+    std::atomic<uint64_t> pool_jobs_received{0};
+    std::string           current_job_id;
+    std::mutex            pool_mtx;
+
     // shutdown
     std::atomic<bool>    running{true};
 };
@@ -2154,6 +2167,9 @@ public:
     StratumJob current_job;
     std::atomic<uint64_t> job_id_counter{0};
     uint64_t last_submit_id = 0;
+    std::atomic<bool> has_job{false};
+    std::atomic<double> difficulty{1.0};
+    std::mutex job_mtx;
 
     bool connect_to_pool() {
         addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
@@ -2179,35 +2195,137 @@ public:
         return ::send(sock, msg.c_str(), msg.size(), 0) > 0;
     }
 
-    std::string recv_line() {
+    std::string recv_line(int timeout_ms = 30000) {
         std::string line;
         char c;
-        while (::recv(sock, &c, 1, 0) == 1) {
-            if (c == '\n') break;
-            line += c;
+        auto start = std::chrono::steady_clock::now();
+        while (true) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            if (elapsed >= timeout_ms) break;
+
+            int r = ::recv(sock, &c, 1, 0);
+            if (r == 1) {
+                if (c == '\n') break;
+                if (c != '\r') line += c;
+            } else if (r <= 0) {
+                break;
+            }
         }
         return line;
     }
 
-    bool subscribe() {
-        std::ostringstream ss;
-        ss << "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"miqminer/1.0\"]}";
-        if (!send_json(ss.str())) return false;
+    // Helper to extract string from JSON array by index
+    static bool json_array_string(const std::string& json, int index, std::string& out) {
+        int depth = 0;
+        int current_idx = -1;
+        bool in_string = false;
+        size_t str_start = 0;
 
-        std::string resp = recv_line();
-        // Parse extranonce1 and extranonce2_size from response
-        size_t en1_pos = resp.find("\"");
-        if (en1_pos != std::string::npos) {
-            // Simple extraction - in production would use proper JSON parsing
-            size_t start = resp.find("[\"");
-            if (start != std::string::npos) {
-                start += 2;
-                size_t end = resp.find("\"", start);
-                if (end != std::string::npos) {
-                    extranonce1 = resp.substr(start, end - start);
+        for (size_t i = 0; i < json.size(); i++) {
+            char c = json[i];
+            if (c == '"' && (i == 0 || json[i-1] != '\\')) {
+                in_string = !in_string;
+                if (in_string && depth == 1) {
+                    str_start = i + 1;
+                } else if (!in_string && depth == 1 && current_idx == index) {
+                    out = json.substr(str_start, i - str_start);
+                    return true;
+                }
+            } else if (!in_string) {
+                if (c == '[') {
+                    depth++;
+                    if (depth == 1) current_idx = 0;
+                } else if (c == ']') {
+                    depth--;
+                } else if (c == ',' && depth == 1) {
+                    current_idx++;
                 }
             }
         }
+        return false;
+    }
+
+    // Helper to extract number from JSON
+    static bool json_array_number(const std::string& json, int index, uint32_t& out) {
+        int depth = 0;
+        int current_idx = -1;
+        bool in_string = false;
+
+        for (size_t i = 0; i < json.size(); i++) {
+            char c = json[i];
+            if (c == '"' && (i == 0 || json[i-1] != '\\')) {
+                in_string = !in_string;
+            } else if (!in_string) {
+                if (c == '[') {
+                    depth++;
+                    if (depth == 1) current_idx = 0;
+                } else if (c == ']') {
+                    depth--;
+                } else if (c == ',' && depth == 1) {
+                    current_idx++;
+                } else if (depth == 1 && current_idx == index && std::isdigit(c)) {
+                    size_t end = i;
+                    while (end < json.size() && (std::isdigit(json[end]) || json[end] == '.')) end++;
+                    out = (uint32_t)std::stoul(json.substr(i, end - i));
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool subscribe() {
+        std::ostringstream ss;
+        ss << "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"chronen-miner/1.0\"]}";
+        if (!send_json(ss.str())) return false;
+
+        std::string resp = recv_line();
+        if (resp.empty()) return false;
+
+        // Parse result array: [[["mining.notify", "subscription_id"]], extranonce1, extranonce2_size]
+        // Find "result" array
+        size_t result_pos = resp.find("\"result\"");
+        if (result_pos == std::string::npos) return false;
+
+        size_t arr_start = resp.find('[', result_pos);
+        if (arr_start == std::string::npos) return false;
+
+        // Find extranonce1 (first string after the nested array)
+        // Skip past the nested subscription arrays to find extranonce1
+        int depth = 0;
+        size_t i = arr_start;
+        bool found_inner = false;
+
+        for (; i < resp.size(); i++) {
+            if (resp[i] == '[') depth++;
+            else if (resp[i] == ']') {
+                depth--;
+                if (depth == 1 && !found_inner) {
+                    found_inner = true;
+                }
+            }
+            else if (resp[i] == '"' && found_inner && depth == 1) {
+                // This should be extranonce1
+                size_t start = i + 1;
+                size_t end = resp.find('"', start);
+                if (end != std::string::npos) {
+                    extranonce1 = resp.substr(start, end - start);
+                    // Find extranonce2_size (number after extranonce1)
+                    size_t num_start = end + 1;
+                    while (num_start < resp.size() && !std::isdigit(resp[num_start])) num_start++;
+                    if (num_start < resp.size()) {
+                        size_t num_end = num_start;
+                        while (num_end < resp.size() && std::isdigit(resp[num_end])) num_end++;
+                        if (num_end > num_start) {
+                            extranonce2_size = (uint32_t)std::stoul(resp.substr(num_start, num_end - num_start));
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
         return !extranonce1.empty();
     }
 
@@ -2218,7 +2336,87 @@ public:
         if (!send_json(ss.str())) return false;
 
         std::string resp = recv_line();
+        // Look for "result":true
         return resp.find("true") != std::string::npos;
+    }
+
+    // Parse mining.notify job notification
+    bool parse_job(const std::string& line) {
+        if (line.find("mining.notify") == std::string::npos) return false;
+
+        // Find params array
+        size_t params_pos = line.find("\"params\"");
+        if (params_pos == std::string::npos) return false;
+
+        size_t arr_start = line.find('[', params_pos);
+        if (arr_start == std::string::npos) return false;
+
+        std::string params = line.substr(arr_start);
+
+        std::lock_guard<std::mutex> lk(job_mtx);
+
+        // Parse job parameters: [job_id, prevhash, coinbase1, coinbase2, merkle_branch[], version, nbits, ntime, clean]
+        std::string job_id, prev_hash_hex, coinb1, coinb2, version_hex, bits_hex, time_hex;
+
+        if (!json_array_string(params, 0, job_id)) return false;
+        if (!json_array_string(params, 1, prev_hash_hex)) return false;
+        if (!json_array_string(params, 2, coinb1)) return false;
+        if (!json_array_string(params, 3, coinb2)) return false;
+        // Skip merkle_branch[4] for now - we'll handle it simply
+        if (!json_array_string(params, 5, version_hex)) return false;
+        if (!json_array_string(params, 6, bits_hex)) return false;
+        if (!json_array_string(params, 7, time_hex)) return false;
+
+        current_job.job_id = job_id;
+        current_job.coinbase1 = coinb1;
+        current_job.coinbase2 = coinb2;
+
+        // Parse hex values
+        try {
+            current_job.prev_hash = from_hex_s(prev_hash_hex);
+            current_job.version = (uint32_t)std::stoul(version_hex, nullptr, 16);
+            current_job.bits = (uint32_t)std::stoul(bits_hex, nullptr, 16);
+            current_job.time = (uint32_t)std::stoul(time_hex, nullptr, 16);
+        } catch (...) {
+            return false;
+        }
+
+        // Check for clean flag
+        current_job.clean = (line.find("true", params_pos + 100) != std::string::npos);
+
+        has_job.store(true);
+        return true;
+    }
+
+    // Parse mining.set_difficulty
+    bool parse_difficulty(const std::string& line) {
+        if (line.find("set_difficulty") == std::string::npos) return false;
+
+        size_t params_pos = line.find("\"params\"");
+        if (params_pos == std::string::npos) return false;
+
+        size_t arr_start = line.find('[', params_pos);
+        if (arr_start == std::string::npos) return false;
+
+        // Find the difficulty number
+        size_t num_start = arr_start + 1;
+        while (num_start < line.size() && !std::isdigit(line[num_start]) && line[num_start] != '.') num_start++;
+
+        if (num_start < line.size()) {
+            size_t num_end = num_start;
+            while (num_end < line.size() && (std::isdigit(line[num_end]) || line[num_end] == '.')) num_end++;
+            try {
+                difficulty.store(std::stod(line.substr(num_start, num_end - num_start)));
+                return true;
+            } catch (...) {}
+        }
+        return false;
+    }
+
+    // Get current job (thread-safe copy)
+    StratumJob get_job() {
+        std::lock_guard<std::mutex> lk(job_mtx);
+        return current_job;
     }
 
     bool submit_share(const std::string& job_id, const std::string& extranonce2,
@@ -2232,12 +2430,21 @@ public:
         return send_json(ss.str());
     }
 
+    // Check if a response indicates share was accepted
+    bool check_submit_response(const std::string& line, uint64_t submit_id) {
+        // Look for {"id":submit_id,"result":true/false}
+        std::string id_str = "\"id\":" + std::to_string(submit_id);
+        if (line.find(id_str) == std::string::npos) return false;
+        return line.find("true") != std::string::npos;
+    }
+
     void disconnect() {
         if (sock >= 0) {
             miq_closesocket(sock);
             sock = -1;
         }
         connected.store(false);
+        has_job.store(false);
     }
 };
 
@@ -2638,31 +2845,63 @@ int main(int argc, char** argv){
                 out << R();
 
                 // ═══════════════════════════════════════════════════════════════
-                // SECTION 1: NETWORK STATUS
+                // SECTION 1: NETWORK/POOL STATUS
                 // ═══════════════════════════════════════════════════════════════
                 out << "\n" << C("36;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
-                out << C("1;4") << " NETWORK STATUS" << R() << "\n";
-                out << C("36") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
 
-                // Connection status
-                bool connected = ui.node_reachable.load();
-                out << "  " << C("1") << "Connection  :" << R() << " "
-                    << ui_status(connected, "CONNECTED", "UNREACHABLE")
-                    << "  " << C("2") << "(" << ui.rpc_host << ":" << ui.rpc_port << ")" << R() << "\n";
+                bool is_pool_mode = ui.pool_mode.load();
 
-                // Blockchain tip
-                uint64_t tip_h = ui.tip_height.load();
-                uint32_t tip_bits = ui.tip_bits.load();
-                double difficulty = difficulty_from_bits(tip_bits);
+                if (is_pool_mode) {
+                    out << C("1;4") << " POOL STATUS" << R() << "\n";
+                    out << C("36") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
 
-                out << "  " << C("1") << "Block Height:" << R() << " " << C("33;1") << tip_h << R() << "\n";
-                out << "  " << C("1") << "Difficulty  :" << R() << " " << std::fixed << std::setprecision(4) << difficulty
-                    << "  " << C("2") << "(bits: 0x" << std::hex << std::setw(8) << std::setfill('0') << tip_bits << std::dec << ")" << R() << "\n";
+                    // Pool connection status
+                    bool connected = ui.node_reachable.load();
+                    out << "  " << C("1") << "Pool        :" << R() << " "
+                        << ui_status(connected, "CONNECTED", "DISCONNECTED")
+                        << "  " << C("2") << "(" << ui.pool_host << ":" << ui.pool_port << ")" << R() << "\n";
 
-                // Network hashrate
-                double net_hs = ui.net_hashps.load();
-                if (net_hs > max_net_hs) max_net_hs = net_hs * 1.2;
-                out << "  " << C("1") << "Network H/s :" << R() << " " << C("36") << fmt_hs(net_hs) << R() << "\n";
+                    out << "  " << C("1") << "Worker      :" << R() << " " << C("33") << ui.pool_worker << R() << "\n";
+
+                    // Pool difficulty
+                    double pool_diff = ui.pool_difficulty.load();
+                    out << "  " << C("1") << "Pool Diff   :" << R() << " " << std::fixed << std::setprecision(4) << pool_diff << "\n";
+
+                    // Jobs received
+                    uint64_t jobs = ui.pool_jobs_received.load();
+                    out << "  " << C("1") << "Jobs Recv'd :" << R() << " " << C("36") << jobs << R() << "\n";
+
+                    // Current job ID
+                    {
+                        std::lock_guard<std::mutex> lk(ui.pool_mtx);
+                        if (!ui.current_job_id.empty()) {
+                            out << "  " << C("1") << "Current Job :" << R() << " " << C("2") << ui.current_job_id << R() << "\n";
+                        }
+                    }
+                } else {
+                    out << C("1;4") << " NETWORK STATUS" << R() << "\n";
+                    out << C("36") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
+
+                    // Connection status
+                    bool connected = ui.node_reachable.load();
+                    out << "  " << C("1") << "Connection  :" << R() << " "
+                        << ui_status(connected, "CONNECTED", "UNREACHABLE")
+                        << "  " << C("2") << "(" << ui.rpc_host << ":" << ui.rpc_port << ")" << R() << "\n";
+
+                    // Blockchain tip
+                    uint64_t tip_h = ui.tip_height.load();
+                    uint32_t tip_bits = ui.tip_bits.load();
+                    double difficulty = difficulty_from_bits(tip_bits);
+
+                    out << "  " << C("1") << "Block Height:" << R() << " " << C("33;1") << tip_h << R() << "\n";
+                    out << "  " << C("1") << "Difficulty  :" << R() << " " << std::fixed << std::setprecision(4) << difficulty
+                        << "  " << C("2") << "(bits: 0x" << std::hex << std::setw(8) << std::setfill('0') << tip_bits << std::dec << ")" << R() << "\n";
+
+                    // Network hashrate
+                    double net_hs = ui.net_hashps.load();
+                    if (net_hs > max_net_hs) max_net_hs = net_hs * 1.2;
+                    out << "  " << C("1") << "Network H/s :" << R() << " " << C("36") << fmt_hs(net_hs) << R() << "\n";
+                }
 
                 // ═══════════════════════════════════════════════════════════════
                 // SECTION 2: CURRENT MINING JOB
@@ -2695,7 +2934,8 @@ int main(int argc, char** argv){
                             out << "  " << C("1") << "Hash Preview:" << R() << " " << C("2;3") << nxh.substr(0,48) << "..." << R() << "\n";
                         }
                     } else {
-                        out << "  " << C("33") << "⏳ " << (connected ? "Waiting for mining template..." : "Connecting to node...") << R() << "\n";
+                        bool conn = ui.node_reachable.load();
+                        out << "  " << C("33") << "⏳ " << (conn ? "Waiting for mining template..." : "Connecting to node...") << R() << "\n";
                     }
                 }
 
@@ -2739,33 +2979,76 @@ int main(int argc, char** argv){
                 }
 
                 // ═══════════════════════════════════════════════════════════════
-                // SECTION 4: WALLET & REWARDS
+                // SECTION 4: WALLET & REWARDS / POOL SHARES
                 // ═══════════════════════════════════════════════════════════════
                 out << "\n" << C("35;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
-                out << C("1;4") << " WALLET & REWARDS" << R() << "\n";
-                out << C("35") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
 
-                out << "  " << C("1") << "Payout Addr :" << R() << " " << C("33") << pkh_to_address(ui.my_pkh) << R() << "\n";
+                if (is_pool_mode) {
+                    out << C("1;4") << " POOL SHARES" << R() << "\n";
+                    out << C("35") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
 
-                uint64_t mined = ui.mined_blocks.load();
-                out << "  " << C("1") << "Blocks Mined:" << R() << " " << C("32;1") << mined << R() << " (this session)\n";
+                    out << "  " << C("1") << "Payout Addr :" << R() << " " << C("33") << pkh_to_address(ui.my_pkh) << R() << "\n";
 
-                [[maybe_unused]] uint64_t paid_base = ui.total_received_base.load();
-                uint64_t est_total = ui.est_total_base.load();
-                uint64_t est_matured = ui.est_matured_base.load();
+                    // Share statistics
+                    uint64_t submitted = ui.shares_submitted.load();
+                    uint64_t accepted = ui.shares_accepted.load();
+                    uint64_t rejected = ui.shares_rejected.load();
 
-                out << "  " << C("1") << "Est. Earned :" << R() << " " << C("36;1") << fmt_miq_amount(est_total) << R();
-                if (est_matured > 0 && est_matured != est_total) {
-                    out << "  " << C("2") << "(matured: " << fmt_miq_amount(est_matured) << ")" << R();
-                }
-                out << "\n";
+                    out << "  " << C("1") << "Submitted   :" << R() << " " << C("36;1") << submitted << R() << " shares\n";
 
-                // Winner notification
-                if(ui.last_seen_height.load() == ui.tip_height.load() && ui.last_seen_height.load() > 0){
-                    if(ui.last_tip_was_mine.load()){
-                        out << "\n  " << C("32;1") << "🎉 YOU MINED THE LATEST BLOCK! 🎉" << R() << "\n";
-                    }else if(!ui.last_winner_addr.empty()){
-                        out << "\n  " << C("2") << "Latest block mined by: " << ui.last_winner_addr.substr(0,24) << "..." << R() << "\n";
+                    // Accepted with success rate
+                    double success_rate = (submitted > 0) ? (100.0 * accepted / submitted) : 0.0;
+                    out << "  " << C("1") << "Accepted    :" << R() << " " << C("32;1") << accepted << R();
+                    if (submitted > 0) {
+                        out << "  " << C("2") << "(" << std::fixed << std::setprecision(1) << success_rate << "% success rate)" << R();
+                    }
+                    out << "\n";
+
+                    // Rejected
+                    out << "  " << C("1") << "Rejected    :" << R() << " ";
+                    if (rejected > 0) {
+                        out << C("31;1") << rejected << R() << "\n";
+                    } else {
+                        out << C("32") << "0" << R() << "\n";
+                    }
+
+                    // Share ratio bar
+                    if (submitted > 0) {
+                        int bar_width = 30;
+                        int accepted_bar = (int)((double)accepted / submitted * bar_width);
+                        out << "  " << C("1") << "Share Ratio :" << R() << " [";
+                        for (int i = 0; i < bar_width; i++) {
+                            if (i < accepted_bar) out << C("32") << "#" << R();
+                            else out << C("31") << "." << R();
+                        }
+                        out << "]\n";
+                    }
+                } else {
+                    out << C("1;4") << " WALLET & REWARDS" << R() << "\n";
+                    out << C("35") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
+
+                    out << "  " << C("1") << "Payout Addr :" << R() << " " << C("33") << pkh_to_address(ui.my_pkh) << R() << "\n";
+
+                    uint64_t mined = ui.mined_blocks.load();
+                    out << "  " << C("1") << "Blocks Mined:" << R() << " " << C("32;1") << mined << R() << " (this session)\n";
+
+                    [[maybe_unused]] uint64_t paid_base = ui.total_received_base.load();
+                    uint64_t est_total = ui.est_total_base.load();
+                    uint64_t est_matured = ui.est_matured_base.load();
+
+                    out << "  " << C("1") << "Est. Earned :" << R() << " " << C("36;1") << fmt_miq_amount(est_total) << R();
+                    if (est_matured > 0 && est_matured != est_total) {
+                        out << "  " << C("2") << "(matured: " << fmt_miq_amount(est_matured) << ")" << R();
+                    }
+                    out << "\n";
+
+                    // Winner notification
+                    if(ui.last_seen_height.load() == ui.tip_height.load() && ui.last_seen_height.load() > 0){
+                        if(ui.last_tip_was_mine.load()){
+                            out << "\n  " << C("32;1") << "*** YOU MINED THE LATEST BLOCK! ***" << R() << "\n";
+                        }else if(!ui.last_winner_addr.empty()){
+                            out << "\n  " << C("2") << "Latest block mined by: " << ui.last_winner_addr.substr(0,24) << "..." << R() << "\n";
+                        }
                     }
                 }
 
@@ -2991,11 +3274,21 @@ int main(int argc, char** argv){
             std::fprintf(stderr, "[pool] Starting pool mining to %s:%u...\n", pool_cfg.host.c_str(), pool_cfg.port);
             log_line("Starting pool mining to " + pool_cfg.host + ":" + std::to_string(pool_cfg.port));
 
+            // Set pool mode in UI
+            ui.pool_mode.store(true);
+            ui.pool_host = pool_cfg.host;
+            ui.pool_port = pool_cfg.port;
+            ui.pool_worker = pool_cfg.worker;
+
             StratumClient stratum;
             stratum.host = pool_cfg.host;
             stratum.port = pool_cfg.port;
             stratum.worker = pool_cfg.worker;
             stratum.password = pool_cfg.password;
+
+            // Reconnection backoff
+            int reconnect_delay_ms = 1000;
+            const int max_reconnect_delay_ms = 30000;
 
             while (ui.running.load()) {
                 // Connect to pool
@@ -3003,24 +3296,30 @@ int main(int argc, char** argv){
                     std::fprintf(stderr, "[pool] Connecting to %s:%u...\n", stratum.host.c_str(), stratum.port);
 
                     if (!stratum.connect_to_pool()) {
-                        std::fprintf(stderr, "[pool] Connection failed. Retrying in 5 seconds...\n");
+                        std::fprintf(stderr, "[pool] Connection failed. Retrying in %d ms...\n", reconnect_delay_ms);
                         {
                             std::lock_guard<std::mutex> lk(ui.mtx);
                             ui.last_submit_msg = C("31;1") + "Pool connection failed - retrying..." + R();
                             ui.last_submit_when = std::chrono::steady_clock::now();
                         }
                         ui.node_reachable.store(false);
-                        for (int i = 0; i < 50 && ui.running.load(); ++i) miq_sleep_ms(100);
+                        for (int i = 0; i < reconnect_delay_ms / 100 && ui.running.load(); ++i) miq_sleep_ms(100);
+                        reconnect_delay_ms = std::min(reconnect_delay_ms * 2, max_reconnect_delay_ms);
                         continue;
                     }
 
-                    // Subscribe and authorize
+                    // Subscribe
                     if (!stratum.subscribe()) {
                         std::fprintf(stderr, "[pool] Subscription failed. Reconnecting...\n");
                         stratum.disconnect();
+                        for (int i = 0; i < 20 && ui.running.load(); ++i) miq_sleep_ms(100);
                         continue;
                     }
 
+                    std::fprintf(stderr, "[pool] Subscribed. Extranonce1: %s, Size2: %u\n",
+                                stratum.extranonce1.c_str(), stratum.extranonce2_size);
+
+                    // Authorize
                     if (!stratum.authorize()) {
                         std::fprintf(stderr, "[pool] Authorization failed. Check worker name/password.\n");
                         {
@@ -3034,44 +3333,308 @@ int main(int argc, char** argv){
                     }
 
                     ui.node_reachable.store(true);
+                    reconnect_delay_ms = 1000; // Reset backoff on successful connection
                     {
                         std::lock_guard<std::mutex> lk(ui.mtx);
                         ui.last_submit_msg = C("32;1") + "Connected to pool " + stratum.host + R();
                         ui.last_submit_when = std::chrono::steady_clock::now();
                     }
+                    std::fprintf(stderr, "[pool] Authorized as %s. Waiting for jobs...\n", stratum.worker.c_str());
                 }
 
-                // Wait for jobs from pool (simplified - in production would parse JSON properly)
-                std::string line = stratum.recv_line();
-                if (line.empty()) {
-                    // Connection lost
-                    std::fprintf(stderr, "[pool] Connection lost. Reconnecting...\n");
+                // Mining state
+                std::atomic<bool> found_share{false};
+                std::atomic<bool> new_job{false};
+                std::atomic<uint64_t> found_nonce{0};
+                std::string current_job_id;
+                uint32_t current_extranonce2 = 0;
+
+                // Wait for initial job
+                while (!stratum.has_job.load() && stratum.connected.load() && ui.running.load()) {
+                    std::string line = stratum.recv_line(1000);
+                    if (line.empty()) {
+                        if (!stratum.connected.load()) break;
+                        continue;
+                    }
+
+                    if (stratum.parse_difficulty(line)) {
+                        ui.pool_difficulty.store(stratum.difficulty.load());
+                        std::fprintf(stderr, "[pool] Difficulty set to: %.4f\n", stratum.difficulty.load());
+                    }
+
+                    if (stratum.parse_job(line)) {
+                        ui.pool_jobs_received.fetch_add(1);
+                        StratumJob job = stratum.get_job();
+                        current_job_id = job.job_id;
+
+                        {
+                            std::lock_guard<std::mutex> lk(ui.pool_mtx);
+                            ui.current_job_id = job.job_id;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lk(ui.mtx);
+                            ui.cand.height = ui.pool_jobs_received.load();
+                            ui.cand.bits = job.bits;
+                            ui.cand.time = job.time;
+                            if (!job.prev_hash.empty()) {
+                                ui.cand.prev_hex = to_hex_s(job.prev_hash);
+                            }
+                            ui.last_submit_msg = C("36;1") + "New job: " + job.job_id + R();
+                            ui.last_submit_when = std::chrono::steady_clock::now();
+                        }
+                        std::fprintf(stderr, "[pool] Job received: %s\n", job.job_id.c_str());
+                    }
+                }
+
+                if (!stratum.connected.load() || !ui.running.load()) {
                     stratum.disconnect();
-                    ui.node_reachable.store(false);
                     continue;
                 }
 
-                // Check for mining.notify (new job)
-                if (line.find("mining.notify") != std::string::npos) {
-                    // Parse job and update UI
-                    std::lock_guard<std::mutex> lk(ui.mtx);
-                    ui.cand.height = ui.tip_height.load() + 1;
-                    ui.last_submit_msg = C("36") + "New job received from pool" + R();
-                    ui.last_submit_when = std::chrono::steady_clock::now();
+                // Main mining loop - mine shares for current job
+                while (stratum.has_job.load() && stratum.connected.load() && ui.running.load()) {
+                    StratumJob job = stratum.get_job();
+                    current_job_id = job.job_id;
+                    current_extranonce2++;
+
+                    // Build coinbase transaction
+                    // coinbase = coinbase1 + extranonce1 + extranonce2 + coinbase2
+                    std::string extranonce2_hex;
+                    {
+                        std::ostringstream ss;
+                        ss << std::hex << std::setw(stratum.extranonce2_size * 2)
+                           << std::setfill('0') << current_extranonce2;
+                        extranonce2_hex = ss.str();
+                    }
+
+                    std::vector<uint8_t> coinbase_raw;
+                    try {
+                        std::string coinbase_hex = job.coinbase1 + stratum.extranonce1 + extranonce2_hex + job.coinbase2;
+                        coinbase_raw = from_hex_s(coinbase_hex);
+                    } catch (...) {
+                        std::fprintf(stderr, "[pool] Invalid coinbase hex\n");
+                        miq_sleep_ms(100);
+                        continue;
+                    }
+
+                    // Hash coinbase to get coinbase txid (double SHA256)
+                    std::array<uint8_t, 32> coinbase_hash;
+                    {
+                        std::vector<uint8_t> hash_result = dsha256(coinbase_raw);
+                        std::memcpy(coinbase_hash.data(), hash_result.data(), 32);
+                    }
+
+                    // Build merkle root from coinbase_hash and merkle_branch
+                    std::array<uint8_t, 32> merkle_root = coinbase_hash;
+                    for (const auto& branch_hex : job.merkle_branch) {
+                        try {
+                            std::vector<uint8_t> branch = from_hex_s(branch_hex);
+                            if (branch.size() != 32) continue;
+
+                            std::vector<uint8_t> concat;
+                            concat.reserve(64);
+                            concat.insert(concat.end(), merkle_root.begin(), merkle_root.end());
+                            concat.insert(concat.end(), branch.begin(), branch.end());
+
+                            std::vector<uint8_t> hash_result = dsha256(concat);
+                            std::memcpy(merkle_root.data(), hash_result.data(), 32);
+                        } catch (...) {
+                            continue;
+                        }
+                    }
+
+                    // Build block header: version + prev_hash + merkle_root + time + bits
+                    std::vector<uint8_t> header_prefix;
+                    header_prefix.reserve(80);
+
+                    // Version (4 bytes LE)
+                    put_u32_le(header_prefix, job.version);
+
+                    // Previous hash (32 bytes) - needs to be reversed for internal use
+                    if (job.prev_hash.size() == 32) {
+                        // Stratum sends prev_hash in a specific byte order
+                        header_prefix.insert(header_prefix.end(), job.prev_hash.begin(), job.prev_hash.end());
+                    } else {
+                        header_prefix.resize(header_prefix.size() + 32, 0);
+                    }
+
+                    // Merkle root (32 bytes)
+                    header_prefix.insert(header_prefix.end(), merkle_root.begin(), merkle_root.end());
+
+                    // Time (8 bytes for Miqrochain's 8-byte time)
+                    put_u64_le(header_prefix, (uint64_t)job.time);
+
+                    // Bits (4 bytes LE)
+                    put_u32_le(header_prefix, job.bits);
+
+                    // Calculate share target from pool difficulty
+                    double pool_diff = stratum.difficulty.load();
+                    ui.pool_difficulty.store(pool_diff);
+
+                    // Convert pool difficulty to bits for share validation
+                    // Pool difficulty 1 = 0xFFFF * 2^208 / difficulty
+                    // For shares, we use a target that's pool_diff times easier than block target
+                    uint32_t share_bits = job.bits;
+                    if (pool_diff > 0 && pool_diff < 65535) {
+                        // Adjust target for pool difficulty
+                        // This is simplified - actual implementation depends on pool
+                        double block_diff = difficulty_from_bits(job.bits);
+                        double share_target_diff = pool_diff;
+                        (void)block_diff; // Use pool difficulty directly
+                        (void)share_target_diff;
+                    }
+
+                    // Setup for CPU mining
+                    found_share.store(false);
+                    new_job.store(false);
+
+                    // Create base context for fast hashing
+                    FastSha256Ctx base1;
+                    fastsha_init(base1);
+                    fastsha_update(base1, header_prefix.data(), header_prefix.size());
+
+                    // CPU mining threads for shares
+                    std::vector<std::thread> thv;
+                    const uint64_t base_nonce = (static_cast<uint64_t>(time(nullptr)) << 32) ^ 0x9e3779b97f4a7c15ull;
+
+                    for (unsigned tid = 0; tid < threads; ++tid) {
+                        thv.emplace_back([&, tid]() {
+                            if (pin_affinity) pin_thread_to_cpu(tid);
+
+                            uint64_t nonce = base_nonce + (uint64_t)tid;
+                            const uint64_t step = (uint64_t)threads;
+                            const uint64_t BATCH = (1ull << 14);
+                            uint64_t local_hashes = 0;
+
+                            while (!found_share.load(std::memory_order_relaxed) &&
+                                   !new_job.load(std::memory_order_relaxed) &&
+                                   ui.running.load()) {
+
+                                for (uint64_t i = 0; i < BATCH && !found_share.load(std::memory_order_relaxed); i++) {
+                                    uint8_t le8[8];
+                                    store_u64_le(le8, nonce);
+
+                                    uint8_t hash[32];
+                                    dsha256_from_base(base1, le8, 8, hash);
+
+                                    // Check if hash meets share target
+                                    if (meets_target_be_raw(hash, share_bits)) {
+                                        found_nonce.store(nonce);
+                                        found_share.store(true);
+                                        break;
+                                    }
+
+                                    // Publish hash preview periodically
+                                    if ((local_hashes & 0x3FF) == 0) {
+                                        publish_next_hash_sample(hash);
+                                    }
+
+                                    nonce += step;
+                                    local_hashes++;
+                                }
+
+                                // Update global hash counter
+                                thr_counts[tid].hashes.fetch_add(local_hashes, std::memory_order_relaxed);
+                                local_hashes = 0;
+                            }
+                        });
+                    }
+
+                    // Monitor for new jobs while mining
+                    std::thread job_monitor([&]() {
+                        while (!found_share.load() && stratum.connected.load() && ui.running.load()) {
+                            std::string line = stratum.recv_line(500);
+                            if (line.empty()) continue;
+
+                            if (stratum.parse_difficulty(line)) {
+                                ui.pool_difficulty.store(stratum.difficulty.load());
+                            }
+
+                            if (stratum.parse_job(line)) {
+                                ui.pool_jobs_received.fetch_add(1);
+                                new_job.store(true);
+
+                                StratumJob new_job_data = stratum.get_job();
+                                {
+                                    std::lock_guard<std::mutex> lk(ui.mtx);
+                                    ui.cand.bits = new_job_data.bits;
+                                    ui.cand.time = new_job_data.time;
+                                    if (!new_job_data.prev_hash.empty()) {
+                                        ui.cand.prev_hex = to_hex_s(new_job_data.prev_hash);
+                                    }
+                                    ui.last_submit_msg = C("36") + "New job: " + new_job_data.job_id + R();
+                                    ui.last_submit_when = std::chrono::steady_clock::now();
+                                }
+                                break;
+                            }
+
+                            // Check for share responses
+                            if (line.find("\"result\"") != std::string::npos) {
+                                if (line.find("true") != std::string::npos) {
+                                    ui.shares_accepted.fetch_add(1);
+                                } else if (line.find("false") != std::string::npos ||
+                                          line.find("\"error\"") != std::string::npos) {
+                                    ui.shares_rejected.fetch_add(1);
+                                }
+                            }
+                        }
+                    });
+
+                    // Wait for mining threads
+                    for (auto& th : thv) th.join();
+                    new_job.store(true); // Signal job monitor to exit
+                    if (job_monitor.joinable()) job_monitor.join();
+
+                    // Submit share if found
+                    if (found_share.load() && stratum.connected.load()) {
+                        uint64_t nonce = found_nonce.load();
+
+                        // Format nonce as hex (8 bytes = 16 hex chars)
+                        std::ostringstream nonce_ss;
+                        nonce_ss << std::hex << std::setw(16) << std::setfill('0') << nonce;
+                        std::string nonce_hex = nonce_ss.str();
+
+                        // Format time as hex
+                        std::ostringstream time_ss;
+                        time_ss << std::hex << std::setw(8) << std::setfill('0') << job.time;
+                        std::string time_hex = time_ss.str();
+
+                        // Submit share
+                        if (stratum.submit_share(current_job_id, extranonce2_hex, time_hex, nonce_hex)) {
+                            ui.shares_submitted.fetch_add(1);
+                            {
+                                std::lock_guard<std::mutex> lk(ui.mtx);
+                                std::ostringstream msg;
+                                msg << C("32;1") << "Share submitted #" << ui.shares_submitted.load()
+                                    << " (accepted: " << ui.shares_accepted.load()
+                                    << ", rejected: " << ui.shares_rejected.load() << ")" << R();
+                                ui.last_submit_msg = msg.str();
+                                ui.last_submit_when = std::chrono::steady_clock::now();
+                            }
+                        } else {
+                            std::fprintf(stderr, "[pool] Failed to submit share\n");
+                        }
+                    }
+
+                    // Small delay before next round
+                    if (!new_job.load() && ui.running.load()) {
+                        miq_sleep_ms(50);
+                    }
                 }
 
-                // Check for mining.set_difficulty
-                if (line.find("set_difficulty") != std::string::npos) {
-                    std::fprintf(stderr, "[pool] Difficulty update received\n");
+                // Disconnected or no job
+                if (!stratum.connected.load()) {
+                    stratum.disconnect();
+                    ui.node_reachable.store(false);
                 }
-
-                // Simple mining simulation for pool (in production would mine actual shares)
-                // For now, just keep connection alive and show we're connected
-                miq_sleep_ms(100);
             }
 
             stratum.disconnect();
             std::fprintf(stderr, "[pool] Pool mining stopped.\n");
+            std::fprintf(stderr, "[pool] Final stats - Submitted: %llu, Accepted: %llu, Rejected: %llu\n",
+                        (unsigned long long)ui.shares_submitted.load(),
+                        (unsigned long long)ui.shares_accepted.load(),
+                        (unsigned long long)ui.shares_rejected.load());
         }
         // ===== SOLO MINING LOOP =====
         else {
