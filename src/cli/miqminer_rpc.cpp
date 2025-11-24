@@ -566,6 +566,7 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
     addrinfo* res=nullptr; char ps[16]; std::snprintf(ps,sizeof(ps), "%u", (unsigned)port);
     int gai_err = getaddrinfo(host.c_str(), ps, &hints, &res);
     if(gai_err != 0) {
+        if(res) freeaddrinfo(res);  // CRITICAL FIX: Free res even on error
         out.code = 0;
         out.body = "DNS resolution failed";
         return false;
@@ -580,12 +581,12 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
         s = (socket_t)socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 #if defined(_WIN32)
         if(s==INVALID_SOCKET) continue;
-        set_socket_timeouts(s, 10000, 15000);  // Increased timeouts for reliability
+        set_socket_timeouts(s, 60000, 60000);  // CRITICAL FIX: Increased to 60s for mining stability
         if(connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen)==0) break;
         miq_closesocket(s); s = INVALID_SOCKET;
 #else
         if(s<0) continue;
-        set_socket_timeouts(s, 10000, 15000);  // Increased timeouts for reliability
+        set_socket_timeouts(s, 60000, 60000);  // CRITICAL FIX: Increased to 60s for mining stability
         if(connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen)==0) break;
         miq_closesocket(s); s = -1;
 #endif
