@@ -1224,26 +1224,18 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
     uint64_t tsec = hdr_time(tip);
     if (tsec == 0) {
         why_out = "waiting for headers time";
-        log_info("DEBUG: sync gate FAILED - waiting for headers time");
         return false;
     }
     uint64_t now = (uint64_t)std::time(nullptr);
     uint64_t age = (now > tsec) ? (now - tsec) : 0;
     const uint64_t fresh = std::max<uint64_t>(BLOCK_TIME_SECS * 3, 300);
 
-    log_info("DEBUG: sync gate - tip_time=" + std::to_string(tsec) +
-             " now=" + std::to_string(now) +
-             " age=" + std::to_string(age) +
-             " fresh_limit=" + std::to_string(fresh));
-
     if (age > fresh) {
         why_out = "tip too old";
-        log_info("DEBUG: sync gate FAILED - tip too old");
         return false;
     }
 
     why_out.clear();
-    log_info("DEBUG: sync gate PASSED - all checks passed");
     return true;
 }
 
@@ -2998,16 +2990,12 @@ int main(int argc, char** argv){
         if (can_tui) { tui.mark_step_started("Start P2P listener"); tui.set_node_state(TUI::NodeState::Starting); }
         if(!cfg.no_p2p){
             uint16_t p2p_port = cfg.p2p_port ? cfg.p2p_port : P2P_PORT;
-            log_info("DEBUG: Using P2P port " + std::to_string(p2p_port) + " (config=" + std::to_string(cfg.p2p_port) + ", default=" + std::to_string(P2P_PORT) + ")");
             if(p2p.start(p2p_port)){
                 p2p_ok = true;
                 log_info("P2P listening on " + std::to_string(p2p_port));
                 if (can_tui) { tui.mark_step_ok("Start P2P listener"); tui.mark_step_started("Connect seeds"); }
                 auto seed_role = compute_seed_role();
-                log_info("DEBUG: seed_role.we_are_seed=" + std::string(seed_role.we_are_seed ? "true" : "false") +
-                         " detail=" + seed_role.detail + " seed_host=" + seed_host_cstr());
                 if (!(seed_role.we_are_seed || g_assume_seed_hairpin.load())) {
-                    log_info("DEBUG: Connecting to seed " + std::string(seed_host_cstr()) + ":" + std::to_string(P2P_PORT));
                     p2p.connect_seed(seed_host_cstr(), P2P_PORT);
                     if (can_tui) tui.mark_step_ok("Connect seeds");
                 } else {

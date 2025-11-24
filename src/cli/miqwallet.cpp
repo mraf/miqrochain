@@ -1,6 +1,6 @@
-// src/miqwallet.cpp - Professional MIQ Wallet CLI v1.0 Stable
+// src/miqwallet.cpp - Professional MIQ Wallet CLI v2.0
 // Production-grade SPV wallet with enterprise reliability, offline transactions,
-// persistent queue system, and professional PowerShell 5+ compatible UI
+// persistent queue system, beautiful animations, and live confirmation tracking
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -326,6 +326,102 @@ namespace ui {
                   << std::string(20, ' ') << std::flush;
     }
 
+    // Beautiful confirmation waiting animation
+    void print_confirmation_waiting(int confirmations, int target, int frame) {
+        const char* pulse[] = {".", "..", "...", "....", "....."};
+        std::cout << "\r  ";
+
+        // Draw confirmation boxes
+        std::cout << cyan() << "[" << reset();
+        for (int i = 0; i < target; i++) {
+            if (i < confirmations) {
+                std::cout << green() << "#" << reset();
+            } else if (i == confirmations) {
+                // Animated waiting box
+                const char* anim[] = {".", "o", "O", "o"};
+                std::cout << yellow() << anim[frame % 4] << reset();
+            } else {
+                std::cout << dim() << "-" << reset();
+            }
+        }
+        std::cout << cyan() << "]" << reset();
+
+        // Status text
+        if (confirmations >= target) {
+            std::cout << green() << " CONFIRMED!" << reset();
+        } else {
+            std::cout << yellow() << " Waiting" << pulse[frame % 5] << reset();
+            std::cout << dim() << " (" << confirmations << "/" << target << ")" << reset();
+        }
+        std::cout << std::string(10, ' ') << std::flush;
+    }
+
+    // Transaction broadcast animation
+    void print_broadcast_animation(int frame) {
+        const char* frames[] = {
+            "[>    ]", "[=>   ]", "[==>  ]", "[===> ]", "[====>]",
+            "[====*]", "[====>]", "[===> ]", "[==>  ]", "[=>   ]"
+        };
+        std::cout << "\r  " << cyan() << frames[frame % 10] << reset()
+                  << " Broadcasting transaction" << std::string(10, ' ') << std::flush;
+    }
+
+    // Success celebration animation
+    void print_success_celebration(const std::string& msg) {
+        std::cout << "\n";
+        std::cout << green() << bold();
+        std::cout << "  +------------------------------------------+\n";
+        std::cout << "  |                                          |\n";
+        std::cout << "  |   [OK] " << std::left << std::setw(33) << msg << "|\n";
+        std::cout << "  |                                          |\n";
+        std::cout << "  +------------------------------------------+\n";
+        std::cout << reset();
+    }
+
+    // Professional transaction summary box
+    void print_tx_summary_box(const std::string& txid, uint64_t amount, uint64_t fee,
+                               const std::string& to_addr, uint64_t change = 0) {
+        std::cout << "\n";
+        std::cout << cyan() << bold();
+        std::cout << "  +============================================+\n";
+        std::cout << "  |         TRANSACTION SUMMARY                |\n";
+        std::cout << "  +============================================+\n";
+        std::cout << reset();
+
+        std::cout << cyan() << "  |" << reset();
+        std::cout << dim() << " TXID:   " << reset() << txid.substr(0, 32) << "...";
+        std::cout << std::string(2, ' ') << cyan() << "|" << reset() << "\n";
+
+        std::cout << cyan() << "  |" << reset();
+        std::ostringstream amt_ss;
+        amt_ss << std::fixed << std::setprecision(8) << ((double)amount / 100000000.0);
+        std::cout << dim() << " Amount: " << reset() << green() << std::setw(20) << std::right
+                  << amt_ss.str() << " MIQ" << reset();
+        std::cout << std::string(5, ' ') << cyan() << "|" << reset() << "\n";
+
+        std::cout << cyan() << "  |" << reset();
+        std::ostringstream fee_ss;
+        fee_ss << std::fixed << std::setprecision(8) << ((double)fee / 100000000.0);
+        std::cout << dim() << " Fee:    " << reset() << yellow() << std::setw(20) << std::right
+                  << fee_ss.str() << " MIQ" << reset();
+        std::cout << std::string(5, ' ') << cyan() << "|" << reset() << "\n";
+
+        if (change > 0) {
+            std::cout << cyan() << "  |" << reset();
+            std::ostringstream chg_ss;
+            chg_ss << std::fixed << std::setprecision(8) << ((double)change / 100000000.0);
+            std::cout << dim() << " Change: " << reset() << cyan() << std::setw(20) << std::right
+                      << chg_ss.str() << " MIQ" << reset();
+            std::cout << std::string(5, ' ') << cyan() << "|" << reset() << "\n";
+        }
+
+        std::cout << cyan() << "  |" << reset();
+        std::cout << dim() << " To:     " << reset() << to_addr.substr(0, 34);
+        std::cout << std::string(1, ' ') << cyan() << "|" << reset() << "\n";
+
+        std::cout << cyan() << "  +--------------------------------------------+" << reset() << "\n";
+    }
+
     // Animated progress bar
     void print_animated_progress(const std::string& msg, double percent, int frame) {
         int width = 25;
@@ -416,8 +512,8 @@ namespace ui {
    |_|  |_|___\__\_\    \_/\_/ \__,_|_|_|\___|\__|
 
 )" << reset();
-        std::cout << dim() << "        Professional Cryptocurrency Wallet v1.0 Stable" << reset() << "\n";
-        std::cout << dim() << "           Offline Transactions | Persistent Queue" << reset() << "\n\n";
+        std::cout << green() << bold() << "         Professional Cryptocurrency Wallet v2.0" << reset() << "\n";
+        std::cout << dim() << "       Live Confirmations | Beautiful Animations | Secure" << reset() << "\n\n";
     }
 
     void print_success(const std::string& msg) {
@@ -4086,23 +4182,34 @@ static bool wallet_session(const std::string& cli_host,
         std::cout << "  " << ui::dim() << "Connected to: " << ui::reset() << used_seed << "\n";
         std::cout << "  " << ui::dim() << "UTXOs found:  " << ui::reset() << utxos.size() << "\n\n";
 
-        std::cout << "  " << ui::bold() << "Total:        " << ui::reset()
-                  << ui::green() << fmt_amount(wb.total) << " MIQ" << ui::reset() << "\n";
-        std::cout << "  " << ui::bold() << "Spendable:    " << ui::reset()
-                  << ui::cyan() << fmt_amount(wb.spendable) << " MIQ" << ui::reset() << "\n";
+        // Professional balance display with clear sections
+        std::cout << ui::cyan() << "  +------------------------------------------+\n";
+        std::cout << "  |          BALANCE OVERVIEW                  |\n";
+        std::cout << "  +------------------------------------------+" << ui::reset() << "\n";
+
+        // Total balance - large and prominent
+        std::cout << "  " << ui::bold() << ui::green() << "  TOTAL:      "
+                  << std::setw(18) << std::right << fmt_amount(wb.total) << " MIQ" << ui::reset() << "\n";
+
+        std::cout << ui::dim() << "  ------------------------------------------" << ui::reset() << "\n";
+
+        // Spendable - available right now
+        std::cout << "  " << ui::cyan() << "  Available:  " << ui::reset()
+                  << std::setw(18) << std::right << fmt_amount(wb.spendable) << " MIQ\n";
 
         if(wb.immature > 0){
-            std::cout << "  " << ui::dim() << "Immature:     " << ui::reset()
-                      << ui::yellow() << fmt_amount(wb.immature) << " MIQ" << ui::reset()
-                      << ui::dim() << " (mining rewards)" << ui::reset() << "\n";
-        }
-        if(wb.pending_hold > 0){
-            std::cout << "  " << ui::dim() << "Pending:      " << ui::reset()
-                      << ui::yellow() << fmt_amount(wb.pending_hold) << " MIQ" << ui::reset()
-                      << ui::dim() << " (awaiting confirmation)" << ui::reset() << "\n";
+            std::cout << "  " << ui::yellow() << "  Immature:   " << ui::reset()
+                      << std::setw(18) << std::right << fmt_amount(wb.immature) << " MIQ"
+                      << ui::dim() << "  (needs 100 conf)" << ui::reset() << "\n";
         }
 
-        std::cout << "\n";
+        if(wb.pending_hold > 0){
+            std::cout << "  " << ui::magenta() << "  In Transit: " << ui::reset()
+                      << std::setw(18) << std::right << fmt_amount(wb.pending_hold) << " MIQ"
+                      << ui::dim() << "  (outgoing tx)" << ui::reset() << "\n";
+        }
+
+        std::cout << ui::cyan() << "  +------------------------------------------+" << ui::reset() << "\n\n";
 
         return utxos;
     };
@@ -4871,6 +4978,14 @@ static bool wallet_session(const std::string& cli_host,
                 }
             }
 
+            // Show beautiful broadcast animation
+            std::cout << "\n";
+            for (int frame = 0; frame < 15; frame++) {
+                ui::print_broadcast_animation(frame);
+                std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            }
+            std::cout << "\r" << std::string(60, ' ') << "\r";
+
             bool broadcast_success = broadcast_any_seed(seeds_b, raw, used_bcast_seed, berr);
 
             // Update pending cache regardless of broadcast success
@@ -4950,22 +5065,34 @@ static bool wallet_session(const std::string& cli_host,
             tracked.to_address = to;
             save_tracked_transaction(wdir, tracked);
 
-            // Success!
+            // Success! Show beautiful animated confirmation
+            ui::print_success_celebration("Transaction Sent!");
+
+            // Show professional transaction summary
+            ui::print_tx_summary_box(txid_hex, amount, fee_final, to, change);
+
             std::cout << "\n";
-            ui::print_success("Transaction broadcasted successfully!");
-            std::cout << "\n";
-            std::cout << "  " << ui::dim() << "TXID:" << ui::reset() << " " << ui::cyan() << txid_hex << ui::reset() << "\n";
-            std::cout << "  " << ui::dim() << "Via:" << ui::reset() << "  " << used_bcast_seed << "\n";
+            std::cout << "  " << ui::dim() << "Broadcast via: " << ui::reset() << used_bcast_seed << "\n";
 
             if(used_change){
-                std::cout << "  " << ui::dim() << "Change returned to:" << ui::reset() << " " << change_addr << "\n";
+                std::cout << "  " << ui::dim() << "Change to:     " << ui::reset() << change_addr << "\n";
             }
 
-            std::cout << "\n  " << ui::dim() << "Transaction is now pending confirmation" << ui::reset() << "\n\n";
+            // Show confirmation waiting animation briefly
+            std::cout << "\n";
+            for (int frame = 0; frame < 12; frame++) {
+                ui::print_confirmation_waiting(0, 6, frame);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            std::cout << "\n\n";
+
+            std::cout << "  " << ui::cyan() << "[i]" << ui::reset()
+                      << " Transaction submitted! Confirmations will update.\n";
+            std::cout << "  " << ui::dim() << "    Check Transaction History (4) to monitor status." << ui::reset() << "\n\n";
 
             is_online = true;
 
-            // Refresh balance after send
+            // Refresh balance after send - balance should now show reduced amount
             utxos = refresh_and_print();
         }
         // =================================================================

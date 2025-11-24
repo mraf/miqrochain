@@ -659,15 +659,6 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
 
     if (best_header_key_.empty()) {
         best_header_key_ = key;
-        // Debug logging for best header updates
-        static int64_t last_best_header_log = 0;
-        int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (now - last_best_header_log > 10000) { // Log every 10 seconds
-            log_info("[DEBUG] accept_header: set initial best_header_key_=" + key.substr(0, 16) + "... " +
-                     " height=" + std::to_string(m.height) + " work=" + std::to_string(m.work_sum));
-            last_best_header_log = now;
-        }
     } else {
         const auto& cur = header_index_.at(best_header_key_);
         const auto& neu = header_index_.at(key);
@@ -681,20 +672,7 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
         bool equalish  = std::fabs(neu.work_sum - cur.work_sum) <= e;
 
         if (greater || (equalish && neu.height > cur.height)) {
-            std::string old_key = best_header_key_;
             best_header_key_ = key;
-            // Debug logging for best header updates
-            static int64_t last_best_header_log = 0;
-            int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            if (now - last_best_header_log > 10000) { // Log every 10 seconds
-                log_info("[DEBUG] accept_header: updated best_header_key_ from=" + old_key.substr(0, 16) + "... " +
-                         " to=" + key.substr(0, 16) + "... new_height=" + std::to_string(neu.height) +
-                         " new_work=" + std::to_string(neu.work_sum) +
-                         " old_height=" + std::to_string(cur.height) +
-                         " old_work=" + std::to_string(cur.work_sum));
-                last_best_header_log = now;
-            }
         }
     }
     return true;
@@ -708,77 +686,26 @@ void Chain::orphan_put(const std::vector<uint8_t>& h, const std::vector<uint8_t>
 void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, size_t max) const {
     MIQ_CHAIN_GUARD();
     out.clear();
-    
+
     // Limit max to prevent memory issues
     if (max > 2000) {
         max = 2000;
     }
 
-    // Debug logging for sync issues
-    static int64_t last_debug_log = 0;
-    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    bool should_log = (now - last_debug_log > 5000);
-
     if (best_header_key_.empty()) {
-        if (should_log) {
-            log_info("[DEBUG] next_block_fetch_targets: best_header_key_ is empty - height=" +
-                     std::to_string(tip_.height) + " header_index_size=" + std::to_string(header_index_.size()));
-
-            // For seed nodes with blocks but no headers, this is expected - they don't need to fetch anything
-            // The aggressive fallback in P2P will handle block requests by index
-            if (tip_.height > 0) {
-                log_info("[DEBUG] next_block_fetch_targets: seed node has blocks (height=" +
-                         std::to_string(tip_.height) + ") but no header index - this is normal for seed nodes");
-            }
-            last_debug_log = now;
-        }
-        
-        // If we have blocks but no header index, try to rebuild it
-        if (tip_.height > 0 && header_index_.empty()) {
-            // Return empty - P2P will handle this via index-based sync
-            return;
-        }
-        
-        // Special case: if we're at genesis and need the next block
-        if (tip_.height == 0 && header_index_.empty()) {
-            log_info("[FIX] Attempting to rebuild header index from blocks");
-            // Note: rebuild_header_index_from_blocks() needs to be called elsewhere as this is const
-            // But we log the need for it here
-        }
+        // If we have blocks but no header index, P2P will handle via index-based sync
         return;
     }
 
     std::vector<uint8_t> bh = header_index_.at(best_header_key_).hash;
     std::vector<std::vector<uint8_t>> up, down;
 
-    if (should_log) {
-        log_info("[DEBUG] next_block_fetch_targets: best_header_key_=" + best_header_key_.substr(0, 16) + "... " +
-                 " tip_hash=" + hexstr(tip_.hash) + " best_header_hash=" + hexstr(bh) +
-                 " tip_height=" + std::to_string(tip_.height) +
-                 " header_index_size=" + std::to_string(header_index_.size()));
-    }
-
     if (!find_header_fork(tip_.hash, bh, up, down)) {
-        if (should_log) {
-            log_info("[DEBUG] next_block_fetch_targets: find_header_fork failed - tip=" + hexstr(tip_.hash) +
-                     " best=" + hexstr(bh));
-            last_debug_log = now;
-        }
         return;
     }
 
     // up contains blocks from best_header UP to common ancestor
-    // down contains blocks from tip DOWN to common ancestor
-    // We want to download blocks from common ancestor UP to best_header
-    // So we should use up, but in reverse order (from common ancestor to best_header)
-
-    if (should_log) {
-        log_info("[DEBUG] next_block_fetch_targets: fork found - up_path_size=" + std::to_string(up.size()) +
-                 " down_path_size=" + std::to_string(down.size()));
-        last_debug_log = now;
-    }
-
+    // We want to download blocks from common ancestor UP to best_header (reverse order)
     size_t blocks_skipped = 0;
     size_t blocks_added = 0;
     for (auto it = up.rbegin(); it != up.rend(); ++it) {
@@ -790,26 +717,16 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
         if (!have_blk && !have_orphan) {
             out.push_back(hh);
             blocks_added++;
-            } else {
+        } else {
             blocks_skipped++;
         }
-        
+
         // OPTIMIZATION: If we have the first few blocks, skip ahead to find missing ones
         if (blocks_skipped > 10 && blocks_added == 0) {
-            // Skip ahead more aggressively to find missing blocks
             auto remaining = up.rend() - it - 1;
             auto skip_count = std::min((size_t)100, (size_t)(remaining > 0 ? remaining : 0));
             it += skip_count;
-            if (should_log) {
-                log_info("[DEBUG] Skipping ahead " + std::to_string(skip_count) + " blocks to find missing ones");
-            }
         }
-    }
-
-    if (should_log) {
-        log_info("[DEBUG] next_block_fetch_targets: returning " + std::to_string(out.size()) +
-                 " blocks to download (added=" + std::to_string(blocks_added) + 
-                 " skipped=" + std::to_string(blocks_skipped) + " max=" + std::to_string(max) + ")");
     }
 }
 
@@ -821,18 +738,6 @@ bool Chain::find_header_fork(const std::vector<uint8_t>& a,
     path_up_from_b.clear();
     path_down_from_a.clear();
 
-    // Debug logging for fork detection issues
-    static int64_t last_fork_debug_log = 0;
-    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    bool should_log = (now - last_fork_debug_log > 20000); // Log every 20 seconds
-
-    if (should_log) {
-        log_info("[DEBUG] find_header_fork: a=" + hexstr(a) + " b=" + hexstr(b) +
-                 " tip_height=" + std::to_string(tip_.height) +
-                 " header_index_size=" + std::to_string(header_index_.size()));
-    }
-
     auto getH = [&](const std::vector<uint8_t>& h)->std::optional<HeaderMeta>{
         auto it = header_index_.find(hk(h));
         if (it != header_index_.end()) return it->second;
@@ -843,18 +748,7 @@ bool Chain::find_header_fork(const std::vector<uint8_t>& a,
     auto A = getH(a);
     auto B = getH(b);
     if (!B) {
-        if (should_log) {
-            log_info("[DEBUG] find_header_fork: B not found - b=" + hexstr(b) + " (returning false)");
-            last_fork_debug_log = now;
-        }
         return false;
-    }
-
-    if (should_log) {
-        log_info("[DEBUG] find_header_fork: A=" + (A ? ("height=" + std::to_string(A->height)) : "null") +
-                 " B=height=" + std::to_string(B->height) +
-                 " A_hash=" + (A ? hexstr(A->hash) : "null") +
-                 " B_hash=" + hexstr(B->hash));
     }
 
     std::vector<uint8_t> x = B->hash;
@@ -943,14 +837,6 @@ bool Chain::find_header_fork(const std::vector<uint8_t>& a,
         }
     }
     std::reverse(path_down_from_a.begin(), path_down_from_a.end());
-
-    if (should_log) {
-        log_info("[DEBUG] find_header_fork: SUCCESS - path_up_from_b.size=" + std::to_string(path_up_from_b.size()) +
-                 " path_down_from_a.size=" + std::to_string(path_down_from_a.size()) +
-                 " common_ancestor=" + hexstr(x));
-        last_fork_debug_log = now;
-    }
-
     return true;
 }
 
@@ -1282,15 +1168,10 @@ void Chain::rebuild_header_index_from_blocks(){
         }
     }
 
-    log_info("[DEBUG] Rebuilding header index: tip_.height=" + std::to_string(tip_.height) +
-             " actual_blocks=" + std::to_string(actual_block_count) +
-             " highest_block=" + std::to_string(highest_block_found));
-
     // Start from genesis (height 0), rebuild for all blocks that exist (handle gaps)
     for (uint64_t h = 0; h <= highest_block_found; ++h) {
         Block blk;
         if (!get_block_by_index((size_t)h, blk)) {
-            log_warn("[DEBUG] Skipping missing block at height " + std::to_string(h) + " during header index rebuild");
             continue;  // Skip missing blocks, don't break
         }
 
@@ -1362,7 +1243,6 @@ void Chain::rebuild_header_index_from_blocks(){
         }
     }
 
-    log_info("[DEBUG] Header index rebuild complete. header_index_size=" + std::to_string(header_index_.size()));
 }
 
 uint64_t Chain::subsidy_for_height(uint64_t h) const {
