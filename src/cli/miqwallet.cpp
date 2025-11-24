@@ -23,6 +23,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <set>
+#include <map>
 #include <cstdint>
 #include <atomic>
 #include <mutex>
@@ -1514,8 +1515,8 @@ static TransactionBuildResult build_transaction_smart(
     const std::set<OutpointKey>& pending_utxos,
     const std::vector<uint8_t>& seed,
     miq::HdAccountMeta& meta,
-    const std::string& wdir,
-    const std::string& pass)
+    [[maybe_unused]] const std::string& wdir,
+    [[maybe_unused]] const std::string& pass)
 {
     TransactionBuildResult result;
 
@@ -6351,9 +6352,9 @@ static bool wallet_session(const std::string& cli_host,
                           << " (" << ui::yellow() << fmt_amount(pending_value) << " MIQ held" << ui::reset() << ")\n";
             }
 
-            int queue_count = count_pending_in_queue(wdir);
-            if(queue_count > 0){
-                std::cout << "    Queued TXs:       " << ui::yellow() << queue_count << ui::reset()
+            int queued_tx_count = count_pending_in_queue(wdir);
+            if(queued_tx_count > 0){
+                std::cout << "    Queued TXs:       " << ui::yellow() << queued_tx_count << ui::reset()
                           << ui::dim() << " (awaiting broadcast)" << ui::reset() << "\n";
             }
             std::cout << "\n";

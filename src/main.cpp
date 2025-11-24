@@ -1084,29 +1084,15 @@ template<typename H> struct has_nBits_field<H, std::void_t<decltype(std::declval
 
 template<typename H>
 static uint64_t hdr_time(const H& h){
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable: 4702)  // Unreachable code from if constexpr
-#endif
     if constexpr (has_time_field<H>::value) return (uint64_t)h.time;
-    if constexpr (has_timestamp_field<H>::value) return (uint64_t)h.timestamp;
-    return 0;
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
+    else if constexpr (has_timestamp_field<H>::value) return (uint64_t)h.timestamp;
+    else return 0;
 }
 template<typename H>
 static uint32_t hdr_bits(const H& h){
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable: 4702)  // Unreachable code from if constexpr
-#endif
     if constexpr (has_bits_field<H>::value) return (uint32_t)h.bits;
-    if constexpr (has_nBits_field<H>::value) return (uint32_t)h.nBits;
-    return (uint32_t)GENESIS_BITS;
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
+    else if constexpr (has_nBits_field<H>::value) return (uint32_t)h.nBits;
+    else return (uint32_t)GENESIS_BITS;
 }
 
 // Difficulty helpers
