@@ -1,6 +1,7 @@
-// src/miqwallet.cpp - Professional MIQ Wallet CLI v2.0
+// src/miqwallet.cpp - Professional MIQ Wallet CLI v4.0
 // Production-grade SPV wallet with enterprise reliability, offline transactions,
-// persistent queue system, beautiful animations, and live confirmation tracking
+// persistent queue system, beautiful animations, live confirmation tracking,
+// enhanced dashboard UI, real-time transaction monitoring, and improved UX
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -512,8 +513,264 @@ namespace ui {
    |_|  |_|___\__\_\    \_/\_/ \__,_|_|_|\___|\__|
 
 )" << reset();
-        std::cout << green() << bold() << "         Professional Cryptocurrency Wallet v2.0" << reset() << "\n";
-        std::cout << dim() << "       Live Confirmations | Beautiful Animations | Secure" << reset() << "\n\n";
+        std::cout << green() << bold() << "         Professional Cryptocurrency Wallet v4.0" << reset() << "\n";
+        std::cout << dim() << "   Dashboard View | Live TX Tracking | Full TXID Display | Secure" << reset() << "\n\n";
+    }
+
+    // =========================================================================
+    // ENHANCED WINDOW-STYLE UI FRAMEWORK v4.0
+    // =========================================================================
+
+    // Window frame characters for app-like appearance
+    const std::string WIN_TL = "+";
+    const std::string WIN_TR = "+";
+    const std::string WIN_BL = "+";
+    const std::string WIN_BR = "+";
+    const std::string WIN_H = "=";
+    const std::string WIN_V = "|";
+    const std::string WIN_TITLE_L = "[";
+    const std::string WIN_TITLE_R = "]";
+
+    // Draw a window frame with title
+    void draw_window_top(const std::string& title, int width = 70) {
+        std::cout << cyan() << bold();
+        std::cout << WIN_TL;
+        int title_space = width - 2;
+        int title_start = (title_space - (int)title.size() - 2) / 2;
+
+        for(int i = 0; i < title_start; i++) std::cout << WIN_H;
+        std::cout << WIN_TITLE_L << " " << title << " " << WIN_TITLE_R;
+        for(int i = title_start + (int)title.size() + 4; i < title_space; i++) std::cout << WIN_H;
+        std::cout << WIN_TR << reset() << "\n";
+    }
+
+    void draw_window_bottom(int width = 70) {
+        std::cout << cyan() << bold();
+        std::cout << WIN_BL;
+        for(int i = 0; i < width - 2; i++) std::cout << WIN_H;
+        std::cout << WIN_BR << reset() << "\n";
+    }
+
+    void draw_window_divider(int width = 70) {
+        std::cout << cyan();
+        std::cout << "+";
+        for(int i = 0; i < width - 2; i++) std::cout << "-";
+        std::cout << "+" << reset() << "\n";
+    }
+
+    void draw_window_line(const std::string& content, int width = 70, bool center = false) {
+        std::cout << cyan() << WIN_V << reset();
+        if(center) {
+            int padding = (width - 2 - (int)content.size()) / 2;
+            std::cout << std::string(padding > 0 ? padding : 1, ' ');
+            std::cout << content;
+            int remaining = width - 2 - padding - (int)content.size();
+            std::cout << std::string(remaining > 0 ? remaining : 1, ' ');
+        } else {
+            std::cout << " " << std::left << std::setw(width - 3) << content;
+        }
+        std::cout << cyan() << WIN_V << reset() << "\n";
+    }
+
+    void draw_window_line_colored(const std::string& label, const std::string& value,
+                                   const std::string& color, int width = 70) {
+        std::cout << cyan() << WIN_V << reset();
+        std::cout << " " << dim() << std::setw(16) << std::left << label << reset();
+
+        if(color == "green") std::cout << green();
+        else if(color == "yellow") std::cout << yellow();
+        else if(color == "red") std::cout << red();
+        else if(color == "cyan") std::cout << cyan();
+        else if(color == "magenta") std::cout << magenta();
+
+        int remaining = width - 19 - (int)value.size();
+        std::cout << value << reset();
+        std::cout << std::string(remaining > 0 ? remaining : 1, ' ');
+        std::cout << cyan() << WIN_V << reset() << "\n";
+    }
+
+    void draw_empty_line(int width = 70) {
+        std::cout << cyan() << WIN_V << reset();
+        std::cout << std::string(width - 2, ' ');
+        std::cout << cyan() << WIN_V << reset() << "\n";
+    }
+
+    // Draw a section header within a window
+    void draw_section_header(const std::string& title, int width = 70) {
+        std::cout << cyan() << WIN_V << reset();
+        std::cout << " " << bold() << cyan() << "[ " << title << " ]" << reset();
+        int remaining = width - 7 - (int)title.size();
+        std::cout << std::string(remaining > 0 ? remaining : 1, ' ');
+        std::cout << cyan() << WIN_V << reset() << "\n";
+    }
+
+    // Draw a transaction row with full TXID
+    void draw_tx_row(const std::string& dir, const std::string& amount,
+                     const std::string& status, const std::string& txid,
+                     const std::string& time_ago, int width = 70) {
+        std::cout << cyan() << WIN_V << reset();
+
+        // Direction indicator
+        if(dir == "sent") {
+            std::cout << " " << red() << bold() << "SENT" << reset() << "   ";
+        } else {
+            std::cout << " " << green() << bold() << "RECV" << reset() << "   ";
+        }
+
+        // Amount (right-aligned)
+        std::string amt_colored = (dir == "sent" ? red() : green()) + amount + " MIQ" + reset();
+        std::cout << std::setw(18) << std::right << amt_colored << reset() << "  ";
+
+        // Status badge
+        if(status == "confirmed") {
+            std::cout << green() << "[OK]" << reset();
+        } else if(status == "pending") {
+            std::cout << yellow() << "[..]" << reset();
+        } else {
+            std::cout << dim() << "[??]" << reset();
+        }
+
+        // Time
+        std::cout << "  " << dim() << std::setw(8) << time_ago << reset();
+
+        int used = 1 + 4 + 3 + 18 + 2 + 4 + 2 + 8;
+        std::cout << std::string(width - 1 - used > 0 ? width - 1 - used : 1, ' ');
+        std::cout << cyan() << WIN_V << reset() << "\n";
+
+        // TXID line (full)
+        std::cout << cyan() << WIN_V << reset();
+        std::cout << "   " << dim() << "TXID: " << reset() << cyan() << txid << reset();
+        int txid_remaining = width - 11 - (int)txid.size();
+        std::cout << std::string(txid_remaining > 0 ? txid_remaining : 1, ' ');
+        std::cout << cyan() << WIN_V << reset() << "\n";
+    }
+
+    // Draw UTXO row with full details
+    void draw_utxo_row(const std::string& txid, uint32_t vout, uint64_t value,
+                       uint64_t height, bool coinbase, bool is_spendable, int width = 70) {
+        std::cout << cyan() << WIN_V << reset();
+
+        // Value
+        std::ostringstream val_ss;
+        val_ss << std::fixed << std::setprecision(8) << ((double)value / 100000000.0);
+        std::string val_str = val_ss.str();
+
+        if(is_spendable) {
+            std::cout << " " << green() << std::setw(18) << std::right << val_str << " MIQ" << reset();
+        } else {
+            std::cout << " " << yellow() << std::setw(18) << std::right << val_str << " MIQ" << reset();
+        }
+
+        // Height
+        std::cout << "  " << dim() << "H:" << std::setw(7) << height << reset();
+
+        // Coinbase indicator
+        if(coinbase) {
+            std::cout << " " << magenta() << "[CB]" << reset();
+        } else {
+            std::cout << "      ";
+        }
+
+        // Spendable status
+        if(is_spendable) {
+            std::cout << " " << green() << "[OK]" << reset();
+        } else {
+            std::cout << " " << yellow() << "[IM]" << reset();
+        }
+
+        int used = 1 + 18 + 4 + 2 + 2 + 7 + 5 + 5;
+        std::cout << std::string(width - 1 - used > 0 ? width - 1 - used : 1, ' ');
+        std::cout << cyan() << WIN_V << reset() << "\n";
+
+        // TXID:vout line
+        std::cout << cyan() << WIN_V << reset();
+        std::string outpoint = txid + ":" + std::to_string(vout);
+        std::cout << "   " << dim() << outpoint << reset();
+        int remaining = width - 4 - (int)outpoint.size();
+        std::cout << std::string(remaining > 0 ? remaining : 1, ' ');
+        std::cout << cyan() << WIN_V << reset() << "\n";
+    }
+
+    // Draw a menu option
+    void draw_menu_option(const std::string& key, const std::string& desc,
+                          const std::string& hint = "", int width = 70) {
+        std::cout << cyan() << WIN_V << reset();
+        std::cout << "  " << cyan() << bold() << "[" << key << "]" << reset();
+        std::cout << " " << std::setw(20) << std::left << desc;
+        if(!hint.empty()) {
+            std::cout << dim() << hint << reset();
+        }
+        int used = 2 + 3 + (int)key.size() + 1 + 20 + (int)hint.size();
+        std::cout << std::string(width - 1 - used > 0 ? width - 1 - used : 1, ' ');
+        std::cout << cyan() << WIN_V << reset() << "\n";
+    }
+
+    // Draw status bar
+    void draw_status_bar(bool online, const std::string& node, int queue_count,
+                         int pending_utxos, int width = 70) {
+        std::cout << cyan() << WIN_V << reset();
+        std::cout << " ";
+
+        // Network status
+        if(online) {
+            std::cout << green() << bold() << "ONLINE" << reset();
+            if(!node.empty() && node.size() <= 25) {
+                std::cout << dim() << " @ " << node << reset();
+            }
+        } else {
+            std::cout << red() << bold() << "OFFLINE" << reset();
+        }
+
+        // Queue indicator
+        if(queue_count > 0) {
+            std::cout << "  " << yellow() << "[" << queue_count << " QUEUED]" << reset();
+        }
+
+        // Pending UTXOs
+        if(pending_utxos > 0) {
+            std::cout << "  " << magenta() << "[" << pending_utxos << " PENDING]" << reset();
+        }
+
+        // Fill remaining space
+        int used = 1 + 6; // minimum
+        if(online && !node.empty()) used += 3 + std::min((int)node.size(), 25);
+        if(queue_count > 0) used += 12;
+        if(pending_utxos > 0) used += 14;
+        std::cout << std::string(width - 1 - used > 0 ? width - 1 - used : 1, ' ');
+        std::cout << cyan() << WIN_V << reset() << "\n";
+    }
+
+    // Compact transaction display for dashboard
+    void draw_tx_compact(const std::string& dir, uint64_t amount,
+                         const std::string& txid, int confs, int width = 70) {
+        std::cout << cyan() << WIN_V << reset();
+
+        // Direction and amount
+        std::ostringstream amt_ss;
+        amt_ss << std::fixed << std::setprecision(4) << ((double)amount / 100000000.0);
+
+        if(dir == "sent") {
+            std::cout << " " << red() << "-" << amt_ss.str() << reset();
+        } else {
+            std::cout << " " << green() << "+" << amt_ss.str() << reset();
+        }
+
+        // Confirmations
+        std::cout << "  ";
+        if(confs >= 6) {
+            std::cout << green() << "[" << confs << "+]" << reset();
+        } else if(confs > 0) {
+            std::cout << yellow() << "[" << confs << "c]" << reset();
+        } else {
+            std::cout << red() << "[0c]" << reset();
+        }
+
+        // Full TXID
+        std::cout << "  " << dim() << txid << reset();
+
+        int used = 1 + 12 + 2 + 4 + 2 + (int)txid.size();
+        std::cout << std::string(width - 1 - used > 0 ? width - 1 - used : 1, ' ');
+        std::cout << cyan() << WIN_V << reset() << "\n";
     }
 
     void print_success(const std::string& msg) {
@@ -4241,98 +4498,144 @@ static bool wallet_session(const std::string& cli_host,
     // Main menu loop
     for(;;){
         // =============================================================
-        // PROFESSIONAL WALLET MENU v3.0
+        // PROFESSIONAL WALLET DASHBOARD v4.0
+        // Enhanced window-style UI with recent transactions
         // =============================================================
+        const int WIN_WIDTH = 72;
+
         std::cout << "\n";
-        std::cout << ui::cyan() << ui::bold();
-        std::cout << "  +============================================================+\n";
-        std::cout << "  |                    MIQ WALLET - DASHBOARD                  |\n";
-        std::cout << "  +============================================================+" << ui::reset() << "\n";
 
-        // Network status bar
-        std::cout << "  " << ui::dim() << "|" << ui::reset();
-        std::cout << " Status: ";
-        if(is_online){
-            std::cout << ui::green() << ui::bold() << "ONLINE" << ui::reset();
-            std::cout << ui::dim() << " @ " << last_connected_node << ui::reset();
-        } else {
-            std::cout << ui::red() << ui::bold() << "OFFLINE" << ui::reset();
-        }
+        // Window title bar
+        ui::draw_window_top("MIQ WALLET v4.0 - DASHBOARD", WIN_WIDTH);
 
-        // Show pending queue count
+        // Status bar
         int queue_count = count_pending_in_queue(wdir);
-        if(queue_count > 0){
-            std::cout << "  " << ui::yellow() << ui::bold() << "[" << queue_count << " QUEUED]" << ui::reset();
-        }
+        ui::draw_status_bar(is_online, last_connected_node, queue_count, (int)pending.size(), WIN_WIDTH);
 
-        // Show pending UTXO holds
-        if(!pending.empty()){
-            std::cout << "  " << ui::magenta() << "[" << pending.size() << " pending]" << ui::reset();
-        }
-        std::cout << "\n";
-        std::cout << ui::dim() << "  +------------------------------------------------------------+" << ui::reset() << "\n\n";
+        ui::draw_window_divider(WIN_WIDTH);
 
-        // Quick balance summary
+        // Balance display
         WalletBalance menu_wb = compute_balance(utxos, pending);
-        std::cout << "  " << ui::bold() << ui::green() << "Balance: " << fmt_amount(menu_wb.total) << " MIQ" << ui::reset();
+        std::ostringstream bal_total, bal_avail;
+        bal_total << std::fixed << std::setprecision(8) << ((double)menu_wb.total / (double)COIN);
+        bal_avail << std::fixed << std::setprecision(8) << ((double)menu_wb.spendable / (double)COIN);
+
+        ui::draw_window_line_colored("Total Balance:", bal_total.str() + " MIQ", "green", WIN_WIDTH);
         if(menu_wb.spendable < menu_wb.total){
-            std::cout << ui::dim() << "  (Available: " << fmt_amount(menu_wb.spendable) << " MIQ)" << ui::reset();
+            ui::draw_window_line_colored("Available:", bal_avail.str() + " MIQ", "cyan", WIN_WIDTH);
         }
-        std::cout << "\n\n";
+        if(menu_wb.immature > 0){
+            std::ostringstream imm_ss;
+            imm_ss << std::fixed << std::setprecision(8) << ((double)menu_wb.immature / (double)COIN);
+            ui::draw_window_line_colored("Immature:", imm_ss.str() + " MIQ (100 conf)", "yellow", WIN_WIDTH);
+        }
+        if(menu_wb.pending_hold > 0){
+            std::ostringstream pen_ss;
+            pen_ss << std::fixed << std::setprecision(8) << ((double)menu_wb.pending_hold / (double)COIN);
+            ui::draw_window_line_colored("In Transit:", pen_ss.str() + " MIQ", "magenta", WIN_WIDTH);
+        }
 
-        // =============================================================
-        // SECTION 1: CORE WALLET OPERATIONS
-        // =============================================================
-        std::cout << ui::cyan() << ui::bold() << "  CORE OPERATIONS" << ui::reset() << "\n";
-        std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "1" << ui::reset() << "   Receive MIQ         " << ui::dim() << "View and generate addresses" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "2" << ui::reset() << "   Send MIQ            " << ui::dim() << "Transfer funds to another address" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "3" << ui::reset() << "   New Address         " << ui::dim() << "Generate fresh receive address" << ui::reset() << "\n";
-        std::cout << "\n";
+        ui::draw_window_divider(WIN_WIDTH);
 
-        // =============================================================
-        // SECTION 2: TRANSACTIONS & HISTORY
-        // =============================================================
-        std::cout << ui::cyan() << ui::bold() << "  TRANSACTIONS" << ui::reset() << "\n";
-        std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "4" << ui::reset() << "   Transaction History " << ui::dim() << "View all past transactions" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "5" << ui::reset() << "   Address Book        " << ui::dim() << "Manage saved contacts" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "7" << ui::reset() << "   Pending Queue       " << ui::dim() << "View/manage queued transactions" << ui::reset() << "\n";
-        std::cout << "\n";
+        // Recent Transactions Section - Show last 5 with full TXIDs
+        ui::draw_section_header("RECENT TRANSACTIONS", WIN_WIDTH);
 
-        // =============================================================
-        // SECTION 3: WALLET MANAGEMENT
-        // =============================================================
-        std::cout << ui::cyan() << ui::bold() << "  WALLET MANAGEMENT" << ui::reset() << "\n";
-        std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "6" << ui::reset() << "   Wallet Info         " << ui::dim() << "View wallet statistics" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "8" << ui::reset() << "   Export Data         " << ui::dim() << "Export transactions CSV/JSON" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "9" << ui::reset() << "   Health Check        " << ui::dim() << "Analyze wallet health & fix issues" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "0" << ui::reset() << "   Settings & Backup   " << ui::dim() << "Configuration and backups" << ui::reset() << "\n";
-        std::cout << "\n";
+        std::vector<TxHistoryEntry> recent_history;
+        load_tx_history(wdir, recent_history);
 
-        // =============================================================
-        // SECTION 4: ADVANCED OPERATIONS
-        // =============================================================
-        std::cout << ui::cyan() << ui::bold() << "  ADVANCED" << ui::reset() << "\n";
-        std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "c" << ui::reset() << "   Consolidate UTXOs   " << ui::dim() << "Reduce fragmentation (combine UTXOs)" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "p" << ui::reset() << "   Release Pending     " << ui::dim() << "Unlock stuck pending UTXOs" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "u" << ui::reset() << "   UTXO Details        " << ui::dim() << "View all UTXOs with full TXIDs" << ui::reset() << "\n";
-        std::cout << "\n";
+        if(recent_history.empty()){
+            ui::draw_window_line("  No transactions yet. Use option [1] to receive MIQ.", WIN_WIDTH);
+        } else {
+            // Show last 5 transactions (most recent first)
+            std::sort(recent_history.begin(), recent_history.end(),
+                [](const TxHistoryEntry& a, const TxHistoryEntry& b){
+                    return a.timestamp > b.timestamp;
+                });
 
-        // =============================================================
-        // SECTION 5: SYSTEM CONTROLS
-        // =============================================================
-        std::cout << ui::cyan() << ui::bold() << "  SYSTEM" << ui::reset() << "\n";
-        std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "r" << ui::reset() << "   Refresh Balance     " << ui::dim() << "Sync with network" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "b" << ui::reset() << "   Broadcast Queue     " << ui::dim() << "Send all queued transactions" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "d" << ui::reset() << "   Network Diagnostics " << ui::dim() << "Test node connectivity" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "h" << ui::reset() << "   Help                " << ui::dim() << "Usage guide and tips" << ui::reset() << "\n";
-        std::cout << "    " << ui::cyan() << ui::bold() << "q" << ui::reset() << "   Exit Wallet         " << ui::dim() << "Return to main menu" << ui::reset() << "\n";
-        std::cout << "\n";
-        std::cout << ui::dim() << "  ================================================================" << ui::reset() << "\n";
+            int tx_shown = 0;
+            for(const auto& tx : recent_history){
+                if(tx_shown >= 5) break;
+
+                // Format amount
+                std::ostringstream amt_ss;
+                amt_ss << std::fixed << std::setprecision(4)
+                       << std::abs((double)tx.amount / (double)COIN);
+
+                // Format time ago
+                std::string time_str = ui::format_time_ago(tx.timestamp);
+
+                // Status
+                std::string status = (tx.confirmations >= 6) ? "confirmed" :
+                                     (tx.confirmations > 0) ? "pending" : "pending";
+
+                // Draw transaction row with full TXID
+                ui::draw_tx_row(tx.direction, amt_ss.str(), status,
+                               tx.txid_hex, time_str, WIN_WIDTH);
+
+                tx_shown++;
+            }
+
+            if(recent_history.size() > 5){
+                std::ostringstream more_ss;
+                more_ss << "  ... and " << (recent_history.size() - 5) << " more. Press [4] for full history.";
+                ui::draw_window_line(more_ss.str(), WIN_WIDTH);
+            }
+        }
+
+        ui::draw_window_divider(WIN_WIDTH);
+
+        // Quick UTXO Summary
+        ui::draw_section_header("UTXO SUMMARY", WIN_WIDTH);
+        std::ostringstream utxo_info;
+        utxo_info << "  " << utxos.size() << " UTXOs total";
+        if(utxos.size() > 0){
+            uint64_t min_u = UINT64_MAX, max_u = 0;
+            for(const auto& u : utxos){
+                min_u = std::min(min_u, u.value);
+                max_u = std::max(max_u, u.value);
+            }
+            utxo_info << " | Smallest: " << fmt_amount_short(min_u)
+                      << " | Largest: " << fmt_amount_short(max_u) << " MIQ";
+        }
+        ui::draw_window_line(utxo_info.str(), WIN_WIDTH);
+
+        ui::draw_window_divider(WIN_WIDTH);
+
+        // Menu sections in compact format
+        ui::draw_section_header("WALLET OPERATIONS", WIN_WIDTH);
+        ui::draw_menu_option("1", "Receive MIQ", "Get addresses", WIN_WIDTH);
+        ui::draw_menu_option("2", "Send MIQ", "Transfer funds", WIN_WIDTH);
+        ui::draw_menu_option("3", "New Address", "Fresh receive addr", WIN_WIDTH);
+
+        ui::draw_empty_line(WIN_WIDTH);
+        ui::draw_section_header("TRANSACTIONS & HISTORY", WIN_WIDTH);
+        ui::draw_menu_option("4", "Full History", "All transactions", WIN_WIDTH);
+        ui::draw_menu_option("5", "Address Book", "Saved contacts", WIN_WIDTH);
+        ui::draw_menu_option("7", "TX Queue", "Pending broadcasts", WIN_WIDTH);
+        ui::draw_menu_option("t", "TX Monitor", "Live TX tracking", WIN_WIDTH);
+
+        ui::draw_empty_line(WIN_WIDTH);
+        ui::draw_section_header("WALLET MANAGEMENT", WIN_WIDTH);
+        ui::draw_menu_option("6", "Wallet Info", "Statistics", WIN_WIDTH);
+        ui::draw_menu_option("8", "Export Data", "CSV/JSON export", WIN_WIDTH);
+        ui::draw_menu_option("9", "Health Check", "Diagnostics", WIN_WIDTH);
+        ui::draw_menu_option("0", "Settings", "Backup & config", WIN_WIDTH);
+
+        ui::draw_empty_line(WIN_WIDTH);
+        ui::draw_section_header("ADVANCED", WIN_WIDTH);
+        ui::draw_menu_option("u", "UTXO Browser", "Full UTXO details", WIN_WIDTH);
+        ui::draw_menu_option("c", "Consolidate", "Combine UTXOs", WIN_WIDTH);
+        ui::draw_menu_option("p", "Release Pending", "Unlock stuck funds", WIN_WIDTH);
+
+        ui::draw_empty_line(WIN_WIDTH);
+        ui::draw_section_header("SYSTEM", WIN_WIDTH);
+        ui::draw_menu_option("r", "Refresh", "Sync with network", WIN_WIDTH);
+        ui::draw_menu_option("b", "Broadcast", "Send queued TXs", WIN_WIDTH);
+        ui::draw_menu_option("d", "Diagnostics", "Network test", WIN_WIDTH);
+        ui::draw_menu_option("h", "Help", "User guide", WIN_WIDTH);
+        ui::draw_menu_option("q", "Exit", "Return to menu", WIN_WIDTH);
+
+        ui::draw_window_bottom(WIN_WIDTH);
 
         std::string c = ui::prompt("Select option: ");
         c = trim(c);
@@ -6230,56 +6533,272 @@ static bool wallet_session(const std::string& cli_host,
             }
         }
         // =================================================================
-        // OPTION u: UTXO Details with Full TXIDs
+        // OPTION t: Transaction Monitor - Live TX Tracking
         // =================================================================
-        else if(c == "u" || c == "U"){
+        else if(c == "t" || c == "T"){
+            const int TX_WIN_WIDTH = 76;
             std::cout << "\n";
-            std::cout << ui::cyan() << ui::bold();
-            std::cout << "  +============================================================+\n";
-            std::cout << "  |                    UTXO DETAILS                            |\n";
-            std::cout << "  +============================================================+" << ui::reset() << "\n\n";
 
-            if(utxos.empty()){
-                std::cout << "  " << ui::dim() << "No UTXOs found in wallet." << ui::reset() << "\n\n";
+            std::vector<TxHistoryEntry> all_txs;
+            load_tx_history(wdir, all_txs);
+
+            if(all_txs.empty()){
+                ui::draw_window_top("TRANSACTION MONITOR", TX_WIN_WIDTH);
+                ui::draw_window_line("  No transactions to monitor yet.", TX_WIN_WIDTH);
+                ui::draw_window_line("  Send or receive MIQ to see transactions here.", TX_WIN_WIDTH);
+                ui::draw_window_bottom(TX_WIN_WIDTH);
+                std::cout << "\n";
                 continue;
             }
 
-            // Summary
-            std::cout << "  " << ui::bold() << "Summary:" << ui::reset() << "\n";
-            std::cout << ui::dim() << "  ----------------------------------------------------------------" << ui::reset() << "\n";
-            std::cout << "    Total UTXOs:     " << ui::cyan() << utxos.size() << ui::reset() << "\n";
+            // Sort by timestamp (most recent first)
+            std::sort(all_txs.begin(), all_txs.end(),
+                [](const TxHistoryEntry& a, const TxHistoryEntry& b){
+                    return a.timestamp > b.timestamp;
+                });
 
+            int page = 0;
+            int per_page = 8;
+            int total_pages = ((int)all_txs.size() + per_page - 1) / per_page;
+
+            bool monitor_running = true;
+            while(monitor_running){
+                std::cout << "\n";
+                std::ostringstream title_ss;
+                title_ss << "TRANSACTION MONITOR - Page " << (page + 1) << "/" << total_pages;
+                ui::draw_window_top(title_ss.str(), TX_WIN_WIDTH);
+
+                // Statistics bar
+                int confirmed = 0, pending_tx = 0;
+                int64_t total_sent = 0, total_recv = 0;
+                for(const auto& tx : all_txs){
+                    if(tx.confirmations >= 6) confirmed++;
+                    else pending_tx++;
+                    if(tx.direction == "sent") total_sent += std::abs(tx.amount);
+                    else total_recv += tx.amount;
+                }
+
+                std::ostringstream stats_ss;
+                stats_ss << "  Confirmed: " << confirmed << "  |  Pending: " << pending_tx
+                         << "  |  Total TXs: " << all_txs.size();
+                ui::draw_window_line(stats_ss.str(), TX_WIN_WIDTH);
+
+                ui::draw_window_divider(TX_WIN_WIDTH);
+
+                int start = page * per_page;
+                int end = std::min(start + per_page, (int)all_txs.size());
+
+                for(int i = start; i < end; i++){
+                    const auto& tx = all_txs[i];
+
+                    // Transaction header with status
+                    std::ostringstream header;
+                    header << " #" << std::setw(3) << std::left << (i + 1) << " ";
+
+                    if(tx.direction == "sent"){
+                        header << ui::red() << "SENT" << ui::reset();
+                    } else {
+                        header << ui::green() << "RECV" << ui::reset();
+                    }
+
+                    // Amount
+                    std::ostringstream amt;
+                    amt << std::fixed << std::setprecision(8) << std::abs((double)tx.amount / (double)COIN);
+                    header << "  " << (tx.direction == "sent" ? ui::red() : ui::green())
+                           << amt.str() << " MIQ" << ui::reset();
+
+                    // Confirmations
+                    header << "  ";
+                    if(tx.confirmations >= 6){
+                        header << ui::green() << "[" << tx.confirmations << " CONF]" << ui::reset();
+                    } else if(tx.confirmations > 0){
+                        header << ui::yellow() << "[" << tx.confirmations << " CONF]" << ui::reset();
+                    } else {
+                        header << ui::red() << "[UNCONFIRMED]" << ui::reset();
+                    }
+
+                    // Time
+                    header << "  " << ui::dim() << ui::format_time_ago(tx.timestamp) << ui::reset();
+
+                    ui::draw_window_line(header.str(), TX_WIN_WIDTH);
+
+                    // Full TXID line
+                    std::ostringstream txid_line;
+                    txid_line << "      " << ui::dim() << "TXID: " << ui::reset()
+                              << ui::cyan() << tx.txid_hex << ui::reset();
+                    ui::draw_window_line(txid_line.str(), TX_WIN_WIDTH);
+
+                    // Address line
+                    if(!tx.to_address.empty()){
+                        std::ostringstream addr_line;
+                        addr_line << "      " << ui::dim() << "To:   " << ui::reset() << tx.to_address;
+                        ui::draw_window_line(addr_line.str(), TX_WIN_WIDTH);
+                    }
+
+                    // Fee if sent
+                    if(tx.direction == "sent" && tx.fee > 0){
+                        std::ostringstream fee_line;
+                        fee_line << "      " << ui::dim() << "Fee:  " << ui::reset()
+                                 << std::fixed << std::setprecision(8) << ((double)tx.fee / (double)COIN) << " MIQ";
+                        ui::draw_window_line(fee_line.str(), TX_WIN_WIDTH);
+                    }
+
+                    ui::draw_empty_line(TX_WIN_WIDTH);
+                }
+
+                ui::draw_window_divider(TX_WIN_WIDTH);
+
+                // Navigation help
+                ui::draw_window_line("  [n] Next  [p] Prev  [r] Refresh  [v #] View details  [q] Back", TX_WIN_WIDTH);
+                ui::draw_window_bottom(TX_WIN_WIDTH);
+
+                std::string cmd = ui::prompt("TX Monitor> ");
+                cmd = trim(cmd);
+
+                if(cmd == "q" || cmd == "Q") {
+                    monitor_running = false;
+                } else if(cmd == "n" && page < total_pages - 1) {
+                    page++;
+                } else if(cmd == "p" && page > 0) {
+                    page--;
+                } else if(cmd == "r" || cmd == "R") {
+                    // Refresh - reload history
+                    load_tx_history(wdir, all_txs);
+                    std::sort(all_txs.begin(), all_txs.end(),
+                        [](const TxHistoryEntry& a, const TxHistoryEntry& b){
+                            return a.timestamp > b.timestamp;
+                        });
+                    total_pages = ((int)all_txs.size() + per_page - 1) / per_page;
+                    ui::print_success("Transaction list refreshed");
+                } else if(cmd.length() > 2 && (cmd[0] == 'v' || cmd[0] == 'V')){
+                    // View specific transaction
+                    int idx = std::atoi(cmd.substr(2).c_str()) - 1;
+                    if(idx >= 0 && idx < (int)all_txs.size()){
+                        const auto& tx = all_txs[idx];
+                        std::cout << "\n";
+                        ui::draw_window_top("TRANSACTION DETAILS", TX_WIN_WIDTH);
+
+                        std::ostringstream txid_full;
+                        txid_full << "  TXID: " << tx.txid_hex;
+                        ui::draw_window_line(txid_full.str(), TX_WIN_WIDTH);
+                        ui::draw_window_divider(TX_WIN_WIDTH);
+
+                        std::ostringstream dir_line;
+                        dir_line << "  Direction:     " << (tx.direction == "sent" ? "SENT" : "RECEIVED");
+                        ui::draw_window_line(dir_line.str(), TX_WIN_WIDTH);
+
+                        std::ostringstream amt_line;
+                        amt_line << "  Amount:        " << std::fixed << std::setprecision(8)
+                                 << std::abs((double)tx.amount / (double)COIN) << " MIQ";
+                        ui::draw_window_line(amt_line.str(), TX_WIN_WIDTH);
+
+                        if(tx.fee > 0){
+                            std::ostringstream fee_line;
+                            fee_line << "  Fee:           " << std::fixed << std::setprecision(8)
+                                     << ((double)tx.fee / (double)COIN) << " MIQ";
+                            ui::draw_window_line(fee_line.str(), TX_WIN_WIDTH);
+                        }
+
+                        std::ostringstream conf_line;
+                        conf_line << "  Confirmations: " << tx.confirmations;
+                        ui::draw_window_line(conf_line.str(), TX_WIN_WIDTH);
+
+                        std::ostringstream time_line;
+                        time_line << "  Time:          " << ui::format_time(tx.timestamp);
+                        ui::draw_window_line(time_line.str(), TX_WIN_WIDTH);
+
+                        if(!tx.to_address.empty()){
+                            std::ostringstream addr_line;
+                            addr_line << "  Address:       " << tx.to_address;
+                            ui::draw_window_line(addr_line.str(), TX_WIN_WIDTH);
+                        }
+
+                        if(!tx.memo.empty()){
+                            std::ostringstream memo_line;
+                            memo_line << "  Memo:          " << tx.memo;
+                            ui::draw_window_line(memo_line.str(), TX_WIN_WIDTH);
+                        }
+
+                        ui::draw_window_bottom(TX_WIN_WIDTH);
+                        std::cout << "\n  Press ENTER to continue...";
+                        std::string dummy;
+                        std::getline(std::cin, dummy);
+                    }
+                }
+            }
+        }
+        // =================================================================
+        // OPTION u: Enhanced UTXO Browser with Full TXIDs
+        // =================================================================
+        else if(c == "u" || c == "U"){
+            const int UTXO_WIN_WIDTH = 76;
+            std::cout << "\n";
+
+            if(utxos.empty()){
+                ui::draw_window_top("UTXO BROWSER", UTXO_WIN_WIDTH);
+                ui::draw_window_line("  No UTXOs found in wallet.", UTXO_WIN_WIDTH);
+                ui::draw_window_line("  Mine blocks or receive MIQ to see UTXOs here.", UTXO_WIN_WIDTH);
+                ui::draw_window_bottom(UTXO_WIN_WIDTH);
+                std::cout << "\n";
+                continue;
+            }
+
+            // Calculate statistics
             uint64_t total_val = 0;
             uint64_t min_val = UINT64_MAX;
             uint64_t max_val = 0;
             int coinbase_count = 0;
-            int mempool_count = 0;
+            int spendable_count = 0;
+            int pending_count = 0;
+
+            uint64_t tip_h = 0;
+            for(const auto& u : utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
 
             for(const auto& u : utxos){
                 total_val += u.value;
                 if(u.value < min_val) min_val = u.value;
                 if(u.value > max_val) max_val = u.value;
                 if(u.coinbase) coinbase_count++;
-                if(u.height == 0) mempool_count++;
+
+                // Check if spendable
+                bool is_mature = true;
+                if(u.coinbase){
+                    uint64_t mh = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
+                    if(tip_h + 1 < mh) is_mature = false;
+                }
+                OutpointKey k{ miq::to_hex(u.txid), u.vout };
+                bool is_pend = pending.find(k) != pending.end();
+
+                if(is_mature && !is_pend) spendable_count++;
+                if(is_pend) pending_count++;
             }
 
-            std::cout << "    Total Value:     " << ui::green() << fmt_amount(total_val) << " MIQ" << ui::reset() << "\n";
-            std::cout << "    Smallest UTXO:   " << fmt_amount(min_val) << " MIQ\n";
-            std::cout << "    Largest UTXO:    " << fmt_amount(max_val) << " MIQ\n";
+            // Summary window
+            ui::draw_window_top("UTXO BROWSER - SUMMARY", UTXO_WIN_WIDTH);
+            ui::draw_window_line_colored("Total UTXOs:", std::to_string(utxos.size()), "cyan", UTXO_WIN_WIDTH);
+            ui::draw_window_line_colored("Spendable:", std::to_string(spendable_count), "green", UTXO_WIN_WIDTH);
+            if(pending_count > 0){
+                ui::draw_window_line_colored("Pending:", std::to_string(pending_count), "yellow", UTXO_WIN_WIDTH);
+            }
             if(coinbase_count > 0){
-                std::cout << "    Coinbase UTXOs:  " << ui::yellow() << coinbase_count << ui::reset() << "\n";
+                ui::draw_window_line_colored("Coinbase:", std::to_string(coinbase_count), "magenta", UTXO_WIN_WIDTH);
             }
-            if(mempool_count > 0){
-                std::cout << "    Mempool UTXOs:   " << ui::magenta() << mempool_count << ui::reset() << "\n";
-            }
+            ui::draw_window_divider(UTXO_WIN_WIDTH);
+            ui::draw_window_line_colored("Total Value:", fmt_amount(total_val) + " MIQ", "green", UTXO_WIN_WIDTH);
+            ui::draw_window_line_colored("Smallest:", fmt_amount(min_val) + " MIQ", "cyan", UTXO_WIN_WIDTH);
+            ui::draw_window_line_colored("Largest:", fmt_amount(max_val) + " MIQ", "cyan", UTXO_WIN_WIDTH);
+            ui::draw_window_bottom(UTXO_WIN_WIDTH);
+
             std::cout << "\n";
 
-            // Sorting options
-            std::cout << "  " << ui::bold() << "Sort By:" << ui::reset() << "\n";
-            std::cout << "    " << ui::cyan() << "[1]" << ui::reset() << " Value (largest first)\n";
-            std::cout << "    " << ui::cyan() << "[2]" << ui::reset() << " Value (smallest first)\n";
-            std::cout << "    " << ui::cyan() << "[3]" << ui::reset() << " Height (oldest first)\n";
-            std::cout << "    " << ui::cyan() << "[q]" << ui::reset() << " Back to menu\n\n";
+            // Sort options
+            ui::draw_window_top("SORT OPTIONS", UTXO_WIN_WIDTH);
+            ui::draw_menu_option("1", "Value (largest)", "", UTXO_WIN_WIDTH);
+            ui::draw_menu_option("2", "Value (smallest)", "", UTXO_WIN_WIDTH);
+            ui::draw_menu_option("3", "Height (oldest)", "", UTXO_WIN_WIDTH);
+            ui::draw_menu_option("4", "Height (newest)", "", UTXO_WIN_WIDTH);
+            ui::draw_menu_option("q", "Back to menu", "", UTXO_WIN_WIDTH);
+            ui::draw_window_bottom(UTXO_WIN_WIDTH);
 
             std::string sort_opt = ui::prompt("Select sort order: ");
             sort_opt = trim(sort_opt);
@@ -6300,18 +6819,22 @@ static bool wallet_session(const std::string& cli_host,
             } else if(sort_opt == "3"){
                 std::sort(sorted_utxos.begin(), sorted_utxos.end(),
                     [](const miq::UtxoLite& a, const miq::UtxoLite& b){ return a.height < b.height; });
+            } else if(sort_opt == "4"){
+                std::sort(sorted_utxos.begin(), sorted_utxos.end(),
+                    [](const miq::UtxoLite& a, const miq::UtxoLite& b){ return a.height > b.height; });
             }
 
             // Paginated display
             int page = 0;
-            int per_page = 10;
+            int per_page = 5;  // Show fewer per page for detailed view
             int total_pages = ((int)sorted_utxos.size() + per_page - 1) / per_page;
 
-            while(true){
+            bool utxo_running = true;
+            while(utxo_running){
                 std::cout << "\n";
-                std::cout << ui::cyan() << ui::bold();
-                std::cout << "  UTXO LIST - Page " << (page + 1) << "/" << total_pages << ui::reset() << "\n";
-                std::cout << ui::dim() << "  ================================================================" << ui::reset() << "\n\n";
+                std::ostringstream title_ss;
+                title_ss << "UTXO LIST - Page " << (page + 1) << "/" << total_pages;
+                ui::draw_window_top(title_ss.str(), UTXO_WIN_WIDTH);
 
                 int start = page * per_page;
                 int end = std::min(start + per_page, (int)sorted_utxos.size());
@@ -6320,46 +6843,38 @@ static bool wallet_session(const std::string& cli_host,
                     const auto& u = sorted_utxos[i];
                     std::string txid_hex = miq::to_hex(u.txid);
 
-                    // Check if pending
-                    OutpointKey k{ txid_hex, u.vout };
-                    bool is_pending = pending.find(k) != pending.end();
-
-                    std::cout << "  " << ui::dim() << std::setw(4) << (i+1) << ui::reset() << " ";
-
-                    // Status indicator
-                    if(is_pending){
-                        std::cout << ui::yellow() << "[PENDING]" << ui::reset() << " ";
-                    } else if(u.coinbase){
-                        std::cout << ui::magenta() << "[COINBASE]" << ui::reset();
-                    } else {
-                        std::cout << ui::green() << "[SPENDABLE]" << ui::reset();
+                    // Check status
+                    bool is_mature = true;
+                    if(u.coinbase){
+                        uint64_t mh = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
+                        if(tip_h + 1 < mh) is_mature = false;
                     }
-                    std::cout << "\n";
+                    OutpointKey k{ txid_hex, u.vout };
+                    bool is_pend = pending.find(k) != pending.end();
+                    bool is_spend = is_mature && !is_pend;
 
-                    // Full TXID
-                    std::cout << "       " << ui::bold() << "TXID:" << ui::reset() << " " << ui::cyan() << txid_hex << ui::reset() << "\n";
-                    std::cout << "       " << ui::bold() << "Vout:" << ui::reset() << " " << u.vout << "\n";
-                    std::cout << "       " << ui::bold() << "Value:" << ui::reset() << " " << ui::green() << fmt_amount(u.value) << " MIQ" << ui::reset() << "\n";
-                    std::cout << "       " << ui::bold() << "Height:" << ui::reset() << " " << (u.height == 0 ? "mempool" : std::to_string(u.height)) << "\n";
+                    // Draw using window-style UI
+                    ui::draw_utxo_row(txid_hex, u.vout, u.value, u.height, u.coinbase, is_spend, UTXO_WIN_WIDTH);
 
-                    // Show PKH
-                    std::cout << "       " << ui::bold() << "PKH:" << ui::reset() << " " << ui::dim() << miq::to_hex(u.pkh) << ui::reset() << "\n";
-                    std::cout << "\n";
+                    if(i < end - 1){
+                        ui::draw_window_divider(UTXO_WIN_WIDTH);
+                    }
                 }
 
-                std::cout << "  " << ui::dim() << "Page " << (page + 1) << "/" << total_pages
-                          << " | Showing " << (end - start) << "/" << sorted_utxos.size() << " UTXOs" << ui::reset() << "\n";
-                std::cout << "\n";
-                std::cout << "  " << ui::cyan() << "n" << ui::reset() << " Next page  "
-                          << ui::cyan() << "p" << ui::reset() << " Previous  "
-                          << ui::cyan() << "q" << ui::reset() << " Back to menu\n\n";
+                ui::draw_window_divider(UTXO_WIN_WIDTH);
+                std::ostringstream page_info;
+                page_info << "  Page " << (page + 1) << "/" << total_pages
+                          << " | Showing " << (end - start) << " of " << sorted_utxos.size() << " UTXOs";
+                ui::draw_window_line(page_info.str(), UTXO_WIN_WIDTH);
+                ui::draw_window_line("  [n] Next  [p] Prev  [q] Back", UTXO_WIN_WIDTH);
+                ui::draw_window_bottom(UTXO_WIN_WIDTH);
 
-                std::string nav = ui::prompt("Command: ");
+                std::string nav = ui::prompt("UTXO Browser> ");
                 nav = trim(nav);
 
                 if(nav == "n" && page < total_pages - 1) page++;
                 else if(nav == "p" && page > 0) page--;
-                else if(nav == "q" || nav == "Q") break;
+                else if(nav == "q" || nav == "Q") utxo_running = false;
             }
         }
         // =================================================================
