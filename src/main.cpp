@@ -1781,6 +1781,32 @@ private:
             right.push_back("");
         }
 
+        // Pool Statistics panel (if Stratum server is running)
+        if (auto* ss = g_stratum_server.load()) {
+            right.push_back(std::string(C_bold()) + "Pool Server (Stratum)" + C_reset());
+            auto stats = ss->get_stats();
+            std::ostringstream p1;
+            p1 << "  connected miners: " << stats.connected_miners
+               << "   port: " << ss->get_port();
+            right.push_back(p1.str());
+
+            std::ostringstream p2;
+            p2 << "  shares: " << stats.accepted_shares << "/" << stats.total_shares
+               << "   rejected: " << stats.rejected_shares;
+            right.push_back(p2.str());
+
+            std::ostringstream p3;
+            p3 << "  pool hashrate: " << fmt_hs(stats.pool_hashrate);
+            right.push_back(p3.str());
+
+            std::ostringstream p4;
+            p4 << "  blocks found: " << stats.blocks_found;
+            right.push_back(p4.str());
+
+            right.push_back(std::string("  ") + C_dim() + "miners connect to port " + std::to_string(ss->get_port()) + " to contribute hashpower" + C_reset());
+            right.push_back("");
+        }
+
         {
             right.push_back(std::string(C_bold()) + "Health & Security" + C_reset());
             right.push_back(std::string("  config reload: ")
