@@ -2831,7 +2831,9 @@ int main(int argc, char** argv){
                     ui.tip_height.store(tip.height);
                     ui.tip_hash_hex = tip.hash_hex;
                     ui.tip_bits.store(tip.bits);
-                    std::fprintf(stderr, "[startup] Connected! Tip height: %llu\n", (unsigned long long)tip.height);
+                    std::fprintf(stderr, "[startup] \x1b[32;1mRPC Connection SUCCEEDED & CONNECTED!\x1b[0m\n");
+                    std::fprintf(stderr, "[startup] Tip height: %llu, Difficulty: %.2f\n",
+                                (unsigned long long)tip.height, difficulty_from_bits(tip.bits));
                 } else {
                     if (attempt == 1) {
                         std::fprintf(stderr, "[startup] Node not responding. Waiting for node to start...\n");
@@ -2878,7 +2880,8 @@ int main(int argc, char** argv){
                 if (stratum.subscribe()) {
                     std::fprintf(stderr, "[startup] Subscribed. Authorizing worker...\n");
                     if (stratum.authorize()) {
-                        std::fprintf(stderr, "[startup] Worker authorized successfully!\n");
+                        std::fprintf(stderr, "[startup] \x1b[32;1mPool Connection SUCCEEDED & CONNECTED!\x1b[0m\n");
+                        std::fprintf(stderr, "[startup] Worker %s authorized successfully!\n", pool_cfg.worker.c_str());
                         ui.node_reachable.store(true);
                     } else {
                         std::fprintf(stderr, "[startup] WARNING: Worker authorization failed\n");
@@ -2955,8 +2958,8 @@ int main(int argc, char** argv){
 
                     // Pool connection status
                     bool connected = ui.node_reachable.load();
-                    out << "  " << C("1") << "Pool        :" << R() << " "
-                        << ui_status(connected, "CONNECTED", "DISCONNECTED")
+                    out << "  " << C("1") << "Connection  :" << R() << " "
+                        << ui_status(connected, "SUCCEEDED & CONNECTED", "DISCONNECTED")
                         << "  " << C("2") << "(" << ui.pool_host << ":" << ui.pool_port << ")" << R() << "\n";
 
                     out << "  " << C("1") << "Worker      :" << R() << " " << C("33") << ui.pool_worker << R() << "\n";
@@ -2980,10 +2983,10 @@ int main(int argc, char** argv){
                     out << C("1;4") << " NETWORK STATUS" << R() << "\n";
                     out << C("36") << "----------------------------------------------------------------------" << R() << "\n";
 
-                    // Connection status
+                    // RPC connection status
                     bool connected = ui.node_reachable.load();
-                    out << "  " << C("1") << "Connection  :" << R() << " "
-                        << ui_status(connected, "CONNECTED", "UNREACHABLE")
+                    out << "  " << C("1") << "RPC Status  :" << R() << " "
+                        << ui_status(connected, "SUCCEEDED & CONNECTED", "NOT CONNECTED")
                         << "  " << C("2") << "(" << ui.rpc_host << ":" << ui.rpc_port << ")" << R() << "\n";
 
                     // Blockchain tip
@@ -3013,8 +3016,8 @@ int main(int argc, char** argv){
                     if(ui.cand.height){
                         out << "  " << C("1") << "Mining Block:" << R() << " " << C("33;1") << "#" << ui.cand.height << R() << "\n";
                         out << "  " << C("1") << "Prev Hash   :" << R() << " " << C("2") << ui.cand.prev_hex.substr(0, 32) << "..." << R() << "\n";
-                        out << "  " << C("1") << "Transactions:" << R() << " " << ui.cand.txs << " txs  (" << ui.cand.size_bytes << " bytes)\n";
-                        out << "  " << C("1") << "Fees        :" << R() << " " << fmt_miq_amount(ui.cand.fees) << "\n";
+                        out << "  " << C("1") << "Transactions:" << R() << " " << C("36") << ui.cand.txs << R() << " txs  (" << ui.cand.size_bytes << " bytes)\n";
+                        out << "  " << C("1") << "Fees        :" << R() << " " << C("33") << fmt_miq_amount(ui.cand.fees) << R() << "\n";
                         out << "  " << C("1") << "Reward      :" << R() << " " << C("32;1") << fmt_miq_amount(ui.cand.coinbase) << R() << "\n";
 
                         // Live hash preview (animated)
@@ -3437,10 +3440,10 @@ int main(int argc, char** argv){
                     reconnect_delay_ms = 1000; // Reset backoff on successful connection
                     {
                         std::lock_guard<std::mutex> lk(ui.mtx);
-                        ui.last_submit_msg = C("32;1") + "Connected to pool " + stratum.host + R();
+                        ui.last_submit_msg = C("32;1") + "Pool connection SUCCEEDED & CONNECTED - " + stratum.host + R();
                         ui.last_submit_when = std::chrono::steady_clock::now();
                     }
-                    std::fprintf(stderr, "[pool] Authorized as %s. Waiting for jobs...\n", stratum.worker.c_str());
+                    std::fprintf(stderr, "[pool] \x1b[32;1mSUCCEEDED & CONNECTED\x1b[0m - Authorized as %s. Waiting for jobs...\n", stratum.worker.c_str());
                 }
 
                 // Mining state
@@ -3480,10 +3483,14 @@ int main(int argc, char** argv){
                             if (!job.prev_hash.empty()) {
                                 ui.cand.prev_hex = to_hex_s(job.prev_hash);
                             }
-                            ui.last_submit_msg = C("36;1") + "New job: " + job.job_id + R();
+                            std::ostringstream msg;
+                            msg << C("36;1") << "New Pool Job | ID: " << job.job_id
+                                << " | Diff: " << std::fixed << std::setprecision(2) << difficulty_from_bits(job.bits) << R();
+                            ui.last_submit_msg = msg.str();
                             ui.last_submit_when = std::chrono::steady_clock::now();
                         }
-                        std::fprintf(stderr, "[pool] Job received: %s\n", job.job_id.c_str());
+                        std::fprintf(stderr, "[pool] Job received: %s (diff: %.2f)\n",
+                                    job.job_id.c_str(), difficulty_from_bits(job.bits));
                     }
                 }
 
@@ -3663,7 +3670,10 @@ int main(int argc, char** argv){
                                     if (!new_job_data.prev_hash.empty()) {
                                         ui.cand.prev_hex = to_hex_s(new_job_data.prev_hash);
                                     }
-                                    ui.last_submit_msg = C("36") + "New job: " + new_job_data.job_id + R();
+                                    std::ostringstream msg;
+                                    msg << C("36") << "New Pool Job | ID: " << new_job_data.job_id
+                                        << " | Diff: " << std::fixed << std::setprecision(2) << difficulty_from_bits(new_job_data.bits) << R();
+                                    ui.last_submit_msg = msg.str();
                                     ui.last_submit_when = std::chrono::steady_clock::now();
                                 }
                                 break;
@@ -3748,11 +3758,10 @@ int main(int argc, char** argv){
             if (!rpc_getminertemplate(rpc_host, rpc_port, token, tpl)) {
                 ui.node_reachable.store(false);
                 std::ostringstream m;
-                m << C("31;1") << "CANNOT MINE: Node not responding at " << rpc_host << ":" << rpc_port << R() << "\n";
-                m << C("33") << "  Ensure miqrochain node is running with RPC enabled\n";
-                m << "  Check: 1) Node running  2) RPC port " << rpc_port << "  3) Token/cookie" << R();
+                m << C("31;1") << "*** RPC CONNECTION LOST *** "
+                  << "Node not responding at " << rpc_host << ":" << rpc_port << " - Retrying..." << R();
                 { std::lock_guard<std::mutex> lk(ui.mtx); ui.last_submit_msg = m.str(); ui.last_submit_when = std::chrono::steady_clock::now(); }
-                log_line("template error: node not responding at " + rpc_host + ":" + std::to_string(rpc_port));
+                log_line("RPC connection lost: node not responding at " + rpc_host + ":" + std::to_string(rpc_port));
                 for(int i=0;i<20 && ui.running.load(); ++i) miq_sleep_ms(100);
                 continue;
             }
@@ -3795,10 +3804,10 @@ int main(int argc, char** argv){
                 ui.cand.coinbase = GetBlockSubsidy((uint32_t)tpl.height) + fees;
                 if (last_job_prev_hex != cur_prev_hex) {
                     std::ostringstream msg;
-                    msg << C("36;1") << "job accepted: height=" << tpl.height
-                        << " prev=" << ui.cand.prev_hex.substr(0,16) << "..."
-                        << " diff=" << std::fixed << std::setprecision(2) << difficulty_from_bits(tpl.bits)
-                        << " txs=" << ui.cand.txs << R();
+                    msg << C("36;1") << "New Mining Job | "
+                        << "Height: " << tpl.height
+                        << " | Diff: " << std::fixed << std::setprecision(2) << difficulty_from_bits(tpl.bits)
+                        << " | TXs: " << ui.cand.txs << R();
                     ui.last_submit_msg = msg.str();
                     ui.last_submit_when = std::chrono::steady_clock::now();
                     last_job_prev_hex = cur_prev_hex;
@@ -3994,8 +4003,9 @@ int main(int argc, char** argv){
                     ui.last_found_block_hash = miq::to_hex(found_block.block_hash());
                     if (confirmed) {
                         ui.mined_blocks.fetch_add(1);
-                        std::ostringstream m; m << C("32;1") << "submit accepted @ height=" << tpl.height
-                                                << " hash=" << ui.last_found_block_hash << R();
+                        std::ostringstream m; m << C("32;1") << "*** BLOCK FOUND & ACCEPTED *** "
+                                                << "Height: " << tpl.height << " | Hash: "
+                                                << ui.last_found_block_hash.substr(0, 16) << "..." << R();
                         ui.last_submit_msg = m.str();
                         ui.last_tip_was_mine.store(true);
                         ui.last_winner_addr.clear();
@@ -4004,13 +4014,13 @@ int main(int argc, char** argv){
                             std::string("miner: accepted block at height ")
                             + std::to_string(tpl.height) + " " + ui.last_found_block_hash
                         );
-                        log_line("accepted block at height "+std::to_string(tpl.height)+" hash="+ui.last_found_block_hash);
+                        log_line("*** BLOCK FOUND & ACCEPTED *** height="+std::to_string(tpl.height)+" hash="+ui.last_found_block_hash);
                     } else {
                         std::ostringstream m; m << C("33;1")
-                                                << "submit accepted (pending tip refresh) hash="
-                                                << ui.last_found_block_hash << R();
+                                                << "Block submitted (confirming...) | Hash: "
+                                                << ui.last_found_block_hash.substr(0, 16) << "..." << R();
                         ui.last_submit_msg = m.str();
-                        log_line("submit accepted (awaiting tip confirm), hash="+ui.last_found_block_hash);
+                        log_line("block submitted (awaiting confirmation), hash="+ui.last_found_block_hash);
                     }
                     ui.last_submit_when = std::chrono::steady_clock::now();
                 }
