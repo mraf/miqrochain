@@ -776,7 +776,8 @@ static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::st
 
 static bool rpc_getminerstats(const std::string& host, uint16_t port, const std::string& auth, double& out_net_hs){
     HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build("getminerstats","[]"), r) || r.code!=200) return false;
+    // Use retry for reliability during network monitoring
+    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getminerstats","[]"), r, 2, true) || r.code!=200) return false;
     if(json_has_error(r.body)) return false;
     if(json_find_double(r.body, "hps", out_net_hs)) return true;
     if(json_find_double(r.body, "network_hash_ps", out_net_hs)) return true;
@@ -785,7 +786,8 @@ static bool rpc_getminerstats(const std::string& host, uint16_t port, const std:
 static bool rpc_getblockhash(const std::string& host, uint16_t port, const std::string& auth, uint64_t height, std::string& out){
     std::ostringstream ps; ps<<"["<<height<<"]";
     HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build("getblockhash", ps.str()), r) || r.code != 200) return false;
+    // Use retry for reliability - called frequently by stale monitoring
+    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getblockhash", ps.str()), r, 2, true) || r.code != 200) return false;
     if(json_has_error(r.body)) return false;
     if(json_find_string(r.body, "result", out)) return true;
     if(json_extract_top_string(r.body, out)) return true;
@@ -795,7 +797,8 @@ static bool rpc_getblockhash(const std::string& host, uint16_t port, const std::
 static bool rpc_getblock_header_time(const std::string& host, uint16_t port, const std::string& auth, const std::string& hh, long long& out_time){
     std::ostringstream ps; ps<<"[\""<<hh<<"\"]";
     HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build("getblock", ps.str()), r) || r.code != 200) return false;
+    // Use retry for reliability
+    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getblock", ps.str()), r, 2, true) || r.code != 200) return false;
     if(json_has_error(r.body)) return false;
     long long t=0;
     if(json_find_number(r.body, "time", t)) { out_time=t; return true; }
@@ -806,7 +809,8 @@ static bool rpc_getblock_time_bits(const std::string& host, uint16_t port, const
                                    const std::string& hh, long long& out_time, uint32_t& out_bits){
     std::ostringstream ps; ps<<"[\""<<hh<<"\"]";
     HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build("getblock", ps.str()), r) || r.code != 200) return false;
+    // Use retry for reliability - called frequently by stale monitoring via gettipinfo fallback
+    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getblock", ps.str()), r, 2, true) || r.code != 200) return false;
     if(json_has_error(r.body)) return false;
     long long t=0; uint32_t b=0;
     (void)json_find_number(r.body, "time", t);
@@ -830,7 +834,8 @@ static bool rpc_getblock_overview(const std::string& host, uint16_t port, const 
 {
     std::ostringstream ps; ps<<"["<<height<<"]";
     HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build("getblock", ps.str()), r) || r.code!=200) return false;
+    // Use retry for reliability during block scanning
+    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getblock", ps.str()), r, 2, true) || r.code!=200) return false;
     if(json_has_error(r.body)) return false;
     std::string hh; long long txs=0;
     if(!json_find_string(r.body, "hash", hh)) return false;
@@ -843,7 +848,8 @@ static bool rpc_getcoinbaserecipient(const std::string& host, uint16_t port, con
 {
     std::ostringstream ps; ps<<"["<<height<<"]";
     HttpResp r;
-    if(!http_post(host, port, "/", auth, rpc_build("getcoinbaserecipient", ps.str()), r) || r.code!=200) return false;
+    // Use retry for reliability during block scanning
+    if(!http_post_with_retry(host, port, "/", auth, rpc_build("getcoinbaserecipient", ps.str()), r, 2, true) || r.code!=200) return false;
     if(json_has_error(r.body)) return false;
     std::string pkh_hex, txid_hex;
     double val_dbl = 0.0;
