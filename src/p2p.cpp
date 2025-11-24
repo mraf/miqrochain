@@ -37,6 +37,10 @@
 #include <netinet/tcp.h>
 #endif
 
+#ifdef _MSC_VER
+#include <intrin.h>  // _mm_pause() for MSVC
+#endif
+
 #ifndef _WIN32
 #include <signal.h>
 #endif
@@ -1093,9 +1097,13 @@ public:
     void lock() noexcept {
         while (flag_.test_and_set(std::memory_order_acquire)) {
             // Spin with pause instruction hint for better CPU efficiency
-            #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+            #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+                _mm_pause();
+            #elif defined(__x86_64__) || defined(__i386__)
                 __builtin_ia32_pause();
-            #elif defined(__aarch64__) || defined(_M_ARM64)
+            #elif defined(_MSC_VER) && defined(_M_ARM64)
+                __yield();
+            #elif defined(__aarch64__)
                 __asm__ volatile("yield");
             #else
                 std::this_thread::yield();
