@@ -29,6 +29,9 @@
 
 // Platform-specific includes for terminal detection
 #ifdef _WIN32
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
   #include <windows.h>
   #include <io.h>
   #define isatty _isatty
@@ -214,6 +217,7 @@ namespace ui {
     }
 
     void print_table_row(const std::vector<std::pair<std::string, int>>& cols, int total_width = 60) {
+        (void)total_width;  // Unused, kept for API consistency
         std::cout << BOX_V;
         for (const auto& col : cols) {
             std::string text = col.first;
