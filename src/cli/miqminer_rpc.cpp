@@ -163,15 +163,88 @@ static inline void set_title(const std::string& t){
     std::cout << "\x1b]0;" << t << "\x07";
 }
 
-// BIG ASCII banner (kept minimal & clean; cyan). This spells MiQ.
+// Professional ASCII banner for Chronen Miner
 static const char* kChronenMinerBanner[] = {
-"  __  __ _                                                                                      ",
-" |  \\/  |                                                                                       ",
-" | \\  / |                                                                                       ",
-" | |\\/| |                                                                                       ",
-" | |   | |                                                                                      ",
-" |_|   |_|                                                                                      ",
+"   ██████╗██╗  ██╗██████╗  ██████╗ ███╗   ██╗███████╗███╗   ██╗",
+"  ██╔════╝██║  ██║██╔══██╗██╔═══██╗████╗  ██║██╔════╝████╗  ██║",
+"  ██║     ███████║██████╔╝██║   ██║██╔██╗ ██║█████╗  ██╔██╗ ██║",
+"  ██║     ██╔══██║██╔══██╗██║   ██║██║╚██╗██║██╔══╝  ██║╚██╗██║",
+"  ╚██████╗██║  ██║██║  ██║╚██████╔╝██║ ╚████║███████╗██║ ╚████║",
+"   ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═══╝",
+"                    ███╗   ███╗██╗███╗   ██╗███████╗██████╗     ",
+"                    ████╗ ████║██║████╗  ██║██╔════╝██╔══██╗    ",
+"                    ██╔████╔██║██║██╔██╗ ██║█████╗  ██████╔╝    ",
+"                    ██║╚██╔╝██║██║██║╚██╗██║██╔══╝  ██╔══██╗    ",
+"                    ██║ ╚═╝ ██║██║██║ ╚████║███████╗██║  ██║    ",
+"                    ╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝    ",
 };
+
+// UI Helper: Draw a horizontal line
+[[maybe_unused]] static std::string ui_hline(int width, char c = '-') {
+    return std::string(width, c);
+}
+
+// UI Helper: Draw a box top
+[[maybe_unused]] static std::string ui_box_top(int width, const std::string& title = "") {
+    std::string hline;
+    for (int i = 0; i < width - 2; i++) hline += "-";
+    if (title.empty()) {
+        return "+" + hline + "+";
+    }
+    int padding = width - 4 - (int)title.size();
+    int left = padding / 2;
+    int right = padding - left;
+    std::string lpad, rpad;
+    for (int i = 0; i < left; i++) lpad += "-";
+    for (int i = 0; i < right; i++) rpad += "-";
+    return "+" + lpad + " " + title + " " + rpad + "+";
+}
+
+// UI Helper: Draw a box bottom
+[[maybe_unused]] static std::string ui_box_bottom(int width) {
+    std::string hline;
+    for (int i = 0; i < width - 2; i++) hline += "-";
+    return "+" + hline + "+";
+}
+
+// UI Helper: Draw a box row with content
+[[maybe_unused]] static std::string ui_box_row(int width, const std::string& content) {
+    int content_width = width - 4;
+    std::string text = content;
+    // Truncate if too long (accounting for ANSI codes which don't take visual space)
+    // Simple approach: just pad/truncate
+    if ((int)text.size() > content_width) {
+        text = text.substr(0, content_width);
+    }
+    int padding = content_width - (int)text.size();
+    return "│ " + text + std::string(padding, ' ') + " │";
+}
+
+// Forward declaration for fmt_hs (defined later in file)
+static std::string fmt_hs(double v);
+
+// UI Helper: Format hash rate with visual bar
+static std::string fmt_hs_bar(double v, double max_v, int bar_width = 20) {
+    std::string hs_str = fmt_hs(v);
+    if (max_v <= 0) max_v = v > 0 ? v : 1.0;
+    double ratio = std::min(1.0, v / max_v);
+    int filled = (int)(ratio * bar_width);
+    std::string bar = "[";
+    for (int i = 0; i < bar_width; i++) {
+        bar += (i < filled) ? '#' : '.';
+    }
+    bar += "]";
+    return bar + " " + hs_str;
+}
+
+// UI Helper: Status indicator with color
+static std::string ui_status(bool ok, const std::string& ok_text, const std::string& fail_text) {
+    if (ok) {
+        return C("32;1") + "● " + ok_text + R();
+    } else {
+        return C("31;1") + "○ " + fail_text + R();
+    }
+}
 
 // ===== helpers ===============================================================
 static const uint64_t MIQ_COIN_UNITS = 100000000ULL; // 1 MIQ = 1e8 base units
@@ -430,6 +503,11 @@ static inline void store_u32_le(uint8_t* p, uint32_t x){
 // ===== minimal HTTP/JSON-RPC ================================================
 struct HttpResp { int code{0}; std::string body; };
 
+// HTTP POST with automatic retry and exponential backoff
+static bool http_post_with_retry(const std::string& host, uint16_t port, const std::string& path,
+                                  const std::string& auth_token, const std::string& json, HttpResp& out,
+                                  int max_retries = 3);
+
 static inline std::string str_tolower(std::string s){
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return (char)std::tolower(c); });
     return s;
@@ -556,6 +634,30 @@ static bool http_post(const std::string& host, uint16_t port, const std::string&
     out.code = code; out.body = std::move(body);
     return true;
 }
+
+// HTTP POST with automatic retry and exponential backoff for network errors
+static bool http_post_with_retry(const std::string& host, uint16_t port, const std::string& path,
+                                  const std::string& auth_token, const std::string& json, HttpResp& out,
+                                  int max_retries)
+{
+    int delay_ms = 1000;  // Start with 1 second delay
+    for (int attempt = 0; attempt <= max_retries; ++attempt) {
+        if (http_post(host, port, path, auth_token, json, out)) {
+            return true;
+        }
+
+        // Only retry on network errors (code 0), not on HTTP errors
+        if (out.code != 0 || attempt == max_retries) {
+            return false;
+        }
+
+        // Exponential backoff: 1s, 2s, 4s, 8s
+        miq_sleep_ms(delay_ms);
+        delay_ms = std::min(delay_ms * 2, 8000);  // Cap at 8 seconds
+    }
+    return false;
+}
+
 static std::string json_escape(const std::string& s){
     std::ostringstream o; o << '"';
     for(unsigned char c : s){
@@ -605,10 +707,10 @@ static std::string diagnose_rpc_failure(const std::string& host, uint16_t port, 
 }
 
 static bool rpc_gettipinfo(const std::string& host, uint16_t port, const std::string& auth, TipInfo& out){
-    // Fast path: dedicated RPC (if present)
+    // Fast path: dedicated RPC (if present) with retry for network errors
     {
         HttpResp r;
-        if (http_post(host, port, "/", auth, rpc_build("gettipinfo","[]"), r)
+        if (http_post_with_retry(host, port, "/", auth, rpc_build("gettipinfo","[]"), r, 2)
             && r.code==200 && !json_has_error(r.body)) {
             long long h=0,t=0; uint32_t b=0; std::string hh;
             // Use json_find_hex_or_number_u32 for bits since server returns it as hex string
@@ -2238,68 +2340,95 @@ int main(int argc, char** argv){
         // ===== UI thread (animated dashboard)
         std::thread ui_th([&](){
             using clock = std::chrono::steady_clock;
-            const int FPS = 12;
+            const int FPS = 8;  // Slightly lower FPS for less CPU usage
             const auto frame_dt = std::chrono::milliseconds(1000/FPS);
             int spin_idx = 0;
 
-            // Config card (one-time)
+            // Config card (one-time startup display)
             {
                 std::ostringstream s;
                 s << CLS();
                 s << C("36;1");
                 const size_t kBannerN = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
-                for(size_t i=0;i<kBannerN;i++) s << "  " << kChronenMinerBanner[i] << "\n";
+                for(size_t i=0;i<kBannerN;i++) s << kChronenMinerBanner[i] << "\n";
                 s << R() << "\n";
-                s << "  " << C("1") << "Endpoint: " << R() << ui.rpc_host << ":" << ui.rpc_port << "\n";
-                s << "  " << C("1") << "Address : " << R() << pkh_to_address(ui.my_pkh) << "\n";
-                s << "  " << C("1") << "Threads : " << R() << (int)threads << (pin_affinity?"  (affinity)":"") << (high_priority?"  (high-priority)":"") << "\n";
+                s << "  " << C("1") << "Initializing Chronen Miner..." << R() << "\n\n";
+                s << "  " << C("36") << "►" << R() << " RPC Endpoint: " << C("1") << ui.rpc_host << ":" << ui.rpc_port << R() << "\n";
+                s << "  " << C("36") << "►" << R() << " Payout Addr : " << C("33;1") << pkh_to_address(ui.my_pkh) << R() << "\n";
+                s << "  " << C("36") << "►" << R() << " CPU Threads : " << C("1") << (int)threads << R();
+                if(pin_affinity) s << C("2") << " [affinity]" << R();
+                if(high_priority) s << C("2") << " [high-priority]" << R();
+                s << "\n";
 #if defined(MIQ_ENABLE_OPENCL)
-                s << "  " << C("1") << "GPU     : " << R() << (ui.gpu_available.load() ? (ui.gpu_platform+" / "+ui.gpu_device) : std::string("(disabled)")) << "\n";
+                s << "  " << C("36") << "►" << R() << " GPU Mining  : " << (ui.gpu_available.load() ? (C("32;1") + "ENABLED" + R() + " - " + ui.gpu_device) : (C("2") + "disabled" + R())) << "\n";
 #endif
-                s << "\n  Preparing dashboard…\n";
+                s << "\n  " << C("33") << "Loading dashboard..." << R() << "\n";
                 std::cout << s.str() << std::flush;
-                miq_sleep_ms(650);
+                miq_sleep_ms(800);
             }
+
+            // Track max hash rates for bar scaling
+            double max_cpu_hs = 1000.0;
+            double max_gpu_hs = 1000.0;
+            double max_net_hs = 10000.0;
 
             while(ui.running.load(std::memory_order_relaxed)){
                 [[maybe_unused]] TermSize ts = get_term_size();
                 std::ostringstream out;
                 out << CLS();
 
-                // Banner
+                // ═══════════════════════════════════════════════════════════════
+                // HEADER - Banner
+                // ═══════════════════════════════════════════════════════════════
                 out << C("36;1");
                 const size_t kBannerN = sizeof(kChronenMinerBanner)/sizeof(kChronenMinerBanner[0]);
-                for(size_t i=0;i<kBannerN;i++) out << "  " << kChronenMinerBanner[i] << "\n";
-                out << R() << "\n";
+                for(size_t i=0;i<kBannerN;i++) out << kChronenMinerBanner[i] << "\n";
+                out << R();
 
-                out << "  " << C("1") << "RPC: " << R() << ui.rpc_host << ":" << ui.rpc_port
-                    << "   " << C(ui.node_reachable.load()? "32;1" : "31;1")
-                    << (ui.node_reachable.load()? "[CONNECTED]" : "[UNREACHABLE]") << R() << "\n";
+                // ═══════════════════════════════════════════════════════════════
+                // SECTION 1: NETWORK STATUS
+                // ═══════════════════════════════════════════════════════════════
+                out << "\n" << C("36;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << C("1;4") << " NETWORK STATUS" << R() << "\n";
+                out << C("36") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
 
-                // Tip / candidate
-                uint64_t th = ui.tip_height.load();
-                if(th){
-                    out << "  " << C("1") << "Tip:  " << R() << "height=" << th
-                        << "  hash=" << ui.tip_hash_hex << "\n";
-                    uint32_t bits = ui.tip_bits.load();
-                    out << "       " << "bits=0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)bits
-                        << std::dec << "  (difficulty " << std::fixed << std::setprecision(2) << difficulty_from_bits(bits) << ")\n";
-                }
+                // Connection status
+                bool connected = ui.node_reachable.load();
+                out << "  " << C("1") << "Connection  :" << R() << " "
+                    << ui_status(connected, "CONNECTED", "UNREACHABLE")
+                    << "  " << C("2") << "(" << ui.rpc_host << ":" << ui.rpc_port << ")" << R() << "\n";
+
+                // Blockchain tip
+                uint64_t tip_h = ui.tip_height.load();
+                uint32_t tip_bits = ui.tip_bits.load();
+                double difficulty = difficulty_from_bits(tip_bits);
+
+                out << "  " << C("1") << "Block Height:" << R() << " " << C("33;1") << tip_h << R() << "\n";
+                out << "  " << C("1") << "Difficulty  :" << R() << " " << std::fixed << std::setprecision(4) << difficulty
+                    << "  " << C("2") << "(bits: 0x" << std::hex << std::setw(8) << std::setfill('0') << tip_bits << std::dec << ")" << R() << "\n";
+
+                // Network hashrate
+                double net_hs = ui.net_hashps.load();
+                if (net_hs > max_net_hs) max_net_hs = net_hs * 1.2;
+                out << "  " << C("1") << "Network H/s :" << R() << " " << C("36") << fmt_hs(net_hs) << R() << "\n";
+
+                // ═══════════════════════════════════════════════════════════════
+                // SECTION 2: CURRENT MINING JOB
+                // ═══════════════════════════════════════════════════════════════
+                out << "\n" << C("33;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << C("1;4") << " CURRENT JOB" << R() << "\n";
+                out << C("33") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
 
                 {
                     std::lock_guard<std::mutex> lk(ui.mtx);
                     if(ui.cand.height){
-                        out << "\n";
-                        out << "  " << C("36;1") << "Job:" << R()
-                            << " height=" << ui.cand.height
-                            << " prev=" << ui.cand.prev_hex
-                            << " bits=0x" << std::hex << std::setw(8) << std::setfill('0') << (unsigned)ui.cand.bits << std::dec
-                            << " txs=" << ui.cand.txs
-                            << " size=" << ui.cand.size_bytes << "B"
-                            << " fees=" << fmt_miq_amount(ui.cand.fees)
-                            << " coinbase=" << C("32;1") << fmt_miq_amount(ui.cand.coinbase) << R() << "\n";
+                        out << "  " << C("1") << "Mining Block:" << R() << " " << C("33;1") << "#" << ui.cand.height << R() << "\n";
+                        out << "  " << C("1") << "Prev Hash   :" << R() << " " << C("2") << ui.cand.prev_hex.substr(0, 32) << "..." << R() << "\n";
+                        out << "  " << C("1") << "Transactions:" << R() << " " << ui.cand.txs << " txs  (" << ui.cand.size_bytes << " bytes)\n";
+                        out << "  " << C("1") << "Fees        :" << R() << " " << fmt_miq_amount(ui.cand.fees) << "\n";
+                        out << "  " << C("1") << "Reward      :" << R() << " " << C("32;1") << fmt_miq_amount(ui.cand.coinbase) << R() << "\n";
 
-                        // live next-hash preview
+                        // Live hash preview (animated)
                         std::string nxh;
                         {
                             std::lock_guard<std::mutex> lk2(ui.next_hash_mtx);
@@ -2308,111 +2437,125 @@ int main(int argc, char** argv){
                             nxh = hh.str();
                         }
                         if(!nxh.empty()){
-                            out << "       next-hash: " << C("2") << nxh.substr(0,64) << R() << "\n";
+                            // Animated hash display
+                            std::array<std::string,5> spin_rows;
+                            spinner_circle_ascii(spin_idx, spin_rows);
+                            out << "  " << C("1") << "Hash Preview:" << R() << " " << C("2;3") << nxh.substr(0,48) << "..." << R() << "\n";
                         }
                     } else {
-                        out << "\n  " << C("33;1") 
-                            << (ui.node_synced.load()? "preparing job..." : "syncing… waiting for job") 
-                            << R() << "\n";
+                        out << "  " << C("33") << "⏳ " << (connected ? "Waiting for mining template..." : "Connecting to node...") << R() << "\n";
                     }
                 }
 
-                // Last block
-                if(ui.lastblk.height){
-                    const auto& lb = ui.lastblk;
-                    out << "\n";
-                    out << "  " << C("33;1") << "Last block:" << R()
-                        << " height=" << lb.height
-                        << " hash=" << lb.hash_hex
-                        << " txs=" << lb.txs << "\n";
-                    if(!lb.coinbase_txid_hex.empty())
-                        out << "              coinbase_txid=" << lb.coinbase_txid_hex << "\n";
-                    if(!lb.coinbase_pkh.empty()){
-                        const std::string winner = pkh_to_address(lb.coinbase_pkh);
-                        out << "              paid to: " << winner
-                            << "  (pkh=" << to_hex_s(lb.coinbase_pkh) << ")\n";
-                        uint64_t expected = GetBlockSubsidy((uint32_t)lb.height);
-                        if(lb.reward_value){
-                            uint64_t normalized = (lb.reward_value ? lb.reward_value : expected);
-                            out << "              reward: expected " << fmt_miq_amount(expected)
-                                << " | node " << fmt_miq_amount(normalized) << "\n";
-                        }else{
-                            out << "              reward: expected " << fmt_miq_amount(expected) << "\n";
-                        }
-                    }
-                }
+                // ═══════════════════════════════════════════════════════════════
+                // SECTION 3: PERFORMANCE METRICS
+                // ═══════════════════════════════════════════════════════════════
+                out << "\n" << C("32;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << C("1;4") << " PERFORMANCE" << R() << "\n";
+                out << C("32") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
 
-                // Hashrates + wallet ests
-                out << "\n";
-                out << "  " << C("1") << "CPU: " << R() << C("36") << fmt_hs(ui.hps_smooth.load()) << R()
-                    << "  " << C("2") << "(now " << fmt_hs(ui.hps_now.load()) << ")" << R() << "\n";
+                // CPU hashrate with bar
+                double cpu_smooth = ui.hps_smooth.load();
+                double cpu_now = ui.hps_now.load();
+                if (cpu_smooth > max_cpu_hs) max_cpu_hs = cpu_smooth * 1.2;
+
+                out << "  " << C("1") << "CPU Hash/s  :" << R() << " " << fmt_hs_bar(cpu_smooth, max_cpu_hs, 15) << "\n";
+                out << "               " << C("2") << "(instant: " << fmt_hs(cpu_now) << ")" << R() << "\n";
+
+                // GPU hashrate with bar
                 if(ui.gpu_available.load()){
-                    out << "  " << C("1") << "GPU: " << R()
-                        << C("36") << fmt_hs(ui.gpu_hps_smooth.load()) << R()
-                        << "  " << C("2") << "(now " << fmt_hs(ui.gpu_hps_now.load()) << ")" << R() << "\n";
+                    double gpu_smooth = ui.gpu_hps_smooth.load();
+                    double gpu_now = ui.gpu_hps_now.load();
+                    if (gpu_smooth > max_gpu_hs) max_gpu_hs = gpu_smooth * 1.2;
+
+                    out << "  " << C("1") << "GPU Hash/s  :" << R() << " " << fmt_hs_bar(gpu_smooth, max_gpu_hs, 15) << "\n";
+                    out << "               " << C("2") << "(instant: " << fmt_hs(gpu_now) << ")" << R() << "\n";
                 } else {
-                    out << "  " << C("1") << "GPU: " << R() << C("2") << "(not available)" << R() << "\n";
-                }
-                out << "  " << C("1") << "Network: " << R() << fmt_hs(ui.net_hashps.load()) << "\n";
-                out << "  " << C("1") << "Mined (session): " << R() << ui.mined_blocks.load() << "\n";
-
-                uint64_t paid_base = ui.total_received_base.load();
-                out << "  " << C("1") << "Payout addr: " << R() << pkh_to_address(ui.my_pkh) << "\n";
-                out << "  " << C("1") << "Paid total : " << R()
-                    << C("36;1") << fmt_miq_whole_dot(paid_base) << R()
-                    << "  " << C("2") << "(" << fmt_miq_amount(paid_base) << ")" << R();
-                {
-                    uint64_t estTot = ui.est_total_base.load();
-                    if (ui.total_received_base.load() == 0 && estTot > 0) {
-                        out << "  " << C("2")
-                            << "  (est. " << fmt_miq_amount(estTot)
-                            << " | matured " << fmt_miq_amount(ui.est_matured_base.load())
-                            << ")"
-                            << R();
-                    }
-                }
-                out << "\n";
-
-                if(ui.last_seen_height.load() == ui.tip_height.load()){
-                    if(ui.last_tip_was_mine.load()){
-                        out << "  " << C("32;1") << "YOU MINED THE LATEST BLOCK." << R() << "\n";
-                    }else if(!ui.last_winner_addr.empty()){
-                        out << "  " << C("31;1") << "Another miner won the latest block: " << ui.last_winner_addr << R() << "\n";
-                    }
+                    out << "  " << C("1") << "GPU Hash/s  :" << R() << " " << C("2") << "[disabled]" << R() << "\n";
                 }
 
-                {
-                    auto age = std::chrono::duration<double>(clock::now() - ui.last_submit_when).count();
-                    if(!ui.last_submit_msg.empty() && age < 7.0){
-                        out << "  " << ui.last_submit_msg << "\n";
-                    }
-                }
+                // Combined stats
+                double total_hs = cpu_smooth + (ui.gpu_available.load() ? ui.gpu_hps_smooth.load() : 0.0);
+                out << "  " << C("1") << "Total H/s   :" << R() << " " << C("36;1") << fmt_hs(total_hs) << R() << "\n";
 
+                // Sparkline trend
                 {
                     std::lock_guard<std::mutex> lk(ui.spark_mtx);
                     if(!ui.sparkline.empty()){
-                        out << "\n  " << C("2") << "h/s trend:" << R() << "        " << spark_ascii(ui.sparkline) << "\n";
+                        out << "  " << C("1") << "Trend       :" << R() << " " << C("36") << spark_ascii(ui.sparkline) << R() << "\n";
                     }
                 }
 
-                // Animated cards
-                std::array<std::string,5> spin_rows;
-                spinner_circle_ascii(spin_idx, spin_rows);
-                ++spin_idx;
+                // ═══════════════════════════════════════════════════════════════
+                // SECTION 4: WALLET & REWARDS
+                // ═══════════════════════════════════════════════════════════════
+                out << "\n" << C("35;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << C("1;4") << " WALLET & REWARDS" << R() << "\n";
+                out << C("35") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
+
+                out << "  " << C("1") << "Payout Addr :" << R() << " " << C("33") << pkh_to_address(ui.my_pkh) << R() << "\n";
+
+                uint64_t mined = ui.mined_blocks.load();
+                out << "  " << C("1") << "Blocks Mined:" << R() << " " << C("32;1") << mined << R() << " (this session)\n";
+
+                [[maybe_unused]] uint64_t paid_base = ui.total_received_base.load();
+                uint64_t est_total = ui.est_total_base.load();
+                uint64_t est_matured = ui.est_matured_base.load();
+
+                out << "  " << C("1") << "Est. Earned :" << R() << " " << C("36;1") << fmt_miq_amount(est_total) << R();
+                if (est_matured > 0 && est_matured != est_total) {
+                    out << "  " << C("2") << "(matured: " << fmt_miq_amount(est_matured) << ")" << R();
+                }
+                out << "\n";
+
+                // Winner notification
+                if(ui.last_seen_height.load() == ui.tip_height.load() && ui.last_seen_height.load() > 0){
+                    if(ui.last_tip_was_mine.load()){
+                        out << "\n  " << C("32;1") << "🎉 YOU MINED THE LATEST BLOCK! 🎉" << R() << "\n";
+                    }else if(!ui.last_winner_addr.empty()){
+                        out << "\n  " << C("2") << "Latest block mined by: " << ui.last_winner_addr.substr(0,24) << "..." << R() << "\n";
+                    }
+                }
+
+                // ═══════════════════════════════════════════════════════════════
+                // SECTION 5: ACTIVITY LOG
+                // ═══════════════════════════════════════════════════════════════
+                out << "\n" << C("37;1") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+                out << C("1;4") << " ACTIVITY" << R() << "\n";
+                out << C("37") << "───────────────────────────────────────────────────────────────────" << R() << "\n";
+
                 {
-                    std::vector<std::string> lines;
-                    lines.push_back("  ##############################   ##############################");
-                    lines.push_back("  #                            #   #                            #");
-                    lines.push_back("  #"+center_fit("MINER STATUS", 28)+"#   #"+center_fit("CHRONEN  MINER", 28)+"#");
-                    lines.push_back("  #                            #   #                            #");
-                    for(int r=0;r<5;r++){
-                        lines.push_back("  #"+center_fit(spin_rows[r], 28)+"#   #"+center_fit("                    ", 28)+"#");
+                    auto age = std::chrono::duration<double>(clock::now() - ui.last_submit_when).count();
+                    if(!ui.last_submit_msg.empty() && age < 15.0){
+                        out << "  " << ui.last_submit_msg << "\n";
+                    } else {
+                        // Show animated spinner when no recent activity
+                        std::array<std::string,5> spin_rows;
+                        spinner_circle_ascii(spin_idx, spin_rows);
+                        const char* spinners = "|/-\\";
+                        char spinner = spinners[spin_idx % 4];
+                        out << "  " << C("2") << spinner << " Mining in progress..." << R() << "\n";
                     }
-                    lines.push_back("  ##############################   ##############################");
-                    for(const auto& L : lines) out << C("36") << L << R() << "\n";
                 }
 
-                out << "\n  Press Ctrl+C to quit.\n";
+                // ═══════════════════════════════════════════════════════════════
+                // FOOTER
+                // ═══════════════════════════════════════════════════════════════
+                out << "\n" << C("36") << "═══════════════════════════════════════════════════════════════════" << R() << "\n";
+
+                // Show uptime
+                static auto start_time = clock::now();
+                auto uptime_secs = std::chrono::duration_cast<std::chrono::seconds>(clock::now() - start_time).count();
+                int hours = uptime_secs / 3600;
+                int mins = (uptime_secs % 3600) / 60;
+                int secs = uptime_secs % 60;
+
+                out << "  " << C("2") << "Uptime: ";
+                if (hours > 0) out << hours << "h ";
+                out << mins << "m " << secs << "s";
+                out << "   |   Press " << C("1") << "Ctrl+C" << R() << C("2") << " to stop mining" << R() << "\n";
+
+                ++spin_idx;
                 std::cout << out.str() << std::flush;
                 std::this_thread::sleep_for(frame_dt);
             }
