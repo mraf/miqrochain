@@ -2954,7 +2954,6 @@ private:
         std::ostringstream out;
 
         static const char* dna_top[] = {"╭", "─", "╮", "│", "╯", "─", "╰", "│"};
-        static const char* dna_bot[] = {"╰", "─", "╯", "│", "╮", "─", "╭", "│"};
         static const int dna_colors[] = {46, 47, 48, 49, 50, 51, 50, 49};
 
         for (int i = 0; i < width; ++i) {
@@ -4261,22 +4260,6 @@ private:
     // ULTIMATE MAIN DASHBOARD - Premium node monitoring with epic visuals
     // =========================================================================
 
-    // Animated fire effect for active mining
-    std::string draw_fire_bar(int width, int tick) const {
-        if (!u8_ok_ || width < 5) return "";
-        std::ostringstream out;
-        static const int fire_colors[] = {196, 202, 208, 214, 220, 226, 227, 228, 229, 230};
-        static const char* fire_chars[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
-
-        for (int i = 0; i < width; ++i) {
-            int phase = (tick * 2 + i * 3) % 16;
-            int height = (phase < 8) ? phase : (16 - phase);
-            int color_idx = (tick + i) % 10;
-            out << "\x1b[38;5;" << fire_colors[color_idx] << "m" << fire_chars[height % 8] << "\x1b[0m";
-        }
-        return out.str();
-    }
-
     // Animated wave effect
     std::string draw_wave(int width, int tick, int color) const {
         if (!u8_ok_ || width < 3) return "";
@@ -4287,46 +4270,6 @@ private:
             int phase = (tick + i) % 14;
             out << "\x1b[38;5;" << color << "m" << wave[phase] << "\x1b[0m";
         }
-        return out.str();
-    }
-
-    // DNA helix animation for blockchain visualization
-    std::string draw_dna_helix(int width, int tick) const {
-        if (!u8_ok_ || width < 10) return "";
-        std::ostringstream out;
-
-        for (int i = 0; i < width; ++i) {
-            double phase = (tick * 0.3 + i * 0.5);
-            double sin_val = std::sin(phase);
-            double cos_val = std::cos(phase);
-
-            if (sin_val > 0.7) {
-                out << "\x1b[38;5;51m●\x1b[0m";
-            } else if (sin_val < -0.7) {
-                out << "\x1b[38;5;201m●\x1b[0m";
-            } else if (cos_val > 0) {
-                out << "\x1b[38;5;240m─\x1b[0m";
-            } else {
-                out << "\x1b[38;5;236m─\x1b[0m";
-            }
-        }
-        return out.str();
-    }
-
-    // Animated activity pulse ring
-    std::string draw_pulse_ring(bool active, int tick) const {
-        if (!u8_ok_) return active ? "[*]" : "[ ]";
-
-        if (!active) {
-            return "\x1b[38;5;240m○\x1b[0m";
-        }
-
-        static const char* rings[] = {"◯", "◎", "◉", "●", "◉", "◎"};
-        static const int colors[] = {46, 47, 48, 49, 48, 47};
-        int frame = tick % 6;
-
-        std::ostringstream out;
-        out << "\x1b[38;5;" << colors[frame] << "m" << rings[frame] << "\x1b[0m";
         return out.str();
     }
 

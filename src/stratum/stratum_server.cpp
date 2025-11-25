@@ -642,9 +642,14 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
     std::vector<uint8_t> merkle_root = coinbase_hash;
     for (const auto& branch : job.merkle_branches) {
         std::vector<uint8_t> combined;
-        combined.insert(combined.end(), merkle_root.begin(), merkle_root.end());
+        combined.reserve(64); // Reserve space for two 32-byte hashes
+        if (!merkle_root.empty()) {
+            combined.insert(combined.end(), merkle_root.begin(), merkle_root.end());
+        }
         auto branch_bytes = hex_decode(branch);
-        combined.insert(combined.end(), branch_bytes.begin(), branch_bytes.end());
+        if (!branch_bytes.empty()) {
+            combined.insert(combined.end(), branch_bytes.begin(), branch_bytes.end());
+        }
         merkle_root = dsha256(combined);
     }
 
@@ -660,10 +665,14 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
     header.push_back((ver >> 24) & 0xff);
 
     // Prev hash (32 bytes)
-    header.insert(header.end(), job.prev_hash.begin(), job.prev_hash.end());
+    if (!job.prev_hash.empty()) {
+        header.insert(header.end(), job.prev_hash.begin(), job.prev_hash.end());
+    }
 
     // Merkle root (32 bytes)
-    header.insert(header.end(), merkle_root.begin(), merkle_root.end());
+    if (!merkle_root.empty()) {
+        header.insert(header.end(), merkle_root.begin(), merkle_root.end());
+    }
 
     // Time (8 bytes, little-endian) - MIQ uses 8-byte timestamps
     uint64_t time_val;
@@ -965,14 +974,22 @@ StratumJob StratumServer::create_job() {
                 if (i + 1 < tx_hashes.size()) {
                     // Combine two hashes
                     std::vector<uint8_t> combined;
-                    combined.insert(combined.end(), tx_hashes[i].begin(), tx_hashes[i].end());
-                    combined.insert(combined.end(), tx_hashes[i+1].begin(), tx_hashes[i+1].end());
+                    combined.reserve(64);
+                    if (!tx_hashes[i].empty()) {
+                        combined.insert(combined.end(), tx_hashes[i].begin(), tx_hashes[i].end());
+                    }
+                    if (!tx_hashes[i+1].empty()) {
+                        combined.insert(combined.end(), tx_hashes[i+1].begin(), tx_hashes[i+1].end());
+                    }
                     next_level.push_back(dsha256(combined));
                 } else {
                     // Odd element, duplicate
                     std::vector<uint8_t> combined;
-                    combined.insert(combined.end(), tx_hashes[i].begin(), tx_hashes[i].end());
-                    combined.insert(combined.end(), tx_hashes[i].begin(), tx_hashes[i].end());
+                    combined.reserve(64);
+                    if (!tx_hashes[i].empty()) {
+                        combined.insert(combined.end(), tx_hashes[i].begin(), tx_hashes[i].end());
+                        combined.insert(combined.end(), tx_hashes[i].begin(), tx_hashes[i].end());
+                    }
                     next_level.push_back(dsha256(combined));
                 }
             }
