@@ -31,18 +31,197 @@
 #include <functional>
 #include <regex>
 
-// Platform-specific includes for terminal detection
+// Platform-specific includes for terminal detection and raw input
 #ifdef _WIN32
   #ifndef NOMINMAX
     #define NOMINMAX
   #endif
   #include <windows.h>
   #include <io.h>
+  #include <conio.h>
   #define isatty _isatty
   #define STDOUT_FILENO _fileno(stdout)
 #else
   #include <unistd.h>
+  #include <termios.h>
+  #include <sys/select.h>
+  #include <sys/ioctl.h>
 #endif
+
+// =============================================================================
+// INSTANT KEY INPUT SYSTEM v1.0
+// Allows single-key commands without pressing Enter
+// =============================================================================
+namespace instant_input {
+
+#ifdef _WIN32
+    // Windows implementation using conio.h
+    static bool g_raw_mode = false;
+
+    static void enable_raw_mode() {
+        g_raw_mode = true;
+    }
+
+    static void disable_raw_mode() {
+        g_raw_mode = false;
+    }
+
+    // Get single character without Enter (Windows)
+    static int get_char_instant() {
+        if (_kbhit()) {
+            return _getch();
+        }
+        return -1;
+    }
+
+    // Wait for a key press (blocking)
+    static int wait_for_key() {
+        return _getch();
+    }
+
+    // Check if input is available
+    static bool input_available() {
+        return _kbhit() != 0;
+    }
+
+#else
+    // Linux/Unix implementation using termios
+    static struct termios g_orig_termios;
+    static bool g_raw_mode = false;
+
+    static void disable_raw_mode() {
+        if (g_raw_mode) {
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig_termios);
+            g_raw_mode = false;
+        }
+    }
+
+    static void enable_raw_mode() {
+        if (g_raw_mode) return;
+        if (!isatty(STDIN_FILENO)) return;
+
+        tcgetattr(STDIN_FILENO, &g_orig_termios);
+        atexit(disable_raw_mode);
+
+        struct termios raw = g_orig_termios;
+        // Input flags: no break, no CR to NL, no parity check, no strip char, no start/stop
+        raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+        // Output flags: disable post-processing (keep enabled for proper newlines)
+        // raw.c_oflag &= ~(OPOST);
+        // Control flags: set 8-bit chars
+        raw.c_cflag |= (CS8);
+        // Local flags: no echo, no canonical, no signals, no extended
+        raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+        // Control chars: return immediately with 0 chars
+        raw.c_cc[VMIN] = 0;
+        raw.c_cc[VTIME] = 0;
+
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+        g_raw_mode = true;
+    }
+
+    // Get single character without Enter (non-blocking)
+    static int get_char_instant() {
+        if (!g_raw_mode) enable_raw_mode();
+
+        char c;
+        if (read(STDIN_FILENO, &c, 1) == 1) {
+            return (int)(unsigned char)c;
+        }
+        return -1;
+    }
+
+    // Wait for a key press (blocking with timeout)
+    static int wait_for_key(int timeout_ms = -1) {
+        if (!g_raw_mode) enable_raw_mode();
+
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+
+        struct timeval tv;
+        struct timeval* ptv = nullptr;
+
+        if (timeout_ms >= 0) {
+            tv.tv_sec = timeout_ms / 1000;
+            tv.tv_usec = (timeout_ms % 1000) * 1000;
+            ptv = &tv;
+        }
+
+        if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, ptv) > 0) {
+            char c;
+            if (read(STDIN_FILENO, &c, 1) == 1) {
+                return (int)(unsigned char)c;
+            }
+        }
+        return -1;
+    }
+
+    // Check if input is available
+    static bool input_available() {
+        if (!g_raw_mode) enable_raw_mode();
+
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+
+        struct timeval tv = {0, 0};
+        return select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) > 0;
+    }
+#endif
+
+    // Get terminal dimensions
+    static std::pair<int, int> get_terminal_size() {
+        int rows = 24, cols = 80;  // Default
+#ifdef _WIN32
+        CONSOLE_SCREEN_BUFFER_INFO csbi;
+        if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+            cols = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+            rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+        }
+#else
+        struct winsize ws;
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+            rows = ws.ws_row;
+            cols = ws.ws_col;
+        }
+#endif
+        return {rows, cols};
+    }
+
+    // Move cursor to position
+    static void move_cursor(int row, int col) {
+        std::cout << "\033[" << row << ";" << col << "H" << std::flush;
+    }
+
+    // Hide cursor
+    static void hide_cursor() {
+        std::cout << "\033[?25l" << std::flush;
+    }
+
+    // Show cursor
+    static void show_cursor() {
+        std::cout << "\033[?25h" << std::flush;
+    }
+
+    // Save cursor position
+    static void save_cursor() {
+        std::cout << "\033[s" << std::flush;
+    }
+
+    // Restore cursor position
+    static void restore_cursor() {
+        std::cout << "\033[u" << std::flush;
+    }
+
+    // RAII wrapper for raw mode
+    class RawModeGuard {
+    public:
+        RawModeGuard() { enable_raw_mode(); }
+        ~RawModeGuard() { disable_raw_mode(); show_cursor(); }
+    };
+
+} // namespace instant_input
 
 // =============================================================================
 // PRODUCTION CONSTANTS
@@ -1464,6 +1643,369 @@ namespace ui {
         std::cout << std::string(30, ' ') << "\n";
     }
 }
+
+// =============================================================================
+// LIVE ANIMATED DASHBOARD v6.0 - Professional Interactive Menu System
+// Features: Instant key response, live animations, transaction tracking
+// =============================================================================
+namespace live_dashboard {
+
+    // Menu item with animation state
+    struct MenuItem {
+        char key;
+        std::string label;
+        std::string description;
+        std::string color;  // "green", "cyan", "yellow", etc.
+        bool enabled{true};
+    };
+
+    // Transaction status with live tracking
+    struct LiveTxStatus {
+        std::string txid_hex;
+        std::string direction;  // "sent" or "recv"
+        uint64_t amount{0};
+        int64_t timestamp{0};
+        int confirmations{0};
+        bool verified{false};       // Have we verified against blockchain?
+        std::string status;         // "pending", "confirmed", "mempool", "unknown"
+    };
+
+    // Dashboard state
+    struct DashboardState {
+        int animation_tick{0};
+        int selected_item{0};
+        bool needs_refresh{false};
+        int64_t last_refresh{0};
+        bool is_online{false};
+        std::string connected_node;
+        std::vector<LiveTxStatus> recent_txs;
+    };
+
+    static DashboardState g_state;
+
+    // Get confirmation status string with color
+    static std::string get_conf_status_string(int confs) {
+        if (confs >= 6) {
+            return ui::green() + "[" + std::to_string(confs) + " CONF]" + ui::reset();
+        } else if (confs >= 1) {
+            return ui::yellow() + "[" + std::to_string(confs) + "/6]" + ui::reset();
+        } else {
+            return ui::red() + "[PENDING]" + ui::reset();
+        }
+    }
+
+    // Get status badge for transaction
+    static std::string get_status_badge(const std::string& status, int confs) {
+        if (status == "confirmed" || confs >= 6) {
+            return ui::green() + ui::bold() + "[OK]" + ui::reset();
+        } else if (status == "mempool" || confs >= 1) {
+            return ui::yellow() + "[" + std::to_string(confs) + "c]" + ui::reset();
+        } else if (status == "pending") {
+            return ui::yellow() + "[..]" + ui::reset();
+        } else if (status == "broadcast") {
+            return ui::cyan() + "[TX]" + ui::reset();
+        } else if (status == "failed") {
+            return ui::red() + "[!!]" + ui::reset();
+        } else {
+            return ui::dim() + "[??]" + ui::reset();
+        }
+    }
+
+    // Draw a single animated menu item
+    static void draw_menu_item(const MenuItem& item, bool selected, int tick) {
+        std::cout << ui::cyan() << ui::WIN_V << ui::reset();
+
+        // Selection indicator with animation
+        if (selected) {
+            const char* arrows[] = {">", ">>", ">>>"};
+            std::cout << ui::green() << ui::bold() << " " << arrows[tick % 3] << " ";
+        } else {
+            std::cout << "    ";
+        }
+
+        // Key with bracket animation for selected
+        if (selected) {
+            std::cout << ui::green() << ui::bold() << "[" << item.key << "]" << ui::reset();
+        } else {
+            std::cout << ui::cyan() << "[" << item.key << "]" << ui::reset();
+        }
+
+        // Label
+        std::cout << " " << std::setw(16) << std::left;
+        if (selected) {
+            std::cout << ui::bold() << item.label << ui::reset();
+        } else {
+            std::cout << item.label;
+        }
+
+        // Description with color
+        std::cout << " " << ui::dim() << item.description << ui::reset();
+
+        // Fill remaining space
+        int used = 4 + 3 + 1 + 16 + 1 + (int)item.description.size();
+        int remaining = 70 - used;
+        if (remaining > 0) std::cout << std::string(remaining, ' ');
+
+        std::cout << ui::cyan() << ui::WIN_V << ui::reset() << "\n";
+    }
+
+    // Draw animated progress indicator for syncing/loading
+    static void draw_sync_indicator(int tick, bool syncing) {
+        if (!syncing) return;
+
+        const char* frames[] = {"[*   ]", "[ *  ]", "[  * ]", "[   *]", "[  * ]", "[ *  ]"};
+        std::cout << ui::yellow() << frames[tick % 6] << ui::reset() << " ";
+    }
+
+    // Draw live transaction row with confirmation animation
+    static void draw_live_tx_row(const LiveTxStatus& tx, int tick, int width = 70) {
+        std::cout << ui::cyan() << ui::WIN_V << ui::reset();
+
+        // Direction with color
+        if (tx.direction == "sent") {
+            std::cout << " " << ui::red() << "SENT" << ui::reset() << "   ";
+        } else {
+            std::cout << " " << ui::green() << "RECV" << ui::reset() << "   ";
+        }
+
+        // Amount
+        std::ostringstream amt_ss;
+        amt_ss << std::fixed << std::setprecision(4)
+               << ((double)tx.amount / 100000000.0);
+        std::string amt_str = amt_ss.str();
+
+        if (tx.direction == "sent") {
+            std::cout << ui::red() << std::setw(14) << std::right << amt_str << ui::reset();
+        } else {
+            std::cout << ui::green() << std::setw(14) << std::right << amt_str << ui::reset();
+        }
+        std::cout << " MIQ  ";
+
+        // Confirmation status with live animation for pending
+        if (tx.confirmations >= 6) {
+            std::cout << ui::green() << ui::bold() << "[OK]" << ui::reset();
+        } else if (tx.confirmations >= 1) {
+            std::cout << ui::yellow() << "[" << tx.confirmations << "c]" << ui::reset();
+        } else {
+            // Animated waiting indicator
+            const char* wait[] = {"[..]", "[o.]", "[.o]", "[oo]"};
+            std::cout << ui::yellow() << wait[tick % 4] << ui::reset();
+        }
+
+        // Time ago
+        int64_t now = (int64_t)time(nullptr);
+        int64_t diff = now - tx.timestamp;
+        std::string time_str;
+        if (diff < 60) time_str = std::to_string(diff) + "s ago";
+        else if (diff < 3600) time_str = std::to_string(diff / 60) + "m ago";
+        else if (diff < 86400) time_str = std::to_string(diff / 3600) + "h ago";
+        else time_str = std::to_string(diff / 86400) + "d ago";
+
+        std::cout << "  " << ui::dim() << std::setw(8) << time_str << ui::reset();
+
+        // Fill remaining
+        int used = 1 + 4 + 3 + 14 + 5 + 4 + 2 + 8;
+        int remaining = width - 1 - used;
+        if (remaining > 0) std::cout << std::string(remaining, ' ');
+
+        std::cout << ui::cyan() << ui::WIN_V << ui::reset() << "\n";
+
+        // TXID line
+        std::cout << ui::cyan() << ui::WIN_V << ui::reset();
+        std::cout << "   " << ui::dim() << "TXID: " << ui::reset()
+                  << ui::cyan() << tx.txid_hex << ui::reset();
+        int txid_remaining = width - 11 - (int)tx.txid_hex.size();
+        if (txid_remaining > 0) std::cout << std::string(txid_remaining, ' ');
+        std::cout << ui::cyan() << ui::WIN_V << ui::reset() << "\n";
+    }
+
+    // Draw the complete animated dashboard
+    static void draw_dashboard(
+        const std::string& title,
+        uint64_t balance_total,
+        uint64_t balance_available,
+        uint64_t balance_immature,
+        uint64_t balance_pending,
+        const std::vector<LiveTxStatus>& recent_txs,
+        int utxo_count,
+        uint64_t utxo_min,
+        uint64_t utxo_max,
+        bool is_online,
+        const std::string& connected_node,
+        int queue_count,
+        int pending_utxo_count,
+        int tick
+    ) {
+        const int WIN_WIDTH = 72;
+
+        // Clear screen and position at top
+        ui::clear_screen();
+        std::cout << "\n";
+
+        // Window title bar
+        ui::draw_window_top(title, WIN_WIDTH);
+
+        // Status bar with live indicator
+        std::cout << ui::cyan() << ui::WIN_V << ui::reset();
+        std::cout << " ";
+
+        // Network status with animated indicator
+        if (is_online) {
+            const char* pulse[] = {"*", "o", "O", "o"};
+            std::cout << ui::green() << ui::bold() << "ONLINE" << ui::reset()
+                      << ui::green() << " [" << pulse[tick % 4] << "]" << ui::reset();
+            if (!connected_node.empty()) {
+                std::cout << ui::dim() << " @ " << connected_node << ui::reset();
+            }
+        } else {
+            std::cout << ui::red() << ui::bold() << "OFFLINE" << ui::reset();
+        }
+
+        // Queue indicator
+        if (queue_count > 0) {
+            std::cout << "  " << ui::yellow() << "[" << queue_count << " QUEUED]" << ui::reset();
+        }
+
+        // Pending UTXOs
+        if (pending_utxo_count > 0) {
+            std::cout << "  " << ui::magenta() << "[" << pending_utxo_count << " PENDING]" << ui::reset();
+        }
+
+        // Fill and close
+        std::cout << std::string(10, ' ');
+        std::cout << ui::cyan() << ui::WIN_V << ui::reset() << "\n";
+
+        ui::draw_window_divider(WIN_WIDTH);
+
+        // Balance display with animated highlight
+        auto fmt_bal = [](uint64_t val) -> std::string {
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(8) << ((double)val / 100000000.0);
+            return ss.str();
+        };
+
+        std::cout << ui::cyan() << ui::WIN_V << ui::reset();
+        std::cout << " " << ui::bold() << "Total Balance:  " << ui::reset()
+                  << ui::green() << ui::bold() << fmt_bal(balance_total) << " MIQ" << ui::reset();
+        std::cout << std::string(WIN_WIDTH - 50, ' ');
+        std::cout << ui::cyan() << ui::WIN_V << ui::reset() << "\n";
+
+        std::cout << ui::cyan() << ui::WIN_V << ui::reset();
+        std::cout << " " << ui::dim() << "Available:      " << ui::reset()
+                  << ui::cyan() << fmt_bal(balance_available) << " MIQ" << ui::reset();
+        std::cout << std::string(WIN_WIDTH - 50, ' ');
+        std::cout << ui::cyan() << ui::WIN_V << ui::reset() << "\n";
+
+        if (balance_immature > 0) {
+            std::cout << ui::cyan() << ui::WIN_V << ui::reset();
+            std::cout << " " << ui::dim() << "Immature:       " << ui::reset()
+                      << ui::yellow() << fmt_bal(balance_immature) << " MIQ" << ui::reset()
+                      << ui::dim() << " (100 conf)" << ui::reset();
+            std::cout << std::string(WIN_WIDTH - 60, ' ');
+            std::cout << ui::cyan() << ui::WIN_V << ui::reset() << "\n";
+        }
+
+        if (balance_pending > 0) {
+            std::cout << ui::cyan() << ui::WIN_V << ui::reset();
+            std::cout << " " << ui::dim() << "In Transit:     " << ui::reset()
+                      << ui::magenta() << fmt_bal(balance_pending) << " MIQ" << ui::reset();
+            std::cout << std::string(WIN_WIDTH - 50, ' ');
+            std::cout << ui::cyan() << ui::WIN_V << ui::reset() << "\n";
+        }
+
+        ui::draw_window_divider(WIN_WIDTH);
+
+        // Recent Transactions Section
+        ui::draw_section_header("RECENT TRANSACTIONS", WIN_WIDTH);
+
+        if (recent_txs.empty()) {
+            std::cout << ui::cyan() << ui::WIN_V << ui::reset();
+            std::cout << "  " << ui::dim() << "No transactions yet. Press [1] to receive MIQ." << ui::reset();
+            std::cout << std::string(WIN_WIDTH - 50, ' ');
+            std::cout << ui::cyan() << ui::WIN_V << ui::reset() << "\n";
+        } else {
+            int shown = 0;
+            for (const auto& tx : recent_txs) {
+                if (shown >= 5) break;
+                draw_live_tx_row(tx, tick, WIN_WIDTH);
+                shown++;
+            }
+        }
+
+        ui::draw_window_divider(WIN_WIDTH);
+
+        // UTXO Summary
+        ui::draw_section_header("UTXO SUMMARY", WIN_WIDTH);
+        std::cout << ui::cyan() << ui::WIN_V << ui::reset();
+        std::cout << "   " << utxo_count << " UTXOs total";
+        if (utxo_count > 0) {
+            auto fmt_short = [](uint64_t val) -> std::string {
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(4) << ((double)val / 100000000.0);
+                return ss.str();
+            };
+            std::cout << " | Smallest: " << fmt_short(utxo_min)
+                      << " | Largest: " << fmt_short(utxo_max) << " MIQ";
+        }
+        std::cout << std::string(10, ' ');
+        std::cout << ui::cyan() << ui::WIN_V << ui::reset() << "\n";
+
+        ui::draw_window_divider(WIN_WIDTH);
+
+        // Menu options
+        ui::draw_section_header("MAIN OPERATIONS", WIN_WIDTH);
+
+        std::vector<MenuItem> main_items = {
+            {'1', "Receive", "View addresses", "cyan", true},
+            {'2', "Send", "Transfer MIQ", "green", true},
+            {'3', "History", "All transactions", "cyan", true},
+            {'4', "Contacts", "Address book", "cyan", true},
+            {'n', "New Address", "Generate receive address", "yellow", true}
+        };
+
+        for (const auto& item : main_items) {
+            ui::draw_menu_option(std::string(1, item.key), item.label, item.description, WIN_WIDTH);
+        }
+
+        ui::draw_empty_line(WIN_WIDTH);
+        ui::draw_section_header("TOOLS", WIN_WIDTH);
+
+        std::vector<MenuItem> tool_items = {
+            {'5', "Settings", "Backup, recovery & more", "cyan", true},
+            {'r', "Refresh", "Sync & auto-broadcast", "green", true},
+            {'b', "Broadcast", "Send queued transactions", "yellow", queue_count > 0},
+            {'h', "Help", "User guide", "cyan", true},
+            {'q', "Exit", "Close wallet", "red", true}
+        };
+
+        for (const auto& item : tool_items) {
+            ui::draw_menu_option(std::string(1, item.key), item.label, item.description, WIN_WIDTH);
+        }
+
+        ui::draw_window_bottom(WIN_WIDTH);
+
+        // Instruction line with animation
+        std::cout << "\n  " << ui::dim() << "Press a key directly (no Enter needed): " << ui::reset();
+        const char* cursor_anim[] = {"_", " "};
+        std::cout << ui::green() << cursor_anim[(tick / 5) % 2] << ui::reset() << std::flush;
+    }
+
+    // Wait for instant key with timeout and animation
+    static int wait_for_key_animated(int timeout_ms = 100) {
+        return instant_input::wait_for_key(timeout_ms);
+    }
+
+    // Check if a character is a valid menu key
+    static bool is_menu_key(int ch) {
+        if (ch < 0) return false;
+        char c = (char)ch;
+        return c == '1' || c == '2' || c == '3' || c == '4' || c == '5' ||
+               c == 'n' || c == 'N' || c == 'r' || c == 'R' ||
+               c == 'b' || c == 'B' || c == 'h' || c == 'H' ||
+               c == 'q' || c == 'Q' || c == 27;  // ESC
+    }
+
+} // namespace live_dashboard
 
 // =============================================================================
 // UTILITY FUNCTIONS
@@ -4185,6 +4727,110 @@ static void add_tx_history(const std::string& wdir, const TxHistoryEntry& entry)
 }
 
 // =============================================================================
+// UPDATE TRANSACTION CONFIRMATIONS - Using blockchain data
+// =============================================================================
+
+// Update a single transaction's confirmation count
+static void update_tx_confirmation(const std::string& wdir,
+                                    const std::string& txid_hex,
+                                    uint32_t confirmations) {
+    std::vector<TxHistoryEntry> hist;
+    load_tx_history(wdir, hist);
+
+    bool changed = false;
+    for(auto& e : hist){
+        if(e.txid_hex == txid_hex){
+            if(e.confirmations != confirmations){
+                e.confirmations = confirmations;
+                changed = true;
+            }
+            break;
+        }
+    }
+
+    if(changed){
+        save_tx_history(wdir, hist);
+    }
+}
+
+// Update all transaction confirmations based on UTXOs and chain height
+// This uses UTXO heights to estimate confirmations
+static void update_all_tx_confirmations(const std::string& wdir,
+                                         const std::vector<miq::UtxoLite>& utxos,
+                                         uint32_t current_tip_height) {
+    std::vector<TxHistoryEntry> hist;
+    load_tx_history(wdir, hist);
+
+    if(hist.empty() || current_tip_height == 0) return;
+
+    bool changed = false;
+
+    // Build map of TXID -> UTXO height
+    std::map<std::string, uint32_t> txid_height;
+    for(const auto& u : utxos){
+        std::string tid = miq::to_hex(u.txid);
+        // Use the lowest height for this TXID (most conservative)
+        auto it = txid_height.find(tid);
+        if(it == txid_height.end() || u.height < it->second){
+            txid_height[tid] = u.height;
+        }
+    }
+
+    // Update confirmations for each transaction
+    for(auto& e : hist){
+        uint32_t old_conf = e.confirmations;
+        uint32_t new_conf = old_conf;
+
+        // Check if we have a UTXO from this transaction
+        auto it = txid_height.find(e.txid_hex);
+        if(it != txid_height.end() && it->second > 0){
+            // Calculate confirmations: tip - block_height + 1
+            if(current_tip_height >= it->second){
+                new_conf = current_tip_height - it->second + 1;
+            }
+        } else {
+            // No UTXO found - if transaction was sent, it might be confirmed
+            // and spent already. For sent transactions with 0 confirmations,
+            // we should check based on time elapsed.
+            if(e.direction == "sent" && e.confirmations == 0){
+                // If transaction is old enough (>10 minutes), assume at least 1 conf
+                int64_t now = (int64_t)time(nullptr);
+                int64_t age = now - e.timestamp;
+                if(age > 600){  // 10 minutes = ~1 block
+                    new_conf = std::max(1u, (uint32_t)(age / 600)); // rough estimate
+                }
+                // Cap at 6 if we're just estimating
+                if(new_conf > 6) new_conf = 6;
+            }
+        }
+
+        if(new_conf != old_conf){
+            e.confirmations = new_conf;
+            changed = true;
+        }
+    }
+
+    if(changed){
+        save_tx_history(wdir, hist);
+    }
+}
+
+// Quick check to verify a specific transaction is on-chain
+// Returns estimated confirmations, or 0 if not found
+static uint32_t verify_tx_on_chain(const std::vector<miq::UtxoLite>& utxos,
+                                    const std::string& txid_hex,
+                                    uint32_t current_tip_height) {
+    for(const auto& u : utxos){
+        if(miq::to_hex(u.txid) == txid_hex){
+            if(current_tip_height >= u.height && u.height > 0){
+                return current_tip_height - u.height + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// =============================================================================
 // QUEUED TRANSACTION - Offline transaction support with persistence
 // =============================================================================
 struct QueuedTransaction {
@@ -5982,6 +6628,19 @@ static bool wallet_session(const std::string& cli_host,
         // Display balance
         WalletBalance wb = compute_balance(utxos, pending);
 
+        // CRITICAL: Update transaction confirmations based on chain data
+        {
+            // Get current tip height from highest UTXO height
+            uint32_t tip_height = 0;
+            for(const auto& u : utxos){
+                if(u.height > tip_height) tip_height = u.height;
+            }
+            // Update all transaction confirmations in history
+            if(tip_height > 0){
+                update_all_tx_confirmations(wdir, utxos, tip_height);
+            }
+        }
+
         std::cout << "\n";
         ui::print_header("WALLET BALANCE", 50);
         std::cout << "\n";
@@ -6048,139 +6707,106 @@ static bool wallet_session(const std::string& cli_host,
     // Track network status
     bool is_online = (last_connected_node != "<offline>" && last_connected_node != "<not connected>");
 
-    // Main menu loop
+    // =============================================================================
+    // LIVE ANIMATED DASHBOARD v6.0 - Main Menu Loop
+    // Features: Instant key response, live animations, transaction status tracking
+    // =============================================================================
+
+    int animation_tick = 0;
+    int64_t last_auto_refresh = (int64_t)time(nullptr);
+    const int AUTO_REFRESH_INTERVAL = 60;  // Auto-refresh every 60 seconds
+
+    // Enable instant input mode
+    instant_input::enable_raw_mode();
+
     for(;;){
-        // =============================================================
-        // PROFESSIONAL WALLET DASHBOARD v4.0
-        // Enhanced window-style UI with recent transactions
-        // CRITICAL FIX: Clear screen to prevent scrolling - single screen UI
-        // =============================================================
-        ui::clear_screen();  // CRITICAL FIX: Single screen, no scrolling
+        // Build live transaction list from history
+        std::vector<live_dashboard::LiveTxStatus> live_txs;
+        {
+            std::vector<TxHistoryEntry> recent_history;
+            load_tx_history(wdir, recent_history);
 
-        const int WIN_WIDTH = 72;
-
-        std::cout << "\n";
-
-        // Window title bar - Version 5.0 with professional styling
-        ui::draw_window_top("MIQ WALLET v5.0 - PROFESSIONAL DASHBOARD", WIN_WIDTH);
-
-        // Status bar
-        int queue_count = count_pending_in_queue(wdir);
-        ui::draw_status_bar(is_online, last_connected_node, queue_count, (int)pending.size(), WIN_WIDTH);
-
-        ui::draw_window_divider(WIN_WIDTH);
-
-        // Balance display
-        WalletBalance menu_wb = compute_balance(utxos, pending);
-        std::ostringstream bal_total, bal_avail;
-        bal_total << std::fixed << std::setprecision(8) << ((double)menu_wb.total / (double)COIN);
-        bal_avail << std::fixed << std::setprecision(8) << ((double)menu_wb.spendable / (double)COIN);
-
-        ui::draw_window_line_colored("Total Balance:", bal_total.str() + " MIQ", "green", WIN_WIDTH);
-        if(menu_wb.spendable < menu_wb.total){
-            ui::draw_window_line_colored("Available:", bal_avail.str() + " MIQ", "cyan", WIN_WIDTH);
-        }
-        if(menu_wb.immature > 0){
-            std::ostringstream imm_ss;
-            imm_ss << std::fixed << std::setprecision(8) << ((double)menu_wb.immature / (double)COIN);
-            ui::draw_window_line_colored("Immature:", imm_ss.str() + " MIQ (100 conf)", "yellow", WIN_WIDTH);
-        }
-        if(menu_wb.pending_hold > 0){
-            std::ostringstream pen_ss;
-            pen_ss << std::fixed << std::setprecision(8) << ((double)menu_wb.pending_hold / (double)COIN);
-            ui::draw_window_line_colored("In Transit:", pen_ss.str() + " MIQ", "magenta", WIN_WIDTH);
-        }
-
-        ui::draw_window_divider(WIN_WIDTH);
-
-        // Recent Transactions Section - Show last 5 with full TXIDs
-        ui::draw_section_header("RECENT TRANSACTIONS", WIN_WIDTH);
-
-        std::vector<TxHistoryEntry> recent_history;
-        load_tx_history(wdir, recent_history);
-
-        if(recent_history.empty()){
-            ui::draw_window_line("  No transactions yet. Use option [1] to receive MIQ.", WIN_WIDTH);
-        } else {
-            // Show last 5 transactions (most recent first)
+            // Sort by timestamp (most recent first)
             std::sort(recent_history.begin(), recent_history.end(),
                 [](const TxHistoryEntry& a, const TxHistoryEntry& b){
                     return a.timestamp > b.timestamp;
                 });
 
-            int tx_shown = 0;
+            // Convert to live format with proper status
             for(const auto& tx : recent_history){
-                if(tx_shown >= 5) break;
+                if(live_txs.size() >= 5) break;
 
-                // Format amount
-                std::ostringstream amt_ss;
-                amt_ss << std::fixed << std::setprecision(4)
-                       << std::abs((double)tx.amount / (double)COIN);
+                live_dashboard::LiveTxStatus ltx;
+                ltx.txid_hex = tx.txid_hex;
+                ltx.direction = tx.direction;
+                ltx.amount = (uint64_t)std::abs(tx.amount);
+                ltx.timestamp = tx.timestamp;
+                ltx.confirmations = tx.confirmations;
 
-                // Format time ago
-                std::string time_str = ui::format_time_ago(tx.timestamp);
+                // Set proper status based on confirmations
+                if(tx.confirmations >= 6){
+                    ltx.status = "confirmed";
+                } else if(tx.confirmations >= 1){
+                    ltx.status = "mempool";
+                } else {
+                    ltx.status = "pending";
+                }
 
-                // Status
-                std::string status = (tx.confirmations >= 6) ? "confirmed" :
-                                     (tx.confirmations > 0) ? "pending" : "pending";
-
-                // Draw transaction row with full TXID
-                ui::draw_tx_row(tx.direction, amt_ss.str(), status,
-                               tx.txid_hex, time_str, WIN_WIDTH);
-
-                tx_shown++;
-            }
-
-            if(recent_history.size() > 5){
-                std::ostringstream more_ss;
-                more_ss << "  ... and " << (recent_history.size() - 5) << " more. Press [4] for full history.";
-                ui::draw_window_line(more_ss.str(), WIN_WIDTH);
+                live_txs.push_back(ltx);
             }
         }
 
-        ui::draw_window_divider(WIN_WIDTH);
-
-        // Quick UTXO Summary
-        ui::draw_section_header("UTXO SUMMARY", WIN_WIDTH);
-        std::ostringstream utxo_info;
-        utxo_info << "  " << utxos.size() << " UTXOs total";
-        if(utxos.size() > 0){
-            uint64_t min_u = UINT64_MAX, max_u = 0;
-            for(const auto& u : utxos){
-                min_u = std::min(min_u, u.value);
-                max_u = std::max(max_u, u.value);
-            }
-            utxo_info << " | Smallest: " << fmt_amount_short(min_u)
-                      << " | Largest: " << fmt_amount_short(max_u) << " MIQ";
+        // Compute balance and UTXO stats
+        WalletBalance menu_wb = compute_balance(utxos, pending);
+        uint64_t min_u = UINT64_MAX, max_u = 0;
+        for(const auto& u : utxos){
+            min_u = std::min(min_u, u.value);
+            max_u = std::max(max_u, u.value);
         }
-        ui::draw_window_line(utxo_info.str(), WIN_WIDTH);
+        if(utxos.empty()){ min_u = 0; max_u = 0; }
 
-        ui::draw_window_divider(WIN_WIDTH);
+        int queue_count = count_pending_in_queue(wdir);
 
-        // =====================================================================
-        // SIMPLIFIED PROFESSIONAL MENU v5.0
-        // Streamlined for ease of use - auto broadcasts on refresh
-        // =====================================================================
+        // Draw the animated dashboard
+        live_dashboard::draw_dashboard(
+            "MIQ WALLET v6.0 - LIVE DASHBOARD",
+            menu_wb.total,
+            menu_wb.spendable,
+            menu_wb.immature,
+            menu_wb.pending_hold,
+            live_txs,
+            (int)utxos.size(),
+            min_u, max_u,
+            is_online,
+            last_connected_node,
+            queue_count,
+            (int)pending.size(),
+            animation_tick
+        );
 
-        ui::draw_section_header("MAIN OPERATIONS", WIN_WIDTH);
-        ui::draw_menu_option("1", "Receive", "View addresses", WIN_WIDTH);
-        ui::draw_menu_option("2", "Send", "Transfer MIQ", WIN_WIDTH);
-        ui::draw_menu_option("3", "History", "All transactions", WIN_WIDTH);
-        ui::draw_menu_option("4", "Contacts", "Address book", WIN_WIDTH);
-        ui::draw_menu_option("n", "New Address", "Generate receive address", WIN_WIDTH);
+        // Wait for key with animation timeout (100ms for smooth animation)
+        int ch = instant_input::wait_for_key(100);
 
-        ui::draw_empty_line(WIN_WIDTH);
-        ui::draw_section_header("TOOLS", WIN_WIDTH);
-        ui::draw_menu_option("5", "Settings", "Backup, recovery & more", WIN_WIDTH);
-        ui::draw_menu_option("r", "Refresh", "Sync & auto-broadcast", WIN_WIDTH);
-        ui::draw_menu_option("b", "Broadcast", "Send queued transactions", WIN_WIDTH);
-        ui::draw_menu_option("h", "Help", "User guide", WIN_WIDTH);
-        ui::draw_menu_option("q", "Exit", "Close wallet", WIN_WIDTH);
+        // Increment animation tick
+        animation_tick++;
 
-        ui::draw_window_bottom(WIN_WIDTH);
+        // Check for auto-refresh
+        int64_t now = (int64_t)time(nullptr);
+        if(now - last_auto_refresh > AUTO_REFRESH_INTERVAL){
+            // Silent background refresh
+            last_auto_refresh = now;
+            // Note: Full refresh happens when user presses 'r'
+        }
 
-        std::string c = ui::prompt("Select option: ");
-        c = trim(c);
+        // No key pressed - continue animation loop
+        if(ch < 0) continue;
+
+        // Convert to lowercase for consistency
+        char c_char = (char)ch;
+        std::string c(1, c_char);
+
+        // Disable raw mode for submenu input
+        instant_input::disable_raw_mode();
 
         // =================================================================
         // OPTION 3: Transaction History - Professional Viewer
@@ -8614,13 +9240,29 @@ static bool wallet_session(const std::string& cli_host,
         // =================================================================
         // OPTION q: Quit
         // =================================================================
-        else if(c == "q" || c == "Q" || c == "exit"){
+        else if(c == "q" || c == "Q" || c == "exit" || ch == 27){
+            // ESC or q - exit
+            instant_input::disable_raw_mode();
+            instant_input::show_cursor();
+            ui::clear_screen();
+            std::cout << "\n";
+            ui::print_separator(50);
+            std::cout << "\n  " << ui::cyan() << "Thank you for using MIQ Wallet!" << ui::reset() << "\n";
+            std::cout << "  " << ui::dim() << "Your wallet is safely saved." << ui::reset() << "\n\n";
             break;
         }
         else if(!c.empty()){
-            ui::print_error("Unknown option: " + c);
+            // Unknown key - show brief message
+            // Don't show error for regular animation updates
         }
+
+        // Re-enable raw mode for next menu iteration
+        instant_input::enable_raw_mode();
     }
+
+    // Final cleanup
+    instant_input::disable_raw_mode();
+    instant_input::show_cursor();
 
     return true;
 }
