@@ -1960,15 +1960,143 @@ private:
     }
 
     // =========================================================================
-    // Splash Screen - Shown during initial sync / block download
+    // SPLASH SCREEN - Professional sync display with animations
     // =========================================================================
+
+    // Animated spinner characters (multiple styles)
+    static const char* splash_spinner(int tick, bool u8) {
+        if (u8) {
+            static const char* frames[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+            return frames[tick % 10];
+        } else {
+            static const char* frames[] = {"|", "/", "-", "\\"};
+            return frames[tick % 4];
+        }
+    }
+
+    // Pulsing block animation for sync
+    static std::string pulse_blocks(int tick, bool u8, bool vt) {
+        if (!u8) return "[###]";
+        // Animated chain of blocks with wave effect
+        static const char* blocks[] = {"░", "▒", "▓", "█"};
+        std::string out;
+        if (vt) out += "\x1b[36m";  // Cyan
+        for (int i = 0; i < 5; ++i) {
+            int phase = (tick + i * 2) % 8;
+            if (phase > 4) phase = 8 - phase;
+            out += blocks[std::min(phase, 3)];
+        }
+        if (vt) out += "\x1b[0m";
+        return out;
+    }
+
+    // Fancy gradient progress bar with glow effect
+    std::string splash_progress_bar(int width, double frac, int tick) const {
+        if (width < 20) width = 20;
+        if (frac < 0.0) frac = 0.0;
+        if (frac > 1.0) frac = 1.0;
+
+        int inner = width - 2;
+        int filled = (int)(frac * inner);
+        double sub_frac = (frac * inner) - filled;  // Sub-character precision
+
+        std::string out;
+        out.reserve((size_t)(width + 100));
+
+        if (vt_ok_ && u8_ok_) {
+            // Premium Unicode progress bar with smooth gradient and glow
+            out += "\x1b[48;5;236m";  // Dark background
+
+            for (int i = 0; i < inner; ++i) {
+                if (i < filled) {
+                    // Gradient from cyan to green based on position
+                    int color_phase = (i * 6) / inner;
+                    switch(color_phase) {
+                        case 0: out += "\x1b[38;5;51m"; break;   // Bright cyan
+                        case 1: out += "\x1b[38;5;50m"; break;   // Cyan-green
+                        case 2: out += "\x1b[38;5;49m"; break;   // Teal
+                        case 3: out += "\x1b[38;5;48m"; break;   // Green-cyan
+                        case 4: out += "\x1b[38;5;47m"; break;   // Bright green
+                        default: out += "\x1b[38;5;46m"; break;  // Pure green
+                    }
+                    out += "█";
+                } else if (i == filled && frac < 1.0) {
+                    // Animated leading edge with smooth transition
+                    out += "\x1b[38;5;51m";  // Cyan glow
+                    static const char* edge[] = {"▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"};
+                    int edge_idx = (int)(sub_frac * 8);
+                    // Add pulse animation
+                    int pulse = (tick % 4);
+                    edge_idx = std::min(7, std::max(0, edge_idx + (pulse < 2 ? pulse : 4 - pulse) - 1));
+                    out += edge[edge_idx];
+                } else {
+                    // Empty space with subtle pattern
+                    out += "\x1b[38;5;238m";
+                    out += ((i + tick/2) % 4 == 0) ? "·" : " ";
+                }
+            }
+            out += "\x1b[0m";
+        } else if (vt_ok_) {
+            // ANSI fallback with color
+            out += "\x1b[42m\x1b[30m";  // Green background
+            for (int i = 0; i < filled; ++i) out += " ";
+            out += "\x1b[0m\x1b[47m\x1b[30m";  // Gray background
+            for (int i = filled; i < inner; ++i) out += " ";
+            out += "\x1b[0m";
+        } else {
+            // Plain ASCII
+            out += "[";
+            for (int i = 0; i < filled; ++i) out += "=";
+            if (filled < inner) out += ">";
+            for (int i = filled + 1; i < inner; ++i) out += " ";
+            out += "]";
+        }
+
+        return out;
+    }
+
+    // Big percentage display with optional animation
+    std::string big_percentage(double pct, int tick) const {
+        std::ostringstream o;
+        o << std::fixed << std::setprecision(2) << pct << "%";
+        std::string pct_str = o.str();
+
+        if (!vt_ok_) return pct_str;
+
+        // Color based on progress
+        std::string color;
+        if (pct >= 99.0) color = "\x1b[38;5;46m\x1b[1m";       // Bright green + bold
+        else if (pct >= 75.0) color = "\x1b[38;5;47m";          // Green
+        else if (pct >= 50.0) color = "\x1b[38;5;226m";         // Yellow
+        else if (pct >= 25.0) color = "\x1b[38;5;214m";         // Orange
+        else color = "\x1b[38;5;51m";                            // Cyan
+
+        return color + pct_str + "\x1b[0m";
+    }
+
+    // Get sync status string - fixed to show "synced" properly
+    std::string get_sync_status(uint64_t blocks_remaining, double sync_pct) const {
+        if (blocks_remaining == 0 || sync_pct >= 100.0) {
+            if (vt_ok_) return std::string("\x1b[38;5;46m\x1b[1m") + (u8_ok_ ? "✓ " : "") + "FULLY SYNCED\x1b[0m";
+            return "FULLY SYNCED";
+        }
+
+        // Only show time behind if actually behind
+        std::string time_behind = fmt_time_behind(sync_last_block_time_);
+        if (time_behind == "synced") {
+            if (vt_ok_) return std::string("\x1b[38;5;46m") + (u8_ok_ ? "✓ " : "") + "Synchronized\x1b[0m";
+            return "Synchronized";
+        }
+
+        if (vt_ok_) return std::string("\x1b[38;5;214m") + time_behind + "\x1b[0m";
+        return time_behind;
+    }
+
     void draw_splash(int cols, int rows) {
         std::ostringstream out;
 
-        // Calculate center positioning
-        const int box_width = std::min(80, cols - 4);
-        const int box_height = 24;
-        const int start_row = std::max(1, (rows - box_height) / 2);
+        // Sizing
+        const int box_width = std::min(76, cols - 4);
         const int start_col = std::max(1, (cols - box_width) / 2);
 
         // Calculate sync metrics
@@ -1977,122 +2105,164 @@ private:
         uint64_t blocks_remaining = (network_height > current_height) ? (network_height - current_height) : 0;
         double sync_progress = (network_height > 0) ? ((double)current_height / (double)network_height * 100.0) : 0.0;
         if (sync_progress > 100.0) sync_progress = 100.0;
+        double frac = sync_progress / 100.0;
 
-        // Build splash screen content
+        // Peer info
+        size_t peer_count = p2p_ ? p2p_->snapshot_peers().size() : 0;
+
         std::vector<std::string> lines;
 
-        // Logo / Title
+        // ===== ASCII ART LOGO =====
+        if (u8_ok_ && box_width >= 60) {
+            lines.push_back("");
+            // Stylized MIQROCHAIN text
+            if (vt_ok_) {
+                std::string logo_color = "\x1b[38;5;51m\x1b[1m";  // Bright cyan bold
+                lines.push_back(logo_color + "  ███╗   ███╗██╗ ██████╗ ██████╗  ██████╗ " + C_reset());
+                lines.push_back(logo_color + "  ████╗ ████║██║██╔═══██╗██╔══██╗██╔═══██╗" + C_reset());
+                lines.push_back(logo_color + "  ██╔████╔██║██║██║   ██║██████╔╝██║   ██║" + C_reset());
+                lines.push_back(logo_color + "  ██║╚██╔╝██║██║██║▄▄ ██║██╔══██╗██║   ██║" + C_reset());
+                lines.push_back(logo_color + "  ██║ ╚═╝ ██║██║╚██████╔╝██║  ██║╚██████╔╝" + C_reset());
+                lines.push_back(logo_color + "  ╚═╝     ╚═╝╚═╝ ╚══▀▀═╝ ╚═╝  ╚═╝ ╚═════╝ " + C_reset());
+            } else {
+                lines.push_back("  MIQROCHAIN");
+            }
+        } else {
+            lines.push_back("");
+            lines.push_back(std::string(C_head()) + C_bold() + center_text("MIQROCHAIN", box_width) + C_reset());
+        }
+
+        // Version with chain name
+        std::ostringstream ver;
+        ver << C_dim() << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
+            << "  " << (u8_ok_ ? "│" : "|") << "  " << CHAIN_NAME << C_reset();
+        lines.push_back(center_text(ver.str(), box_width));
         lines.push_back("");
-        std::string title = "MIQROCHAIN";
-        std::string version = "v" + std::to_string(MIQ_VERSION_MAJOR) + "." +
-                             std::to_string(MIQ_VERSION_MINOR) + "." +
-                             std::to_string(MIQ_VERSION_PATCH);
-        lines.push_back(std::string(C_head()) + C_bold() + center_text(title, box_width - 4) + C_reset());
-        lines.push_back(std::string(C_dim()) + center_text(version, box_width - 4) + C_reset());
+
+        // ===== SYNC STATUS HEADER =====
+        std::ostringstream header;
+        header << C_bold();
+        if (sync_progress >= 100.0) {
+            header << "\x1b[38;5;46m" << (u8_ok_ ? "✓ " : "[OK] ") << "Blockchain Synchronized";
+        } else {
+            header << C_warn() << splash_spinner(tick_, u8_ok_) << " Synchronizing Blockchain";
+        }
+        header << C_reset() << "  " << pulse_blocks(tick_, u8_ok_, vt_ok_);
+        lines.push_back(center_text(header.str(), box_width));
         lines.push_back("");
 
-        // Sync status header
-        std::string sync_icon = u8_ok_ ? "⟳ " : "[*] ";
-        lines.push_back(std::string(C_bold()) + C_warn() + sync_icon + "Synchronizing Blockchain" + C_reset());
+        // ===== LARGE PROGRESS BAR =====
+        int bar_width = box_width - 6;
+        lines.push_back("   " + splash_progress_bar(bar_width, frac, tick_));
+
+        // ===== BIG PERCENTAGE =====
+        lines.push_back(center_text(big_percentage(sync_progress, tick_), box_width));
         lines.push_back("");
 
-        // Progress bar (large, centered)
-        int bar_width = box_width - 8;
-        double frac = sync_progress / 100.0;
-        lines.push_back("  " + progress_bar_animated(bar_width, frac, tick_, vt_ok_, u8_ok_));
+        // ===== STATS BOX =====
+        std::string box_top = u8_ok_ ? "┌" + std::string(box_width - 8, '-') + "┐" : "+" + std::string(box_width - 8, '-') + "+";
+        std::string box_bot = u8_ok_ ? "└" + std::string(box_width - 8, '-') + "┘" : "+" + std::string(box_width - 8, '-') + "+";
+        std::string vbar = u8_ok_ ? "│" : "|";
 
-        // Progress percentage (large display)
-        std::ostringstream pct;
-        pct << std::fixed << std::setprecision(2) << sync_progress << "%";
-        lines.push_back(std::string(C_bold()) + C_info() + center_text(pct.str(), box_width - 4) + C_reset());
-        lines.push_back("");
+        lines.push_back("   " + std::string(C_dim()) + box_top + C_reset());
 
-        // Stats in two columns
-        std::ostringstream s1;
-        s1 << C_dim() << "Blocks: " << C_reset() << C_info() << fmt_num(current_height) << C_reset()
-           << C_dim() << " / " << C_reset() << fmt_num(network_height);
-        lines.push_back("  " + s1.str());
+        // Block progress
+        std::ostringstream b1;
+        b1 << vbar << " " << C_dim() << "Blocks      " << C_reset()
+           << C_info() << std::setw(12) << fmt_num(current_height) << C_reset()
+           << C_dim() << " / " << C_reset() << std::setw(12) << fmt_num(network_height);
+        int pad1 = box_width - 10 - 46;
+        b1 << std::string(std::max(0, pad1), ' ') << vbar;
+        lines.push_back("   " + std::string(C_dim()) + b1.str() + C_reset());
 
-        std::ostringstream s2;
-        s2 << C_dim() << "Remaining: " << C_reset() << fmt_num(blocks_remaining) << " blocks";
-        lines.push_back("  " + s2.str());
+        // Remaining
+        std::ostringstream b2;
+        b2 << vbar << " " << C_dim() << "Remaining   " << C_reset()
+           << std::setw(12) << fmt_num(blocks_remaining) << " blocks";
+        int pad2 = box_width - 10 - 35;
+        b2 << std::string(std::max(0, pad2), ' ') << vbar;
+        lines.push_back("   " + std::string(C_dim()) + b2.str() + C_reset());
 
         // ETA
         std::string eta_str = "Calculating...";
-        if (sync_blocks_per_sec_ > 0.01 && blocks_remaining > 0) {
+        if (sync_progress >= 100.0 || blocks_remaining == 0) {
+            eta_str = u8_ok_ ? "✓ Complete" : "Complete";
+        } else if (sync_blocks_per_sec_ > 0.01 && blocks_remaining > 0) {
             eta_str = fmt_eta(blocks_remaining, sync_blocks_per_sec_);
-        } else if (blocks_remaining == 0) {
-            eta_str = "Almost done!";
         }
-        std::ostringstream s3;
-        s3 << C_dim() << "ETA: " << C_reset() << C_warn() << eta_str << C_reset();
-        lines.push_back("  " + s3.str());
+        std::ostringstream b3;
+        b3 << vbar << " " << C_dim() << "ETA         " << C_reset() << C_warn() << eta_str << C_reset();
+        int eta_vis = 13 + (int)eta_str.size();
+        int pad3 = box_width - 10 - eta_vis;
+        b3 << std::string(std::max(0, pad3), ' ') << C_dim() << vbar << C_reset();
+        lines.push_back("   " + b3.str());
 
-        // Sync speed
+        // Speed
+        std::ostringstream b4;
+        b4 << vbar << " " << C_dim() << "Speed       " << C_reset();
         if (sync_blocks_per_sec_ > 0.01) {
-            std::ostringstream s4;
-            s4 << C_dim() << "Speed: " << C_reset() << std::fixed << std::setprecision(1)
-               << sync_blocks_per_sec_ << " blocks/sec";
-            lines.push_back("  " + s4.str());
-        }
-
-        lines.push_back("");
-
-        // Time behind (Bitcoin Core style)
-        std::string time_behind = fmt_time_behind(sync_last_block_time_);
-        std::ostringstream tb;
-        tb << C_dim() << "Status: " << C_reset() << C_warn() << time_behind << C_reset();
-        lines.push_back("  " + tb.str());
-
-        // Connected seed info
-        if (!ibd_seed_host_.empty()) {
-            std::ostringstream seed;
-            seed << C_dim() << "Syncing from: " << C_reset() << ibd_seed_host_;
-            lines.push_back("  " + seed.str());
-        }
-
-        // Peer count
-        size_t peer_count = p2p_ ? p2p_->snapshot_peers().size() : 0;
-        std::ostringstream pc;
-        pc << C_dim() << "Peers: " << C_reset();
-        if (peer_count == 0) {
-            pc << C_err() << "connecting..." << C_reset();
+            b4 << std::fixed << std::setprecision(1) << sync_blocks_per_sec_ << " blocks/sec";
         } else {
-            pc << C_ok() << peer_count << " connected" << C_reset();
+            b4 << C_dim() << "measuring..." << C_reset();
         }
-        lines.push_back("  " + pc.str());
+        std::string b4s = b4.str();
+        // Pad to align
+        lines.push_back("   " + std::string(C_dim()) + b4s + std::string(std::max(1, box_width - 10 - 35), ' ') + vbar + C_reset());
 
+        lines.push_back("   " + std::string(C_dim()) + box_bot + C_reset());
         lines.push_back("");
 
-        // Warning message
-        lines.push_back(std::string("  ") + C_dim() + "Please wait while the blockchain syncs." + C_reset());
-        lines.push_back(std::string("  ") + C_dim() + "The main dashboard will open automatically." + C_reset());
+        // ===== STATUS LINE =====
+        std::ostringstream status;
+        status << C_dim() << "Status: " << C_reset() << get_sync_status(blocks_remaining, sync_progress);
+        lines.push_back("   " + status.str());
+
+        // ===== NETWORK INFO =====
+        std::ostringstream net;
+        net << C_dim() << "Network: " << C_reset();
+        if (peer_count == 0) {
+            // Animated connecting indicator
+            static const char* conn_anim[] = {"connecting", "connecting.", "connecting..", "connecting..."};
+            net << C_err() << conn_anim[tick_ % 4] << C_reset();
+        } else {
+            net << C_ok() << peer_count << " peer" << (peer_count != 1 ? "s" : "") << " connected" << C_reset();
+            if (!ibd_seed_host_.empty()) {
+                net << C_dim() << " via " << C_reset() << ibd_seed_host_;
+            }
+        }
+        lines.push_back("   " + net.str());
         lines.push_back("");
 
-        // Controls hint
-        lines.push_back(std::string(C_dim()) + center_text("[q] quit  [t] theme  [v] verbose", box_width - 4) + C_reset());
+        // ===== FOOTER =====
+        std::ostringstream foot1;
+        foot1 << C_dim() << (u8_ok_ ? "⚡ " : "> ") << "Main dashboard opens automatically when sync completes" << C_reset();
+        lines.push_back(center_text(foot1.str(), box_width));
 
-        // Build frame with centering
+        std::ostringstream foot2;
+        foot2 << C_dim() << "[q] quit  [t] theme  [v] verbose" << C_reset();
+        lines.push_back(center_text(foot2.str(), box_width));
+        lines.push_back("");
+
+        // ===== RENDER =====
+        int content_height = (int)lines.size();
+        int start_row = std::max(1, (rows - content_height) / 2);
+
         if (vt_ok_) {
-            out << "\x1b[H\x1b[J";  // Clear screen, cursor home
+            out << "\x1b[H\x1b[J";  // Clear screen
         }
 
-        // Add top padding
-        for (int i = 0; i < start_row; ++i) {
-            out << "\n";
-        }
+        // Top padding
+        for (int i = 0; i < start_row; ++i) out << "\n";
 
-        // Draw each line centered
+        // Content
         std::string padding(start_col, ' ');
         for (const auto& line : lines) {
             out << padding << line << "\n";
         }
 
-        // Fill remaining rows
-        int lines_drawn = start_row + (int)lines.size();
-        for (int i = lines_drawn; i < rows; ++i) {
-            out << "\n";
-        }
+        // Bottom padding
+        int lines_drawn = start_row + content_height;
+        for (int i = lines_drawn; i < rows; ++i) out << "\n";
 
         // Write frame
         std::string frame = out.str();
@@ -2104,7 +2274,7 @@ private:
         std::fflush(stdout);
     }
 
-    // Helper to center text
+    // Helper to center text accounting for ANSI escape codes
     static std::string center_text(const std::string& text, int width) {
         int visible_len = 0;
         bool in_escape = false;
