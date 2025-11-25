@@ -2074,22 +2074,37 @@ private:
         return color + pct_str + "\x1b[0m";
     }
 
-    // Get sync status string - fixed to show "synced" properly
-    std::string get_sync_status(uint64_t blocks_remaining, double sync_pct) const {
-        if (blocks_remaining == 0 || sync_pct >= 100.0) {
+    // Get sync status string - FIXED: Only show FULLY SYNCED when actually synced
+    // Must have: valid network height > 0, current height >= network height, and ibd_done_
+    std::string get_sync_status(uint64_t network_height, uint64_t current_height, bool is_done) const {
+        // CRITICAL: Only show FULLY SYNCED when:
+        // 1. We know the network height (network_height > 0)
+        // 2. We have actually synced to or past it (current_height >= network_height)
+        // 3. The IBD process is marked as done
+        if (is_done && network_height > 0 && current_height >= network_height) {
             if (vt_ok_) return std::string("\x1b[38;5;46m\x1b[1m") + (u8_ok_ ? "✓ " : "") + "FULLY SYNCED\x1b[0m";
             return "FULLY SYNCED";
         }
 
-        // Only show time behind if actually behind
-        std::string time_behind = fmt_time_behind(sync_last_block_time_);
-        if (time_behind == "synced") {
-            if (vt_ok_) return std::string("\x1b[38;5;46m") + (u8_ok_ ? "✓ " : "") + "Synchronized\x1b[0m";
-            return "Synchronized";
+        // If we don't have network height yet, we're still connecting
+        if (network_height == 0) {
+            if (vt_ok_) return std::string("\x1b[38;5;214m") + "Connecting to network..." + "\x1b[0m";
+            return "Connecting to network...";
         }
 
-        if (vt_ok_) return std::string("\x1b[38;5;214m") + time_behind + "\x1b[0m";
-        return time_behind;
+        // If we have blocks to sync, show progress
+        uint64_t blocks_remaining = (network_height > current_height) ? (network_height - current_height) : 0;
+        if (blocks_remaining > 0) {
+            double pct = (double)current_height / (double)network_height * 100.0;
+            std::ostringstream status;
+            status << std::fixed << std::setprecision(1) << pct << "% synced";
+            if (vt_ok_) return std::string("\x1b[38;5;214m") + status.str() + "\x1b[0m";
+            return status.str();
+        }
+
+        // Edge case: we have all blocks but IBD not marked done yet
+        if (vt_ok_) return std::string("\x1b[38;5;47m") + "Finalizing..." + "\x1b[0m";
+        return "Finalizing...";
     }
 
     void draw_splash(int cols, int rows) {
@@ -2140,9 +2155,11 @@ private:
         lines.push_back("");
 
         // ===== SYNC STATUS HEADER =====
+        // FIXED: Only show "Synchronized" when actually synced (network_height > 0 AND ibd_done_)
         std::ostringstream header;
         header << C_bold();
-        if (sync_progress >= 100.0) {
+        bool actually_synced = ibd_done_ && network_height > 0 && current_height >= network_height;
+        if (actually_synced) {
             header << "\x1b[38;5;46m" << (u8_ok_ ? "✓ " : "[OK] ") << "Blockchain Synchronized";
         } else {
             header << C_warn() << splash_spinner(tick_, u8_ok_) << " Synchronizing Blockchain";
@@ -2156,7 +2173,18 @@ private:
         lines.push_back("   " + splash_progress_bar(bar_width, frac, tick_));
 
         // ===== BIG PERCENTAGE =====
-        lines.push_back(center_text(big_percentage(sync_progress, tick_), box_width));
+        // FIXED: Show meaningful text when we don't have network height yet
+        if (network_height == 0) {
+            // Waiting for peers - show animated "Connecting..." instead of 0.00%
+            static const char* dots[] = {"   ", ".  ", ".. ", "..."};
+            std::string connecting = "Connecting" + std::string(dots[tick_ % 4]);
+            if (vt_ok_) {
+                connecting = std::string("\x1b[38;5;214m") + connecting + "\x1b[0m";
+            }
+            lines.push_back(center_text(connecting, box_width));
+        } else {
+            lines.push_back(center_text(big_percentage(sync_progress, tick_), box_width));
+        }
         lines.push_back("");
 
         // ===== STATS BOX =====
@@ -2168,30 +2196,55 @@ private:
 
         // Block progress
         std::ostringstream b1;
-        b1 << vbar << " " << C_dim() << "Blocks      " << C_reset()
-           << C_info() << std::setw(12) << fmt_num(current_height) << C_reset()
-           << C_dim() << " / " << C_reset() << std::setw(12) << fmt_num(network_height);
+        b1 << vbar << " " << C_dim() << "Blocks      " << C_reset();
+        if (network_height == 0) {
+            // Waiting for network height - show placeholder
+            b1 << C_info() << std::setw(12) << fmt_num(current_height) << C_reset()
+               << C_dim() << " / " << C_reset() << std::setw(12) << "discovering...";
+        } else {
+            b1 << C_info() << std::setw(12) << fmt_num(current_height) << C_reset()
+               << C_dim() << " / " << C_reset() << std::setw(12) << fmt_num(network_height);
+        }
         int pad1 = box_width - 10 - 46;
         b1 << std::string(std::max(0, pad1), ' ') << vbar;
         lines.push_back("   " + std::string(C_dim()) + b1.str() + C_reset());
 
         // Remaining
         std::ostringstream b2;
-        b2 << vbar << " " << C_dim() << "Remaining   " << C_reset()
-           << std::setw(12) << fmt_num(blocks_remaining) << " blocks";
+        b2 << vbar << " " << C_dim() << "Remaining   " << C_reset();
+        if (network_height == 0) {
+            // Waiting for network height - show placeholder
+            b2 << std::setw(12) << "unknown" << " blocks";
+        } else {
+            b2 << std::setw(12) << fmt_num(blocks_remaining) << " blocks";
+        }
         int pad2 = box_width - 10 - 35;
         b2 << std::string(std::max(0, pad2), ' ') << vbar;
         lines.push_back("   " + std::string(C_dim()) + b2.str() + C_reset());
 
-        // ETA
-        std::string eta_str = "Calculating...";
-        if (sync_progress >= 100.0 || blocks_remaining == 0) {
+        // ETA - FIXED: Only show Complete when actually synced
+        std::string eta_str;
+        if (actually_synced) {
+            // Only show Complete when actually done syncing
             eta_str = u8_ok_ ? "✓ Complete" : "Complete";
+        } else if (network_height == 0) {
+            // Waiting for network height discovery
+            eta_str = "Waiting for peers...";
         } else if (sync_blocks_per_sec_ > 0.01 && blocks_remaining > 0) {
+            // Have speed measurement, calculate ETA
             eta_str = fmt_eta(blocks_remaining, sync_blocks_per_sec_);
+        } else {
+            // Still measuring or just started
+            eta_str = "Calculating...";
         }
         std::ostringstream b3;
-        b3 << vbar << " " << C_dim() << "ETA         " << C_reset() << C_warn() << eta_str << C_reset();
+        b3 << vbar << " " << C_dim() << "ETA         " << C_reset();
+        // Use green color when complete, yellow/orange otherwise
+        if (actually_synced) {
+            b3 << "\x1b[38;5;46m" << eta_str << "\x1b[0m";  // Bright green
+        } else {
+            b3 << C_warn() << eta_str << C_reset();  // Yellow/orange
+        }
         int eta_vis = 13 + (int)eta_str.size();
         int pad3 = box_width - 10 - eta_vis;
         b3 << std::string(std::max(0, pad3), ' ') << C_dim() << vbar << C_reset();
@@ -2214,7 +2267,7 @@ private:
 
         // ===== STATUS LINE =====
         std::ostringstream status;
-        status << C_dim() << "Status: " << C_reset() << get_sync_status(blocks_remaining, sync_progress);
+        status << C_dim() << "Status: " << C_reset() << get_sync_status(network_height, current_height, ibd_done_);
         lines.push_back("   " + status.str());
 
         // ===== NETWORK INFO =====
@@ -2293,13 +2346,23 @@ private:
     // =========================================================================
 
     // Get visible length of string (excluding ANSI escape codes)
+    // FIXED: Properly handles UTF-8 multi-byte characters for accurate width calculation
     static int visible_length(const std::string& s) {
         int len = 0;
         bool in_escape = false;
-        for (char c : s) {
-            if (c == '\x1b') in_escape = true;
-            else if (in_escape && c == 'm') in_escape = false;
-            else if (!in_escape) ++len;
+        for (size_t i = 0; i < s.size(); ++i) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            if (c == '\x1b') {
+                in_escape = true;
+            } else if (in_escape) {
+                if (c == 'm') in_escape = false;
+            } else {
+                // UTF-8: Skip continuation bytes (10xxxxxx pattern = 0x80-0xBF)
+                // Only count start bytes and ASCII characters
+                if ((c & 0xC0) != 0x80) {
+                    ++len;
+                }
+            }
         }
         return len;
     }
@@ -2527,12 +2590,18 @@ private:
     }
 
     // Draw the premium main dashboard
+    // FIXED: Uses fixed layout dimensions for 100% stable positioning
     void draw_main(int cols, int rows) {
         std::ostringstream out;
         std::vector<std::string> lines;
 
-        // Box width and positioning
-        const int box_width = std::min(110, cols - 4);
+        // FIXED: Enforce minimum dimensions for stable layout
+        // This ensures the TUI always renders with consistent positioning
+        if (cols < 114) cols = 114;
+        if (rows < 38) rows = 38;
+
+        // Box width and positioning - use fixed values for stability
+        const int box_width = 110;  // Fixed width for consistent layout
         const int start_col = std::max(1, (cols - box_width) / 2);
         const int half_width = (box_width - 3) / 2;
 
@@ -2841,14 +2910,15 @@ private:
             // Recent TXIDs header
             right_panel2.push_back(box_row(C_dim() + std::string("Recent TXIDs:") + C_reset(), half_width));
 
-            // Show last 2 txids
+            // FIXED: Always show exactly 2 txid slots for consistent panel height
             size_t tx_show = std::min<size_t>(2, recent_txids_.size());
-            for (size_t i = 0; i < tx_show; ++i) {
-                std::string txid = recent_txids_[recent_txids_.size() - 1 - i];
-                right_panel2.push_back(box_row("  " + short_hex(txid, 28), half_width));
-            }
-            if (tx_show == 0) {
-                right_panel2.push_back(box_row(C_dim() + std::string("  (none yet)") + C_reset(), half_width));
+            for (size_t i = 0; i < 2; ++i) {
+                if (i < tx_show) {
+                    std::string txid = recent_txids_[recent_txids_.size() - 1 - i];
+                    right_panel2.push_back(box_row("  " + short_hex(txid, 28), half_width));
+                } else {
+                    right_panel2.push_back(box_row(C_dim() + std::string("  (none yet)") + C_reset(), half_width));
+                }
             }
 
             right_panel2.push_back(box_footer(half_width));
@@ -2864,25 +2934,24 @@ private:
         }
 
         // ===== RECENT BLOCKS PANEL (Full Width) =====
+        // FIXED: Always show exactly 4 block slots for consistent height
         {
             lines.push_back("");
             lines.push_back(box_header("Recent Blocks", box_width - 2, "\x1b[38;5;208m"));
 
-            if (recent_blocks_.empty()) {
-                lines.push_back(box_row(C_dim() + std::string("Waiting for blocks...") + C_reset(), box_width - 2));
-            } else {
-                // Header row
-                std::ostringstream hdr;
-                hdr << C_dim() << std::left << std::setw(10) << "Height"
-                    << std::setw(24) << "Hash"
-                    << std::setw(8) << "TXs"
-                    << std::setw(14) << "Miner" << C_reset();
-                lines.push_back(box_row(hdr.str(), box_width - 2));
+            // Header row (always shown)
+            std::ostringstream hdr;
+            hdr << C_dim() << std::left << std::setw(10) << "Height"
+                << std::setw(24) << "Hash"
+                << std::setw(8) << "TXs"
+                << std::setw(14) << "Miner" << C_reset();
+            lines.push_back(box_row(hdr.str(), box_width - 2));
 
-                // Show last 4 blocks
-                size_t show = std::min<size_t>(4, recent_blocks_.size());
-                for (size_t i = 0; i < show; ++i) {
-                    const auto& b = recent_blocks_[recent_blocks_.size() - 1 - i];
+            // Always show exactly 4 block rows for fixed layout
+            size_t available = recent_blocks_.size();
+            for (size_t i = 0; i < 4; ++i) {
+                if (i < available) {
+                    const auto& b = recent_blocks_[available - 1 - i];
                     std::ostringstream row;
 
                     row << C_info() << std::left << std::setw(10) << fmt_num(b.height) << C_reset();
@@ -2894,6 +2963,9 @@ private:
                     row << C_dim() << miner << C_reset();
 
                     lines.push_back(box_row(row.str(), box_width - 2));
+                } else {
+                    // Empty slot - waiting for blocks
+                    lines.push_back(box_row(C_dim() + std::string("Waiting for blocks...") + C_reset(), box_width - 2));
                 }
             }
             lines.push_back(box_footer(box_width - 2));
@@ -2925,15 +2997,17 @@ private:
         }
 
         // ===== RENDER =====
-        int content_height = (int)lines.size();
-        int start_row = std::max(0, (rows - content_height - 10) / 2);  // Leave room for logs
+        // FIXED: Use fixed positioning for stable layout
+        // The dashboard always starts at row 2 for consistent appearance
+        const int fixed_start_row = 2;
+        const int fixed_log_lines = 8;  // Always show exactly 8 log lines
 
         if (vt_ok_) {
-            out << "\x1b[H\x1b[J";  // Clear screen
+            out << "\x1b[H\x1b[J";  // Clear screen and home cursor
         }
 
-        // Top padding
-        for (int i = 0; i < start_row; ++i) out << "\n";
+        // Top padding (fixed)
+        for (int i = 0; i < fixed_start_row; ++i) out << "\n";
 
         // Content
         std::string padding(start_col, ' ');
@@ -2942,9 +3016,8 @@ private:
         }
 
         // ===== LOGS SECTION =====
-        int remain = rows - start_row - content_height - 2;
-        if (remain < 4) remain = 4;
-        if (remain > 12) remain = 12;
+        // FIXED: Always use fixed number of log lines for stable layout
+        int remain = fixed_log_lines;
 
         out << padding << C_bold() << "Logs" << C_reset() << " " << C_dim() << "(recent activity)" << C_reset() << "\n";
         out << padding << std::string(box_width - 2, u8_ok_ ? '-' : '-') << "\n";
@@ -2992,10 +3065,10 @@ private:
         std::lock_guard<std::mutex> lk(mu_);
         int cols, rows; term::get_winsize(cols, rows);
 
-        // BULLETPROOF FIX: Enforce minimum dimensions for single-layout rendering
-        // This ensures the TUI fits in one screen without scrolling
+        // FIXED: Enforce minimum dimensions for 100% stable layout rendering
+        // This ensures the TUI always fits in one screen without scrolling or shifting
         if (cols < 114) cols = 114;
-        if (rows < 34) rows = 34;
+        if (rows < 38) rows = 38;
 
         // Check if sync is complete to transition from Splash to Main
         bool sync_complete = ibd_done_ || (ibd_target_ > 0 && ibd_cur_ >= ibd_target_);
