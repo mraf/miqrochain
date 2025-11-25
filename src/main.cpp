@@ -2057,6 +2057,7 @@ private:
 
     // Big percentage display with optional animation
     std::string big_percentage(double pct, int tick) const {
+        (void)tick; // Parameter reserved for future animation
         std::ostringstream o;
         o << std::fixed << std::setprecision(2) << pct << "%";
         std::string pct_str = o.str();
@@ -2537,6 +2538,8 @@ private:
 
     // Premium gradient bar for hashrate/performance
     std::string gradient_bar(int width, double frac, int tick, const char* start_color = "51", const char* end_color = "46") const {
+        (void)start_color; // Parameters reserved for future gradient customization
+        (void)end_color;
         if (width < 4) width = 4;
         if (frac < 0.0) frac = 0.0;
         if (frac > 1.0) frac = 1.0;
