@@ -39,12 +39,8 @@ if(MSVC)
   add_compile_options(/W4 /permissive- /Zc:__cplusplus)
   add_definitions(/D_CRT_SECURE_NO_WARNINGS)
   add_compile_definitions(_WIN32_WINNT=0x0600)
-  # UTF-8 source and execution character set for proper Unicode TUI display
-  add_compile_options(/utf-8)
 else()
   add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
-  # UTF-8 source and execution character set for GCC/Clang (proper Unicode TUI display)
-  add_compile_options(-finput-charset=UTF-8 -fexec-charset=UTF-8)
 endif()
 
 # ---------------- DB (LevelDB default) ----------------
