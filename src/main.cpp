@@ -3093,14 +3093,23 @@ private:
         if (rows < 38) rows = 38;
 
         // Check if sync is complete to transition from Splash to Main
-        // FIXED: Only transition when ALL conditions are met:
-        // 1. ibd_done_ is true (sync is actually complete)
-        // 2. Node state is Running (node is fully operational)
-        // 3. Progress bar has been shown at 100% for several frames
+        // Transition when either:
+        // 1. ibd_done_ is true AND node state is Running (normal completion)
+        // 2. OR blocks are 100% synced (ibd_cur_ >= ibd_target_) - handles peer disconnect case
         bool sync_complete = ibd_done_ && (nstate_ == NodeState::Running);
 
-        // Additional check: ensure we have valid progress data
-        if (!sync_complete && ibd_target_ > 0 && ibd_cur_ >= ibd_target_ && ibd_done_) {
+        // FIXED: Also transition when blocks are 100% synced even if ibd_done_ isn't set
+        // This handles the case where peers disconnect after all blocks are downloaded,
+        // which prevents compute_sync_gate() from returning true and leaves us stuck
+        if (!sync_complete && ibd_target_ > 0 && ibd_cur_ >= ibd_target_) {
+            // We've downloaded all known blocks - treat as successful sync
+            // Set the internal state to match so the main screen shows correct info
+            if (!ibd_done_) {
+                ibd_done_ = true;
+            }
+            if (nstate_ != NodeState::Running) {
+                nstate_ = NodeState::Running;
+            }
             sync_complete = true;
         }
 
