@@ -705,7 +705,7 @@ static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
 
 } // namespace term
 
-// Console writer avoids recursion with log capture
+// Console writer avoids recursion with log capture - IMPROVED for PowerShell 5+
 class ConsoleWriter {
 public:
     ConsoleWriter(){ init(); }
@@ -716,9 +716,15 @@ public:
         if (fd_ >= 0 && fd_ != STDOUT_FILENO) ::close(fd_);
 #endif
     }
+
+    // Optimized write with buffering for reduced flicker on PowerShell 5+
     void write_raw(const std::string& s){
+        if (s.empty()) return;
 #ifdef _WIN32
+        // For PowerShell 5+ compatibility: use direct console buffer writes
+        // This provides smoother output with less flicker
         if (hFile_ && hFile_ != INVALID_HANDLE_VALUE) {
+            // Try WriteConsoleW first for best Unicode support
             int wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
             if (wlen > 0) {
                 std::wstring ws((size_t)wlen, L'\0');
@@ -727,18 +733,72 @@ public:
                 if (WriteConsoleW(hFile_, ws.c_str(), (DWORD)ws.size(), &wroteW, nullptr)) return;
             }
         }
-        DWORD wrote = 0;
-        WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), s.c_str(), (DWORD)s.size(), &wrote, nullptr);
+        // Fallback: direct file write with retry for robustness
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (hOut != INVALID_HANDLE_VALUE) {
+            DWORD wrote = 0;
+            const char* ptr = s.c_str();
+            DWORD remaining = (DWORD)s.size();
+            int retries = 3;
+            while (remaining > 0 && retries-- > 0) {
+                if (WriteFile(hOut, ptr, remaining, &wrote, nullptr)) {
+                    ptr += wrote;
+                    remaining -= wrote;
+                } else {
+                    Sleep(1);  // Brief pause before retry
+                }
+            }
+        }
 #else
         int fd = (fd_ >= 0) ? fd_ : STDOUT_FILENO;
-        size_t off = 0; while (off < s.size()) { ssize_t n = ::write(fd, s.data()+off, s.size()-off); if (n<=0) break; off += (size_t)n; }
+        size_t off = 0;
+        int retries = 5;
+        while (off < s.size() && retries > 0) {
+            ssize_t n = ::write(fd, s.data()+off, s.size()-off);
+            if (n > 0) {
+                off += (size_t)n;
+            } else if (n < 0 && errno == EINTR) {
+                continue;  // Retry on interrupt
+            } else {
+                --retries;
+                usleep(1000);  // Brief pause before retry
+            }
+        }
 #endif
     }
+
+    // Batch write for smoother updates (reduces flicker)
+    void write_frame(const std::string& clear_seq, const std::string& content) {
+#ifdef _WIN32
+        // On Windows, write clear and content together to reduce flicker
+        std::string combined;
+        combined.reserve(clear_seq.size() + content.size());
+        combined += clear_seq;
+        combined += content;
+        write_raw(combined);
+#else
+        // On Unix, write separately (terminals handle this better)
+        write_raw(clear_seq);
+        write_raw(content);
+#endif
+    }
+
 private:
     void init(){
 #ifdef _WIN32
-        hFile_ = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE | FILE_SHARE_READ,
+        // Try to get console handle with best mode for smooth output
+        hFile_ = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_WRITE | FILE_SHARE_READ,
                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile_ != INVALID_HANDLE_VALUE) {
+            // Enable VT processing for best ANSI support
+            DWORD mode = 0;
+            if (GetConsoleMode(hFile_, &mode)) {
+                mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                mode |= ENABLE_PROCESSED_OUTPUT;
+                SetConsoleMode(hFile_, mode);
+            }
+        }
 #else
         fd_ = ::open("/dev/tty", O_WRONLY | O_CLOEXEC);
         if (fd_ < 0) fd_ = STDOUT_FILENO;
@@ -855,14 +915,38 @@ static inline std::string fmt_diff(long double d){
     return o.str();
 }
 
-// Spinner & drawing helpers
+// Spinner & drawing helpers - IMPROVED with smoother animations
 static inline std::string spinner(int tick, bool fancy){
     if (fancy){
+        // Braille spinner for Unicode terminals - smooth 10-frame animation
         static const char* frames[] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
         return frames[(size_t)(tick % 10)];
     } else {
-        static const char frames[] = {'-','\\','|','/'};
-        return std::string(1, frames[(size_t)(tick & 3)]);
+        // ASCII spinner optimized for PowerShell 5+ - 8-frame animation for smoother look
+        static const char* frames[] = {"|", "/", "-", "\\", "|", "/", "-", "\\"};
+        return std::string(frames[(size_t)(tick & 7)]);
+    }
+}
+
+// Additional animated indicators for professional look
+static inline std::string activity_indicator(int tick, bool active, bool fancy){
+    if (!active) return fancy ? "○" : "o";
+    if (fancy){
+        static const char* frames[] = {"◐","◓","◑","◒"};
+        return frames[(size_t)(tick % 4)];
+    } else {
+        static const char* frames[] = {"[*]","[+]","[*]","[x]"};
+        return frames[(size_t)(tick % 4)];
+    }
+}
+
+static inline std::string pulse_indicator(int tick, bool fancy){
+    if (fancy){
+        static const char* frames[] = {"▁","▂","▃","▄","▅","▆","▇","█","▇","▆","▅","▄","▃","▂"};
+        return frames[(size_t)(tick % 14)];
+    } else {
+        static const char* frames[] = {".", "o", "O", "0", "O", "o"};
+        return frames[(size_t)(tick % 6)];
     }
 }
 static inline std::string straight_line(int w){
@@ -1554,26 +1638,54 @@ private:
         using namespace std::chrono_literals;
         running_ = true;
         auto last_hs_time = clock::now();
+        auto last_draw_time = clock::now();
         uint64_t last_stats_ms = now_ms();
         uint64_t last_net_ms   = now_ms();
+
+        // IMPROVED: Adaptive refresh rate for smoother animations
+        // - VT terminals: 250ms for smooth spinner animation
+        // - Non-VT/PowerShell 5: 400ms to reduce flicker while staying responsive
+        const auto draw_interval = vt_ok_ ? 250ms : 400ms;
+        const auto idle_sleep = 16ms;  // ~60fps loop rate for responsive key handling
+
         while (running_) {
-            if(global::tui_toggle_theme.exchange(false)) { std::lock_guard<std::mutex> lk(mu_); dark_theme_ = !dark_theme_; }
-            draw_once(false);
-            std::this_thread::sleep_for(std::chrono::milliseconds(vt_ok_ ? 500 : 750));
-            ++tick_;
+            auto now = clock::now();
+
+            // Handle theme toggle immediately for responsiveness
+            if(global::tui_toggle_theme.exchange(false)) {
+                std::lock_guard<std::mutex> lk(mu_);
+                dark_theme_ = !dark_theme_;
+            }
+
+            // IMPROVED: Time-based drawing for consistent animation speed
+            if ((now - last_draw_time) >= draw_interval) {
+                draw_once(false);
+                last_draw_time = now;
+                ++tick_;
+            }
+
+            // Sleep for short interval to maintain responsive input handling
+            std::this_thread::sleep_for(idle_sleep);
+
+            // Update hashrate sparkline at 250ms intervals
             if((clock::now()-last_hs_time) > 250ms){
                 last_hs_time = clock::now();
                 std::lock_guard<std::mutex> lk(mu_);
                 spark_hs_.push_back(g_miner_stats.hps.load());
                 if(spark_hs_.size() > 90) spark_hs_.erase(spark_hs_.begin());
             }
+
+            // Handle snapshot requests
             if (global::tui_snapshot_requested.exchange(false)) snapshot_to_disk();
+
+            // Update miner stats every second
             if (now_ms() - last_stats_ms > 1000) {
                 last_stats_ms = now_ms();
-                // Update miner hashrate from actual miner stats
                 miq::MinerStats ms = miq::miner_stats_now();
                 g_miner_stats.hps.store(ms.hps);
             }
+
+            // Update network hashrate every second
             if (now_ms() - last_net_ms > 1000){
                 last_net_ms = now_ms();
                 double nh = estimate_network_hashrate(chain_);
@@ -2120,18 +2232,19 @@ private:
         // Now write the entire frame with control sequences
         std::string frame = out.str();
 
-        // Send clear screen FIRST, separately
+        // IMPROVED: Use optimized write_frame for smoother updates on PowerShell 5+
+        // This reduces flicker by combining clear + content into a single write operation
         if (vt_ok_) {
-            cw_.write_raw("\x1b[2J\x1b[H");  // Clear entire screen and move cursor to home
+            // Use cursor home + clear-to-end approach for smoother updates (less flicker)
+            // \x1b[H = cursor home, \x1b[J = clear from cursor to end of screen
+            cw_.write_frame("\x1b[H\x1b[J", frame);
+        } else {
+            // Fallback for non-VT terminals
+            cw_.write_raw(frame);
         }
-
-        // Then write the frame content
-        cw_.write_raw(frame);
 
         // Ensure output is flushed to terminal
-        if (vt_ok_) {
-            std::fflush(stdout);
-        }
+        std::fflush(stdout);
     }
 
 private:
