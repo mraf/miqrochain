@@ -501,6 +501,55 @@ static double difficulty_from_bits(uint32_t bits){
     return (double)D;
 }
 
+// Convert pool difficulty to compact bits format for share validation
+// Pool difficulty 1 = 0xFFFF * 2^208 (same as Bitcoin pdiff=1)
+static uint32_t bits_from_pool_difficulty(double pool_diff) {
+    if (pool_diff <= 0.0) return miq::GENESIS_BITS;
+
+    // pdiff1_target = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+    // For pool difficulty D, target = pdiff1_target / D
+    //
+    // We need to convert this target to compact bits format.
+    // The compact format is: 0xEEMMMMMMM where EE is exponent, MMMMMM is mantissa
+    // target = mantissa * 256^(exponent-3)
+
+    // Calculate target as a 256-bit number represented by (mantissa, exponent)
+    // pdiff1 mantissa = 0xFFFF, exponent = 0x1d (29)
+    // So pdiff1_target = 0xFFFF * 256^(29-3) = 0xFFFF * 256^26
+
+    // For difficulty D: new_target = pdiff1_target / D = (0xFFFF * 256^26) / D
+    // We need to find new exponent and mantissa such that:
+    // new_mantissa * 256^(new_exp-3) = 0xFFFF * 256^26 / D
+
+    // Start with the base values
+    double mantissa = 0xFFFF;
+    int exponent = 29; // 0x1d
+
+    // Divide by pool difficulty
+    mantissa = mantissa / pool_diff;
+
+    // Normalize: mantissa should be in range [0x8000, 0xFFFFFF]
+    // If mantissa is too large, increase exponent
+    while (mantissa > 0x7FFFFF && exponent < 32) {
+        mantissa /= 256.0;
+        exponent++;
+    }
+    // If mantissa is too small, decrease exponent
+    while (mantissa < 0x8000 && exponent > 3) {
+        mantissa *= 256.0;
+        exponent--;
+    }
+
+    // Clamp mantissa to valid range
+    if (mantissa > 0x7FFFFF) mantissa = 0x7FFFFF;
+    if (mantissa < 1) mantissa = 1;
+
+    uint32_t mant = (uint32_t)mantissa;
+    uint32_t bits = ((uint32_t)exponent << 24) | (mant & 0x7FFFFF);
+
+    return bits;
+}
+
 // ===== little-endian store ===================================================
 static inline void put_u32_le(std::vector<uint8_t>& v, uint32_t x){
     v.push_back(uint8_t((x>>0)&0xff));
@@ -2803,10 +2852,16 @@ public:
 
         // Find params array
         size_t params_pos = line.find("\"params\"");
-        if (params_pos == std::string::npos) return false;
+        if (params_pos == std::string::npos) {
+            std::fprintf(stderr, "[pool] parse_job: params not found in notify\n");
+            return false;
+        }
 
         size_t arr_start = line.find('[', params_pos);
-        if (arr_start == std::string::npos) return false;
+        if (arr_start == std::string::npos) {
+            std::fprintf(stderr, "[pool] parse_job: array start not found\n");
+            return false;
+        }
 
         std::string params = line.substr(arr_start);
 
@@ -2816,17 +2871,38 @@ public:
         std::string job_id, prev_hash_hex, coinb1, coinb2, version_hex, bits_hex, time_hex;
         std::vector<std::string> merkle_branch;
 
-        if (!json_array_string(params, 0, job_id)) return false;
-        if (!json_array_string(params, 1, prev_hash_hex)) return false;
-        if (!json_array_string(params, 2, coinb1)) return false;
-        if (!json_array_string(params, 3, coinb2)) return false;
+        if (!json_array_string(params, 0, job_id)) {
+            std::fprintf(stderr, "[pool] parse_job: failed to parse job_id\n");
+            return false;
+        }
+        if (!json_array_string(params, 1, prev_hash_hex)) {
+            std::fprintf(stderr, "[pool] parse_job: failed to parse prev_hash\n");
+            return false;
+        }
+        if (!json_array_string(params, 2, coinb1)) {
+            std::fprintf(stderr, "[pool] parse_job: failed to parse coinbase1\n");
+            return false;
+        }
+        if (!json_array_string(params, 3, coinb2)) {
+            std::fprintf(stderr, "[pool] parse_job: failed to parse coinbase2\n");
+            return false;
+        }
 
         // Parse merkle_branch array at index 4
         json_array_strings(params, 4, merkle_branch);
 
-        if (!json_array_string(params, 5, version_hex)) return false;
-        if (!json_array_string(params, 6, bits_hex)) return false;
-        if (!json_array_string(params, 7, time_hex)) return false;
+        if (!json_array_string(params, 5, version_hex)) {
+            std::fprintf(stderr, "[pool] parse_job: failed to parse version\n");
+            return false;
+        }
+        if (!json_array_string(params, 6, bits_hex)) {
+            std::fprintf(stderr, "[pool] parse_job: failed to parse bits\n");
+            return false;
+        }
+        if (!json_array_string(params, 7, time_hex)) {
+            std::fprintf(stderr, "[pool] parse_job: failed to parse time\n");
+            return false;
+        }
 
         current_job.job_id = job_id;
         current_job.coinbase1 = coinb1;
@@ -3831,11 +3907,22 @@ int main(int argc, char** argv){
                 uint32_t current_extranonce2 = 0;
 
                 // Wait for initial job
+                std::fprintf(stderr, "[pool] Waiting for mining job from pool...\n");
+                int wait_count = 0;
                 while (!stratum.has_job.load() && stratum.connected.load() && ui.running.load()) {
                     std::string line = stratum.recv_line(1000);
                     if (line.empty()) {
                         if (!stratum.connected.load()) break;
+                        wait_count++;
+                        if (wait_count % 10 == 0) {
+                            std::fprintf(stderr, "[pool] Still waiting for job... (%d seconds)\n", wait_count);
+                        }
                         continue;
+                    }
+
+                    // Debug: show received messages
+                    if (line.find("mining") != std::string::npos || line.find("error") != std::string::npos) {
+                        std::fprintf(stderr, "[pool] Received: %.200s%s\n", line.c_str(), line.size() > 200 ? "..." : "");
                     }
 
                     if (stratum.parse_difficulty(line)) {
@@ -3877,6 +3964,7 @@ int main(int argc, char** argv){
                 }
 
                 // Main mining loop - mine shares for current job
+                std::fprintf(stderr, "[pool] \x1b[32;1mStarting mining loop with %u threads\x1b[0m\n", threads);
                 while (stratum.has_job.load() && stratum.connected.load() && ui.running.load()) {
                     StratumJob job = stratum.get_job();
                     current_job_id = job.job_id;
@@ -3886,9 +3974,13 @@ int main(int argc, char** argv){
                     // coinbase = coinbase1 + extranonce1 + extranonce2 + coinbase2
                     std::string extranonce2_hex;
                     {
+                        // CRITICAL FIX: extranonce2 should be in little-endian byte order
                         std::ostringstream ss;
-                        ss << std::hex << std::setw(stratum.extranonce2_size * 2)
-                           << std::setfill('0') << current_extranonce2;
+                        uint32_t en2 = current_extranonce2;
+                        for (uint32_t i = 0; i < stratum.extranonce2_size; i++) {
+                            ss << std::hex << std::setw(2) << std::setfill('0') << (en2 & 0xFF);
+                            en2 >>= 8;
+                        }
                         extranonce2_hex = ss.str();
                     }
 
@@ -3956,17 +4048,23 @@ int main(int argc, char** argv){
                     double pool_diff = stratum.difficulty.load();
                     ui.pool_difficulty.store(pool_diff);
 
-                    // Convert pool difficulty to bits for share validation
-                    // Pool difficulty 1 = 0xFFFF * 2^208 / difficulty
-                    // For shares, we use a target that's pool_diff times easier than block target
-                    uint32_t share_bits = job.bits;
-                    if (pool_diff > 0 && pool_diff < 65535) {
-                        // Adjust target for pool difficulty
-                        // This is simplified - actual implementation depends on pool
-                        double block_diff = difficulty_from_bits(job.bits);
-                        double share_target_diff = pool_diff;
-                        (void)block_diff; // Use pool difficulty directly
-                        (void)share_target_diff;
+                    // CRITICAL FIX: Convert pool difficulty to compact bits for share validation
+                    // Pool difficulty defines how hard it is to find a share (not a block)
+                    // Pool diff 1 = target 0x00000000FFFF... (much easier than block target)
+                    uint32_t share_bits;
+                    if (pool_diff > 0) {
+                        share_bits = bits_from_pool_difficulty(pool_diff);
+                        // Debug: show share target difficulty
+                        static bool logged_share_target = false;
+                        if (!logged_share_target) {
+                            std::fprintf(stderr, "[pool] Share target: pool_diff=%.4f -> bits=0x%08x (share_diff=%.4f)\n",
+                                        pool_diff, share_bits, difficulty_from_bits(share_bits));
+                            logged_share_target = true;
+                        }
+                    } else {
+                        // Fallback to block difficulty if pool diff not set (should not happen)
+                        share_bits = job.bits;
+                        std::fprintf(stderr, "[pool] WARNING: Pool difficulty not set, using block target!\n");
                     }
 
                     // Setup for CPU mining
@@ -4077,15 +4175,33 @@ int main(int argc, char** argv){
                     if (found_share.load() && stratum.connected.load()) {
                         uint64_t nonce = found_nonce.load();
 
-                        // Format nonce as hex (8 bytes = 16 hex chars)
-                        std::ostringstream nonce_ss;
-                        nonce_ss << std::hex << std::setw(16) << std::setfill('0') << nonce;
-                        std::string nonce_hex = nonce_ss.str();
+                        // CRITICAL FIX: Format nonce as little-endian hex for Stratum
+                        // Stratum expects the nonce bytes in little-endian order as hex
+                        // For standard Stratum (4-byte nonce), use lower 32 bits
+                        // For Miqrochain pools (8-byte nonce), use full 64 bits
+                        std::string nonce_hex;
+                        {
+                            // Format as 8-byte little-endian hex (Miqrochain uses 64-bit nonce)
+                            uint8_t nonce_bytes[8];
+                            store_u64_le(nonce_bytes, nonce);
+                            std::ostringstream ss;
+                            for (int i = 0; i < 8; i++) {
+                                ss << std::hex << std::setw(2) << std::setfill('0') << (unsigned)nonce_bytes[i];
+                            }
+                            nonce_hex = ss.str();
+                        }
 
-                        // Format time as hex
-                        std::ostringstream time_ss;
-                        time_ss << std::hex << std::setw(8) << std::setfill('0') << job.time;
-                        std::string time_hex = time_ss.str();
+                        // Format time as little-endian hex (4 bytes for Stratum compatibility)
+                        std::string time_hex;
+                        {
+                            uint8_t time_bytes[4];
+                            store_u32_le(time_bytes, job.time);
+                            std::ostringstream ss;
+                            for (int i = 0; i < 4; i++) {
+                                ss << std::hex << std::setw(2) << std::setfill('0') << (unsigned)time_bytes[i];
+                            }
+                            time_hex = ss.str();
+                        }
 
                         // Submit share
                         if (stratum.submit_share(current_job_id, extranonce2_hex, time_hex, nonce_hex)) {
