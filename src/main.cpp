@@ -2493,11 +2493,9 @@ static void miner_worker(Chain* chain, Mempool* mempool, P2P* p2p,
                         g_telemetry.push_txids(txids);
                     }
 
-                    log_info("mined block accepted, height=" + std::to_string(bs.height)
-                             + ", miner=" + miner_addr
-                             + ", coinbase_txid=" + cb_txid_hex
-                             + ", txs=" + std::to_string(std::max(0, noncb))
-                             + (bs.fees_known ? (", fees=" + std::to_string(bs.fees)) : ""));
+                    log_warn("⛏ MINED block height=" + std::to_string(bs.height)
+                             + " txs=" + std::to_string(std::max(0, noncb))
+                             + (bs.fees_known ? (" fees=" + std::to_string(bs.fees)) : ""));
                     if (!global::shutdown_requested.load() && p2p) {
                         p2p->announce_block_async(b.block_hash());
                     }

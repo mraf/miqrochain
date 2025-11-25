@@ -2603,7 +2603,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 #endif
     }
 
-    log_info("P2P: connected seed " + peers_[s].ip);
+    log_warn("Peer: connected → " + peers_[s].ip);
 
     // Gate first, then mark loopback (so flag actually sticks)
     gate_on_connect(s);
@@ -3175,15 +3175,16 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
         // PERFORMANCE: Throttle block acceptance logging during sync (1 per second max)
         static int64_t last_block_log_ms = 0;
+        // PRODUCTION: Log block acceptance at WARN level so it shows with default settings
         static uint64_t blocks_since_log = 0;
         int64_t now_block_ms = now_ms();
         blocks_since_log++;
-        if (now_block_ms - last_block_log_ms > 1000) {  // Log at most every 1 second
+        if (now_block_ms - last_block_log_ms > 5000) {  // Log at most every 5 seconds to reduce spam
             last_block_log_ms = now_block_ms;
             if (blocks_since_log > 1) {
-                log_info("P2P: accepted " + std::to_string(blocks_since_log) + " blocks, height=" + std::to_string(chain_.height()));
+                log_warn("Chain: +" + std::to_string(blocks_since_log) + " blocks → height " + std::to_string(chain_.height()));
             } else {
-                log_info("P2P: accepted block height=" + std::to_string(chain_.height()) + " from=" + src_ip);
+                log_warn("Chain: new block → height " + std::to_string(chain_.height()));
             }
             blocks_since_log = 0;
         }
@@ -4032,7 +4033,7 @@ void P2P::loop(){
             #endif
             if (!any_want && !any_inflight && headers_done && !g_sync_green_logged) {
                  g_sync_green_logged = true;
-                 log_info("P2P: fully synchronized (height=" + std::to_string(chain_.height()) + ")");
+                 log_warn("Sync: complete ✓ height=" + std::to_string(chain_.height()));
                  for (auto &kvp : peers_) {
                      kvp.second.syncing = false;
                      kvp.second.inflight_index = 0;
