@@ -2120,6 +2120,12 @@ private:
         uint64_t blocks_remaining = (network_height > current_height) ? (network_height - current_height) : 0;
         double sync_progress = (network_height > 0) ? ((double)current_height / (double)network_height * 100.0) : 0.0;
         if (sync_progress > 100.0) sync_progress = 100.0;
+
+        // FIXED: When ibd_done_ is true, force progress to 100% so the bar fills completely
+        // This ensures the progress bar is visually complete when sync finishes
+        if (ibd_done_) {
+            sync_progress = 100.0;
+        }
         double frac = sync_progress / 100.0;
 
         // Peer info
@@ -2307,15 +2313,20 @@ private:
         // Top padding
         for (int i = 0; i < start_row; ++i) out << "\n";
 
-        // Content
-        std::string padding(start_col, ' ');
+        // Content - FIXED: Clear to end of line for stable layout
+        std::string left_padding(start_col, ' ');
         for (const auto& line : lines) {
-            out << padding << line << "\n";
+            out << left_padding << line;
+            if (vt_ok_) out << "\x1b[K";  // Clear to end of line
+            out << "\n";
         }
 
         // Bottom padding
         int lines_drawn = start_row + content_height;
-        for (int i = lines_drawn; i < rows; ++i) out << "\n";
+        for (int i = lines_drawn; i < rows; ++i) {
+            if (vt_ok_) out << "\x1b[K";  // Clear to end of line
+            out << "\n";
+        }
 
         // Write frame
         std::string frame = out.str();
@@ -2418,6 +2429,7 @@ private:
     }
 
     // Create a box row with content
+    // FIXED: Ensure consistent width output for stable layout
     std::string box_row(const std::string& content, int width) const {
         auto bc = get_box_chars();
         std::ostringstream out;
@@ -2425,8 +2437,9 @@ private:
         out << content;
 
         int vis_len = visible_length(content);
-        int padding = width - 4 - vis_len;
-        if (padding > 0) out << std::string(padding, ' ');
+        // Ensure padding is at least 0 to prevent negative padding
+        int padding = std::max(0, width - 4 - vis_len);
+        out << std::string(padding, ' ');
         out << " " << C_dim() << bc.v << C_reset();
         return out.str();
     }
@@ -3010,17 +3023,24 @@ private:
         for (int i = 0; i < fixed_start_row; ++i) out << "\n";
 
         // Content
-        std::string padding(start_col, ' ');
+        // FIXED: Use padding on the left and clear to end of line to prevent layout issues
+        std::string left_padding(start_col, ' ');
         for (const auto& line : lines) {
-            out << padding << line << "\n";
+            out << left_padding << line;
+            if (vt_ok_) out << "\x1b[K";  // Clear to end of line
+            out << "\n";
         }
 
         // ===== LOGS SECTION =====
         // FIXED: Always use fixed number of log lines for stable layout
         int remain = fixed_log_lines;
 
-        out << padding << C_bold() << "Logs" << C_reset() << " " << C_dim() << "(recent activity)" << C_reset() << "\n";
-        out << padding << std::string(box_width - 2, u8_ok_ ? '-' : '-') << "\n";
+        out << left_padding << C_bold() << "Logs" << C_reset() << " " << C_dim() << "(recent activity)" << C_reset();
+        if (vt_ok_) out << "\x1b[K";
+        out << "\n";
+        out << left_padding << std::string(box_width - 2, '-');
+        if (vt_ok_) out << "\x1b[K";
+        out << "\n";
 
         int log_start = (int)logs_.size() - remain;
         if (log_start < 0) log_start = 0;
@@ -3033,7 +3053,7 @@ private:
                 txt = txt.substr(0, cols - start_col - 5) + "...";
             }
 
-            out << padding;
+            out << left_padding;
             switch(line.level) {
                 case 2: out << C_err() << txt << C_reset(); break;
                 case 1: out << C_warn() << txt << C_reset(); break;
@@ -3041,12 +3061,14 @@ private:
                 case 4: out << C_ok() << txt << C_reset(); break;
                 default: out << txt; break;
             }
+            if (vt_ok_) out << "\x1b[K";  // Clear to end of line
             out << "\n";
             ++printed;
         }
 
-        // Fill remaining with empty lines
+        // Fill remaining with empty lines (with clear to end of line)
         for (int i = printed; i < remain; ++i) {
+            if (vt_ok_) out << "\x1b[K";
             out << "\n";
         }
 
@@ -3071,18 +3093,32 @@ private:
         if (rows < 38) rows = 38;
 
         // Check if sync is complete to transition from Splash to Main
-        bool sync_complete = ibd_done_ || (ibd_target_ > 0 && ibd_cur_ >= ibd_target_);
+        // FIXED: Only transition when ALL conditions are met:
+        // 1. ibd_done_ is true (sync is actually complete)
+        // 2. Node state is Running (node is fully operational)
+        // 3. Progress bar has been shown at 100% for several frames
+        bool sync_complete = ibd_done_ && (nstate_ == NodeState::Running);
+
+        // Additional check: ensure we have valid progress data
+        if (!sync_complete && ibd_target_ > 0 && ibd_cur_ >= ibd_target_ && ibd_done_) {
+            sync_complete = true;
+        }
+
         if (sync_complete && view_mode_ == ViewMode::Splash) {
-            // Delay transition slightly to show "100%" message
-            if (!splash_transition_done_) {
-                splash_transition_done_ = true;
+            // FIXED: Delay transition for 20+ frames (~2 seconds) to show "100%" completion
+            // This ensures the progress bar is visibly full before transitioning
+            if (splash_transition_counter_ < 20) {
+                splash_transition_counter_++;
             } else {
                 view_mode_ = ViewMode::Main;
             }
+        } else if (!sync_complete) {
+            // Reset counter if sync isn't complete (in case of re-sync)
+            splash_transition_counter_ = 0;
         }
 
-        // Draw splash screen during sync, main dashboard after sync
-        if (view_mode_ == ViewMode::Splash && !sync_complete) {
+        // Draw splash screen during sync, or while showing completion animation
+        if (view_mode_ == ViewMode::Splash) {
             draw_splash(cols, rows);
             return;
         }
@@ -3769,7 +3805,7 @@ private:
 
     // View mode: Splash during sync, Main after sync complete
     ViewMode    view_mode_{ViewMode::Splash};
-    bool        splash_transition_done_{false};  // Track if we've shown transition animation
+    int         splash_transition_counter_{0};  // Count frames at 100% before transitioning
 };
 
 // ==================================================================
