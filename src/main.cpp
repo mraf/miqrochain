@@ -1,20 +1,9 @@
-// =============================================================================
-// UTF-8 Source/Execution Encoding - Essential for Unicode TUI characters
-// =============================================================================
-// This file MUST be saved as UTF-8 (with or without BOM) for Unicode literals
-// to work correctly. The pragmas/defines below tell the compiler to interpret
-// source as UTF-8 and produce UTF-8 string literals in the binary.
-
 #ifdef _MSC_VER
-  // MSVC: /utf-8 or this pragma ensures UTF-8 encoding
   #pragma execution_character_set("utf-8")
   #ifndef _CRT_SECURE_NO_WARNINGS
     #define _CRT_SECURE_NO_WARNINGS
   #endif
 #endif
-
-// GCC/Clang: No pragma needed if compiled with -finput-charset=UTF-8 -fexec-charset=UTF-8
-// (see CMakeLists.txt). The u8"" prefix can be used for explicit UTF-8 strings.
 
 // =============================================================================
 // Windows portability flags
@@ -771,74 +760,42 @@ static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
 } // namespace term
 
 // Console writer avoids recursion with log capture - IMPROVED for PowerShell 5+
-// Uses WriteConsoleW exclusively on Windows to bypass byte-stream layer encoding issues
 class ConsoleWriter {
 public:
     ConsoleWriter(){ init(); }
     ~ConsoleWriter(){
 #ifdef _WIN32
-        if (hConOut_ && hConOut_ != INVALID_HANDLE_VALUE) CloseHandle(hConOut_);
+        if (hFile_ && hFile_ != INVALID_HANDLE_VALUE) CloseHandle(hFile_);
 #else
         if (fd_ >= 0 && fd_ != STDOUT_FILENO) ::close(fd_);
 #endif
     }
 
     // Optimized write with buffering for reduced flicker on PowerShell 5+
-    // CRITICAL: Uses WriteConsoleW to bypass the problematic byte-stream layer
     void write_raw(const std::string& s){
         if (s.empty()) return;
 #ifdef _WIN32
-        // ALWAYS use WriteConsoleW for proper UTF-8 display on Windows consoles
-        // This bypasses the problematic byte-stream layer that causes mojibake
-        // even when SetConsoleOutputCP(CP_UTF8) is set.
-        //
-        // The issue: Windows console's byte-stream mode doesn't properly handle
-        // multi-byte UTF-8 sequences. By converting to UTF-16 and using
-        // WriteConsoleW, we write directly to the console buffer.
-
+        // For PowerShell 5+ compatibility: use WriteConsoleW for proper Unicode support
+        // Convert UTF-8 to wide string and use WriteConsoleW
         int wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
         if (wlen > 0) {
             std::wstring ws((size_t)wlen, L'\0');
             MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), ws.data(), wlen);
+            DWORD wroteW = 0;
 
-            // Write in chunks if needed (WriteConsoleW has buffer limits)
-            const wchar_t* ptr = ws.c_str();
-            DWORD remaining = (DWORD)ws.size();
-
-            while (remaining > 0) {
-                DWORD wroteW = 0;
-                DWORD toWrite = (remaining > 8192) ? 8192 : remaining;
-
-                // Try dedicated console handle first (most reliable)
-                if (hConOut_ && hConOut_ != INVALID_HANDLE_VALUE) {
-                    if (WriteConsoleW(hConOut_, ptr, toWrite, &wroteW, nullptr) && wroteW > 0) {
-                        ptr += wroteW;
-                        remaining -= wroteW;
-                        continue;
-                    }
-                }
-
-                // Fallback: try STD_OUTPUT_HANDLE
-                HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-                if (hOut != INVALID_HANDLE_VALUE) {
-                    if (WriteConsoleW(hOut, ptr, toWrite, &wroteW, nullptr) && wroteW > 0) {
-                        ptr += wroteW;
-                        remaining -= wroteW;
-                        continue;
-                    }
-                }
-
-                // If WriteConsoleW fails (e.g., redirected output), fall back to WriteFile
-                // with UTF-8 bytes. The console code page should be set to 65001.
-                break;
+            // Try our console handle first
+            if (hFile_ && hFile_ != INVALID_HANDLE_VALUE) {
+                if (WriteConsoleW(hFile_, ws.c_str(), (DWORD)ws.size(), &wroteW, nullptr)) return;
             }
 
-            // If we wrote everything via WriteConsoleW, we're done
-            if (remaining == 0) return;
+            // Fallback: try STD_OUTPUT_HANDLE with WriteConsoleW
+            HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+            if (hOut != INVALID_HANDLE_VALUE) {
+                if (WriteConsoleW(hOut, ws.c_str(), (DWORD)ws.size(), &wroteW, nullptr)) return;
+            }
         }
 
-        // Last resort fallback: WriteFile with UTF-8 bytes
-        // This path is used when output is redirected or WriteConsoleW fails
+        // Last resort fallback: WriteFile (may not handle Unicode properly but ensures output)
         HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
         if (hOut != INVALID_HANDLE_VALUE) {
             DWORD wrote = 0;
@@ -894,23 +851,17 @@ public:
 private:
     void init(){
 #ifdef _WIN32
-        // Set UTF-8 code pages for the console FIRST
-        // This is essential for proper Unicode display
-        SetConsoleOutputCP(CP_UTF8);
-        SetConsoleCP(CP_UTF8);
-
-        // Get a dedicated console output handle for WriteConsoleW
-        // CONOUT$ always points to the console even if stdout is redirected
-        hConOut_ = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE,
-                               FILE_SHARE_WRITE | FILE_SHARE_READ,
-                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hConOut_ != INVALID_HANDLE_VALUE) {
-            // Enable VT processing for ANSI escape sequence support
+        // Try to get console handle with best mode for smooth output
+        hFile_ = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_WRITE | FILE_SHARE_READ,
+                             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile_ != INVALID_HANDLE_VALUE) {
+            // Enable VT processing for best ANSI support
             DWORD mode = 0;
-            if (GetConsoleMode(hConOut_, &mode)) {
+            if (GetConsoleMode(hFile_, &mode)) {
                 mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
                 mode |= ENABLE_PROCESSED_OUTPUT;
-                SetConsoleMode(hConOut_, mode);
+                SetConsoleMode(hFile_, mode);
             }
         }
 #else
@@ -919,7 +870,7 @@ private:
 #endif
     }
 #ifdef _WIN32
-    HANDLE hConOut_{};  // Dedicated console output handle
+    HANDLE hFile_{};
 #else
     int fd_ = -1;
 #endif
