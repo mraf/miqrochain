@@ -2288,6 +2288,705 @@ private:
         return std::string(pad, ' ') + text;
     }
 
+    // =========================================================================
+    // PREMIUM MAIN DASHBOARD - Professional animated display
+    // =========================================================================
+
+    // Get visible length of string (excluding ANSI escape codes)
+    static int visible_length(const std::string& s) {
+        int len = 0;
+        bool in_escape = false;
+        for (char c : s) {
+            if (c == '\x1b') in_escape = true;
+            else if (in_escape && c == 'm') in_escape = false;
+            else if (!in_escape) ++len;
+        }
+        return len;
+    }
+
+    // Premium box drawing characters
+    struct BoxChars {
+        const char* tl;  // top-left
+        const char* tr;  // top-right
+        const char* bl;  // bottom-left
+        const char* br;  // bottom-right
+        const char* h;   // horizontal
+        const char* v;   // vertical
+        const char* lt;  // left-tee
+        const char* rt;  // right-tee
+    };
+
+    BoxChars get_box_chars() const {
+        if (u8_ok_) {
+            return {"╭", "╮", "╰", "╯", "─", "│", "├", "┤"};
+        } else {
+            return {"+", "+", "+", "+", "-", "|", "+", "+"};
+        }
+    }
+
+    // Create a boxed panel header
+    std::string box_header(const std::string& title, int width, const char* color = nullptr) const {
+        auto bc = get_box_chars();
+        std::ostringstream out;
+
+        if (vt_ok_ && color) out << color;
+        out << bc.tl;
+
+        // Title with padding
+        std::string padded_title = u8_ok_ ? ("─ " + title + " ") : ("- " + title + " ");
+        out << padded_title;
+
+        int remaining = width - 2 - (int)padded_title.size();
+        for (int i = 0; i < remaining; ++i) out << bc.h;
+        out << bc.tr;
+
+        if (vt_ok_) out << "\x1b[0m";
+        return out.str();
+    }
+
+    // Create a box footer
+    std::string box_footer(int width) const {
+        auto bc = get_box_chars();
+        std::ostringstream out;
+        out << C_dim() << bc.bl;
+        for (int i = 0; i < width - 2; ++i) out << bc.h;
+        out << bc.br << C_reset();
+        return out.str();
+    }
+
+    // Create a box row with content
+    std::string box_row(const std::string& content, int width) const {
+        auto bc = get_box_chars();
+        std::ostringstream out;
+        out << C_dim() << bc.v << C_reset() << " ";
+        out << content;
+
+        int vis_len = visible_length(content);
+        int padding = width - 4 - vis_len;
+        if (padding > 0) out << std::string(padding, ' ');
+        out << " " << C_dim() << bc.v << C_reset();
+        return out.str();
+    }
+
+    // Animated activity dot
+    std::string activity_dot(int tick, bool active) const {
+        if (!active) return u8_ok_ ? "○" : "o";
+        if (u8_ok_) {
+            static const char* frames[] = {"●", "◉", "○", "◉"};
+            return frames[tick % 4];
+        } else {
+            static const char* frames[] = {"*", "o", "*", "O"};
+            return frames[tick % 4];
+        }
+    }
+
+    // Wave animation for status bar
+    std::string wave_bar(int width, int tick) const {
+        if (!u8_ok_) return std::string(width, '~');
+        std::string out;
+        static const char* waves[] = {"░", "▒", "▓", "█", "▓", "▒"};
+        for (int i = 0; i < width; ++i) {
+            int phase = (tick + i) % 6;
+            out += waves[phase];
+        }
+        return out;
+    }
+
+    // Mini sparkline for inline stats
+    std::string mini_spark(double value, double max_val, int width) const {
+        if (max_val <= 0) max_val = 1.0;
+        double frac = value / max_val;
+        if (frac > 1.0) frac = 1.0;
+        if (frac < 0.0) frac = 0.0;
+
+        int filled = (int)(frac * width);
+        std::string out;
+
+        if (u8_ok_ && vt_ok_) {
+            out += "\x1b[38;5;51m";  // Cyan
+            for (int i = 0; i < filled; ++i) out += "█";
+            out += "\x1b[38;5;238m";
+            for (int i = filled; i < width; ++i) out += "░";
+            out += "\x1b[0m";
+        } else {
+            for (int i = 0; i < filled; ++i) out += "#";
+            for (int i = filled; i < width; ++i) out += ".";
+        }
+        return out;
+    }
+
+    // Premium status indicator with glow
+    std::string status_indicator(const std::string& status, bool good, int tick) const {
+        std::ostringstream out;
+        if (vt_ok_) {
+            if (good) {
+                // Pulsing green glow
+                int brightness = 46 + (tick % 4);
+                out << "\x1b[38;5;" << brightness << "m";
+                out << (u8_ok_ ? "● " : "* ");
+            } else {
+                // Warning orange
+                out << "\x1b[38;5;214m";
+                out << (u8_ok_ ? "◐ " : "o ");
+            }
+            out << status << "\x1b[0m";
+        } else {
+            out << (good ? "[OK] " : "[..] ") << status;
+        }
+        return out.str();
+    }
+
+    // Animated network activity indicator
+    std::string network_activity(int tick, size_t peers, bool has_activity) const {
+        std::ostringstream out;
+        if (u8_ok_ && vt_ok_) {
+            // Network icon with pulse
+            if (peers > 0) {
+                static const char* net_frames[] = {"◈", "◇", "◈", "◆"};
+                out << "\x1b[38;5;51m" << net_frames[tick % 4] << "\x1b[0m";
+            } else {
+                out << "\x1b[38;5;238m○\x1b[0m";
+            }
+
+            // Activity arrows
+            if (has_activity && peers > 0) {
+                static const char* arrows[] = {"↑", "↗", "→", "↘", "↓", "↙", "←", "↖"};
+                out << "\x1b[38;5;46m" << arrows[tick % 8] << "\x1b[0m";
+            }
+        } else {
+            out << (peers > 0 ? "[NET]" : "[---]");
+        }
+        return out.str();
+    }
+
+    // Premium gradient bar for hashrate/performance
+    std::string gradient_bar(int width, double frac, int tick, const char* start_color = "51", const char* end_color = "46") const {
+        if (width < 4) width = 4;
+        if (frac < 0.0) frac = 0.0;
+        if (frac > 1.0) frac = 1.0;
+
+        int filled = (int)(frac * width);
+        std::ostringstream out;
+
+        if (vt_ok_ && u8_ok_) {
+            for (int i = 0; i < width; ++i) {
+                if (i < filled) {
+                    // Gradient from start to end color
+                    int color = 51 - (i * 5) / width;  // Cyan to green gradient
+                    if (color < 46) color = 46;
+                    out << "\x1b[38;5;" << color << "m█";
+                } else if (i == filled && frac < 1.0) {
+                    // Animated edge
+                    static const char* edge[] = {"▏", "▎", "▍", "▌", "▋", "▊", "▉"};
+                    out << "\x1b[38;5;51m" << edge[tick % 7];
+                } else {
+                    out << "\x1b[38;5;236m░";
+                }
+            }
+            out << "\x1b[0m";
+        } else {
+            for (int i = 0; i < filled; ++i) out << "=";
+            if (filled < width) out << ">";
+            for (int i = filled + 1; i < width; ++i) out << " ";
+        }
+        return out.str();
+    }
+
+    // Animated chain blocks visualization
+    std::string chain_blocks_viz(int tick, uint64_t height) const {
+        if (!u8_ok_ || !vt_ok_) return "[" + std::to_string(height) + "]";
+
+        std::ostringstream out;
+        // Show last 5 "blocks" with animation
+        static const char* block_states[] = {"░", "▒", "▓", "█"};
+
+        for (int i = 0; i < 5; ++i) {
+            int phase = (tick + i * 2) % 8;
+            if (phase > 4) phase = 8 - phase;
+            int idx = std::min(3, phase);
+
+            // Color gradient
+            int color = 51 - i * 1;
+            out << "\x1b[38;5;" << color << "m" << block_states[idx];
+        }
+        out << "\x1b[0m";
+        return out.str();
+    }
+
+    // Mining pickaxe animation
+    std::string mining_animation(int tick, bool active) const {
+        if (!active) return u8_ok_ ? "⛏" : "[M]";
+        if (u8_ok_ && vt_ok_) {
+            static const char* frames[] = {"⛏ ", " ⛏", "⛏ ", "⛏·"};
+            int bright = 46 + (tick % 4);
+            std::ostringstream out;
+            out << "\x1b[38;5;" << bright << "m" << frames[tick % 4] << "\x1b[0m";
+            return out.str();
+        }
+        return "[MINING]";
+    }
+
+    // Draw the premium main dashboard
+    void draw_main(int cols, int rows) {
+        std::ostringstream out;
+        std::vector<std::string> lines;
+
+        // Box width and positioning
+        const int box_width = std::min(110, cols - 4);
+        const int start_col = std::max(1, (cols - box_width) / 2);
+        const int half_width = (box_width - 3) / 2;
+
+        // ===== ANIMATED HEADER LOGO =====
+        if (u8_ok_ && box_width >= 50) {
+            // Compact but stylish logo
+            std::string logo_color = vt_ok_ ? "\x1b[38;5;51m\x1b[1m" : "";
+            std::string reset = vt_ok_ ? "\x1b[0m" : "";
+
+            lines.push_back("");
+            lines.push_back(logo_color + "  ╔╦╗╦╔═╗ ╦═╗╔═╗╔═╗╦ ╦╔═╗╦╔╗╔" + reset + "   " +
+                           C_dim() + "v" + std::to_string(MIQ_VERSION_MAJOR) + "." +
+                           std::to_string(MIQ_VERSION_MINOR) + "." +
+                           std::to_string(MIQ_VERSION_PATCH) + C_reset());
+            lines.push_back(logo_color + "  ║║║║║═╬╗╠╦╝║ ║║  ╠═╣╠═╣║║║║" + reset + "   " +
+                           spinner(tick_, u8_ok_) + " " + pulse_blocks(tick_, u8_ok_, vt_ok_));
+            lines.push_back(logo_color + "  ╩ ╩╩╚═╝╚╩╚═╚═╝╚═╝╩ ╩╩ ╩╩╝╚╝" + reset + "   " +
+                           C_dim() + CHAIN_NAME + C_reset());
+        } else {
+            lines.push_back("");
+            std::ostringstream h;
+            h << C_head() << C_bold() << "MIQROCHAIN" << C_reset()
+              << "  " << C_dim() << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH << C_reset()
+              << "  " << spinner(tick_, u8_ok_);
+            lines.push_back(h.str());
+        }
+
+        // ===== STATUS BAR =====
+        {
+            std::ostringstream status;
+            status << C_dim() << "Status: " << C_reset();
+
+            NodeState show_state = nstate_;
+            if (degraded_override_) show_state = NodeState::Degraded;
+
+            switch(show_state) {
+                case NodeState::Starting:
+                    status << status_indicator("STARTING", false, tick_);
+                    break;
+                case NodeState::Syncing:
+                    status << status_indicator("SYNCING", false, tick_);
+                    break;
+                case NodeState::Running:
+                    status << status_indicator("RUNNING", true, tick_);
+                    break;
+                case NodeState::Degraded:
+                    status << "\x1b[38;5;196m" << (u8_ok_ ? "⚠ " : "[!] ") << "DEGRADED\x1b[0m";
+                    break;
+                case NodeState::Quitting:
+                    status << C_warn() << "SHUTTING DOWN" << C_reset();
+                    break;
+            }
+
+            // Network activity indicator
+            size_t peer_count = p2p_ ? p2p_->snapshot_peers().size() : 0;
+            status << "   " << network_activity(tick_, peer_count, peer_count > 0);
+            status << " " << C_dim() << peer_count << " peers" << C_reset();
+
+            // Mining indicator
+            if (miner_running_badge()) {
+                status << "   " << mining_animation(tick_, true);
+            }
+
+            lines.push_back("");
+            lines.push_back(center_text(status.str(), box_width));
+        }
+
+        // ===== PORTS & CONFIG BAR =====
+        {
+            std::ostringstream ports;
+            std::string sep = u8_ok_ ? " │ " : " | ";
+
+            ports << C_dim() << "P2P:" << C_reset() << " " << C_info() << p2p_port_ << C_reset();
+            ports << sep << C_dim() << "RPC:" << C_reset() << " " << C_info() << rpc_port_ << C_reset();
+
+            if (auto* ss = g_stratum_server.load()) {
+                ports << sep << C_dim() << "Pool:" << C_reset() << " " << C_info() << ss->get_port() << C_reset();
+            }
+
+            ports << sep << C_dim() << "Theme:" << C_reset() << " " << (dark_theme_ ? "dark" : "light");
+
+            lines.push_back(center_text(ports.str(), box_width));
+            lines.push_back("");
+        }
+
+        // ===== MAIN PANELS (2 columns) =====
+        std::vector<std::string> left_panel, right_panel;
+
+        // ----- LEFT PANEL: Blockchain -----
+        {
+            left_panel.push_back(box_header("Blockchain", half_width, "\x1b[38;5;51m"));
+
+            uint64_t height = chain_ ? chain_->height() : 0;
+            std::string tip_hex;
+            long double tip_diff = 0.0L;
+            uint64_t tip_age_s = 0;
+
+            if (chain_) {
+                auto t = chain_->tip();
+                tip_hex = to_hex(t.hash);
+                tip_diff = difficulty_from_bits(hdr_bits(t));
+                uint64_t tip_ts = hdr_time(t);
+                if (tip_ts) {
+                    uint64_t now = (uint64_t)std::time(nullptr);
+                    tip_age_s = (now > tip_ts) ? (now - tip_ts) : 0;
+                }
+            }
+
+            // Height with chain visualization
+            std::ostringstream h1;
+            h1 << C_dim() << "Height:" << C_reset() << "     " << chain_blocks_viz(tick_, height) << " "
+               << C_info() << C_bold() << fmt_num(height) << C_reset();
+            left_panel.push_back(box_row(h1.str(), half_width));
+
+            // Tip hash
+            std::ostringstream h2;
+            h2 << C_dim() << "Tip:" << C_reset() << "        " << short_hex(tip_hex, 24);
+            left_panel.push_back(box_row(h2.str(), half_width));
+
+            // Tip age with color coding
+            std::ostringstream h3;
+            h3 << C_dim() << "Tip Age:" << C_reset() << "    ";
+            if (tip_age_s < 120) {
+                h3 << C_ok() << fmt_uptime(tip_age_s) << C_reset();
+            } else if (tip_age_s < 600) {
+                h3 << C_warn() << fmt_uptime(tip_age_s) << C_reset();
+            } else {
+                h3 << C_err() << fmt_uptime(tip_age_s) << C_reset();
+            }
+            left_panel.push_back(box_row(h3.str(), half_width));
+
+            // Difficulty
+            std::ostringstream h4;
+            h4 << C_dim() << "Difficulty:" << C_reset() << " " << fmt_diff(tip_diff);
+            left_panel.push_back(box_row(h4.str(), half_width));
+
+            // Network hashrate with spark
+            std::ostringstream h5;
+            h5 << C_dim() << "Net Hash:" << C_reset() << "   " << C_info() << fmt_hs(net_hashrate_) << C_reset();
+            left_panel.push_back(box_row(h5.str(), half_width));
+
+            // Hashrate trend sparkline
+            std::ostringstream h6;
+            h6 << C_dim() << "Trend:" << C_reset() << "      " << spark_ascii(net_spark_);
+            left_panel.push_back(box_row(h6.str(), half_width));
+
+            left_panel.push_back(box_footer(half_width));
+        }
+
+        // ----- RIGHT PANEL: Network -----
+        {
+            right_panel.push_back(box_header("Network", half_width, "\x1b[38;5;47m"));
+
+            size_t peers_n = 0, verack_ok = 0, inflight_tx = 0;
+            if (p2p_) {
+                auto peers = p2p_->snapshot_peers();
+                peers_n = peers.size();
+                for (auto& s : peers) {
+                    if (s.verack_ok) ++verack_ok;
+                    inflight_tx += (size_t)s.inflight;
+                }
+            }
+
+            // Peer count with mini bar
+            std::ostringstream n1;
+            n1 << C_dim() << "Peers:" << C_reset() << "      ";
+            if (peers_n == 0) {
+                n1 << C_err() << "0 (connecting...)" << C_reset();
+            } else if (peers_n < 3) {
+                n1 << C_warn() << peers_n << C_reset() << " " << mini_spark((double)peers_n, 8.0, 8);
+            } else {
+                n1 << C_ok() << peers_n << C_reset() << " " << mini_spark((double)peers_n, 8.0, 8);
+            }
+            right_panel.push_back(box_row(n1.str(), half_width));
+
+            // Active peers
+            std::ostringstream n2;
+            n2 << C_dim() << "Active:" << C_reset() << "     " << C_info() << verack_ok << C_reset() << " verified";
+            right_panel.push_back(box_row(n2.str(), half_width));
+
+            // In-flight
+            std::ostringstream n3;
+            n3 << C_dim() << "In-flight:" << C_reset() << "  " << inflight_tx << " requests";
+            right_panel.push_back(box_row(n3.str(), half_width));
+
+            // Network stats
+            std::ostringstream n4;
+            n4 << C_dim() << "Sent:" << C_reset() << "       " << fmt_net_bytes(g_net_stats.bytes_sent.load());
+            right_panel.push_back(box_row(n4.str(), half_width));
+
+            std::ostringstream n5;
+            n5 << C_dim() << "Received:" << C_reset() << "   " << fmt_net_bytes(g_net_stats.bytes_recv.load());
+            right_panel.push_back(box_row(n5.str(), half_width));
+
+            // Connection status
+            std::ostringstream n6;
+            n6 << C_dim() << "Status:" << C_reset() << "     ";
+            if (peers_n > 0) {
+                n6 << activity_dot(tick_, true) << " " << C_ok() << "Connected" << C_reset();
+            } else {
+                n6 << activity_dot(tick_, false) << " " << C_warn() << "Searching..." << C_reset();
+            }
+            right_panel.push_back(box_row(n6.str(), half_width));
+
+            right_panel.push_back(box_footer(half_width));
+        }
+
+        // Merge left and right panels
+        lines.push_back("");
+        size_t max_panel = std::max(left_panel.size(), right_panel.size());
+        for (size_t i = 0; i < max_panel; ++i) {
+            std::string l = (i < left_panel.size()) ? left_panel[i] : std::string(half_width, ' ');
+            std::string r = (i < right_panel.size()) ? right_panel[i] : std::string(half_width, ' ');
+            lines.push_back(" " + l + "   " + r);
+        }
+
+        // ===== SECOND ROW PANELS =====
+        std::vector<std::string> left_panel2, right_panel2;
+
+        // ----- Mining Panel -----
+        {
+            left_panel2.push_back(box_header("Mining", half_width, "\x1b[38;5;226m"));
+
+            bool active = g_miner_stats.active.load();
+            unsigned thr = g_miner_stats.threads.load();
+            uint64_t ok = g_miner_stats.accepted.load();
+            uint64_t rej = g_miner_stats.rejected.load();
+            double hps = g_miner_stats.hps.load();
+
+            // Mining status
+            std::ostringstream m1;
+            m1 << C_dim() << "Status:" << C_reset() << "     ";
+            if (mining_gate_available_) {
+                if (active) {
+                    m1 << mining_animation(tick_, true) << " " << C_ok() << "MINING" << C_reset()
+                       << " (" << thr << " threads)";
+                } else {
+                    m1 << C_ok() << "Available" << C_reset();
+                }
+            } else {
+                m1 << C_warn() << "Unavailable" << C_reset();
+            }
+            left_panel2.push_back(box_row(m1.str(), half_width));
+
+            // Hashrate with gradient bar
+            std::ostringstream m2;
+            m2 << C_dim() << "Hashrate:" << C_reset() << "   " << C_info() << fmt_hs(hps) << C_reset();
+            if (active && hps > 0) {
+                m2 << " " << gradient_bar(12, std::min(1.0, hps / std::max(1.0, net_hashrate_ * 0.01)), tick_);
+            }
+            left_panel2.push_back(box_row(m2.str(), half_width));
+
+            // Trend
+            std::ostringstream m3;
+            m3 << C_dim() << "Trend:" << C_reset() << "      " << spark_ascii(spark_hs_);
+            left_panel2.push_back(box_row(m3.str(), half_width));
+
+            // Blocks mined
+            std::ostringstream m4;
+            m4 << C_dim() << "Blocks:" << C_reset() << "     " << C_ok() << ok << " mined" << C_reset();
+            if (rej > 0) m4 << ", " << C_err() << rej << " rejected" << C_reset();
+            left_panel2.push_back(box_row(m4.str(), half_width));
+
+            // Network share
+            double share = (net_hashrate_ > 0.0 && hps > 0.0) ? (hps / net_hashrate_) * 100.0 : 0.0;
+            std::ostringstream m5;
+            m5 << C_dim() << "Net Share:" << C_reset() << "  " << std::fixed << std::setprecision(4) << share << "%";
+            left_panel2.push_back(box_row(m5.str(), half_width));
+
+            // Mining address
+            std::ostringstream m6;
+            m6 << C_dim() << "Reward To:" << C_reset() << "  ";
+            if (!g_miner_address_b58.empty()) {
+                std::string addr = g_miner_address_b58;
+                if (addr.size() > 20) addr = addr.substr(0, 8) + "..." + addr.substr(addr.size() - 8);
+                m6 << C_info() << addr << C_reset();
+            } else {
+                m6 << C_dim() << "not set" << C_reset();
+            }
+            left_panel2.push_back(box_row(m6.str(), half_width));
+
+            left_panel2.push_back(box_footer(half_width));
+        }
+
+        // ----- Mempool Panel -----
+        {
+            right_panel2.push_back(box_header("Mempool", half_width, "\x1b[38;5;213m"));
+
+            auto stat = mempool_view_fallback(mempool_);
+
+            // Transaction count
+            std::ostringstream p1;
+            p1 << C_dim() << "Pending TX:" << C_reset() << " " << C_info() << stat.count << C_reset();
+            right_panel2.push_back(box_row(p1.str(), half_width));
+
+            // Size
+            std::ostringstream p2;
+            p2 << C_dim() << "Size:" << C_reset() << "       " << fmt_bytes(stat.bytes);
+            right_panel2.push_back(box_row(p2.str(), half_width));
+
+            // Recent adds
+            std::ostringstream p3;
+            p3 << C_dim() << "Recent:" << C_reset() << "     +" << stat.recent_adds << " added";
+            right_panel2.push_back(box_row(p3.str(), half_width));
+
+            // Recent TXIDs header
+            right_panel2.push_back(box_row(C_dim() + std::string("Recent TXIDs:") + C_reset(), half_width));
+
+            // Show last 2 txids
+            size_t tx_show = std::min<size_t>(2, recent_txids_.size());
+            for (size_t i = 0; i < tx_show; ++i) {
+                std::string txid = recent_txids_[recent_txids_.size() - 1 - i];
+                right_panel2.push_back(box_row("  " + short_hex(txid, 28), half_width));
+            }
+            if (tx_show == 0) {
+                right_panel2.push_back(box_row(C_dim() + std::string("  (none yet)") + C_reset(), half_width));
+            }
+
+            right_panel2.push_back(box_footer(half_width));
+        }
+
+        // Merge second row panels
+        lines.push_back("");
+        max_panel = std::max(left_panel2.size(), right_panel2.size());
+        for (size_t i = 0; i < max_panel; ++i) {
+            std::string l = (i < left_panel2.size()) ? left_panel2[i] : std::string(half_width, ' ');
+            std::string r = (i < right_panel2.size()) ? right_panel2[i] : std::string(half_width, ' ');
+            lines.push_back(" " + l + "   " + r);
+        }
+
+        // ===== RECENT BLOCKS PANEL (Full Width) =====
+        {
+            lines.push_back("");
+            lines.push_back(box_header("Recent Blocks", box_width - 2, "\x1b[38;5;208m"));
+
+            if (recent_blocks_.empty()) {
+                lines.push_back(box_row(C_dim() + std::string("Waiting for blocks...") + C_reset(), box_width - 2));
+            } else {
+                // Header row
+                std::ostringstream hdr;
+                hdr << C_dim() << std::left << std::setw(10) << "Height"
+                    << std::setw(24) << "Hash"
+                    << std::setw(8) << "TXs"
+                    << std::setw(14) << "Miner" << C_reset();
+                lines.push_back(box_row(hdr.str(), box_width - 2));
+
+                // Show last 4 blocks
+                size_t show = std::min<size_t>(4, recent_blocks_.size());
+                for (size_t i = 0; i < show; ++i) {
+                    const auto& b = recent_blocks_[recent_blocks_.size() - 1 - i];
+                    std::ostringstream row;
+
+                    row << C_info() << std::left << std::setw(10) << fmt_num(b.height) << C_reset();
+                    row << std::setw(24) << short_hex(b.hash_hex.empty() ? "?" : b.hash_hex, 20);
+                    row << std::setw(8) << (b.tx_count ? std::to_string(b.tx_count) : "?");
+
+                    std::string miner = b.miner;
+                    if (miner.size() > 12) miner = miner.substr(0, 6) + "..." + miner.substr(miner.size() - 4);
+                    row << C_dim() << miner << C_reset();
+
+                    lines.push_back(box_row(row.str(), box_width - 2));
+                }
+            }
+            lines.push_back(box_footer(box_width - 2));
+        }
+
+        // ===== SYSTEM INFO BAR =====
+        {
+            lines.push_back("");
+            uptime_s_ = (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start_tp_).count();
+            uint64_t rss = get_rss_bytes();
+
+            std::ostringstream sys;
+            std::string sep = u8_ok_ ? " │ " : " | ";
+
+            sys << C_dim() << "Uptime:" << C_reset() << " " << fmt_uptime(uptime_s_);
+            sys << sep << C_dim() << "Memory:" << C_reset() << " " << fmt_bytes(rss);
+            sys << sep << C_dim() << "Datadir:" << C_reset() << " " << (datadir_.size() > 30 ? "..." + datadir_.substr(datadir_.size() - 27) : datadir_);
+
+            lines.push_back(center_text(sys.str(), box_width));
+        }
+
+        // ===== CONTROLS FOOTER =====
+        {
+            std::ostringstream ctrl;
+            ctrl << C_dim() << "[q]uit  [t]heme  [p]ause  [s]nap  [v]erbose  [r]eload" << C_reset();
+            lines.push_back(center_text(ctrl.str(), box_width));
+            lines.push_back("");
+        }
+
+        // ===== RENDER =====
+        int content_height = (int)lines.size();
+        int start_row = std::max(0, (rows - content_height - 10) / 2);  // Leave room for logs
+
+        if (vt_ok_) {
+            out << "\x1b[H\x1b[J";  // Clear screen
+        }
+
+        // Top padding
+        for (int i = 0; i < start_row; ++i) out << "\n";
+
+        // Content
+        std::string padding(start_col, ' ');
+        for (const auto& line : lines) {
+            out << padding << line << "\n";
+        }
+
+        // ===== LOGS SECTION =====
+        int remain = rows - start_row - content_height - 2;
+        if (remain < 4) remain = 4;
+        if (remain > 12) remain = 12;
+
+        out << padding << C_bold() << "Logs" << C_reset() << " " << C_dim() << "(recent activity)" << C_reset() << "\n";
+        out << padding << std::string(box_width - 2, u8_ok_ ? '-' : '-') << "\n";
+
+        int log_start = (int)logs_.size() - remain;
+        if (log_start < 0) log_start = 0;
+
+        int printed = 0;
+        for (int i = log_start; i < (int)logs_.size() && printed < remain; ++i) {
+            const auto& line = logs_[i];
+            std::string txt = line.txt;
+            if ((int)txt.size() > cols - start_col - 2) {
+                txt = txt.substr(0, cols - start_col - 5) + "...";
+            }
+
+            out << padding;
+            switch(line.level) {
+                case 2: out << C_err() << txt << C_reset(); break;
+                case 1: out << C_warn() << txt << C_reset(); break;
+                case 3: out << C_dim() << txt << C_reset(); break;
+                case 4: out << C_ok() << txt << C_reset(); break;
+                default: out << txt; break;
+            }
+            out << "\n";
+            ++printed;
+        }
+
+        // Fill remaining with empty lines
+        for (int i = printed; i < remain; ++i) {
+            out << "\n";
+        }
+
+        // Write frame
+        std::string frame = out.str();
+        if (vt_ok_) {
+            cw_.write_frame("", frame);
+        } else {
+            cw_.write_raw(frame);
+        }
+        std::fflush(stdout);
+    }
+
     void draw_once(bool first){
         (void)first;  // Reserved for future first-draw optimization
         std::lock_guard<std::mutex> lk(mu_);
@@ -2314,6 +3013,12 @@ private:
             draw_splash(cols, rows);
             return;
         }
+
+        // Use the new premium main dashboard
+        draw_main(cols, rows);
+        return;
+
+        // ==== LEGACY CODE BELOW (kept for reference, not executed) ====
 
         // Calculate layout dimensions - ensure right column fits
         const int rightw = std::max(50, cols / 3);
