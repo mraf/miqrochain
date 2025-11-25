@@ -1590,6 +1590,7 @@ private:
 class TUI {
 public:
     enum class NodeState { Starting, Syncing, Running, Degraded, Quitting };
+    enum class ViewMode { Splash, Main };  // Splash = sync screen, Main = full dashboard
 
     explicit TUI(bool vt_ok, bool u8_ok) : vt_ok_(vt_ok), u8_ok_(u8_ok) { init_step_order(); }
     void set_enabled(bool on){ enabled_ = on; }
@@ -1958,6 +1959,165 @@ private:
         return miner_on && node_run;
     }
 
+    // =========================================================================
+    // Splash Screen - Shown during initial sync / block download
+    // =========================================================================
+    void draw_splash(int cols, int rows) {
+        std::ostringstream out;
+
+        // Calculate center positioning
+        const int box_width = std::min(80, cols - 4);
+        const int box_height = 24;
+        const int start_row = std::max(1, (rows - box_height) / 2);
+        const int start_col = std::max(1, (cols - box_width) / 2);
+
+        // Calculate sync metrics
+        uint64_t network_height = sync_network_height_ > 0 ? sync_network_height_ : ibd_target_;
+        uint64_t current_height = ibd_cur_;
+        uint64_t blocks_remaining = (network_height > current_height) ? (network_height - current_height) : 0;
+        double sync_progress = (network_height > 0) ? ((double)current_height / (double)network_height * 100.0) : 0.0;
+        if (sync_progress > 100.0) sync_progress = 100.0;
+
+        // Build splash screen content
+        std::vector<std::string> lines;
+
+        // Logo / Title
+        lines.push_back("");
+        std::string title = "MIQROCHAIN";
+        std::string version = "v" + std::to_string(MIQ_VERSION_MAJOR) + "." +
+                             std::to_string(MIQ_VERSION_MINOR) + "." +
+                             std::to_string(MIQ_VERSION_PATCH);
+        lines.push_back(std::string(C_head()) + C_bold() + center_text(title, box_width - 4) + C_reset());
+        lines.push_back(std::string(C_dim()) + center_text(version, box_width - 4) + C_reset());
+        lines.push_back("");
+
+        // Sync status header
+        std::string sync_icon = u8_ok_ ? "⟳ " : "[*] ";
+        lines.push_back(std::string(C_bold()) + C_warn() + sync_icon + "Synchronizing Blockchain" + C_reset());
+        lines.push_back("");
+
+        // Progress bar (large, centered)
+        int bar_width = box_width - 8;
+        double frac = sync_progress / 100.0;
+        lines.push_back("  " + progress_bar_animated(bar_width, frac, tick_, vt_ok_, u8_ok_));
+
+        // Progress percentage (large display)
+        std::ostringstream pct;
+        pct << std::fixed << std::setprecision(2) << sync_progress << "%";
+        lines.push_back(std::string(C_bold()) + C_info() + center_text(pct.str(), box_width - 4) + C_reset());
+        lines.push_back("");
+
+        // Stats in two columns
+        std::ostringstream s1;
+        s1 << C_dim() << "Blocks: " << C_reset() << C_info() << fmt_num(current_height) << C_reset()
+           << C_dim() << " / " << C_reset() << fmt_num(network_height);
+        lines.push_back("  " + s1.str());
+
+        std::ostringstream s2;
+        s2 << C_dim() << "Remaining: " << C_reset() << fmt_num(blocks_remaining) << " blocks";
+        lines.push_back("  " + s2.str());
+
+        // ETA
+        std::string eta_str = "Calculating...";
+        if (sync_blocks_per_sec_ > 0.01 && blocks_remaining > 0) {
+            eta_str = fmt_eta(blocks_remaining, sync_blocks_per_sec_);
+        } else if (blocks_remaining == 0) {
+            eta_str = "Almost done!";
+        }
+        std::ostringstream s3;
+        s3 << C_dim() << "ETA: " << C_reset() << C_warn() << eta_str << C_reset();
+        lines.push_back("  " + s3.str());
+
+        // Sync speed
+        if (sync_blocks_per_sec_ > 0.01) {
+            std::ostringstream s4;
+            s4 << C_dim() << "Speed: " << C_reset() << std::fixed << std::setprecision(1)
+               << sync_blocks_per_sec_ << " blocks/sec";
+            lines.push_back("  " + s4.str());
+        }
+
+        lines.push_back("");
+
+        // Time behind (Bitcoin Core style)
+        std::string time_behind = fmt_time_behind(sync_last_block_time_);
+        std::ostringstream tb;
+        tb << C_dim() << "Status: " << C_reset() << C_warn() << time_behind << C_reset();
+        lines.push_back("  " + tb.str());
+
+        // Connected seed info
+        if (!ibd_seed_host_.empty()) {
+            std::ostringstream seed;
+            seed << C_dim() << "Syncing from: " << C_reset() << ibd_seed_host_;
+            lines.push_back("  " + seed.str());
+        }
+
+        // Peer count
+        size_t peer_count = p2p_ ? p2p_->snapshot_peers().size() : 0;
+        std::ostringstream pc;
+        pc << C_dim() << "Peers: " << C_reset();
+        if (peer_count == 0) {
+            pc << C_err() << "connecting..." << C_reset();
+        } else {
+            pc << C_ok() << peer_count << " connected" << C_reset();
+        }
+        lines.push_back("  " + pc.str());
+
+        lines.push_back("");
+
+        // Warning message
+        lines.push_back(std::string("  ") + C_dim() + "Please wait while the blockchain syncs." + C_reset());
+        lines.push_back(std::string("  ") + C_dim() + "The main dashboard will open automatically." + C_reset());
+        lines.push_back("");
+
+        // Controls hint
+        lines.push_back(std::string(C_dim()) + center_text("[q] quit  [t] theme  [v] verbose", box_width - 4) + C_reset());
+
+        // Build frame with centering
+        if (vt_ok_) {
+            out << "\x1b[H\x1b[J";  // Clear screen, cursor home
+        }
+
+        // Add top padding
+        for (int i = 0; i < start_row; ++i) {
+            out << "\n";
+        }
+
+        // Draw each line centered
+        std::string padding(start_col, ' ');
+        for (const auto& line : lines) {
+            out << padding << line << "\n";
+        }
+
+        // Fill remaining rows
+        int lines_drawn = start_row + (int)lines.size();
+        for (int i = lines_drawn; i < rows; ++i) {
+            out << "\n";
+        }
+
+        // Write frame
+        std::string frame = out.str();
+        if (vt_ok_) {
+            cw_.write_frame("", frame);
+        } else {
+            cw_.write_raw(frame);
+        }
+        std::fflush(stdout);
+    }
+
+    // Helper to center text
+    static std::string center_text(const std::string& text, int width) {
+        int visible_len = 0;
+        bool in_escape = false;
+        for (char c : text) {
+            if (c == '\x1b') in_escape = true;
+            else if (in_escape && c == 'm') in_escape = false;
+            else if (!in_escape) ++visible_len;
+        }
+        if (visible_len >= width) return text;
+        int pad = (width - visible_len) / 2;
+        return std::string(pad, ' ') + text;
+    }
+
     void draw_once(bool first){
         (void)first;  // Reserved for future first-draw optimization
         std::lock_guard<std::mutex> lk(mu_);
@@ -1967,6 +2127,23 @@ private:
         // This ensures the TUI fits in one screen without scrolling
         if (cols < 114) cols = 114;
         if (rows < 34) rows = 34;
+
+        // Check if sync is complete to transition from Splash to Main
+        bool sync_complete = ibd_done_ || (ibd_target_ > 0 && ibd_cur_ >= ibd_target_);
+        if (sync_complete && view_mode_ == ViewMode::Splash) {
+            // Delay transition slightly to show "100%" message
+            if (!splash_transition_done_) {
+                splash_transition_done_ = true;
+            } else {
+                view_mode_ = ViewMode::Main;
+            }
+        }
+
+        // Draw splash screen during sync, main dashboard after sync
+        if (view_mode_ == ViewMode::Splash && !sync_complete) {
+            draw_splash(cols, rows);
+            return;
+        }
 
         // Calculate layout dimensions - ensure right column fits
         const int rightw = std::max(50, cols / 3);
@@ -2641,6 +2818,10 @@ private:
     // mining gate status
     bool        mining_gate_available_{false};
     std::string mining_gate_reason_;
+
+    // View mode: Splash during sync, Main after sync complete
+    ViewMode    view_mode_{ViewMode::Splash};
+    bool        splash_transition_done_{false};  // Track if we've shown transition animation
 };
 
 // ==================================================================

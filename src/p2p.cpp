@@ -1306,8 +1306,9 @@ namespace {
   }
 }
 // Light-touch guard for peers_ against snapshot_peers() racing the loop
+// FIXED: Use recursive_mutex to prevent deadlock when same thread re-acquires lock
 namespace {
-  static std::mutex g_peers_mu;
+  static std::recursive_mutex g_peers_mu;
 }
 
 
@@ -2608,7 +2609,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     // Gate first, then mark loopback (so flag actually sticks)
     gate_on_connect(s);
     {
-        std::lock_guard<std::mutex> lk(g_peers_mu);
+        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
         // mark as outbound for gating/diversity
         g_outbounds.insert(s);
     }
@@ -2666,7 +2667,7 @@ static bool violates_group_diversity(const std::unordered_map<Sock, miq::PeerSta
 void P2P::handle_new_peer(Sock c, const std::string& ip){
     // Check for duplicate IP to prevent same peer appearing twice
     {
-        std::lock_guard<std::mutex> lk(g_peers_mu);
+        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
         for (const auto& kv : peers_) {
             if (kv.second.ip == ip) {
                 log_info("P2P: rejecting duplicate inbound connection from " + ip);
@@ -3427,7 +3428,7 @@ void P2P::loop(){
                          ps.blocks_failed_delivery = 0;
                          ps.health_score = 1.0;
                          ps.last_block_received_ms = 0;
-                         { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
+                         { std::lock_guard<std::recursive_mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
                          g_peer_index_capable[s] = false;
                          g_trickle_last_ms[s] = 0;
                          log_info("P2P: outbound (addrman) " + ps.ip);
@@ -3483,7 +3484,7 @@ void P2P::loop(){
                                 ps.blocks_failed_delivery = 0;
                                 ps.health_score = 1.0;
                                 ps.last_block_received_ms = 0;
-                                { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
+                                { std::lock_guard<std::recursive_mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
                                 g_peer_index_capable[s] = false;
                                 g_trickle_last_ms[s] = 0;
 
@@ -3528,7 +3529,7 @@ void P2P::loop(){
                                     ps.blocks_failed_delivery = 0;
                                     ps.health_score = 1.0;
                                     ps.last_block_received_ms = 0;
-                                    { std::lock_guard<std::mutex> lk(g_peers_mu); peers_[s]=ps; g_outbounds.insert(s); }
+                                    { std::lock_guard<std::recursive_mutex> lk(g_peers_mu); peers_[s]=ps; g_outbounds.insert(s); }
                                     g_peer_index_capable[s] = false;
                                     g_trickle_last_ms[s] = 0;
                                     log_info("P2P: feeler " + dotted);
@@ -3611,7 +3612,7 @@ void P2P::loop(){
                 // Snapshot just the sockets; update real PeerState under lock.
                 std::vector<Sock> snapshot;
                 {
-                    std::lock_guard<std::mutex> lk2(g_peers_mu);
+                    std::lock_guard<std::recursive_mutex> lk2(g_peers_mu);
                     snapshot.reserve(peers_.size());
                     for (auto& kv : peers_) snapshot.push_back(kv.first);
                 }
@@ -3619,7 +3620,7 @@ void P2P::loop(){
                     bool do_send = false;
                     bool flip = false;
                     {
-                        std::lock_guard<std::mutex> lk2(g_peers_mu);
+                        std::lock_guard<std::recursive_mutex> lk2(g_peers_mu);
                         auto itp = peers_.find(sd);
                         if (itp != peers_.end() &&
                             itp->second.verack_ok &&
@@ -3683,8 +3684,12 @@ void P2P::loop(){
                 }
                 g_next_stall_probe_ms = tnow + g_stall_retry_ms;
             } else if (tnow >= g_next_stall_probe_ms && peers_.empty()) {
-                // No peers connected during stall
-                log_warn("P2P: stall detected with NO PEERS connected (height=" + std::to_string(h) + ") - attempting to reconnect");
+                // No peers connected during stall - rate limit logging to once per 60s
+                static int64_t s_last_no_peers_log_ms = 0;
+                if (tnow - s_last_no_peers_log_ms > 60000) {
+                    s_last_no_peers_log_ms = tnow;
+                    log_info("P2P: no peers connected (height=" + std::to_string(h) + ") - attempting to reconnect");
+                }
                 g_next_stall_probe_ms = tnow + g_stall_retry_ms;
             }
         }
@@ -4133,13 +4138,12 @@ void P2P::loop(){
                     log_info("[SYNC] Proactive pipeline active (height=" + std::to_string(current_height) + ")");
                 }
             } else if (height_stalled && (now - last_refetch_time > refetch_interval)) {
-                // Stall-based refetch (fallback)
+                // Stall-based refetch (fallback) - this is normal during sync, not a warning
                 should_refetch = true;
-                // Rate-limit stall warning to once per 30 seconds
-                if (now - last_stall_log > 30000) {
+                // Rate-limit log to once per 60 seconds (reduced from 30s)
+                if (now - last_stall_log > 60000) {
                     last_stall_log = now;
-                    log_warn("[SYNC] Height stalled at " + std::to_string(current_height) + " for " +
-                            std::to_string((now - last_height_time) / 1000) + "s - forcing refetch");
+                    log_info("[SYNC] refetching blocks (height=" + std::to_string(current_height) + ")");
                 }
             }
 
@@ -4298,7 +4302,7 @@ void P2P::loop(){
         trickle_flush();
 
         // --- build pollfd list (SNAPSHOT of peers_) ---
-        std::lock_guard<std::mutex> lk(g_peers_mu);
+        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
         std::vector<PollFD> fds;
         std::vector<Sock>   peer_fd_order;
         size_t srv_idx_v4 = (size_t)-1, srv_idx_v6 = (size_t)-1;
@@ -5900,7 +5904,7 @@ void P2P::loop(){
             }
             if (!todos.empty()) {
                 std::vector<Sock> sockets;
-                { std::lock_guard<std::mutex> lk2(g_peers_mu);
+                { std::lock_guard<std::recursive_mutex> lk2(g_peers_mu);
                   for (auto& kv : peers_) sockets.push_back(kv.first); }
                 for (const auto& txid : todos) {
                     for (auto s : sockets) trickle_enqueue(s, txid);
@@ -5956,7 +5960,7 @@ void P2P::loop(){
 std::vector<PeerSnapshot> P2P::snapshot_peers() const {
     std::vector<PeerSnapshot> out;
     out.reserve(peers_.size());
-    std::lock_guard<std::mutex> lk(g_peers_mu);
+    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
     for (const auto& kv : peers_) {
         const auto& ps = kv.second;
         PeerSnapshot s;
