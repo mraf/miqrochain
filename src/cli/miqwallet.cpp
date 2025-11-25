@@ -74,9 +74,24 @@ namespace instant_input {
         return -1;
     }
 
-    // Wait for a key press (blocking)
-    static int wait_for_key() {
-        return _getch();
+    // Wait for a key press (blocking with timeout)
+    static int wait_for_key(int timeout_ms = -1) {
+        if (timeout_ms < 0) {
+            // No timeout, blocking wait
+            return _getch();
+        }
+
+        // Wait with timeout
+        int elapsed = 0;
+        const int check_interval = 10; // Check every 10ms
+        while (elapsed < timeout_ms) {
+            if (_kbhit()) {
+                return _getch();
+            }
+            Sleep(check_interval);
+            elapsed += check_interval;
+        }
+        return -1; // Timeout
     }
 
     // Check if input is available
@@ -1476,6 +1491,7 @@ namespace ui {
 
     // SEND Transaction Splash Screen
     static void run_send_splash(const std::string& recipient, uint64_t amount, uint64_t fee) {
+        (void)fee; // Parameter reserved for future fee display
         std::ostringstream amt_ss;
         amt_ss << std::fixed << std::setprecision(4) << ((double)amount / 100000000.0) << " MIQ";
         std::string short_recipient = recipient.size() > 16 ? recipient.substr(0, 8) + "..." + recipient.substr(recipient.size() - 8) : recipient;
@@ -7510,10 +7526,10 @@ static bool wallet_session(const std::string& cli_host,
                     continue;
                 }
                 cpkh = miq::hash160(cpub);
-                miq::TxOut ch;
-                ch.value = change;
-                ch.pkh = cpkh;
-                tx.vout.push_back(ch);
+                miq::TxOut change_out;
+                change_out.value = change;
+                change_out.pkh = cpkh;
+                tx.vout.push_back(change_out);
                 used_change = true;
 
                 // Get change address for display
