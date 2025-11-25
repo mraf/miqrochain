@@ -4125,11 +4125,12 @@ private:
         }
     }
 
-    // Cyber matrix-style rain effect for splash background
+    // Cyber matrix-style rain effect for splash background (ASCII-safe)
     static std::string cyber_rain(int width, int tick, bool vt) {
         if (!vt) return "";
         std::string out;
-        static const char* chars[] = {"0", "1", "ø", "×", "·", " ", " ", " "};
+        // ASCII-safe characters only for maximum compatibility
+        static const char* chars[] = {"0", "1", "o", "x", ".", " ", " ", " "};
         for (int i = 0; i < width; ++i) {
             int phase = (tick + i * 3) % 8;
             int brightness = (tick + i * 7) % 6;
@@ -4287,22 +4288,41 @@ private:
             out += "\x1b[0m\x1b[38;5;27m▌\x1b[0m";  // Right cap
 
         } else if (vt_ok_) {
-            // ANSI fallback with nice gradient effect
-            out += "\x1b[1m[\x1b[0m";
+            // ANSI colors with ASCII characters for PowerShell 5 compatibility
+            // Professional animated gradient using only safe ASCII chars
+            out += "\x1b[1;97m[\x1b[0m";
             for (int i = 0; i < inner; ++i) {
                 if (i < filled) {
-                    // Simple gradient: green
+                    // Animated color gradient: blue -> cyan -> green -> yellow
                     double pos = (double)i / (double)inner;
-                    if (pos < 0.5) out += "\x1b[36m";  // Cyan
-                    else out += "\x1b[32m";  // Green
-                    out += "█";
+                    int color_code;
+                    if (pos < 0.25) color_code = 34;       // Blue
+                    else if (pos < 0.5) color_code = 36;   // Cyan
+                    else if (pos < 0.75) color_code = 32;  // Green
+                    else color_code = 33;                   // Yellow
+
+                    // Add shimmer/pulse effect
+                    bool shimmer = ((i + tick) % 6 == 0);
+                    if (shimmer) {
+                        out += "\x1b[1;97m#\x1b[0m";  // Bright white flash
+                    } else {
+                        out += "\x1b[1;" + std::to_string(color_code) + "m#\x1b[0m";
+                    }
                 } else if (i == filled && frac < 1.0) {
-                    out += "\x1b[33m▓\x1b[0m";  // Yellow edge
+                    // Animated leading edge with pulsing effect
+                    static const char* edge_chars[] = {".", "o", "O", "o"};
+                    out += "\x1b[1;93m" + std::string(edge_chars[tick % 4]) + "\x1b[0m";
                 } else {
-                    out += "\x1b[90m░\x1b[0m";
+                    // Background with subtle animation
+                    int bg_phase = (i + tick/2) % 4;
+                    if (bg_phase == 0) {
+                        out += "\x1b[90m.\x1b[0m";
+                    } else {
+                        out += "\x1b[90m-\x1b[0m";
+                    }
                 }
             }
-            out += "\x1b[1m]\x1b[0m";
+            out += "\x1b[1;97m]\x1b[0m";
         } else {
             // Plain ASCII with nice pattern
             out += "[";
