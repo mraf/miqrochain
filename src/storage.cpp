@@ -1,5 +1,6 @@
 #include "storage.h"
 #include "hex.h"
+#include "log.h"  // For log_warn
 #include <cstdint>
 #include <fstream>
 #include <filesystem>
@@ -43,15 +44,32 @@ bool Storage::open(const std::string& dir){
     std::ofstream ensure(path_blocks_, std::ios::app|std::ios::binary); ensure.close();
     std::ifstream f(path_blocks_, std::ios::binary);
     uint64_t off=0; [[maybe_unused]] uint32_t idx=0;
+
+    // STABILITY FIX: Limit maximum block size to prevent corrupt file hangs
+    static constexpr uint32_t MAX_BLOCK_SIZE = 32 * 1024 * 1024; // 32 MB max block
+    static constexpr uint32_t MAX_KEY_SIZE = 1024; // Max hash key size
+
     while(true){
         uint32_t sz=0; f.read((char*)&sz,sizeof(sz)); if(!f) break;
+        // STABILITY FIX: Validate block size to prevent corrupt file issues
+        if (sz == 0 || sz > MAX_BLOCK_SIZE) {
+            log_warn("Storage: corrupt blocks.dat detected at offset " + std::to_string(off));
+            break;
+        }
         offsets_.push_back(off);
-        f.seekg(sz, std::ios::cur); off = (uint64_t)f.tellg(); idx++;
+        f.seekg(sz, std::ios::cur);
+        if (!f) break; // Check seek succeeded
+        off = (uint64_t)f.tellg(); idx++;
     }
     // load hashmap
     std::ifstream hm(path_hashmap_, std::ios::binary);
     while(hm){
         uint32_t ksz=0; hm.read((char*)&ksz,sizeof(ksz)); if(!hm) break;
+        // STABILITY FIX: Validate key size
+        if (ksz == 0 || ksz > MAX_KEY_SIZE) {
+            log_warn("Storage: corrupt hash.map detected");
+            break;
+        }
         std::string k(ksz,'\0'); hm.read(&k[0], ksz); uint32_t vi=0; hm.read((char*)&vi,sizeof(vi)); hash_to_index_[k]=vi;
     }
     return true;
@@ -62,7 +80,14 @@ bool miq::Storage::append_block(const std::vector<uint8_t>& raw,
     std::ofstream f(path_blocks_, std::ios::app|std::ios::binary);
     if(!f) return false;
 
-    uint64_t off = (uint64_t)std::filesystem::file_size(path_blocks_);
+    // STABILITY FIX: Handle file_size() exception gracefully
+    uint64_t off = 0;
+    try {
+        off = (uint64_t)std::filesystem::file_size(path_blocks_);
+    } catch (const std::exception& e) {
+        log_warn("Storage: failed to get file size: " + std::string(e.what()));
+        return false;
+    }
     uint32_t sz  = (uint32_t)raw.size();
     f.write((const char*)&sz, sizeof(sz));
     f.write((const char*)raw.data(), sz);

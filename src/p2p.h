@@ -672,9 +672,12 @@ private:
         if (ps.whitelisted) return false;
 
         if (std::string(kind) == "tx") {
-            if (!key.empty() && ps.inflight_tx.count(key)) return false;
-            if (!key.empty() && ps.recent_inv_keys.count(key)) return false;
-            return true;
+            // CRITICAL FIX: Do NOT drop unsolicited transactions!
+            // Wallets send transactions directly via "tx" message without the
+            // inv/gettx request-response cycle. Dropping these breaks wallet functionality.
+            // Rate limiting (rate_consume_tx) already provides DoS protection.
+            // Mempool validation will reject invalid transactions.
+            return false;  // Never drop transactions - let mempool validate them
         }
         if (std::string(kind) == "block") {
             if (!key.empty() && ps.inflight_blocks.count(key)) return false;

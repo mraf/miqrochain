@@ -403,6 +403,12 @@ static std::mutex g_header_full_mtx;
 // Full headers cache for serving getheaders even with empty block store
 static std::unordered_map<std::string, BlockHeader> g_header_full; // key = hk(hash32)
 
+// STABILITY FIX: Thread-safe helper to update header cache
+static inline void set_header_full(const std::string& key, const BlockHeader& h) {
+    std::lock_guard<std::mutex> lk(g_header_full_mtx);
+    g_header_full[key] = h;
+}
+
 // --- Low-S helper (RAW-64 r||s) --------------------------------------------
 static inline bool is_low_s64(const std::vector<uint8_t>& sig64){
     if (sig64.size() != 64) return false;
@@ -579,15 +585,19 @@ bool Chain::header_exists(const std::vector<uint8_t>& h) const {
 std::vector<uint8_t> Chain::best_header_hash() const {
     MIQ_CHAIN_GUARD();
     if (best_header_key_.empty()) return tip_.hash;
-    const auto& m = header_index_.at(best_header_key_);
-    return m.hash;
+    // STABILITY FIX: Use find() instead of at() to avoid exceptions
+    auto it = header_index_.find(best_header_key_);
+    if (it == header_index_.end()) return tip_.hash;
+    return it->second.hash;
 }
 
 uint64_t Chain::best_header_height() const {
     MIQ_CHAIN_GUARD();
     if (best_header_key_.empty()) return tip_.height;
-    const auto& m = header_index_.at(best_header_key_);
-    return m.height;
+    // STABILITY FIX: Use find() instead of at() to avoid exceptions
+    auto it = header_index_.find(best_header_key_);
+    if (it == header_index_.end()) return tip_.height;
+    return it->second.height;
 }
 
 bool Chain::accept_header(const BlockHeader& h, std::string& err) {
@@ -598,7 +608,7 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     
     // Check if we already have this header
     if (header_index_.find(key) != header_index_.end()) {
-        g_header_full[key] = h;
+        set_header_full(key, h);  // THREAD-SAFE
         return true;
     }
     
@@ -614,7 +624,7 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     // If we already know this header, ensure full header cached too.
     auto itExisting = header_index_.find(key);
     if (itExisting != header_index_.end()) {
-        g_header_full[key] = h;
+        set_header_full(key, h);  // THREAD-SAFE
         return true;
     }
 
@@ -655,13 +665,21 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     m.work_sum = parent_work + work_from_bits(h.bits);
 
     header_index_.emplace(key, std::move(m));
-    g_header_full[key] = h;
+    set_header_full(key, h);  // THREAD-SAFE
 
     if (best_header_key_.empty()) {
         best_header_key_ = key;
     } else {
-        const auto& cur = header_index_.at(best_header_key_);
-        const auto& neu = header_index_.at(key);
+        // STABILITY FIX: Use find() instead of at() to avoid exceptions
+        auto cur_it = header_index_.find(best_header_key_);
+        auto neu_it = header_index_.find(key);
+        if (cur_it == header_index_.end() || neu_it == header_index_.end()) {
+            // Shouldn't happen, but handle gracefully
+            if (cur_it == header_index_.end()) best_header_key_ = key;
+            return true;
+        }
+        const auto& cur = cur_it->second;
+        const auto& neu = neu_it->second;
 
         auto eps = [](long double a, long double b){
             long double scale = std::max<long double>(1.0L, std::max(std::fabs(a), std::fabs(b)));
@@ -697,7 +715,10 @@ void Chain::next_block_fetch_targets(std::vector<std::vector<uint8_t>>& out, siz
         return;
     }
 
-    std::vector<uint8_t> bh = header_index_.at(best_header_key_).hash;
+    // STABILITY FIX: Use find() instead of at() to avoid exceptions
+    auto best_it = header_index_.find(best_header_key_);
+    if (best_it == header_index_.end()) return;
+    std::vector<uint8_t> bh = best_it->second.hash;
     std::vector<std::vector<uint8_t>> up, down;
 
     if (!find_header_fork(tip_.hash, bh, up, down)) {
@@ -843,7 +864,10 @@ bool Chain::find_header_fork(const std::vector<uint8_t>& a,
 bool Chain::reconsider_best_chain(std::string& err){
     MIQ_CHAIN_GUARD();
     if (best_header_key_.empty()) return true;
-    const auto& best = header_index_.at(best_header_key_);
+    // STABILITY FIX: Use find() instead of at() to avoid exceptions
+    auto best_it = header_index_.find(best_header_key_);
+    if (best_it == header_index_.end()) return true;
+    const auto& best = best_it->second;
     if (best.hash == tip_.hash) return true;
 
     std::vector<std::vector<uint8_t>> up, down;
@@ -915,7 +939,10 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
     for (const auto& h : locators) lset[hk(h)] = 1;
 
     if (!best_header_key_.empty()) {
-        const auto* cur = &header_index_.at(best_header_key_);
+        // STABILITY FIX: Use find() instead of at() to avoid exceptions
+        auto best_it = header_index_.find(best_header_key_);
+        if (best_it == header_index_.end()) return true;  // Nothing to return
+        const auto* cur = &best_it->second;
 
         std::vector<std::vector<uint8_t>> back_hashes;
         back_hashes.reserve(2048);
@@ -1222,22 +1249,29 @@ void Chain::rebuild_header_index_from_blocks(){
         m.work_sum = parent_work + work_from_bits(blk.header.bits);
 
         header_index_.emplace(key, std::move(m));
-        g_header_full[key] = blk.header;
+        set_header_full(key, blk.header);  // THREAD-SAFE
 
         // Update best header if this has more work
         if (best_header_key_.empty()) {
             best_header_key_ = key;
         } else {
-            const auto& cur = header_index_.at(best_header_key_);
-            const auto& neu = header_index_.at(key);
-            auto eps = [](long double a, long double b){
-                long double scale = std::max<long double>(1.0L, std::max(std::fabs(a), std::fabs(b)));
-                return 1e-12L * scale;
-            };
-            long double e = eps(neu.work_sum, cur.work_sum);
-            bool greater   = (neu.work_sum - cur.work_sum) >  e;
-            bool equalish  = std::fabs(neu.work_sum - cur.work_sum) <= e;
-            if (greater || (equalish && neu.height > cur.height)) {
+            // STABILITY FIX: Use find() instead of at() to avoid exceptions
+            auto cur_it = header_index_.find(best_header_key_);
+            auto neu_it = header_index_.find(key);
+            if (cur_it != header_index_.end() && neu_it != header_index_.end()) {
+                const auto& cur = cur_it->second;
+                const auto& neu = neu_it->second;
+                auto eps = [](long double a, long double b){
+                    long double scale = std::max<long double>(1.0L, std::max(std::fabs(a), std::fabs(b)));
+                    return 1e-12L * scale;
+                };
+                long double e = eps(neu.work_sum, cur.work_sum);
+                bool greater   = (neu.work_sum - cur.work_sum) >  e;
+                bool equalish  = std::fabs(neu.work_sum - cur.work_sum) <= e;
+                if (greater || (equalish && neu.height > cur.height)) {
+                    best_header_key_ = key;
+                }
+            } else if (cur_it == header_index_.end()) {
                 best_header_key_ = key;
             }
         }
@@ -1274,7 +1308,7 @@ bool Chain::init_genesis(const Block& g){
     save_state();
 
     // Cache the full genesis header for serving to peers
-    g_header_full[hk(g.block_hash())] = g.header;
+    set_header_full(hk(g.block_hash()), g.header);  // THREAD-SAFE
 
     #if MIQ_HAVE_GCS_FILTERS
     // Build & store genesis filter (best-effort)
@@ -1291,15 +1325,32 @@ bool Chain::init_genesis(const Block& g){
     return true;
 }
 
+// SECURITY: Maximum transactions per block to prevent DoS
+static constexpr size_t MAX_BLOCK_TXS = 50000;
+// SECURITY: Maximum coinbase outputs to prevent DoS
+static constexpr size_t MAX_COINBASE_OUTPUTS = 100;
+
 bool Chain::verify_block(const Block& b, std::string& err) const{
     MIQ_CHAIN_GUARD();
-    
+
     // Basic block structure validation
     if (b.txs.empty()) {
         err = "block has no transactions";
         return false;
     }
-    
+
+    // SECURITY FIX: Limit transaction count to prevent memory exhaustion
+    if (b.txs.size() > MAX_BLOCK_TXS) {
+        err = "too many transactions in block";
+        return false;
+    }
+
+    // SECURITY FIX: Limit coinbase outputs to prevent DoS
+    if (!b.txs.empty() && b.txs[0].vout.size() > MAX_COINBASE_OUTPUTS) {
+        err = "too many coinbase outputs";
+        return false;
+    }
+
     if(b.header.prev_hash != tip_.hash){ err="bad prev hash"; return false; }
 
     // MTP
@@ -1431,7 +1482,17 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     struct KE { bool operator()(Key const& a, Key const& b) const noexcept { return a.vout==b.vout && a.txid==b.txid; } };
     std::unordered_set<Key, KH, KE> spent_in_block;
 
-    auto sigh=[&](const Transaction& t){ Transaction tmp=t; for(auto& i: tmp.vin) i.sig.clear(); return dsha256(ser_tx(tmp)); };
+    // SECURITY FIX: Clear BOTH sig AND pubkey for sighash computation
+    // This prevents signature malleability attacks where different pubkeys
+    // could produce different sighashes for the same transaction
+    auto sigh=[&](const Transaction& t){
+        Transaction tmp=t;
+        for(auto& i: tmp.vin) {
+            i.sig.clear();
+            i.pubkey.clear();
+        }
+        return dsha256(ser_tx(tmp));
+    };
 
     uint64_t fees = 0, tmp = 0;
     for(size_t ti=1; ti<b.txs.size(); ++ti){
@@ -1456,7 +1517,11 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
 
             UTXOEntry e;
             if(!utxo_.get(inx.prev.txid, inx.prev.vout, e)){ err="missing utxo"; return false; }
-            if(e.coinbase && tip_.height+1 < e.height + COINBASE_MATURITY){ err="immature coinbase"; return false; }
+            // SECURITY FIX: Use <= instead of < for coinbase maturity check
+            // Bitcoin requires 100 confirmations, meaning coinbase at height H
+            // is spendable at height H + COINBASE_MATURITY + 1
+            // Example: coinbase at 100, maturity 100 -> spendable at 201
+            if(e.coinbase && tip_.height+1 <= e.height + COINBASE_MATURITY){ err="immature coinbase"; return false; }
             if(hash160(inx.pubkey)!=e.pkh){ err="pkh mismatch"; return false; }
             if(!crypto::ECDSA::verify(inx.pubkey, hash, inx.sig)){ err="bad signature"; return false; }
         #if MIQ_RULE_ENFORCE_LOW_S
@@ -1720,7 +1785,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
     g_undo[hk(tip_.hash)] = std::move(undo);
 
     // Also cache the full header for serving to peers
-    g_header_full[hk(new_hash)] = b.header;
+    set_header_full(hk(new_hash), b.header);  // THREAD-SAFE
 
     // Prune old undo if beyond window
     if (tip_.height >= UNDO_WINDOW) {

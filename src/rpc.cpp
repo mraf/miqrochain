@@ -1160,6 +1160,9 @@ std::string RpcService::handle(const std::string& body){
                 return err(std::string("submitblock: rejected: ")+e);
             }
 
+            // CRITICAL FIX: Notify mempool to remove confirmed transactions
+            mempool_.on_block_connect(b);
+
             // Build a small success object
             std::map<std::string,JNode> o;
             o["accepted"] = jbool(true);
@@ -1488,7 +1491,10 @@ std::string RpcService::handle(const std::string& body){
             uint64_t timeout_s = 300;
             if (params.size() >= 2) {
                 if (std::holds_alternative<double>(params[1].v)) {
-                    timeout_s = (uint64_t)std::get<double>(params[1].v);
+                    // SECURITY FIX: Validate double before casting to uint64_t
+                    double dval = std::get<double>(params[1].v);
+                    if (dval < 0.0 || dval > 86400.0 * 365.0) return err("invalid timeout");
+                    timeout_s = (uint64_t)dval;
                 } else if (std::holds_alternative<std::string>(params[1].v)) {
                     try { timeout_s = (uint64_t)std::stoull(std::get<std::string>(params[1].v)); }
                     catch(...) { return err("bad timeout"); }
@@ -1659,7 +1665,10 @@ std::string RpcService::handle(const std::string& body){
             uint64_t feerate = MIN_RELAY_FEE_RATE;
             if (params.size() >= 3) {
                 if (std::holds_alternative<double>(params[2].v)) {
-                    feerate = (uint64_t)std::get<double>(params[2].v);
+                    // SECURITY FIX: Validate double before casting to uint64_t
+                    double dval = std::get<double>(params[2].v);
+                    if (dval < 0.0 || dval > (double)UINT64_MAX) return err("invalid feerate");
+                    feerate = (uint64_t)dval;
                 } else if (std::holds_alternative<std::string>(params[2].v)) {
                     try { feerate = (uint64_t)std::stoull(std::get<std::string>(params[2].v)); }
                     catch(...) { return err("bad feerate"); }
