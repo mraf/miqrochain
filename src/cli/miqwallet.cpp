@@ -80,6 +80,16 @@ namespace wallet_config {
     static constexpr int MAX_BROADCAST_ATTEMPTS = 15;
     static constexpr int CONFIRMATION_TARGET = 6;
 
+    // CRITICAL FIX: Pending transaction timeout (30 minutes)
+    // If a transaction hasn't been confirmed within this time, release the UTXOs
+    static constexpr int PENDING_TIMEOUT_MINUTES = 30;
+    static constexpr int64_t PENDING_TIMEOUT_SECONDS = PENDING_TIMEOUT_MINUTES * 60;
+
+    // CRITICAL FIX: Rebroadcast interval for unconfirmed transactions
+    // Transactions with "broadcast" status should be rebroadcast periodically
+    static constexpr int REBROADCAST_INTERVAL_MINUTES = 10;
+    static constexpr int64_t REBROADCAST_INTERVAL_SECONDS = REBROADCAST_INTERVAL_MINUTES * 60;
+
     // Animation timings (PowerShell 5+ compatible)
     static constexpr int ANIMATION_FRAME_MS = 80;
     static constexpr int FAST_ANIMATION_MS = 50;
@@ -1064,7 +1074,7 @@ static void verify_cache_ownership(const std::string& wdir,
 }
 
 // =============================================================================
-// PENDING-SPENT CACHE
+// PENDING-SPENT CACHE - Enhanced with timestamps for timeout support
 // =============================================================================
 struct OutpointKey {
     std::string txid_hex;
@@ -1075,8 +1085,88 @@ struct OutpointKey {
     }
 };
 
+// CRITICAL FIX: Timestamped pending entry for timeout support
+struct PendingEntry {
+    OutpointKey key;
+    int64_t timestamp{0};       // When this was marked as pending
+    std::string source_txid;    // The TX that is spending this UTXO (for tracking)
+
+    bool operator<(const PendingEntry& o) const {
+        return key < o.key;
+    }
+
+    // Check if this pending entry has timed out
+    bool is_timed_out(int64_t now = 0) const {
+        if (now == 0) now = (int64_t)time(nullptr);
+        return (now - timestamp) > wallet_config::PENDING_TIMEOUT_SECONDS;
+    }
+};
+
+// Map from OutpointKey to PendingEntry for fast lookups
+static std::map<OutpointKey, PendingEntry> g_pending_map;
+
 static std::string pending_file_path_for_wdir(const std::string& wdir){
     return join_path(wdir, "pending_spent.dat");
+}
+
+// CRITICAL FIX: Enhanced load_pending with timestamp support
+static void load_pending_enhanced(const std::string& wdir, std::set<OutpointKey>& out, std::map<OutpointKey, PendingEntry>& pending_map){
+    out.clear();
+    pending_map.clear();
+    std::ifstream f(pending_file_path_for_wdir(wdir));
+    if(!f.good()) return;
+    std::string line;
+    int64_t now = (int64_t)time(nullptr);
+    while(std::getline(f,line)){
+        if(line.empty()) continue;
+        // Format: txid_hex:vout:timestamp:source_txid
+        // OR legacy format: txid_hex:vout
+        std::vector<std::string> parts;
+        std::stringstream ss(line);
+        std::string part;
+        while(std::getline(ss, part, ':')){
+            parts.push_back(part);
+        }
+        if(parts.size() < 2) continue;
+
+        PendingEntry entry;
+        entry.key.txid_hex = parts[0];
+        entry.key.vout = (uint32_t)std::strtoul(parts[1].c_str(), nullptr, 10);
+
+        // Parse timestamp if present (new format), otherwise use current time
+        if(parts.size() >= 3 && !parts[2].empty()){
+            entry.timestamp = (int64_t)std::strtoll(parts[2].c_str(), nullptr, 10);
+        } else {
+            entry.timestamp = now; // Legacy entry - set to now
+        }
+
+        // Parse source txid if present
+        if(parts.size() >= 4){
+            entry.source_txid = parts[3];
+        }
+
+        // CRITICAL: Skip timed-out entries when loading
+        if(!entry.is_timed_out(now)){
+            out.insert(entry.key);
+            pending_map[entry.key] = entry;
+        }
+    }
+}
+
+// CRITICAL FIX: Enhanced save_pending with timestamp support
+static void save_pending_enhanced(const std::string& wdir, const std::set<OutpointKey>& st, const std::map<OutpointKey, PendingEntry>& pending_map){
+    std::ofstream f(pending_file_path_for_wdir(wdir), std::ios::out | std::ios::trunc);
+    if(!f.good()) return;
+    for(const auto& k : st){
+        auto it = pending_map.find(k);
+        if(it != pending_map.end()){
+            // New format with timestamp and source txid
+            f << k.txid_hex << ":" << k.vout << ":" << it->second.timestamp << ":" << it->second.source_txid << "\n";
+        } else {
+            // Fallback: entry without metadata (shouldn't happen)
+            f << k.txid_hex << ":" << k.vout << ":" << (int64_t)time(nullptr) << ":\n";
+        }
+    }
 }
 
 // =============================================================================
@@ -3401,26 +3491,54 @@ static std::string metrics_file_path(const std::string& wdir){
 // END OF PROFESSIONAL WALLET UPGRADE v1.0
 // =============================================================================
 
+// LEGACY WRAPPERS: These now use the enhanced versions with timestamps
 static void load_pending(const std::string& wdir, std::set<OutpointKey>& out){
-    out.clear();
-    std::ifstream f(pending_file_path_for_wdir(wdir));
-    if(!f.good()) return;
-    std::string line;
-    while(std::getline(f,line)){
-        if(line.empty()) continue;
-        size_t c = line.find(':'); if(c==std::string::npos) continue;
-        OutpointKey k; k.txid_hex = line.substr(0,c);
-        k.vout = (uint32_t)std::strtoul(line.c_str()+c+1, nullptr, 10);
-        out.insert(k);
-    }
+    load_pending_enhanced(wdir, out, g_pending_map);
 }
 
 static void save_pending(const std::string& wdir, const std::set<OutpointKey>& st){
-    std::ofstream f(pending_file_path_for_wdir(wdir), std::ios::out | std::ios::trunc);
-    if(!f.good()) return;
-    for(const auto& k : st){
-        f << k.txid_hex << ":" << k.vout << "\n";
+    save_pending_enhanced(wdir, st, g_pending_map);
+}
+
+// CRITICAL FIX: Add a pending entry with timestamp tracking
+static void add_pending_entry(const OutpointKey& key, const std::string& source_txid, std::set<OutpointKey>& pending){
+    PendingEntry entry;
+    entry.key = key;
+    entry.timestamp = (int64_t)time(nullptr);
+    entry.source_txid = source_txid;
+    pending.insert(key);
+    g_pending_map[key] = entry;
+}
+
+// CRITICAL FIX: Check and cleanup timed-out pending entries
+static int cleanup_timed_out_pending(std::set<OutpointKey>& pending, const std::string& wdir){
+    int64_t now = (int64_t)time(nullptr);
+    int cleaned = 0;
+    std::vector<OutpointKey> to_remove;
+
+    for(const auto& k : pending){
+        auto it = g_pending_map.find(k);
+        if(it != g_pending_map.end()){
+            if(it->second.is_timed_out(now)){
+                to_remove.push_back(k);
+            }
+        } else {
+            // Entry without timestamp metadata - check if it's very old (legacy cleanup)
+            // Give it benefit of doubt - assume it was just added
+        }
     }
+
+    for(const auto& k : to_remove){
+        pending.erase(k);
+        g_pending_map.erase(k);
+        cleaned++;
+    }
+
+    if(cleaned > 0){
+        save_pending(wdir, pending);
+    }
+
+    return cleaned;
 }
 
 // Forward declaration for pending management functions (defined after QueuedTransaction)
@@ -3712,12 +3830,24 @@ static void add_to_tx_queue(const std::string& wdir, const QueuedTransaction& tx
     queue.push_back(tx);
 
     // Keep only recent transactions (remove expired)
+    // CRITICAL FIX: "broadcast" status should NOT be kept forever - only "confirmed"
+    // A transaction with "broadcast" status that hasn't been confirmed after expiry
+    // should be considered expired (it was probably dropped from mempool)
     int64_t now = (int64_t)time(nullptr);
     int64_t expiry_seconds = wallet_config::TX_EXPIRY_HOURS * 3600;
 
     std::vector<QueuedTransaction> filtered;
     for(const auto& q : queue){
-        if(now - q.created_at < expiry_seconds || q.status == "confirmed" || q.status == "broadcast"){
+        bool keep = false;
+        if(q.status == "confirmed"){
+            // Confirmed transactions are always kept (they're historical record)
+            keep = true;
+        } else if(now - q.created_at < expiry_seconds){
+            // Non-expired transactions are kept
+            keep = true;
+        }
+        // Note: "broadcast" status but expired = NOT kept (it was never confirmed)
+        if(keep){
             filtered.push_back(q);
         }
     }
@@ -3877,8 +4007,53 @@ static bool remove_inputs_from_pending(const std::string& wdir,
                                       std::set<OutpointKey>& pending) {
     int count = (int)pending.size();
     pending.clear();
+    g_pending_map.clear();
     save_pending(wdir, pending);
     return count;
+}
+
+// CRITICAL FIX: Recover stuck transactions - release pending UTXOs for
+// transactions that have been "broadcast" but never confirmed after timeout
+static int recover_stuck_transactions(const std::string& wdir,
+                                       std::set<OutpointKey>& pending,
+                                       bool verbose = true) {
+    std::vector<QueuedTransaction> queue;
+    load_tx_queue(wdir, queue);
+
+    int64_t now = (int64_t)time(nullptr);
+    int64_t stuck_threshold = wallet_config::PENDING_TIMEOUT_SECONDS * 2; // 1 hour
+    int recovered = 0;
+
+    for(auto& tx : queue){
+        // Check for stuck "broadcast" transactions
+        if(tx.status == "broadcast"){
+            int64_t age = now - tx.created_at;
+            if(age > stuck_threshold){
+                // This transaction was broadcast but never confirmed for too long
+                if(verbose){
+                    ui::print_warning("Recovering stuck TX " + tx.txid_hex.substr(0, 16) +
+                                     "... (age: " + std::to_string(age / 3600) + " hours)");
+                }
+
+                // Release the pending UTXOs
+                if(!tx.raw_tx.empty()){
+                    remove_inputs_from_pending(wdir, tx.raw_tx, pending);
+                }
+
+                // Mark as expired
+                tx.status = "expired";
+                tx.error_msg = "Transaction never confirmed - inputs recovered";
+                recovered++;
+            }
+        }
+    }
+
+    if(recovered > 0){
+        save_tx_queue(wdir, queue);
+        save_pending(wdir, pending);
+    }
+
+    return recovered;
 }
 
 // =============================================================================
@@ -4595,8 +4770,22 @@ static int process_tx_queue(
     int64_t now = (int64_t)time(nullptr);
 
     for(auto& tx : queue){
-        // Skip if not queued or already too many attempts
-        if(tx.status != "queued" && tx.status != "broadcasting") continue;
+        // CRITICAL FIX: Also rebroadcast "broadcast" status transactions that haven't been
+        // confirmed for a while. They may have been dropped from mempool.
+        bool needs_rebroadcast = false;
+        if(tx.status == "broadcast"){
+            // Check if it's been too long since last attempt without confirmation
+            int64_t since_last = now - tx.last_attempt;
+            if(since_last >= wallet_config::REBROADCAST_INTERVAL_SECONDS){
+                needs_rebroadcast = true;
+                if(verbose){
+                    ui::print_info("Rebroadcasting unconfirmed TX " + tx.txid_hex.substr(0, 8) + "...");
+                }
+            }
+        }
+
+        // Skip if not queued, broadcasting, or needs rebroadcast
+        if(tx.status != "queued" && tx.status != "broadcasting" && !needs_rebroadcast) continue;
 
         if(tx.broadcast_attempts >= wallet_config::MAX_BROADCAST_ATTEMPTS){
             tx.status = "failed";
@@ -4901,22 +5090,45 @@ static bool wallet_session(const std::string& cli_host,
             utxos = std::move(deduped);
         }
 
-        // Prune pending entries that are no longer in current UTXOs (already spent/confirmed)
+        // CRITICAL FIX: Enhanced pending cleanup with timeout support
+        // 1. Remove pending entries for confirmed transactions (UTXO no longer exists)
+        // 2. Remove pending entries that have timed out (transaction never confirmed)
         {
             std::set<OutpointKey> cur;
             for(const auto& u : utxos) cur.insert(OutpointKey{ miq::to_hex(u.txid), u.vout });
-            size_t before_prune = pending.size();
+
+            // First: Remove entries for spent/confirmed UTXOs
+            size_t confirmed_count = 0;
             for(auto it = pending.begin(); it != pending.end(); ){
-                if(cur.find(*it) == cur.end()) it = pending.erase(it);
-                else ++it;
-            }
-            if(pending.size() != before_prune){
-                // Some pending transactions were confirmed
-                size_t confirmed = before_prune - pending.size();
-                if(confirmed > 0){
-                    ui::print_info(std::to_string(confirmed) + " pending transaction(s) confirmed");
+                if(cur.find(*it) == cur.end()){
+                    // UTXO no longer exists = transaction was confirmed and UTXO was spent
+                    g_pending_map.erase(*it);
+                    it = pending.erase(it);
+                    confirmed_count++;
+                } else {
+                    ++it;
                 }
             }
+
+            // Second: CRITICAL FIX - Remove timed-out entries
+            // If a pending entry has been waiting too long without the UTXO disappearing,
+            // the transaction was likely never accepted or confirmed - release the UTXOs
+            int timed_out = cleanup_timed_out_pending(pending, wdir);
+
+            // Third: CRITICAL FIX - Recover stuck transactions
+            // Transactions with "broadcast" status that haven't been confirmed for too long
+            int recovered = recover_stuck_transactions(wdir, pending, false);
+
+            if(confirmed_count > 0){
+                ui::print_info(std::to_string(confirmed_count) + " pending transaction(s) confirmed");
+            }
+            if(timed_out > 0){
+                ui::print_warning(std::to_string(timed_out) + " pending UTXO(s) released (transaction timeout)");
+            }
+            if(recovered > 0){
+                ui::print_warning(std::to_string(recovered) + " stuck transaction(s) recovered - inputs released");
+            }
+
             save_pending(wdir, pending);
         }
 
@@ -5018,7 +5230,10 @@ static bool wallet_session(const std::string& cli_host,
         // =============================================================
         // PROFESSIONAL WALLET DASHBOARD v4.0
         // Enhanced window-style UI with recent transactions
+        // CRITICAL FIX: Clear screen to prevent scrolling - single screen UI
         // =============================================================
+        ui::clear_screen();  // CRITICAL FIX: Single screen, no scrolling
+
         const int WIN_WIDTH = 72;
 
         std::cout << "\n";
@@ -5923,9 +6138,10 @@ static bool wallet_session(const std::string& cli_host,
 
             bool broadcast_success = broadcast_any_seed(seeds_b, raw, used_bcast_seed, berr);
 
-            // Update pending cache regardless of broadcast success
+            // CRITICAL FIX: Update pending cache with timestamps for timeout tracking
             for(const auto& in : tx.vin){
-                pending.insert(OutpointKey{ miq::to_hex(in.prev.txid), in.prev.vout });
+                OutpointKey k{ miq::to_hex(in.prev.txid), in.prev.vout };
+                add_pending_entry(k, txid_hex, pending);
             }
             save_pending(wdir, pending);
 
@@ -6975,9 +7191,10 @@ static bool wallet_session(const std::string& cli_host,
 
             bool broadcast_success = broadcast_any_seed(seeds, raw, used_bcast_seed, berr);
 
-            // Mark inputs as pending
+            // CRITICAL FIX: Mark inputs as pending with timestamps for timeout tracking
             for(const auto& in : cons_tx.vin){
-                pending.insert(OutpointKey{ miq::to_hex(in.prev.txid), in.prev.vout });
+                OutpointKey k{ miq::to_hex(in.prev.txid), in.prev.vout };
+                add_pending_entry(k, txid_hex, pending);
             }
             save_pending(wdir, pending);
 
@@ -7764,8 +7981,10 @@ int main(int argc, char** argv){
     if(seeds.size() > 3) std::cout << " (+" << (seeds.size() - 3) << " more)";
     std::cout << "\n";
 
-    // Main menu loop
+    // Main menu loop - CRITICAL FIX: Clear screen to prevent scrolling
     for(;;){
+        ui::clear_screen();  // CRITICAL FIX: Single screen, no scrolling
+
         std::cout << "\n";
         ui::print_separator(50);
         std::cout << "\n";
