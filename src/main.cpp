@@ -2050,6 +2050,734 @@ private:
     }
 
     // =========================================================================
+    // PREMIUM TUI COMPONENT SYSTEM - Professional visualization library
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // COLOR PALETTE - Professional color scheme for consistent branding
+    // -------------------------------------------------------------------------
+    struct ColorPalette {
+        static constexpr int PRIMARY = 51;      // Bright cyan - main brand color
+        static constexpr int SECONDARY = 39;    // Blue - secondary actions
+        static constexpr int ACCENT = 214;      // Orange - highlights
+        static constexpr int SUCCESS = 46;      // Green - positive states
+        static constexpr int WARNING = 226;     // Yellow - caution
+        static constexpr int ERROR = 196;       // Red - errors
+        static constexpr int INFO = 87;         // Light cyan - information
+        static constexpr int MUTED = 240;       // Gray - disabled/secondary text
+        static constexpr int BORDER = 27;       // Dark blue - borders
+        static constexpr int TEXT = 252;        // Light gray - main text
+        static constexpr int TEXT_DIM = 245;    // Dimmer text
+        static constexpr int BG_DARK = 235;     // Dark background
+        static constexpr int BG_PANEL = 236;    // Panel background
+    };
+
+    // -------------------------------------------------------------------------
+    // WINDOW FRAME - Professional window with title, shadow, and animations
+    // -------------------------------------------------------------------------
+    struct WindowFrame {
+        std::string title;
+        std::string icon;
+        int x, y, width, height;
+        int border_color;
+        bool has_shadow;
+        bool animate_border;
+        int animation_phase;
+
+        WindowFrame(const std::string& t, const std::string& ico, int w, int h)
+            : title(t), icon(ico), x(0), y(0), width(w), height(h),
+              border_color(ColorPalette::BORDER), has_shadow(true),
+              animate_border(true), animation_phase(0) {}
+    };
+
+    // Draw a professional window frame with optional shadow and animation
+    std::string draw_window_frame(const WindowFrame& wf, int tick) const {
+        std::ostringstream out;
+        int w = wf.width;
+
+        if (!vt_ok_) {
+            // ASCII fallback
+            out << "+" << std::string(w - 2, '-') << "+\n";
+            out << "| " << wf.title << std::string(w - 4 - (int)wf.title.size(), ' ') << " |\n";
+            out << "+" << std::string(w - 2, '-') << "+\n";
+            return out.str();
+        }
+
+        // Shadow effect (rendered first, offset)
+        if (wf.has_shadow && u8_ok_) {
+            out << "\x1b[38;5;235m ";
+            for (int i = 0; i < w; ++i) out << "▄";
+            out << "\n";
+        }
+
+        // Top border with animation
+        out << "\x1b[38;5;" << wf.border_color << "m";
+        if (u8_ok_) {
+            out << "╭";
+            for (int i = 0; i < w - 2; ++i) {
+                if (wf.animate_border) {
+                    int pulse = (tick + i) % 20;
+                    int c = (pulse < 10) ? wf.border_color + (pulse % 5) : wf.border_color + (10 - pulse % 5);
+                    out << "\x1b[38;5;" << c << "m─";
+                } else {
+                    out << "─";
+                }
+            }
+            out << "\x1b[38;5;" << wf.border_color << "m╮";
+        } else {
+            out << "+" << std::string(w - 2, '-') << "+";
+        }
+        out << "\x1b[0m";
+        if (wf.has_shadow) out << "\x1b[38;5;235m▐\x1b[0m";
+        out << "\n";
+
+        // Title bar
+        out << "\x1b[38;5;" << wf.border_color << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m";
+        out << "\x1b[48;5;" << ColorPalette::BG_PANEL << "m";
+
+        // Icon with glow effect
+        if (!wf.icon.empty() && u8_ok_) {
+            int icon_color = (tick % 4 < 2) ? ColorPalette::PRIMARY : ColorPalette::SECONDARY;
+            out << " \x1b[38;5;" << icon_color << "m" << wf.icon << "\x1b[0m";
+            out << "\x1b[48;5;" << ColorPalette::BG_PANEL << "m";
+        }
+
+        // Title with gradient
+        out << " \x1b[38;5;255m\x1b[1m" << wf.title << "\x1b[0m";
+        out << "\x1b[48;5;" << ColorPalette::BG_PANEL << "m";
+
+        // Fill rest of title bar
+        int title_len = (int)wf.title.size() + (wf.icon.empty() ? 2 : 4 + (int)wf.icon.size());
+        out << std::string(w - 2 - title_len, ' ');
+        out << "\x1b[0m\x1b[38;5;" << wf.border_color << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m";
+        if (wf.has_shadow) out << "\x1b[38;5;235m▐\x1b[0m";
+        out << "\n";
+
+        // Separator under title
+        out << "\x1b[38;5;" << wf.border_color << "m" << (u8_ok_ ? "├" : "+");
+        for (int i = 0; i < w - 2; ++i) out << (u8_ok_ ? "─" : "-");
+        out << (u8_ok_ ? "┤" : "+") << "\x1b[0m";
+        if (wf.has_shadow) out << "\x1b[38;5;235m▐\x1b[0m";
+        out << "\n";
+
+        return out.str();
+    }
+
+    // Draw window content area row
+    std::string draw_window_row(const std::string& content, int width, int border_color, bool has_shadow) const {
+        std::ostringstream out;
+        if (!vt_ok_) {
+            out << "| " << content;
+            int pad = width - 4 - visible_length(content);
+            if (pad > 0) out << std::string(pad, ' ');
+            out << " |\n";
+            return out.str();
+        }
+
+        out << "\x1b[38;5;" << border_color << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m";
+        out << "\x1b[48;5;" << ColorPalette::BG_PANEL << "m ";
+        out << content;
+        int vis_len = visible_length(content);
+        int pad = width - 4 - vis_len;
+        if (pad > 0) out << std::string(pad, ' ');
+        out << " \x1b[0m";
+        out << "\x1b[38;5;" << border_color << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m";
+        if (has_shadow) out << "\x1b[38;5;235m▐\x1b[0m";
+        out << "\n";
+        return out.str();
+    }
+
+    // Draw window bottom border
+    std::string draw_window_bottom(int width, int border_color, bool has_shadow, int tick, bool animate) const {
+        std::ostringstream out;
+        if (!vt_ok_) {
+            out << "+" << std::string(width - 2, '-') << "+\n";
+            return out.str();
+        }
+
+        out << "\x1b[38;5;" << border_color << "m";
+        if (u8_ok_) {
+            out << "╰";
+            for (int i = 0; i < width - 2; ++i) {
+                if (animate) {
+                    int pulse = (tick + i) % 20;
+                    int c = (pulse < 10) ? border_color + (pulse % 5) : border_color + (10 - pulse % 5);
+                    out << "\x1b[38;5;" << c << "m─";
+                } else {
+                    out << "─";
+                }
+            }
+            out << "\x1b[38;5;" << border_color << "m╯";
+        } else {
+            out << "+" << std::string(width - 2, '-') << "+";
+        }
+        out << "\x1b[0m";
+        if (has_shadow) out << "\x1b[38;5;235m▐\x1b[0m";
+        out << "\n";
+
+        // Shadow bottom
+        if (has_shadow && u8_ok_) {
+            out << " \x1b[38;5;235m";
+            for (int i = 0; i < width; ++i) out << "▀";
+            out << "\x1b[0m\n";
+        }
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // GAUGE - Animated circular/arc gauge for metrics
+    // -------------------------------------------------------------------------
+    std::string draw_gauge(double value, double max_val, int width, const std::string& label,
+                           int color_low, int color_mid, int color_high, int tick) const {
+        if (width < 10) width = 10;
+        double pct = (max_val > 0) ? (value / max_val) : 0;
+        if (pct < 0) pct = 0;
+        if (pct > 1) pct = 1;
+
+        std::ostringstream out;
+
+        if (!vt_ok_ || !u8_ok_) {
+            // ASCII fallback
+            int filled = (int)(pct * (width - 2));
+            out << "[";
+            for (int i = 0; i < width - 2; ++i) {
+                out << (i < filled ? "#" : ".");
+            }
+            out << "] " << (int)(pct * 100) << "%";
+            return out.str();
+        }
+
+        // Determine color based on value
+        int color;
+        if (pct < 0.33) color = color_low;
+        else if (pct < 0.66) color = color_mid;
+        else color = color_high;
+
+        // Animated gauge with gradient fill
+        int inner = width - 4;
+        int filled = (int)(pct * inner);
+
+        out << "\x1b[38;5;240m⟨\x1b[0m";
+        for (int i = 0; i < inner; ++i) {
+            if (i < filled) {
+                // Gradient from low to high color
+                int grad_color = color_low + (int)((double)i / inner * (color_high - color_low));
+                // Add shimmer effect
+                bool shimmer = ((i + tick) % 6 == 0);
+                if (shimmer) grad_color = 255;
+                out << "\x1b[38;5;" << grad_color << "m█\x1b[0m";
+            } else if (i == filled && pct < 1.0) {
+                // Animated edge
+                static const char* edge_chars[] = {"░", "▒", "▓", "█", "▓", "▒"};
+                out << "\x1b[38;5;" << color << "m" << edge_chars[tick % 6] << "\x1b[0m";
+            } else {
+                out << "\x1b[38;5;236m░\x1b[0m";
+            }
+        }
+        out << "\x1b[38;5;240m⟩\x1b[0m";
+
+        // Percentage with color
+        out << " \x1b[38;5;" << color << "m\x1b[1m" << (int)(pct * 100) << "%\x1b[0m";
+
+        if (!label.empty()) {
+            out << " \x1b[38;5;245m" << label << "\x1b[0m";
+        }
+
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // SPARKLINE GRAPH - Mini line graph for trends
+    // -------------------------------------------------------------------------
+    std::string draw_sparkline(const std::vector<double>& data, int width, int color, bool show_minmax) const {
+        if (data.empty() || width < 3) {
+            return vt_ok_ ? "\x1b[38;5;240m(no data)\x1b[0m" : "(no data)";
+        }
+
+        std::ostringstream out;
+
+        if (!u8_ok_) {
+            // ASCII fallback
+            double max_v = *std::max_element(data.begin(), data.end());
+            double min_v = *std::min_element(data.begin(), data.end());
+            double range = max_v - min_v;
+            if (range < 0.001) range = 1;
+
+            for (size_t i = 0; i < std::min(data.size(), (size_t)width); ++i) {
+                double norm = (data[i] - min_v) / range;
+                if (norm < 0.25) out << "_";
+                else if (norm < 0.5) out << "-";
+                else if (norm < 0.75) out << "=";
+                else out << "#";
+            }
+            return out.str();
+        }
+
+        // Unicode sparkline characters (8 levels)
+        static const char* sparks[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+
+        double max_v = *std::max_element(data.begin(), data.end());
+        double min_v = *std::min_element(data.begin(), data.end());
+        double range = max_v - min_v;
+        if (range < 0.001) range = 1;
+
+        if (vt_ok_) out << "\x1b[38;5;" << color << "m";
+
+        size_t start = (data.size() > (size_t)width) ? data.size() - width : 0;
+        for (size_t i = start; i < data.size(); ++i) {
+            double norm = (data[i] - min_v) / range;
+            int level = (int)(norm * 7.999);
+            if (level < 0) level = 0;
+            if (level > 7) level = 7;
+
+            // Color gradient based on value
+            if (vt_ok_) {
+                int c = color - (7 - level) * 2;
+                if (c < 16) c = 16;
+                out << "\x1b[38;5;" << c << "m";
+            }
+            out << sparks[level];
+        }
+
+        if (vt_ok_) out << "\x1b[0m";
+
+        // Min/max labels
+        if (show_minmax && vt_ok_) {
+            out << " \x1b[38;5;240m[" << std::fixed << std::setprecision(1) << min_v
+                << "-" << max_v << "]\x1b[0m";
+        }
+
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // PROGRESS RING - Circular progress indicator
+    // -------------------------------------------------------------------------
+    std::string draw_progress_ring(double pct, int tick) const {
+        if (!u8_ok_) {
+            return "[" + std::to_string((int)(pct * 100)) + "%]";
+        }
+
+        std::ostringstream out;
+
+        // 8 segments for the ring
+        static const char* segments[] = {"◜", "◝", "◞", "◟", "◠", "◡", "◜", "◝"};
+        int filled = (int)(pct * 8);
+
+        if (vt_ok_) {
+            // Animated spinning effect
+            int anim_offset = tick % 8;
+            for (int i = 0; i < 8; ++i) {
+                int seg_idx = (i + anim_offset) % 8;
+                if (i < filled) {
+                    out << "\x1b[38;5;" << ColorPalette::SUCCESS << "m";
+                } else {
+                    out << "\x1b[38;5;236m";
+                }
+                out << segments[seg_idx];
+            }
+            out << "\x1b[0m";
+        } else {
+            for (int i = 0; i < 8; ++i) {
+                out << segments[i];
+            }
+        }
+
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // METRICS ROW - Formatted metric with label, value, and optional trend
+    // -------------------------------------------------------------------------
+    std::string draw_metric(const std::string& label, const std::string& value,
+                            int value_color, const std::string& trend = "") const {
+        std::ostringstream out;
+
+        if (!vt_ok_) {
+            out << label << ": " << value;
+            if (!trend.empty()) out << " " << trend;
+            return out.str();
+        }
+
+        // Label (dimmed)
+        out << "\x1b[38;5;" << ColorPalette::TEXT_DIM << "m" << label << "\x1b[0m";
+
+        // Spacing
+        int label_len = (int)label.size();
+        int pad = 14 - label_len;
+        if (pad > 0) out << std::string(pad, ' ');
+
+        // Value (colored)
+        out << "\x1b[38;5;" << value_color << "m\x1b[1m" << value << "\x1b[0m";
+
+        // Trend indicator
+        if (!trend.empty()) {
+            out << " \x1b[38;5;240m" << trend << "\x1b[0m";
+        }
+
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // STATUS INDICATOR - Animated status dot with label
+    // -------------------------------------------------------------------------
+    std::string draw_status(const std::string& label, bool ok, int tick, bool animate = true) const {
+        std::ostringstream out;
+
+        if (!vt_ok_) {
+            out << (ok ? "[OK]" : "[--]") << " " << label;
+            return out.str();
+        }
+
+        if (ok) {
+            // Pulsing green dot
+            if (animate && u8_ok_) {
+                static const int pulse_colors[] = {46, 47, 48, 49, 48, 47};
+                int c = pulse_colors[tick % 6];
+                out << "\x1b[38;5;" << c << "m●\x1b[0m";
+            } else {
+                out << "\x1b[38;5;" << ColorPalette::SUCCESS << "m" << (u8_ok_ ? "●" : "*") << "\x1b[0m";
+            }
+        } else {
+            // Static gray dot
+            out << "\x1b[38;5;" << ColorPalette::MUTED << "m" << (u8_ok_ ? "○" : "o") << "\x1b[0m";
+        }
+
+        out << " \x1b[38;5;" << ColorPalette::TEXT << "m" << label << "\x1b[0m";
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // NETWORK SIGNAL - Signal strength indicator
+    // -------------------------------------------------------------------------
+    std::string draw_signal(int strength, int max_strength, int tick) const {
+        if (!u8_ok_) {
+            std::string bars = "";
+            for (int i = 0; i < max_strength; ++i) {
+                bars += (i < strength) ? "|" : ".";
+            }
+            return "[" + bars + "]";
+        }
+
+        std::ostringstream out;
+        static const char* levels[] = {"▁", "▂", "▃", "▅", "▇"};
+
+        for (int i = 0; i < max_strength; ++i) {
+            if (i < strength) {
+                // Color based on signal strength
+                int color;
+                double ratio = (double)strength / max_strength;
+                if (ratio > 0.66) color = ColorPalette::SUCCESS;
+                else if (ratio > 0.33) color = ColorPalette::WARNING;
+                else color = ColorPalette::ERROR;
+
+                // Add shimmer animation
+                bool shimmer = (i == strength - 1) && (tick % 4 < 2);
+                if (shimmer && vt_ok_) color = 255;
+
+                if (vt_ok_) out << "\x1b[38;5;" << color << "m";
+                out << levels[i % 5];
+                if (vt_ok_) out << "\x1b[0m";
+            } else {
+                if (vt_ok_) out << "\x1b[38;5;236m";
+                out << "▁";
+                if (vt_ok_) out << "\x1b[0m";
+            }
+        }
+
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // BLOCK VISUALIZATION - Block with hash preview
+    // -------------------------------------------------------------------------
+    std::string draw_block_mini(uint64_t height, const std::string& hash, int txs, int tick) const {
+        std::ostringstream out;
+
+        if (!u8_ok_) {
+            out << "#" << height << " " << short_hex(hash, 8) << " " << txs << "tx";
+            return out.str();
+        }
+
+        // Block icon with animation
+        bool highlight = (tick % 8 < 2);
+        int block_color = highlight ? ColorPalette::PRIMARY : ColorPalette::SECONDARY;
+
+        if (vt_ok_) {
+            out << "\x1b[38;5;" << block_color << "m◼\x1b[0m ";
+            out << "\x1b[38;5;" << ColorPalette::INFO << "m#" << height << "\x1b[0m ";
+            out << "\x1b[38;5;240m" << short_hex(hash, 8) << "\x1b[0m ";
+            out << "\x1b[38;5;" << ColorPalette::TEXT << "m" << txs << "tx\x1b[0m";
+        } else {
+            out << "# " << height << " " << short_hex(hash, 8) << " " << txs << "tx";
+        }
+
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // ANIMATED LOADING - Various loading animations
+    // -------------------------------------------------------------------------
+    std::string draw_loading(int style, int tick) const {
+        if (!u8_ok_) {
+            static const char* ascii_spin[] = {"|", "/", "-", "\\"};
+            return std::string("[") + ascii_spin[tick % 4] + "]";
+        }
+
+        std::ostringstream out;
+
+        switch (style) {
+            case 0: {
+                // Braille spinner
+                static const char* braille[] = {"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"};
+                if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::PRIMARY << "m";
+                out << braille[tick % 8];
+                break;
+            }
+            case 1: {
+                // Dots spinner
+                static const char* dots[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+                if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::ACCENT << "m";
+                out << dots[tick % 10];
+                break;
+            }
+            case 2: {
+                // Arc spinner
+                static const char* arcs[] = {"◜", "◠", "◝", "◞", "◡", "◟"};
+                if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::SUCCESS << "m";
+                out << arcs[tick % 6];
+                break;
+            }
+            case 3: {
+                // Block bounce
+                static const char* blocks[] = {"▖", "▘", "▝", "▗"};
+                if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::INFO << "m";
+                out << blocks[tick % 4];
+                break;
+            }
+            default: {
+                // Default braille
+                static const char* def[] = {"⠿", "⡿", "⣿", "⣷", "⣯", "⣟"};
+                if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::PRIMARY << "m";
+                out << def[tick % 6];
+            }
+        }
+
+        if (vt_ok_) out << "\x1b[0m";
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // HEAT MAP - Color intensity based on value
+    // -------------------------------------------------------------------------
+    std::string draw_heatmap_cell(double value, double max_val) const {
+        double pct = (max_val > 0) ? (value / max_val) : 0;
+        if (pct < 0) pct = 0;
+        if (pct > 1) pct = 1;
+
+        if (!u8_ok_) {
+            if (pct < 0.25) return ".";
+            if (pct < 0.5) return "o";
+            if (pct < 0.75) return "O";
+            return "#";
+        }
+
+        // Heat colors: blue -> cyan -> green -> yellow -> orange -> red
+        int color;
+        if (pct < 0.2) color = 21;       // Blue
+        else if (pct < 0.4) color = 39;  // Cyan
+        else if (pct < 0.6) color = 46;  // Green
+        else if (pct < 0.8) color = 226; // Yellow
+        else color = 196;                // Red
+
+        std::ostringstream out;
+        if (vt_ok_) out << "\x1b[38;5;" << color << "m";
+        out << "█";
+        if (vt_ok_) out << "\x1b[0m";
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // TREND ARROW - Direction indicator
+    // -------------------------------------------------------------------------
+    std::string draw_trend_arrow(double current, double previous) const {
+        if (!u8_ok_) {
+            if (current > previous * 1.01) return "^";
+            if (current < previous * 0.99) return "v";
+            return "=";
+        }
+
+        std::ostringstream out;
+        if (current > previous * 1.05) {
+            if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::SUCCESS << "m";
+            out << "▲▲";
+        } else if (current > previous * 1.01) {
+            if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::SUCCESS << "m";
+            out << "▲";
+        } else if (current < previous * 0.95) {
+            if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::ERROR << "m";
+            out << "▼▼";
+        } else if (current < previous * 0.99) {
+            if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::ERROR << "m";
+            out << "▼";
+        } else {
+            if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::MUTED << "m";
+            out << "━";
+        }
+        if (vt_ok_) out << "\x1b[0m";
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // BADGE - Styled label/tag
+    // -------------------------------------------------------------------------
+    std::string draw_badge(const std::string& text, int bg_color, int text_color) const {
+        std::ostringstream out;
+
+        if (!vt_ok_) {
+            return "[" + text + "]";
+        }
+
+        if (u8_ok_) {
+            out << "\x1b[48;5;" << bg_color << "m\x1b[38;5;" << text_color << "m";
+            out << " " << text << " ";
+            out << "\x1b[0m";
+        } else {
+            out << "\x1b[38;5;" << text_color << "m[" << text << "]\x1b[0m";
+        }
+
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // DIVIDER - Styled horizontal line
+    // -------------------------------------------------------------------------
+    std::string draw_divider(int width, int style, int color, int tick) const {
+        std::ostringstream out;
+
+        if (!vt_ok_) {
+            char c = (style == 0) ? '-' : (style == 1) ? '=' : '~';
+            return std::string(width, c);
+        }
+
+        out << "\x1b[38;5;" << color << "m";
+
+        switch (style) {
+            case 0: // Thin line
+                for (int i = 0; i < width; ++i) out << (u8_ok_ ? "─" : "-");
+                break;
+            case 1: // Thick line
+                for (int i = 0; i < width; ++i) out << (u8_ok_ ? "━" : "=");
+                break;
+            case 2: // Dotted
+                for (int i = 0; i < width; ++i) {
+                    out << (u8_ok_ ? ((i % 2 == 0) ? "·" : " ") : ".");
+                }
+                break;
+            case 3: // Animated gradient
+                for (int i = 0; i < width; ++i) {
+                    int pulse = (tick + i) % 10;
+                    int c = color + (pulse < 5 ? pulse : 10 - pulse);
+                    out << "\x1b[38;5;" << c << "m" << (u8_ok_ ? "═" : "=");
+                }
+                break;
+            default:
+                out << std::string(width, u8_ok_ ? *"─" : '-');
+        }
+
+        out << "\x1b[0m";
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // HEADER BANNER - Main title with effects
+    // -------------------------------------------------------------------------
+    std::string draw_header_banner(int width, int tick) const {
+        std::ostringstream out;
+
+        if (!vt_ok_ || !u8_ok_) {
+            out << "+" << std::string(width - 2, '=') << "+\n";
+            out << "| MIQROCHAIN NODE";
+            out << std::string(width - 20, ' ') << " |\n";
+            out << "+" << std::string(width - 2, '=') << "+\n";
+            return out.str();
+        }
+
+        // Animated top border
+        out << "\x1b[38;5;" << ColorPalette::BORDER << "m╔";
+        for (int i = 0; i < width - 2; ++i) {
+            int pulse = (tick + i) % 24;
+            int c;
+            if (pulse < 8) c = ColorPalette::BORDER + pulse;
+            else if (pulse < 16) c = ColorPalette::BORDER + (16 - pulse);
+            else c = ColorPalette::BORDER + (pulse - 16);
+            out << "\x1b[38;5;" << c << "m═";
+        }
+        out << "\x1b[38;5;" << ColorPalette::BORDER << "m╗\x1b[0m\n";
+
+        // Logo line with gradient animation
+        out << "\x1b[38;5;" << ColorPalette::BORDER << "m║\x1b[0m ";
+
+        // Animated logo
+        static const int logo_colors[] = {51, 50, 49, 48, 47, 46, 45, 44, 43, 42};
+        int lc = logo_colors[tick % 10];
+        out << "\x1b[38;5;" << lc << "m\x1b[1m◆ MIQROCHAIN\x1b[0m";
+
+        // Version
+        out << " \x1b[38;5;" << ColorPalette::MUTED << "mv" << MIQ_VERSION_MAJOR << "."
+            << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH << "\x1b[0m";
+
+        // Separator
+        out << " \x1b[38;5;240m│\x1b[0m ";
+
+        // Chain name
+        out << "\x1b[38;5;" << ColorPalette::INFO << "m" << CHAIN_NAME << "\x1b[0m";
+
+        // Separator
+        out << " \x1b[38;5;240m│\x1b[0m ";
+
+        // Animated spinner
+        out << draw_loading(0, tick);
+
+        // Separator
+        out << " \x1b[38;5;240m│\x1b[0m ";
+
+        // State badge
+        NodeState show_state = degraded_override_ ? NodeState::Degraded : nstate_;
+        switch (show_state) {
+            case NodeState::Starting:
+                out << draw_badge("STARTING", ColorPalette::ACCENT, 0);
+                break;
+            case NodeState::Syncing:
+                out << draw_badge("SYNCING", ColorPalette::ACCENT, 0);
+                break;
+            case NodeState::Running:
+                out << draw_badge("RUNNING", ColorPalette::SUCCESS, 0);
+                break;
+            case NodeState::Degraded:
+                out << draw_badge("DEGRADED", ColorPalette::ERROR, 255);
+                break;
+            case NodeState::Quitting:
+                out << draw_badge("SHUTDOWN", ColorPalette::WARNING, 0);
+                break;
+        }
+
+        // Miner badge if active
+        if (miner_running_badge()) {
+            out << " \x1b[38;5;240m│\x1b[0m " << draw_badge("⛏ MINING", ColorPalette::SUCCESS, 0);
+        }
+
+        // Pad to end
+        int content_len = 75 + (miner_running_badge() ? 15 : 0);
+        int pad = width - content_len - 2;
+        if (pad > 0) out << std::string(pad, ' ');
+
+        out << "\x1b[38;5;" << ColorPalette::BORDER << "m║\x1b[0m\n";
+
+        return out.str();
+    }
+
+    // =========================================================================
     // SPLASH SCREEN - ULTRA PROFESSIONAL sync display with premium animations
     // =========================================================================
 
