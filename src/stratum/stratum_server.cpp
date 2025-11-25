@@ -757,6 +757,8 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
             // Submit to chain
             std::string submit_err;
             if (chain_.submit_block(block, submit_err)) {
+                // CRITICAL FIX: Notify mempool to remove confirmed transactions
+                mempool_.on_block_connect(block);
                 log_info("Stratum: Block " + std::to_string(job.height) + " accepted!");
                 {
                     std::lock_guard<std::mutex> stats_lock(stats_mutex_);

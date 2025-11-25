@@ -2465,6 +2465,10 @@ static void miner_worker(Chain* chain, Mempool* mempool, P2P* p2p,
             try {
                 std::string err;
                 if (chain->submit_block(b, err)) {
+                    // CRITICAL FIX: Notify mempool to remove confirmed transactions
+                    if (mempool) {
+                        mempool->on_block_connect(b);
+                    }
                     std::string miner_addr = "(unknown)";
                     std::string cb_txid_hex = "(n/a)";
                     if (!b.txs.empty()) {

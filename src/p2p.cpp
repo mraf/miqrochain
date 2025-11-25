@@ -3163,6 +3163,11 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
     std::string err;
     if (chain_.submit_block(b, err)) {
+        // CRITICAL FIX: Notify mempool to remove confirmed transactions
+        // Without this, confirmed transactions stay in mempool forever!
+        if (mempool_) {
+            mempool_->on_block_connect(b);
+        }
         const std::string miner = miq_miner_from_block(b);
         std::string src_ip = "?";
         auto pit = peers_.find(sock);
@@ -3319,6 +3324,10 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
 
         std::string err;
         if (chain_.submit_block(ob, err)) {
+            // CRITICAL FIX: Notify mempool to remove confirmed transactions
+            if (mempool_) {
+                mempool_->on_block_connect(ob);
+            }
             const std::string miner = miq_miner_from_block(ob);
             log_info("P2P: accepted orphan as block height=" + std::to_string(chain_.height())
                      + " miner=" + miner

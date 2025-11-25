@@ -505,6 +505,11 @@ void Miner::run(){
             continue;
         }
 
+        // CRITICAL FIX: Notify mempool to remove confirmed transactions
+        if (p2p_ && p2p_->mempool()) {
+            p2p_->mempool()->on_block_connect(b);
+        }
+
         // Broadcast to peers as soon as the block is accepted locally.
         if (p2p_) {
             const auto bh = b.block_hash();

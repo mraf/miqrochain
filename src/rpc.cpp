@@ -1160,6 +1160,9 @@ std::string RpcService::handle(const std::string& body){
                 return err(std::string("submitblock: rejected: ")+e);
             }
 
+            // CRITICAL FIX: Notify mempool to remove confirmed transactions
+            mempool_.on_block_connect(b);
+
             // Build a small success object
             std::map<std::string,JNode> o;
             o["accepted"] = jbool(true);
