@@ -2074,22 +2074,37 @@ private:
         return color + pct_str + "\x1b[0m";
     }
 
-    // Get sync status string - fixed to show "synced" properly
-    std::string get_sync_status(uint64_t blocks_remaining, double sync_pct) const {
-        if (blocks_remaining == 0 || sync_pct >= 100.0) {
+    // Get sync status string - FIXED: Only show FULLY SYNCED when actually synced
+    // Must have: valid network height > 0, current height >= network height, and ibd_done_
+    std::string get_sync_status(uint64_t network_height, uint64_t current_height, bool is_done) const {
+        // CRITICAL: Only show FULLY SYNCED when:
+        // 1. We know the network height (network_height > 0)
+        // 2. We have actually synced to or past it (current_height >= network_height)
+        // 3. The IBD process is marked as done
+        if (is_done && network_height > 0 && current_height >= network_height) {
             if (vt_ok_) return std::string("\x1b[38;5;46m\x1b[1m") + (u8_ok_ ? "✓ " : "") + "FULLY SYNCED\x1b[0m";
             return "FULLY SYNCED";
         }
 
-        // Only show time behind if actually behind
-        std::string time_behind = fmt_time_behind(sync_last_block_time_);
-        if (time_behind == "synced") {
-            if (vt_ok_) return std::string("\x1b[38;5;46m") + (u8_ok_ ? "✓ " : "") + "Synchronized\x1b[0m";
-            return "Synchronized";
+        // If we don't have network height yet, we're still connecting
+        if (network_height == 0) {
+            if (vt_ok_) return std::string("\x1b[38;5;214m") + "Connecting to network..." + "\x1b[0m";
+            return "Connecting to network...";
         }
 
-        if (vt_ok_) return std::string("\x1b[38;5;214m") + time_behind + "\x1b[0m";
-        return time_behind;
+        // If we have blocks to sync, show progress
+        uint64_t blocks_remaining = (network_height > current_height) ? (network_height - current_height) : 0;
+        if (blocks_remaining > 0) {
+            double pct = (double)current_height / (double)network_height * 100.0;
+            std::ostringstream status;
+            status << std::fixed << std::setprecision(1) << pct << "% synced";
+            if (vt_ok_) return std::string("\x1b[38;5;214m") + status.str() + "\x1b[0m";
+            return status.str();
+        }
+
+        // Edge case: we have all blocks but IBD not marked done yet
+        if (vt_ok_) return std::string("\x1b[38;5;47m") + "Finalizing..." + "\x1b[0m";
+        return "Finalizing...";
     }
 
     void draw_splash(int cols, int rows) {
@@ -2140,9 +2155,11 @@ private:
         lines.push_back("");
 
         // ===== SYNC STATUS HEADER =====
+        // FIXED: Only show "Synchronized" when actually synced (network_height > 0 AND ibd_done_)
         std::ostringstream header;
         header << C_bold();
-        if (sync_progress >= 100.0) {
+        bool actually_synced = ibd_done_ && network_height > 0 && current_height >= network_height;
+        if (actually_synced) {
             header << "\x1b[38;5;46m" << (u8_ok_ ? "✓ " : "[OK] ") << "Blockchain Synchronized";
         } else {
             header << C_warn() << splash_spinner(tick_, u8_ok_) << " Synchronizing Blockchain";
@@ -2156,7 +2173,18 @@ private:
         lines.push_back("   " + splash_progress_bar(bar_width, frac, tick_));
 
         // ===== BIG PERCENTAGE =====
-        lines.push_back(center_text(big_percentage(sync_progress, tick_), box_width));
+        // FIXED: Show meaningful text when we don't have network height yet
+        if (network_height == 0) {
+            // Waiting for peers - show animated "Connecting..." instead of 0.00%
+            static const char* dots[] = {"   ", ".  ", ".. ", "..."};
+            std::string connecting = "Connecting" + std::string(dots[tick_ % 4]);
+            if (vt_ok_) {
+                connecting = std::string("\x1b[38;5;214m") + connecting + "\x1b[0m";
+            }
+            lines.push_back(center_text(connecting, box_width));
+        } else {
+            lines.push_back(center_text(big_percentage(sync_progress, tick_), box_width));
+        }
         lines.push_back("");
 
         // ===== STATS BOX =====
@@ -2168,30 +2196,55 @@ private:
 
         // Block progress
         std::ostringstream b1;
-        b1 << vbar << " " << C_dim() << "Blocks      " << C_reset()
-           << C_info() << std::setw(12) << fmt_num(current_height) << C_reset()
-           << C_dim() << " / " << C_reset() << std::setw(12) << fmt_num(network_height);
+        b1 << vbar << " " << C_dim() << "Blocks      " << C_reset();
+        if (network_height == 0) {
+            // Waiting for network height - show placeholder
+            b1 << C_info() << std::setw(12) << fmt_num(current_height) << C_reset()
+               << C_dim() << " / " << C_reset() << std::setw(12) << "discovering...";
+        } else {
+            b1 << C_info() << std::setw(12) << fmt_num(current_height) << C_reset()
+               << C_dim() << " / " << C_reset() << std::setw(12) << fmt_num(network_height);
+        }
         int pad1 = box_width - 10 - 46;
         b1 << std::string(std::max(0, pad1), ' ') << vbar;
         lines.push_back("   " + std::string(C_dim()) + b1.str() + C_reset());
 
         // Remaining
         std::ostringstream b2;
-        b2 << vbar << " " << C_dim() << "Remaining   " << C_reset()
-           << std::setw(12) << fmt_num(blocks_remaining) << " blocks";
+        b2 << vbar << " " << C_dim() << "Remaining   " << C_reset();
+        if (network_height == 0) {
+            // Waiting for network height - show placeholder
+            b2 << std::setw(12) << "unknown" << " blocks";
+        } else {
+            b2 << std::setw(12) << fmt_num(blocks_remaining) << " blocks";
+        }
         int pad2 = box_width - 10 - 35;
         b2 << std::string(std::max(0, pad2), ' ') << vbar;
         lines.push_back("   " + std::string(C_dim()) + b2.str() + C_reset());
 
-        // ETA
-        std::string eta_str = "Calculating...";
-        if (sync_progress >= 100.0 || blocks_remaining == 0) {
+        // ETA - FIXED: Only show Complete when actually synced
+        std::string eta_str;
+        if (actually_synced) {
+            // Only show Complete when actually done syncing
             eta_str = u8_ok_ ? "✓ Complete" : "Complete";
+        } else if (network_height == 0) {
+            // Waiting for network height discovery
+            eta_str = "Waiting for peers...";
         } else if (sync_blocks_per_sec_ > 0.01 && blocks_remaining > 0) {
+            // Have speed measurement, calculate ETA
             eta_str = fmt_eta(blocks_remaining, sync_blocks_per_sec_);
+        } else {
+            // Still measuring or just started
+            eta_str = "Calculating...";
         }
         std::ostringstream b3;
-        b3 << vbar << " " << C_dim() << "ETA         " << C_reset() << C_warn() << eta_str << C_reset();
+        b3 << vbar << " " << C_dim() << "ETA         " << C_reset();
+        // Use green color when complete, yellow/orange otherwise
+        if (actually_synced) {
+            b3 << "\x1b[38;5;46m" << eta_str << "\x1b[0m";  // Bright green
+        } else {
+            b3 << C_warn() << eta_str << C_reset();  // Yellow/orange
+        }
         int eta_vis = 13 + (int)eta_str.size();
         int pad3 = box_width - 10 - eta_vis;
         b3 << std::string(std::max(0, pad3), ' ') << C_dim() << vbar << C_reset();
@@ -2214,7 +2267,7 @@ private:
 
         // ===== STATUS LINE =====
         std::ostringstream status;
-        status << C_dim() << "Status: " << C_reset() << get_sync_status(blocks_remaining, sync_progress);
+        status << C_dim() << "Status: " << C_reset() << get_sync_status(network_height, current_height, ibd_done_);
         lines.push_back("   " + status.str());
 
         // ===== NETWORK INFO =====
