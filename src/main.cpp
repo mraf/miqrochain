@@ -1629,13 +1629,17 @@ public:
         mining_gate_reason_ = reason;
     }
 
-    // logs in
+    // logs in - with spam filtering
     void feed_logs(const std::deque<LogCapture::Line>& raw_lines) {
         std::lock_guard<std::mutex> lk(mu_);
         if (!paused_) {
             logs_.clear(); logs_.reserve(raw_lines.size());
             for (auto& L : raw_lines){
-                logs_.push_back(stylize_log(L));
+                auto styled = stylize_log(L);
+                // Skip filtered messages (level -1)
+                if (styled.level >= 0) {
+                    logs_.push_back(styled);
+                }
             }
         }
         // Drain telemetry
@@ -1725,14 +1729,100 @@ public:
 
 private:
     struct StyledLine { std::string txt; int level; };
+
+    // Check if a log message should be filtered (spam reduction)
+    // Returns true if the message should be HIDDEN (filtered out)
+    bool should_filter_log(const std::string& s) const {
+        // In verbose mode, show everything
+        if (global::tui_verbose.load()) return false;
+
+        // Filter out spammy sync/download messages - these are shown on splash screen
+        static const char* spam_patterns[] = {
+            "downloading block",
+            "Downloading block",
+            "fetching block",
+            "Fetching block",
+            "requesting block",
+            "Requesting block",
+            "received block",
+            "got block",
+            "block download",
+            "sync progress",
+            "Sync progress",
+            "syncing block",
+            "Syncing block",
+            "IBD progress",
+            "headers progress",
+            "Headers progress",
+            "fetching headers",
+            "Fetching headers",
+            "peer latency",
+            "Peer latency",
+            "ping time",
+            "pong received",
+            "Pong received",
+            "inv received",
+            "getdata sent",
+            "Getdata sent"
+        };
+
+        for (const char* pattern : spam_patterns) {
+            if (s.find(pattern) != std::string::npos) {
+                return true;  // Filter this message
+            }
+        }
+
+        return false;  // Don't filter - show the message
+    }
+
+    // Stylize and categorize a log line
     StyledLine stylize_log(const LogCapture::Line& L){
         const std::string& s = L.text;
+
+        // Filter spam messages (unless verbose mode)
+        if (should_filter_log(s)) {
+            return StyledLine{"", -1};  // level -1 = filtered/hidden
+        }
+
         StyledLine out{ s, 0 };
-        if      (s.find("[FATAL]") != std::string::npos || s.find("[ERROR]") != std::string::npos) out.level=2;
-        else if (s.find("[WARN]")  != std::string::npos) out.level=1;
-        else if (s.find("accepted block") != std::string::npos || s.find("mined block accepted") != std::string::npos) out.level=4;
-        else if (s.find("[TRACE]") != std::string::npos) out.level=3;
-        else if (global::tui_verbose.load()) out.level=3;
+
+        // Priority categorization for important messages
+        if (s.find("[FATAL]") != std::string::npos || s.find("[ERROR]") != std::string::npos) {
+            out.level = 2;  // Error - red
+        }
+        else if (s.find("[WARN]") != std::string::npos) {
+            out.level = 1;  // Warning - yellow
+        }
+        else if (s.find("accepted block") != std::string::npos ||
+                 s.find("mined block accepted") != std::string::npos ||
+                 s.find("new block") != std::string::npos ||
+                 s.find("Block mined") != std::string::npos) {
+            out.level = 4;  // Success - green (important events)
+        }
+        else if (s.find("peer connected") != std::string::npos ||
+                 s.find("Peer connected") != std::string::npos ||
+                 s.find("new peer") != std::string::npos ||
+                 s.find("verack") != std::string::npos) {
+            out.level = 5;  // Info - cyan (network events)
+        }
+        else if (s.find("transaction") != std::string::npos ||
+                 s.find("tx accepted") != std::string::npos ||
+                 s.find("mempool") != std::string::npos) {
+            out.level = 5;  // Info - cyan (tx events)
+        }
+        else if (s.find("[TRACE]") != std::string::npos ||
+                 s.find("[DEBUG]") != std::string::npos) {
+            out.level = 3;  // Dim - trace/debug
+        }
+        else if (s.find("RPC") != std::string::npos ||
+                 s.find("rpc") != std::string::npos) {
+            out.level = 0;  // Normal - RPC info
+        }
+        else {
+            // Regular log message
+            out.level = 0;
+        }
+
         return out;
     }
     void init_step_order(){
@@ -1960,143 +2050,2264 @@ private:
     }
 
     // =========================================================================
-    // SPLASH SCREEN - Professional sync display with animations
+    // PREMIUM TUI COMPONENT SYSTEM - Professional visualization library
     // =========================================================================
 
-    // Animated spinner characters (multiple styles)
+    // -------------------------------------------------------------------------
+    // COLOR PALETTE - Professional color scheme for consistent branding
+    // -------------------------------------------------------------------------
+    struct ColorPalette {
+        static constexpr int PRIMARY = 51;      // Bright cyan - main brand color
+        static constexpr int SECONDARY = 39;    // Blue - secondary actions
+        static constexpr int ACCENT = 214;      // Orange - highlights
+        static constexpr int SUCCESS = 46;      // Green - positive states
+        static constexpr int WARNING = 226;     // Yellow - caution
+        static constexpr int ERROR = 196;       // Red - errors
+        static constexpr int INFO = 87;         // Light cyan - information
+        static constexpr int MUTED = 240;       // Gray - disabled/secondary text
+        static constexpr int BORDER = 27;       // Dark blue - borders
+        static constexpr int TEXT = 252;        // Light gray - main text
+        static constexpr int TEXT_DIM = 245;    // Dimmer text
+        static constexpr int BG_DARK = 235;     // Dark background
+        static constexpr int BG_PANEL = 236;    // Panel background
+    };
+
+    // -------------------------------------------------------------------------
+    // WINDOW FRAME - Professional window with title, shadow, and animations
+    // -------------------------------------------------------------------------
+    struct WindowFrame {
+        std::string title;
+        std::string icon;
+        int x, y, width, height;
+        int border_color;
+        bool has_shadow;
+        bool animate_border;
+        int animation_phase;
+
+        WindowFrame(const std::string& t, const std::string& ico, int w, int h)
+            : title(t), icon(ico), x(0), y(0), width(w), height(h),
+              border_color(ColorPalette::BORDER), has_shadow(true),
+              animate_border(true), animation_phase(0) {}
+    };
+
+    // Draw a professional window frame with optional shadow and animation
+    std::string draw_window_frame(const WindowFrame& wf, int tick) const {
+        std::ostringstream out;
+        int w = wf.width;
+
+        if (!vt_ok_) {
+            // ASCII fallback
+            out << "+" << std::string(w - 2, '-') << "+\n";
+            out << "| " << wf.title << std::string(w - 4 - (int)wf.title.size(), ' ') << " |\n";
+            out << "+" << std::string(w - 2, '-') << "+\n";
+            return out.str();
+        }
+
+        // Shadow effect (rendered first, offset)
+        if (wf.has_shadow && u8_ok_) {
+            out << "\x1b[38;5;235m ";
+            for (int i = 0; i < w; ++i) out << "▄";
+            out << "\n";
+        }
+
+        // Top border with animation
+        out << "\x1b[38;5;" << wf.border_color << "m";
+        if (u8_ok_) {
+            out << "╭";
+            for (int i = 0; i < w - 2; ++i) {
+                if (wf.animate_border) {
+                    int pulse = (tick + i) % 20;
+                    int c = (pulse < 10) ? wf.border_color + (pulse % 5) : wf.border_color + (10 - pulse % 5);
+                    out << "\x1b[38;5;" << c << "m─";
+                } else {
+                    out << "─";
+                }
+            }
+            out << "\x1b[38;5;" << wf.border_color << "m╮";
+        } else {
+            out << "+" << std::string(w - 2, '-') << "+";
+        }
+        out << "\x1b[0m";
+        if (wf.has_shadow) out << "\x1b[38;5;235m▐\x1b[0m";
+        out << "\n";
+
+        // Title bar
+        out << "\x1b[38;5;" << wf.border_color << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m";
+        out << "\x1b[48;5;" << ColorPalette::BG_PANEL << "m";
+
+        // Icon with glow effect
+        if (!wf.icon.empty() && u8_ok_) {
+            int icon_color = (tick % 4 < 2) ? ColorPalette::PRIMARY : ColorPalette::SECONDARY;
+            out << " \x1b[38;5;" << icon_color << "m" << wf.icon << "\x1b[0m";
+            out << "\x1b[48;5;" << ColorPalette::BG_PANEL << "m";
+        }
+
+        // Title with gradient
+        out << " \x1b[38;5;255m\x1b[1m" << wf.title << "\x1b[0m";
+        out << "\x1b[48;5;" << ColorPalette::BG_PANEL << "m";
+
+        // Fill rest of title bar
+        int title_len = (int)wf.title.size() + (wf.icon.empty() ? 2 : 4 + (int)wf.icon.size());
+        out << std::string(w - 2 - title_len, ' ');
+        out << "\x1b[0m\x1b[38;5;" << wf.border_color << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m";
+        if (wf.has_shadow) out << "\x1b[38;5;235m▐\x1b[0m";
+        out << "\n";
+
+        // Separator under title
+        out << "\x1b[38;5;" << wf.border_color << "m" << (u8_ok_ ? "├" : "+");
+        for (int i = 0; i < w - 2; ++i) out << (u8_ok_ ? "─" : "-");
+        out << (u8_ok_ ? "┤" : "+") << "\x1b[0m";
+        if (wf.has_shadow) out << "\x1b[38;5;235m▐\x1b[0m";
+        out << "\n";
+
+        return out.str();
+    }
+
+    // Draw window content area row
+    std::string draw_window_row(const std::string& content, int width, int border_color, bool has_shadow) const {
+        std::ostringstream out;
+        if (!vt_ok_) {
+            out << "| " << content;
+            int pad = width - 4 - visible_length(content);
+            if (pad > 0) out << std::string(pad, ' ');
+            out << " |\n";
+            return out.str();
+        }
+
+        out << "\x1b[38;5;" << border_color << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m";
+        out << "\x1b[48;5;" << ColorPalette::BG_PANEL << "m ";
+        out << content;
+        int vis_len = visible_length(content);
+        int pad = width - 4 - vis_len;
+        if (pad > 0) out << std::string(pad, ' ');
+        out << " \x1b[0m";
+        out << "\x1b[38;5;" << border_color << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m";
+        if (has_shadow) out << "\x1b[38;5;235m▐\x1b[0m";
+        out << "\n";
+        return out.str();
+    }
+
+    // Draw window bottom border
+    std::string draw_window_bottom(int width, int border_color, bool has_shadow, int tick, bool animate) const {
+        std::ostringstream out;
+        if (!vt_ok_) {
+            out << "+" << std::string(width - 2, '-') << "+\n";
+            return out.str();
+        }
+
+        out << "\x1b[38;5;" << border_color << "m";
+        if (u8_ok_) {
+            out << "╰";
+            for (int i = 0; i < width - 2; ++i) {
+                if (animate) {
+                    int pulse = (tick + i) % 20;
+                    int c = (pulse < 10) ? border_color + (pulse % 5) : border_color + (10 - pulse % 5);
+                    out << "\x1b[38;5;" << c << "m─";
+                } else {
+                    out << "─";
+                }
+            }
+            out << "\x1b[38;5;" << border_color << "m╯";
+        } else {
+            out << "+" << std::string(width - 2, '-') << "+";
+        }
+        out << "\x1b[0m";
+        if (has_shadow) out << "\x1b[38;5;235m▐\x1b[0m";
+        out << "\n";
+
+        // Shadow bottom
+        if (has_shadow && u8_ok_) {
+            out << " \x1b[38;5;235m";
+            for (int i = 0; i < width; ++i) out << "▀";
+            out << "\x1b[0m\n";
+        }
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // GAUGE - Animated circular/arc gauge for metrics
+    // -------------------------------------------------------------------------
+    std::string draw_gauge(double value, double max_val, int width, const std::string& label,
+                           int color_low, int color_mid, int color_high, int tick) const {
+        if (width < 10) width = 10;
+        double pct = (max_val > 0) ? (value / max_val) : 0;
+        if (pct < 0) pct = 0;
+        if (pct > 1) pct = 1;
+
+        std::ostringstream out;
+
+        if (!vt_ok_ || !u8_ok_) {
+            // ASCII fallback
+            int filled = (int)(pct * (width - 2));
+            out << "[";
+            for (int i = 0; i < width - 2; ++i) {
+                out << (i < filled ? "#" : ".");
+            }
+            out << "] " << (int)(pct * 100) << "%";
+            return out.str();
+        }
+
+        // Determine color based on value
+        int color;
+        if (pct < 0.33) color = color_low;
+        else if (pct < 0.66) color = color_mid;
+        else color = color_high;
+
+        // Animated gauge with gradient fill
+        int inner = width - 4;
+        int filled = (int)(pct * inner);
+
+        out << "\x1b[38;5;240m⟨\x1b[0m";
+        for (int i = 0; i < inner; ++i) {
+            if (i < filled) {
+                // Gradient from low to high color
+                int grad_color = color_low + (int)((double)i / inner * (color_high - color_low));
+                // Add shimmer effect
+                bool shimmer = ((i + tick) % 6 == 0);
+                if (shimmer) grad_color = 255;
+                out << "\x1b[38;5;" << grad_color << "m█\x1b[0m";
+            } else if (i == filled && pct < 1.0) {
+                // Animated edge
+                static const char* edge_chars[] = {"░", "▒", "▓", "█", "▓", "▒"};
+                out << "\x1b[38;5;" << color << "m" << edge_chars[tick % 6] << "\x1b[0m";
+            } else {
+                out << "\x1b[38;5;236m░\x1b[0m";
+            }
+        }
+        out << "\x1b[38;5;240m⟩\x1b[0m";
+
+        // Percentage with color
+        out << " \x1b[38;5;" << color << "m\x1b[1m" << (int)(pct * 100) << "%\x1b[0m";
+
+        if (!label.empty()) {
+            out << " \x1b[38;5;245m" << label << "\x1b[0m";
+        }
+
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // SPARKLINE GRAPH - Mini line graph for trends
+    // -------------------------------------------------------------------------
+    std::string draw_sparkline(const std::vector<double>& data, int width, int color, bool show_minmax) const {
+        if (data.empty() || width < 3) {
+            return vt_ok_ ? "\x1b[38;5;240m(no data)\x1b[0m" : "(no data)";
+        }
+
+        std::ostringstream out;
+
+        if (!u8_ok_) {
+            // ASCII fallback
+            double max_v = *std::max_element(data.begin(), data.end());
+            double min_v = *std::min_element(data.begin(), data.end());
+            double range = max_v - min_v;
+            if (range < 0.001) range = 1;
+
+            for (size_t i = 0; i < std::min(data.size(), (size_t)width); ++i) {
+                double norm = (data[i] - min_v) / range;
+                if (norm < 0.25) out << "_";
+                else if (norm < 0.5) out << "-";
+                else if (norm < 0.75) out << "=";
+                else out << "#";
+            }
+            return out.str();
+        }
+
+        // Unicode sparkline characters (8 levels)
+        static const char* sparks[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+
+        double max_v = *std::max_element(data.begin(), data.end());
+        double min_v = *std::min_element(data.begin(), data.end());
+        double range = max_v - min_v;
+        if (range < 0.001) range = 1;
+
+        if (vt_ok_) out << "\x1b[38;5;" << color << "m";
+
+        size_t start = (data.size() > (size_t)width) ? data.size() - width : 0;
+        for (size_t i = start; i < data.size(); ++i) {
+            double norm = (data[i] - min_v) / range;
+            int level = (int)(norm * 7.999);
+            if (level < 0) level = 0;
+            if (level > 7) level = 7;
+
+            // Color gradient based on value
+            if (vt_ok_) {
+                int c = color - (7 - level) * 2;
+                if (c < 16) c = 16;
+                out << "\x1b[38;5;" << c << "m";
+            }
+            out << sparks[level];
+        }
+
+        if (vt_ok_) out << "\x1b[0m";
+
+        // Min/max labels
+        if (show_minmax && vt_ok_) {
+            out << " \x1b[38;5;240m[" << std::fixed << std::setprecision(1) << min_v
+                << "-" << max_v << "]\x1b[0m";
+        }
+
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // PROGRESS RING - Circular progress indicator
+    // -------------------------------------------------------------------------
+    std::string draw_progress_ring(double pct, int tick) const {
+        if (!u8_ok_) {
+            return "[" + std::to_string((int)(pct * 100)) + "%]";
+        }
+
+        std::ostringstream out;
+
+        // 8 segments for the ring
+        static const char* segments[] = {"◜", "◝", "◞", "◟", "◠", "◡", "◜", "◝"};
+        int filled = (int)(pct * 8);
+
+        if (vt_ok_) {
+            // Animated spinning effect
+            int anim_offset = tick % 8;
+            for (int i = 0; i < 8; ++i) {
+                int seg_idx = (i + anim_offset) % 8;
+                if (i < filled) {
+                    out << "\x1b[38;5;" << ColorPalette::SUCCESS << "m";
+                } else {
+                    out << "\x1b[38;5;236m";
+                }
+                out << segments[seg_idx];
+            }
+            out << "\x1b[0m";
+        } else {
+            for (int i = 0; i < 8; ++i) {
+                out << segments[i];
+            }
+        }
+
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // METRICS ROW - Formatted metric with label, value, and optional trend
+    // -------------------------------------------------------------------------
+    std::string draw_metric(const std::string& label, const std::string& value,
+                            int value_color, const std::string& trend = "") const {
+        std::ostringstream out;
+
+        if (!vt_ok_) {
+            out << label << ": " << value;
+            if (!trend.empty()) out << " " << trend;
+            return out.str();
+        }
+
+        // Label (dimmed)
+        out << "\x1b[38;5;" << ColorPalette::TEXT_DIM << "m" << label << "\x1b[0m";
+
+        // Spacing
+        int label_len = (int)label.size();
+        int pad = 14 - label_len;
+        if (pad > 0) out << std::string(pad, ' ');
+
+        // Value (colored)
+        out << "\x1b[38;5;" << value_color << "m\x1b[1m" << value << "\x1b[0m";
+
+        // Trend indicator
+        if (!trend.empty()) {
+            out << " \x1b[38;5;240m" << trend << "\x1b[0m";
+        }
+
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // STATUS INDICATOR - Animated status dot with label
+    // -------------------------------------------------------------------------
+    std::string draw_status(const std::string& label, bool ok, int tick, bool animate = true) const {
+        std::ostringstream out;
+
+        if (!vt_ok_) {
+            out << (ok ? "[OK]" : "[--]") << " " << label;
+            return out.str();
+        }
+
+        if (ok) {
+            // Pulsing green dot
+            if (animate && u8_ok_) {
+                static const int pulse_colors[] = {46, 47, 48, 49, 48, 47};
+                int c = pulse_colors[tick % 6];
+                out << "\x1b[38;5;" << c << "m●\x1b[0m";
+            } else {
+                out << "\x1b[38;5;" << ColorPalette::SUCCESS << "m" << (u8_ok_ ? "●" : "*") << "\x1b[0m";
+            }
+        } else {
+            // Static gray dot
+            out << "\x1b[38;5;" << ColorPalette::MUTED << "m" << (u8_ok_ ? "○" : "o") << "\x1b[0m";
+        }
+
+        out << " \x1b[38;5;" << ColorPalette::TEXT << "m" << label << "\x1b[0m";
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // NETWORK SIGNAL - Signal strength indicator
+    // -------------------------------------------------------------------------
+    std::string draw_signal(int strength, int max_strength, int tick) const {
+        if (!u8_ok_) {
+            std::string bars = "";
+            for (int i = 0; i < max_strength; ++i) {
+                bars += (i < strength) ? "|" : ".";
+            }
+            return "[" + bars + "]";
+        }
+
+        std::ostringstream out;
+        static const char* levels[] = {"▁", "▂", "▃", "▅", "▇"};
+
+        for (int i = 0; i < max_strength; ++i) {
+            if (i < strength) {
+                // Color based on signal strength
+                int color;
+                double ratio = (double)strength / max_strength;
+                if (ratio > 0.66) color = ColorPalette::SUCCESS;
+                else if (ratio > 0.33) color = ColorPalette::WARNING;
+                else color = ColorPalette::ERROR;
+
+                // Add shimmer animation
+                bool shimmer = (i == strength - 1) && (tick % 4 < 2);
+                if (shimmer && vt_ok_) color = 255;
+
+                if (vt_ok_) out << "\x1b[38;5;" << color << "m";
+                out << levels[i % 5];
+                if (vt_ok_) out << "\x1b[0m";
+            } else {
+                if (vt_ok_) out << "\x1b[38;5;236m";
+                out << "▁";
+                if (vt_ok_) out << "\x1b[0m";
+            }
+        }
+
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // BLOCK VISUALIZATION - Block with hash preview
+    // -------------------------------------------------------------------------
+    std::string draw_block_mini(uint64_t height, const std::string& hash, int txs, int tick) const {
+        std::ostringstream out;
+
+        if (!u8_ok_) {
+            out << "#" << height << " " << short_hex(hash, 8) << " " << txs << "tx";
+            return out.str();
+        }
+
+        // Block icon with animation
+        bool highlight = (tick % 8 < 2);
+        int block_color = highlight ? ColorPalette::PRIMARY : ColorPalette::SECONDARY;
+
+        if (vt_ok_) {
+            out << "\x1b[38;5;" << block_color << "m◼\x1b[0m ";
+            out << "\x1b[38;5;" << ColorPalette::INFO << "m#" << height << "\x1b[0m ";
+            out << "\x1b[38;5;240m" << short_hex(hash, 8) << "\x1b[0m ";
+            out << "\x1b[38;5;" << ColorPalette::TEXT << "m" << txs << "tx\x1b[0m";
+        } else {
+            out << "# " << height << " " << short_hex(hash, 8) << " " << txs << "tx";
+        }
+
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // ANIMATED LOADING - Various loading animations
+    // -------------------------------------------------------------------------
+    std::string draw_loading(int style, int tick) const {
+        if (!u8_ok_) {
+            static const char* ascii_spin[] = {"|", "/", "-", "\\"};
+            return std::string("[") + ascii_spin[tick % 4] + "]";
+        }
+
+        std::ostringstream out;
+
+        switch (style) {
+            case 0: {
+                // Braille spinner
+                static const char* braille[] = {"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"};
+                if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::PRIMARY << "m";
+                out << braille[tick % 8];
+                break;
+            }
+            case 1: {
+                // Dots spinner
+                static const char* dots[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+                if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::ACCENT << "m";
+                out << dots[tick % 10];
+                break;
+            }
+            case 2: {
+                // Arc spinner
+                static const char* arcs[] = {"◜", "◠", "◝", "◞", "◡", "◟"};
+                if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::SUCCESS << "m";
+                out << arcs[tick % 6];
+                break;
+            }
+            case 3: {
+                // Block bounce
+                static const char* blocks[] = {"▖", "▘", "▝", "▗"};
+                if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::INFO << "m";
+                out << blocks[tick % 4];
+                break;
+            }
+            default: {
+                // Default braille
+                static const char* def[] = {"⠿", "⡿", "⣿", "⣷", "⣯", "⣟"};
+                if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::PRIMARY << "m";
+                out << def[tick % 6];
+            }
+        }
+
+        if (vt_ok_) out << "\x1b[0m";
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // HEAT MAP - Color intensity based on value
+    // -------------------------------------------------------------------------
+    std::string draw_heatmap_cell(double value, double max_val) const {
+        double pct = (max_val > 0) ? (value / max_val) : 0;
+        if (pct < 0) pct = 0;
+        if (pct > 1) pct = 1;
+
+        if (!u8_ok_) {
+            if (pct < 0.25) return ".";
+            if (pct < 0.5) return "o";
+            if (pct < 0.75) return "O";
+            return "#";
+        }
+
+        // Heat colors: blue -> cyan -> green -> yellow -> orange -> red
+        int color;
+        if (pct < 0.2) color = 21;       // Blue
+        else if (pct < 0.4) color = 39;  // Cyan
+        else if (pct < 0.6) color = 46;  // Green
+        else if (pct < 0.8) color = 226; // Yellow
+        else color = 196;                // Red
+
+        std::ostringstream out;
+        if (vt_ok_) out << "\x1b[38;5;" << color << "m";
+        out << "█";
+        if (vt_ok_) out << "\x1b[0m";
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // TREND ARROW - Direction indicator
+    // -------------------------------------------------------------------------
+    std::string draw_trend_arrow(double current, double previous) const {
+        if (!u8_ok_) {
+            if (current > previous * 1.01) return "^";
+            if (current < previous * 0.99) return "v";
+            return "=";
+        }
+
+        std::ostringstream out;
+        if (current > previous * 1.05) {
+            if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::SUCCESS << "m";
+            out << "▲▲";
+        } else if (current > previous * 1.01) {
+            if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::SUCCESS << "m";
+            out << "▲";
+        } else if (current < previous * 0.95) {
+            if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::ERROR << "m";
+            out << "▼▼";
+        } else if (current < previous * 0.99) {
+            if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::ERROR << "m";
+            out << "▼";
+        } else {
+            if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::MUTED << "m";
+            out << "━";
+        }
+        if (vt_ok_) out << "\x1b[0m";
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // BADGE - Styled label/tag
+    // -------------------------------------------------------------------------
+    std::string draw_badge(const std::string& text, int bg_color, int text_color) const {
+        std::ostringstream out;
+
+        if (!vt_ok_) {
+            return "[" + text + "]";
+        }
+
+        if (u8_ok_) {
+            out << "\x1b[48;5;" << bg_color << "m\x1b[38;5;" << text_color << "m";
+            out << " " << text << " ";
+            out << "\x1b[0m";
+        } else {
+            out << "\x1b[38;5;" << text_color << "m[" << text << "]\x1b[0m";
+        }
+
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // DIVIDER - Styled horizontal line
+    // -------------------------------------------------------------------------
+    std::string draw_divider(int width, int style, int color, int tick) const {
+        std::ostringstream out;
+
+        if (!vt_ok_) {
+            char c = (style == 0) ? '-' : (style == 1) ? '=' : '~';
+            return std::string(width, c);
+        }
+
+        out << "\x1b[38;5;" << color << "m";
+
+        switch (style) {
+            case 0: // Thin line
+                for (int i = 0; i < width; ++i) out << (u8_ok_ ? "─" : "-");
+                break;
+            case 1: // Thick line
+                for (int i = 0; i < width; ++i) out << (u8_ok_ ? "━" : "=");
+                break;
+            case 2: // Dotted
+                for (int i = 0; i < width; ++i) {
+                    out << (u8_ok_ ? ((i % 2 == 0) ? "·" : " ") : ".");
+                }
+                break;
+            case 3: // Animated gradient
+                for (int i = 0; i < width; ++i) {
+                    int pulse = (tick + i) % 10;
+                    int c = color + (pulse < 5 ? pulse : 10 - pulse);
+                    out << "\x1b[38;5;" << c << "m" << (u8_ok_ ? "═" : "=");
+                }
+                break;
+            default:
+                out << std::string(width, u8_ok_ ? *"─" : '-');
+        }
+
+        out << "\x1b[0m";
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // HEADER BANNER - Main title with effects
+    // -------------------------------------------------------------------------
+    std::string draw_header_banner(int width, int tick) const {
+        std::ostringstream out;
+
+        if (!vt_ok_ || !u8_ok_) {
+            out << "+" << std::string(width - 2, '=') << "+\n";
+            out << "| MIQROCHAIN NODE";
+            out << std::string(width - 20, ' ') << " |\n";
+            out << "+" << std::string(width - 2, '=') << "+\n";
+            return out.str();
+        }
+
+        // Animated top border
+        out << "\x1b[38;5;" << ColorPalette::BORDER << "m╔";
+        for (int i = 0; i < width - 2; ++i) {
+            int pulse = (tick + i) % 24;
+            int c;
+            if (pulse < 8) c = ColorPalette::BORDER + pulse;
+            else if (pulse < 16) c = ColorPalette::BORDER + (16 - pulse);
+            else c = ColorPalette::BORDER + (pulse - 16);
+            out << "\x1b[38;5;" << c << "m═";
+        }
+        out << "\x1b[38;5;" << ColorPalette::BORDER << "m╗\x1b[0m\n";
+
+        // Logo line with gradient animation
+        out << "\x1b[38;5;" << ColorPalette::BORDER << "m║\x1b[0m ";
+
+        // Animated logo
+        static const int logo_colors[] = {51, 50, 49, 48, 47, 46, 45, 44, 43, 42};
+        int lc = logo_colors[tick % 10];
+        out << "\x1b[38;5;" << lc << "m\x1b[1m◆ MIQROCHAIN\x1b[0m";
+
+        // Version
+        out << " \x1b[38;5;" << ColorPalette::MUTED << "mv" << MIQ_VERSION_MAJOR << "."
+            << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH << "\x1b[0m";
+
+        // Separator
+        out << " \x1b[38;5;240m│\x1b[0m ";
+
+        // Chain name
+        out << "\x1b[38;5;" << ColorPalette::INFO << "m" << CHAIN_NAME << "\x1b[0m";
+
+        // Separator
+        out << " \x1b[38;5;240m│\x1b[0m ";
+
+        // Animated spinner
+        out << draw_loading(0, tick);
+
+        // Separator
+        out << " \x1b[38;5;240m│\x1b[0m ";
+
+        // State badge
+        NodeState show_state = degraded_override_ ? NodeState::Degraded : nstate_;
+        switch (show_state) {
+            case NodeState::Starting:
+                out << draw_badge("STARTING", ColorPalette::ACCENT, 0);
+                break;
+            case NodeState::Syncing:
+                out << draw_badge("SYNCING", ColorPalette::ACCENT, 0);
+                break;
+            case NodeState::Running:
+                out << draw_badge("RUNNING", ColorPalette::SUCCESS, 0);
+                break;
+            case NodeState::Degraded:
+                out << draw_badge("DEGRADED", ColorPalette::ERROR, 255);
+                break;
+            case NodeState::Quitting:
+                out << draw_badge("SHUTDOWN", ColorPalette::WARNING, 0);
+                break;
+        }
+
+        // Miner badge if active
+        if (miner_running_badge()) {
+            out << " \x1b[38;5;240m│\x1b[0m " << draw_badge("⛏ MINING", ColorPalette::SUCCESS, 0);
+        }
+
+        // Pad to end
+        int content_len = 75 + (miner_running_badge() ? 15 : 0);
+        int pad = width - content_len - 2;
+        if (pad > 0) out << std::string(pad, ' ');
+
+        out << "\x1b[38;5;" << ColorPalette::BORDER << "m║\x1b[0m\n";
+
+        return out.str();
+    }
+
+    // =========================================================================
+    // ADVANCED PANEL SYSTEM - Professional multi-panel layouts with animations
+    // =========================================================================
+
+    // Panel configuration for advanced layouts
+    struct PanelConfig {
+        std::string title;
+        std::string icon;
+        int min_width;
+        int min_height;
+        int border_color;
+        bool animated_border;
+        bool has_shadow;
+    };
+
+    // Draw a complete panel with content
+    std::string draw_panel(const PanelConfig& cfg, const std::vector<std::string>& content,
+                           int width, int tick) const {
+        std::ostringstream out;
+        int inner_w = width - 4;
+
+        if (!vt_ok_) {
+            // ASCII fallback
+            out << "+" << std::string(width - 2, '-') << "+\n";
+            out << "| " << cfg.title << std::string(width - 4 - (int)cfg.title.size(), ' ') << " |\n";
+            out << "+" << std::string(width - 2, '-') << "+\n";
+            for (const auto& line : content) {
+                out << "| " << line;
+                int pad = width - 4 - (int)line.size();
+                if (pad > 0) out << std::string(pad, ' ');
+                out << " |\n";
+            }
+            out << "+" << std::string(width - 2, '-') << "+\n";
+            return out.str();
+        }
+
+        int bc = cfg.border_color > 0 ? cfg.border_color : ColorPalette::BORDER;
+
+        // Top border with optional animation
+        out << "\x1b[38;5;" << bc << "m" << (u8_ok_ ? "╭" : "+");
+        for (int i = 0; i < width - 2; ++i) {
+            if (cfg.animated_border && u8_ok_) {
+                int pulse = (tick + i) % 12;
+                int c = bc + (pulse < 6 ? pulse : 12 - pulse);
+                out << "\x1b[38;5;" << c << "m─";
+            } else {
+                out << (u8_ok_ ? "─" : "-");
+            }
+        }
+        out << "\x1b[38;5;" << bc << "m" << (u8_ok_ ? "╮" : "+") << "\x1b[0m\n";
+
+        // Title bar
+        out << "\x1b[38;5;" << bc << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m";
+        out << "\x1b[48;5;" << ColorPalette::BG_PANEL << "m ";
+        if (!cfg.icon.empty() && u8_ok_) {
+            int icon_c = (tick % 6 < 3) ? ColorPalette::PRIMARY : ColorPalette::SECONDARY;
+            out << "\x1b[38;5;" << icon_c << "m" << cfg.icon << "\x1b[0m ";
+        }
+        out << "\x1b[38;5;255m\x1b[1m" << cfg.title << "\x1b[0m";
+        out << "\x1b[48;5;" << ColorPalette::BG_PANEL << "m";
+        int title_len = (int)cfg.title.size() + (cfg.icon.empty() ? 1 : 4);
+        out << std::string(inner_w - title_len, ' ');
+        out << "\x1b[0m\x1b[38;5;" << bc << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m\n";
+
+        // Separator
+        out << "\x1b[38;5;" << bc << "m" << (u8_ok_ ? "├" : "+");
+        for (int i = 0; i < width - 2; ++i) out << (u8_ok_ ? "─" : "-");
+        out << (u8_ok_ ? "┤" : "+") << "\x1b[0m\n";
+
+        // Content
+        for (const auto& line : content) {
+            out << "\x1b[38;5;" << bc << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m";
+            out << "\x1b[48;5;" << ColorPalette::BG_PANEL << "m ";
+            out << line;
+            int vis_len = visible_length(line);
+            int pad = inner_w - vis_len;
+            if (pad > 0) out << std::string(pad, ' ');
+            out << " \x1b[0m\x1b[38;5;" << bc << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m\n";
+        }
+
+        // Bottom border
+        out << "\x1b[38;5;" << bc << "m" << (u8_ok_ ? "╰" : "+");
+        for (int i = 0; i < width - 2; ++i) {
+            if (cfg.animated_border && u8_ok_) {
+                int pulse = (tick + i) % 12;
+                int c = bc + (pulse < 6 ? pulse : 12 - pulse);
+                out << "\x1b[38;5;" << c << "m─";
+            } else {
+                out << (u8_ok_ ? "─" : "-");
+            }
+        }
+        out << "\x1b[38;5;" << bc << "m" << (u8_ok_ ? "╯" : "+") << "\x1b[0m\n";
+
+        return out.str();
+    }
+
+    // =========================================================================
+    // NETWORK TOPOLOGY VISUALIZATION - Peer map with quality indicators
+    // =========================================================================
+
+    // Peer quality score (0-100)
+    int calculate_peer_quality(uint64_t latency_ms, uint64_t bytes_recv, bool verack_ok) const {
+        if (!verack_ok) return 0;
+        int score = 50;
+        // Latency scoring
+        if (latency_ms < 50) score += 30;
+        else if (latency_ms < 100) score += 20;
+        else if (latency_ms < 200) score += 10;
+        else if (latency_ms > 500) score -= 20;
+        // Activity scoring
+        if (bytes_recv > 1000000) score += 20;
+        else if (bytes_recv > 100000) score += 10;
+        if (score < 0) score = 0;
+        if (score > 100) score = 100;
+        return score;
+    }
+
+    // Draw peer quality bar
+    std::string draw_peer_quality(int quality, int width) const {
+        if (width < 5) width = 5;
+        std::ostringstream out;
+
+        if (!vt_ok_ || !u8_ok_) {
+            int filled = quality * width / 100;
+            out << "[";
+            for (int i = 0; i < width; ++i) {
+                out << (i < filled ? "#" : ".");
+            }
+            out << "]";
+            return out.str();
+        }
+
+        int color;
+        if (quality >= 80) color = ColorPalette::SUCCESS;
+        else if (quality >= 50) color = ColorPalette::WARNING;
+        else color = ColorPalette::ERROR;
+
+        int filled = quality * width / 100;
+        for (int i = 0; i < width; ++i) {
+            if (i < filled) {
+                out << "\x1b[38;5;" << color << "m█\x1b[0m";
+            } else {
+                out << "\x1b[38;5;236m░\x1b[0m";
+            }
+        }
+        return out.str();
+    }
+
+    // Draw network topology map
+    std::string draw_network_topology(int width, int tick) const {
+        std::ostringstream out;
+
+        if (!p2p_) {
+            return vt_ok_ ? "\x1b[38;5;240m(no P2P connection)\x1b[0m" : "(no P2P)";
+        }
+
+        auto peers = p2p_->snapshot_peers();
+        if (peers.empty()) {
+            return vt_ok_ ? "\x1b[38;5;240m(searching for peers...)\x1b[0m" : "(searching...)";
+        }
+
+        // Sort by quality
+        std::vector<std::pair<int, size_t>> quality_idx;
+        for (size_t i = 0; i < peers.size(); ++i) {
+            int q = calculate_peer_quality(0, 0, peers[i].verack_ok);
+            quality_idx.push_back({q, i});
+        }
+        std::sort(quality_idx.rbegin(), quality_idx.rend());
+
+        // Draw mini topology - center node with spokes
+        if (u8_ok_ && vt_ok_) {
+            // Animated center node
+            static const char* center_frames[] = {"◉", "◎", "●", "◎"};
+            int c_color = (tick % 8 < 4) ? ColorPalette::PRIMARY : ColorPalette::SECONDARY;
+            out << "\x1b[38;5;" << c_color << "m" << center_frames[tick % 4] << "\x1b[0m";
+
+            // Connection spokes
+            size_t show_peers = std::min(peers.size(), (size_t)8);
+            for (size_t i = 0; i < show_peers; ++i) {
+                const auto& p = peers[quality_idx[i].second];
+                int q = quality_idx[i].first;
+                int color = (q >= 80) ? ColorPalette::SUCCESS :
+                           (q >= 50) ? ColorPalette::WARNING : ColorPalette::ERROR;
+
+                // Animated connection line
+                bool active = (tick + (int)i) % 4 < 2;
+                out << "\x1b[38;5;" << (active ? color : 240) << "m";
+                out << (p.verack_ok ? "━" : "╌");
+                out << (p.verack_ok ? "●" : "○");
+                out << "\x1b[0m ";
+            }
+        } else {
+            out << "[NODE]";
+            for (size_t i = 0; i < std::min(peers.size(), (size_t)4); ++i) {
+                out << (peers[i].verack_ok ? "-*" : "-o");
+            }
+        }
+
+        return out.str();
+    }
+
+    // Draw detailed peer list with quality metrics
+    std::vector<std::string> draw_peer_details(int width) const {
+        std::vector<std::string> lines;
+
+        if (!p2p_) return lines;
+
+        auto peers = p2p_->snapshot_peers();
+        if (peers.empty()) {
+            lines.push_back(vt_ok_ ? "\x1b[38;5;240m  No peers connected\x1b[0m" : "  No peers");
+            return lines;
+        }
+
+        // Header
+        if (vt_ok_) {
+            lines.push_back("\x1b[38;5;245m  IP Address        Quality  Status\x1b[0m");
+        } else {
+            lines.push_back("  IP Address        Quality  Status");
+        }
+
+        size_t show = std::min(peers.size(), (size_t)6);
+        for (size_t i = 0; i < show; ++i) {
+            const auto& p = peers[i];
+            std::ostringstream ln;
+
+            std::string ip = p.ip;
+            if (ip.size() > 15) ip = ip.substr(0, 12) + "...";
+
+            int quality = calculate_peer_quality(0, 0, p.verack_ok);
+
+            if (vt_ok_) {
+                ln << "  ";
+                ln << (p.verack_ok ? "\x1b[38;5;46m●\x1b[0m" : "\x1b[38;5;240m○\x1b[0m");
+                ln << " \x1b[38;5;252m" << std::left << std::setw(15) << ip << "\x1b[0m ";
+                ln << draw_peer_quality(quality, 8) << " ";
+
+                if (p.verack_ok) {
+                    ln << "\x1b[38;5;46mActive\x1b[0m";
+                } else {
+                    ln << "\x1b[38;5;240mConnecting\x1b[0m";
+                }
+            } else {
+                ln << "  " << (p.verack_ok ? "*" : "o") << " ";
+                ln << std::left << std::setw(15) << ip << " ";
+                ln << "[" << quality << "%] ";
+                ln << (p.verack_ok ? "Active" : "Connecting");
+            }
+            lines.push_back(ln.str());
+        }
+
+        if (peers.size() > show) {
+            std::ostringstream more;
+            if (vt_ok_) {
+                more << "  \x1b[38;5;240m+ " << (peers.size() - show) << " more peers\x1b[0m";
+            } else {
+                more << "  + " << (peers.size() - show) << " more";
+            }
+            lines.push_back(more.str());
+        }
+
+        return lines;
+    }
+
+    // =========================================================================
+    // MINING PERFORMANCE DASHBOARD - Advanced mining visualization
+    // =========================================================================
+
+    // Mining history for graphs
+    struct MiningHistory {
+        std::deque<double> hashrates;      // Last N hashrate samples
+        std::deque<uint64_t> block_times;  // Time between blocks
+        std::deque<double> efficiency;     // Hash/second per thread
+        static constexpr size_t MAX_SAMPLES = 60;
+
+        void add_hashrate(double hr) {
+            hashrates.push_back(hr);
+            if (hashrates.size() > MAX_SAMPLES) hashrates.pop_front();
+        }
+
+        void add_block_time(uint64_t time_s) {
+            block_times.push_back(time_s);
+            if (block_times.size() > MAX_SAMPLES) block_times.pop_front();
+        }
+
+        double avg_hashrate() const {
+            if (hashrates.empty()) return 0;
+            double sum = 0;
+            for (auto h : hashrates) sum += h;
+            return sum / hashrates.size();
+        }
+
+        double peak_hashrate() const {
+            if (hashrates.empty()) return 0;
+            return *std::max_element(hashrates.begin(), hashrates.end());
+        }
+    };
+
+    // Draw mining performance graph
+    std::string draw_mining_graph(const std::vector<double>& data, int width, int height, int tick) const {
+        if (data.empty() || width < 5 || height < 2) {
+            return vt_ok_ ? "\x1b[38;5;240m(no data)\x1b[0m" : "(no data)";
+        }
+
+        std::ostringstream out;
+
+        if (!u8_ok_) {
+            // Simple ASCII sparkline
+            return spark_ascii(data);
+        }
+
+        double max_val = *std::max_element(data.begin(), data.end());
+        double min_val = *std::min_element(data.begin(), data.end());
+        double range = max_val - min_val;
+        if (range < 0.001) range = 1;
+
+        // Draw mini bar graph
+        size_t start = (data.size() > (size_t)width) ? data.size() - width : 0;
+
+        for (size_t i = start; i < data.size(); ++i) {
+            double norm = (data[i] - min_val) / range;
+            int bar_height = (int)(norm * 8);
+            if (bar_height > 7) bar_height = 7;
+
+            // Gradient color based on value
+            int color;
+            if (norm > 0.8) color = ColorPalette::SUCCESS;
+            else if (norm > 0.5) color = ColorPalette::INFO;
+            else if (norm > 0.2) color = ColorPalette::WARNING;
+            else color = ColorPalette::MUTED;
+
+            // Add shimmer effect on recent values
+            if (i == data.size() - 1 && (tick % 4 < 2)) {
+                color = 255;
+            }
+
+            static const char* bars[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+            out << "\x1b[38;5;" << color << "m" << bars[bar_height] << "\x1b[0m";
+        }
+
+        return out.str();
+    }
+
+    // Draw mining statistics panel content
+    std::vector<std::string> draw_mining_stats(int width, int tick) const {
+        std::vector<std::string> lines;
+
+        bool active = g_miner_stats.active.load();
+        double hps = g_miner_stats.hps.load();
+        uint64_t threads = g_miner_stats.threads.load();
+        uint64_t accepted = g_miner_stats.accepted.load();
+        uint64_t rejected = g_miner_stats.rejected.load();
+
+        // Status line with animated indicator
+        std::ostringstream status;
+        if (vt_ok_) {
+            if (active) {
+                static const int pulse[] = {46, 47, 48, 49, 48, 47};
+                int c = pulse[tick % 6];
+                status << "\x1b[38;5;" << c << "m● MINING ACTIVE\x1b[0m";
+                status << "  \x1b[38;5;240m(" << threads << " threads)\x1b[0m";
+            } else if (mining_gate_available_) {
+                status << "\x1b[38;5;240m○ Ready to mine\x1b[0m";
+            } else {
+                status << "\x1b[38;5;196m○ Mining unavailable\x1b[0m";
+            }
+        } else {
+            status << (active ? "* MINING" : "o Idle");
+        }
+        lines.push_back(status.str());
+
+        if (active || accepted > 0) {
+            // Hashrate with trend
+            std::ostringstream hr;
+            if (vt_ok_) {
+                hr << "\x1b[38;5;245mHashrate\x1b[0m  \x1b[38;5;87m\x1b[1m" << fmt_hs(hps) << "\x1b[0m";
+            } else {
+                hr << "Hashrate: " << fmt_hs(hps);
+            }
+            lines.push_back(hr.str());
+
+            // Hashrate sparkline
+            if (!spark_hs_.empty()) {
+                std::ostringstream spark;
+                if (vt_ok_) {
+                    spark << "\x1b[38;5;245mTrend\x1b[0m     ";
+                    spark << draw_mining_graph(spark_hs_, 24, 1, tick);
+                } else {
+                    spark << "Trend: " << spark_ascii(spark_hs_);
+                }
+                lines.push_back(spark.str());
+            }
+
+            // Blocks found
+            std::ostringstream blocks;
+            if (vt_ok_) {
+                blocks << "\x1b[38;5;245mBlocks\x1b[0m    \x1b[38;5;46m" << accepted << " found\x1b[0m";
+                if (rejected > 0) {
+                    blocks << "  \x1b[38;5;196m" << rejected << " rejected\x1b[0m";
+                }
+            } else {
+                blocks << "Blocks: " << accepted << " found";
+            }
+            lines.push_back(blocks.str());
+
+            // Efficiency
+            if (threads > 0) {
+                double eff = hps / threads;
+                std::ostringstream effln;
+                if (vt_ok_) {
+                    effln << "\x1b[38;5;245mEfficiency\x1b[0m\x1b[38;5;183m " << fmt_hs(eff) << "/thread\x1b[0m";
+                } else {
+                    effln << "Efficiency: " << fmt_hs(eff) << "/thread";
+                }
+                lines.push_back(effln.str());
+            }
+        }
+
+        return lines;
+    }
+
+    // =========================================================================
+    // PROFESSIONAL LOG VIEWER - Filtered, searchable log display
+    // =========================================================================
+
+    // Log filter state
+    mutable std::string log_filter_text_;
+    mutable int log_filter_level_{0};  // 0=all, 1=warn+, 2=error only, 3=debug
+    mutable bool log_filter_active_{false};
+
+    // Filter logs based on current settings
+    std::vector<StyledLine> filter_logs(size_t max_lines) const {
+        std::vector<StyledLine> filtered;
+
+        for (const auto& log : logs_) {
+            // Level filter
+            if (log_filter_level_ > 0) {
+                if (log_filter_level_ == 1 && log.level > 1) continue;  // warn+ only
+                if (log_filter_level_ == 2 && log.level != 2) continue; // error only
+                if (log_filter_level_ == 3 && log.level != 3) continue; // debug only
+            }
+
+            // Text filter
+            if (!log_filter_text_.empty()) {
+                if (log.txt.find(log_filter_text_) == std::string::npos) continue;
+            }
+
+            filtered.push_back(log);
+        }
+
+        // Return last N
+        if (filtered.size() > max_lines) {
+            return std::vector<StyledLine>(filtered.end() - max_lines, filtered.end());
+        }
+        return filtered;
+    }
+
+    // Draw log entry with enhanced styling
+    std::string draw_log_entry(const StyledLine& log, int width, int tick) const {
+        std::ostringstream out;
+
+        std::string txt = log.txt;
+        if ((int)txt.size() > width - 4) {
+            txt = txt.substr(0, width - 7) + "...";
+        }
+
+        if (!vt_ok_) {
+            return txt;
+        }
+
+        // Level indicator
+        std::string level_icon;
+        int color;
+        switch (log.level) {
+            case 2:  // Error
+                level_icon = u8_ok_ ? "✖ " : "[E] ";
+                color = ColorPalette::ERROR;
+                break;
+            case 1:  // Warning
+                level_icon = u8_ok_ ? "⚠ " : "[W] ";
+                color = ColorPalette::WARNING;
+                break;
+            case 3:  // Debug
+                level_icon = u8_ok_ ? "◌ " : "[D] ";
+                color = ColorPalette::MUTED;
+                break;
+            case 4:  // Success
+                level_icon = u8_ok_ ? "✓ " : "[+] ";
+                color = ColorPalette::SUCCESS;
+                break;
+            case 5:  // Info highlight
+                level_icon = u8_ok_ ? "◆ " : "[I] ";
+                color = ColorPalette::INFO;
+                break;
+            default:
+                level_icon = "  ";
+                color = ColorPalette::TEXT;
+        }
+
+        // Highlight recent entries
+        bool recent = (tick % 8 < 4) && (&log == &logs_.back());
+
+        out << "\x1b[38;5;" << color << "m" << level_icon;
+        if (recent) out << "\x1b[1m";
+        out << txt;
+        out << "\x1b[0m";
+
+        return out.str();
+    }
+
+    // Draw log viewer header with filter info
+    std::string draw_log_header(int width, int tick) const {
+        std::ostringstream out;
+
+        if (!vt_ok_) {
+            return "[ LOGS ]";
+        }
+
+        out << "\x1b[38;5;255m\x1b[1m";
+        out << (u8_ok_ ? "📜 " : "");
+        out << "SYSTEM LOG\x1b[0m";
+
+        // Filter indicator
+        if (log_filter_active_) {
+            out << "  \x1b[38;5;214m[FILTERED]\x1b[0m";
+        }
+
+        // Log count
+        out << "  \x1b[38;5;240m(" << logs_.size() << " entries)\x1b[0m";
+
+        // Controls hint
+        out << "  \x1b[38;5;236m[f]filter [c]clear [↑↓]scroll\x1b[0m";
+
+        return out.str();
+    }
+
+    // =========================================================================
+    // REAL-TIME METRICS DASHBOARD - Live data visualization
+    // =========================================================================
+
+    // Metrics history storage
+    struct MetricsHistory {
+        std::deque<double> cpu_usage;
+        std::deque<uint64_t> memory_usage;
+        std::deque<double> network_in;
+        std::deque<double> network_out;
+        std::deque<uint64_t> block_heights;
+        std::deque<size_t> peer_counts;
+        std::deque<size_t> mempool_sizes;
+        static constexpr size_t MAX_HISTORY = 120;
+
+        void add_sample(double cpu, uint64_t mem, double net_in, double net_out,
+                       uint64_t height, size_t peers, size_t mempool) {
+            cpu_usage.push_back(cpu);
+            memory_usage.push_back(mem);
+            network_in.push_back(net_in);
+            network_out.push_back(net_out);
+            block_heights.push_back(height);
+            peer_counts.push_back(peers);
+            mempool_sizes.push_back(mempool);
+
+            while (cpu_usage.size() > MAX_HISTORY) cpu_usage.pop_front();
+            while (memory_usage.size() > MAX_HISTORY) memory_usage.pop_front();
+            while (network_in.size() > MAX_HISTORY) network_in.pop_front();
+            while (network_out.size() > MAX_HISTORY) network_out.pop_front();
+            while (block_heights.size() > MAX_HISTORY) block_heights.pop_front();
+            while (peer_counts.size() > MAX_HISTORY) peer_counts.pop_front();
+            while (mempool_sizes.size() > MAX_HISTORY) mempool_sizes.pop_front();
+        }
+    };
+
+    // Draw metrics overview panel
+    std::vector<std::string> draw_metrics_overview(int width, int tick) const {
+        std::vector<std::string> lines;
+
+        uint64_t rss = get_rss_bytes();
+        size_t peer_count = p2p_ ? p2p_->snapshot_peers().size() : 0;
+        size_t mempool_count = 0;
+        if (mempool_) {
+            auto stat = mempool_view_fallback(mempool_);
+            mempool_count = stat.count;
+        }
+        uint64_t height = chain_ ? chain_->height() : 0;
+
+        // Memory usage with mini graph
+        std::ostringstream mem;
+        if (vt_ok_) {
+            mem << "\x1b[38;5;245mMemory\x1b[0m    ";
+            mem << draw_gauge((double)rss, 500.0 * 1024 * 1024, 16, "",
+                             ColorPalette::SUCCESS, ColorPalette::WARNING, ColorPalette::ERROR, tick);
+            mem << " \x1b[38;5;183m" << fmt_bytes(rss) << "\x1b[0m";
+        } else {
+            mem << "Memory: " << fmt_bytes(rss);
+        }
+        lines.push_back(mem.str());
+
+        // Peer health indicator
+        std::ostringstream peers;
+        if (vt_ok_) {
+            peers << "\x1b[38;5;245mPeers\x1b[0m     ";
+            peers << draw_signal((int)std::min(peer_count, (size_t)5), 5, tick);
+            peers << " \x1b[38;5;252m" << peer_count << " connected\x1b[0m";
+        } else {
+            peers << "Peers: " << peer_count;
+        }
+        lines.push_back(peers.str());
+
+        // Chain height with trend
+        std::ostringstream chain_ln;
+        if (vt_ok_) {
+            chain_ln << "\x1b[38;5;245mChain\x1b[0m     ";
+            chain_ln << "\x1b[38;5;51m#" << fmt_num(height) << "\x1b[0m";
+
+            // Add mini sparkline for block progress
+            if (!net_spark_.empty()) {
+                chain_ln << " " << draw_sparkline(net_spark_, 12, ColorPalette::INFO, false);
+            }
+        } else {
+            chain_ln << "Chain: #" << fmt_num(height);
+        }
+        lines.push_back(chain_ln.str());
+
+        // Mempool status
+        std::ostringstream mp;
+        if (vt_ok_) {
+            mp << "\x1b[38;5;245mMempool\x1b[0m   ";
+            if (mempool_count > 0) {
+                mp << "\x1b[38;5;214m" << mempool_count << " tx\x1b[0m";
+            } else {
+                mp << "\x1b[38;5;240mempty\x1b[0m";
+            }
+        } else {
+            mp << "Mempool: " << mempool_count << " tx";
+        }
+        lines.push_back(mp.str());
+
+        return lines;
+    }
+
+    // Draw combined multi-metric sparkline display
+    std::string draw_multi_sparkline(int width, int tick) const {
+        std::ostringstream out;
+
+        if (!vt_ok_ || !u8_ok_) {
+            return "";
+        }
+
+        // Create labels and data
+        struct MetricLine {
+            std::string label;
+            const std::vector<double>* data;
+            int color;
+        };
+
+        std::vector<double> peer_data;
+        if (p2p_) {
+            peer_data.push_back((double)p2p_->snapshot_peers().size());
+        }
+
+        // Network hashrate sparkline
+        if (!net_spark_.empty()) {
+            out << "\x1b[38;5;245mNet H/s\x1b[0m ";
+            out << draw_sparkline(net_spark_, width - 10, ColorPalette::INFO, false);
+        }
+
+        return out.str();
+    }
+
+    // =========================================================================
+    // MATRIX TRANSITION ANIMATION - Epic digital rain decode effect
+    // =========================================================================
+
+    // Matrix rain column state
+    struct MatrixColumn {
+        int y;           // Current head position
+        int length;      // Trail length
+        int speed;       // Fall speed (1-3)
+        int char_tick;   // Character change timer
+        bool active;
+    };
+
+    // Initialize matrix rain columns
+    mutable std::vector<MatrixColumn> matrix_columns_;
+    mutable int transition_frame_{0};
+    mutable bool transition_active_{false};
+    static constexpr int TRANSITION_FRAMES = 45;  // ~1.5 seconds at 30fps
+
+    void init_matrix_transition(int cols) const {
+        matrix_columns_.clear();
+        matrix_columns_.resize(cols);
+        std::mt19937 rng(std::chrono::steady_clock::now().time_since_epoch().count());
+        for (int i = 0; i < cols; ++i) {
+            matrix_columns_[i].y = -(int)(rng() % 20);  // Staggered start
+            matrix_columns_[i].length = 5 + rng() % 15;
+            matrix_columns_[i].speed = 1 + rng() % 3;
+            matrix_columns_[i].char_tick = rng() % 4;
+            matrix_columns_[i].active = true;
+        }
+        transition_frame_ = 0;
+        transition_active_ = true;
+    }
+
+    // Get matrix character (katakana-like + numbers + symbols)
+    char get_matrix_char(int tick) const {
+        static const char chars[] = "0123456789ABCDEF@#$%&*+=<>{}[]|/\\~";
+        return chars[(tick * 7 + 13) % (sizeof(chars) - 1)];
+    }
+
+    // Draw matrix transition frame
+    void draw_matrix_transition(int cols, int rows) {
+        if (!transition_active_) return;
+
+        std::ostringstream out;
+        out << "\x1b[H";  // Home cursor
+
+        // Matrix green color palette
+        static const int greens[] = {22, 28, 34, 40, 46, 82, 118, 154, 190, 226, 231};
+
+        // Resize columns if needed
+        if ((int)matrix_columns_.size() != cols) {
+            init_matrix_transition(cols);
+        }
+
+        // Build frame buffer
+        std::vector<std::string> screen(rows);
+        for (int row = 0; row < rows; ++row) {
+            screen[row].reserve(cols * 20);  // Pre-allocate for ANSI codes
+        }
+
+        // Update and render each column
+        for (int x = 0; x < cols && x < (int)matrix_columns_.size(); ++x) {
+            auto& col = matrix_columns_[x];
+
+            // Update position
+            if (transition_frame_ % col.speed == 0) {
+                col.y++;
+            }
+            col.char_tick++;
+
+            // Render trail
+            for (int t = 0; t < col.length && col.active; ++t) {
+                int y = col.y - t;
+                if (y >= 0 && y < rows) {
+                    // Brightness based on trail position
+                    int brightness = col.length - t;
+                    int color_idx = std::min(10, brightness * 11 / col.length);
+
+                    if (t == 0) {
+                        // Head is white/bright
+                        screen[y] += "\x1b[38;5;231m";
+                    } else {
+                        screen[y] += "\x1b[38;5;" + std::to_string(greens[color_idx]) + "m";
+                    }
+
+                    // Character with slight randomization
+                    char c = get_matrix_char(col.char_tick + t + x);
+                    screen[y] += c;
+                    screen[y] += "\x1b[0m";
+                }
+            }
+        }
+
+        // Phase 2: Decode effect - reveal MIQROCHAIN text
+        int decode_start = TRANSITION_FRAMES / 3;
+        if (transition_frame_ > decode_start) {
+            int decode_progress = (transition_frame_ - decode_start) * 100 / (TRANSITION_FRAMES - decode_start);
+
+            // Center text reveal
+            const char* reveal_text = "◆ MIQROCHAIN NODE ◆";
+            int text_len = 19;
+            int text_x = (cols - text_len) / 2;
+            int text_y = rows / 2;
+
+            if (text_y >= 0 && text_y < rows && decode_progress > 20) {
+                std::string reveal_line;
+
+                // Clear line first
+                reveal_line += "\x1b[" + std::to_string(text_y + 1) + ";1H";
+                reveal_line += std::string(cols, ' ');
+                reveal_line += "\x1b[" + std::to_string(text_y + 1) + ";" + std::to_string(text_x + 1) + "H";
+
+                // Animated color reveal
+                static const int logo_colors[] = {46, 47, 48, 49, 50, 51, 50, 49, 48, 47};
+                int color = logo_colors[transition_frame_ % 10];
+
+                reveal_line += "\x1b[38;5;" + std::to_string(color) + "m\x1b[1m";
+
+                // Gradually reveal characters
+                int chars_to_show = text_len * decode_progress / 100;
+                for (int i = 0; i < text_len; ++i) {
+                    if (i < chars_to_show) {
+                        reveal_line += reveal_text[i];
+                    } else {
+                        reveal_line += get_matrix_char(transition_frame_ + i);
+                    }
+                }
+                reveal_line += "\x1b[0m";
+
+                out << reveal_line;
+            }
+
+            // Subtitle reveal
+            if (decode_progress > 60) {
+                const char* subtitle = "[ BLOCKCHAIN SYNCHRONIZED - ENTERING DASHBOARD ]";
+                int sub_len = 48;
+                int sub_x = (cols - sub_len) / 2;
+                int sub_y = text_y + 2;
+
+                if (sub_y < rows) {
+                    out << "\x1b[" << (sub_y + 1) << ";" << (sub_x + 1) << "H";
+                    out << "\x1b[38;5;46m" << subtitle << "\x1b[0m";
+                }
+            }
+        }
+
+        // Output frame
+        for (int row = 0; row < rows; ++row) {
+            out << "\x1b[" << (row + 1) << ";1H";
+            if (!screen[row].empty()) {
+                out << screen[row];
+            }
+        }
+
+        std::string frame = out.str();
+        cw_.write_frame("", frame);
+        std::fflush(stdout);
+
+        transition_frame_++;
+
+        // End transition
+        if (transition_frame_ >= TRANSITION_FRAMES) {
+            transition_active_ = false;
+            // Clear screen for main dashboard
+            std::cout << "\x1b[H\x1b[J" << std::flush;
+        }
+    }
+
+    // =========================================================================
+    // ULTIMATE MAIN DASHBOARD - Premium node monitoring with epic visuals
+    // =========================================================================
+
+    // Animated fire effect for active mining
+    std::string draw_fire_bar(int width, int tick) const {
+        if (!u8_ok_ || width < 5) return "";
+        std::ostringstream out;
+        static const int fire_colors[] = {196, 202, 208, 214, 220, 226, 227, 228, 229, 230};
+        static const char* fire_chars[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+
+        for (int i = 0; i < width; ++i) {
+            int phase = (tick * 2 + i * 3) % 16;
+            int height = (phase < 8) ? phase : (16 - phase);
+            int color_idx = (tick + i) % 10;
+            out << "\x1b[38;5;" << fire_colors[color_idx] << "m" << fire_chars[height % 8] << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Animated wave effect
+    std::string draw_wave(int width, int tick, int color) const {
+        if (!u8_ok_ || width < 3) return "";
+        std::ostringstream out;
+        static const char* wave[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃", "▂"};
+
+        for (int i = 0; i < width; ++i) {
+            int phase = (tick + i) % 14;
+            out << "\x1b[38;5;" << color << "m" << wave[phase] << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // DNA helix animation for blockchain visualization
+    std::string draw_dna_helix(int width, int tick) const {
+        if (!u8_ok_ || width < 10) return "";
+        std::ostringstream out;
+
+        for (int i = 0; i < width; ++i) {
+            double phase = (tick * 0.3 + i * 0.5);
+            double sin_val = std::sin(phase);
+            double cos_val = std::cos(phase);
+
+            if (sin_val > 0.7) {
+                out << "\x1b[38;5;51m●\x1b[0m";
+            } else if (sin_val < -0.7) {
+                out << "\x1b[38;5;201m●\x1b[0m";
+            } else if (cos_val > 0) {
+                out << "\x1b[38;5;240m─\x1b[0m";
+            } else {
+                out << "\x1b[38;5;236m─\x1b[0m";
+            }
+        }
+        return out.str();
+    }
+
+    // Animated activity pulse ring
+    std::string draw_pulse_ring(bool active, int tick) const {
+        if (!u8_ok_) return active ? "[*]" : "[ ]";
+
+        if (!active) {
+            return "\x1b[38;5;240m○\x1b[0m";
+        }
+
+        static const char* rings[] = {"◯", "◎", "◉", "●", "◉", "◎"};
+        static const int colors[] = {46, 47, 48, 49, 48, 47};
+        int frame = tick % 6;
+
+        std::ostringstream out;
+        out << "\x1b[38;5;" << colors[frame] << "m" << rings[frame] << "\x1b[0m";
+        return out.str();
+    }
+
+    // Draw fancy section divider with title
+    std::string draw_section_divider(const std::string& title, const std::string& icon, int width, int tick) const {
+        if (!vt_ok_) {
+            int pad = width - (int)title.size() - 5;
+            if (pad < 0) pad = 0;
+            return "--- " + title + " " + std::string(pad, '-');
+        }
+
+        std::ostringstream out;
+        int title_len = visible_length(title) + (icon.empty() ? 0 : 2);
+        int left_len = 3;
+        int right_len = width - title_len - left_len - 4;
+        if (right_len < 3) right_len = 3;
+
+        // Left segment with animation
+        out << "\x1b[38;5;240m";
+        for (int i = 0; i < left_len; ++i) {
+            int pulse = (tick + i) % 8;
+            int c = 236 + (pulse < 4 ? pulse : 8 - pulse);
+            out << "\x1b[38;5;" << c << "m" << (u8_ok_ ? "─" : "-");
+        }
+
+        // Icon and title
+        out << "\x1b[0m ";
+        if (!icon.empty() && u8_ok_) {
+            int icon_c = (tick % 6 < 3) ? ColorPalette::PRIMARY : ColorPalette::ACCENT;
+            out << "\x1b[38;5;" << icon_c << "m" << icon << "\x1b[0m ";
+        }
+        out << "\x1b[38;5;255m\x1b[1m" << title << "\x1b[0m ";
+
+        // Right segment with animation
+        for (int i = 0; i < right_len; ++i) {
+            int pulse = (tick + i + 5) % 8;
+            int c = 236 + (pulse < 4 ? pulse : 8 - pulse);
+            out << "\x1b[38;5;" << c << "m" << (u8_ok_ ? "─" : "-");
+        }
+        out << "\x1b[0m";
+
+        return out.str();
+    }
+
+    // Draw epic stats box with glow effect
+    std::string draw_stat_box(const std::string& label, const std::string& value, int color, int tick, bool highlight = false) const {
+        std::ostringstream out;
+
+        if (!vt_ok_) {
+            return label + ": " + value;
+        }
+
+        // Glow effect for highlighted stats
+        int border_c = highlight ? ((tick % 4 < 2) ? color : color + 2) : 240;
+
+        if (u8_ok_) {
+            out << "\x1b[38;5;" << border_c << "m┌";
+            for (size_t i = 0; i < label.size() + 2; ++i) out << "─";
+            out << "┐\x1b[0m ";
+        }
+
+        out << "\x1b[38;5;245m" << label << "\x1b[0m ";
+        out << "\x1b[38;5;" << color << "m\x1b[1m" << value << "\x1b[0m";
+
+        return out.str();
+    }
+
+    // Draw blockchain blocks visualization
+    std::string draw_blockchain_viz(int num_blocks, int tick) const {
+        if (!u8_ok_) return "[CHAIN]";
+        std::ostringstream out;
+
+        out << "\x1b[38;5;240m⟦\x1b[0m";
+        for (int i = 0; i < num_blocks && i < 12; ++i) {
+            // Animated block color
+            int phase = (tick + i * 2) % 8;
+            int color;
+            if (i == num_blocks - 1) {
+                // Latest block glows
+                static const int glow[] = {46, 47, 48, 49, 50, 51, 50, 49};
+                color = glow[tick % 8];
+            } else {
+                color = 39 + (phase < 4 ? phase : 8 - phase);
+            }
+
+            out << "\x1b[38;5;" << color << "m█\x1b[0m";
+            if (i < num_blocks - 1 && i < 11) {
+                out << "\x1b[38;5;240m─\x1b[0m";
+            }
+        }
+        out << "\x1b[38;5;240m⟧\x1b[0m";
+
+        return out.str();
+    }
+
+    // =========================================================================
+    // ULTRA PREMIUM COMPONENTS - Expert level visualizations
+    // =========================================================================
+
+    // Epic glowing text effect
+    std::string draw_glow_text(const std::string& text, int color, int tick, bool bold = true) const {
+        if (!vt_ok_) return text;
+        std::ostringstream out;
+
+        // Pulse between color and brighter version
+        int pulse = tick % 8;
+        int c = color + (pulse < 4 ? pulse : 8 - pulse);
+        if (c > 255) c = 255;
+
+        out << "\x1b[38;5;" << c << "m";
+        if (bold) out << "\x1b[1m";
+        out << text << "\x1b[0m";
+        return out.str();
+    }
+
+    // Animated radar sweep effect
+    std::string draw_radar(int size, int tick) const {
+        if (!u8_ok_ || size < 3) return "[O]";
+        std::ostringstream out;
+
+        static const char* radar_chars[] = {"◴", "◷", "◶", "◵"};
+        int frame = tick % 4;
+
+        out << "\x1b[38;5;46m" << radar_chars[frame] << "\x1b[0m";
+        return out.str();
+    }
+
+    // Activity heat indicator (shows intensity with color)
+    std::string draw_heat_indicator(double value, double max_val, int tick) const {
+        if (!u8_ok_) {
+            if (value > max_val * 0.8) return "[HOT]";
+            if (value > max_val * 0.5) return "[MED]";
+            return "[LOW]";
+        }
+
+        double ratio = max_val > 0 ? value / max_val : 0;
+        if (ratio > 1.0) ratio = 1.0;
+
+        std::ostringstream out;
+
+        // Heat colors from cool to hot
+        int color;
+        std::string icon;
+        if (ratio > 0.8) {
+            static const int hot[] = {196, 202, 208, 214, 208, 202};
+            color = hot[tick % 6];
+            icon = "🔥";
+        } else if (ratio > 0.5) {
+            color = 214 + (tick % 3);
+            icon = "◆";
+        } else if (ratio > 0.2) {
+            color = 226;
+            icon = "◇";
+        } else {
+            color = 240;
+            icon = "○";
+        }
+
+        out << "\x1b[38;5;" << color << "m" << icon << "\x1b[0m";
+        return out.str();
+    }
+
+    // Epic animated counter with rolling digits effect
+    std::string draw_rolling_number(uint64_t value, int width, int color, int tick) const {
+        std::string num_str = fmt_num(value);
+        if (!vt_ok_) return num_str;
+
+        std::ostringstream out;
+        out << "\x1b[38;5;" << color << "m";
+
+        // Add subtle animation to last digit
+        if (u8_ok_ && tick % 4 == 0) {
+            out << "\x1b[1m";
+        }
+        out << num_str << "\x1b[0m";
+        return out.str();
+    }
+
+    // Network activity visualization (mini traffic graph)
+    std::string draw_network_activity(int width, int tick) const {
+        if (!u8_ok_ || width < 5) return "";
+        std::ostringstream out;
+
+        // Simulated network activity bars
+        static const char* bars[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+
+        for (int i = 0; i < width; ++i) {
+            // Create wave-like pattern
+            int phase = (tick * 2 + i * 3) % 16;
+            int height = (phase < 8) ? phase : (16 - phase);
+            if (height > 7) height = 7;
+
+            // Color based on height
+            int color = 39 + height;
+            out << "\x1b[38;5;" << color << "m" << bars[height] << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Draw epic animated logo line
+    std::string draw_logo_animation(int width, int tick) const {
+        if (!u8_ok_) return "";
+        std::ostringstream out;
+
+        // Particle effect
+        int particle_pos = (tick * 2) % width;
+        for (int i = 0; i < width; ++i) {
+            int dist = std::abs(i - particle_pos);
+            if (dist == 0) {
+                out << "\x1b[38;5;231m★\x1b[0m";  // Bright particle
+            } else if (dist < 3) {
+                static const int trail[] = {255, 252, 249};
+                out << "\x1b[38;5;" << trail[dist - 1] << "m·\x1b[0m";
+            } else {
+                out << "\x1b[38;5;236m─\x1b[0m";
+            }
+        }
+        return out.str();
+    }
+
+    // System load meter with animated fill
+    std::string draw_load_meter(double load, int width, int tick) const {
+        if (width < 5) return "";
+        std::ostringstream out;
+
+        if (!u8_ok_) {
+            int filled = (int)(load * width);
+            out << "[";
+            for (int i = 0; i < width; ++i) {
+                out << (i < filled ? "=" : " ");
+            }
+            out << "]";
+            return out.str();
+        }
+
+        int filled = (int)(load * width);
+
+        // Gradient fill with animation
+        for (int i = 0; i < width; ++i) {
+            if (i < filled) {
+                // Color gradient based on position
+                int color;
+                double pos_ratio = (double)i / width;
+                if (pos_ratio < 0.5) {
+                    color = 46;  // Green
+                } else if (pos_ratio < 0.75) {
+                    color = 226;  // Yellow
+                } else {
+                    color = 196 + (tick % 3);  // Red with pulse
+                }
+
+                // Shimmer effect on edge
+                if (i == filled - 1 && tick % 4 < 2) {
+                    color = 231;  // White flash
+                }
+
+                out << "\x1b[38;5;" << color << "m█\x1b[0m";
+            } else {
+                out << "\x1b[38;5;236m░\x1b[0m";
+            }
+        }
+        return out.str();
+    }
+
+    // Animated connection indicator
+    std::string draw_connection_status(bool connected, int quality, int tick) const {
+        if (!u8_ok_) {
+            return connected ? "[*]" : "[ ]";
+        }
+
+        std::ostringstream out;
+
+        if (!connected) {
+            // Scanning animation
+            static const char* scan[] = {"◜", "◝", "◞", "◟"};
+            out << "\x1b[38;5;240m" << scan[tick % 4] << "\x1b[0m";
+        } else {
+            // Quality-based indicator with pulse
+            int color;
+            std::string icon;
+            if (quality >= 80) {
+                static const int good[] = {46, 47, 48, 49, 48, 47};
+                color = good[tick % 6];
+                icon = "◉";
+            } else if (quality >= 50) {
+                color = 214 + (tick % 3);
+                icon = "◎";
+            } else {
+                color = 196;
+                icon = "○";
+            }
+            out << "\x1b[38;5;" << color << "m" << icon << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Epic timestamp display
+    std::string draw_timestamp(int tick) const {
+        if (!vt_ok_) return "";
+
+        auto now = std::chrono::system_clock::now();
+        auto time = std::chrono::system_clock::to_time_t(now);
+        std::tm* tm = std::localtime(&time);
+
+        std::ostringstream out;
+        out << "\x1b[38;5;240m";
+
+        // Blinking colon
+        out << std::setfill('0') << std::setw(2) << tm->tm_hour;
+        out << ((tick % 2 == 0) ? "\x1b[38;5;252m:\x1b[38;5;240m" : "\x1b[38;5;236m:\x1b[38;5;240m");
+        out << std::setfill('0') << std::setw(2) << tm->tm_min;
+        out << ((tick % 2 == 0) ? "\x1b[38;5;252m:\x1b[38;5;240m" : "\x1b[38;5;236m:\x1b[38;5;240m");
+        out << std::setfill('0') << std::setw(2) << tm->tm_sec;
+        out << "\x1b[0m";
+
+        return out.str();
+    }
+
+    // Cyber-punk style label
+    std::string draw_cyber_label(const std::string& text, int color, int tick) const {
+        if (!vt_ok_) return "[" + text + "]";
+        std::ostringstream out;
+
+        // Animated brackets
+        int bracket_c = 240 + (tick % 4);
+        out << "\x1b[38;5;" << bracket_c << "m⟨\x1b[0m";
+        out << "\x1b[38;5;" << color << "m" << text << "\x1b[0m";
+        out << "\x1b[38;5;" << bracket_c << "m⟩\x1b[0m";
+
+        return out.str();
+    }
+
+    // Draw horizontal animated line with glow
+    std::string draw_glow_line(int width, int color, int tick) const {
+        if (!u8_ok_ || width < 1) return "";
+        std::ostringstream out;
+
+        // Traveling glow effect
+        int glow_pos = (tick * 3) % width;
+
+        for (int i = 0; i < width; ++i) {
+            int dist = std::abs(i - glow_pos);
+            int c;
+            if (dist == 0) {
+                c = 231;  // White center
+            } else if (dist < 3) {
+                c = color + (3 - dist) * 2;
+                if (c > 255) c = 255;
+            } else {
+                c = color;
+            }
+            out << "\x1b[38;5;" << c << "m─\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // =========================================================================
+    // SPLASH SCREEN - ULTRA PROFESSIONAL sync display with premium animations
+    // =========================================================================
+
+    // Animated spinner characters (multiple styles) - enhanced with more frames
     static const char* splash_spinner(int tick, bool u8) {
         if (u8) {
-            static const char* frames[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
-            return frames[tick % 10];
+            // Premium 12-frame braille spinner for ultra-smooth animation
+            static const char* frames[] = {"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷", "⠿", "⡿", "⣟", "⣯"};
+            return frames[tick % 12];
         } else {
             static const char* frames[] = {"|", "/", "-", "\\"};
             return frames[tick % 4];
         }
     }
 
-    // Pulsing block animation for sync
-    static std::string pulse_blocks(int tick, bool u8, bool vt) {
-        if (!u8) return "[###]";
-        // Animated chain of blocks with wave effect
-        static const char* blocks[] = {"░", "▒", "▓", "█"};
+    // Cyber matrix-style rain effect for splash background
+    static std::string cyber_rain(int width, int tick, bool vt) {
+        if (!vt) return "";
         std::string out;
-        if (vt) out += "\x1b[36m";  // Cyan
-        for (int i = 0; i < 5; ++i) {
-            int phase = (tick + i * 2) % 8;
-            if (phase > 4) phase = 8 - phase;
-            out += blocks[std::min(phase, 3)];
+        static const char* chars[] = {"0", "1", "ø", "×", "·", " ", " ", " "};
+        for (int i = 0; i < width; ++i) {
+            int phase = (tick + i * 3) % 8;
+            int brightness = (tick + i * 7) % 6;
+            if (brightness < 2) {
+                out += "\x1b[38;5;22m";  // Dark green
+            } else if (brightness < 4) {
+                out += "\x1b[38;5;28m";  // Medium green
+            } else {
+                out += "\x1b[38;5;46m";  // Bright green
+            }
+            out += chars[phase];
         }
-        if (vt) out += "\x1b[0m";
+        out += "\x1b[0m";
         return out;
     }
 
-    // Fancy gradient progress bar with glow effect
+    // Animated blockchain visualization
+    static std::string blockchain_anim(int tick, bool u8, bool vt) {
+        if (!u8 || !vt) return vt ? "\x1b[36m[===CHAIN===]\x1b[0m" : "[===CHAIN===]";
+
+        std::string out;
+        // Animated chain with flowing blocks
+        static const char* blocks[] = {"░", "▒", "▓", "█", "▓", "▒"};
+        static const char* links[] = {"─", "═", "━", "═"};
+
+        out += "\x1b[38;5;39m";  // Bright blue
+        out += "⟦";
+        for (int i = 0; i < 7; ++i) {
+            int phase = (tick + i * 2) % 6;
+            // Gradient from cyan to green
+            int color = 51 - (i % 4);
+            out += "\x1b[38;5;" + std::to_string(color) + "m";
+            out += blocks[phase];
+            if (i < 6) {
+                out += "\x1b[38;5;240m";
+                out += links[tick % 4];
+            }
+        }
+        out += "\x1b[38;5;39m⟧\x1b[0m";
+        return out;
+    }
+
+    // Pulsing glow effect around text
+    static std::string glow_text(const std::string& text, int tick, bool vt) {
+        if (!vt) return text;
+        // Cycle through bright colors for glow effect
+        static const int colors[] = {51, 87, 123, 159, 195, 231, 195, 159, 123, 87};
+        int color = colors[tick % 10];
+        return "\x1b[38;5;" + std::to_string(color) + "m\x1b[1m" + text + "\x1b[0m";
+    }
+
+    // Network activity pulse visualization
+    static std::string network_pulse(int tick, int peers, bool u8, bool vt) {
+        if (!vt) return peers > 0 ? "[CONNECTED]" : "[SEARCHING]";
+
+        std::string out;
+        if (peers == 0) {
+            // Searching animation
+            static const char* search[] = {"◜ ", " ◝", " ◞", "◟ "};
+            out += "\x1b[38;5;208m";  // Orange
+            out += u8 ? search[tick % 4] : ".";
+            out += " Searching";
+            out += "\x1b[0m";
+        } else {
+            // Connected with signal strength
+            static const char* signals[] = {"▁▃▅▇", "▁▃▅█", "▂▄▆█", "▁▃▆█"};
+            out += "\x1b[38;5;46m";  // Bright green
+            out += u8 ? signals[tick % 4] : "||||";
+            out += " " + std::to_string(peers) + " peer" + (peers != 1 ? "s" : "");
+            out += "\x1b[0m";
+        }
+        return out;
+    }
+
+    // ULTRA-PREMIUM gradient progress bar with electric glow effect
     std::string splash_progress_bar(int width, double frac, int tick) const {
         if (width < 20) width = 20;
         if (frac < 0.0) frac = 0.0;
         if (frac > 1.0) frac = 1.0;
 
-        int inner = width - 2;
+        int inner = width - 4;  // Room for fancy brackets
         int filled = (int)(frac * inner);
-        double sub_frac = (frac * inner) - filled;  // Sub-character precision
 
         std::string out;
-        out.reserve((size_t)(width + 100));
+        out.reserve((size_t)(width + 200));
 
         if (vt_ok_ && u8_ok_) {
-            // Premium Unicode progress bar with smooth gradient and glow
-            out += "\x1b[48;5;236m";  // Dark background
+            // PREMIUM: Electric neon progress bar with rainbow gradient
+            out += "\x1b[38;5;27m▐\x1b[48;5;235m";  // Left cap with dark bg
 
             for (int i = 0; i < inner; ++i) {
                 if (i < filled) {
-                    // Gradient from cyan to green based on position
-                    int color_phase = (i * 6) / inner;
-                    switch(color_phase) {
-                        case 0: out += "\x1b[38;5;51m"; break;   // Bright cyan
-                        case 1: out += "\x1b[38;5;50m"; break;   // Cyan-green
-                        case 2: out += "\x1b[38;5;49m"; break;   // Teal
-                        case 3: out += "\x1b[38;5;48m"; break;   // Green-cyan
-                        case 4: out += "\x1b[38;5;47m"; break;   // Bright green
-                        default: out += "\x1b[38;5;46m"; break;  // Pure green
+                    // Rainbow gradient: blue -> cyan -> green -> yellow
+                    double pos = (double)i / (double)inner;
+                    int color;
+                    if (pos < 0.25) {
+                        color = 27 + (int)(pos * 4 * 8);  // Blue to cyan
+                    } else if (pos < 0.5) {
+                        color = 51 - (int)((pos - 0.25) * 4 * 6);  // Cyan to green
+                    } else if (pos < 0.75) {
+                        color = 46 + (int)((pos - 0.5) * 4 * 40);  // Green to yellow
+                    } else {
+                        color = 226 - (int)((pos - 0.75) * 4 * 10);  // Yellow bright
                     }
-                    out += "█";
+                    // Add shimmer effect
+                    if ((i + tick) % 8 < 2) color = 231;  // White flash
+                    out += "\x1b[38;5;" + std::to_string(color) + "m█";
                 } else if (i == filled && frac < 1.0) {
-                    // Animated leading edge with smooth transition
-                    out += "\x1b[38;5;51m";  // Cyan glow
-                    static const char* edge[] = {"▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"};
-                    int edge_idx = (int)(sub_frac * 8);
-                    // Add pulse animation
-                    int pulse = (tick % 4);
-                    edge_idx = std::min(7, std::max(0, edge_idx + (pulse < 2 ? pulse : 4 - pulse) - 1));
+                    // Animated glowing leading edge
+                    static const char* edge[] = {"░", "▒", "▓", "█", "▓", "▒"};
+                    int edge_idx = (tick % 6);
+                    out += "\x1b[38;5;231m";  // White glow
                     out += edge[edge_idx];
                 } else {
-                    // Empty space with subtle pattern
-                    out += "\x1b[38;5;238m";
-                    out += ((i + tick/2) % 4 == 0) ? "·" : " ";
+                    // Subtle animated background pattern
+                    int pattern_phase = (i + tick/2) % 6;
+                    if (pattern_phase == 0) {
+                        out += "\x1b[38;5;237m·";
+                    } else if (pattern_phase == 3) {
+                        out += "\x1b[38;5;238m•";
+                    } else {
+                        out += "\x1b[38;5;235m ";
+                    }
                 }
             }
-            out += "\x1b[0m";
+            out += "\x1b[0m\x1b[38;5;27m▌\x1b[0m";  // Right cap
+
         } else if (vt_ok_) {
-            // ANSI fallback with color
-            out += "\x1b[42m\x1b[30m";  // Green background
-            for (int i = 0; i < filled; ++i) out += " ";
-            out += "\x1b[0m\x1b[47m\x1b[30m";  // Gray background
-            for (int i = filled; i < inner; ++i) out += " ";
-            out += "\x1b[0m";
+            // ANSI fallback with nice gradient effect
+            out += "\x1b[1m[\x1b[0m";
+            for (int i = 0; i < inner; ++i) {
+                if (i < filled) {
+                    // Simple gradient: green
+                    double pos = (double)i / (double)inner;
+                    if (pos < 0.5) out += "\x1b[36m";  // Cyan
+                    else out += "\x1b[32m";  // Green
+                    out += "█";
+                } else if (i == filled && frac < 1.0) {
+                    out += "\x1b[33m▓\x1b[0m";  // Yellow edge
+                } else {
+                    out += "\x1b[90m░\x1b[0m";
+                }
+            }
+            out += "\x1b[1m]\x1b[0m";
         } else {
-            // Plain ASCII
+            // Plain ASCII with nice pattern
             out += "[";
-            for (int i = 0; i < filled; ++i) out += "=";
-            if (filled < inner) out += ">";
-            for (int i = filled + 1; i < inner; ++i) out += " ";
+            for (int i = 0; i < inner; ++i) {
+                if (i < filled) out += "#";
+                else if (i == filled && frac < 1.0) out += ">";
+                else out += ".";
+            }
             out += "]";
         }
 
         return out;
     }
 
-    // Big percentage display with optional animation
+    // EPIC big percentage display with glow animation
     std::string big_percentage(double pct, int tick) const {
         std::ostringstream o;
         o << std::fixed << std::setprecision(2) << pct << "%";
         std::string pct_str = o.str();
 
-        if (!vt_ok_) return pct_str;
+        if (!vt_ok_) return "[ " + pct_str + " ]";
 
-        // Color based on progress
-        std::string color;
-        if (pct >= 99.0) color = "\x1b[38;5;46m\x1b[1m";       // Bright green + bold
-        else if (pct >= 75.0) color = "\x1b[38;5;47m";          // Green
-        else if (pct >= 50.0) color = "\x1b[38;5;226m";         // Yellow
-        else if (pct >= 25.0) color = "\x1b[38;5;214m";         // Orange
-        else color = "\x1b[38;5;51m";                            // Cyan
+        std::string out;
 
-        return color + pct_str + "\x1b[0m";
+        // Dynamic color based on progress with pulse effect
+        int base_color;
+        if (pct >= 99.0) {
+            // Complete! Celebratory rainbow flash
+            static const int rainbow[] = {46, 226, 208, 201, 51, 46};
+            base_color = rainbow[tick % 6];
+        } else if (pct >= 75.0) {
+            base_color = 46;   // Green
+        } else if (pct >= 50.0) {
+            base_color = 226;  // Yellow
+        } else if (pct >= 25.0) {
+            base_color = 214;  // Orange
+        } else {
+            base_color = 51;   // Cyan
+        }
+
+        // Add subtle glow pulse
+        bool bright = (tick % 4) < 2;
+
+        if (u8_ok_) {
+            out += "\x1b[38;5;240m⟨ \x1b[0m";  // Left bracket
+        }
+        out += "\x1b[38;5;" + std::to_string(base_color) + "m";
+        if (bright) out += "\x1b[1m";  // Bold on pulse
+        out += pct_str;
+        out += "\x1b[0m";
+        if (u8_ok_) {
+            out += "\x1b[38;5;240m ⟩\x1b[0m";  // Right bracket
+        }
+
+        return out;
     }
 
-    // Get sync status string - fixed to show "synced" properly
-    std::string get_sync_status(uint64_t blocks_remaining, double sync_pct) const {
-        if (blocks_remaining == 0 || sync_pct >= 100.0) {
-            if (vt_ok_) return std::string("\x1b[38;5;46m\x1b[1m") + (u8_ok_ ? "✓ " : "") + "FULLY SYNCED\x1b[0m";
-            return "FULLY SYNCED";
+    // Get sync status string with cool animated indicators
+    std::string get_sync_status(uint64_t blocks_remaining, double sync_pct, uint64_t network_height) const {
+        // IMPORTANT: Only show as synced if we actually have network height data
+        // and we're truly synchronized (not just at startup with no data)
+        bool has_network_data = network_height > 0;
+        bool actually_synced = has_network_data && (blocks_remaining == 0 || sync_pct >= 99.9);
+
+        if (!has_network_data) {
+            // Still initializing - no network height known yet
+            if (vt_ok_) {
+                static const char* init_frames[] = {"◐", "◓", "◑", "◒"};
+                std::string spinner = u8_ok_ ? init_frames[tick_ % 4] : ".";
+                return std::string("\x1b[38;5;214m") + spinner + " Initializing...\x1b[0m";
+            }
+            return "Initializing...";
+        }
+
+        if (actually_synced) {
+            if (vt_ok_) {
+                std::string check = u8_ok_ ? "✓ " : "[OK] ";
+                return std::string("\x1b[38;5;46m\x1b[1m") + check + "BLOCKCHAIN SYNCHRONIZED\x1b[0m";
+            }
+            return "BLOCKCHAIN SYNCHRONIZED";
         }
 
         // Only show time behind if actually behind
         std::string time_behind = fmt_time_behind(sync_last_block_time_);
         if (time_behind == "synced") {
-            if (vt_ok_) return std::string("\x1b[38;5;46m") + (u8_ok_ ? "✓ " : "") + "Synchronized\x1b[0m";
+            if (vt_ok_) {
+                std::string check = u8_ok_ ? "✓ " : "[OK] ";
+                return std::string("\x1b[38;5;46m") + check + "Synchronized\x1b[0m";
+            }
             return "Synchronized";
         }
 
-        if (vt_ok_) return std::string("\x1b[38;5;214m") + time_behind + "\x1b[0m";
+        if (vt_ok_) {
+            std::string clock = u8_ok_ ? "⏳ " : "";
+            return std::string("\x1b[38;5;214m") + clock + time_behind + "\x1b[0m";
+        }
         return time_behind;
     }
 
     void draw_splash(int cols, int rows) {
         std::ostringstream out;
 
-        // Sizing
-        const int box_width = std::min(76, cols - 4);
+        // Sizing - wider box for epic look
+        const int box_width = std::min(84, cols - 4);
         const int start_col = std::max(1, (cols - box_width) / 2);
 
         // Calculate sync metrics
@@ -2112,134 +4323,283 @@ private:
 
         std::vector<std::string> lines;
 
-        // ===== ASCII ART LOGO =====
-        if (u8_ok_ && box_width >= 60) {
+        // ===== CYBER BORDER TOP =====
+        if (vt_ok_ && u8_ok_) {
+            std::string border;
+            border += "\x1b[38;5;27m╔";
+            for (int i = 0; i < box_width - 2; ++i) {
+                int pulse = (tick_ + i) % 12;
+                if (pulse < 3) border += "\x1b[38;5;33m";
+                else if (pulse < 6) border += "\x1b[38;5;39m";
+                else if (pulse < 9) border += "\x1b[38;5;45m";
+                else border += "\x1b[38;5;51m";
+                border += "═";
+            }
+            border += "\x1b[38;5;27m╗\x1b[0m";
+            lines.push_back(border);
+        }
+
+        // ===== EPIC ASCII ART LOGO =====
+        if (u8_ok_ && box_width >= 70) {
             lines.push_back("");
-            // Stylized MIQROCHAIN text
             if (vt_ok_) {
-                std::string logo_color = "\x1b[38;5;51m\x1b[1m";  // Bright cyan bold
-                lines.push_back(logo_color + "  ███╗   ███╗██╗ ██████╗ ██████╗  ██████╗ " + C_reset());
-                lines.push_back(logo_color + "  ████╗ ████║██║██╔═══██╗██╔══██╗██╔═══██╗" + C_reset());
-                lines.push_back(logo_color + "  ██╔████╔██║██║██║   ██║██████╔╝██║   ██║" + C_reset());
-                lines.push_back(logo_color + "  ██║╚██╔╝██║██║██║▄▄ ██║██╔══██╗██║   ██║" + C_reset());
-                lines.push_back(logo_color + "  ██║ ╚═╝ ██║██║╚██████╔╝██║  ██║╚██████╔╝" + C_reset());
-                lines.push_back(logo_color + "  ╚═╝     ╚═╝╚═╝ ╚══▀▀═╝ ╚═╝  ╚═╝ ╚═════╝ " + C_reset());
+                // Animated gradient logo - cycles through electric colors
+                int color_offset = tick_ % 6;
+                static const int logo_colors[] = {51, 45, 39, 33, 27, 21};
+
+                auto logo_line = [&](const char* text) {
+                    std::string ln = "\x1b[38;5;" + std::to_string(logo_colors[color_offset]) + "m\x1b[1m";
+                    ln += text;
+                    ln += "\x1b[0m";
+                    return ln;
+                };
+
+                // BIGGER, more impressive ASCII art
+                lines.push_back(logo_line("    ███╗   ███╗██╗ ██████╗ ██████╗  ██████╗  ██████╗██╗  ██╗ █████╗ ██╗███╗   ██╗"));
+                lines.push_back(logo_line("    ████╗ ████║██║██╔═══██╗██╔══██╗██╔═══██╗██╔════╝██║  ██║██╔══██╗██║████╗  ██║"));
+                lines.push_back(logo_line("    ██╔████╔██║██║██║   ██║██████╔╝██║   ██║██║     ███████║███████║██║██╔██╗ ██║"));
+                lines.push_back(logo_line("    ██║╚██╔╝██║██║██║▄▄ ██║██╔══██╗██║   ██║██║     ██╔══██║██╔══██║██║██║╚██╗██║"));
+                lines.push_back(logo_line("    ██║ ╚═╝ ██║██║╚██████╔╝██║  ██║╚██████╔╝╚██████╗██║  ██║██║  ██║██║██║ ╚████║"));
+                lines.push_back(logo_line("    ╚═╝     ╚═╝╚═╝ ╚══▀▀═╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝"));
             } else {
-                lines.push_back("  MIQROCHAIN");
+                lines.push_back("  MIQROCHAIN NODE");
             }
         } else {
             lines.push_back("");
-            lines.push_back(std::string(C_head()) + C_bold() + center_text("MIQROCHAIN", box_width) + C_reset());
+            lines.push_back(glow_text("MIQROCHAIN", tick_, vt_ok_));
         }
 
-        // Version with chain name
+        // ===== TAGLINE WITH BLOCKCHAIN ANIMATION =====
+        lines.push_back("");
+        if (vt_ok_) {
+            std::string tagline = "\x1b[38;5;240m" + std::string(u8_ok_ ? "━━━━━━━━━━━━━" : "-------------") + "\x1b[0m  ";
+            tagline += blockchain_anim(tick_, u8_ok_, vt_ok_);
+            tagline += "  \x1b[38;5;240m" + std::string(u8_ok_ ? "━━━━━━━━━━━━━" : "-------------") + "\x1b[0m";
+            lines.push_back(center_text(tagline, box_width));
+        }
+
+        // ===== VERSION & NETWORK INFO =====
         std::ostringstream ver;
-        ver << C_dim() << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
-            << "  " << (u8_ok_ ? "│" : "|") << "  " << CHAIN_NAME << C_reset();
+        if (vt_ok_) {
+            ver << "\x1b[38;5;243mv" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
+                << "\x1b[0m  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;75m" << CHAIN_NAME << "\x1b[0m"
+                << "  \x1b[38;5;240m│\x1b[0m  " << network_pulse(tick_, (int)peer_count, u8_ok_, vt_ok_);
+        } else {
+            ver << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
+                << " | " << CHAIN_NAME << " | " << peer_count << " peers";
+        }
         lines.push_back(center_text(ver.str(), box_width));
         lines.push_back("");
 
-        // ===== SYNC STATUS HEADER =====
+        // ===== SYNC STATUS HEADER WITH EFFECTS =====
+        // IMPORTANT: Only show as complete if we have network data AND are actually synced
+        bool has_network_data = network_height > 0;
+        bool actually_complete = has_network_data && sync_progress >= 99.9;
+
         std::ostringstream header;
-        header << C_bold();
-        if (sync_progress >= 100.0) {
-            header << "\x1b[38;5;46m" << (u8_ok_ ? "✓ " : "[OK] ") << "Blockchain Synchronized";
+        if (actually_complete) {
+            // EPIC completion animation - only when TRULY complete
+            if (vt_ok_) {
+                static const int celebrate_colors[] = {46, 226, 208, 201, 51, 46};
+                int c = celebrate_colors[tick_ % 6];
+                header << "\x1b[38;5;" << c << "m\x1b[1m";
+                header << (u8_ok_ ? "★ ✓ " : "[*] ");
+                header << "BLOCKCHAIN SYNCHRONIZED";
+                header << (u8_ok_ ? " ✓ ★" : " [*]");
+                header << "\x1b[0m";
+            } else {
+                header << "[OK] BLOCKCHAIN SYNCHRONIZED";
+            }
+        } else if (!has_network_data) {
+            // No network data yet - show initializing state
+            if (vt_ok_) {
+                header << "\x1b[38;5;214m" << splash_spinner(tick_, u8_ok_) << " \x1b[0m";
+                header << "\x1b[38;5;255m\x1b[1mCONNECTING TO NETWORK\x1b[0m";
+            } else {
+                header << splash_spinner(tick_, u8_ok_) << " CONNECTING TO NETWORK";
+            }
         } else {
-            header << C_warn() << splash_spinner(tick_, u8_ok_) << " Synchronizing Blockchain";
+            // Syncing in progress
+            if (vt_ok_) {
+                header << "\x1b[38;5;214m" << splash_spinner(tick_, u8_ok_) << " \x1b[0m";
+                header << "\x1b[38;5;255m\x1b[1mSYNCHRONIZING BLOCKCHAIN\x1b[0m";
+            } else {
+                header << splash_spinner(tick_, u8_ok_) << " SYNCHRONIZING BLOCKCHAIN";
+            }
         }
-        header << C_reset() << "  " << pulse_blocks(tick_, u8_ok_, vt_ok_);
         lines.push_back(center_text(header.str(), box_width));
         lines.push_back("");
 
-        // ===== LARGE PROGRESS BAR =====
-        int bar_width = box_width - 6;
-        lines.push_back("   " + splash_progress_bar(bar_width, frac, tick_));
+        // ===== MEGA PROGRESS BAR =====
+        int bar_width = box_width - 8;
+        lines.push_back("    " + splash_progress_bar(bar_width, frac, tick_));
 
-        // ===== BIG PERCENTAGE =====
+        // ===== EPIC PERCENTAGE DISPLAY =====
         lines.push_back(center_text(big_percentage(sync_progress, tick_), box_width));
         lines.push_back("");
 
-        // ===== STATS BOX =====
-        std::string box_top = u8_ok_ ? "┌" + std::string(box_width - 8, '-') + "┐" : "+" + std::string(box_width - 8, '-') + "+";
-        std::string box_bot = u8_ok_ ? "└" + std::string(box_width - 8, '-') + "┘" : "+" + std::string(box_width - 8, '-') + "+";
-        std::string vbar = u8_ok_ ? "│" : "|";
+        // ===== PREMIUM STATS PANEL =====
+        std::string panel_top = u8_ok_ ? "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+                                       : "+--------------------------------------------------------------+";
+        std::string panel_bot = u8_ok_ ? "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+                                       : "+--------------------------------------------------------------+";
+        std::string vbar = u8_ok_ ? "┃" : "|";
+        int panel_inner = 62;
 
-        lines.push_back("   " + std::string(C_dim()) + box_top + C_reset());
+        if (vt_ok_) lines.push_back("    \x1b[38;5;240m" + panel_top + "\x1b[0m");
+        else lines.push_back("    " + panel_top);
 
-        // Block progress
-        std::ostringstream b1;
-        b1 << vbar << " " << C_dim() << "Blocks      " << C_reset()
-           << C_info() << std::setw(12) << fmt_num(current_height) << C_reset()
-           << C_dim() << " / " << C_reset() << std::setw(12) << fmt_num(network_height);
-        int pad1 = box_width - 10 - 46;
-        b1 << std::string(std::max(0, pad1), ' ') << vbar;
-        lines.push_back("   " + std::string(C_dim()) + b1.str() + C_reset());
-
-        // Remaining
-        std::ostringstream b2;
-        b2 << vbar << " " << C_dim() << "Remaining   " << C_reset()
-           << std::setw(12) << fmt_num(blocks_remaining) << " blocks";
-        int pad2 = box_width - 10 - 35;
-        b2 << std::string(std::max(0, pad2), ' ') << vbar;
-        lines.push_back("   " + std::string(C_dim()) + b2.str() + C_reset());
-
-        // ETA
-        std::string eta_str = "Calculating...";
-        if (sync_progress >= 100.0 || blocks_remaining == 0) {
-            eta_str = u8_ok_ ? "✓ Complete" : "Complete";
-        } else if (sync_blocks_per_sec_ > 0.01 && blocks_remaining > 0) {
-            eta_str = fmt_eta(blocks_remaining, sync_blocks_per_sec_);
+        // Row 1: Block Progress with mini-visualization
+        {
+            std::ostringstream row;
+            row << vbar << " ";
+            if (vt_ok_) {
+                row << "\x1b[38;5;75m" << (u8_ok_ ? "◆ " : "> ") << "\x1b[38;5;248mBlocks\x1b[0m     ";
+                row << "\x1b[38;5;87m" << std::setw(12) << fmt_num(current_height) << "\x1b[0m";
+                row << "\x1b[38;5;240m / \x1b[0m";
+                row << "\x1b[38;5;255m" << std::setw(12) << fmt_num(network_height) << "\x1b[0m";
+            } else {
+                row << "> Blocks       " << std::setw(12) << fmt_num(current_height);
+                row << " / " << std::setw(12) << fmt_num(network_height);
+            }
+            std::string r = row.str();
+            int vis_len = 45;
+            r += std::string(panel_inner - vis_len, ' ') + vbar;
+            lines.push_back(std::string("    ") + (vt_ok_ ? "\x1b[38;5;240m" : "") + r + (vt_ok_ ? "\x1b[0m" : ""));
         }
-        std::ostringstream b3;
-        b3 << vbar << " " << C_dim() << "ETA         " << C_reset() << C_warn() << eta_str << C_reset();
-        int eta_vis = 13 + (int)eta_str.size();
-        int pad3 = box_width - 10 - eta_vis;
-        b3 << std::string(std::max(0, pad3), ' ') << C_dim() << vbar << C_reset();
-        lines.push_back("   " + b3.str());
 
-        // Speed
-        std::ostringstream b4;
-        b4 << vbar << " " << C_dim() << "Speed       " << C_reset();
-        if (sync_blocks_per_sec_ > 0.01) {
-            b4 << std::fixed << std::setprecision(1) << sync_blocks_per_sec_ << " blocks/sec";
-        } else {
-            b4 << C_dim() << "measuring..." << C_reset();
+        // Row 2: Remaining
+        {
+            std::ostringstream row;
+            row << vbar << " ";
+            if (vt_ok_) {
+                row << "\x1b[38;5;214m" << (u8_ok_ ? "◇ " : "> ") << "\x1b[38;5;248mRemaining\x1b[0m  ";
+                row << "\x1b[38;5;214m" << std::setw(12) << fmt_num(blocks_remaining) << "\x1b[0m";
+                row << " blocks";
+            } else {
+                row << "> Remaining    " << std::setw(12) << fmt_num(blocks_remaining) << " blocks";
+            }
+            std::string r = row.str();
+            int vis_len = 38;
+            r += std::string(panel_inner - vis_len, ' ') + vbar;
+            lines.push_back(std::string("    ") + (vt_ok_ ? "\x1b[38;5;240m" : "") + r + (vt_ok_ ? "\x1b[0m" : ""));
         }
-        std::string b4s = b4.str();
-        // Pad to align
-        lines.push_back("   " + std::string(C_dim()) + b4s + std::string(std::max(1, box_width - 10 - 35), ' ') + vbar + C_reset());
 
-        lines.push_back("   " + std::string(C_dim()) + box_bot + C_reset());
+        // Row 3: Speed with trend indicator
+        {
+            std::ostringstream row;
+            row << vbar << " ";
+            if (vt_ok_) {
+                row << "\x1b[38;5;46m" << (u8_ok_ ? "◈ " : "> ") << "\x1b[38;5;248mSpeed\x1b[0m      ";
+                if (sync_blocks_per_sec_ > 0.01) {
+                    row << "\x1b[38;5;46m" << std::fixed << std::setprecision(1) << sync_blocks_per_sec_ << "\x1b[0m blk/s";
+                    // Trend indicator
+                    row << "  " << (u8_ok_ ? "↑" : "^");
+                } else {
+                    row << "\x1b[38;5;240m" << (u8_ok_ ? "◌ measuring..." : "measuring...") << "\x1b[0m";
+                }
+            } else {
+                row << "> Speed        ";
+                if (sync_blocks_per_sec_ > 0.01) {
+                    row << std::fixed << std::setprecision(1) << sync_blocks_per_sec_ << " blk/s";
+                } else {
+                    row << "measuring...";
+                }
+            }
+            std::string r = row.str();
+            int vis_len = 40;
+            r += std::string(panel_inner - vis_len, ' ') + vbar;
+            lines.push_back(std::string("    ") + (vt_ok_ ? "\x1b[38;5;240m" : "") + r + (vt_ok_ ? "\x1b[0m" : ""));
+        }
+
+        // Row 4: ETA
+        {
+            std::string eta_str = "Calculating...";
+            // Only show complete if we ACTUALLY have data and are synced
+            if (actually_complete) {
+                eta_str = u8_ok_ ? "✓ Complete" : "Complete";
+            } else if (!has_network_data) {
+                eta_str = u8_ok_ ? "◌ Awaiting peers..." : "Awaiting peers...";
+            } else if (sync_blocks_per_sec_ > 0.01 && blocks_remaining > 0) {
+                eta_str = fmt_eta(blocks_remaining, sync_blocks_per_sec_);
+            }
+
+            std::ostringstream row;
+            row << vbar << " ";
+            if (vt_ok_) {
+                row << "\x1b[38;5;226m" << (u8_ok_ ? "◉ " : "> ") << "\x1b[38;5;248mETA\x1b[0m        ";
+                row << "\x1b[38;5;226m" << eta_str << "\x1b[0m";
+            } else {
+                row << "> ETA          " << eta_str;
+            }
+            std::string r = row.str();
+            int vis_len = 16 + (int)eta_str.size();
+            r += std::string(std::max(1, panel_inner - vis_len), ' ') + vbar;
+            lines.push_back(std::string("    ") + (vt_ok_ ? "\x1b[38;5;240m" : "") + r + (vt_ok_ ? "\x1b[0m" : ""));
+        }
+
+        if (vt_ok_) lines.push_back("    \x1b[38;5;240m" + panel_bot + "\x1b[0m");
+        else lines.push_back("    " + panel_bot);
+
         lines.push_back("");
 
         // ===== STATUS LINE =====
         std::ostringstream status;
-        status << C_dim() << "Status: " << C_reset() << get_sync_status(blocks_remaining, sync_progress);
-        lines.push_back("   " + status.str());
+        status << C_dim() << (u8_ok_ ? "⚡ " : "> ") << "Status: " << C_reset() << get_sync_status(blocks_remaining, sync_progress, network_height);
+        lines.push_back(center_text(status.str(), box_width));
 
         // ===== NETWORK INFO =====
         std::ostringstream net;
-        net << C_dim() << "Network: " << C_reset();
+        net << C_dim() << (u8_ok_ ? "🌐 " : "@ ") << "Network: " << C_reset();
         if (peer_count == 0) {
-            // Animated connecting indicator
-            static const char* conn_anim[] = {"connecting", "connecting.", "connecting..", "connecting..."};
-            net << C_err() << conn_anim[tick_ % 4] << C_reset();
+            static const char* conn_anim[] = {"scanning", "scanning.", "scanning..", "scanning..."};
+            if (vt_ok_) net << "\x1b[38;5;208m" << conn_anim[tick_ % 4] << "\x1b[0m";
+            else net << conn_anim[tick_ % 4];
         } else {
-            net << C_ok() << peer_count << " peer" << (peer_count != 1 ? "s" : "") << " connected" << C_reset();
+            if (vt_ok_) net << "\x1b[38;5;46m" << peer_count << " peer" << (peer_count != 1 ? "s" : "") << " active\x1b[0m";
+            else net << peer_count << " peers active";
             if (!ibd_seed_host_.empty()) {
-                net << C_dim() << " via " << C_reset() << ibd_seed_host_;
+                net << C_dim() << " via " << C_reset();
+                if (vt_ok_) net << "\x1b[38;5;75m" << ibd_seed_host_ << "\x1b[0m";
+                else net << ibd_seed_host_;
             }
         }
-        lines.push_back("   " + net.str());
+        lines.push_back(center_text(net.str(), box_width));
+        lines.push_back("");
+
+        // ===== CYBER BORDER BOTTOM =====
+        if (vt_ok_ && u8_ok_) {
+            std::string border;
+            border += "\x1b[38;5;27m╚";
+            for (int i = 0; i < box_width - 2; ++i) {
+                int pulse = (tick_ + i) % 12;
+                if (pulse < 3) border += "\x1b[38;5;33m";
+                else if (pulse < 6) border += "\x1b[38;5;39m";
+                else if (pulse < 9) border += "\x1b[38;5;45m";
+                else border += "\x1b[38;5;51m";
+                border += "═";
+            }
+            border += "\x1b[38;5;27m╝\x1b[0m";
+            lines.push_back(border);
+        }
         lines.push_back("");
 
         // ===== FOOTER =====
         std::ostringstream foot1;
-        foot1 << C_dim() << (u8_ok_ ? "⚡ " : "> ") << "Main dashboard opens automatically when sync completes" << C_reset();
+        if (vt_ok_) {
+            foot1 << "\x1b[38;5;240m" << (u8_ok_ ? "⚡ " : "> ");
+            foot1 << "Dashboard opens automatically when sync completes\x1b[0m";
+        } else {
+            foot1 << "> Dashboard opens automatically when sync completes";
+        }
         lines.push_back(center_text(foot1.str(), box_width));
 
         std::ostringstream foot2;
-        foot2 << C_dim() << "[q] quit  [t] theme  [v] verbose" << C_reset();
+        if (vt_ok_) {
+            foot2 << "\x1b[38;5;240m[q] quit  [t] theme  [v] verbose\x1b[0m";
+        } else {
+            foot2 << "[q] quit  [t] theme  [v] verbose";
+        }
         lines.push_back(center_text(foot2.str(), box_width));
         lines.push_back("");
 
@@ -2288,641 +4648,904 @@ private:
         return std::string(pad, ' ') + text;
     }
 
+    // =========================================================================
+    // ULTRA-PROFESSIONAL MAIN DASHBOARD - Premium node monitoring interface
+    // =========================================================================
+
+    // Create animated panel header with icon
+    std::string panel_header(const std::string& title, const char* icon, int width) const {
+        if (!vt_ok_) return "[ " + title + " ]";
+
+        std::string out;
+        // Animated glow on panel headers
+        int glow = (tick_ % 8 < 4) ? 255 : 250;
+
+        out += "\x1b[38;5;" + std::to_string(glow) + "m\x1b[1m";
+        if (u8_ok_ && icon) out += std::string(icon) + " ";
+        out += title;
+        out += "\x1b[0m";
+
+        return out;
+    }
+
+    // Create styled metric line with label and value
+    std::string metric_line(const std::string& label, const std::string& value, int color = 0) const {
+        std::ostringstream out;
+        out << "  ";
+        if (vt_ok_) {
+            out << "\x1b[38;5;245m" << label << "\x1b[0m ";
+            if (color > 0) out << "\x1b[38;5;" << color << "m";
+            out << value;
+            if (color > 0) out << "\x1b[0m";
+        } else {
+            out << label << " " << value;
+        }
+        return out.str();
+    }
+
+    // Create animated activity indicator
+    std::string activity_dot(bool active) const {
+        if (!vt_ok_) return active ? "[*]" : "[ ]";
+        if (!active) return "\x1b[38;5;240m○\x1b[0m";
+
+        // Pulsing dot animation
+        static const int pulse_colors[] = {46, 47, 48, 49, 48, 47};
+        int c = pulse_colors[tick_ % 6];
+        return "\x1b[38;5;" + std::to_string(c) + "m●\x1b[0m";
+    }
+
+    // Create mini sparkline bar
+    std::string mini_bar(double frac, int width) const {
+        if (width < 3) width = 3;
+        if (frac < 0) frac = 0;
+        if (frac > 1) frac = 1;
+
+        int filled = (int)(frac * width);
+        std::string out;
+
+        if (vt_ok_ && u8_ok_) {
+            out += "\x1b[38;5;240m[\x1b[0m";
+            for (int i = 0; i < width; ++i) {
+                if (i < filled) {
+                    // Color gradient
+                    int c = 46 + (i * 5 / width);
+                    out += "\x1b[38;5;" + std::to_string(c) + "m█\x1b[0m";
+                } else {
+                    out += "\x1b[38;5;236m░\x1b[0m";
+                }
+            }
+            out += "\x1b[38;5;240m]\x1b[0m";
+        } else {
+            out += "[";
+            for (int i = 0; i < width; ++i) {
+                out += (i < filled) ? "#" : ".";
+            }
+            out += "]";
+        }
+        return out;
+    }
+
     void draw_once(bool first){
-        (void)first;  // Reserved for future first-draw optimization
+        (void)first;
         std::lock_guard<std::mutex> lk(mu_);
         int cols, rows; term::get_winsize(cols, rows);
 
-        // BULLETPROOF FIX: Enforce minimum dimensions for single-layout rendering
-        // This ensures the TUI fits in one screen without scrolling
-        if (cols < 114) cols = 114;
-        if (rows < 34) rows = 34;
+        // Enforce minimum dimensions
+        if (cols < 120) cols = 120;
+        if (rows < 36) rows = 36;
 
-        // Check if sync is complete to transition from Splash to Main
+        // Check sync transition
         bool sync_complete = ibd_done_ || (ibd_target_ > 0 && ibd_cur_ >= ibd_target_);
+
+        // Handle transition states
         if (sync_complete && view_mode_ == ViewMode::Splash) {
-            // Delay transition slightly to show "100%" message
             if (!splash_transition_done_) {
+                // Start Matrix transition animation
                 splash_transition_done_ = true;
-            } else {
-                view_mode_ = ViewMode::Main;
+                if (vt_ok_ && u8_ok_) {
+                    init_matrix_transition(cols);
+                }
             }
+
+            // Run Matrix transition if active
+            if (transition_active_ && vt_ok_ && u8_ok_) {
+                draw_matrix_transition(cols, rows);
+                return;
+            }
+
+            // Transition complete, switch to main
+            view_mode_ = ViewMode::Main;
         }
 
-        // Draw splash screen during sync, main dashboard after sync
         if (view_mode_ == ViewMode::Splash && !sync_complete) {
             draw_splash(cols, rows);
             return;
         }
 
-        // Calculate layout dimensions - ensure right column fits
-        const int rightw = std::max(50, cols / 3);
+        // Layout for ULTIMATE dashboard
+        const int rightw = std::max(56, cols / 3);
         const int leftw  = cols - rightw - 3;
 
         std::vector<std::string> left, right;
+        std::ostringstream out;
 
-        // Header bar - Professional branding
+        // ═══════════════════════════════════════════════════════════════════════
+        // ULTIMATE HEADER - Animated premium branding bar with effects
+        // ═══════════════════════════════════════════════════════════════════════
         {
-            std::ostringstream h;
-            std::string bullet = u8_ok_ ? " • " : " | ";
+            if (vt_ok_ && u8_ok_) {
+                // ─── TOP BORDER with rainbow wave animation ───
+                out << "\x1b[38;5;27m╔";
+                for (int i = 0; i < cols - 2; ++i) {
+                    // Rainbow wave effect
+                    int wave_phase = (tick_ * 2 + i) % 36;
+                    int color;
+                    if (wave_phase < 6) color = 21 + wave_phase;       // Blue to cyan
+                    else if (wave_phase < 12) color = 27 + (wave_phase - 6) * 2;  // Cyan shades
+                    else if (wave_phase < 18) color = 39 + (wave_phase - 12);     // Cyan to green
+                    else if (wave_phase < 24) color = 45 - (wave_phase - 18);     // Green back
+                    else if (wave_phase < 30) color = 39 - (wave_phase - 24);     // Back to blue
+                    else color = 33 - (wave_phase - 30);              // Blue shades
+                    out << "\x1b[38;5;" << color << "m═";
+                }
+                out << "\x1b[38;5;27m╗\x1b[0m\n";
 
-            // Main title with version
-            h << C_head() << "MIQROCHAIN" << C_reset()
-              << "  " << C_dim()
-              << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
-              << C_reset()
-              << "  " << spinner(tick_, u8_ok_);
-            left.push_back(h.str());
+                // ─── LOGO LINE with epic effects ───
+                out << "\x1b[38;5;27m║\x1b[0m\x1b[48;5;233m ";
 
-            // Network info line
-            std::ostringstream n;
-            n << "  " << C_dim() << "Chain: " << C_reset() << CHAIN_NAME
-              << C_dim() << bullet << "P2P: " << C_reset() << p2p_port_
-              << C_dim() << bullet << "RPC: " << C_reset() << rpc_port_;
+                // Animated diamond logo
+                static const int diamond_colors[] = {51, 50, 49, 48, 47, 46, 82, 118, 154, 190};
+                int dc = diamond_colors[tick_ % 10];
+                out << "\x1b[38;5;" << dc << "m\x1b[1m◆\x1b[0m\x1b[48;5;233m ";
 
-            // Show Stratum port if enabled
-            if (auto* ss = g_stratum_server.load()) {
-                n << C_dim() << bullet << "Pool: " << C_reset() << ss->get_port();
+                // MIQROCHAIN with letter-by-letter color wave
+                const char* logo = "MIQROCHAIN";
+                for (int i = 0; logo[i]; ++i) {
+                    int letter_phase = (tick_ + i * 2) % 12;
+                    int lc = 45 + (letter_phase < 6 ? letter_phase : 12 - letter_phase);
+                    out << "\x1b[38;5;" << lc << "m\x1b[1m" << logo[i];
+                }
+                out << "\x1b[0m\x1b[48;5;233m";
+
+                // Version badge
+                out << "  \x1b[38;5;238m[\x1b[38;5;245mv" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH << "\x1b[38;5;238m]\x1b[0m\x1b[48;5;233m";
+
+                // Animated separator
+                out << "  \x1b[38;5;" << (236 + tick_ % 4) << "m│\x1b[0m\x1b[48;5;233m  ";
+
+                // Chain name with glow
+                int chain_glow = (tick_ % 8 < 4) ? 75 : 81;
+                out << "\x1b[38;5;" << chain_glow << "m" << CHAIN_NAME << "\x1b[0m\x1b[48;5;233m";
+
+                // Separator
+                out << "  \x1b[38;5;" << (236 + tick_ % 4) << "m│\x1b[0m\x1b[48;5;233m  ";
+
+                // Animated activity indicator
+                out << draw_loading(0, tick_);
+                out << "\x1b[48;5;233m";
+
+                // Separator
+                out << "  \x1b[38;5;" << (236 + tick_ % 4) << "m│\x1b[0m\x1b[48;5;233m  ";
+
+                // Node state with animated badge
+                NodeState show_state = degraded_override_ ? NodeState::Degraded : nstate_;
+                switch(show_state) {
+                    case NodeState::Starting:
+                        out << "\x1b[48;5;94m\x1b[38;5;230m ● STARTING \x1b[0m\x1b[48;5;233m";
+                        break;
+                    case NodeState::Syncing: {
+                        static const int sync_colors[] = {214, 215, 216, 217, 216, 215};
+                        out << "\x1b[48;5;" << (sync_colors[tick_ % 6] - 180) << "m\x1b[38;5;" << sync_colors[tick_ % 6] << "m ● SYNCING \x1b[0m\x1b[48;5;233m";
+                        break;
+                    }
+                    case NodeState::Running: {
+                        static const int run_colors[] = {46, 47, 48, 49, 48, 47};
+                        out << "\x1b[48;5;22m\x1b[38;5;" << run_colors[tick_ % 6] << "m ● RUNNING \x1b[0m\x1b[48;5;233m";
+                        break;
+                    }
+                    case NodeState::Degraded:
+                        out << "\x1b[48;5;52m\x1b[38;5;196m ● DEGRADED \x1b[0m\x1b[48;5;233m";
+                        break;
+                    case NodeState::Quitting:
+                        out << "\x1b[48;5;94m\x1b[38;5;214m ● SHUTDOWN \x1b[0m\x1b[48;5;233m";
+                        break;
+                }
+
+                // Mining badge with fire effect if active
+                if (miner_running_badge()) {
+                    out << "  \x1b[38;5;" << (236 + tick_ % 4) << "m│\x1b[0m\x1b[48;5;233m  ";
+                    static const int fire_c[] = {196, 202, 208, 214, 220, 226};
+                    out << "\x1b[48;5;52m\x1b[38;5;" << fire_c[tick_ % 6] << "m ⛏ MINING \x1b[0m\x1b[48;5;233m";
+                }
+
+                // Uptime
+                uptime_s_ = (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - start_tp_).count();
+                out << "  \x1b[38;5;" << (236 + tick_ % 4) << "m│\x1b[0m\x1b[48;5;233m  ";
+                out << "\x1b[38;5;240m⏱ \x1b[38;5;252m" << fmt_uptime(uptime_s_) << "\x1b[0m\x1b[48;5;233m";
+
+                // Live timestamp
+                out << "  \x1b[38;5;" << (236 + tick_ % 4) << "m│\x1b[0m\x1b[48;5;233m  ";
+                out << draw_timestamp(tick_);
+                out << "\x1b[48;5;233m";
+
+                // Pad to end
+                int used = 108 + (miner_running_badge() ? 18 : 0);
+                int pad = cols - used - 2;
+                if (pad > 0) out << std::string(pad, ' ');
+                out << "\x1b[0m\x1b[38;5;27m║\x1b[0m\n";
+
+                // ─── DNA HELIX VISUALIZATION LINE ───
+                out << "\x1b[38;5;27m║\x1b[0m\x1b[48;5;233m ";
+                out << "\x1b[38;5;240m⟦\x1b[0m\x1b[48;5;233m";
+                out << draw_dna_helix(cols - 8, tick_);
+                out << "\x1b[48;5;233m\x1b[38;5;240m⟧\x1b[0m\x1b[48;5;233m ";
+                out << "\x1b[0m\x1b[38;5;27m║\x1b[0m\n";
+
+                // ─── COLUMN DIVIDER ───
+                out << "\x1b[38;5;27m╠";
+                for (int i = 0; i < leftw - 1; ++i) {
+                    int pulse = (tick_ + i) % 12;
+                    int c = 24 + (pulse < 6 ? pulse : 12 - pulse);
+                    out << "\x1b[38;5;" << c << "m═";
+                }
+                out << "\x1b[38;5;27m╦";
+                for (int i = 0; i < rightw; ++i) {
+                    int pulse = (tick_ + i + 6) % 12;
+                    int c = 24 + (pulse < 6 ? pulse : 12 - pulse);
+                    out << "\x1b[38;5;" << c << "m═";
+                }
+                out << "\x1b[38;5;27m╣\x1b[0m\n";
+
+            } else {
+                // ASCII fallback
+                out << "+" << std::string(cols - 2, '=') << "+\n";
+                out << "| MIQROCHAIN v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH;
+                out << " | " << CHAIN_NAME << " | " << spinner(tick_, false);
+                NodeState show_state = degraded_override_ ? NodeState::Degraded : nstate_;
+                out << " | ";
+                switch(show_state) {
+                    case NodeState::Starting: out << "STARTING"; break;
+                    case NodeState::Syncing: out << "SYNCING"; break;
+                    case NodeState::Running: out << "RUNNING"; break;
+                    case NodeState::Degraded: out << "DEGRADED"; break;
+                    case NodeState::Quitting: out << "SHUTDOWN"; break;
+                }
+                if (miner_running_badge()) out << " | MINING";
+                out << std::string(20, ' ') << "|\n";
+                out << "+" << std::string(leftw - 1, '=') << "+" << std::string(rightw, '=') << "+\n";
             }
-            left.push_back(n.str());
-
-            left.push_back("");
-
-            // Status messages
-            if(!banner_.empty()){
-                left.push_back(std::string("  ") + C_info() + banner_ + C_reset());
-            }
-            if (!hot_message_.empty() && (now_ms() - hot_msg_ts_) < 4000){
-                left.push_back(std::string("  ") + C_warn() + hot_message_ + C_reset());
-            }
-
-            // Help hint for new users
-            if (uptime_s_ < 30 && nstate_ == NodeState::Starting) {
-                left.push_back(std::string("  ") + C_dim() + "Press 'q' to quit" + bullet + "'t' toggle theme" + bullet + "'v' verbose mode" + C_reset());
-            }
-
-            left.push_back(std::string("  ") + straight_line(leftw-2));
-            left.push_back("");
         }
 
-        // System panel - Enhanced with professional formatting
+        // ═══════════════════════════════════════════════════════════════════════
+        // LEFT COLUMN - System, Node, Blockchain with ULTIMATE visuals
+        // ═══════════════════════════════════════════════════════════════════════
+
+        // System Panel - Enhanced with gauges and animations
         {
-            left.push_back(std::string(C_bold()) + "System" + C_reset());
-            uptime_s_ = (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_tp_).count();
+            left.push_back(draw_section_divider("SYSTEM METRICS", "⚙", leftw - 2, tick_));
+
             uint64_t rss = get_rss_bytes();
 
-            // Uptime with human-readable format
-            std::ostringstream ln1;
-            ln1 << "  Uptime: " << C_info() << fmt_uptime(uptime_s_) << C_reset()
-                << "   Memory: " << fmt_bytes(rss)
-                << "   Threads: " << std::thread::hardware_concurrency();
-            left.push_back(ln1.str());
+            // Memory gauge with visualization
+            std::ostringstream mem_line;
+            if (vt_ok_ && u8_ok_) {
+                mem_line << "  \x1b[38;5;245m⟨MEM⟩\x1b[0m ";
+                mem_line << draw_gauge((double)rss, 512.0 * 1024 * 1024, 18, "",
+                                       ColorPalette::SUCCESS, ColorPalette::WARNING, ColorPalette::ERROR, tick_);
+                mem_line << " \x1b[38;5;183m" << fmt_bytes(rss) << "\x1b[0m";
+            } else {
+                mem_line << "  Memory: " << fmt_bytes(rss);
+            }
+            left.push_back(mem_line.str());
 
-            // Platform and version info
-            std::ostringstream ln2;
-            ln2 << "  Platform: "
+            // Platform info with icons
+            std::ostringstream plat;
+            if (vt_ok_) {
+                plat << "  \x1b[38;5;240m◆\x1b[0m \x1b[38;5;245mPlatform\x1b[0m \x1b[38;5;252m";
 #ifdef _WIN32
-                << "Windows"
+                plat << "Windows";
 #elif defined(__APPLE__)
-                << "macOS"
+                plat << "macOS";
 #else
-                << "Linux"
+                plat << "Linux";
 #endif
-                << "   Theme: " << (dark_theme_ ? "dark" : "light")
-                << "   Verbose: " << (global::tui_verbose.load() ? C_ok() + std::string("yes") + C_reset() : C_dim() + std::string("no") + C_reset());
-            left.push_back(ln2.str());
-
-            // Controls hint
-            left.push_back(std::string("  ") + C_dim() + "[q]uit [t]heme [p]ause [s]nap [v]erbose [r]eload" + C_reset());
+                plat << "\x1b[0m  \x1b[38;5;240m◆\x1b[0m \x1b[38;5;245mCPUs\x1b[0m \x1b[38;5;87m";
+                plat << std::thread::hardware_concurrency() << "\x1b[0m";
+            } else {
+                plat << "  Platform: Linux  CPUs: " << std::thread::hardware_concurrency();
+            }
+            left.push_back(plat.str());
             left.push_back("");
         }
 
-        // Node state panel
+        // Network Ports Panel - Enhanced with status indicators
         {
-            std::ostringstream s;
-            s << C_bold() << "Node" << C_reset() << "   State: ";
-            NodeState show_state = nstate_;
-            if (degraded_override_) show_state = NodeState::Degraded;
-            switch(show_state){
-                case NodeState::Starting: s << C_warn() << "starting" << C_reset(); break;
-                case NodeState::Syncing:  s << C_warn() << "syncing"  << C_reset(); break;
-                case NodeState::Running:  s << C_ok()   << "running"  << C_reset(); break;
-                case NodeState::Degraded: s << C_err()  << "degraded" << C_reset(); break;
-                case NodeState::Quitting: s << C_warn() << "shutting down" << C_reset(); break;
+            left.push_back(draw_section_divider("NETWORK PORTS", "🌐", leftw - 2, tick_));
+
+            std::ostringstream ports;
+            if (vt_ok_ && u8_ok_) {
+                // P2P port with pulse
+                ports << "  " << draw_pulse_ring(true, tick_) << " \x1b[38;5;245mP2P\x1b[0m ";
+                ports << "\x1b[38;5;46m" << p2p_port_ << "\x1b[0m";
+
+                // RPC port
+                ports << "  " << draw_pulse_ring(true, tick_ + 2) << " \x1b[38;5;245mRPC\x1b[0m ";
+                ports << "\x1b[38;5;87m" << rpc_port_ << "\x1b[0m";
+
+                // Stratum port if active
+                if (auto* ss = g_stratum_server.load()) {
+                    ports << "  " << draw_pulse_ring(true, tick_ + 4) << " \x1b[38;5;245mStratum\x1b[0m ";
+                    ports << "\x1b[38;5;214m" << ss->get_port() << "\x1b[0m";
+                }
+            } else {
+                ports << "  P2P: " << p2p_port_ << "  RPC: " << rpc_port_;
             }
-            if (miner_running_badge()){
-                s << "   " << C_bold() << (u8_ok_ ? (std::string(C_ok()) + "⛏ RUNNING" + C_reset())
-                                                  : (std::string(C_ok()) + "MINER" + C_reset()));
-            }
-            left.push_back(s.str());
+            left.push_back(ports.str());
             left.push_back("");
         }
 
-        // Startup progress
+        // Sync Status Panel - Enhanced with progress visualization
         {
-            left.push_back(std::string(C_bold()) + "Startup" + C_reset());
-            size_t total = steps_.size(), okc = 0;
-            for (auto& s : steps_) if (s.second) ++okc;
-            int bw = std::max(10, leftw - 20);
-            double frac = (double)okc / std::max<size_t>(1,total);
-            std::ostringstream progress;
-            progress << "  " << bar(bw, frac, vt_ok_, u8_ok_) << "  "
-                     << okc << "/" << total << " completed";
-            if (eta_secs_ > 0 && frac < 0.999){
-                progress << "  " << C_dim() << "(~" << std::fixed << std::setprecision(1) << eta_secs_ << "s)" << C_reset();
-            }
-            left.push_back(progress.str());
-            for (auto& s : steps_) {
-                bool ok = s.second;
-                bool failed = failures_.count(s.first) > 0;
-                std::ostringstream ln;
-                ln << "    ";
-                if (ok)         ln << C_ok()  << "[OK]    " << C_reset();
-                else if (failed)ln << C_err() << "[FAIL]  " << C_reset();
-                else            ln << C_dim() << "[..]    " << C_reset();
-                ln << s.first;
-                left.push_back(ln.str());
-            }
-            left.push_back("");
-        }
+            uint64_t network_height = sync_network_height_ > 0 ? sync_network_height_ : ibd_target_;
+            uint64_t current_height = ibd_cur_;
+            bool is_synced = ibd_done_ || (network_height > 0 && current_height >= network_height);
 
-        // =============================================================
-        // Bitcoin Core-style Sync Progress Panel
-        // =============================================================
-        {
-            bool show_sync_panel = (nstate_ == NodeState::Syncing || ibd_visible_ || (!ibd_done_ && ibd_target_ > 0));
+            left.push_back(draw_section_divider("SYNC STATUS", "⚡", leftw - 2, tick_));
 
-            if (show_sync_panel) {
-                // Panel header with warning icon
-                std::string warn_icon = u8_ok_ ? "⚠ " : "[!] ";
-                left.push_back(std::string(C_bold()) + C_warn() + warn_icon + "Synchronizing with Network" + C_reset());
-                left.push_back("");
+            std::ostringstream sync;
+            if (vt_ok_ && u8_ok_) {
+                if (is_synced) {
+                    // Epic synced animation
+                    static const int glow_c[] = {46, 47, 48, 49, 50, 51, 50, 49, 48, 47};
+                    int gc = glow_c[tick_ % 10];
+                    sync << "  \x1b[38;5;" << gc << "m\x1b[1m✓ FULLY SYNCHRONIZED\x1b[0m";
+                    sync << "  \x1b[38;5;240m│\x1b[0m  ";
+                    sync << draw_blockchain_viz(8, tick_);
+                } else if (network_height > 0) {
+                    double pct = (double)current_height / (double)network_height * 100.0;
 
-                // Warning message like Bitcoin Core
-                left.push_back(std::string("  ") + C_warn() + "Recent transactions may not yet be visible, and therefore" + C_reset());
-                left.push_back(std::string("  ") + C_warn() + "your wallet's balance might be incorrect. This information" + C_reset());
-                left.push_back(std::string("  ") + C_warn() + "will be correct once your node has finished synchronizing." + C_reset());
-                left.push_back("");
+                    // Animated sync indicator
+                    sync << "  " << draw_loading(1, tick_) << " ";
 
-                // Calculate sync metrics
-                uint64_t network_height = sync_network_height_ > 0 ? sync_network_height_ : ibd_target_;
-                uint64_t current_height = ibd_cur_;
-                uint64_t blocks_remaining = (network_height > current_height) ? (network_height - current_height) : 0;
-                double sync_progress = (network_height > 0) ? ((double)current_height / (double)network_height * 100.0) : 0.0;
+                    // Progress percentage with glow
+                    int pct_color = (pct < 50) ? ColorPalette::WARNING : ColorPalette::INFO;
+                    sync << "\x1b[38;5;" << pct_color << "m\x1b[1m";
+                    sync << std::fixed << std::setprecision(1) << pct << "%\x1b[0m  ";
 
-                // Determine header sync status
-                std::string header_status;
-                if (ibd_stage_ == "headers" || current_height == 0) {
-                    header_status = "Syncing Headers (" + fmt_num(network_height) + ", " +
-                                   std::to_string((int)(sync_progress)) + "%)...";
+                    // Progress bar
+                    sync << draw_gauge(pct, 100.0, 20, "", ColorPalette::INFO, ColorPalette::SUCCESS, ColorPalette::SUCCESS, tick_);
                 } else {
-                    header_status = fmt_num(blocks_remaining);
+                    sync << "  " << draw_loading(2, tick_) << " \x1b[38;5;240mInitializing...\x1b[0m";
                 }
-
-                // Bitcoin Core-style metrics display
-                std::ostringstream l1;
-                l1 << "  " << C_dim() << "Number of blocks left" << C_reset() << "    " << C_info() << header_status << C_reset();
-                left.push_back(l1.str());
-
-                std::ostringstream l2;
-                l2 << "  " << C_dim() << "Last block time" << C_reset() << "         "
-                   << fmt_datetime(sync_last_block_time_);
-                left.push_back(l2.str());
-
-                std::ostringstream l3;
-                l3 << "  " << C_dim() << "Progress" << C_reset() << "                 "
-                   << C_info() << std::fixed << std::setprecision(2) << sync_progress << "%" << C_reset();
-                left.push_back(l3.str());
-
-                std::ostringstream l4;
-                l4 << "  " << C_dim() << "Progress increase per hour" << C_reset() << " "
-                   << std::fixed << std::setprecision(2) << sync_progress_per_hour_ << "%";
-                left.push_back(l4.str());
-
-                // ETA calculation
-                std::string eta_str = "Unknown...";
-                if (sync_blocks_per_sec_ > 0.01 && blocks_remaining > 0) {
-                    eta_str = fmt_eta(blocks_remaining, sync_blocks_per_sec_);
-                }
-                std::ostringstream l5;
-                l5 << "  " << C_dim() << "Estimated time left" << C_reset() << "      " << eta_str;
-                left.push_back(l5.str());
-
-                left.push_back("");
-
-                // Animated progress bar (full width)
-                int bar_width = std::max(30, leftw - 4);
-                double frac = sync_progress / 100.0;
-                left.push_back(std::string("  ") + progress_bar_animated(bar_width, frac, tick_, vt_ok_, u8_ok_));
-
-                // Time behind indicator (like "8 years and 51 weeks behind")
-                std::string time_behind = fmt_time_behind(sync_last_block_time_);
-                std::ostringstream behind;
-                behind << "  " << C_dim() << "Processing blocks on disk... " << C_reset()
-                       << C_warn() << time_behind << C_reset();
-                left.push_back(behind.str());
-
-                left.push_back("");
-
-                // Sync speed indicator
-                if (sync_blocks_per_sec_ > 0.01) {
-                    std::ostringstream speed;
-                    speed << "  " << C_dim() << "Sync speed: " << C_reset()
-                          << std::fixed << std::setprecision(1) << sync_blocks_per_sec_ << " blocks/sec";
-                    if (!ibd_seed_host_.empty()) {
-                        speed << "  " << C_dim() << "(from " << ibd_seed_host_ << ")" << C_reset();
-                    }
-                    left.push_back(speed.str());
-                }
-
-                if (ibd_done_) {
-                    std::string check = u8_ok_ ? "✓ " : "[OK] ";
-                    left.push_back(std::string("  ") + C_ok() + check + "Synchronization complete!" + C_reset());
-                }
-
-                left.push_back("");
+            } else {
+                sync << "  " << (is_synced ? "[OK] Synced" : "Syncing...");
             }
+            left.push_back(sync.str());
+
+            // Block counts
+            if (vt_ok_ && network_height > 0) {
+                std::ostringstream blocks;
+                blocks << "  \x1b[38;5;240m◆\x1b[0m \x1b[38;5;87m" << fmt_num(current_height) << "\x1b[0m";
+                blocks << " \x1b[38;5;240m/\x1b[0m \x1b[38;5;252m" << fmt_num(network_height) << " blocks\x1b[0m";
+                left.push_back(blocks.str());
+            }
+            left.push_back("");
         }
 
-        // Chain status - Enhanced with better formatting
+        // Blockchain Panel - Enhanced with advanced visualizations
         {
-            left.push_back(std::string(C_bold()) + "Blockchain" + C_reset());
+            left.push_back(draw_section_divider("BLOCKCHAIN", "⛓", leftw - 2, tick_));
+
             uint64_t height = chain_ ? chain_->height() : 0;
             std::string tip_hex;
             long double tip_diff = 0.0L;
             uint64_t tip_age_s = 0;
-            uint64_t tip_timestamp = 0;
+
             if (chain_) {
                 auto t = chain_->tip();
                 tip_hex = to_hex(t.hash);
                 tip_diff = difficulty_from_bits(hdr_bits(t));
-                tip_timestamp = hdr_time(t);
-                if (tip_timestamp) {
+                uint64_t tip_ts = hdr_time(t);
+                if (tip_ts) {
                     uint64_t now = (uint64_t)std::time(nullptr);
-                    tip_age_s = (now > tip_timestamp) ? (now - tip_timestamp) : 0;
+                    tip_age_s = (now > tip_ts) ? (now - tip_ts) : 0;
                 }
             }
 
-            // Height with formatted number
-            std::ostringstream c1;
-            c1 << "  Height: " << C_info() << fmt_num(height) << C_reset()
-               << "   Tip: " << short_hex(tip_hex, 14);
-            left.push_back(c1.str());
-
-            // Tip age with human-readable format
-            std::ostringstream c2;
-            c2 << "  Tip Age: ";
-            if (tip_age_s < 120) {
-                c2 << C_ok() << fmt_uptime(tip_age_s) << C_reset();
-            } else if (tip_age_s < 600) {
-                c2 << C_warn() << fmt_uptime(tip_age_s) << C_reset();
+            // Height with epic animation
+            std::ostringstream h1;
+            if (vt_ok_ && u8_ok_) {
+                static const int height_colors[] = {51, 50, 49, 48, 47, 46, 82, 118};
+                int hc = height_colors[tick_ % 8];
+                h1 << "  \x1b[38;5;240m◆\x1b[0m \x1b[38;5;245mHeight\x1b[0m     \x1b[38;5;" << hc << "m\x1b[1m#" << fmt_num(height) << "\x1b[0m";
             } else {
-                c2 << C_err() << fmt_uptime(tip_age_s) << C_reset();
+                h1 << "  Height: #" << fmt_num(height);
             }
-            c2 << "   Difficulty: " << fmt_diff(tip_diff);
-            left.push_back(c2.str());
+            left.push_back(h1.str());
 
-            // Network hashrate and trend
-            left.push_back(std::string("  Network Hashrate: ") + C_info() + fmt_hs(net_hashrate_) + C_reset());
-            left.push_back(std::string("  Hashrate Trend:   ") + spark_ascii(net_spark_));
-
-            // Recent blocks header
-            size_t N = recent_blocks_.size();
-            if (N > 0) {
-                left.push_back(std::string("  ") + C_dim() + "Recent Blocks:" + C_reset());
-                size_t show = std::min<size_t>(6, N);
-                for (size_t i=0;i<show;i++){
-                    const auto& b = recent_blocks_[N-1-i];
-                    std::ostringstream ln;
-                    ln << "    " << C_dim() << "#" << C_reset() << b.height
-                       << "  " << short_hex(b.hash_hex.empty() ? std::string("?") : b.hash_hex, 10)
-                       << "  " << (b.tx_count ? std::to_string(b.tx_count) : std::string("?")) << " txs";
-                    if (b.fees_known) ln << "  " << b.fees << " fees";
-                    if (!b.miner.empty()) {
-                        // Shorten miner address for display
-                        std::string short_miner = b.miner;
-                        if (short_miner.size() > 12) {
-                            short_miner = short_miner.substr(0, 6) + "..." + short_miner.substr(short_miner.size() - 4);
-                        }
-                        ln << "  " << C_dim() << short_miner << C_reset();
-                    }
-                    left.push_back(ln.str());
-                }
+            // Tip hash with subtle animation
+            std::ostringstream h2;
+            if (vt_ok_) {
+                h2 << "  \x1b[38;5;240m◆\x1b[0m \x1b[38;5;245mTip\x1b[0m        \x1b[38;5;240m" << short_hex(tip_hex, 20) << "\x1b[0m";
             } else {
-                left.push_back(std::string("  ") + C_dim() + "(awaiting first block)" + C_reset());
+                h2 << "  Tip: " << short_hex(tip_hex, 20);
+            }
+            left.push_back(h2.str());
+
+            // Tip age with color-coded freshness
+            std::ostringstream h3;
+            if (vt_ok_ && u8_ok_) {
+                h3 << "  \x1b[38;5;240m◆\x1b[0m \x1b[38;5;245mTip Age\x1b[0m    ";
+                int age_color;
+                std::string age_icon;
+                if (tip_age_s < 120) {
+                    age_color = ColorPalette::SUCCESS;
+                    age_icon = "✓";
+                } else if (tip_age_s < 600) {
+                    age_color = ColorPalette::WARNING;
+                    age_icon = "◐";
+                } else {
+                    age_color = ColorPalette::ERROR;
+                    age_icon = "✗";
+                }
+                h3 << "\x1b[38;5;" << age_color << "m" << age_icon << " " << fmt_uptime(tip_age_s) << "\x1b[0m";
+            } else {
+                h3 << "  Tip Age: " << fmt_uptime(tip_age_s);
+            }
+            left.push_back(h3.str());
+
+            // Difficulty with visual indicator
+            std::ostringstream h4;
+            if (vt_ok_) {
+                h4 << "  \x1b[38;5;240m◆\x1b[0m \x1b[38;5;245mDifficulty\x1b[0m \x1b[38;5;183m" << fmt_diff(tip_diff) << "\x1b[0m";
+            } else {
+                h4 << "  Difficulty: " << fmt_diff(tip_diff);
+            }
+            left.push_back(h4.str());
+
+            // Network hashrate with sparkline
+            std::ostringstream h5;
+            if (vt_ok_ && u8_ok_) {
+                h5 << "  \x1b[38;5;240m◆\x1b[0m \x1b[38;5;245mNet H/s\x1b[0m    \x1b[38;5;87m" << fmt_hs(net_hashrate_) << "\x1b[0m";
+            } else {
+                h5 << "  Net Hashrate: " << fmt_hs(net_hashrate_);
+            }
+            left.push_back(h5.str());
+
+            // Animated hashrate sparkline
+            if (vt_ok_ && u8_ok_ && !net_spark_.empty()) {
+                std::ostringstream spark;
+                spark << "  \x1b[38;5;240m◆\x1b[0m \x1b[38;5;245mTrend\x1b[0m      ";
+                spark << draw_sparkline(net_spark_, 24, ColorPalette::INFO, true);
+                left.push_back(spark.str());
             }
             left.push_back("");
         }
 
-        // Right column: Network/Mempool/Miner/Health/Logs
-        if (p2p_) {
-            right.push_back(std::string(C_bold()) + "Network Peers" + C_reset());
-            auto peers = p2p_->snapshot_peers();
+        // Recent Blocks Panel - Enhanced with block visualization
+        {
+            left.push_back(draw_section_divider("RECENT BLOCKS", "◆", leftw - 2, tick_));
 
-            std::stable_sort(peers.begin(), peers.end(), [](const auto& a, const auto& b){
-                if (a.verack_ok != b.verack_ok) return a.verack_ok > b.verack_ok;
-                if (a.last_seen_ms != b.last_seen_ms) return a.last_seen_ms < b.last_seen_ms;
-                if (a.rx_buf != b.rx_buf) return a.rx_buf < b.rx_buf;
-                return a.inflight < b.inflight;
-            });
-
-            size_t peers_n = peers.size();
-            size_t inflight_tx = 0, rxbuf_sum = 0, awaiting_pongs = 0, verack_ok = 0;
-            for (auto& s : peers) {
-                inflight_tx += (size_t)s.inflight;
-                rxbuf_sum += (size_t)s.rx_buf;
-                if (s.awaiting_pong) ++awaiting_pongs;
-                if (s.verack_ok) ++verack_ok;
+            // Animated chain visualization
+            if (vt_ok_ && u8_ok_) {
+                std::ostringstream chain_viz;
+                chain_viz << "  " << draw_blockchain_viz(std::min((int)recent_blocks_.size(), 10), tick_);
+                left.push_back(chain_viz.str());
             }
 
-            // Summary line with color coding for peer count
-            std::ostringstream sum;
-            sum << "  Connected: ";
-            if (peers_n == 0) {
-                sum << C_err() << "0" << C_reset();
-            } else if (peers_n < 3) {
-                sum << C_warn() << peers_n << C_reset();
+            size_t N = recent_blocks_.size();
+            if (N > 0) {
+                size_t show = std::min<size_t>(4, N);
+                for (size_t i = 0; i < show; i++) {
+                    const auto& b = recent_blocks_[N - 1 - i];
+                    std::ostringstream ln;
+                    if (vt_ok_ && u8_ok_) {
+                        // Newest block gets glow effect
+                        bool newest = (i == 0);
+                        if (newest) {
+                            static const int glow[] = {51, 50, 49, 48, 47, 46};
+                            int gc = glow[tick_ % 6];
+                            ln << "  \x1b[38;5;" << gc << "m●\x1b[0m ";
+                        } else {
+                            ln << "  \x1b[38;5;240m○\x1b[0m ";
+                        }
+                        ln << "\x1b[38;5;87m#" << b.height << "\x1b[0m ";
+                        ln << "\x1b[38;5;240m" << short_hex(b.hash_hex.empty() ? "?" : b.hash_hex, 10) << "\x1b[0m ";
+                        ln << "\x1b[38;5;252m" << (b.tx_count ? std::to_string(b.tx_count) : "?") << "tx\x1b[0m";
+                    } else {
+                        ln << "  #" << b.height << " " << short_hex(b.hash_hex, 8) << " " << b.tx_count << "tx";
+                    }
+                    left.push_back(ln.str());
+                }
             } else {
-                sum << C_ok() << peers_n << C_reset();
+                left.push_back(vt_ok_ ? "  \x1b[38;5;240m(awaiting blocks)\x1b[0m" : "  (awaiting blocks)");
             }
-            sum << "   Active: " << verack_ok
-                << "   In-flight: " << inflight_tx;
-            right.push_back(sum.str());
+            left.push_back("");
+        }
 
-            // Buffer status
-            right.push_back(std::string("  RX Buffer: ") + fmt_bytes(rxbuf_sum)
-                          + "   Pings: " + std::to_string(awaiting_pongs));
+        // ═══════════════════════════════════════════════════════════════════════
+        // RIGHT COLUMN - Peers, Mining, Mempool with ULTIMATE visuals
+        // ═══════════════════════════════════════════════════════════════════════
 
-            // Peer table
+        // Network Peers Panel - Enhanced with topology visualization
+        if (p2p_) {
+            right.push_back(draw_section_divider("NETWORK PEERS", "📡", rightw - 2, tick_));
+
+            auto peers = p2p_->snapshot_peers();
+            size_t peers_n = peers.size();
+            size_t verack_ok = 0;
+            for (const auto& s : peers) if (s.verack_ok) ++verack_ok;
+
+            // Network topology visualization
+            if (vt_ok_ && u8_ok_) {
+                std::ostringstream topo;
+                topo << "  " << draw_network_topology(rightw - 6, tick_);
+                right.push_back(topo.str());
+            }
+
+            // Peer stats with signal bars
+            std::ostringstream psum;
+            if (vt_ok_ && u8_ok_) {
+                psum << "  " << draw_signal((int)std::min(peers_n, (size_t)5), 5, tick_) << " ";
+                if (peers_n == 0) psum << "\x1b[38;5;196m";
+                else if (peers_n < 3) psum << "\x1b[38;5;214m";
+                else psum << "\x1b[38;5;46m";
+                psum << peers_n << " connected\x1b[0m";
+                psum << "  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;46m" << verack_ok << " active\x1b[0m";
+            } else {
+                psum << "  Connected: " << peers_n << "  Active: " << verack_ok;
+            }
+            right.push_back(psum.str());
+
+            // Peer list with quality indicators
             if (peers_n > 0) {
-                right.push_back(std::string("  ") + C_dim() + "Peer List:" + C_reset());
-                size_t showN = std::min(peers.size(), (size_t)6);
-                for (size_t i=0;i<showN; ++i) {
+                std::stable_sort(peers.begin(), peers.end(), [](const auto& a, const auto& b){
+                    return a.verack_ok > b.verack_ok;
+                });
+                size_t showN = std::min(peers.size(), (size_t)5);
+                for (size_t i = 0; i < showN; ++i) {
                     const auto& s = peers[i];
                     std::string ip = s.ip;
-                    if ((int)ip.size() > 16) ip = ip.substr(0,13) + "...";
+                    if (ip.size() > 18) ip = ip.substr(0, 15) + "...";
                     std::ostringstream ln;
-                    ln << "    " << std::left << std::setw(16) << ip << " ";
-                    if (s.verack_ok) {
-                        ln << C_ok() << "OK" << C_reset();
+                    if (vt_ok_ && u8_ok_) {
+                        int quality = calculate_peer_quality(0, 0, s.verack_ok);
+                        ln << "  " << draw_pulse_ring(s.verack_ok, tick_ + (int)i);
+                        ln << " \x1b[38;5;252m" << std::left << std::setw(18) << ip << "\x1b[0m ";
+                        ln << draw_peer_quality(quality, 6);
                     } else {
-                        ln << C_warn() << ".." << C_reset();
-                    }
-                    ln << " rx:" << (uint64_t)s.rx_buf;
-                    if (s.inflight > 0) {
-                        ln << " (" << s.inflight << " pending)";
+                        ln << "  " << (s.verack_ok ? "[*]" : "[ ]") << " " << ip;
                     }
                     right.push_back(ln.str());
                 }
                 if (peers.size() > showN) {
-                    right.push_back(std::string("    ") + C_dim() + "+ " + std::to_string(peers.size()-showN) + " more peers" + C_reset());
+                    right.push_back(vt_ok_ ?
+                        "  \x1b[38;5;240m+ " + std::to_string(peers.size() - showN) + " more peers\x1b[0m" :
+                        "  + " + std::to_string(peers.size() - showN) + " more");
                 }
-            } else {
-                right.push_back(std::string("  ") + C_dim() + "(no peers connected)" + C_reset());
             }
             right.push_back("");
         }
 
-        if (mempool_) {
-            right.push_back(std::string(C_bold()) + "Mempool" + C_reset());
-            auto stat = mempool_view_fallback(mempool_);
-            right.push_back(std::string("  txs: ") + std::to_string(stat.count)
-                            + (stat.bytes? (std::string("   bytes: ") + fmt_bytes(stat.bytes)) : std::string())
-                            + (stat.recent_adds? (std::string("   recent_adds: ") + std::to_string(stat.recent_adds)) : std::string()));
-            right.push_back("");
-        }
-
-        // Mining panel - Enhanced with better formatting
+        // Mining Panel - Enhanced with fire effects and graphs
         {
-            right.push_back(std::string(C_bold()) + "Local Mining" + C_reset());
+            right.push_back(draw_section_divider("MINING", "⛏", rightw - 2, tick_));
+
             bool active = g_miner_stats.active.load();
-            unsigned thr = g_miner_stats.threads.load();
-            uint64_t ok  = g_miner_stats.accepted.load();
-            uint64_t rej = g_miner_stats.rejected.load();
-            double   hps = g_miner_stats.hps.load();
-            uint64_t miner_uptime = 0;
-            if (active) {
-                miner_uptime = (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::steady_clock::now() - g_miner_stats.start).count();
+            double hps = g_miner_stats.hps.load();
+            uint64_t threads = g_miner_stats.threads.load();
+            uint64_t blocks_mined = g_miner_stats.accepted.load();
+
+            // Fire effect bar when mining
+            if (active && vt_ok_ && u8_ok_) {
+                std::ostringstream fire;
+                fire << "  " << draw_fire_bar(rightw - 6, tick_);
+                right.push_back(fire.str());
             }
 
-            // Mining availability status
-            std::ostringstream m0;
-            m0 << "  Status: ";
-            if (mining_gate_available_) {
-                if (active) {
-                    m0 << C_ok() << "MINING" << C_reset() << " (" << thr << " threads)";
+            // Status with epic indicator
+            std::ostringstream m1;
+            if (vt_ok_ && u8_ok_) {
+                if (mining_gate_available_) {
+                    if (active) {
+                        static const int mine_c[] = {196, 202, 208, 214, 220, 226};
+                        int mc = mine_c[tick_ % 6];
+                        m1 << "  \x1b[48;5;52m\x1b[38;5;" << mc << "m ⛏ MINING ACTIVE \x1b[0m";
+                        m1 << " \x1b[38;5;240m" << threads << " threads\x1b[0m";
+                    } else {
+                        m1 << "  " << draw_pulse_ring(false, tick_) << " \x1b[38;5;46mReady to mine\x1b[0m";
+                    }
                 } else {
-                    m0 << C_ok() << "available" << C_reset();
+                    m1 << "  \x1b[38;5;240m○ Mining unavailable\x1b[0m";
                 }
             } else {
-                m0 << C_warn() << "unavailable" << C_reset();
-                if (!mining_gate_reason_.empty()) {
-                    std::string reason = mining_gate_reason_;
-                    if (reason.size() > 30) reason = reason.substr(0, 27) + "...";
-                    m0 << " - " << reason;
-                }
+                m1 << "  Status: " << (active ? "ACTIVE" : (mining_gate_available_ ? "Available" : "Unavailable"));
             }
-            right.push_back(m0.str());
+            right.push_back(m1.str());
 
-            // External miner detection
-            if (std::getenv("MIQ_MINER_HEARTBEAT")) {
-                std::ostringstream ext;
-                ext << "  External: " << (g_extminer.alive.load() ?
-                    (std::string(C_ok()) + "detected" + C_reset()) :
-                    (std::string(C_dim()) + "not detected" + C_reset()));
-                right.push_back(ext.str());
-            }
-
-            // Mining address (shortened for display)
-            if (!g_miner_address_b58.empty()) {
-                std::string addr = g_miner_address_b58;
-                if (addr.size() > 24) {
-                    addr = addr.substr(0, 8) + "..." + addr.substr(addr.size() - 8);
+            if (active || blocks_mined > 0) {
+                // Hashrate with gauge
+                std::ostringstream m2;
+                if (vt_ok_ && u8_ok_) {
+                    m2 << "  \x1b[38;5;240m◆\x1b[0m \x1b[38;5;245mHashrate\x1b[0m \x1b[38;5;87m\x1b[1m" << fmt_hs(hps) << "\x1b[0m";
+                } else {
+                    m2 << "  Hashrate: " << fmt_hs(hps);
                 }
-                right.push_back(std::string("  Reward To: ") + C_info() + addr + C_reset());
-            }
+                right.push_back(m2.str());
 
-            // Performance metrics
-            if (active || ok > 0 || rej > 0) {
-                // Hashrate with trend
-                right.push_back(std::string("  Hashrate: ") + C_info() + fmt_hs(hps) + C_reset());
-                right.push_back(std::string("  Trend:    ") + spark_ascii(spark_hs_));
-
-                // Blocks mined
-                std::ostringstream blocks;
-                blocks << "  Blocks: " << C_ok() << ok << " mined" << C_reset();
-                if (rej > 0) {
-                    blocks << ", " << C_err() << rej << " rejected" << C_reset();
-                }
-                right.push_back(blocks.str());
-
-                // Uptime
-                if (active) {
-                    right.push_back(std::string("  Uptime: ") + fmt_uptime(miner_uptime));
+                // Hashrate sparkline with animation
+                if (vt_ok_ && u8_ok_ && !spark_hs_.empty()) {
+                    std::ostringstream spark;
+                    spark << "  \x1b[38;5;240m◆\x1b[0m \x1b[38;5;245mTrend\x1b[0m    ";
+                    spark << draw_mining_graph(spark_hs_, 20, 1, tick_);
+                    right.push_back(spark.str());
                 }
 
-                // Network share
-                double share = (net_hashrate_ > 0.0) ? (hps / net_hashrate_) * 100.0 : 0.0;
-                if (share < 0.0) share = 0.0;
-                if (share > 100.0) share = 100.0;
-                std::ostringstream sh;
-                sh << "  Network Share: " << std::fixed << std::setprecision(2) << share << "%";
-                right.push_back(sh.str());
-            }
+                // Blocks mined with celebration effect
+                std::ostringstream m3;
+                if (vt_ok_ && u8_ok_) {
+                    m3 << "  \x1b[38;5;240m◆\x1b[0m \x1b[38;5;245mBlocks\x1b[0m   ";
+                    if (blocks_mined > 0) {
+                        static const int gold[] = {220, 221, 222, 223, 222, 221};
+                        m3 << "\x1b[38;5;" << gold[tick_ % 6] << "m\x1b[1m" << blocks_mined << " found!\x1b[0m";
+                    } else {
+                        m3 << "\x1b[38;5;240m0 found\x1b[0m";
+                    }
+                } else {
+                    m3 << "  Blocks: " << blocks_mined << " mined";
+                }
+                right.push_back(m3.str());
 
-            // Miners observed
-            size_t miners_obs = distinct_miners_recent(64);
-            if (miners_obs > 0) {
-                right.push_back(std::string("  Active Miners: ") + std::to_string(miners_obs) + " (last 64 blocks)");
+                // Efficiency
+                if (threads > 0 && vt_ok_) {
+                    double eff = hps / threads;
+                    std::ostringstream m4;
+                    m4 << "  \x1b[38;5;240m◆\x1b[0m \x1b[38;5;245mEfficiency\x1b[0m \x1b[38;5;183m" << fmt_hs(eff) << "/thread\x1b[0m";
+                    right.push_back(m4.str());
+                }
             }
-
             right.push_back("");
         }
 
-        // Pool Statistics panel (if Stratum server is running) - Enhanced
+        // Mempool Panel - Enhanced
+        if (mempool_) {
+            right.push_back(draw_section_divider("MEMPOOL", "📋", rightw - 2, tick_));
+
+            auto stat = mempool_view_fallback(mempool_);
+            std::ostringstream mp;
+            if (vt_ok_ && u8_ok_) {
+                mp << "  " << draw_pulse_ring(stat.count > 0, tick_) << " ";
+                mp << "\x1b[38;5;51m" << stat.count << "\x1b[0m \x1b[38;5;245mtransactions\x1b[0m";
+                if (stat.bytes) {
+                    mp << "  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;183m" << fmt_bytes(stat.bytes) << "\x1b[0m";
+                }
+            } else {
+                mp << "  Transactions: " << stat.count;
+            }
+            right.push_back(mp.str());
+            right.push_back("");
+        }
+
+        // Pool Server Panel (if active) - Enhanced
         if (auto* ss = g_stratum_server.load()) {
-            right.push_back(std::string(C_bold()) + "Pool Server (Stratum)" + C_reset());
+            right.push_back(draw_section_divider("POOL SERVER", "🏊", rightw - 2, tick_));
+
             auto stats = ss->get_stats();
-
-            // Connection status
-            std::ostringstream p1;
-            p1 << "  Port: " << C_info() << ss->get_port() << C_reset()
-               << "   Miners: ";
-            if (stats.connected_miners == 0) {
-                p1 << C_dim() << "0" << C_reset();
+            std::ostringstream ps;
+            if (vt_ok_ && u8_ok_) {
+                ps << "  " << draw_pulse_ring(stats.connected_miners > 0, tick_) << " ";
+                ps << "\x1b[38;5;46m" << stats.connected_miners << "\x1b[0m \x1b[38;5;245mminers\x1b[0m";
+                ps << "  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;87m" << fmt_hs(stats.pool_hashrate) << "\x1b[0m";
             } else {
-                p1 << C_ok() << stats.connected_miners << C_reset();
+                ps << "  Miners: " << stats.connected_miners << "  Hashrate: " << fmt_hs(stats.pool_hashrate);
             }
-            right.push_back(p1.str());
+            right.push_back(ps.str());
 
-            // Pool performance
-            right.push_back(std::string("  Pool Hashrate: ") + C_info() + fmt_hs(stats.pool_hashrate) + C_reset());
-
-            // Shares
-            std::ostringstream p2;
-            p2 << "  Shares: " << C_ok() << stats.accepted_shares << " accepted" << C_reset();
-            if (stats.rejected_shares > 0) {
-                p2 << ", " << C_err() << stats.rejected_shares << " rejected" << C_reset();
-            }
-            right.push_back(p2.str());
-
-            // Blocks found
-            std::ostringstream p3;
-            p3 << "  Blocks Found: ";
-            if (stats.blocks_found > 0) {
-                p3 << C_ok() << stats.blocks_found << C_reset();
+            std::ostringstream ps2;
+            if (vt_ok_) {
+                ps2 << "  \x1b[38;5;240m◆\x1b[0m \x1b[38;5;245mShares\x1b[0m \x1b[38;5;46m" << stats.accepted_shares << "\x1b[0m";
+                ps2 << "  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;245mBlocks\x1b[0m \x1b[38;5;226m" << stats.blocks_found << "\x1b[0m";
             } else {
-                p3 << C_dim() << "0" << C_reset();
+                ps2 << "  Shares: " << stats.accepted_shares << "  Blocks: " << stats.blocks_found;
             }
-            right.push_back(p3.str());
-
-            // Connection hint
-            right.push_back(std::string("  ") + C_dim() + "Connect miners to this port for pool mining" + C_reset());
+            right.push_back(ps2.str());
             right.push_back("");
         }
 
+        // Health Panel - Enhanced with visual indicators
         {
-            right.push_back(std::string(C_bold()) + "Health & Security" + C_reset());
-            right.push_back(std::string("  config reload: ")
-               + (global::reload_requested.load()? "pending" : (u8_ok_? "—" : "-")));
-            if (!hot_warning_.empty() && now_ms()-hot_warn_ts_ < 6000){
-                right.push_back(std::string("  ") + C_warn() + hot_warning_ + C_reset());
+            right.push_back(draw_section_divider("NODE HEALTH", "❤", rightw - 2, tick_));
+
+            // Overall health status
+            std::ostringstream hp;
+            if (vt_ok_ && u8_ok_) {
+                bool healthy = (nstate_ == NodeState::Running);
+                if (healthy) {
+                    static const int pulse_c[] = {46, 47, 48, 49, 48, 47};
+                    hp << "  \x1b[38;5;" << pulse_c[tick_ % 6] << "m● ALL SYSTEMS OPERATIONAL\x1b[0m";
+                } else {
+                    hp << "  \x1b[38;5;214m◐ System initializing...\x1b[0m";
+                }
+            } else {
+                hp << "  Node " << (nstate_ == NodeState::Running ? "operational" : "starting");
             }
-            if (!datadir_.empty()){
-                right.push_back(std::string("  datadir: ") + datadir_);
+            right.push_back(hp.str());
+
+            // Health indicators
+            if (vt_ok_ && u8_ok_) {
+                std::ostringstream h1;
+                h1 << "  " << draw_status("P2P Network", p2p_ && p2p_->snapshot_peers().size() > 0, tick_);
+                right.push_back(h1.str());
+
+                std::ostringstream h2;
+                h2 << "  " << draw_status("Blockchain", chain_ != nullptr, tick_ + 2);
+                right.push_back(h2.str());
+
+                std::ostringstream h3;
+                h3 << "  " << draw_status("Mempool", mempool_ != nullptr, tick_ + 4);
+                right.push_back(h3.str());
+            }
+
+            if (!hot_warning_.empty() && now_ms() - hot_warn_ts_ < 6000) {
+                right.push_back(vt_ok_ ? "  \x1b[38;5;214m⚠ " + hot_warning_ + "\x1b[0m" : "  ! " + hot_warning_);
             }
             right.push_back("");
         }
 
+        // Recent TXIDs Panel - Enhanced
         {
-            right.push_back(std::string(C_bold()) + "Recent TXIDs" + C_reset());
-            if (recent_txids_.empty()) right.push_back("  (no txids yet)");
-            size_t n = std::min<size_t>(recent_txids_.size(), 10);
-            for (size_t i=0;i<n;i++){
-                right.push_back(std::string("  ") + short_hex(recent_txids_[recent_txids_.size()-1-i], 20));
+            right.push_back(draw_section_divider("RECENT TXs", "📝", rightw - 2, tick_));
+
+            if (recent_txids_.empty()) {
+                right.push_back(vt_ok_ ? "  \x1b[38;5;240m(awaiting transactions)\x1b[0m" : "  (no transactions)");
+            } else {
+                size_t n = std::min<size_t>(recent_txids_.size(), 4);
+                for (size_t i = 0; i < n; i++) {
+                    std::string txid = short_hex(recent_txids_[recent_txids_.size() - 1 - i], 28);
+                    std::ostringstream tx_ln;
+                    if (vt_ok_ && u8_ok_) {
+                        // Newest TX gets highlight
+                        if (i == 0) {
+                            static const int tx_c[] = {51, 50, 49, 48, 47, 46};
+                            tx_ln << "  \x1b[38;5;" << tx_c[tick_ % 6] << "m●\x1b[0m \x1b[38;5;252m" << txid << "\x1b[0m";
+                        } else {
+                            tx_ln << "  \x1b[38;5;240m○ " << txid << "\x1b[0m";
+                        }
+                    } else {
+                        tx_ln << "  " << txid;
+                    }
+                    right.push_back(tx_ln.str());
+                }
             }
             right.push_back("");
         }
 
-        std::ostringstream out;
+        // ═══════════════════════════════════════════════════════════════════════
+        // RENDER COLUMNS
+        // ═══════════════════════════════════════════════════════════════════════
 
-        // Build the entire frame first (double buffering)
         size_t NL = left.size(), NR = right.size(), N = std::max(NL, NR);
-        for (size_t i=0;i<N;i++){
-            std::string l = (i<NL) ? left[i] : "";
-            std::string r = (i<NR) ? right[i] : "";
-            if ((int)l.size() > leftw)  l = fit(l, leftw);
-            if ((int)r.size() > rightw) r = fit(r, rightw);
-            out << std::left << std::setw(leftw) << l << " | " << r << "\n";
+        std::string vert_sep = vt_ok_ ? "\x1b[38;5;27m║\x1b[0m" : "|";
+
+        for (size_t i = 0; i < N; i++) {
+            std::string l = (i < NL) ? left[i] : "";
+            std::string r = (i < NR) ? right[i] : "";
+
+            // Pad left column
+            int l_vis = visible_length(l);
+            if (l_vis < leftw - 1) l += std::string(leftw - 1 - l_vis, ' ');
+
+            out << vert_sep << l << vert_sep << r << "\n";
         }
 
-        // BULLETPROOF: Separator line
-        out << std::string((size_t)cols, '-') << "\n";
+        // ═══════════════════════════════════════════════════════════════════════
+        // LOG AREA - Professional styled log display
+        // ═══════════════════════════════════════════════════════════════════════
 
-        // BULLETPROOF: Status/shutdown banner (fixed 2 lines)
-        if (nstate_ == NodeState::Quitting){
-            out << C_bold() << "Shutting down" << C_reset() << "  " << C_dim() << "(Ctrl+C again = force)" << C_reset() << "\n";
-            std::string phase = shutdown_phase_.empty() ? "initiating..." : shutdown_phase_;
-            out << "  phase: " << phase << "\n";
+        // Log header bar
+        if (vt_ok_ && u8_ok_) {
+            out << "\x1b[38;5;27m╠";
+            for (int i = 0; i < cols - 2; ++i) out << "═";
+            out << "╣\x1b[0m\n";
+
+            out << "\x1b[38;5;27m║\x1b[0m ";
+            out << "\x1b[38;5;255m\x1b[1m📜 LOGS\x1b[0m";
+            out << "  \x1b[38;5;240m[q]quit [t]theme [p]pause [v]verbose [s]snap [r]reload\x1b[0m";
+            out << std::string(cols - 70, ' ');
+            out << "\x1b[38;5;27m║\x1b[0m\n";
+
+            out << "\x1b[38;5;27m╠";
+            for (int i = 0; i < cols - 2; ++i) out << "─";
+            out << "╣\x1b[0m\n";
         } else {
-            out << C_bold() << "Logs" << C_reset() << "  " << C_dim() << "(q=quit t=theme p=pause r=reload s=snap v=verbose)" << C_reset() << "\n";
+            out << "+" << std::string(cols - 2, '-') << "+\n";
+            out << "| LOGS  [q]quit [t]theme [p]pause [v]verbose\n";
+            out << "+" << std::string(cols - 2, '-') << "+\n";
         }
 
-        // BULLETPROOF: Calculate log area to fit exactly in remaining screen space
-        // This ensures no scrolling - the TUI is a single fixed-size layout
-        int header_rows = (int)N + 2;  // Main content + separator
-        int footer_rows = 3;            // Status line + 2 buffer
-        int remain = rows - header_rows - footer_rows;
+        // Calculate remaining space for logs
+        int header_lines = (int)N + 6;  // Header + columns + log header
+        int footer_lines = 2;
+        int log_space = rows - header_lines - footer_lines;
+        if (log_space < 4) log_space = 4;
+        if (log_space > 20) log_space = 20;
 
-        // Ensure minimum log lines but cap to prevent overflow
-        if (remain < 6) remain = 6;
-        if (remain > 30) remain = 30;  // Cap to prevent excessive logs pushing layout
+        // Render logs
+        int log_start = (int)logs_.size() - log_space;
+        if (log_start < 0) log_start = 0;
 
-        // Get only the last 'remain' log entries
-        int start = (int)logs_.size() - remain;
-        if (start < 0) start = 0;
-
-        // Print log lines (each exactly one line, no overflow)
         int printed = 0;
-        for (int i = start; i < (int)logs_.size() && printed < remain; ++i) {
+        for (int i = log_start; i < (int)logs_.size() && printed < log_space; ++i) {
             const auto& line = logs_[i];
-            // Truncate long lines to prevent wrapping
             std::string txt = line.txt;
-            if ((int)txt.size() > cols - 2) {
-                txt = txt.substr(0, cols - 5) + "...";
+            if ((int)txt.size() > cols - 4) {
+                txt = txt.substr(0, cols - 7) + "...";
             }
-            switch(line.level){
-                case 2: out << C_err()  << txt << C_reset() << "\n"; break;
-                case 1: out << C_warn() << txt << C_reset() << "\n"; break;
-                case 3: out << C_dim()  << txt << C_reset() << "\n"; break;
-                case 4: out << C_ok()   << txt << C_reset() << "\n"; break;
-                default: out << txt << "\n"; break;
+
+            if (vt_ok_) {
+                out << "\x1b[38;5;27m║\x1b[0m ";
+                switch(line.level) {
+                    case 2: out << "\x1b[38;5;196m" << txt << "\x1b[0m"; break;
+                    case 1: out << "\x1b[38;5;214m" << txt << "\x1b[0m"; break;
+                    case 3: out << "\x1b[38;5;240m" << txt << "\x1b[0m"; break;
+                    case 4: out << "\x1b[38;5;46m" << txt << "\x1b[0m"; break;
+                    case 5: out << "\x1b[38;5;87m" << txt << "\x1b[0m"; break;
+                    default: out << "\x1b[38;5;252m" << txt << "\x1b[0m"; break;
+                }
+                // Pad to edge
+                int txt_len = (int)txt.size();
+                if (txt_len < cols - 4) out << std::string(cols - 4 - txt_len, ' ');
+                out << "\x1b[38;5;27m║\x1b[0m";
+            } else {
+                out << "| " << txt;
             }
+            out << "\n";
             ++printed;
         }
 
-        // Fill remaining lines with empty lines to maintain fixed layout
-        for (int i = printed; i < remain; ++i) {
-            out << "\n";
+        // Fill remaining log space
+        for (int i = printed; i < log_space; ++i) {
+            if (vt_ok_) {
+                out << "\x1b[38;5;27m║\x1b[0m" << std::string(cols - 2, ' ') << "\x1b[38;5;27m║\x1b[0m\n";
+            } else {
+                out << "|" << std::string(cols - 2, ' ') << "|\n";
+            }
         }
 
-        // Now write the entire frame with control sequences
-        std::string frame = out.str();
+        // Bottom border
+        if (vt_ok_ && u8_ok_) {
+            out << "\x1b[38;5;27m╚";
+            for (int i = 0; i < cols - 2; ++i) {
+                int pulse = (tick_ + i) % 16;
+                int c = (pulse < 8) ? 27 + pulse : 35 - (pulse - 8);
+                out << "\x1b[38;5;" << c << "m═";
+            }
+            out << "\x1b[38;5;27m╝\x1b[0m\n";
+        } else {
+            out << "+" << std::string(cols - 2, '=') << "+\n";
+        }
 
-        // IMPROVED: Use optimized write_frame for smoother updates on PowerShell 5+
-        // This reduces flicker by combining clear + content into a single write operation
+        // Write frame
+        std::string frame = out.str();
         if (vt_ok_) {
-            // Use cursor home + clear-to-end approach for smoother updates (less flicker)
-            // \x1b[H = cursor home, \x1b[J = clear from cursor to end of screen
             cw_.write_frame("\x1b[H\x1b[J", frame);
         } else {
-            // Fallback for non-VT terminals
             cw_.write_raw(frame);
         }
-
-        // Ensure output is flushed to terminal
         std::fflush(stdout);
+    }
+
+    // Helper to calculate visible string length (excluding ANSI codes)
+    static int visible_length(const std::string& s) {
+        int len = 0;
+        bool in_escape = false;
+        for (char c : s) {
+            if (c == '\x1b') in_escape = true;
+            else if (in_escape && c == 'm') in_escape = false;
+            else if (!in_escape) ++len;
+        }
+        return len;
     }
 
 private:
