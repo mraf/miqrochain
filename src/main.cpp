@@ -918,6 +918,155 @@ static inline std::string fmt_diff(long double d){
     return o.str();
 }
 
+// =============================================================================
+// Bitcoin Core-like sync display helpers
+// =============================================================================
+
+// Format "X years and Y weeks behind" for sync status
+static inline std::string fmt_time_behind(uint64_t last_block_timestamp){
+    uint64_t now = (uint64_t)std::time(nullptr);
+    if (last_block_timestamp == 0 || last_block_timestamp >= now) return "synced";
+
+    uint64_t behind_secs = now - last_block_timestamp;
+
+    // Calculate components
+    uint64_t years = behind_secs / (365 * 24 * 3600);
+    uint64_t remaining = behind_secs % (365 * 24 * 3600);
+    uint64_t weeks = remaining / (7 * 24 * 3600);
+    remaining = remaining % (7 * 24 * 3600);
+    uint64_t days = remaining / (24 * 3600);
+    remaining = remaining % (24 * 3600);
+    uint64_t hours = remaining / 3600;
+
+    std::ostringstream o;
+    if (years > 0) {
+        o << years << " year" << (years != 1 ? "s" : "");
+        if (weeks > 0) o << " and " << weeks << " week" << (weeks != 1 ? "s" : "");
+        o << " behind";
+    } else if (weeks > 0) {
+        o << weeks << " week" << (weeks != 1 ? "s" : "");
+        if (days > 0) o << " and " << days << " day" << (days != 1 ? "s" : "");
+        o << " behind";
+    } else if (days > 0) {
+        o << days << " day" << (days != 1 ? "s" : "");
+        if (hours > 0) o << " and " << hours << " hour" << (hours != 1 ? "s" : "");
+        o << " behind";
+    } else if (hours > 0) {
+        o << hours << " hour" << (hours != 1 ? "s" : "") << " behind";
+    } else {
+        uint64_t mins = behind_secs / 60;
+        if (mins > 0) {
+            o << mins << " minute" << (mins != 1 ? "s" : "") << " behind";
+        } else {
+            o << "less than a minute behind";
+        }
+    }
+    return o.str();
+}
+
+// Format datetime for "Last block time"
+static inline std::string fmt_datetime(uint64_t timestamp){
+    if (timestamp == 0) return "Unknown";
+    std::time_t t = (std::time_t)timestamp;
+    std::tm tm_buf{};
+#ifdef _WIN32
+    localtime_s(&tm_buf, &t);
+#else
+    localtime_r(&t, &tm_buf);
+#endif
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "%a %b %d %H:%M:%S %Y", &tm_buf);
+    return std::string(buf);
+}
+
+// Animated progress bar with gradient effect (Bitcoin Core style)
+static inline std::string progress_bar_animated(int width, double frac, int tick, bool vt_ok, bool u8_ok){
+    if (width < 10) width = 10;
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 1.0) frac = 1.0;
+
+    int inner = width - 2;
+    int filled = (int)(frac * inner);
+
+    std::string out;
+    out.reserve((size_t)(width + 20));
+
+    if (vt_ok && u8_ok) {
+        // Professional Unicode progress bar with animation
+        out += "\x1b[32m"; // Green color
+        out += "▐";
+
+        for (int i = 0; i < inner; ++i) {
+            if (i < filled) {
+                // Filled portion with subtle animation
+                out += "█";
+            } else if (i == filled && frac < 1.0) {
+                // Animated leading edge
+                static const char* anim[] = {"░", "▒", "▓", "▒"};
+                out += anim[tick % 4];
+            } else {
+                out += "░";
+            }
+        }
+        out += "▌";
+        out += "\x1b[0m";
+    } else if (vt_ok) {
+        // ANSI progress bar
+        out += "\x1b[32m[";
+        for (int i = 0; i < inner; ++i) {
+            if (i < filled) {
+                out += "=";
+            } else if (i == filled && frac < 1.0) {
+                out += ">";
+            } else {
+                out += " ";
+            }
+        }
+        out += "]\x1b[0m";
+    } else {
+        // Plain ASCII
+        out += "[";
+        for (int i = 0; i < inner; ++i) {
+            if (i < filled) {
+                out += "#";
+            } else if (i == filled && frac < 1.0) {
+                out += ">";
+            } else {
+                out += ".";
+            }
+        }
+        out += "]";
+    }
+    return out;
+}
+
+// Calculate ETA based on sync speed
+static inline std::string fmt_eta(uint64_t blocks_remaining, double blocks_per_second){
+    if (blocks_per_second <= 0.0 || blocks_remaining == 0) return "Unknown...";
+
+    double eta_secs = (double)blocks_remaining / blocks_per_second;
+
+    if (eta_secs > 365.0 * 24.0 * 3600.0 * 10.0) return "Unknown..."; // More than 10 years
+    if (eta_secs < 60.0) return "less than a minute";
+
+    uint64_t secs = (uint64_t)eta_secs;
+    uint64_t days = secs / 86400;
+    uint64_t hours = (secs % 86400) / 3600;
+    uint64_t mins = (secs % 3600) / 60;
+
+    std::ostringstream o;
+    if (days > 0) {
+        o << days << " day" << (days != 1 ? "s" : "");
+        if (hours > 0) o << " " << hours << " hour" << (hours != 1 ? "s" : "");
+    } else if (hours > 0) {
+        o << hours << " hour" << (hours != 1 ? "s" : "");
+        if (mins > 0) o << " " << mins << " min" << (mins != 1 ? "s" : "");
+    } else {
+        o << mins << " minute" << (mins != 1 ? "s" : "");
+    }
+    return o.str();
+}
+
 // Spinner & drawing helpers - IMPROVED with smoother animations
 static inline std::string spinner(int tick, bool fancy){
     if (fancy){
@@ -1527,6 +1676,52 @@ public:
         ibd_last_update_ms_ = now_ms();
     }
 
+    // Bitcoin Core-like sync stats update
+    void update_sync_stats(uint64_t current_height, uint64_t network_height, uint64_t last_block_timestamp) {
+        std::lock_guard<std::mutex> lk(mu_);
+        uint64_t now = now_ms();
+
+        sync_network_height_ = network_height;
+        sync_last_block_time_ = last_block_timestamp;
+
+        // Initialize sync start tracking
+        if (sync_start_ms_ == 0 && current_height > 0) {
+            sync_start_ms_ = now;
+            sync_start_height_ = current_height;
+            sync_last_sample_ms_ = now;
+            sync_last_sample_height_ = current_height;
+        }
+
+        // Calculate sync speed every 2 seconds for smoother updates
+        if (now - sync_last_sample_ms_ >= 2000 && sync_last_sample_ms_ > 0) {
+            uint64_t blocks_synced = current_height - sync_last_sample_height_;
+            double time_elapsed_sec = (double)(now - sync_last_sample_ms_) / 1000.0;
+
+            if (time_elapsed_sec > 0.0) {
+                // Exponential moving average for smoother display
+                double new_rate = (double)blocks_synced / time_elapsed_sec;
+                if (sync_blocks_per_sec_ > 0.0) {
+                    sync_blocks_per_sec_ = 0.7 * sync_blocks_per_sec_ + 0.3 * new_rate;
+                } else {
+                    sync_blocks_per_sec_ = new_rate;
+                }
+            }
+
+            // Calculate progress increase per hour
+            if (network_height > 0 && sync_start_ms_ > 0) {
+                double total_time_hours = (double)(now - sync_start_ms_) / 3600000.0;
+                if (total_time_hours > 0.0) {
+                    double progress_now = (double)current_height / (double)network_height * 100.0;
+                    double progress_start = (double)sync_start_height_ / (double)network_height * 100.0;
+                    sync_progress_per_hour_ = (progress_now - progress_start) / total_time_hours;
+                }
+            }
+
+            sync_last_sample_ms_ = now;
+            sync_last_sample_height_ = current_height;
+        }
+    }
+
 private:
     struct StyledLine { std::string txt; int level; };
     StyledLine stylize_log(const LogCapture::Line& L){
@@ -1696,6 +1891,41 @@ private:
                 net_hashrate_ = nh;
                 net_spark_.push_back(nh);
                 if (net_spark_.size() > 90) net_spark_.erase(net_spark_.begin());
+
+                // Update Bitcoin Core-like sync stats
+                if (chain_ && p2p_) {
+                    uint64_t network_height = 0;
+
+                    // Get max peer tip for network height
+                    auto peers = p2p_->snapshot_peers();
+                    for (const auto& peer : peers) {
+                        if (peer.peer_tip > network_height) {
+                            network_height = peer.peer_tip;
+                        }
+                    }
+
+                    // Get last block timestamp
+                    auto tip = chain_->tip();
+                    uint64_t last_block_time = hdr_time(tip);
+
+                    // Store values (already have lock)
+                    sync_network_height_ = network_height;
+                    sync_last_block_time_ = last_block_time;
+                }
+            }
+
+            // Update sync speed tracking (every 2 seconds for accuracy)
+            static uint64_t last_sync_update_ms = 0;
+            if (chain_ && p2p_ && now_ms() - last_sync_update_ms > 2000) {
+                last_sync_update_ms = now_ms();
+                uint64_t current_height = chain_->height();
+                uint64_t network_height = 0;
+                auto peers = p2p_->snapshot_peers();
+                for (const auto& peer : peers) {
+                    if (peer.peer_tip > network_height) network_height = peer.peer_tip;
+                }
+                uint64_t last_block_time = hdr_time(chain_->tip());
+                update_sync_stats(current_height, network_height, last_block_time);
             }
         }
     }
@@ -1869,31 +2099,100 @@ private:
             left.push_back("");
         }
 
+        // =============================================================
+        // Bitcoin Core-style Sync Progress Panel
+        // =============================================================
         {
-            if (nstate_ == NodeState::Syncing || ibd_visible_ || (!ibd_done_ && ibd_target_ > 0)) {
-                left.push_back(std::string(C_bold()) + "Initial Block Download" + C_reset());
-                std::ostringstream meta;
-                if (!ibd_seed_host_.empty()) meta << "  seed: " << ibd_seed_host_ << "   ";
-                meta << "stage: " << (ibd_stage_.empty() ? "discovering" : ibd_stage_);
-                left.push_back(meta.str());
-                if (ibd_target_ > ibd_cur_) {
-                int bw = std::max(10, leftw - 20);
-                double frac = std::min(1.0, (ibd_target_ ? (double)ibd_cur_ / (double)ibd_target_ : 0.0));
-                std::ostringstream p;
-                p << "  " << bar(bw, frac, vt_ok_, u8_ok_) << "  "
-                  << ibd_cur_ << "/" << ibd_target_ << " blocks  ("
-                  << std::fixed << std::setprecision(1) << (frac * 100.0) << "%)";
-                left.push_back(p.str());
-            } else {
-                // Facts only: show what we've actually found so far.
-                std::ostringstream p;
-                p << "  scanned so far: " << ibd_cur_ << " blocks";
-                left.push_back(p.str());
-            }
-            std::ostringstream d;
-            d << "  discovered from seed: " << ibd_discovered_;
-                if (ibd_done_) d << "   " << C_ok() << "complete" << C_reset();
-                left.push_back(d.str());
+            bool show_sync_panel = (nstate_ == NodeState::Syncing || ibd_visible_ || (!ibd_done_ && ibd_target_ > 0));
+
+            if (show_sync_panel) {
+                // Panel header with warning icon
+                std::string warn_icon = u8_ok_ ? "⚠ " : "[!] ";
+                left.push_back(std::string(C_bold()) + C_warn() + warn_icon + "Synchronizing with Network" + C_reset());
+                left.push_back("");
+
+                // Warning message like Bitcoin Core
+                left.push_back(std::string("  ") + C_warn() + "Recent transactions may not yet be visible, and therefore" + C_reset());
+                left.push_back(std::string("  ") + C_warn() + "your wallet's balance might be incorrect. This information" + C_reset());
+                left.push_back(std::string("  ") + C_warn() + "will be correct once your node has finished synchronizing." + C_reset());
+                left.push_back("");
+
+                // Calculate sync metrics
+                uint64_t network_height = sync_network_height_ > 0 ? sync_network_height_ : ibd_target_;
+                uint64_t current_height = ibd_cur_;
+                uint64_t blocks_remaining = (network_height > current_height) ? (network_height - current_height) : 0;
+                double sync_progress = (network_height > 0) ? ((double)current_height / (double)network_height * 100.0) : 0.0;
+
+                // Determine header sync status
+                std::string header_status;
+                if (ibd_stage_ == "headers" || current_height == 0) {
+                    header_status = "Syncing Headers (" + fmt_num(network_height) + ", " +
+                                   std::to_string((int)(sync_progress)) + "%)...";
+                } else {
+                    header_status = fmt_num(blocks_remaining);
+                }
+
+                // Bitcoin Core-style metrics display
+                std::ostringstream l1;
+                l1 << "  " << C_dim() << "Number of blocks left" << C_reset() << "    " << C_info() << header_status << C_reset();
+                left.push_back(l1.str());
+
+                std::ostringstream l2;
+                l2 << "  " << C_dim() << "Last block time" << C_reset() << "         "
+                   << fmt_datetime(sync_last_block_time_);
+                left.push_back(l2.str());
+
+                std::ostringstream l3;
+                l3 << "  " << C_dim() << "Progress" << C_reset() << "                 "
+                   << C_info() << std::fixed << std::setprecision(2) << sync_progress << "%" << C_reset();
+                left.push_back(l3.str());
+
+                std::ostringstream l4;
+                l4 << "  " << C_dim() << "Progress increase per hour" << C_reset() << " "
+                   << std::fixed << std::setprecision(2) << sync_progress_per_hour_ << "%";
+                left.push_back(l4.str());
+
+                // ETA calculation
+                std::string eta_str = "Unknown...";
+                if (sync_blocks_per_sec_ > 0.01 && blocks_remaining > 0) {
+                    eta_str = fmt_eta(blocks_remaining, sync_blocks_per_sec_);
+                }
+                std::ostringstream l5;
+                l5 << "  " << C_dim() << "Estimated time left" << C_reset() << "      " << eta_str;
+                left.push_back(l5.str());
+
+                left.push_back("");
+
+                // Animated progress bar (full width)
+                int bar_width = std::max(30, leftw - 4);
+                double frac = sync_progress / 100.0;
+                left.push_back(std::string("  ") + progress_bar_animated(bar_width, frac, tick_, vt_ok_, u8_ok_));
+
+                // Time behind indicator (like "8 years and 51 weeks behind")
+                std::string time_behind = fmt_time_behind(sync_last_block_time_);
+                std::ostringstream behind;
+                behind << "  " << C_dim() << "Processing blocks on disk... " << C_reset()
+                       << C_warn() << time_behind << C_reset();
+                left.push_back(behind.str());
+
+                left.push_back("");
+
+                // Sync speed indicator
+                if (sync_blocks_per_sec_ > 0.01) {
+                    std::ostringstream speed;
+                    speed << "  " << C_dim() << "Sync speed: " << C_reset()
+                          << std::fixed << std::setprecision(1) << sync_blocks_per_sec_ << " blocks/sec";
+                    if (!ibd_seed_host_.empty()) {
+                        speed << "  " << C_dim() << "(from " << ibd_seed_host_ << ")" << C_reset();
+                    }
+                    left.push_back(speed.str());
+                }
+
+                if (ibd_done_) {
+                    std::string check = u8_ok_ ? "✓ " : "[OK] ";
+                    left.push_back(std::string("  ") + C_ok() + check + "Synchronization complete!" + C_reset());
+                }
+
                 left.push_back("");
             }
         }
@@ -2328,6 +2627,16 @@ private:
     std::string ibd_stage_;
     std::string ibd_seed_host_;
     uint64_t    ibd_last_update_ms_{0};
+
+    // Bitcoin Core-like sync tracking
+    uint64_t    sync_network_height_{0};         // Max peer tip height
+    uint64_t    sync_last_block_time_{0};        // Timestamp of last synced block
+    double      sync_blocks_per_sec_{0.0};       // Current sync speed
+    double      sync_progress_per_hour_{0.0};    // Progress increase per hour
+    uint64_t    sync_start_height_{0};           // Height when sync started
+    uint64_t    sync_start_ms_{0};               // Timestamp when sync started
+    uint64_t    sync_last_sample_height_{0};     // Last sampled height for speed calc
+    uint64_t    sync_last_sample_ms_{0};         // Last sample timestamp
 
     // mining gate status
     bool        mining_gate_available_{false};
