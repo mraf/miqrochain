@@ -767,20 +767,23 @@ public:
 #endif
     }
 
-    // Batch write for smoother updates (reduces flicker)
+    // BULLETPROOF: Batch write for smoother updates (reduces flicker)
+    // Hides cursor during update for professional appearance
     void write_frame(const std::string& clear_seq, const std::string& content) {
-#ifdef _WIN32
-        // On Windows, write clear and content together to reduce flicker
-        std::string combined;
-        combined.reserve(clear_seq.size() + content.size());
-        combined += clear_seq;
-        combined += content;
-        write_raw(combined);
-#else
-        // On Unix, write separately (terminals handle this better)
-        write_raw(clear_seq);
-        write_raw(content);
-#endif
+        // ANSI sequences for cursor control
+        static const char* CURSOR_HIDE = "\x1b[?25l";  // Hide cursor
+        static const char* CURSOR_SHOW = "\x1b[?25h";  // Show cursor
+
+        // Build complete frame with cursor hidden during update
+        std::string frame;
+        frame.reserve(clear_seq.size() + content.size() + 32);
+        frame += CURSOR_HIDE;   // Hide cursor before update
+        frame += clear_seq;      // Clear/home
+        frame += content;        // Frame content
+        frame += CURSOR_SHOW;   // Show cursor after update
+
+        // Single atomic write for flicker-free rendering
+        write_raw(frame);
     }
 
 private:
@@ -1729,8 +1732,13 @@ private:
         (void)first;  // Reserved for future first-draw optimization
         std::lock_guard<std::mutex> lk(mu_);
         int cols, rows; term::get_winsize(cols, rows);
+
+        // BULLETPROOF FIX: Enforce minimum dimensions for single-layout rendering
+        // This ensures the TUI fits in one screen without scrolling
         if (cols < 114) cols = 114;
         if (rows < 34) rows = 34;
+
+        // Calculate layout dimensions - ensure right column fits
         const int rightw = std::max(50, cols / 3);
         const int leftw  = cols - rightw - 3;
 
@@ -2203,7 +2211,10 @@ private:
             out << std::left << std::setw(leftw) << l << " | " << r << "\n";
         }
 
+        // BULLETPROOF: Separator line
         out << std::string((size_t)cols, '-') << "\n";
+
+        // BULLETPROOF: Status/shutdown banner (fixed 2 lines)
         if (nstate_ == NodeState::Quitting){
             out << C_bold() << "Shutting down" << C_reset() << "  " << C_dim() << "(Ctrl+C again = force)" << C_reset() << "\n";
             std::string phase = shutdown_phase_.empty() ? "initiating..." : shutdown_phase_;
@@ -2211,23 +2222,44 @@ private:
         } else {
             out << C_bold() << "Logs" << C_reset() << "  " << C_dim() << "(q=quit t=theme p=pause r=reload s=snap v=verbose)" << C_reset() << "\n";
         }
-        int header_rows = (int)N + 2;
-        int remain = rows - header_rows - 3;
-        if (remain < 8) remain = 8;
+
+        // BULLETPROOF: Calculate log area to fit exactly in remaining screen space
+        // This ensures no scrolling - the TUI is a single fixed-size layout
+        int header_rows = (int)N + 2;  // Main content + separator
+        int footer_rows = 3;            // Status line + 2 buffer
+        int remain = rows - header_rows - footer_rows;
+
+        // Ensure minimum log lines but cap to prevent overflow
+        if (remain < 6) remain = 6;
+        if (remain > 30) remain = 30;  // Cap to prevent excessive logs pushing layout
+
+        // Get only the last 'remain' log entries
         int start = (int)logs_.size() - remain;
         if (start < 0) start = 0;
-        for (int i=start; i<(int)logs_.size(); ++i) {
+
+        // Print log lines (each exactly one line, no overflow)
+        int printed = 0;
+        for (int i = start; i < (int)logs_.size() && printed < remain; ++i) {
             const auto& line = logs_[i];
-            switch(line.level){
-                case 2: out << C_err()  << line.txt << C_reset() << "\n"; break;
-                case 1: out << C_warn() << line.txt << C_reset() << "\n"; break;
-                case 3: out << C_dim()  << line.txt << C_reset() << "\n"; break;
-                case 4: out << C_ok()   << line.txt << C_reset() << "\n"; break;
-                default: out << line.txt << "\n"; break;
+            // Truncate long lines to prevent wrapping
+            std::string txt = line.txt;
+            if ((int)txt.size() > cols - 2) {
+                txt = txt.substr(0, cols - 5) + "...";
             }
+            switch(line.level){
+                case 2: out << C_err()  << txt << C_reset() << "\n"; break;
+                case 1: out << C_warn() << txt << C_reset() << "\n"; break;
+                case 3: out << C_dim()  << txt << C_reset() << "\n"; break;
+                case 4: out << C_ok()   << txt << C_reset() << "\n"; break;
+                default: out << txt << "\n"; break;
+            }
+            ++printed;
         }
-        int printed = (int)logs_.size() - start;
-        for (int i=printed; i<remain; ++i) out << "\n";
+
+        // Fill remaining lines with empty lines to maintain fixed layout
+        for (int i = printed; i < remain; ++i) {
+            out << "\n";
+        }
 
         // Now write the entire frame with control sequences
         std::string frame = out.str();
