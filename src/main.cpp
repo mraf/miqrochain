@@ -2778,6 +2778,673 @@ private:
     }
 
     // =========================================================================
+    // ADVANCED PANEL SYSTEM - Professional multi-panel layouts with animations
+    // =========================================================================
+
+    // Panel configuration for advanced layouts
+    struct PanelConfig {
+        std::string title;
+        std::string icon;
+        int min_width;
+        int min_height;
+        int border_color;
+        bool animated_border;
+        bool has_shadow;
+    };
+
+    // Draw a complete panel with content
+    std::string draw_panel(const PanelConfig& cfg, const std::vector<std::string>& content,
+                           int width, int tick) const {
+        std::ostringstream out;
+        int inner_w = width - 4;
+
+        if (!vt_ok_) {
+            // ASCII fallback
+            out << "+" << std::string(width - 2, '-') << "+\n";
+            out << "| " << cfg.title << std::string(width - 4 - (int)cfg.title.size(), ' ') << " |\n";
+            out << "+" << std::string(width - 2, '-') << "+\n";
+            for (const auto& line : content) {
+                out << "| " << line;
+                int pad = width - 4 - (int)line.size();
+                if (pad > 0) out << std::string(pad, ' ');
+                out << " |\n";
+            }
+            out << "+" << std::string(width - 2, '-') << "+\n";
+            return out.str();
+        }
+
+        int bc = cfg.border_color > 0 ? cfg.border_color : ColorPalette::BORDER;
+
+        // Top border with optional animation
+        out << "\x1b[38;5;" << bc << "m" << (u8_ok_ ? "╭" : "+");
+        for (int i = 0; i < width - 2; ++i) {
+            if (cfg.animated_border && u8_ok_) {
+                int pulse = (tick + i) % 12;
+                int c = bc + (pulse < 6 ? pulse : 12 - pulse);
+                out << "\x1b[38;5;" << c << "m─";
+            } else {
+                out << (u8_ok_ ? "─" : "-");
+            }
+        }
+        out << "\x1b[38;5;" << bc << "m" << (u8_ok_ ? "╮" : "+") << "\x1b[0m\n";
+
+        // Title bar
+        out << "\x1b[38;5;" << bc << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m";
+        out << "\x1b[48;5;" << ColorPalette::BG_PANEL << "m ";
+        if (!cfg.icon.empty() && u8_ok_) {
+            int icon_c = (tick % 6 < 3) ? ColorPalette::PRIMARY : ColorPalette::SECONDARY;
+            out << "\x1b[38;5;" << icon_c << "m" << cfg.icon << "\x1b[0m ";
+        }
+        out << "\x1b[38;5;255m\x1b[1m" << cfg.title << "\x1b[0m";
+        out << "\x1b[48;5;" << ColorPalette::BG_PANEL << "m";
+        int title_len = (int)cfg.title.size() + (cfg.icon.empty() ? 1 : 4);
+        out << std::string(inner_w - title_len, ' ');
+        out << "\x1b[0m\x1b[38;5;" << bc << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m\n";
+
+        // Separator
+        out << "\x1b[38;5;" << bc << "m" << (u8_ok_ ? "├" : "+");
+        for (int i = 0; i < width - 2; ++i) out << (u8_ok_ ? "─" : "-");
+        out << (u8_ok_ ? "┤" : "+") << "\x1b[0m\n";
+
+        // Content
+        for (const auto& line : content) {
+            out << "\x1b[38;5;" << bc << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m";
+            out << "\x1b[48;5;" << ColorPalette::BG_PANEL << "m ";
+            out << line;
+            int vis_len = visible_length(line);
+            int pad = inner_w - vis_len;
+            if (pad > 0) out << std::string(pad, ' ');
+            out << " \x1b[0m\x1b[38;5;" << bc << "m" << (u8_ok_ ? "│" : "|") << "\x1b[0m\n";
+        }
+
+        // Bottom border
+        out << "\x1b[38;5;" << bc << "m" << (u8_ok_ ? "╰" : "+");
+        for (int i = 0; i < width - 2; ++i) {
+            if (cfg.animated_border && u8_ok_) {
+                int pulse = (tick + i) % 12;
+                int c = bc + (pulse < 6 ? pulse : 12 - pulse);
+                out << "\x1b[38;5;" << c << "m─";
+            } else {
+                out << (u8_ok_ ? "─" : "-");
+            }
+        }
+        out << "\x1b[38;5;" << bc << "m" << (u8_ok_ ? "╯" : "+") << "\x1b[0m\n";
+
+        return out.str();
+    }
+
+    // =========================================================================
+    // NETWORK TOPOLOGY VISUALIZATION - Peer map with quality indicators
+    // =========================================================================
+
+    // Peer quality score (0-100)
+    int calculate_peer_quality(uint64_t latency_ms, uint64_t bytes_recv, bool verack_ok) const {
+        if (!verack_ok) return 0;
+        int score = 50;
+        // Latency scoring
+        if (latency_ms < 50) score += 30;
+        else if (latency_ms < 100) score += 20;
+        else if (latency_ms < 200) score += 10;
+        else if (latency_ms > 500) score -= 20;
+        // Activity scoring
+        if (bytes_recv > 1000000) score += 20;
+        else if (bytes_recv > 100000) score += 10;
+        if (score < 0) score = 0;
+        if (score > 100) score = 100;
+        return score;
+    }
+
+    // Draw peer quality bar
+    std::string draw_peer_quality(int quality, int width) const {
+        if (width < 5) width = 5;
+        std::ostringstream out;
+
+        if (!vt_ok_ || !u8_ok_) {
+            int filled = quality * width / 100;
+            out << "[";
+            for (int i = 0; i < width; ++i) {
+                out << (i < filled ? "#" : ".");
+            }
+            out << "]";
+            return out.str();
+        }
+
+        int color;
+        if (quality >= 80) color = ColorPalette::SUCCESS;
+        else if (quality >= 50) color = ColorPalette::WARNING;
+        else color = ColorPalette::ERROR;
+
+        int filled = quality * width / 100;
+        for (int i = 0; i < width; ++i) {
+            if (i < filled) {
+                out << "\x1b[38;5;" << color << "m█\x1b[0m";
+            } else {
+                out << "\x1b[38;5;236m░\x1b[0m";
+            }
+        }
+        return out.str();
+    }
+
+    // Draw network topology map
+    std::string draw_network_topology(int width, int tick) const {
+        std::ostringstream out;
+
+        if (!p2p_) {
+            return vt_ok_ ? "\x1b[38;5;240m(no P2P connection)\x1b[0m" : "(no P2P)";
+        }
+
+        auto peers = p2p_->snapshot_peers();
+        if (peers.empty()) {
+            return vt_ok_ ? "\x1b[38;5;240m(searching for peers...)\x1b[0m" : "(searching...)";
+        }
+
+        // Sort by quality
+        std::vector<std::pair<int, size_t>> quality_idx;
+        for (size_t i = 0; i < peers.size(); ++i) {
+            int q = calculate_peer_quality(0, 0, peers[i].verack_ok);
+            quality_idx.push_back({q, i});
+        }
+        std::sort(quality_idx.rbegin(), quality_idx.rend());
+
+        // Draw mini topology - center node with spokes
+        if (u8_ok_ && vt_ok_) {
+            // Animated center node
+            static const char* center_frames[] = {"◉", "◎", "●", "◎"};
+            int c_color = (tick % 8 < 4) ? ColorPalette::PRIMARY : ColorPalette::SECONDARY;
+            out << "\x1b[38;5;" << c_color << "m" << center_frames[tick % 4] << "\x1b[0m";
+
+            // Connection spokes
+            size_t show_peers = std::min(peers.size(), (size_t)8);
+            for (size_t i = 0; i < show_peers; ++i) {
+                const auto& p = peers[quality_idx[i].second];
+                int q = quality_idx[i].first;
+                int color = (q >= 80) ? ColorPalette::SUCCESS :
+                           (q >= 50) ? ColorPalette::WARNING : ColorPalette::ERROR;
+
+                // Animated connection line
+                bool active = (tick + (int)i) % 4 < 2;
+                out << "\x1b[38;5;" << (active ? color : 240) << "m";
+                out << (p.verack_ok ? "━" : "╌");
+                out << (p.verack_ok ? "●" : "○");
+                out << "\x1b[0m ";
+            }
+        } else {
+            out << "[NODE]";
+            for (size_t i = 0; i < std::min(peers.size(), (size_t)4); ++i) {
+                out << (peers[i].verack_ok ? "-*" : "-o");
+            }
+        }
+
+        return out.str();
+    }
+
+    // Draw detailed peer list with quality metrics
+    std::vector<std::string> draw_peer_details(int width) const {
+        std::vector<std::string> lines;
+
+        if (!p2p_) return lines;
+
+        auto peers = p2p_->snapshot_peers();
+        if (peers.empty()) {
+            lines.push_back(vt_ok_ ? "\x1b[38;5;240m  No peers connected\x1b[0m" : "  No peers");
+            return lines;
+        }
+
+        // Header
+        if (vt_ok_) {
+            lines.push_back("\x1b[38;5;245m  IP Address        Quality  Status\x1b[0m");
+        } else {
+            lines.push_back("  IP Address        Quality  Status");
+        }
+
+        size_t show = std::min(peers.size(), (size_t)6);
+        for (size_t i = 0; i < show; ++i) {
+            const auto& p = peers[i];
+            std::ostringstream ln;
+
+            std::string ip = p.ip;
+            if (ip.size() > 15) ip = ip.substr(0, 12) + "...";
+
+            int quality = calculate_peer_quality(0, 0, p.verack_ok);
+
+            if (vt_ok_) {
+                ln << "  ";
+                ln << (p.verack_ok ? "\x1b[38;5;46m●\x1b[0m" : "\x1b[38;5;240m○\x1b[0m");
+                ln << " \x1b[38;5;252m" << std::left << std::setw(15) << ip << "\x1b[0m ";
+                ln << draw_peer_quality(quality, 8) << " ";
+
+                if (p.verack_ok) {
+                    ln << "\x1b[38;5;46mActive\x1b[0m";
+                } else {
+                    ln << "\x1b[38;5;240mConnecting\x1b[0m";
+                }
+            } else {
+                ln << "  " << (p.verack_ok ? "*" : "o") << " ";
+                ln << std::left << std::setw(15) << ip << " ";
+                ln << "[" << quality << "%] ";
+                ln << (p.verack_ok ? "Active" : "Connecting");
+            }
+            lines.push_back(ln.str());
+        }
+
+        if (peers.size() > show) {
+            std::ostringstream more;
+            if (vt_ok_) {
+                more << "  \x1b[38;5;240m+ " << (peers.size() - show) << " more peers\x1b[0m";
+            } else {
+                more << "  + " << (peers.size() - show) << " more";
+            }
+            lines.push_back(more.str());
+        }
+
+        return lines;
+    }
+
+    // =========================================================================
+    // MINING PERFORMANCE DASHBOARD - Advanced mining visualization
+    // =========================================================================
+
+    // Mining history for graphs
+    struct MiningHistory {
+        std::deque<double> hashrates;      // Last N hashrate samples
+        std::deque<uint64_t> block_times;  // Time between blocks
+        std::deque<double> efficiency;     // Hash/second per thread
+        static constexpr size_t MAX_SAMPLES = 60;
+
+        void add_hashrate(double hr) {
+            hashrates.push_back(hr);
+            if (hashrates.size() > MAX_SAMPLES) hashrates.pop_front();
+        }
+
+        void add_block_time(uint64_t time_s) {
+            block_times.push_back(time_s);
+            if (block_times.size() > MAX_SAMPLES) block_times.pop_front();
+        }
+
+        double avg_hashrate() const {
+            if (hashrates.empty()) return 0;
+            double sum = 0;
+            for (auto h : hashrates) sum += h;
+            return sum / hashrates.size();
+        }
+
+        double peak_hashrate() const {
+            if (hashrates.empty()) return 0;
+            return *std::max_element(hashrates.begin(), hashrates.end());
+        }
+    };
+
+    // Draw mining performance graph
+    std::string draw_mining_graph(const std::vector<double>& data, int width, int height, int tick) const {
+        if (data.empty() || width < 5 || height < 2) {
+            return vt_ok_ ? "\x1b[38;5;240m(no data)\x1b[0m" : "(no data)";
+        }
+
+        std::ostringstream out;
+
+        if (!u8_ok_) {
+            // Simple ASCII sparkline
+            return spark_ascii(data);
+        }
+
+        double max_val = *std::max_element(data.begin(), data.end());
+        double min_val = *std::min_element(data.begin(), data.end());
+        double range = max_val - min_val;
+        if (range < 0.001) range = 1;
+
+        // Draw mini bar graph
+        size_t start = (data.size() > (size_t)width) ? data.size() - width : 0;
+
+        for (size_t i = start; i < data.size(); ++i) {
+            double norm = (data[i] - min_val) / range;
+            int bar_height = (int)(norm * 8);
+            if (bar_height > 7) bar_height = 7;
+
+            // Gradient color based on value
+            int color;
+            if (norm > 0.8) color = ColorPalette::SUCCESS;
+            else if (norm > 0.5) color = ColorPalette::INFO;
+            else if (norm > 0.2) color = ColorPalette::WARNING;
+            else color = ColorPalette::MUTED;
+
+            // Add shimmer effect on recent values
+            if (i == data.size() - 1 && (tick % 4 < 2)) {
+                color = 255;
+            }
+
+            static const char* bars[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+            out << "\x1b[38;5;" << color << "m" << bars[bar_height] << "\x1b[0m";
+        }
+
+        return out.str();
+    }
+
+    // Draw mining statistics panel content
+    std::vector<std::string> draw_mining_stats(int width, int tick) const {
+        std::vector<std::string> lines;
+
+        bool active = g_miner_stats.active.load();
+        double hps = g_miner_stats.hps.load();
+        uint64_t threads = g_miner_stats.threads.load();
+        uint64_t accepted = g_miner_stats.accepted.load();
+        uint64_t rejected = g_miner_stats.rejected.load();
+
+        // Status line with animated indicator
+        std::ostringstream status;
+        if (vt_ok_) {
+            if (active) {
+                static const int pulse[] = {46, 47, 48, 49, 48, 47};
+                int c = pulse[tick % 6];
+                status << "\x1b[38;5;" << c << "m● MINING ACTIVE\x1b[0m";
+                status << "  \x1b[38;5;240m(" << threads << " threads)\x1b[0m";
+            } else if (mining_gate_available_) {
+                status << "\x1b[38;5;240m○ Ready to mine\x1b[0m";
+            } else {
+                status << "\x1b[38;5;196m○ Mining unavailable\x1b[0m";
+            }
+        } else {
+            status << (active ? "* MINING" : "o Idle");
+        }
+        lines.push_back(status.str());
+
+        if (active || accepted > 0) {
+            // Hashrate with trend
+            std::ostringstream hr;
+            if (vt_ok_) {
+                hr << "\x1b[38;5;245mHashrate\x1b[0m  \x1b[38;5;87m\x1b[1m" << fmt_hs(hps) << "\x1b[0m";
+            } else {
+                hr << "Hashrate: " << fmt_hs(hps);
+            }
+            lines.push_back(hr.str());
+
+            // Hashrate sparkline
+            if (!spark_hs_.empty()) {
+                std::ostringstream spark;
+                if (vt_ok_) {
+                    spark << "\x1b[38;5;245mTrend\x1b[0m     ";
+                    spark << draw_mining_graph(spark_hs_, 24, 1, tick);
+                } else {
+                    spark << "Trend: " << spark_ascii(spark_hs_);
+                }
+                lines.push_back(spark.str());
+            }
+
+            // Blocks found
+            std::ostringstream blocks;
+            if (vt_ok_) {
+                blocks << "\x1b[38;5;245mBlocks\x1b[0m    \x1b[38;5;46m" << accepted << " found\x1b[0m";
+                if (rejected > 0) {
+                    blocks << "  \x1b[38;5;196m" << rejected << " rejected\x1b[0m";
+                }
+            } else {
+                blocks << "Blocks: " << accepted << " found";
+            }
+            lines.push_back(blocks.str());
+
+            // Efficiency
+            if (threads > 0) {
+                double eff = hps / threads;
+                std::ostringstream effln;
+                if (vt_ok_) {
+                    effln << "\x1b[38;5;245mEfficiency\x1b[0m\x1b[38;5;183m " << fmt_hs(eff) << "/thread\x1b[0m";
+                } else {
+                    effln << "Efficiency: " << fmt_hs(eff) << "/thread";
+                }
+                lines.push_back(effln.str());
+            }
+        }
+
+        return lines;
+    }
+
+    // =========================================================================
+    // PROFESSIONAL LOG VIEWER - Filtered, searchable log display
+    // =========================================================================
+
+    // Log filter state
+    mutable std::string log_filter_text_;
+    mutable int log_filter_level_{0};  // 0=all, 1=warn+, 2=error only, 3=debug
+    mutable bool log_filter_active_{false};
+
+    // Filter logs based on current settings
+    std::vector<StyledLine> filter_logs(size_t max_lines) const {
+        std::vector<StyledLine> filtered;
+
+        for (const auto& log : logs_) {
+            // Level filter
+            if (log_filter_level_ > 0) {
+                if (log_filter_level_ == 1 && log.level > 1) continue;  // warn+ only
+                if (log_filter_level_ == 2 && log.level != 2) continue; // error only
+                if (log_filter_level_ == 3 && log.level != 3) continue; // debug only
+            }
+
+            // Text filter
+            if (!log_filter_text_.empty()) {
+                if (log.txt.find(log_filter_text_) == std::string::npos) continue;
+            }
+
+            filtered.push_back(log);
+        }
+
+        // Return last N
+        if (filtered.size() > max_lines) {
+            return std::vector<StyledLine>(filtered.end() - max_lines, filtered.end());
+        }
+        return filtered;
+    }
+
+    // Draw log entry with enhanced styling
+    std::string draw_log_entry(const StyledLine& log, int width, int tick) const {
+        std::ostringstream out;
+
+        std::string txt = log.txt;
+        if ((int)txt.size() > width - 4) {
+            txt = txt.substr(0, width - 7) + "...";
+        }
+
+        if (!vt_ok_) {
+            return txt;
+        }
+
+        // Level indicator
+        std::string level_icon;
+        int color;
+        switch (log.level) {
+            case 2:  // Error
+                level_icon = u8_ok_ ? "✖ " : "[E] ";
+                color = ColorPalette::ERROR;
+                break;
+            case 1:  // Warning
+                level_icon = u8_ok_ ? "⚠ " : "[W] ";
+                color = ColorPalette::WARNING;
+                break;
+            case 3:  // Debug
+                level_icon = u8_ok_ ? "◌ " : "[D] ";
+                color = ColorPalette::MUTED;
+                break;
+            case 4:  // Success
+                level_icon = u8_ok_ ? "✓ " : "[+] ";
+                color = ColorPalette::SUCCESS;
+                break;
+            case 5:  // Info highlight
+                level_icon = u8_ok_ ? "◆ " : "[I] ";
+                color = ColorPalette::INFO;
+                break;
+            default:
+                level_icon = "  ";
+                color = ColorPalette::TEXT;
+        }
+
+        // Highlight recent entries
+        bool recent = (tick % 8 < 4) && (&log == &logs_.back());
+
+        out << "\x1b[38;5;" << color << "m" << level_icon;
+        if (recent) out << "\x1b[1m";
+        out << txt;
+        out << "\x1b[0m";
+
+        return out.str();
+    }
+
+    // Draw log viewer header with filter info
+    std::string draw_log_header(int width, int tick) const {
+        std::ostringstream out;
+
+        if (!vt_ok_) {
+            return "[ LOGS ]";
+        }
+
+        out << "\x1b[38;5;255m\x1b[1m";
+        out << (u8_ok_ ? "📜 " : "");
+        out << "SYSTEM LOG\x1b[0m";
+
+        // Filter indicator
+        if (log_filter_active_) {
+            out << "  \x1b[38;5;214m[FILTERED]\x1b[0m";
+        }
+
+        // Log count
+        out << "  \x1b[38;5;240m(" << logs_.size() << " entries)\x1b[0m";
+
+        // Controls hint
+        out << "  \x1b[38;5;236m[f]filter [c]clear [↑↓]scroll\x1b[0m";
+
+        return out.str();
+    }
+
+    // =========================================================================
+    // REAL-TIME METRICS DASHBOARD - Live data visualization
+    // =========================================================================
+
+    // Metrics history storage
+    struct MetricsHistory {
+        std::deque<double> cpu_usage;
+        std::deque<uint64_t> memory_usage;
+        std::deque<double> network_in;
+        std::deque<double> network_out;
+        std::deque<uint64_t> block_heights;
+        std::deque<size_t> peer_counts;
+        std::deque<size_t> mempool_sizes;
+        static constexpr size_t MAX_HISTORY = 120;
+
+        void add_sample(double cpu, uint64_t mem, double net_in, double net_out,
+                       uint64_t height, size_t peers, size_t mempool) {
+            cpu_usage.push_back(cpu);
+            memory_usage.push_back(mem);
+            network_in.push_back(net_in);
+            network_out.push_back(net_out);
+            block_heights.push_back(height);
+            peer_counts.push_back(peers);
+            mempool_sizes.push_back(mempool);
+
+            while (cpu_usage.size() > MAX_HISTORY) cpu_usage.pop_front();
+            while (memory_usage.size() > MAX_HISTORY) memory_usage.pop_front();
+            while (network_in.size() > MAX_HISTORY) network_in.pop_front();
+            while (network_out.size() > MAX_HISTORY) network_out.pop_front();
+            while (block_heights.size() > MAX_HISTORY) block_heights.pop_front();
+            while (peer_counts.size() > MAX_HISTORY) peer_counts.pop_front();
+            while (mempool_sizes.size() > MAX_HISTORY) mempool_sizes.pop_front();
+        }
+    };
+
+    // Draw metrics overview panel
+    std::vector<std::string> draw_metrics_overview(int width, int tick) const {
+        std::vector<std::string> lines;
+
+        uint64_t rss = get_rss_bytes();
+        size_t peer_count = p2p_ ? p2p_->snapshot_peers().size() : 0;
+        size_t mempool_count = 0;
+        if (mempool_) {
+            auto stat = mempool_view_fallback(mempool_);
+            mempool_count = stat.count;
+        }
+        uint64_t height = chain_ ? chain_->height() : 0;
+
+        // Memory usage with mini graph
+        std::ostringstream mem;
+        if (vt_ok_) {
+            mem << "\x1b[38;5;245mMemory\x1b[0m    ";
+            mem << draw_gauge((double)rss, 500.0 * 1024 * 1024, 16, "",
+                             ColorPalette::SUCCESS, ColorPalette::WARNING, ColorPalette::ERROR, tick);
+            mem << " \x1b[38;5;183m" << fmt_bytes(rss) << "\x1b[0m";
+        } else {
+            mem << "Memory: " << fmt_bytes(rss);
+        }
+        lines.push_back(mem.str());
+
+        // Peer health indicator
+        std::ostringstream peers;
+        if (vt_ok_) {
+            peers << "\x1b[38;5;245mPeers\x1b[0m     ";
+            peers << draw_signal((int)std::min(peer_count, (size_t)5), 5, tick);
+            peers << " \x1b[38;5;252m" << peer_count << " connected\x1b[0m";
+        } else {
+            peers << "Peers: " << peer_count;
+        }
+        lines.push_back(peers.str());
+
+        // Chain height with trend
+        std::ostringstream chain_ln;
+        if (vt_ok_) {
+            chain_ln << "\x1b[38;5;245mChain\x1b[0m     ";
+            chain_ln << "\x1b[38;5;51m#" << fmt_num(height) << "\x1b[0m";
+
+            // Add mini sparkline for block progress
+            if (!net_spark_.empty()) {
+                chain_ln << " " << draw_sparkline(net_spark_, 12, ColorPalette::INFO, false);
+            }
+        } else {
+            chain_ln << "Chain: #" << fmt_num(height);
+        }
+        lines.push_back(chain_ln.str());
+
+        // Mempool status
+        std::ostringstream mp;
+        if (vt_ok_) {
+            mp << "\x1b[38;5;245mMempool\x1b[0m   ";
+            if (mempool_count > 0) {
+                mp << "\x1b[38;5;214m" << mempool_count << " tx\x1b[0m";
+            } else {
+                mp << "\x1b[38;5;240mempty\x1b[0m";
+            }
+        } else {
+            mp << "Mempool: " << mempool_count << " tx";
+        }
+        lines.push_back(mp.str());
+
+        return lines;
+    }
+
+    // Draw combined multi-metric sparkline display
+    std::string draw_multi_sparkline(int width, int tick) const {
+        std::ostringstream out;
+
+        if (!vt_ok_ || !u8_ok_) {
+            return "";
+        }
+
+        // Create labels and data
+        struct MetricLine {
+            std::string label;
+            const std::vector<double>* data;
+            int color;
+        };
+
+        std::vector<double> peer_data;
+        if (p2p_) {
+            peer_data.push_back((double)p2p_->snapshot_peers().size());
+        }
+
+        // Network hashrate sparkline
+        if (!net_spark_.empty()) {
+            out << "\x1b[38;5;245mNet H/s\x1b[0m ";
+            out << draw_sparkline(net_spark_, width - 10, ColorPalette::INFO, false);
+        }
+
+        return out.str();
+    }
+
+    // =========================================================================
     // SPLASH SCREEN - ULTRA PROFESSIONAL sync display with premium animations
     // =========================================================================
 
