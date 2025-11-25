@@ -39,7 +39,7 @@ static std::atomic<bool> g_async_mode{false};
 static std::mutex g_log_mutex;
 
 // Pre-allocated buffer for timestamp formatting to avoid allocations
-static thread_local char g_timestamp_buf[32];
+static thread_local char g_timestamp_buf[64];
 static thread_local int64_t g_last_timestamp_sec = 0;
 
 static inline const char* format_timestamp_fast() {

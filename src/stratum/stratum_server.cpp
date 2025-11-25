@@ -464,7 +464,7 @@ void StratumServer::process_message(StratumMiner& miner, const std::string& line
                     id = 0;
                 }
             } else {
-                int64_t num;
+                int64_t num = 0;
                 parse_json_number(line, pos, num);
                 id = (uint64_t)num;
             }

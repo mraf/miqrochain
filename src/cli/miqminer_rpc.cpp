@@ -531,11 +531,6 @@ static inline void store_u32_le(uint8_t* p, uint32_t x){
 // ===== minimal HTTP/JSON-RPC ================================================
 struct HttpResp { int code{0}; std::string body; };
 
-// HTTP POST with automatic retry and exponential backoff
-static bool http_post_with_retry(const std::string& host, uint16_t port, const std::string& path,
-                                  const std::string& auth_token, const std::string& json, HttpResp& out,
-                                  int max_retries = 3);
-
 static inline std::string str_tolower(std::string s){
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return (char)std::tolower(c); });
     return s;
@@ -1699,8 +1694,6 @@ enum class MiningMode { SOLO = 1, POOL = 2 };
 
 // Professional mining mode selection menu
 static MiningMode show_mining_mode_menu() {
-    using clock = std::chrono::steady_clock;
-
     while (true) {
         std::ostringstream s;
         s << CLS();
@@ -3017,7 +3010,7 @@ int main(int argc, char** argv){
 #endif
 
         std::vector<uint8_t> salt_bytes;
-        SaltPos salt_pos = SaltPos::NONE;
+        [[maybe_unused]] SaltPos salt_pos = SaltPos::NONE;
 
         // Pool mining options
         std::string pool_host;

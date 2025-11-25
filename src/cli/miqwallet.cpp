@@ -331,14 +331,12 @@ namespace ui {
         std::cout << "\r" << cyan() << "[" << spinner[frame % 4] << "] " << reset() << msg << std::flush;
     }
 
-    // Enhanced spinner for PowerShell 5+ (Braille pattern animation)
+    // Enhanced spinner for PowerShell 5+ (ASCII fallback for compatibility)
     void print_spinner(const std::string& msg, int frame) {
-        // Works well in PowerShell 5+ and modern terminals
-        const char* frames[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
-        const char* fallback[] = {"[*   ]", "[ *  ]", "[  * ]", "[   *]", "[  * ]", "[ *  ]"};
+        const char* spinner[] = {"[*   ]", "[ *  ]", "[  * ]", "[   *]", "[  * ]", "[ *  ]"};
 
         // Use ASCII fallback for better compatibility
-        std::cout << "\r" << cyan() << fallback[frame % 6] << " " << reset() << msg
+        std::cout << "\r" << cyan() << spinner[frame % 6] << " " << reset() << msg
                   << std::string(20, ' ') << std::flush;
     }
 
@@ -1346,7 +1344,7 @@ static bool coin_select_greedy(
 // TRANSACTION VALIDATION
 // =============================================================================
 
-static TxValidationResult validate_transaction(
+[[maybe_unused]] static TxValidationResult validate_transaction(
     const miq::Transaction& tx,
     const std::vector<miq::UtxoLite>& utxos,
     uint64_t max_fee = 10000000)  // 0.1 MIQ max fee by default
@@ -1509,7 +1507,7 @@ struct TransactionBuildRequest {
 };
 
 // Smart transaction builder with automatic everything
-static TransactionBuildResult build_transaction_smart(
+[[maybe_unused]] static TransactionBuildResult build_transaction_smart(
     const TransactionBuildRequest& req,
     const std::vector<miq::UtxoLite>& all_utxos,
     const std::set<OutpointKey>& pending_utxos,
@@ -1730,7 +1728,7 @@ static TransactionBuildResult build_transaction_smart(
 }
 
 // Sign a built transaction
-static bool sign_transaction_robust(
+[[maybe_unused]] static bool sign_transaction_robust(
     miq::Transaction& tx,
     const std::vector<miq::UtxoLite>& spendables,
     const std::vector<size_t>& input_indices,
@@ -1802,7 +1800,7 @@ static bool sign_transaction_robust(
 }
 
 // Verify a signed transaction before broadcast
-static bool verify_transaction_before_broadcast(
+[[maybe_unused]] static bool verify_transaction_before_broadcast(
     const miq::Transaction& tx,
     std::string& error)
 {
@@ -2319,7 +2317,7 @@ namespace ui_pro {
     }
 
     // Print a status line with icon
-    static void print_status(const std::string& icon, const std::string& message,
+    [[maybe_unused]] static void print_status(const std::string& icon, const std::string& message,
                              const std::string& color = ""){
         if(!color.empty()) std::cout << color;
         std::cout << "  " << icon << " " << message;
@@ -2373,7 +2371,7 @@ namespace ui_pro {
     }
 
     // Print transaction details in a nice format
-    static void print_tx_details(const std::string& txid, uint64_t amount, uint64_t fee,
+    [[maybe_unused]] static void print_tx_details(const std::string& txid, uint64_t amount, uint64_t fee,
                                   const std::string& to_addr, const std::string& status){
         std::vector<std::string> lines;
         lines.push_back("TXID: " + txid.substr(0, 32) + "...");
@@ -2385,7 +2383,7 @@ namespace ui_pro {
     }
 
     // Animated waiting indicator
-    static void show_spinner_once(){
+    [[maybe_unused]] static void show_spinner_once(){
         int frame = g_animation_frame.fetch_add(1) % SPINNER_FRAME_COUNT;
         std::cout << "\r  " << SPINNER_FRAMES[frame] << " " << std::flush;
     }
@@ -2778,7 +2776,7 @@ struct ChangeOptimizationResult {
     std::string recommendation;
 };
 
-static ChangeOptimizationResult optimize_change(uint64_t total_input, uint64_t amount,
+[[maybe_unused]] static ChangeOptimizationResult optimize_change(uint64_t total_input, uint64_t amount,
                                                   uint64_t fee, uint64_t dust_threshold = 546){
     ChangeOptimizationResult result;
 
@@ -6442,7 +6440,7 @@ static bool wallet_session(const std::string& cli_host,
             // =============================================================
             // ISSUES AND QUICK FIXES
             // =============================================================
-            bool has_issues = false;
+            [[maybe_unused]] bool has_issues = false;
             std::vector<std::pair<std::string, std::string>> quick_fixes;
 
             if(health.utxo_count > 50){
