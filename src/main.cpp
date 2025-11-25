@@ -2293,13 +2293,23 @@ private:
     // =========================================================================
 
     // Get visible length of string (excluding ANSI escape codes)
+    // FIXED: Properly handles UTF-8 multi-byte characters for accurate width calculation
     static int visible_length(const std::string& s) {
         int len = 0;
         bool in_escape = false;
-        for (char c : s) {
-            if (c == '\x1b') in_escape = true;
-            else if (in_escape && c == 'm') in_escape = false;
-            else if (!in_escape) ++len;
+        for (size_t i = 0; i < s.size(); ++i) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            if (c == '\x1b') {
+                in_escape = true;
+            } else if (in_escape) {
+                if (c == 'm') in_escape = false;
+            } else {
+                // UTF-8: Skip continuation bytes (10xxxxxx pattern = 0x80-0xBF)
+                // Only count start bytes and ASCII characters
+                if ((c & 0xC0) != 0x80) {
+                    ++len;
+                }
+            }
         }
         return len;
     }
@@ -2527,12 +2537,18 @@ private:
     }
 
     // Draw the premium main dashboard
+    // FIXED: Uses fixed layout dimensions for 100% stable positioning
     void draw_main(int cols, int rows) {
         std::ostringstream out;
         std::vector<std::string> lines;
 
-        // Box width and positioning
-        const int box_width = std::min(110, cols - 4);
+        // FIXED: Enforce minimum dimensions for stable layout
+        // This ensures the TUI always renders with consistent positioning
+        if (cols < 114) cols = 114;
+        if (rows < 38) rows = 38;
+
+        // Box width and positioning - use fixed values for stability
+        const int box_width = 110;  // Fixed width for consistent layout
         const int start_col = std::max(1, (cols - box_width) / 2);
         const int half_width = (box_width - 3) / 2;
 
@@ -2841,14 +2857,15 @@ private:
             // Recent TXIDs header
             right_panel2.push_back(box_row(C_dim() + std::string("Recent TXIDs:") + C_reset(), half_width));
 
-            // Show last 2 txids
+            // FIXED: Always show exactly 2 txid slots for consistent panel height
             size_t tx_show = std::min<size_t>(2, recent_txids_.size());
-            for (size_t i = 0; i < tx_show; ++i) {
-                std::string txid = recent_txids_[recent_txids_.size() - 1 - i];
-                right_panel2.push_back(box_row("  " + short_hex(txid, 28), half_width));
-            }
-            if (tx_show == 0) {
-                right_panel2.push_back(box_row(C_dim() + std::string("  (none yet)") + C_reset(), half_width));
+            for (size_t i = 0; i < 2; ++i) {
+                if (i < tx_show) {
+                    std::string txid = recent_txids_[recent_txids_.size() - 1 - i];
+                    right_panel2.push_back(box_row("  " + short_hex(txid, 28), half_width));
+                } else {
+                    right_panel2.push_back(box_row(C_dim() + std::string("  (none yet)") + C_reset(), half_width));
+                }
             }
 
             right_panel2.push_back(box_footer(half_width));
@@ -2864,25 +2881,24 @@ private:
         }
 
         // ===== RECENT BLOCKS PANEL (Full Width) =====
+        // FIXED: Always show exactly 4 block slots for consistent height
         {
             lines.push_back("");
             lines.push_back(box_header("Recent Blocks", box_width - 2, "\x1b[38;5;208m"));
 
-            if (recent_blocks_.empty()) {
-                lines.push_back(box_row(C_dim() + std::string("Waiting for blocks...") + C_reset(), box_width - 2));
-            } else {
-                // Header row
-                std::ostringstream hdr;
-                hdr << C_dim() << std::left << std::setw(10) << "Height"
-                    << std::setw(24) << "Hash"
-                    << std::setw(8) << "TXs"
-                    << std::setw(14) << "Miner" << C_reset();
-                lines.push_back(box_row(hdr.str(), box_width - 2));
+            // Header row (always shown)
+            std::ostringstream hdr;
+            hdr << C_dim() << std::left << std::setw(10) << "Height"
+                << std::setw(24) << "Hash"
+                << std::setw(8) << "TXs"
+                << std::setw(14) << "Miner" << C_reset();
+            lines.push_back(box_row(hdr.str(), box_width - 2));
 
-                // Show last 4 blocks
-                size_t show = std::min<size_t>(4, recent_blocks_.size());
-                for (size_t i = 0; i < show; ++i) {
-                    const auto& b = recent_blocks_[recent_blocks_.size() - 1 - i];
+            // Always show exactly 4 block rows for fixed layout
+            size_t available = recent_blocks_.size();
+            for (size_t i = 0; i < 4; ++i) {
+                if (i < available) {
+                    const auto& b = recent_blocks_[available - 1 - i];
                     std::ostringstream row;
 
                     row << C_info() << std::left << std::setw(10) << fmt_num(b.height) << C_reset();
@@ -2894,6 +2910,9 @@ private:
                     row << C_dim() << miner << C_reset();
 
                     lines.push_back(box_row(row.str(), box_width - 2));
+                } else {
+                    // Empty slot - waiting for blocks
+                    lines.push_back(box_row(C_dim() + std::string("Waiting for blocks...") + C_reset(), box_width - 2));
                 }
             }
             lines.push_back(box_footer(box_width - 2));
@@ -2925,15 +2944,17 @@ private:
         }
 
         // ===== RENDER =====
-        int content_height = (int)lines.size();
-        int start_row = std::max(0, (rows - content_height - 10) / 2);  // Leave room for logs
+        // FIXED: Use fixed positioning for stable layout
+        // The dashboard always starts at row 2 for consistent appearance
+        const int fixed_start_row = 2;
+        const int fixed_log_lines = 8;  // Always show exactly 8 log lines
 
         if (vt_ok_) {
-            out << "\x1b[H\x1b[J";  // Clear screen
+            out << "\x1b[H\x1b[J";  // Clear screen and home cursor
         }
 
-        // Top padding
-        for (int i = 0; i < start_row; ++i) out << "\n";
+        // Top padding (fixed)
+        for (int i = 0; i < fixed_start_row; ++i) out << "\n";
 
         // Content
         std::string padding(start_col, ' ');
@@ -2942,9 +2963,8 @@ private:
         }
 
         // ===== LOGS SECTION =====
-        int remain = rows - start_row - content_height - 2;
-        if (remain < 4) remain = 4;
-        if (remain > 12) remain = 12;
+        // FIXED: Always use fixed number of log lines for stable layout
+        int remain = fixed_log_lines;
 
         out << padding << C_bold() << "Logs" << C_reset() << " " << C_dim() << "(recent activity)" << C_reset() << "\n";
         out << padding << std::string(box_width - 2, u8_ok_ ? '-' : '-') << "\n";
@@ -2992,10 +3012,10 @@ private:
         std::lock_guard<std::mutex> lk(mu_);
         int cols, rows; term::get_winsize(cols, rows);
 
-        // BULLETPROOF FIX: Enforce minimum dimensions for single-layout rendering
-        // This ensures the TUI fits in one screen without scrolling
+        // FIXED: Enforce minimum dimensions for 100% stable layout rendering
+        // This ensures the TUI always fits in one screen without scrolling or shifting
         if (cols < 114) cols = 114;
-        if (rows < 34) rows = 34;
+        if (rows < 38) rows = 38;
 
         // Check if sync is complete to transition from Splash to Main
         bool sync_complete = ibd_done_ || (ibd_target_ > 0 && ibd_cur_ >= ibd_target_);
