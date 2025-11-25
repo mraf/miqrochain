@@ -97,6 +97,9 @@ extern bool ensure_utxo_fully_indexed(Chain&, const std::string&, bool) __attrib
   #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
   #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
   #endif
+  #ifndef ENABLE_VIRTUAL_TERMINAL_INPUT
+  #define ENABLE_VIRTUAL_TERMINAL_INPUT 0x0200
+  #endif
   #ifdef _MSC_VER
     #pragma comment(lib, "Psapi.lib")
   #endif
@@ -685,13 +688,29 @@ static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
         if (is_pipe) vt_ok = true;
     }
 
-    const bool force_utf8 = []{
+    // Check if user explicitly disabled UTF-8 (opt-out model)
+    const bool disable_utf8 = []{
         const char* s = std::getenv("MIQ_TUI_UTF8");
-        return s && *s ? (std::strcmp(s,"0")!=0 && std::strcmp(s,"false")!=0 && std::strcmp(s,"False")!=0) : false;
+        return s && *s && (std::strcmp(s,"0")==0 || std::strcmp(s,"false")==0 || std::strcmp(s,"False")==0);
     }();
-    if (force_utf8 && have_console) {
+
+    // Enable UTF-8 by default on Windows for PowerShell 5+ compatibility
+    // Only skip if user explicitly sets MIQ_TUI_UTF8=0
+    if (!disable_utf8 && have_console) {
+        // Set console code pages to UTF-8 (65001)
         SetConsoleOutputCP(CP_UTF8);
         SetConsoleCP(CP_UTF8);
+
+        // Also enable stdin for VT sequences if available
+        HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+        if (hIn && hIn != INVALID_HANDLE_VALUE) {
+            DWORD inMode = 0;
+            if (GetConsoleMode(hIn, &inMode)) {
+                inMode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+                SetConsoleMode(hIn, inMode);
+            }
+        }
+
         u8_ok = true;
     }
 
@@ -721,19 +740,27 @@ public:
     void write_raw(const std::string& s){
         if (s.empty()) return;
 #ifdef _WIN32
-        // For PowerShell 5+ compatibility: use direct console buffer writes
-        // This provides smoother output with less flicker
-        if (hFile_ && hFile_ != INVALID_HANDLE_VALUE) {
-            // Try WriteConsoleW first for best Unicode support
-            int wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
-            if (wlen > 0) {
-                std::wstring ws((size_t)wlen, L'\0');
-                MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), ws.data(), wlen);
-                DWORD wroteW = 0;
+        // For PowerShell 5+ compatibility: use WriteConsoleW for proper Unicode support
+        // Convert UTF-8 to wide string and use WriteConsoleW
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
+        if (wlen > 0) {
+            std::wstring ws((size_t)wlen, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), ws.data(), wlen);
+            DWORD wroteW = 0;
+
+            // Try our console handle first
+            if (hFile_ && hFile_ != INVALID_HANDLE_VALUE) {
                 if (WriteConsoleW(hFile_, ws.c_str(), (DWORD)ws.size(), &wroteW, nullptr)) return;
             }
+
+            // Fallback: try STD_OUTPUT_HANDLE with WriteConsoleW
+            HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+            if (hOut != INVALID_HANDLE_VALUE) {
+                if (WriteConsoleW(hOut, ws.c_str(), (DWORD)ws.size(), &wroteW, nullptr)) return;
+            }
         }
-        // Fallback: direct file write with retry for robustness
+
+        // Last resort fallback: WriteFile (may not handle Unicode properly but ensures output)
         HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
         if (hOut != INVALID_HANDLE_VALUE) {
             DWORD wrote = 0;
@@ -822,6 +849,15 @@ private:
 static inline bool env_truthy_local(const char* name){
     const char* v = std::getenv(name);
     if(!v||!*v) return false;
+    if(std::strcmp(v,"0")==0 || std::strcmp(v,"false")==0 || std::strcmp(v,"False")==0) return false;
+    return true;
+}
+
+// UTF-8 enabled by default (opt-out model for Windows PowerShell 5+ compatibility)
+// Returns true unless MIQ_TUI_UTF8 is explicitly set to 0/false
+static inline bool is_utf8_enabled(){
+    const char* v = std::getenv("MIQ_TUI_UTF8");
+    if(!v||!*v) return true;  // Default: enabled
     if(std::strcmp(v,"0")==0 || std::strcmp(v,"false")==0 || std::strcmp(v,"False")==0) return false;
     return true;
 }
@@ -1114,18 +1150,15 @@ static inline std::string bar(int width, double frac, bool /*vt_ok*/, bool u8_ok
     int full  = (int)std::round(frac * inner);
     std::string out; out.reserve((size_t)width);
     out.push_back('[');
-    if (u8_ok && env_truthy_local("MIQ_TUI_UTF8")){
-        for (int i=0;i<inner;i++) out += (i<full ? "#" : " ");
-    } else {
-        for (int i=0;i<inner;i++) out.push_back(i<full ? '#' : ' ');
-    }
+    // Use same logic for both paths - u8_ok already indicates UTF-8 support
+    for (int i=0;i<inner;i++) out.push_back(i<full ? '#' : ' ');
     out.push_back(']');
     return out;
 }
 static inline std::string short_hex(const std::string& h, int keep){
     if ((int)h.size() <= keep) return h;
     int half = keep/2;
-    const char* ell = env_truthy_local("MIQ_TUI_UTF8")? "…" : "...";
+    const char* ell = is_utf8_enabled() ? "…" : "...";
     return h.substr(0,(size_t)half) + ell + h.substr(h.size()-(size_t)(keep-half));
 }
 
@@ -1379,7 +1412,7 @@ static inline std::string spark_ascii(const std::vector<double>& v){
     double mn = v.front(), mx = v.front();
     for (double x : v){ if (x < mn) mn = x; if (x > mx) mx = x; }
     double span = (mx - mn);
-    bool fancy = env_truthy_local("MIQ_TUI_UTF8");
+    bool fancy = is_utf8_enabled();
     const char* blocks8 = "▁▂▃▄▅▆▇#"; // 8 glyphs, UTF-8 (3 bytes each)
     const char* ascii   = " .:-=+*#%@";
     std::string out; out.reserve(v.size());
