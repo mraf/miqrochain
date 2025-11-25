@@ -3779,6 +3779,267 @@ private:
     }
 
     // =========================================================================
+    // ULTRA PREMIUM COMPONENTS - Expert level visualizations
+    // =========================================================================
+
+    // Epic glowing text effect
+    std::string draw_glow_text(const std::string& text, int color, int tick, bool bold = true) const {
+        if (!vt_ok_) return text;
+        std::ostringstream out;
+
+        // Pulse between color and brighter version
+        int pulse = tick % 8;
+        int c = color + (pulse < 4 ? pulse : 8 - pulse);
+        if (c > 255) c = 255;
+
+        out << "\x1b[38;5;" << c << "m";
+        if (bold) out << "\x1b[1m";
+        out << text << "\x1b[0m";
+        return out.str();
+    }
+
+    // Animated radar sweep effect
+    std::string draw_radar(int size, int tick) const {
+        if (!u8_ok_ || size < 3) return "[O]";
+        std::ostringstream out;
+
+        static const char* radar_chars[] = {"◴", "◷", "◶", "◵"};
+        int frame = tick % 4;
+
+        out << "\x1b[38;5;46m" << radar_chars[frame] << "\x1b[0m";
+        return out.str();
+    }
+
+    // Activity heat indicator (shows intensity with color)
+    std::string draw_heat_indicator(double value, double max_val, int tick) const {
+        if (!u8_ok_) {
+            if (value > max_val * 0.8) return "[HOT]";
+            if (value > max_val * 0.5) return "[MED]";
+            return "[LOW]";
+        }
+
+        double ratio = max_val > 0 ? value / max_val : 0;
+        if (ratio > 1.0) ratio = 1.0;
+
+        std::ostringstream out;
+
+        // Heat colors from cool to hot
+        int color;
+        std::string icon;
+        if (ratio > 0.8) {
+            static const int hot[] = {196, 202, 208, 214, 208, 202};
+            color = hot[tick % 6];
+            icon = "🔥";
+        } else if (ratio > 0.5) {
+            color = 214 + (tick % 3);
+            icon = "◆";
+        } else if (ratio > 0.2) {
+            color = 226;
+            icon = "◇";
+        } else {
+            color = 240;
+            icon = "○";
+        }
+
+        out << "\x1b[38;5;" << color << "m" << icon << "\x1b[0m";
+        return out.str();
+    }
+
+    // Epic animated counter with rolling digits effect
+    std::string draw_rolling_number(uint64_t value, int width, int color, int tick) const {
+        std::string num_str = fmt_num(value);
+        if (!vt_ok_) return num_str;
+
+        std::ostringstream out;
+        out << "\x1b[38;5;" << color << "m";
+
+        // Add subtle animation to last digit
+        if (u8_ok_ && tick % 4 == 0) {
+            out << "\x1b[1m";
+        }
+        out << num_str << "\x1b[0m";
+        return out.str();
+    }
+
+    // Network activity visualization (mini traffic graph)
+    std::string draw_network_activity(int width, int tick) const {
+        if (!u8_ok_ || width < 5) return "";
+        std::ostringstream out;
+
+        // Simulated network activity bars
+        static const char* bars[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+
+        for (int i = 0; i < width; ++i) {
+            // Create wave-like pattern
+            int phase = (tick * 2 + i * 3) % 16;
+            int height = (phase < 8) ? phase : (16 - phase);
+            if (height > 7) height = 7;
+
+            // Color based on height
+            int color = 39 + height;
+            out << "\x1b[38;5;" << color << "m" << bars[height] << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Draw epic animated logo line
+    std::string draw_logo_animation(int width, int tick) const {
+        if (!u8_ok_) return "";
+        std::ostringstream out;
+
+        // Particle effect
+        int particle_pos = (tick * 2) % width;
+        for (int i = 0; i < width; ++i) {
+            int dist = std::abs(i - particle_pos);
+            if (dist == 0) {
+                out << "\x1b[38;5;231m★\x1b[0m";  // Bright particle
+            } else if (dist < 3) {
+                static const int trail[] = {255, 252, 249};
+                out << "\x1b[38;5;" << trail[dist - 1] << "m·\x1b[0m";
+            } else {
+                out << "\x1b[38;5;236m─\x1b[0m";
+            }
+        }
+        return out.str();
+    }
+
+    // System load meter with animated fill
+    std::string draw_load_meter(double load, int width, int tick) const {
+        if (width < 5) return "";
+        std::ostringstream out;
+
+        if (!u8_ok_) {
+            int filled = (int)(load * width);
+            out << "[";
+            for (int i = 0; i < width; ++i) {
+                out << (i < filled ? "=" : " ");
+            }
+            out << "]";
+            return out.str();
+        }
+
+        int filled = (int)(load * width);
+
+        // Gradient fill with animation
+        for (int i = 0; i < width; ++i) {
+            if (i < filled) {
+                // Color gradient based on position
+                int color;
+                double pos_ratio = (double)i / width;
+                if (pos_ratio < 0.5) {
+                    color = 46;  // Green
+                } else if (pos_ratio < 0.75) {
+                    color = 226;  // Yellow
+                } else {
+                    color = 196 + (tick % 3);  // Red with pulse
+                }
+
+                // Shimmer effect on edge
+                if (i == filled - 1 && tick % 4 < 2) {
+                    color = 231;  // White flash
+                }
+
+                out << "\x1b[38;5;" << color << "m█\x1b[0m";
+            } else {
+                out << "\x1b[38;5;236m░\x1b[0m";
+            }
+        }
+        return out.str();
+    }
+
+    // Animated connection indicator
+    std::string draw_connection_status(bool connected, int quality, int tick) const {
+        if (!u8_ok_) {
+            return connected ? "[*]" : "[ ]";
+        }
+
+        std::ostringstream out;
+
+        if (!connected) {
+            // Scanning animation
+            static const char* scan[] = {"◜", "◝", "◞", "◟"};
+            out << "\x1b[38;5;240m" << scan[tick % 4] << "\x1b[0m";
+        } else {
+            // Quality-based indicator with pulse
+            int color;
+            std::string icon;
+            if (quality >= 80) {
+                static const int good[] = {46, 47, 48, 49, 48, 47};
+                color = good[tick % 6];
+                icon = "◉";
+            } else if (quality >= 50) {
+                color = 214 + (tick % 3);
+                icon = "◎";
+            } else {
+                color = 196;
+                icon = "○";
+            }
+            out << "\x1b[38;5;" << color << "m" << icon << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Epic timestamp display
+    std::string draw_timestamp(int tick) const {
+        if (!vt_ok_) return "";
+
+        auto now = std::chrono::system_clock::now();
+        auto time = std::chrono::system_clock::to_time_t(now);
+        std::tm* tm = std::localtime(&time);
+
+        std::ostringstream out;
+        out << "\x1b[38;5;240m";
+
+        // Blinking colon
+        out << std::setfill('0') << std::setw(2) << tm->tm_hour;
+        out << ((tick % 2 == 0) ? "\x1b[38;5;252m:\x1b[38;5;240m" : "\x1b[38;5;236m:\x1b[38;5;240m");
+        out << std::setfill('0') << std::setw(2) << tm->tm_min;
+        out << ((tick % 2 == 0) ? "\x1b[38;5;252m:\x1b[38;5;240m" : "\x1b[38;5;236m:\x1b[38;5;240m");
+        out << std::setfill('0') << std::setw(2) << tm->tm_sec;
+        out << "\x1b[0m";
+
+        return out.str();
+    }
+
+    // Cyber-punk style label
+    std::string draw_cyber_label(const std::string& text, int color, int tick) const {
+        if (!vt_ok_) return "[" + text + "]";
+        std::ostringstream out;
+
+        // Animated brackets
+        int bracket_c = 240 + (tick % 4);
+        out << "\x1b[38;5;" << bracket_c << "m⟨\x1b[0m";
+        out << "\x1b[38;5;" << color << "m" << text << "\x1b[0m";
+        out << "\x1b[38;5;" << bracket_c << "m⟩\x1b[0m";
+
+        return out.str();
+    }
+
+    // Draw horizontal animated line with glow
+    std::string draw_glow_line(int width, int color, int tick) const {
+        if (!u8_ok_ || width < 1) return "";
+        std::ostringstream out;
+
+        // Traveling glow effect
+        int glow_pos = (tick * 3) % width;
+
+        for (int i = 0; i < width; ++i) {
+            int dist = std::abs(i - glow_pos);
+            int c;
+            if (dist == 0) {
+                c = 231;  // White center
+            } else if (dist < 3) {
+                c = color + (3 - dist) * 2;
+                if (c > 255) c = 255;
+            } else {
+                c = color;
+            }
+            out << "\x1b[38;5;" << c << "m─\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // =========================================================================
     // SPLASH SCREEN - ULTRA PROFESSIONAL sync display with premium animations
     // =========================================================================
 
@@ -4001,8 +4262,23 @@ private:
     }
 
     // Get sync status string with cool animated indicators
-    std::string get_sync_status(uint64_t blocks_remaining, double sync_pct) const {
-        if (blocks_remaining == 0 || sync_pct >= 100.0) {
+    std::string get_sync_status(uint64_t blocks_remaining, double sync_pct, uint64_t network_height) const {
+        // IMPORTANT: Only show as synced if we actually have network height data
+        // and we're truly synchronized (not just at startup with no data)
+        bool has_network_data = network_height > 0;
+        bool actually_synced = has_network_data && (blocks_remaining == 0 || sync_pct >= 99.9);
+
+        if (!has_network_data) {
+            // Still initializing - no network height known yet
+            if (vt_ok_) {
+                static const char* init_frames[] = {"◐", "◓", "◑", "◒"};
+                std::string spinner = u8_ok_ ? init_frames[tick_ % 4] : ".";
+                return std::string("\x1b[38;5;214m") + spinner + " Initializing...\x1b[0m";
+            }
+            return "Initializing...";
+        }
+
+        if (actually_synced) {
             if (vt_ok_) {
                 std::string check = u8_ok_ ? "✓ " : "[OK] ";
                 return std::string("\x1b[38;5;46m\x1b[1m") + check + "BLOCKCHAIN SYNCHRONIZED\x1b[0m";
@@ -4116,9 +4392,13 @@ private:
         lines.push_back("");
 
         // ===== SYNC STATUS HEADER WITH EFFECTS =====
+        // IMPORTANT: Only show as complete if we have network data AND are actually synced
+        bool has_network_data = network_height > 0;
+        bool actually_complete = has_network_data && sync_progress >= 99.9;
+
         std::ostringstream header;
-        if (sync_progress >= 100.0) {
-            // EPIC completion animation
+        if (actually_complete) {
+            // EPIC completion animation - only when TRULY complete
             if (vt_ok_) {
                 static const int celebrate_colors[] = {46, 226, 208, 201, 51, 46};
                 int c = celebrate_colors[tick_ % 6];
@@ -4130,7 +4410,16 @@ private:
             } else {
                 header << "[OK] BLOCKCHAIN SYNCHRONIZED";
             }
+        } else if (!has_network_data) {
+            // No network data yet - show initializing state
+            if (vt_ok_) {
+                header << "\x1b[38;5;214m" << splash_spinner(tick_, u8_ok_) << " \x1b[0m";
+                header << "\x1b[38;5;255m\x1b[1mCONNECTING TO NETWORK\x1b[0m";
+            } else {
+                header << splash_spinner(tick_, u8_ok_) << " CONNECTING TO NETWORK";
+            }
         } else {
+            // Syncing in progress
             if (vt_ok_) {
                 header << "\x1b[38;5;214m" << splash_spinner(tick_, u8_ok_) << " \x1b[0m";
                 header << "\x1b[38;5;255m\x1b[1mSYNCHRONIZING BLOCKCHAIN\x1b[0m";
@@ -4226,8 +4515,11 @@ private:
         // Row 4: ETA
         {
             std::string eta_str = "Calculating...";
-            if (sync_progress >= 100.0 || blocks_remaining == 0) {
+            // Only show complete if we ACTUALLY have data and are synced
+            if (actually_complete) {
                 eta_str = u8_ok_ ? "✓ Complete" : "Complete";
+            } else if (!has_network_data) {
+                eta_str = u8_ok_ ? "◌ Awaiting peers..." : "Awaiting peers...";
             } else if (sync_blocks_per_sec_ > 0.01 && blocks_remaining > 0) {
                 eta_str = fmt_eta(blocks_remaining, sync_blocks_per_sec_);
             }
@@ -4253,7 +4545,7 @@ private:
 
         // ===== STATUS LINE =====
         std::ostringstream status;
-        status << C_dim() << (u8_ok_ ? "⚡ " : "> ") << "Status: " << C_reset() << get_sync_status(blocks_remaining, sync_progress);
+        status << C_dim() << (u8_ok_ ? "⚡ " : "> ") << "Status: " << C_reset() << get_sync_status(blocks_remaining, sync_progress, network_height);
         lines.push_back(center_text(status.str(), box_width));
 
         // ===== NETWORK INFO =====
@@ -4572,8 +4864,13 @@ private:
                 out << "  \x1b[38;5;" << (236 + tick_ % 4) << "m│\x1b[0m\x1b[48;5;233m  ";
                 out << "\x1b[38;5;240m⏱ \x1b[38;5;252m" << fmt_uptime(uptime_s_) << "\x1b[0m\x1b[48;5;233m";
 
+                // Live timestamp
+                out << "  \x1b[38;5;" << (236 + tick_ % 4) << "m│\x1b[0m\x1b[48;5;233m  ";
+                out << draw_timestamp(tick_);
+                out << "\x1b[48;5;233m";
+
                 // Pad to end
-                int used = 95 + (miner_running_badge() ? 18 : 0);
+                int used = 108 + (miner_running_badge() ? 18 : 0);
                 int pad = cols - used - 2;
                 if (pad > 0) out << std::string(pad, ' ');
                 out << "\x1b[0m\x1b[38;5;27m║\x1b[0m\n";
