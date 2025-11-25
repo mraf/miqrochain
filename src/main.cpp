@@ -1050,7 +1050,7 @@ static inline std::string fmt_datetime(uint64_t timestamp){
     return std::string(buf);
 }
 
-// Animated progress bar with gradient effect (Bitcoin Core style)
+// Animated progress bar with gradient effect (Bitcoin Core style) - EXPERT EDITION
 static inline std::string progress_bar_animated(int width, double frac, int tick, bool vt_ok, bool u8_ok){
     if (width < 10) width = 10;
     if (frac < 0.0) frac = 0.0;
@@ -1060,40 +1060,74 @@ static inline std::string progress_bar_animated(int width, double frac, int tick
     int filled = (int)(frac * inner);
 
     std::string out;
-    out.reserve((size_t)(width + 20));
+    out.reserve((size_t)(width + 200));  // Extra space for ANSI codes
 
     if (vt_ok && u8_ok) {
-        // Professional Unicode progress bar with animation
-        out += "\x1b[32m"; // Green color
-        out += "▐";
+        // EXPERT Unicode progress bar with rainbow gradient and shimmer animation
+        out += "\x1b[38;5;240m▐\x1b[0m";
 
         for (int i = 0; i < inner; ++i) {
             if (i < filled) {
-                // Filled portion with subtle animation
-                out += "█";
+                // Gradient color from cyan to green based on position
+                double ratio = (double)i / (double)inner;
+                int color;
+                if (ratio < 0.25) {
+                    color = 51;  // Cyan
+                } else if (ratio < 0.5) {
+                    color = 49;  // Cyan-green
+                } else if (ratio < 0.75) {
+                    color = 47;  // Green-cyan
+                } else {
+                    color = 46;  // Green
+                }
+
+                // Shimmer wave effect - brighten cells in wave pattern
+                int shimmer_phase = (tick * 2 + i) % 12;
+                if (shimmer_phase < 3) {
+                    color = 231;  // Bright white shimmer
+                }
+
+                out += "\x1b[38;5;";
+                out += std::to_string(color);
+                out += "m█\x1b[0m";
             } else if (i == filled && frac < 1.0) {
-                // Animated leading edge
-                static const char* anim[] = {"░", "▒", "▓", "▒"};
-                out += anim[tick % 4];
+                // Expert animated leading edge with 8-frame animation
+                static const char* edge_chars[] = {"░", "▒", "▓", "█", "▓", "▒", "░", " "};
+                static const int edge_colors[] = {46, 47, 48, 49, 50, 51, 87, 123};
+                int phase = tick % 8;
+                out += "\x1b[38;5;";
+                out += std::to_string(edge_colors[phase]);
+                out += "m";
+                out += edge_chars[phase];
+                out += "\x1b[0m";
             } else {
-                out += "░";
+                // Unfilled - subtle animated dark blocks
+                int bg_phase = (tick + i) % 4;
+                int bg_color = 235 + bg_phase;
+                out += "\x1b[38;5;";
+                out += std::to_string(bg_color);
+                out += "m░\x1b[0m";
             }
         }
-        out += "▌";
-        out += "\x1b[0m";
+        out += "\x1b[38;5;240m▌\x1b[0m";
     } else if (vt_ok) {
-        // ANSI progress bar
-        out += "\x1b[32m[";
+        // ANSI progress bar with color gradient
+        out += "\x1b[38;5;240m[\x1b[0m";
         for (int i = 0; i < inner; ++i) {
             if (i < filled) {
-                out += "=";
+                // Color gradient from cyan to green
+                int color = 46 + ((filled - i) * 5 / inner);
+                if (color > 51) color = 51;
+                out += "\x1b[38;5;";
+                out += std::to_string(color);
+                out += "m=\x1b[0m";
             } else if (i == filled && frac < 1.0) {
-                out += ">";
+                out += "\x1b[38;5;87m>\x1b[0m";
             } else {
-                out += " ";
+                out += "\x1b[38;5;236m-\x1b[0m";
             }
         }
-        out += "]\x1b[0m";
+        out += "\x1b[38;5;240m]\x1b[0m";
     } else {
         // Plain ASCII
         out += "[";
@@ -1108,6 +1142,122 @@ static inline std::string progress_bar_animated(int width, double frac, int tick
         }
         out += "]";
     }
+    return out;
+}
+
+// Expert progress bar styles - additional animation variants
+static inline std::string progress_bar_fire(int width, double frac, int tick, bool vt_ok, bool u8_ok){
+    if (!vt_ok || !u8_ok) return progress_bar_animated(width, frac, tick, vt_ok, u8_ok);
+
+    if (width < 10) width = 10;
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 1.0) frac = 1.0;
+
+    int inner = width - 2;
+    int filled = (int)(frac * inner);
+
+    std::string out;
+    out.reserve((size_t)(width + 200));
+
+    out += "\x1b[38;5;240m⟨\x1b[0m";
+
+    static const int fire_colors[] = {52, 88, 124, 160, 196, 202, 208, 214, 220, 226};
+
+    for (int i = 0; i < inner; ++i) {
+        if (i < filled) {
+            int color_phase = (tick * 2 + i) % 10;
+            int c = fire_colors[color_phase];
+            out += "\x1b[38;5;";
+            out += std::to_string(c);
+            out += "m█\x1b[0m";
+        } else if (i == filled && frac < 1.0) {
+            static const char* flame[] = {"🔥", "💥", "✨", "💫"};
+            out += flame[tick % 4];
+        } else {
+            out += "\x1b[38;5;236m░\x1b[0m";
+        }
+    }
+    out += "\x1b[38;5;240m⟩\x1b[0m";
+    return out;
+}
+
+static inline std::string progress_bar_cyber(int width, double frac, int tick, bool vt_ok, bool u8_ok){
+    if (!vt_ok || !u8_ok) return progress_bar_animated(width, frac, tick, vt_ok, u8_ok);
+
+    if (width < 10) width = 10;
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 1.0) frac = 1.0;
+
+    int inner = width - 2;
+    int filled = (int)(frac * inner);
+
+    std::string out;
+    out.reserve((size_t)(width + 200));
+
+    out += "\x1b[38;5;33m◄\x1b[0m";
+
+    for (int i = 0; i < inner; ++i) {
+        if (i < filled) {
+            // Matrix-style green with scan line
+            int scan = (tick * 3 + i) % 8;
+            int c = (scan < 2) ? 231 : (scan < 4 ? 46 : 34);
+            out += "\x1b[38;5;";
+            out += std::to_string(c);
+            out += "m▓\x1b[0m";
+        } else if (i == filled && frac < 1.0) {
+            static const char* cyber[] = {"◈", "◇", "◆", "◇"};
+            static const int cyber_c[] = {46, 82, 118, 154};
+            out += "\x1b[38;5;";
+            out += std::to_string(cyber_c[tick % 4]);
+            out += "m";
+            out += cyber[tick % 4];
+            out += "\x1b[0m";
+        } else {
+            out += "\x1b[38;5;235m░\x1b[0m";
+        }
+    }
+    out += "\x1b[38;5;33m►\x1b[0m";
+    return out;
+}
+
+static inline std::string progress_bar_neon(int width, double frac, int tick, bool vt_ok, bool u8_ok){
+    if (!vt_ok || !u8_ok) return progress_bar_animated(width, frac, tick, vt_ok, u8_ok);
+
+    if (width < 10) width = 10;
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 1.0) frac = 1.0;
+
+    int inner = width - 2;
+    int filled = (int)(frac * inner);
+
+    std::string out;
+    out.reserve((size_t)(width + 200));
+
+    // Neon pink/purple theme
+    out += "\x1b[38;5;201m⟦\x1b[0m";
+
+    static const int neon_colors[] = {201, 200, 199, 198, 197, 163, 129, 93, 129, 163};
+
+    for (int i = 0; i < inner; ++i) {
+        if (i < filled) {
+            int color_phase = (tick + i) % 10;
+            int c = neon_colors[color_phase];
+            // Pulse brightness
+            int pulse = (tick * 2 + i) % 6;
+            if (pulse < 2) c = 231;  // Bright flash
+            out += "\x1b[38;5;";
+            out += std::to_string(c);
+            out += "m━\x1b[0m";
+        } else if (i == filled && frac < 1.0) {
+            static const char* glow[] = {"✦", "✧", "★", "✧"};
+            out += "\x1b[38;5;201m";
+            out += glow[tick % 4];
+            out += "\x1b[0m";
+        } else {
+            out += "\x1b[38;5;236m─\x1b[0m";
+        }
+    }
+    out += "\x1b[38;5;201m⟧\x1b[0m";
     return out;
 }
 
@@ -1138,12 +1288,12 @@ static inline std::string fmt_eta(uint64_t blocks_remaining, double blocks_per_s
     return o.str();
 }
 
-// Spinner & drawing helpers - IMPROVED with smoother animations
+// Spinner & drawing helpers - EXPERT-LEVEL with full UTF-8 animations
 static inline std::string spinner(int tick, bool fancy){
     if (fancy){
-        // Braille spinner for Unicode terminals - smooth 10-frame animation
-        static const char* frames[] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
-        return frames[(size_t)(tick % 10)];
+        // Expert braille spinner - 12-frame smooth rotation with glow effect
+        static const char* frames[] = {"⠋","⠙","⠚","⠞","⠖","⠦","⠴","⠲","⠳","⠓","⠋","⠉"};
+        return frames[(size_t)(tick % 12)];
     } else {
         // ASCII spinner optimized for PowerShell 5+ - 8-frame animation for smoother look
         static const char* frames[] = {"|", "/", "-", "\\", "|", "/", "-", "\\"};
@@ -1151,12 +1301,62 @@ static inline std::string spinner(int tick, bool fancy){
     }
 }
 
+// Expert spinner variants - multiple animation styles
+static inline std::string spinner_cyber(int tick, bool fancy){
+    if (fancy){
+        static const char* frames[] = {"◈","◇","◆","◇","◈","✦","✧","✦"};
+        return frames[(size_t)(tick % 8)];
+    }
+    return spinner(tick, false);
+}
+
+static inline std::string spinner_quantum(int tick, bool fancy){
+    if (fancy){
+        static const char* frames[] = {"⊕","⊗","⊖","⊘","⊕","⊛","⊚","⊙"};
+        return frames[(size_t)(tick % 8)];
+    }
+    return spinner(tick, false);
+}
+
+static inline std::string spinner_orbital(int tick, bool fancy){
+    if (fancy){
+        static const char* frames[] = {"◐","◓","◑","◒","◐","◓","◑","◒"};
+        return frames[(size_t)(tick % 8)];
+    }
+    return spinner(tick, false);
+}
+
+static inline std::string spinner_atom(int tick, bool fancy){
+    if (fancy){
+        static const char* frames[] = {"⚛","◎","⊛","⊚","◉","⊙","◎","⚛"};
+        return frames[(size_t)(tick % 8)];
+    }
+    return spinner(tick, false);
+}
+
+static inline std::string spinner_wave(int tick, bool fancy){
+    if (fancy){
+        static const char* frames[] = {"∿","≋","≈","〜","≈","≋","∿","〰"};
+        return frames[(size_t)(tick % 8)];
+    }
+    return spinner(tick, false);
+}
+
+static inline std::string spinner_crypto(int tick, bool fancy){
+    if (fancy){
+        static const char* frames[] = {"₿","◯","◔","◑","◕","●","◕","◑","◔"};
+        return frames[(size_t)(tick % 9)];
+    }
+    return spinner(tick, false);
+}
+
 // Additional animated indicators for professional look
 static inline std::string activity_indicator(int tick, bool active, bool fancy){
     if (!active) return fancy ? "○" : "o";
     if (fancy){
-        static const char* frames[] = {"◐","◓","◑","◒"};
-        return frames[(size_t)(tick % 4)];
+        // Expert orbital animation with smooth rotation
+        static const char* frames[] = {"◐","◓","◑","◒","●","◓","◑","◒"};
+        return frames[(size_t)(tick % 8)];
     } else {
         static const char* frames[] = {"[*]","[+]","[*]","[x]"};
         return frames[(size_t)(tick % 4)];
@@ -1165,12 +1365,40 @@ static inline std::string activity_indicator(int tick, bool active, bool fancy){
 
 static inline std::string pulse_indicator(int tick, bool fancy){
     if (fancy){
-        static const char* frames[] = {"▁","▂","▃","▄","▅","▆","▇","█","▇","▆","▅","▄","▃","▂"};
-        return frames[(size_t)(tick % 14)];
+        // Expert pulse with 16-frame smooth animation
+        static const char* frames[] = {"▁","▂","▃","▄","▅","▆","▇","█","▇","▆","▅","▄","▃","▂","▁","▁"};
+        return frames[(size_t)(tick % 16)];
     } else {
         static const char* frames[] = {".", "o", "O", "0", "O", "o"};
         return frames[(size_t)(tick % 6)];
     }
+}
+
+// Expert DNA helix spinner
+static inline std::string spinner_dna(int tick, bool fancy){
+    if (fancy){
+        static const char* frames[] = {"╭╮","╮│","│╯","╯─","─╰","╰│","│╭","╭─"};
+        return frames[(size_t)(tick % 8)];
+    }
+    return spinner(tick, false);
+}
+
+// Expert matrix-style spinner
+static inline std::string spinner_matrix(int tick, bool fancy){
+    if (fancy){
+        static const char* frames[] = {"░","▒","▓","█","▓","▒","░"," "};
+        return frames[(size_t)(tick % 8)];
+    }
+    return spinner(tick, false);
+}
+
+// Expert electric spark spinner
+static inline std::string spinner_electric(int tick, bool fancy){
+    if (fancy){
+        static const char* frames[] = {"⚡","✧","⚡","✦","⚡","★","⚡","☆"};
+        return frames[(size_t)(tick % 8)];
+    }
+    return spinner(tick, false);
 }
 static inline std::string straight_line(int w){
     if (w <= 0) return {};
@@ -2584,7 +2812,7 @@ private:
     }
 
     // -------------------------------------------------------------------------
-    // ANIMATED LOADING - Various loading animations
+    // ANIMATED LOADING - Expert-level loading animations with full UTF-8 support
     // -------------------------------------------------------------------------
     std::string draw_loading(int style, int tick) const {
         if (!u8_ok_) {
@@ -2596,42 +2824,389 @@ private:
 
         switch (style) {
             case 0: {
-                // Braille spinner
+                // Braille spinner - smooth 8-frame rotation
                 static const char* braille[] = {"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"};
                 if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::PRIMARY << "m";
                 out << braille[tick % 8];
                 break;
             }
             case 1: {
-                // Dots spinner
+                // Dots spinner - 10-frame smooth dots
                 static const char* dots[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
                 if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::ACCENT << "m";
                 out << dots[tick % 10];
                 break;
             }
             case 2: {
-                // Arc spinner
+                // Arc spinner - circular arc motion
                 static const char* arcs[] = {"◜", "◠", "◝", "◞", "◡", "◟"};
                 if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::SUCCESS << "m";
                 out << arcs[tick % 6];
                 break;
             }
             case 3: {
-                // Block bounce
+                // Block bounce - corner bounce animation
                 static const char* blocks[] = {"▖", "▘", "▝", "▗"};
                 if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::INFO << "m";
                 out << blocks[tick % 4];
                 break;
             }
+            case 4: {
+                // DNA helix - double helix rotation
+                static const char* dna[] = {"🧬", "⟲", "◎", "⟳", "🧬", "⟳", "◎", "⟲"};
+                static const int dna_c[] = {46, 47, 48, 49, 50, 51, 50, 49};
+                if (vt_ok_) out << "\x1b[38;5;" << dna_c[tick % 8] << "m";
+                out << dna[tick % 8];
+                break;
+            }
+            case 5: {
+                // Cyber pulse - matrix-style pulse
+                static const char* cyber[] = {"◈", "◇", "◆", "◇", "◈", "✦", "✧", "✦"};
+                static const int cyber_c[] = {46, 82, 118, 154, 190, 226, 190, 154};
+                if (vt_ok_) out << "\x1b[38;5;" << cyber_c[tick % 8] << "m";
+                out << cyber[tick % 8];
+                break;
+            }
+            case 6: {
+                // Moon phases - lunar cycle animation
+                static const char* moons[] = {"🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"};
+                out << moons[tick % 8];
+                break;
+            }
+            case 7: {
+                // Clock spinner - animated clock
+                static const char* clocks[] = {"🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"};
+                out << clocks[tick % 12];
+                break;
+            }
+            case 8: {
+                // Bouncing ball - smooth bounce
+                static const char* ball[] = {"⠁", "⠂", "⠄", "⡀", "⢀", "⠠", "⠐", "⠈"};
+                if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::WARNING << "m";
+                out << ball[tick % 8];
+                break;
+            }
+            case 9: {
+                // Electric bolt - lightning effect
+                static const char* bolt[] = {"⚡", "✧", "⚡", "✦", "⚡", "★", "⚡", "☆"};
+                static const int bolt_c[] = {226, 227, 228, 229, 230, 231, 230, 229};
+                if (vt_ok_) out << "\x1b[38;5;" << bolt_c[tick % 8] << "m";
+                out << bolt[tick % 8];
+                break;
+            }
+            case 10: {
+                // Fire animation - flames
+                static const char* fire[] = {"🔥", "💥", "✨", "💫", "🔥", "⚡", "✨", "💥"};
+                out << fire[tick % 8];
+                break;
+            }
+            case 11: {
+                // Orbital - rotating orbital
+                static const char* orbital[] = {"◐", "◓", "◑", "◒"};
+                static const int orb_c[] = {51, 45, 39, 33};
+                if (vt_ok_) out << "\x1b[38;5;" << orb_c[tick % 4] << "m";
+                out << orbital[tick % 4];
+                break;
+            }
+            case 12: {
+                // Wave - water wave
+                static const char* wave[] = {"≋", "≈", "∿", "〜", "≈", "≋", "〰", "∿"};
+                static const int wave_c[] = {33, 39, 45, 51, 87, 51, 45, 39};
+                if (vt_ok_) out << "\x1b[38;5;" << wave_c[tick % 8] << "m";
+                out << wave[tick % 8];
+                break;
+            }
+            case 13: {
+                // Atom - orbiting electrons
+                static const char* atom[] = {"⚛", "◎", "⊛", "⊚", "◉", "⊙", "◎", "⚛"};
+                static const int atom_c[] = {196, 202, 208, 214, 220, 226, 220, 214};
+                if (vt_ok_) out << "\x1b[38;5;" << atom_c[tick % 8] << "m";
+                out << atom[tick % 8];
+                break;
+            }
+            case 14: {
+                // Crypto coin - spinning coin
+                static const char* coin[] = {"◯", "◔", "◑", "◕", "●", "◕", "◑", "◔"};
+                static const int coin_c[] = {220, 221, 222, 223, 229, 223, 222, 221};
+                if (vt_ok_) out << "\x1b[38;5;" << coin_c[tick % 8] << "m";
+                out << coin[tick % 8];
+                break;
+            }
             default: {
-                // Default braille
-                static const char* def[] = {"⠿", "⡿", "⣿", "⣷", "⣯", "⣟"};
+                // Default braille matrix
+                static const char* def[] = {"⠿", "⡿", "⣿", "⣷", "⣯", "⣟", "⣻", "⢿"};
                 if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::PRIMARY << "m";
-                out << def[tick % 6];
+                out << def[tick % 8];
             }
         }
 
         if (vt_ok_) out << "\x1b[0m";
+        return out.str();
+    }
+
+    // -------------------------------------------------------------------------
+    // EXPERT ANIMATIONS - Ultra premium visual effects
+    // -------------------------------------------------------------------------
+
+    // DNA Helix animation - double strand visualization
+    std::string draw_dna_helix(int width, int tick) const {
+        if (!u8_ok_ || width < 10) return "[DNA]";
+        std::ostringstream out;
+
+        static const char* dna_top[] = {"╭", "─", "╮", "│", "╯", "─", "╰", "│"};
+        static const int dna_colors[] = {46, 47, 48, 49, 50, 51, 50, 49};
+
+        for (int i = 0; i < width; ++i) {
+            int phase = (tick + i) % 8;
+            int c = dna_colors[phase];
+            out << "\x1b[38;5;" << c << "m" << dna_top[phase] << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Matrix rain effect - vertical cascade
+    std::string draw_matrix_rain(int width, int tick) const {
+        if (!u8_ok_ || width < 5) return "";
+        std::ostringstream out;
+
+        static const char* matrix_chars[] = {"░", "▒", "▓", "█", "▓", "▒", "░", " "};
+        static const int matrix_colors[] = {22, 28, 34, 40, 46, 40, 34, 28};
+
+        for (int i = 0; i < width; ++i) {
+            int phase = (tick * 2 + i * 3) % 8;
+            int c = matrix_colors[phase];
+            out << "\x1b[38;5;" << c << "m" << matrix_chars[phase] << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Cyber wave - animated wave pattern
+    std::string draw_cyber_wave(int width, int tick) const {
+        if (!u8_ok_ || width < 5) return "";
+        std::ostringstream out;
+
+        static const char* wave_chars[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃", "▂"};
+        static const int wave_colors[] = {39, 38, 37, 36, 35, 34, 33, 32, 33, 34, 35, 36, 37, 38};
+
+        for (int i = 0; i < width; ++i) {
+            int phase = (tick + i) % 14;
+            int c = wave_colors[phase];
+            out << "\x1b[38;5;" << c << "m" << wave_chars[phase] << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Fire animation - animated flame bar
+    std::string draw_fire_bar(int width, int tick) const {
+        if (!u8_ok_ || width < 3) return "";
+        std::ostringstream out;
+
+        static const char* fire_chars[] = {"░", "▒", "▓", "█", "▓", "▒"};
+        static const int fire_colors[] = {52, 88, 124, 160, 196, 202, 208, 214, 220, 226};
+
+        for (int i = 0; i < width; ++i) {
+            int char_phase = (tick + i * 2) % 6;
+            int color_phase = (tick * 2 + i) % 10;
+            int c = fire_colors[color_phase];
+            out << "\x1b[38;5;" << c << "m" << fire_chars[char_phase] << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Plasma effect - morphing colors
+    std::string draw_plasma_effect(int width, int tick) const {
+        if (!u8_ok_ || width < 3) return "";
+        std::ostringstream out;
+
+        for (int i = 0; i < width; ++i) {
+            // Create plasma-like color cycling
+            int phase1 = (tick + i) % 12;
+            int phase2 = (tick * 2 + i * 3) % 12;
+            int color = 196 + ((phase1 + phase2) % 36);
+            out << "\x1b[38;5;" << color << "m█\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Audio visualizer - bouncing bars
+    std::string draw_audio_viz(int width, int tick) const {
+        if (!u8_ok_ || width < 5) return "";
+        std::ostringstream out;
+
+        static const char* levels[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
+        static const int viz_colors[] = {46, 82, 118, 154, 190, 226, 220, 214};
+
+        for (int i = 0; i < width; ++i) {
+            // Simulate audio bars with pseudo-random heights
+            int seed = (tick * 7 + i * 13) % 17;
+            int height = (seed + (tick + i) % 8) % 8;
+            int c = viz_colors[height];
+            out << "\x1b[38;5;" << c << "m" << levels[height] << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Neon pulse - glowing neon effect
+    std::string draw_neon_pulse(int width, int tick, int base_color) const {
+        if (!u8_ok_ || width < 3) return "";
+        std::ostringstream out;
+
+        for (int i = 0; i < width; ++i) {
+            int pulse = (tick + i) % 8;
+            int brightness = (pulse < 4) ? pulse : (8 - pulse);
+            int c = base_color + brightness;
+            if (c > 255) c = 255;
+            out << "\x1b[38;5;" << c << "m━\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Starfield - twinkling stars
+    std::string draw_starfield(int width, int tick) const {
+        if (!u8_ok_ || width < 5) return "";
+        std::ostringstream out;
+
+        static const char* stars[] = {"✦", "✧", "★", "☆", "✶", "✷", "✸", "·"};
+        static const int star_colors[] = {255, 253, 251, 249, 247, 245, 243, 241};
+
+        for (int i = 0; i < width; ++i) {
+            int seed = (i * 7 + tick) % 23;
+            int phase = (seed + tick) % 8;
+            int c = star_colors[phase];
+            out << "\x1b[38;5;" << c << "m" << stars[phase] << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Electric arc - lightning between points
+    std::string draw_electric_arc(int width, int tick) const {
+        if (!u8_ok_ || width < 5) return "";
+        std::ostringstream out;
+
+        static const char* arc_chars[] = {"╲", "│", "╱", "─", "╲", "│", "╱", "─"};
+        static const int arc_colors[] = {51, 87, 123, 159, 195, 231, 195, 159};
+
+        for (int i = 0; i < width; ++i) {
+            int phase = (tick * 3 + i * 2) % 8;
+            int c = arc_colors[phase];
+            out << "\x1b[38;5;" << c << "m" << arc_chars[phase] << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Heartbeat - ECG style pulse
+    std::string draw_heartbeat(int width, int tick) const {
+        if (!u8_ok_ || width < 8) return "";
+        std::ostringstream out;
+
+        // ECG-style pattern: flat, small bump, big spike, negative, recovery
+        static const char* ecg[] = {"─", "─", "╱", "│", "╲", "─", "╱", "╲", "─", "─"};
+        static const int ecg_colors[] = {196, 196, 202, 208, 214, 196, 202, 214, 196, 196};
+
+        for (int i = 0; i < width; ++i) {
+            int phase = (i + tick) % 10;
+            int c = ecg_colors[phase];
+            out << "\x1b[38;5;" << c << "m" << ecg[phase] << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Blockchain chain animation - linking blocks
+    std::string draw_chain_animation(int num_blocks, int tick) const {
+        if (!u8_ok_ || num_blocks < 1) return "[CHAIN]";
+        std::ostringstream out;
+
+        out << "\x1b[38;5;240m⟦\x1b[0m";
+        for (int i = 0; i < num_blocks && i < 15; ++i) {
+            // Latest block pulses brighter
+            bool is_latest = (i == num_blocks - 1);
+            int phase = (tick + i) % 8;
+            int color;
+
+            if (is_latest) {
+                static const int glow[] = {46, 47, 48, 49, 50, 51, 87, 123};
+                color = glow[tick % 8];
+            } else {
+                color = 39 + (phase < 4 ? phase : 8 - phase);
+            }
+
+            // Animated block character
+            static const char* block_chars[] = {"▣", "◼", "■", "◼"};
+            out << "\x1b[38;5;" << color << "m" << block_chars[(tick + i) % 4] << "\x1b[0m";
+
+            // Animated link between blocks
+            if (i < num_blocks - 1 && i < 14) {
+                int link_phase = (tick + i) % 4;
+                static const char* links[] = {"─", "━", "═", "━"};
+                out << "\x1b[38;5;240m" << links[link_phase] << "\x1b[0m";
+            }
+        }
+        out << "\x1b[38;5;240m⟧\x1b[0m";
+        return out.str();
+    }
+
+    // Crypto mining animation - hash visualization
+    std::string draw_mining_animation(int width, int tick) const {
+        if (!u8_ok_ || width < 8) return "[MINING]";
+        std::ostringstream out;
+
+        static const char* pick[] = {"⛏", "⚒", "🔨", "⚒"};
+        static const int pick_colors[] = {214, 220, 226, 220};
+
+        // Mining pick animation
+        int pick_phase = tick % 4;
+        out << "\x1b[38;5;" << pick_colors[pick_phase] << "m" << pick[pick_phase] << " \x1b[0m";
+
+        // Hash stream visualization
+        static const char hex_chars[] = "0123456789abcdef";
+        for (int i = 0; i < width - 3; ++i) {
+            int char_idx = (tick * 3 + i * 7) % 16;
+            int color = (i == 0 && (tick % 8 < 4)) ? 46 : 240;  // Flash green on "find"
+            out << "\x1b[38;5;" << color << "m" << hex_chars[char_idx] << "\x1b[0m";
+        }
+        return out.str();
+    }
+
+    // Pulse ring - expanding ring effect
+    std::string draw_pulse_ring(bool active, int tick) const {
+        if (!u8_ok_) return active ? "(*)" : "( )";
+
+        if (!active) {
+            return "\x1b[38;5;240m○\x1b[0m";
+        }
+
+        static const char* rings[] = {"◉", "◎", "○", "◎"};
+        static const int ring_colors[] = {46, 47, 48, 49};
+
+        int phase = tick % 4;
+        std::ostringstream out;
+        out << "\x1b[38;5;" << ring_colors[phase] << "m" << rings[phase] << "\x1b[0m";
+        return out.str();
+    }
+
+    // Quantum spinner - superposition effect
+    std::string draw_quantum_spinner(int tick) const {
+        if (!u8_ok_) return "[Q]";
+
+        static const char* quantum[] = {"◇", "◆", "◈", "◆", "◇", "✧", "✦", "✧"};
+        static const int quantum_colors[] = {135, 141, 147, 153, 159, 165, 171, 177};
+
+        int phase = tick % 8;
+        std::ostringstream out;
+        out << "\x1b[38;5;" << quantum_colors[phase] << "m" << quantum[phase] << "\x1b[0m";
+        return out.str();
+    }
+
+    // Infinity loop - figure-8 animation
+    std::string draw_infinity_loop(int tick) const {
+        if (!u8_ok_) return "(8)";
+
+        static const char* inf[] = {"∞", "◠◡", "◡◠", "∞", "◟◞", "◞◟"};
+        static const int inf_colors[] = {51, 45, 39, 33, 39, 45};
+
+        int phase = tick % 6;
+        std::ostringstream out;
+        out << "\x1b[38;5;" << inf_colors[phase] << "m" << inf[phase] << "\x1b[0m";
         return out.str();
     }
 
@@ -3685,22 +4260,6 @@ private:
     // ULTIMATE MAIN DASHBOARD - Premium node monitoring with epic visuals
     // =========================================================================
 
-    // Animated fire effect for active mining
-    std::string draw_fire_bar(int width, int tick) const {
-        if (!u8_ok_ || width < 5) return "";
-        std::ostringstream out;
-        static const int fire_colors[] = {196, 202, 208, 214, 220, 226, 227, 228, 229, 230};
-        static const char* fire_chars[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
-
-        for (int i = 0; i < width; ++i) {
-            int phase = (tick * 2 + i * 3) % 16;
-            int height = (phase < 8) ? phase : (16 - phase);
-            int color_idx = (tick + i) % 10;
-            out << "\x1b[38;5;" << fire_colors[color_idx] << "m" << fire_chars[height % 8] << "\x1b[0m";
-        }
-        return out.str();
-    }
-
     // Animated wave effect
     std::string draw_wave(int width, int tick, int color) const {
         if (!u8_ok_ || width < 3) return "";
@@ -3711,46 +4270,6 @@ private:
             int phase = (tick + i) % 14;
             out << "\x1b[38;5;" << color << "m" << wave[phase] << "\x1b[0m";
         }
-        return out.str();
-    }
-
-    // DNA helix animation for blockchain visualization
-    std::string draw_dna_helix(int width, int tick) const {
-        if (!u8_ok_ || width < 10) return "";
-        std::ostringstream out;
-
-        for (int i = 0; i < width; ++i) {
-            double phase = (tick * 0.3 + i * 0.5);
-            double sin_val = std::sin(phase);
-            double cos_val = std::cos(phase);
-
-            if (sin_val > 0.7) {
-                out << "\x1b[38;5;51m●\x1b[0m";
-            } else if (sin_val < -0.7) {
-                out << "\x1b[38;5;201m●\x1b[0m";
-            } else if (cos_val > 0) {
-                out << "\x1b[38;5;240m─\x1b[0m";
-            } else {
-                out << "\x1b[38;5;236m─\x1b[0m";
-            }
-        }
-        return out.str();
-    }
-
-    // Animated activity pulse ring
-    std::string draw_pulse_ring(bool active, int tick) const {
-        if (!u8_ok_) return active ? "[*]" : "[ ]";
-
-        if (!active) {
-            return "\x1b[38;5;240m○\x1b[0m";
-        }
-
-        static const char* rings[] = {"◯", "◎", "◉", "●", "◉", "◎"};
-        static const int colors[] = {46, 47, 48, 49, 48, 47};
-        int frame = tick % 6;
-
-        std::ostringstream out;
-        out << "\x1b[38;5;" << colors[frame] << "m" << rings[frame] << "\x1b[0m";
         return out.str();
     }
 
@@ -4047,7 +4566,7 @@ private:
         return out.str();
     }
 
-    // Epic timestamp display
+    // Epic timestamp display - EXPERT EDITION with glow effects
     std::string draw_timestamp(int tick) const {
         if (!vt_ok_) return "";
 
@@ -4056,15 +4575,41 @@ private:
         std::tm* tm = std::localtime(&time);
 
         std::ostringstream out;
-        out << "\x1b[38;5;240m";
 
-        // Blinking colon
-        out << std::setfill('0') << std::setw(2) << tm->tm_hour;
-        out << ((tick % 2 == 0) ? "\x1b[38;5;252m:\x1b[38;5;240m" : "\x1b[38;5;236m:\x1b[38;5;240m");
-        out << std::setfill('0') << std::setw(2) << tm->tm_min;
-        out << ((tick % 2 == 0) ? "\x1b[38;5;252m:\x1b[38;5;240m" : "\x1b[38;5;236m:\x1b[38;5;240m");
-        out << std::setfill('0') << std::setw(2) << tm->tm_sec;
-        out << "\x1b[0m";
+        if (u8_ok_) {
+            // Expert timestamp with animated clock icon
+            static const char* clock_icons[] = {"🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"};
+            int clock_phase = tm->tm_hour % 12;
+            out << clock_icons[clock_phase] << " ";
+
+            // Animated time digits with glow
+            static const int time_colors[] = {252, 253, 254, 255, 254, 253};
+            int color_phase = tick % 6;
+
+            out << "\x1b[38;5;" << time_colors[color_phase] << "m";
+            out << std::setfill('0') << std::setw(2) << tm->tm_hour;
+
+            // Animated colon with pulse
+            int colon_c = (tick % 2 == 0) ? 231 : 240;
+            out << "\x1b[38;5;" << colon_c << "m:\x1b[0m";
+
+            out << "\x1b[38;5;" << time_colors[(color_phase + 2) % 6] << "m";
+            out << std::setfill('0') << std::setw(2) << tm->tm_min;
+
+            out << "\x1b[38;5;" << colon_c << "m:\x1b[0m";
+
+            out << "\x1b[38;5;" << time_colors[(color_phase + 4) % 6] << "m";
+            out << std::setfill('0') << std::setw(2) << tm->tm_sec;
+            out << "\x1b[0m";
+        } else {
+            out << "\x1b[38;5;240m";
+            out << std::setfill('0') << std::setw(2) << tm->tm_hour;
+            out << ((tick % 2 == 0) ? "\x1b[38;5;252m:\x1b[38;5;240m" : "\x1b[38;5;236m:\x1b[38;5;240m");
+            out << std::setfill('0') << std::setw(2) << tm->tm_min;
+            out << ((tick % 2 == 0) ? "\x1b[38;5;252m:\x1b[38;5;240m" : "\x1b[38;5;236m:\x1b[38;5;240m");
+            out << std::setfill('0') << std::setw(2) << tm->tm_sec;
+            out << "\x1b[0m";
+        }
 
         return out.str();
     }
@@ -4111,13 +4656,16 @@ private:
     // SPLASH SCREEN - ULTRA PROFESSIONAL sync display with premium animations
     // =========================================================================
 
-    // Animated spinner characters (multiple styles) - enhanced with more frames
+    // Animated spinner characters (multiple styles) - EXPERT 16-FRAME ANIMATIONS
     // Uses ASCII for legacy terminals (PowerShell 5, cmd.exe)
     static const char* splash_spinner(int tick, bool u8) {
         if (u8) {
-            // Premium 12-frame braille spinner for ultra-smooth animation
-            static const char* frames[] = {"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷", "⠿", "⡿", "⣟", "⣯"};
-            return frames[tick % 12];
+            // Expert 16-frame braille spinner with smooth rotation pattern
+            static const char* frames[] = {
+                "⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷",
+                "⣿", "⢿", "⡿", "⣟", "⣯", "⣷", "⣾", "⣽"
+            };
+            return frames[tick % 16];
         } else {
             // ASCII spinner that works in all terminals
             static const char* frames[] = {"[|]", "[/]", "[-]", "[\\]"};
