@@ -2627,20 +2627,95 @@ private:
         return std::string(pad, ' ') + text;
     }
 
+    // =========================================================================
+    // ULTRA-PROFESSIONAL MAIN DASHBOARD - Premium node monitoring interface
+    // =========================================================================
+
+    // Create animated panel header with icon
+    std::string panel_header(const std::string& title, const char* icon, int width) const {
+        if (!vt_ok_) return "[ " + title + " ]";
+
+        std::string out;
+        // Animated glow on panel headers
+        int glow = (tick_ % 8 < 4) ? 255 : 250;
+
+        out += "\x1b[38;5;" + std::to_string(glow) + "m\x1b[1m";
+        if (u8_ok_ && icon) out += std::string(icon) + " ";
+        out += title;
+        out += "\x1b[0m";
+
+        return out;
+    }
+
+    // Create styled metric line with label and value
+    std::string metric_line(const std::string& label, const std::string& value, int color = 0) const {
+        std::ostringstream out;
+        out << "  ";
+        if (vt_ok_) {
+            out << "\x1b[38;5;245m" << label << "\x1b[0m ";
+            if (color > 0) out << "\x1b[38;5;" << color << "m";
+            out << value;
+            if (color > 0) out << "\x1b[0m";
+        } else {
+            out << label << " " << value;
+        }
+        return out.str();
+    }
+
+    // Create animated activity indicator
+    std::string activity_dot(bool active) const {
+        if (!vt_ok_) return active ? "[*]" : "[ ]";
+        if (!active) return "\x1b[38;5;240m○\x1b[0m";
+
+        // Pulsing dot animation
+        static const int pulse_colors[] = {46, 47, 48, 49, 48, 47};
+        int c = pulse_colors[tick_ % 6];
+        return "\x1b[38;5;" + std::to_string(c) + "m●\x1b[0m";
+    }
+
+    // Create mini sparkline bar
+    std::string mini_bar(double frac, int width) const {
+        if (width < 3) width = 3;
+        if (frac < 0) frac = 0;
+        if (frac > 1) frac = 1;
+
+        int filled = (int)(frac * width);
+        std::string out;
+
+        if (vt_ok_ && u8_ok_) {
+            out += "\x1b[38;5;240m[\x1b[0m";
+            for (int i = 0; i < width; ++i) {
+                if (i < filled) {
+                    // Color gradient
+                    int c = 46 + (i * 5 / width);
+                    out += "\x1b[38;5;" + std::to_string(c) + "m█\x1b[0m";
+                } else {
+                    out += "\x1b[38;5;236m░\x1b[0m";
+                }
+            }
+            out += "\x1b[38;5;240m]\x1b[0m";
+        } else {
+            out += "[";
+            for (int i = 0; i < width; ++i) {
+                out += (i < filled) ? "#" : ".";
+            }
+            out += "]";
+        }
+        return out;
+    }
+
     void draw_once(bool first){
-        (void)first;  // Reserved for future first-draw optimization
+        (void)first;
         std::lock_guard<std::mutex> lk(mu_);
         int cols, rows; term::get_winsize(cols, rows);
 
-        // BULLETPROOF FIX: Enforce minimum dimensions for single-layout rendering
-        // This ensures the TUI fits in one screen without scrolling
-        if (cols < 114) cols = 114;
-        if (rows < 34) rows = 34;
+        // Enforce minimum dimensions
+        if (cols < 120) cols = 120;
+        if (rows < 36) rows = 36;
 
-        // Check if sync is complete to transition from Splash to Main
+        // Check sync transition
         bool sync_complete = ibd_done_ || (ibd_target_ > 0 && ibd_cur_ >= ibd_target_);
         if (sync_complete && view_mode_ == ViewMode::Splash) {
-            // Delay transition slightly to show "100%" message
             if (!splash_transition_done_) {
                 splash_transition_done_ = true;
             } else {
@@ -2648,555 +2723,614 @@ private:
             }
         }
 
-        // Draw splash screen during sync, main dashboard after sync
         if (view_mode_ == ViewMode::Splash && !sync_complete) {
             draw_splash(cols, rows);
             return;
         }
 
-        // Calculate layout dimensions - ensure right column fits
-        const int rightw = std::max(50, cols / 3);
+        // Layout
+        const int rightw = std::max(52, cols / 3);
         const int leftw  = cols - rightw - 3;
 
         std::vector<std::string> left, right;
+        std::ostringstream out;
 
-        // Header bar - Professional branding
+        // ═══════════════════════════════════════════════════════════════════════
+        // EPIC HEADER - Animated branding bar
+        // ═══════════════════════════════════════════════════════════════════════
         {
-            std::ostringstream h;
-            std::string bullet = u8_ok_ ? " • " : " | ";
+            std::string header_line;
 
-            // Main title with version
-            h << C_head() << "MIQROCHAIN" << C_reset()
-              << "  " << C_dim()
-              << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
-              << C_reset()
-              << "  " << spinner(tick_, u8_ok_);
-            left.push_back(h.str());
+            if (vt_ok_ && u8_ok_) {
+                // Animated gradient border
+                header_line += "\x1b[38;5;27m╔";
+                for (int i = 0; i < cols - 2; ++i) {
+                    int pulse = (tick_ + i) % 16;
+                    int c = (pulse < 8) ? 27 + pulse : 35 - (pulse - 8);
+                    header_line += "\x1b[38;5;" + std::to_string(c) + "m═";
+                }
+                header_line += "\x1b[38;5;27m╗\x1b[0m";
+                out << header_line << "\n";
 
-            // Network info line
-            std::ostringstream n;
-            n << "  " << C_dim() << "Chain: " << C_reset() << CHAIN_NAME
-              << C_dim() << bullet << "P2P: " << C_reset() << p2p_port_
-              << C_dim() << bullet << "RPC: " << C_reset() << rpc_port_;
+                // Logo line
+                out << "\x1b[38;5;27m║\x1b[0m ";
 
-            // Show Stratum port if enabled
-            if (auto* ss = g_stratum_server.load()) {
-                n << C_dim() << bullet << "Pool: " << C_reset() << ss->get_port();
+                // Animated MIQROCHAIN text
+                static const int logo_colors[] = {51, 50, 49, 48, 47, 46, 47, 48, 49, 50};
+                int lc = logo_colors[tick_ % 10];
+                out << "\x1b[38;5;" << lc << "m\x1b[1m◆ MIQROCHAIN\x1b[0m";
+
+                // Version
+                out << "  \x1b[38;5;240mv" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH << "\x1b[0m";
+
+                // Separator
+                out << "  \x1b[38;5;240m│\x1b[0m  ";
+
+                // Chain name
+                out << "\x1b[38;5;75m" << CHAIN_NAME << "\x1b[0m";
+
+                // Separator
+                out << "  \x1b[38;5;240m│\x1b[0m  ";
+
+                // Animated spinner
+                out << "\x1b[38;5;214m" << splash_spinner(tick_, true) << "\x1b[0m";
+
+                // Separator
+                out << "  \x1b[38;5;240m│\x1b[0m  ";
+
+                // Node state with animation
+                NodeState show_state = degraded_override_ ? NodeState::Degraded : nstate_;
+                switch(show_state) {
+                    case NodeState::Starting:
+                        out << "\x1b[38;5;214m● STARTING\x1b[0m";
+                        break;
+                    case NodeState::Syncing:
+                        out << "\x1b[38;5;214m● SYNCING\x1b[0m";
+                        break;
+                    case NodeState::Running:
+                        out << "\x1b[38;5;46m● RUNNING\x1b[0m";
+                        break;
+                    case NodeState::Degraded:
+                        out << "\x1b[38;5;196m● DEGRADED\x1b[0m";
+                        break;
+                    case NodeState::Quitting:
+                        out << "\x1b[38;5;214m● SHUTDOWN\x1b[0m";
+                        break;
+                }
+
+                // Miner badge if active
+                if (miner_running_badge()) {
+                    out << "  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;46m\x1b[1m⛏ MINING\x1b[0m";
+                }
+
+                // Padding to right edge
+                // (simplified - just add spacing)
+                out << std::string(20, ' ');
+                out << "\x1b[38;5;27m║\x1b[0m\n";
+
+                // Bottom border of header
+                out << "\x1b[38;5;27m╠";
+                for (int i = 0; i < leftw - 1; ++i) out << "═";
+                out << "╦";
+                for (int i = 0; i < rightw; ++i) out << "═";
+                out << "╣\x1b[0m\n";
+
+            } else {
+                // ASCII fallback
+                out << "+" << std::string(cols - 2, '=') << "+\n";
+                out << "| MIQROCHAIN v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH;
+                out << " | " << CHAIN_NAME << " | " << spinner(tick_, false);
+                out << std::string(40, ' ') << "|\n";
+                out << "+" << std::string(leftw - 1, '=') << "+" << std::string(rightw, '=') << "+\n";
             }
-            left.push_back(n.str());
-
-            left.push_back("");
-
-            // Status messages
-            if(!banner_.empty()){
-                left.push_back(std::string("  ") + C_info() + banner_ + C_reset());
-            }
-            if (!hot_message_.empty() && (now_ms() - hot_msg_ts_) < 4000){
-                left.push_back(std::string("  ") + C_warn() + hot_message_ + C_reset());
-            }
-
-            // Help hint for new users
-            if (uptime_s_ < 30 && nstate_ == NodeState::Starting) {
-                left.push_back(std::string("  ") + C_dim() + "Press 'q' to quit" + bullet + "'t' toggle theme" + bullet + "'v' verbose mode" + C_reset());
-            }
-
-            left.push_back(std::string("  ") + straight_line(leftw-2));
-            left.push_back("");
         }
 
-        // System panel - Enhanced with professional formatting
+        // ═══════════════════════════════════════════════════════════════════════
+        // LEFT COLUMN - System, Node, Blockchain
+        // ═══════════════════════════════════════════════════════════════════════
+
+        // System Panel
         {
-            left.push_back(std::string(C_bold()) + "System" + C_reset());
-            uptime_s_ = (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_tp_).count();
+            left.push_back(panel_header("SYSTEM", "⚙", leftw));
+
+            uptime_s_ = (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start_tp_).count();
             uint64_t rss = get_rss_bytes();
 
-            // Uptime with human-readable format
             std::ostringstream ln1;
-            ln1 << "  Uptime: " << C_info() << fmt_uptime(uptime_s_) << C_reset()
-                << "   Memory: " << fmt_bytes(rss)
-                << "   Threads: " << std::thread::hardware_concurrency();
+            if (vt_ok_) {
+                ln1 << "  \x1b[38;5;245mUptime\x1b[0m    \x1b[38;5;87m" << fmt_uptime(uptime_s_) << "\x1b[0m";
+                ln1 << "  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;245mMemory\x1b[0m  \x1b[38;5;183m" << fmt_bytes(rss) << "\x1b[0m";
+            } else {
+                ln1 << "  Uptime: " << fmt_uptime(uptime_s_) << "  Memory: " << fmt_bytes(rss);
+            }
             left.push_back(ln1.str());
 
-            // Platform and version info
             std::ostringstream ln2;
-            ln2 << "  Platform: "
+            if (vt_ok_) {
+                ln2 << "  \x1b[38;5;245mPlatform\x1b[0m  \x1b[38;5;252m";
 #ifdef _WIN32
-                << "Windows"
+                ln2 << "Windows";
 #elif defined(__APPLE__)
-                << "macOS"
+                ln2 << "macOS";
 #else
-                << "Linux"
+                ln2 << "Linux";
 #endif
-                << "   Theme: " << (dark_theme_ ? "dark" : "light")
-                << "   Verbose: " << (global::tui_verbose.load() ? C_ok() + std::string("yes") + C_reset() : C_dim() + std::string("no") + C_reset());
+                ln2 << "\x1b[0m  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;245mCPUs\x1b[0m  \x1b[38;5;252m";
+                ln2 << std::thread::hardware_concurrency() << "\x1b[0m";
+            } else {
+                ln2 << "  Platform: Linux  CPUs: " << std::thread::hardware_concurrency();
+            }
             left.push_back(ln2.str());
-
-            // Controls hint
-            left.push_back(std::string("  ") + C_dim() + "[q]uit [t]heme [p]ause [s]nap [v]erbose [r]eload" + C_reset());
             left.push_back("");
         }
 
-        // Node state panel
+        // Network Ports Panel
         {
-            std::ostringstream s;
-            s << C_bold() << "Node" << C_reset() << "   State: ";
-            NodeState show_state = nstate_;
-            if (degraded_override_) show_state = NodeState::Degraded;
-            switch(show_state){
-                case NodeState::Starting: s << C_warn() << "starting" << C_reset(); break;
-                case NodeState::Syncing:  s << C_warn() << "syncing"  << C_reset(); break;
-                case NodeState::Running:  s << C_ok()   << "running"  << C_reset(); break;
-                case NodeState::Degraded: s << C_err()  << "degraded" << C_reset(); break;
-                case NodeState::Quitting: s << C_warn() << "shutting down" << C_reset(); break;
+            left.push_back(panel_header("NETWORK PORTS", "🌐", leftw));
+
+            std::ostringstream ports;
+            if (vt_ok_) {
+                ports << "  \x1b[38;5;245mP2P\x1b[0m \x1b[38;5;46m" << p2p_port_ << "\x1b[0m";
+                ports << "  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;245mRPC\x1b[0m \x1b[38;5;87m" << rpc_port_ << "\x1b[0m";
+                if (auto* ss = g_stratum_server.load()) {
+                    ports << "  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;245mStratum\x1b[0m \x1b[38;5;214m" << ss->get_port() << "\x1b[0m";
+                }
+            } else {
+                ports << "  P2P: " << p2p_port_ << "  RPC: " << rpc_port_;
             }
-            if (miner_running_badge()){
-                s << "   " << C_bold() << (u8_ok_ ? (std::string(C_ok()) + "⛏ RUNNING" + C_reset())
-                                                  : (std::string(C_ok()) + "MINER" + C_reset()));
-            }
-            left.push_back(s.str());
+            left.push_back(ports.str());
             left.push_back("");
         }
 
-        // Startup progress
+        // Sync Status Panel
         {
-            left.push_back(std::string(C_bold()) + "Startup" + C_reset());
-            size_t total = steps_.size(), okc = 0;
-            for (auto& s : steps_) if (s.second) ++okc;
-            int bw = std::max(10, leftw - 20);
-            double frac = (double)okc / std::max<size_t>(1,total);
-            std::ostringstream progress;
-            progress << "  " << bar(bw, frac, vt_ok_, u8_ok_) << "  "
-                     << okc << "/" << total << " completed";
-            if (eta_secs_ > 0 && frac < 0.999){
-                progress << "  " << C_dim() << "(~" << std::fixed << std::setprecision(1) << eta_secs_ << "s)" << C_reset();
-            }
-            left.push_back(progress.str());
-            for (auto& s : steps_) {
-                bool ok = s.second;
-                bool failed = failures_.count(s.first) > 0;
-                std::ostringstream ln;
-                ln << "    ";
-                if (ok)         ln << C_ok()  << "[OK]    " << C_reset();
-                else if (failed)ln << C_err() << "[FAIL]  " << C_reset();
-                else            ln << C_dim() << "[..]    " << C_reset();
-                ln << s.first;
-                left.push_back(ln.str());
-            }
-            left.push_back("");
-        }
-
-        // =============================================================
-        // Sync Status - Simple one-line indicator (full sync on splash)
-        // =============================================================
-        {
-            // Only show a simple sync status line on main screen
-            // The detailed sync progress with progress bar is shown on splash screen
-            std::ostringstream sync_line;
-            sync_line << C_bold() << "Sync Status" << C_reset() << "   ";
-
             uint64_t network_height = sync_network_height_ > 0 ? sync_network_height_ : ibd_target_;
             uint64_t current_height = ibd_cur_;
             bool is_synced = ibd_done_ || (network_height > 0 && current_height >= network_height);
 
-            if (is_synced) {
-                // Fully synced - show green status
-                std::string check = u8_ok_ ? "✓ " : "[OK] ";
-                sync_line << C_ok() << check << "Synchronized" << C_reset();
-            } else if (network_height > 0) {
-                // Show brief progress without the full panel
-                double sync_pct = (double)current_height / (double)network_height * 100.0;
-                std::string spinner_char = u8_ok_ ? "◌" : "*";
-                sync_line << C_warn() << spinner_char << " " << std::fixed << std::setprecision(1) << sync_pct << "%" << C_reset();
-                sync_line << C_dim() << " (" << fmt_num(current_height) << "/" << fmt_num(network_height) << ")" << C_reset();
-            } else {
-                // Waiting for network info
-                sync_line << C_dim() << "Initializing..." << C_reset();
-            }
+            left.push_back(panel_header("SYNC STATUS", "⚡", leftw));
 
-            left.push_back(sync_line.str());
+            std::ostringstream sync;
+            if (vt_ok_) {
+                if (is_synced) {
+                    sync << "  \x1b[38;5;46m\x1b[1m✓ SYNCHRONIZED\x1b[0m";
+                    sync << "  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;252m" << fmt_num(current_height) << " blocks\x1b[0m";
+                } else if (network_height > 0) {
+                    double pct = (double)current_height / (double)network_height * 100.0;
+                    sync << "  " << activity_dot(true) << " \x1b[38;5;214m";
+                    sync << std::fixed << std::setprecision(1) << pct << "%\x1b[0m";
+                    sync << "  " << mini_bar(pct / 100.0, 20);
+                    sync << "  \x1b[38;5;240m" << fmt_num(current_height) << "/" << fmt_num(network_height) << "\x1b[0m";
+                } else {
+                    sync << "  \x1b[38;5;240m◌ Initializing...\x1b[0m";
+                }
+            } else {
+                sync << "  " << (is_synced ? "[OK] Synced" : "Syncing...");
+            }
+            left.push_back(sync.str());
             left.push_back("");
         }
 
-        // Chain status - Enhanced with better formatting
+        // Blockchain Panel
         {
-            left.push_back(std::string(C_bold()) + "Blockchain" + C_reset());
+            left.push_back(panel_header("BLOCKCHAIN", "⛓", leftw));
+
             uint64_t height = chain_ ? chain_->height() : 0;
             std::string tip_hex;
             long double tip_diff = 0.0L;
             uint64_t tip_age_s = 0;
-            uint64_t tip_timestamp = 0;
+
             if (chain_) {
                 auto t = chain_->tip();
                 tip_hex = to_hex(t.hash);
                 tip_diff = difficulty_from_bits(hdr_bits(t));
-                tip_timestamp = hdr_time(t);
-                if (tip_timestamp) {
+                uint64_t tip_ts = hdr_time(t);
+                if (tip_ts) {
                     uint64_t now = (uint64_t)std::time(nullptr);
-                    tip_age_s = (now > tip_timestamp) ? (now - tip_timestamp) : 0;
+                    tip_age_s = (now > tip_ts) ? (now - tip_ts) : 0;
                 }
             }
 
-            // Height with formatted number
-            std::ostringstream c1;
-            c1 << "  Height: " << C_info() << fmt_num(height) << C_reset()
-               << "   Tip: " << short_hex(tip_hex, 14);
-            left.push_back(c1.str());
-
-            // Tip age with human-readable format
-            std::ostringstream c2;
-            c2 << "  Tip Age: ";
-            if (tip_age_s < 120) {
-                c2 << C_ok() << fmt_uptime(tip_age_s) << C_reset();
-            } else if (tip_age_s < 600) {
-                c2 << C_warn() << fmt_uptime(tip_age_s) << C_reset();
+            // Height row
+            std::ostringstream h1;
+            if (vt_ok_) {
+                h1 << "  \x1b[38;5;245mHeight\x1b[0m       \x1b[38;5;51m\x1b[1m" << fmt_num(height) << "\x1b[0m";
             } else {
-                c2 << C_err() << fmt_uptime(tip_age_s) << C_reset();
+                h1 << "  Height: " << fmt_num(height);
             }
-            c2 << "   Difficulty: " << fmt_diff(tip_diff);
-            left.push_back(c2.str());
+            left.push_back(h1.str());
 
-            // Network hashrate and trend
-            left.push_back(std::string("  Network Hashrate: ") + C_info() + fmt_hs(net_hashrate_) + C_reset());
-            left.push_back(std::string("  Hashrate Trend:   ") + spark_ascii(net_spark_));
-
-            // Recent blocks header
-            size_t N = recent_blocks_.size();
-            if (N > 0) {
-                left.push_back(std::string("  ") + C_dim() + "Recent Blocks:" + C_reset());
-                size_t show = std::min<size_t>(6, N);
-                for (size_t i=0;i<show;i++){
-                    const auto& b = recent_blocks_[N-1-i];
-                    std::ostringstream ln;
-                    ln << "    " << C_dim() << "#" << C_reset() << b.height
-                       << "  " << short_hex(b.hash_hex.empty() ? std::string("?") : b.hash_hex, 10)
-                       << "  " << (b.tx_count ? std::to_string(b.tx_count) : std::string("?")) << " txs";
-                    if (b.fees_known) ln << "  " << b.fees << " fees";
-                    if (!b.miner.empty()) {
-                        // Shorten miner address for display
-                        std::string short_miner = b.miner;
-                        if (short_miner.size() > 12) {
-                            short_miner = short_miner.substr(0, 6) + "..." + short_miner.substr(short_miner.size() - 4);
-                        }
-                        ln << "  " << C_dim() << short_miner << C_reset();
-                    }
-                    left.push_back(ln.str());
-                }
+            // Tip hash row
+            std::ostringstream h2;
+            if (vt_ok_) {
+                h2 << "  \x1b[38;5;245mTip\x1b[0m          \x1b[38;5;240m" << short_hex(tip_hex, 18) << "\x1b[0m";
             } else {
-                left.push_back(std::string("  ") + C_dim() + "(awaiting first block)" + C_reset());
+                h2 << "  Tip: " << short_hex(tip_hex, 18);
+            }
+            left.push_back(h2.str());
+
+            // Tip age row
+            std::ostringstream h3;
+            if (vt_ok_) {
+                h3 << "  \x1b[38;5;245mTip Age\x1b[0m      ";
+                if (tip_age_s < 120) h3 << "\x1b[38;5;46m";
+                else if (tip_age_s < 600) h3 << "\x1b[38;5;214m";
+                else h3 << "\x1b[38;5;196m";
+                h3 << fmt_uptime(tip_age_s) << "\x1b[0m";
+            } else {
+                h3 << "  Tip Age: " << fmt_uptime(tip_age_s);
+            }
+            left.push_back(h3.str());
+
+            // Difficulty row
+            std::ostringstream h4;
+            if (vt_ok_) {
+                h4 << "  \x1b[38;5;245mDifficulty\x1b[0m   \x1b[38;5;183m" << fmt_diff(tip_diff) << "\x1b[0m";
+            } else {
+                h4 << "  Difficulty: " << fmt_diff(tip_diff);
+            }
+            left.push_back(h4.str());
+
+            // Network hashrate
+            std::ostringstream h5;
+            if (vt_ok_) {
+                h5 << "  \x1b[38;5;245mNet Hashrate\x1b[0m \x1b[38;5;87m" << fmt_hs(net_hashrate_) << "\x1b[0m";
+            } else {
+                h5 << "  Net Hashrate: " << fmt_hs(net_hashrate_);
+            }
+            left.push_back(h5.str());
+
+            // Sparkline
+            if (vt_ok_) {
+                left.push_back(std::string("  \x1b[38;5;245mTrend\x1b[0m        \x1b[38;5;39m") + spark_ascii(net_spark_) + "\x1b[0m");
+            } else {
+                left.push_back(std::string("  Trend: ") + spark_ascii(net_spark_));
             }
             left.push_back("");
         }
 
-        // Right column: Network/Mempool/Miner/Health/Logs
-        if (p2p_) {
-            right.push_back(std::string(C_bold()) + "Network Peers" + C_reset());
-            auto peers = p2p_->snapshot_peers();
+        // Recent Blocks Panel
+        {
+            left.push_back(panel_header("RECENT BLOCKS", "◆", leftw));
 
-            std::stable_sort(peers.begin(), peers.end(), [](const auto& a, const auto& b){
-                if (a.verack_ok != b.verack_ok) return a.verack_ok > b.verack_ok;
-                if (a.last_seen_ms != b.last_seen_ms) return a.last_seen_ms < b.last_seen_ms;
-                if (a.rx_buf != b.rx_buf) return a.rx_buf < b.rx_buf;
-                return a.inflight < b.inflight;
-            });
-
-            size_t peers_n = peers.size();
-            size_t inflight_tx = 0, rxbuf_sum = 0, awaiting_pongs = 0, verack_ok = 0;
-            for (auto& s : peers) {
-                inflight_tx += (size_t)s.inflight;
-                rxbuf_sum += (size_t)s.rx_buf;
-                if (s.awaiting_pong) ++awaiting_pongs;
-                if (s.verack_ok) ++verack_ok;
-            }
-
-            // Summary line with color coding for peer count
-            std::ostringstream sum;
-            sum << "  Connected: ";
-            if (peers_n == 0) {
-                sum << C_err() << "0" << C_reset();
-            } else if (peers_n < 3) {
-                sum << C_warn() << peers_n << C_reset();
+            size_t N = recent_blocks_.size();
+            if (N > 0) {
+                size_t show = std::min<size_t>(4, N);
+                for (size_t i = 0; i < show; i++) {
+                    const auto& b = recent_blocks_[N - 1 - i];
+                    std::ostringstream ln;
+                    if (vt_ok_) {
+                        ln << "  \x1b[38;5;240m#\x1b[38;5;87m" << b.height << "\x1b[0m";
+                        ln << " \x1b[38;5;240m" << short_hex(b.hash_hex.empty() ? "?" : b.hash_hex, 8) << "\x1b[0m";
+                        ln << " \x1b[38;5;252m" << (b.tx_count ? std::to_string(b.tx_count) : "?") << "tx\x1b[0m";
+                    } else {
+                        ln << "  #" << b.height << " " << short_hex(b.hash_hex, 8) << " " << b.tx_count << "tx";
+                    }
+                    left.push_back(ln.str());
+                }
             } else {
-                sum << C_ok() << peers_n << C_reset();
+                left.push_back(vt_ok_ ? "  \x1b[38;5;240m(awaiting blocks)\x1b[0m" : "  (awaiting blocks)");
             }
-            sum << "   Active: " << verack_ok
-                << "   In-flight: " << inflight_tx;
-            right.push_back(sum.str());
+            left.push_back("");
+        }
 
-            // Buffer status
-            right.push_back(std::string("  RX Buffer: ") + fmt_bytes(rxbuf_sum)
-                          + "   Pings: " + std::to_string(awaiting_pongs));
+        // ═══════════════════════════════════════════════════════════════════════
+        // RIGHT COLUMN - Peers, Mining, Mempool
+        // ═══════════════════════════════════════════════════════════════════════
 
-            // Peer table
+        // Network Peers Panel
+        if (p2p_) {
+            right.push_back(panel_header("NETWORK PEERS", "📡", rightw));
+
+            auto peers = p2p_->snapshot_peers();
+            size_t peers_n = peers.size();
+            size_t verack_ok = 0;
+            for (const auto& s : peers) if (s.verack_ok) ++verack_ok;
+
+            std::ostringstream psum;
+            if (vt_ok_) {
+                psum << "  \x1b[38;5;245mConnected\x1b[0m ";
+                if (peers_n == 0) psum << "\x1b[38;5;196m";
+                else if (peers_n < 3) psum << "\x1b[38;5;214m";
+                else psum << "\x1b[38;5;46m";
+                psum << peers_n << "\x1b[0m";
+                psum << "  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;245mActive\x1b[0m \x1b[38;5;46m" << verack_ok << "\x1b[0m";
+            } else {
+                psum << "  Connected: " << peers_n << "  Active: " << verack_ok;
+            }
+            right.push_back(psum.str());
+
+            // Peer list (compact)
             if (peers_n > 0) {
-                right.push_back(std::string("  ") + C_dim() + "Peer List:" + C_reset());
-                size_t showN = std::min(peers.size(), (size_t)6);
-                for (size_t i=0;i<showN; ++i) {
+                std::stable_sort(peers.begin(), peers.end(), [](const auto& a, const auto& b){
+                    return a.verack_ok > b.verack_ok;
+                });
+                size_t showN = std::min(peers.size(), (size_t)4);
+                for (size_t i = 0; i < showN; ++i) {
                     const auto& s = peers[i];
                     std::string ip = s.ip;
-                    if ((int)ip.size() > 16) ip = ip.substr(0,13) + "...";
+                    if (ip.size() > 15) ip = ip.substr(0, 12) + "...";
                     std::ostringstream ln;
-                    ln << "    " << std::left << std::setw(16) << ip << " ";
-                    if (s.verack_ok) {
-                        ln << C_ok() << "OK" << C_reset();
+                    if (vt_ok_) {
+                        ln << "  " << (s.verack_ok ? "\x1b[38;5;46m●\x1b[0m" : "\x1b[38;5;240m○\x1b[0m");
+                        ln << " \x1b[38;5;252m" << std::left << std::setw(15) << ip << "\x1b[0m";
                     } else {
-                        ln << C_warn() << ".." << C_reset();
-                    }
-                    ln << " rx:" << (uint64_t)s.rx_buf;
-                    if (s.inflight > 0) {
-                        ln << " (" << s.inflight << " pending)";
+                        ln << "  " << (s.verack_ok ? "[*]" : "[ ]") << " " << ip;
                     }
                     right.push_back(ln.str());
                 }
                 if (peers.size() > showN) {
-                    right.push_back(std::string("    ") + C_dim() + "+ " + std::to_string(peers.size()-showN) + " more peers" + C_reset());
+                    right.push_back(vt_ok_ ?
+                        "  \x1b[38;5;240m+ " + std::to_string(peers.size() - showN) + " more\x1b[0m" :
+                        "  + " + std::to_string(peers.size() - showN) + " more");
                 }
-            } else {
-                right.push_back(std::string("  ") + C_dim() + "(no peers connected)" + C_reset());
             }
             right.push_back("");
         }
 
-        if (mempool_) {
-            right.push_back(std::string(C_bold()) + "Mempool" + C_reset());
-            auto stat = mempool_view_fallback(mempool_);
-            right.push_back(std::string("  txs: ") + std::to_string(stat.count)
-                            + (stat.bytes? (std::string("   bytes: ") + fmt_bytes(stat.bytes)) : std::string())
-                            + (stat.recent_adds? (std::string("   recent_adds: ") + std::to_string(stat.recent_adds)) : std::string()));
-            right.push_back("");
-        }
-
-        // Mining panel - Enhanced with better formatting
+        // Mining Panel
         {
-            right.push_back(std::string(C_bold()) + "Local Mining" + C_reset());
-            bool active = g_miner_stats.active.load();
-            unsigned thr = g_miner_stats.threads.load();
-            uint64_t ok  = g_miner_stats.accepted.load();
-            uint64_t rej = g_miner_stats.rejected.load();
-            double   hps = g_miner_stats.hps.load();
-            uint64_t miner_uptime = 0;
-            if (active) {
-                miner_uptime = (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::steady_clock::now() - g_miner_stats.start).count();
-            }
+            right.push_back(panel_header("MINING", "⛏", rightw));
 
-            // Mining availability status
-            std::ostringstream m0;
-            m0 << "  Status: ";
-            if (mining_gate_available_) {
-                if (active) {
-                    m0 << C_ok() << "MINING" << C_reset() << " (" << thr << " threads)";
+            bool active = g_miner_stats.active.load();
+            double hps = g_miner_stats.hps.load();
+            uint64_t blocks_mined = g_miner_stats.accepted.load();
+
+            std::ostringstream m1;
+            if (vt_ok_) {
+                m1 << "  \x1b[38;5;245mStatus\x1b[0m   ";
+                if (mining_gate_available_) {
+                    if (active) {
+                        m1 << "\x1b[38;5;46m\x1b[1m● ACTIVE\x1b[0m";
+                        m1 << " \x1b[38;5;240m(" << g_miner_stats.threads.load() << " threads)\x1b[0m";
+                    } else {
+                        m1 << "\x1b[38;5;46m○ Available\x1b[0m";
+                    }
                 } else {
-                    m0 << C_ok() << "available" << C_reset();
+                    m1 << "\x1b[38;5;214m○ Unavailable\x1b[0m";
                 }
             } else {
-                m0 << C_warn() << "unavailable" << C_reset();
-                if (!mining_gate_reason_.empty()) {
-                    std::string reason = mining_gate_reason_;
-                    if (reason.size() > 30) reason = reason.substr(0, 27) + "...";
-                    m0 << " - " << reason;
+                m1 << "  Status: " << (active ? "ACTIVE" : (mining_gate_available_ ? "Available" : "Unavailable"));
+            }
+            right.push_back(m1.str());
+
+            if (active || blocks_mined > 0) {
+                // Hashrate
+                std::ostringstream m2;
+                if (vt_ok_) {
+                    m2 << "  \x1b[38;5;245mHashrate\x1b[0m \x1b[38;5;87m" << fmt_hs(hps) << "\x1b[0m";
+                } else {
+                    m2 << "  Hashrate: " << fmt_hs(hps);
                 }
-            }
-            right.push_back(m0.str());
+                right.push_back(m2.str());
 
-            // External miner detection
-            if (std::getenv("MIQ_MINER_HEARTBEAT")) {
-                std::ostringstream ext;
-                ext << "  External: " << (g_extminer.alive.load() ?
-                    (std::string(C_ok()) + "detected" + C_reset()) :
-                    (std::string(C_dim()) + "not detected" + C_reset()));
-                right.push_back(ext.str());
-            }
-
-            // Mining address (shortened for display)
-            if (!g_miner_address_b58.empty()) {
-                std::string addr = g_miner_address_b58;
-                if (addr.size() > 24) {
-                    addr = addr.substr(0, 8) + "..." + addr.substr(addr.size() - 8);
+                // Sparkline
+                if (vt_ok_) {
+                    right.push_back(std::string("  \x1b[38;5;245mTrend\x1b[0m    \x1b[38;5;214m") + spark_ascii(spark_hs_) + "\x1b[0m");
                 }
-                right.push_back(std::string("  Reward To: ") + C_info() + addr + C_reset());
-            }
-
-            // Performance metrics
-            if (active || ok > 0 || rej > 0) {
-                // Hashrate with trend
-                right.push_back(std::string("  Hashrate: ") + C_info() + fmt_hs(hps) + C_reset());
-                right.push_back(std::string("  Trend:    ") + spark_ascii(spark_hs_));
 
                 // Blocks mined
-                std::ostringstream blocks;
-                blocks << "  Blocks: " << C_ok() << ok << " mined" << C_reset();
-                if (rej > 0) {
-                    blocks << ", " << C_err() << rej << " rejected" << C_reset();
+                std::ostringstream m3;
+                if (vt_ok_) {
+                    m3 << "  \x1b[38;5;245mBlocks\x1b[0m   \x1b[38;5;46m" << blocks_mined << " mined\x1b[0m";
+                } else {
+                    m3 << "  Blocks: " << blocks_mined << " mined";
                 }
-                right.push_back(blocks.str());
-
-                // Uptime
-                if (active) {
-                    right.push_back(std::string("  Uptime: ") + fmt_uptime(miner_uptime));
-                }
-
-                // Network share
-                double share = (net_hashrate_ > 0.0) ? (hps / net_hashrate_) * 100.0 : 0.0;
-                if (share < 0.0) share = 0.0;
-                if (share > 100.0) share = 100.0;
-                std::ostringstream sh;
-                sh << "  Network Share: " << std::fixed << std::setprecision(2) << share << "%";
-                right.push_back(sh.str());
+                right.push_back(m3.str());
             }
-
-            // Miners observed
-            size_t miners_obs = distinct_miners_recent(64);
-            if (miners_obs > 0) {
-                right.push_back(std::string("  Active Miners: ") + std::to_string(miners_obs) + " (last 64 blocks)");
-            }
-
             right.push_back("");
         }
 
-        // Pool Statistics panel (if Stratum server is running) - Enhanced
+        // Mempool Panel
+        if (mempool_) {
+            right.push_back(panel_header("MEMPOOL", "📋", rightw));
+
+            auto stat = mempool_view_fallback(mempool_);
+            std::ostringstream mp;
+            if (vt_ok_) {
+                mp << "  \x1b[38;5;245mTransactions\x1b[0m \x1b[38;5;51m" << stat.count << "\x1b[0m";
+                if (stat.bytes) {
+                    mp << "  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;245mSize\x1b[0m \x1b[38;5;183m" << fmt_bytes(stat.bytes) << "\x1b[0m";
+                }
+            } else {
+                mp << "  Transactions: " << stat.count;
+            }
+            right.push_back(mp.str());
+            right.push_back("");
+        }
+
+        // Pool Server Panel (if active)
         if (auto* ss = g_stratum_server.load()) {
-            right.push_back(std::string(C_bold()) + "Pool Server (Stratum)" + C_reset());
+            right.push_back(panel_header("POOL SERVER", "🏊", rightw));
+
             auto stats = ss->get_stats();
-
-            // Connection status
-            std::ostringstream p1;
-            p1 << "  Port: " << C_info() << ss->get_port() << C_reset()
-               << "   Miners: ";
-            if (stats.connected_miners == 0) {
-                p1 << C_dim() << "0" << C_reset();
+            std::ostringstream ps;
+            if (vt_ok_) {
+                ps << "  \x1b[38;5;245mMiners\x1b[0m ";
+                if (stats.connected_miners > 0) ps << "\x1b[38;5;46m";
+                else ps << "\x1b[38;5;240m";
+                ps << stats.connected_miners << "\x1b[0m";
+                ps << "  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;245mHashrate\x1b[0m \x1b[38;5;87m" << fmt_hs(stats.pool_hashrate) << "\x1b[0m";
             } else {
-                p1 << C_ok() << stats.connected_miners << C_reset();
+                ps << "  Miners: " << stats.connected_miners << "  Hashrate: " << fmt_hs(stats.pool_hashrate);
             }
-            right.push_back(p1.str());
+            right.push_back(ps.str());
 
-            // Pool performance
-            right.push_back(std::string("  Pool Hashrate: ") + C_info() + fmt_hs(stats.pool_hashrate) + C_reset());
-
-            // Shares
-            std::ostringstream p2;
-            p2 << "  Shares: " << C_ok() << stats.accepted_shares << " accepted" << C_reset();
-            if (stats.rejected_shares > 0) {
-                p2 << ", " << C_err() << stats.rejected_shares << " rejected" << C_reset();
-            }
-            right.push_back(p2.str());
-
-            // Blocks found
-            std::ostringstream p3;
-            p3 << "  Blocks Found: ";
-            if (stats.blocks_found > 0) {
-                p3 << C_ok() << stats.blocks_found << C_reset();
+            std::ostringstream ps2;
+            if (vt_ok_) {
+                ps2 << "  \x1b[38;5;245mShares\x1b[0m \x1b[38;5;46m" << stats.accepted_shares << "\x1b[0m";
+                ps2 << "  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;245mBlocks\x1b[0m \x1b[38;5;226m" << stats.blocks_found << "\x1b[0m";
             } else {
-                p3 << C_dim() << "0" << C_reset();
+                ps2 << "  Shares: " << stats.accepted_shares << "  Blocks: " << stats.blocks_found;
             }
-            right.push_back(p3.str());
-
-            // Connection hint
-            right.push_back(std::string("  ") + C_dim() + "Connect miners to this port for pool mining" + C_reset());
+            right.push_back(ps2.str());
             right.push_back("");
         }
 
+        // Health Panel
         {
-            right.push_back(std::string(C_bold()) + "Health & Security" + C_reset());
-            right.push_back(std::string("  config reload: ")
-               + (global::reload_requested.load()? "pending" : (u8_ok_? "—" : "-")));
-            if (!hot_warning_.empty() && now_ms()-hot_warn_ts_ < 6000){
-                right.push_back(std::string("  ") + C_warn() + hot_warning_ + C_reset());
+            right.push_back(panel_header("HEALTH", "❤", rightw));
+
+            std::ostringstream hp;
+            if (vt_ok_) {
+                hp << "  " << activity_dot(nstate_ == NodeState::Running) << " \x1b[38;5;252mNode operational\x1b[0m";
+            } else {
+                hp << "  Node operational";
             }
-            if (!datadir_.empty()){
-                right.push_back(std::string("  datadir: ") + datadir_);
+            right.push_back(hp.str());
+
+            if (!hot_warning_.empty() && now_ms() - hot_warn_ts_ < 6000) {
+                right.push_back(vt_ok_ ? "  \x1b[38;5;214m⚠ " + hot_warning_ + "\x1b[0m" : "  ! " + hot_warning_);
             }
             right.push_back("");
         }
 
+        // Recent TXIDs Panel
         {
-            right.push_back(std::string(C_bold()) + "Recent TXIDs" + C_reset());
-            if (recent_txids_.empty()) right.push_back("  (no txids yet)");
-            size_t n = std::min<size_t>(recent_txids_.size(), 10);
-            for (size_t i=0;i<n;i++){
-                right.push_back(std::string("  ") + short_hex(recent_txids_[recent_txids_.size()-1-i], 20));
+            right.push_back(panel_header("RECENT TXs", "📝", rightw));
+
+            if (recent_txids_.empty()) {
+                right.push_back(vt_ok_ ? "  \x1b[38;5;240m(no transactions)\x1b[0m" : "  (no transactions)");
+            } else {
+                size_t n = std::min<size_t>(recent_txids_.size(), 3);
+                for (size_t i = 0; i < n; i++) {
+                    std::string txid = short_hex(recent_txids_[recent_txids_.size() - 1 - i], 24);
+                    if (vt_ok_) {
+                        right.push_back("  \x1b[38;5;240m" + txid + "\x1b[0m");
+                    } else {
+                        right.push_back("  " + txid);
+                    }
+                }
             }
             right.push_back("");
         }
 
-        std::ostringstream out;
+        // ═══════════════════════════════════════════════════════════════════════
+        // RENDER COLUMNS
+        // ═══════════════════════════════════════════════════════════════════════
 
-        // Build the entire frame first (double buffering)
         size_t NL = left.size(), NR = right.size(), N = std::max(NL, NR);
-        for (size_t i=0;i<N;i++){
-            std::string l = (i<NL) ? left[i] : "";
-            std::string r = (i<NR) ? right[i] : "";
-            if ((int)l.size() > leftw)  l = fit(l, leftw);
-            if ((int)r.size() > rightw) r = fit(r, rightw);
-            out << std::left << std::setw(leftw) << l << " | " << r << "\n";
+        std::string vert_sep = vt_ok_ ? "\x1b[38;5;27m║\x1b[0m" : "|";
+
+        for (size_t i = 0; i < N; i++) {
+            std::string l = (i < NL) ? left[i] : "";
+            std::string r = (i < NR) ? right[i] : "";
+
+            // Pad left column
+            int l_vis = visible_length(l);
+            if (l_vis < leftw - 1) l += std::string(leftw - 1 - l_vis, ' ');
+
+            out << vert_sep << l << vert_sep << r << "\n";
         }
 
-        // BULLETPROOF: Separator line
-        out << std::string((size_t)cols, '-') << "\n";
+        // ═══════════════════════════════════════════════════════════════════════
+        // LOG AREA - Professional styled log display
+        // ═══════════════════════════════════════════════════════════════════════
 
-        // BULLETPROOF: Status/shutdown banner (fixed 2 lines)
-        if (nstate_ == NodeState::Quitting){
-            out << C_bold() << "Shutting down" << C_reset() << "  " << C_dim() << "(Ctrl+C again = force)" << C_reset() << "\n";
-            std::string phase = shutdown_phase_.empty() ? "initiating..." : shutdown_phase_;
-            out << "  phase: " << phase << "\n";
+        // Log header bar
+        if (vt_ok_ && u8_ok_) {
+            out << "\x1b[38;5;27m╠";
+            for (int i = 0; i < cols - 2; ++i) out << "═";
+            out << "╣\x1b[0m\n";
+
+            out << "\x1b[38;5;27m║\x1b[0m ";
+            out << "\x1b[38;5;255m\x1b[1m📜 LOGS\x1b[0m";
+            out << "  \x1b[38;5;240m[q]quit [t]theme [p]pause [v]verbose [s]snap [r]reload\x1b[0m";
+            out << std::string(cols - 70, ' ');
+            out << "\x1b[38;5;27m║\x1b[0m\n";
+
+            out << "\x1b[38;5;27m╠";
+            for (int i = 0; i < cols - 2; ++i) out << "─";
+            out << "╣\x1b[0m\n";
         } else {
-            out << C_bold() << "Logs" << C_reset() << "  " << C_dim() << "(q=quit t=theme p=pause r=reload s=snap v=verbose)" << C_reset() << "\n";
+            out << "+" << std::string(cols - 2, '-') << "+\n";
+            out << "| LOGS  [q]quit [t]theme [p]pause [v]verbose\n";
+            out << "+" << std::string(cols - 2, '-') << "+\n";
         }
 
-        // BULLETPROOF: Calculate log area to fit exactly in remaining screen space
-        // This ensures no scrolling - the TUI is a single fixed-size layout
-        int header_rows = (int)N + 2;  // Main content + separator
-        int footer_rows = 3;            // Status line + 2 buffer
-        int remain = rows - header_rows - footer_rows;
+        // Calculate remaining space for logs
+        int header_lines = (int)N + 6;  // Header + columns + log header
+        int footer_lines = 2;
+        int log_space = rows - header_lines - footer_lines;
+        if (log_space < 4) log_space = 4;
+        if (log_space > 20) log_space = 20;
 
-        // Ensure minimum log lines but cap to prevent overflow
-        if (remain < 6) remain = 6;
-        if (remain > 30) remain = 30;  // Cap to prevent excessive logs pushing layout
+        // Render logs
+        int log_start = (int)logs_.size() - log_space;
+        if (log_start < 0) log_start = 0;
 
-        // Get only the last 'remain' log entries
-        int start = (int)logs_.size() - remain;
-        if (start < 0) start = 0;
-
-        // Print log lines (each exactly one line, no overflow)
         int printed = 0;
-        for (int i = start; i < (int)logs_.size() && printed < remain; ++i) {
+        for (int i = log_start; i < (int)logs_.size() && printed < log_space; ++i) {
             const auto& line = logs_[i];
-            // Truncate long lines to prevent wrapping
             std::string txt = line.txt;
-            if ((int)txt.size() > cols - 2) {
-                txt = txt.substr(0, cols - 5) + "...";
+            if ((int)txt.size() > cols - 4) {
+                txt = txt.substr(0, cols - 7) + "...";
             }
-            switch(line.level){
-                case 2: out << C_err()  << txt << C_reset() << "\n"; break;  // Error - red
-                case 1: out << C_warn() << txt << C_reset() << "\n"; break;  // Warning - yellow
-                case 3: out << C_dim()  << txt << C_reset() << "\n"; break;  // Trace/debug - dim
-                case 4: out << C_ok()   << txt << C_reset() << "\n"; break;  // Success - green
-                case 5: out << C_info() << txt << C_reset() << "\n"; break;  // Info - cyan
-                default: out << txt << "\n"; break;  // Normal
+
+            if (vt_ok_) {
+                out << "\x1b[38;5;27m║\x1b[0m ";
+                switch(line.level) {
+                    case 2: out << "\x1b[38;5;196m" << txt << "\x1b[0m"; break;
+                    case 1: out << "\x1b[38;5;214m" << txt << "\x1b[0m"; break;
+                    case 3: out << "\x1b[38;5;240m" << txt << "\x1b[0m"; break;
+                    case 4: out << "\x1b[38;5;46m" << txt << "\x1b[0m"; break;
+                    case 5: out << "\x1b[38;5;87m" << txt << "\x1b[0m"; break;
+                    default: out << "\x1b[38;5;252m" << txt << "\x1b[0m"; break;
+                }
+                // Pad to edge
+                int txt_len = (int)txt.size();
+                if (txt_len < cols - 4) out << std::string(cols - 4 - txt_len, ' ');
+                out << "\x1b[38;5;27m║\x1b[0m";
+            } else {
+                out << "| " << txt;
             }
+            out << "\n";
             ++printed;
         }
 
-        // Fill remaining lines with empty lines to maintain fixed layout
-        for (int i = printed; i < remain; ++i) {
-            out << "\n";
+        // Fill remaining log space
+        for (int i = printed; i < log_space; ++i) {
+            if (vt_ok_) {
+                out << "\x1b[38;5;27m║\x1b[0m" << std::string(cols - 2, ' ') << "\x1b[38;5;27m║\x1b[0m\n";
+            } else {
+                out << "|" << std::string(cols - 2, ' ') << "|\n";
+            }
         }
 
-        // Now write the entire frame with control sequences
-        std::string frame = out.str();
+        // Bottom border
+        if (vt_ok_ && u8_ok_) {
+            out << "\x1b[38;5;27m╚";
+            for (int i = 0; i < cols - 2; ++i) {
+                int pulse = (tick_ + i) % 16;
+                int c = (pulse < 8) ? 27 + pulse : 35 - (pulse - 8);
+                out << "\x1b[38;5;" << c << "m═";
+            }
+            out << "\x1b[38;5;27m╝\x1b[0m\n";
+        } else {
+            out << "+" << std::string(cols - 2, '=') << "+\n";
+        }
 
-        // IMPROVED: Use optimized write_frame for smoother updates on PowerShell 5+
-        // This reduces flicker by combining clear + content into a single write operation
+        // Write frame
+        std::string frame = out.str();
         if (vt_ok_) {
-            // Use cursor home + clear-to-end approach for smoother updates (less flicker)
-            // \x1b[H = cursor home, \x1b[J = clear from cursor to end of screen
             cw_.write_frame("\x1b[H\x1b[J", frame);
         } else {
-            // Fallback for non-VT terminals
             cw_.write_raw(frame);
         }
-
-        // Ensure output is flushed to terminal
         std::fflush(stdout);
+    }
+
+    // Helper to calculate visible string length (excluding ANSI codes)
+    static int visible_length(const std::string& s) {
+        int len = 0;
+        bool in_escape = false;
+        for (char c : s) {
+            if (c == '\x1b') in_escape = true;
+            else if (in_escape && c == 'm') in_escape = false;
+            else if (!in_escape) ++len;
+        }
+        return len;
     }
 
 private:
