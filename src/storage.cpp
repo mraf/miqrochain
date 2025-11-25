@@ -46,13 +46,13 @@ bool Storage::open(const std::string& dir){
     uint64_t off=0; [[maybe_unused]] uint32_t idx=0;
 
     // STABILITY FIX: Limit maximum block size to prevent corrupt file hangs
-    static constexpr uint32_t MAX_BLOCK_SIZE = 32 * 1024 * 1024; // 32 MB max block
+    static constexpr uint32_t STORAGE_MAX_BLOCK_SIZE = 32 * 1024 * 1024; // 32 MB max block
     static constexpr uint32_t MAX_KEY_SIZE = 1024; // Max hash key size
 
     while(true){
         uint32_t sz=0; f.read((char*)&sz,sizeof(sz)); if(!f) break;
         // STABILITY FIX: Validate block size to prevent corrupt file issues
-        if (sz == 0 || sz > MAX_BLOCK_SIZE) {
+        if (sz == 0 || sz > STORAGE_MAX_BLOCK_SIZE) {
             log_warn("Storage: corrupt blocks.dat detected at offset " + std::to_string(off));
             break;
         }

@@ -2062,7 +2062,7 @@ private:
         static constexpr int ACCENT = 214;      // Orange - highlights
         static constexpr int SUCCESS = 46;      // Green - positive states
         static constexpr int WARNING = 226;     // Yellow - caution
-        static constexpr int ERROR = 196;       // Red - errors
+        static constexpr int DANGER = 196;      // Red - errors (avoid ERROR - Windows macro conflict)
         static constexpr int INFO = 87;         // Light cyan - information
         static constexpr int MUTED = 240;       // Gray - disabled/secondary text
         static constexpr int BORDER = 27;       // Dark blue - borders
@@ -2469,7 +2469,7 @@ private:
                 double ratio = (double)strength / max_strength;
                 if (ratio > 0.66) color = ColorPalette::SUCCESS;
                 else if (ratio > 0.33) color = ColorPalette::WARNING;
-                else color = ColorPalette::ERROR;
+                else color = ColorPalette::DANGER;
 
                 // Add shimmer animation
                 bool shimmer = (i == strength - 1) && (tick % 4 < 2);
@@ -2615,10 +2615,10 @@ private:
             if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::SUCCESS << "m";
             out << "▲";
         } else if (current < previous * 0.95) {
-            if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::ERROR << "m";
+            if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::DANGER << "m";
             out << "▼▼";
         } else if (current < previous * 0.99) {
-            if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::ERROR << "m";
+            if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::DANGER << "m";
             out << "▼";
         } else {
             if (vt_ok_) out << "\x1b[38;5;" << ColorPalette::MUTED << "m";
@@ -2755,7 +2755,7 @@ private:
                 out << draw_badge("RUNNING", ColorPalette::SUCCESS, 0);
                 break;
             case NodeState::Degraded:
-                out << draw_badge("DEGRADED", ColorPalette::ERROR, 255);
+                out << draw_badge("DEGRADED", ColorPalette::DANGER, 255);
                 break;
             case NodeState::Quitting:
                 out << draw_badge("SHUTDOWN", ColorPalette::WARNING, 0);
@@ -2912,7 +2912,7 @@ private:
         int color;
         if (quality >= 80) color = ColorPalette::SUCCESS;
         else if (quality >= 50) color = ColorPalette::WARNING;
-        else color = ColorPalette::ERROR;
+        else color = ColorPalette::DANGER;
 
         int filled = quality * width / 100;
         for (int i = 0; i < width; ++i) {
@@ -2959,7 +2959,7 @@ private:
                 const auto& p = peers[quality_idx[i].second];
                 int q = quality_idx[i].first;
                 int color = (q >= 80) ? ColorPalette::SUCCESS :
-                           (q >= 50) ? ColorPalette::WARNING : ColorPalette::ERROR;
+                           (q >= 50) ? ColorPalette::WARNING : ColorPalette::DANGER;
 
                 // Animated connection line
                 bool active = (tick + (int)i) % 4 < 2;
@@ -3252,7 +3252,7 @@ private:
         switch (log.level) {
             case 2:  // Error
                 level_icon = u8_ok_ ? "✖ " : "[E] ";
-                color = ColorPalette::ERROR;
+                color = ColorPalette::DANGER;
                 break;
             case 1:  // Warning
                 level_icon = u8_ok_ ? "⚠ " : "[W] ";
@@ -3365,7 +3365,7 @@ private:
         if (vt_ok_) {
             mem << "\x1b[38;5;245mMemory\x1b[0m    ";
             mem << draw_gauge((double)rss, 500.0 * 1024 * 1024, 16, "",
-                             ColorPalette::SUCCESS, ColorPalette::WARNING, ColorPalette::ERROR, tick);
+                             ColorPalette::SUCCESS, ColorPalette::WARNING, ColorPalette::DANGER, tick);
             mem << " \x1b[38;5;183m" << fmt_bytes(rss) << "\x1b[0m";
         } else {
             mem << "Memory: " << fmt_bytes(rss);
@@ -3466,7 +3466,7 @@ private:
     void init_matrix_transition(int cols) const {
         matrix_columns_.clear();
         matrix_columns_.resize(cols);
-        std::mt19937 rng(std::chrono::steady_clock::now().time_since_epoch().count());
+        std::mt19937 rng(static_cast<unsigned int>(std::chrono::steady_clock::now().time_since_epoch().count()));
         for (int i = 0; i < cols; ++i) {
             matrix_columns_[i].y = -(int)(rng() % 20);  // Staggered start
             matrix_columns_[i].length = 5 + rng() % 15;
@@ -4932,7 +4932,7 @@ private:
             if (vt_ok_ && u8_ok_) {
                 mem_line << "  \x1b[38;5;245m⟨MEM⟩\x1b[0m ";
                 mem_line << draw_gauge((double)rss, 512.0 * 1024 * 1024, 18, "",
-                                       ColorPalette::SUCCESS, ColorPalette::WARNING, ColorPalette::ERROR, tick_);
+                                       ColorPalette::SUCCESS, ColorPalette::WARNING, ColorPalette::DANGER, tick_);
                 mem_line << " \x1b[38;5;183m" << fmt_bytes(rss) << "\x1b[0m";
             } else {
                 mem_line << "  Memory: " << fmt_bytes(rss);
@@ -5086,7 +5086,7 @@ private:
                     age_color = ColorPalette::WARNING;
                     age_icon = "◐";
                 } else {
-                    age_color = ColorPalette::ERROR;
+                    age_color = ColorPalette::DANGER;
                     age_icon = "✗";
                 }
                 h3 << "\x1b[38;5;" << age_color << "m" << age_icon << " " << fmt_uptime(tip_age_s) << "\x1b[0m";
