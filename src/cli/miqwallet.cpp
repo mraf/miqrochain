@@ -117,6 +117,7 @@ namespace wallet_config {
 
 #include "wallet/p2p_light.h"
 #include "wallet/spv_simple.h"
+#include "wallet/http_client.h"
 
 using miq::CHAIN_NAME;
 using miq::COIN;
@@ -950,6 +951,247 @@ namespace ui {
         std::string input;
         std::getline(std::cin, input);
         return !input.empty() && (input[0] == 'y' || input[0] == 'Y');
+    }
+
+    // =========================================================================
+    // PROFESSIONAL SPLASH SCREEN SYSTEM v1.0
+    // Similar to the node daemon splash screen with smooth animations
+    // =========================================================================
+
+    // Animated spinner for splash screen
+    static const char* splash_spinner(int tick) {
+        static const char* frames[] = {"|", "/", "-", "\\"};
+        return frames[tick % 4];
+    }
+
+    // Smooth progress bar with gradient effect
+    static std::string splash_progress_bar(double frac, int width, int tick) {
+        if (width < 10) width = 10;
+        if (frac < 0.0) frac = 0.0;
+        if (frac > 1.0) frac = 1.0;
+
+        int inner = width - 2;
+        int filled = (int)(frac * inner);
+
+        std::string out;
+        out.reserve((size_t)(width + 50));
+
+        if (g_use_colors) {
+            out += "\033[48;5;236m";  // Dark background
+            for (int i = 0; i < inner; ++i) {
+                if (i < filled) {
+                    // Gradient from cyan to green
+                    int phase = (i * 5) / inner;
+                    switch(phase) {
+                        case 0: out += "\033[38;5;51m"; break;   // Bright cyan
+                        case 1: out += "\033[38;5;50m"; break;   // Cyan-green
+                        case 2: out += "\033[38;5;49m"; break;   // Teal
+                        case 3: out += "\033[38;5;48m"; break;   // Green-cyan
+                        default: out += "\033[38;5;46m"; break;  // Bright green
+                    }
+                    out += "=";
+                } else if (i == filled && frac < 1.0) {
+                    // Animated leading edge
+                    out += "\033[38;5;51m";
+                    static const char* edge[] = {">", "*", ">", "+"};
+                    out += edge[tick % 4];
+                } else {
+                    out += "\033[38;5;238m ";
+                }
+            }
+            out += "\033[0m";
+        } else {
+            out += "[";
+            for (int i = 0; i < filled; ++i) out += "=";
+            if (filled < inner) out += ">";
+            for (int i = filled + 1; i < inner; ++i) out += " ";
+            out += "]";
+        }
+        return out;
+    }
+
+    // Draw animated splash screen
+    static void draw_splash_screen(const std::string& status, double progress, int tick,
+                                   const std::string& detail = "") {
+        // Clear screen and position cursor
+        std::cout << "\033[2J\033[H" << std::flush;
+
+        const int WIDTH = 60;
+        std::cout << "\n\n";
+
+        // Logo with colors
+        if (g_use_colors) {
+            std::cout << cyan() << bold();
+            std::cout << "       __  __ ___ ___   __        __    _ _      _\n";
+            std::cout << "      |  \\/  |_ _/ _ \\  \\ \\      / /_ _| | | ___| |_\n";
+            std::cout << "      | |\\/| || | | | |  \\ \\ /\\ / / _` | | |/ _ \\ __|\n";
+            std::cout << "      | |  | || | |_| |   \\ V  V / (_| | | |  __/ |_\n";
+            std::cout << "      |_|  |_|___\\__\\_\\    \\_/\\_/ \\__,_|_|_|\\___|\\__|\n";
+            std::cout << reset() << "\n";
+        } else {
+            std::cout << "       MIQ WALLET\n\n";
+        }
+
+        // Version and subtitle
+        std::cout << green() << bold() << "           Professional Cryptocurrency Wallet v5.0" << reset() << "\n";
+        std::cout << dim() << "        Secure | SPV | Live Dashboard | Auto-TX Queue" << reset() << "\n\n";
+
+        // Status box
+        std::cout << cyan() << "    +";
+        for (int i = 0; i < WIDTH - 2; i++) std::cout << "-";
+        std::cout << "+" << reset() << "\n";
+
+        // Status line with spinner
+        std::cout << cyan() << "    |" << reset();
+        std::cout << " " << yellow() << splash_spinner(tick) << reset() << " ";
+        std::cout << bold() << status << reset();
+        int padding = WIDTH - 7 - (int)status.size();
+        std::cout << std::string(padding > 0 ? padding : 1, ' ');
+        std::cout << cyan() << "|" << reset() << "\n";
+
+        // Progress bar line
+        std::cout << cyan() << "    |" << reset();
+        std::cout << " " << splash_progress_bar(progress, WIDTH - 6, tick) << " ";
+        std::cout << cyan() << "|" << reset() << "\n";
+
+        // Percentage line
+        std::cout << cyan() << "    |" << reset();
+        std::ostringstream pct;
+        pct << std::fixed << std::setprecision(1) << (progress * 100.0) << "%";
+        std::string pct_str = pct.str();
+        int pct_pad = (WIDTH - 2 - (int)pct_str.size()) / 2;
+        std::cout << std::string(pct_pad, ' ');
+        if (progress >= 1.0) {
+            std::cout << green() << bold() << pct_str << reset();
+        } else if (progress >= 0.75) {
+            std::cout << green() << pct_str << reset();
+        } else if (progress >= 0.5) {
+            std::cout << yellow() << pct_str << reset();
+        } else {
+            std::cout << cyan() << pct_str << reset();
+        }
+        std::cout << std::string(WIDTH - 2 - pct_pad - (int)pct_str.size(), ' ');
+        std::cout << cyan() << "|" << reset() << "\n";
+
+        // Detail line (optional)
+        if (!detail.empty()) {
+            std::cout << cyan() << "    |" << reset();
+            std::string det = detail.size() > (size_t)(WIDTH - 4) ? detail.substr(0, WIDTH - 7) + "..." : detail;
+            int det_pad = (WIDTH - 2 - (int)det.size()) / 2;
+            std::cout << std::string(det_pad, ' ');
+            std::cout << dim() << det << reset();
+            std::cout << std::string(WIDTH - 2 - det_pad - (int)det.size(), ' ');
+            std::cout << cyan() << "|" << reset() << "\n";
+        } else {
+            std::cout << cyan() << "    |" << reset();
+            std::cout << std::string(WIDTH - 2, ' ');
+            std::cout << cyan() << "|" << reset() << "\n";
+        }
+
+        // Bottom border
+        std::cout << cyan() << "    +";
+        for (int i = 0; i < WIDTH - 2; i++) std::cout << "-";
+        std::cout << "+" << reset() << "\n";
+
+        std::cout << "\n";
+        std::cout << std::flush;
+    }
+
+    // Complete startup splash sequence
+    static void run_startup_splash(const std::string& chain_name,
+                                   const std::vector<std::pair<std::string, std::string>>& seeds) {
+        // Phase 1: Initializing
+        for (int i = 0; i < 8; i++) {
+            draw_splash_screen("Initializing wallet engine...", 0.1 + (i * 0.05), i);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        // Phase 2: Loading chain
+        for (int i = 0; i < 8; i++) {
+            draw_splash_screen("Loading chain: " + chain_name, 0.3 + (i * 0.05), i + 8,
+                              "Preparing cryptographic subsystem");
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        // Phase 3: Discovering nodes
+        std::string seed_info = seeds.empty() ? "localhost" : seeds[0].first;
+        for (int i = 0; i < 10; i++) {
+            draw_splash_screen("Discovering network nodes...", 0.5 + (i * 0.03), i + 16,
+                              "Primary: " + seed_info);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        // Phase 4: Preparing UI
+        for (int i = 0; i < 8; i++) {
+            draw_splash_screen("Preparing secure interface...", 0.8 + (i * 0.02), i + 26);
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        }
+
+        // Phase 5: Ready
+        for (int i = 0; i < 10; i++) {
+            draw_splash_screen("WALLET READY", 1.0, i + 34,
+                              seeds.size() > 0 ? std::to_string(seeds.size()) + " seed node(s) available" : "");
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        }
+
+        // Final pause at 100%
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
+
+    // Transaction confirmation splash with progress
+    static void draw_tx_confirmation_splash(const std::string& txid, int confirmations,
+                                            int target, int tick, const std::string& status) {
+        // Clear line and redraw
+        std::cout << "\r";
+
+        std::cout << cyan() << "  [" << reset();
+
+        // Draw confirmation blocks
+        for (int i = 0; i < target; i++) {
+            if (i < confirmations) {
+                std::cout << green() << "#" << reset();
+            } else if (i == confirmations) {
+                // Animated waiting block
+                const char* anim[] = {".", "o", "O", "o"};
+                std::cout << yellow() << anim[tick % 4] << reset();
+            } else {
+                std::cout << dim() << "-" << reset();
+            }
+        }
+
+        std::cout << cyan() << "]" << reset();
+        std::cout << " " << confirmations << "/" << target << " ";
+
+        if (confirmations >= target) {
+            std::cout << green() << bold() << "CONFIRMED" << reset();
+        } else {
+            std::cout << status;
+        }
+
+        // TXID hint
+        std::cout << dim() << " (" << txid.substr(0, 8) << "...)" << reset();
+        std::cout << std::string(20, ' ') << std::flush;
+    }
+
+    // Network sync splash for wallet
+    static void draw_wallet_sync_splash(const std::string& node, int headers_synced,
+                                        int blocks_scanned, int utxos_found, int tick) {
+        std::cout << "\r";
+
+        const char* spinner = splash_spinner(tick);
+        std::cout << cyan() << "  [" << yellow() << spinner << cyan() << "]" << reset();
+
+        std::cout << " Syncing";
+        if (!node.empty()) {
+            std::cout << dim() << " @ " << node << reset();
+        }
+
+        std::cout << " | ";
+        std::cout << "H:" << cyan() << headers_synced << reset();
+        std::cout << " B:" << green() << blocks_scanned << reset();
+        std::cout << " U:" << yellow() << utxos_found << reset();
+
+        std::cout << std::string(20, ' ') << std::flush;
     }
 }
 
@@ -4752,6 +4994,109 @@ static bool broadcast_any_seed(
 }
 
 // =============================================================================
+// TRANSACTION VERIFICATION VIA RPC
+// =============================================================================
+
+// Verify a transaction exists in the mempool or blockchain via RPC
+static bool verify_tx_in_mempool(
+    const std::string& host,
+    const std::string& port,
+    const std::string& txid_hex,
+    std::string& err_out)
+{
+    uint16_t rpc_port = (uint16_t)std::stoi(port);
+    // RPC port is typically P2P port + 1
+    rpc_port = (rpc_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : rpc_port;
+
+    // Build JSON-RPC request to check if tx is in mempool
+    std::string rpc_body = R"({"method":"getrawmempool","params":[]})";
+
+    miq::HttpResponse resp;
+    std::vector<std::pair<std::string, std::string>> headers;
+
+    if (!miq::http_post(host, rpc_port, "/", rpc_body, headers, resp, 5000)) {
+        err_out = "RPC connection failed";
+        return false;
+    }
+
+    if (resp.code != 200) {
+        err_out = "RPC error: HTTP " + std::to_string(resp.code);
+        return false;
+    }
+
+    // Check if txid is in the response
+    if (resp.body.find(txid_hex) != std::string::npos) {
+        return true;  // Transaction found in mempool!
+    }
+
+    // Also try to get the transaction directly
+    std::string get_tx_body = R"({"method":"getrawtransaction","params":[")" + txid_hex + R"("]})";
+    miq::HttpResponse tx_resp;
+    if (miq::http_post(host, rpc_port, "/", get_tx_body, headers, tx_resp, 5000)) {
+        if (tx_resp.code == 200 && tx_resp.body.find("error") == std::string::npos) {
+            return true;  // Transaction exists
+        }
+    }
+
+    err_out = "Transaction not found in mempool";
+    return false;
+}
+
+// Enhanced broadcast with mempool verification and animated feedback
+static bool broadcast_and_verify(
+    const std::vector<std::pair<std::string, std::string>>& seeds,
+    const std::vector<uint8_t>& raw_tx,
+    const std::string& txid_hex,
+    std::string& used_seed,
+    std::string& err_out,
+    bool show_animation = true)
+{
+    // Step 1: Broadcast the transaction
+    if (!broadcast_any_seed(seeds, raw_tx, used_seed, err_out)) {
+        return false;
+    }
+
+    // Step 2: Show verification animation
+    if (show_animation) {
+        std::cout << "\n";
+        for (int tick = 0; tick < 20; tick++) {
+            ui::draw_tx_confirmation_splash(txid_hex, 0, 6, tick, "Verifying...");
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::cout << "\n";
+    }
+
+    // Step 3: Verify the transaction made it to mempool
+    // Try verification with the node we broadcast to
+    size_t colon = used_seed.find(':');
+    if (colon != std::string::npos) {
+        std::string host = used_seed.substr(0, colon);
+        std::string port = used_seed.substr(colon + 1);
+
+        std::string verify_err;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (verify_tx_in_mempool(host, port, txid_hex, verify_err)) {
+                if (show_animation) {
+                    ui::print_success("Transaction verified in mempool!");
+                }
+                return true;
+            }
+            // Wait a bit before retrying - transaction might still be propagating
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+
+        // Transaction sent but not verified in mempool - still might be OK
+        // (could be mined already, or mempool check failed)
+        if (show_animation) {
+            ui::print_warning("Transaction sent but mempool verification failed: " + verify_err);
+            ui::print_info("The transaction may still be valid - check your balance in a few minutes");
+        }
+    }
+
+    return true;  // Broadcast succeeded even if verification wasn't possible
+}
+
+// =============================================================================
 // TRANSACTION QUEUE PROCESSING - Auto-broadcast pending transactions
 // =============================================================================
 static int process_tx_queue(
@@ -6128,7 +6473,7 @@ static bool wallet_session(const std::string& cli_host,
                 }
             }
 
-            // Show beautiful broadcast animation
+            // Enhanced broadcast with verification animation
             std::cout << "\n";
             for (int frame = 0; frame < 15; frame++) {
                 ui::print_broadcast_animation(frame);
@@ -6136,7 +6481,8 @@ static bool wallet_session(const std::string& cli_host,
             }
             std::cout << "\r" << std::string(60, ' ') << "\r";
 
-            bool broadcast_success = broadcast_any_seed(seeds_b, raw, used_bcast_seed, berr);
+            // Use enhanced broadcast with mempool verification
+            bool broadcast_success = broadcast_and_verify(seeds_b, raw, txid_hex, used_bcast_seed, berr, true);
 
             // CRITICAL FIX: Update pending cache with timestamps for timeout tracking
             for(const auto& in : tx.vin){
@@ -7181,7 +7527,7 @@ static bool wallet_session(const std::string& cli_host,
             std::string txid_hex = miq::to_hex(cons_tx.txid());
             std::string used_bcast_seed, berr;
 
-            // Show broadcast animation
+            // Show broadcast animation with verification
             std::cout << "\n";
             for (int frame = 0; frame < 15; frame++) {
                 ui::print_broadcast_animation(frame);
@@ -7189,7 +7535,8 @@ static bool wallet_session(const std::string& cli_host,
             }
             std::cout << "\r" << std::string(60, ' ') << "\r";
 
-            bool broadcast_success = broadcast_any_seed(seeds, raw, used_bcast_seed, berr);
+            // Use enhanced broadcast with mempool verification
+            bool broadcast_success = broadcast_and_verify(seeds, raw, txid_hex, used_bcast_seed, berr, true);
 
             // CRITICAL FIX: Mark inputs as pending with timestamps for timeout tracking
             for(const auto& in : cons_tx.vin){
@@ -7966,20 +8313,11 @@ int main(int argc, char** argv){
         }
     }
 
-    // Display banner
-    ui::print_banner();
-
-    std::cout << ui::dim() << "  Chain: " << ui::reset() << CHAIN_NAME << "\n";
-
-    // Show seed nodes
+    // Build seed candidates first (needed for splash screen)
     auto seeds = build_seed_candidates(cli_host, cli_port);
-    std::cout << ui::dim() << "  Seeds: " << ui::reset();
-    for(size_t i = 0; i < std::min(seeds.size(), (size_t)3); ++i){
-        if(i) std::cout << ", ";
-        std::cout << seeds[i].first << ":" << seeds[i].second;
-    }
-    if(seeds.size() > 3) std::cout << " (+" << (seeds.size() - 3) << " more)";
-    std::cout << "\n";
+
+    // Run professional animated splash screen
+    ui::run_startup_splash(std::string(CHAIN_NAME), seeds);
 
     // Main menu loop - CRITICAL FIX: Clear screen to prevent scrolling
     for(;;){
