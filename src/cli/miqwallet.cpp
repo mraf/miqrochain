@@ -331,14 +331,12 @@ namespace ui {
         std::cout << "\r" << cyan() << "[" << spinner[frame % 4] << "] " << reset() << msg << std::flush;
     }
 
-    // Enhanced spinner for PowerShell 5+ (Braille pattern animation)
+    // Enhanced spinner for PowerShell 5+ (ASCII fallback for compatibility)
     void print_spinner(const std::string& msg, int frame) {
-        // Works well in PowerShell 5+ and modern terminals
-        const char* frames[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
-        const char* fallback[] = {"[*   ]", "[ *  ]", "[  * ]", "[   *]", "[  * ]", "[ *  ]"};
+        const char* spinner[] = {"[*   ]", "[ *  ]", "[  * ]", "[   *]", "[  * ]", "[ *  ]"};
 
         // Use ASCII fallback for better compatibility
-        std::cout << "\r" << cyan() << fallback[frame % 6] << " " << reset() << msg
+        std::cout << "\r" << cyan() << spinner[frame % 6] << " " << reset() << msg
                   << std::string(20, ' ') << std::flush;
     }
 
@@ -1346,7 +1344,7 @@ static bool coin_select_greedy(
 // TRANSACTION VALIDATION
 // =============================================================================
 
-static TxValidationResult validate_transaction(
+[[maybe_unused]] static TxValidationResult validate_transaction(
     const miq::Transaction& tx,
     const std::vector<miq::UtxoLite>& utxos,
     uint64_t max_fee = 10000000)  // 0.1 MIQ max fee by default
@@ -1509,7 +1507,7 @@ struct TransactionBuildRequest {
 };
 
 // Smart transaction builder with automatic everything
-static TransactionBuildResult build_transaction_smart(
+[[maybe_unused]] static TransactionBuildResult build_transaction_smart(
     const TransactionBuildRequest& req,
     const std::vector<miq::UtxoLite>& all_utxos,
     const std::set<OutpointKey>& pending_utxos,
@@ -1730,7 +1728,7 @@ static TransactionBuildResult build_transaction_smart(
 }
 
 // Sign a built transaction
-static bool sign_transaction_robust(
+[[maybe_unused]] static bool sign_transaction_robust(
     miq::Transaction& tx,
     const std::vector<miq::UtxoLite>& spendables,
     const std::vector<size_t>& input_indices,
@@ -1802,7 +1800,7 @@ static bool sign_transaction_robust(
 }
 
 // Verify a signed transaction before broadcast
-static bool verify_transaction_before_broadcast(
+[[maybe_unused]] static bool verify_transaction_before_broadcast(
     const miq::Transaction& tx,
     std::string& error)
 {
@@ -2319,7 +2317,7 @@ namespace ui_pro {
     }
 
     // Print a status line with icon
-    static void print_status(const std::string& icon, const std::string& message,
+    [[maybe_unused]] static void print_status(const std::string& icon, const std::string& message,
                              const std::string& color = ""){
         if(!color.empty()) std::cout << color;
         std::cout << "  " << icon << " " << message;
@@ -2373,7 +2371,7 @@ namespace ui_pro {
     }
 
     // Print transaction details in a nice format
-    static void print_tx_details(const std::string& txid, uint64_t amount, uint64_t fee,
+    [[maybe_unused]] static void print_tx_details(const std::string& txid, uint64_t amount, uint64_t fee,
                                   const std::string& to_addr, const std::string& status){
         std::vector<std::string> lines;
         lines.push_back("TXID: " + txid.substr(0, 32) + "...");
@@ -2385,7 +2383,7 @@ namespace ui_pro {
     }
 
     // Animated waiting indicator
-    static void show_spinner_once(){
+    [[maybe_unused]] static void show_spinner_once(){
         int frame = g_animation_frame.fetch_add(1) % SPINNER_FRAME_COUNT;
         std::cout << "\r  " << SPINNER_FRAMES[frame] << " " << std::flush;
     }
@@ -2778,7 +2776,7 @@ struct ChangeOptimizationResult {
     std::string recommendation;
 };
 
-static ChangeOptimizationResult optimize_change(uint64_t total_input, uint64_t amount,
+[[maybe_unused]] static ChangeOptimizationResult optimize_change(uint64_t total_input, uint64_t amount,
                                                   uint64_t fee, uint64_t dust_threshold = 546){
     ChangeOptimizationResult result;
 
@@ -5121,39 +5119,23 @@ static bool wallet_session(const std::string& cli_host,
 
         ui::draw_window_divider(WIN_WIDTH);
 
-        // Menu sections in compact format
-        ui::draw_section_header("WALLET OPERATIONS", WIN_WIDTH);
-        ui::draw_menu_option("1", "Receive MIQ", "Get addresses", WIN_WIDTH);
-        ui::draw_menu_option("2", "Send MIQ", "Transfer funds", WIN_WIDTH);
-        ui::draw_menu_option("3", "New Address", "Fresh receive addr", WIN_WIDTH);
+        // =====================================================================
+        // SIMPLIFIED PROFESSIONAL MENU v5.0
+        // Streamlined for ease of use - auto broadcasts on refresh
+        // =====================================================================
+
+        ui::draw_section_header("MAIN OPERATIONS", WIN_WIDTH);
+        ui::draw_menu_option("1", "Receive", "View/generate addresses", WIN_WIDTH);
+        ui::draw_menu_option("2", "Send", "Transfer MIQ", WIN_WIDTH);
+        ui::draw_menu_option("3", "History", "All transactions", WIN_WIDTH);
+        ui::draw_menu_option("4", "Contacts", "Address book", WIN_WIDTH);
 
         ui::draw_empty_line(WIN_WIDTH);
-        ui::draw_section_header("TRANSACTIONS & HISTORY", WIN_WIDTH);
-        ui::draw_menu_option("4", "Full History", "All transactions", WIN_WIDTH);
-        ui::draw_menu_option("5", "Address Book", "Saved contacts", WIN_WIDTH);
-        ui::draw_menu_option("7", "TX Queue", "Pending broadcasts", WIN_WIDTH);
-        ui::draw_menu_option("t", "TX Monitor", "Live TX tracking", WIN_WIDTH);
-
-        ui::draw_empty_line(WIN_WIDTH);
-        ui::draw_section_header("WALLET MANAGEMENT", WIN_WIDTH);
-        ui::draw_menu_option("6", "Wallet Info", "Statistics", WIN_WIDTH);
-        ui::draw_menu_option("8", "Export Data", "CSV/JSON export", WIN_WIDTH);
-        ui::draw_menu_option("9", "Health Check", "Diagnostics", WIN_WIDTH);
-        ui::draw_menu_option("0", "Settings", "Backup & config", WIN_WIDTH);
-
-        ui::draw_empty_line(WIN_WIDTH);
-        ui::draw_section_header("ADVANCED", WIN_WIDTH);
-        ui::draw_menu_option("u", "UTXO Browser", "Full UTXO details", WIN_WIDTH);
-        ui::draw_menu_option("c", "Consolidate", "Combine UTXOs", WIN_WIDTH);
-        ui::draw_menu_option("p", "Release Pending", "Unlock stuck funds", WIN_WIDTH);
-
-        ui::draw_empty_line(WIN_WIDTH);
-        ui::draw_section_header("SYSTEM", WIN_WIDTH);
-        ui::draw_menu_option("r", "Refresh", "Sync with network", WIN_WIDTH);
-        ui::draw_menu_option("b", "Broadcast", "Send queued TXs", WIN_WIDTH);
-        ui::draw_menu_option("d", "Diagnostics", "Network test", WIN_WIDTH);
+        ui::draw_section_header("TOOLS", WIN_WIDTH);
+        ui::draw_menu_option("5", "Settings", "Backup, info & more", WIN_WIDTH);
+        ui::draw_menu_option("r", "Refresh", "Sync & auto-broadcast", WIN_WIDTH);
         ui::draw_menu_option("h", "Help", "User guide", WIN_WIDTH);
-        ui::draw_menu_option("q", "Exit", "Return to menu", WIN_WIDTH);
+        ui::draw_menu_option("q", "Exit", "Close wallet", WIN_WIDTH);
 
         ui::draw_window_bottom(WIN_WIDTH);
 
@@ -5161,9 +5143,9 @@ static bool wallet_session(const std::string& cli_host,
         c = trim(c);
 
         // =================================================================
-        // OPTION 4: Transaction History - Professional Viewer
+        // OPTION 3: Transaction History - Professional Viewer
         // =================================================================
-        if(c == "4"){
+        if(c == "3"){
             std::vector<TxHistoryEntry> history_raw;
             load_tx_history(wdir, history_raw);
             std::vector<AddressBookEntry> address_book;
@@ -5275,9 +5257,9 @@ static bool wallet_session(const std::string& cli_host,
         }
 
         // =================================================================
-        // OPTION 5: Address Book
+        // OPTION 4: Address Book (Contacts)
         // =================================================================
-        if(c == "5"){
+        if(c == "4"){
             std::cout << "\n";
             ui::print_double_header("ADDRESS BOOK", 60);
             std::cout << "\n";
@@ -5351,39 +5333,124 @@ static bool wallet_session(const std::string& cli_host,
         }
 
         // =================================================================
-        // OPTION 6: Wallet Info
+        // OPTION 5: Settings & Tools (Combined Menu)
         // =================================================================
-        if(c == "6"){
-            std::cout << "\n";
-            ui::print_double_header("WALLET INFORMATION", 60);
-            std::cout << "\n";
+        if(c == "5"){
+            bool settings_loop = true;
+            while(settings_loop){
+                std::cout << "\n";
+                ui::print_double_header("SETTINGS & TOOLS", 60);
+                std::cout << "\n";
 
-            std::cout << "  " << ui::bold() << "Wallet Directory:" << ui::reset() << "\n";
-            std::cout << "    " << ui::cyan() << wdir << ui::reset() << "\n\n";
+                std::cout << "  " << ui::cyan() << "[1]" << ui::reset() << " Wallet Info          " << ui::dim() << "Statistics & details" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << "[2]" << ui::reset() << " Export Transactions  " << ui::dim() << "CSV/JSON export" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << "[3]" << ui::reset() << " Health Check         " << ui::dim() << "Diagnostics" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << "[4]" << ui::reset() << " UTXO Browser         " << ui::dim() << "View all UTXOs" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << "[5]" << ui::reset() << " Consolidate UTXOs    " << ui::dim() << "Combine small UTXOs" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << "[6]" << ui::reset() << " TX Queue             " << ui::dim() << "Pending broadcasts" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << "[7]" << ui::reset() << " Release Pending      " << ui::dim() << "Unlock stuck funds" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << "[8]" << ui::reset() << " Network Diagnostics  " << ui::dim() << "Connection test" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << "[b]" << ui::reset() << " Backup Wallet        " << ui::dim() << "Create backup" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << "[q]" << ui::reset() << " Back to Main Menu\n";
+                std::cout << "\n";
 
-            std::cout << "  " << ui::bold() << "Address Statistics:" << ui::reset() << "\n";
-            std::cout << "    Receive addresses used: " << meta.next_recv << "\n";
-            std::cout << "    Change addresses used:  " << meta.next_change << "\n\n";
+                std::string set_cmd = ui::prompt("Settings option: ");
+                set_cmd = trim(set_cmd);
 
-            std::cout << "  " << ui::bold() << "UTXO Statistics:" << ui::reset() << "\n";
-            std::cout << "    Total UTXOs: " << utxos.size() << "\n";
+                if(set_cmd == "q" || set_cmd == "Q"){
+                    settings_loop = false;
+                    continue;
+                }
 
-            uint64_t min_utxo = UINT64_MAX, max_utxo = 0;
-            for(const auto& u : utxos){
-                min_utxo = std::min(min_utxo, u.value);
-                max_utxo = std::max(max_utxo, u.value);
+                // Sub-option 1: Wallet Info
+                if(set_cmd == "1"){
+                    std::cout << "\n";
+                    ui::print_double_header("WALLET INFORMATION", 60);
+                    std::cout << "\n";
+
+                    std::cout << "  " << ui::bold() << "Wallet Directory:" << ui::reset() << "\n";
+                    std::cout << "    " << ui::cyan() << wdir << ui::reset() << "\n\n";
+
+                    std::cout << "  " << ui::bold() << "Address Statistics:" << ui::reset() << "\n";
+                    std::cout << "    Receive addresses used: " << meta.next_recv << "\n";
+                    std::cout << "    Change addresses used:  " << meta.next_change << "\n\n";
+
+                    std::cout << "  " << ui::bold() << "UTXO Statistics:" << ui::reset() << "\n";
+                    std::cout << "    Total UTXOs: " << utxos.size() << "\n";
+
+                    uint64_t min_utxo = UINT64_MAX, max_utxo = 0;
+                    for(const auto& u : utxos){
+                        min_utxo = std::min(min_utxo, u.value);
+                        max_utxo = std::max(max_utxo, u.value);
+                    }
+                    if(!utxos.empty()){
+                        std::cout << "    Smallest UTXO: " << fmt_amount(min_utxo) << " MIQ\n";
+                        std::cout << "    Largest UTXO:  " << fmt_amount(max_utxo) << " MIQ\n";
+                    }
+
+                    std::cout << "\n  " << ui::bold() << "Connected Node:" << ui::reset() << "\n";
+                    std::cout << "    " << last_connected_node << "\n\n";
+
+                    std::cout << "  " << ui::dim() << "Press ENTER to continue..." << ui::reset();
+                    std::string dummy;
+                    std::getline(std::cin, dummy);
+                }
+                // Sub-option 2: Export - redirect to old option 8 handler
+                else if(set_cmd == "2"){
+                    // Export transactions handler will be triggered below
+                    c = "8";
+                    settings_loop = false;
+                }
+                // Sub-option 3: Health Check - redirect to old option 9 handler
+                else if(set_cmd == "3"){
+                    c = "9";
+                    settings_loop = false;
+                }
+                // Sub-option 4: UTXO Browser - redirect to old 'u' handler
+                else if(set_cmd == "4"){
+                    c = "u";
+                    settings_loop = false;
+                }
+                // Sub-option 5: Consolidate - redirect to old 'c' handler
+                else if(set_cmd == "5"){
+                    c = "c";
+                    settings_loop = false;
+                }
+                // Sub-option 6: TX Queue - redirect to old '7' handler
+                else if(set_cmd == "6"){
+                    c = "7";
+                    settings_loop = false;
+                }
+                // Sub-option 7: Release Pending - redirect to old 'p' handler
+                else if(set_cmd == "7"){
+                    c = "p";
+                    settings_loop = false;
+                }
+                // Sub-option 8: Network Diagnostics - redirect to old 'd' handler
+                else if(set_cmd == "8"){
+                    c = "d";
+                    settings_loop = false;
+                }
+                // Sub-option b: Backup
+                else if(set_cmd == "b" || set_cmd == "B"){
+                    std::cout << "\n";
+                    ui::print_info("Creating wallet backup...");
+
+                    std::string backup_path, backup_err;
+                    if(create_wallet_backup(wdir, backup_path, backup_err)){
+                        std::cout << "\n";
+                        ui::print_success("Backup created successfully!");
+                        std::cout << "  " << ui::dim() << "Location: " << backup_path << ui::reset() << "\n\n";
+                    } else {
+                        ui::print_error("Backup failed: " + backup_err);
+                    }
+
+                    std::cout << "  " << ui::dim() << "Press ENTER to continue..." << ui::reset();
+                    std::string dummy;
+                    std::getline(std::cin, dummy);
+                }
             }
-            if(!utxos.empty()){
-                std::cout << "    Smallest UTXO: " << fmt_amount(min_utxo) << " MIQ\n";
-                std::cout << "    Largest UTXO:  " << fmt_amount(max_utxo) << " MIQ\n";
-            }
-
-            std::cout << "\n  " << ui::bold() << "Connected Node:" << ui::reset() << "\n";
-            std::cout << "    " << last_connected_node << "\n\n";
-
-            std::cout << "  " << ui::dim() << "Press ENTER to return..." << ui::reset();
-            std::string dummy;
-            std::getline(std::cin, dummy);
+            if(settings_loop == false && c != "5") continue; // Re-process redirected command
             continue;
         }
 
@@ -6167,22 +6234,33 @@ static bool wallet_session(const std::string& cli_host,
             }
         }
         // =================================================================
-        // OPTION r: Refresh Balance
+        // OPTION r: Refresh Balance (with auto-broadcast)
         // =================================================================
         else if(c == "r" || c == "R"){
+            std::cout << "\n";
+            ui::print_info("Syncing wallet and processing queued transactions...");
+
             utxos = refresh_and_print();
             is_online = (last_connected_node != "<offline>" && last_connected_node != "<not connected>");
 
-            // Try to broadcast any pending transactions
+            // AUTO-BROADCAST: Automatically broadcast any pending transactions
             int pending_count = count_pending_in_queue(wdir);
             if(pending_count > 0 && is_online){
-                std::cout << "  " << ui::dim() << "Broadcasting " << pending_count << " queued transaction(s)..." << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << "[AUTO]" << ui::reset()
+                          << " Broadcasting " << pending_count << " queued transaction(s)...\n";
                 int broadcasted = process_tx_queue(wdir, seeds, pending, false);
                 if(broadcasted > 0){
-                    std::cout << "  " << ui::green() << "Broadcasted " << broadcasted << " transaction(s)" << ui::reset() << "\n\n";
-                    // Refresh balance display
+                    std::cout << "  " << ui::green() << "SUCCESS:" << ui::reset()
+                              << " Broadcasted " << broadcasted << " transaction(s)\n\n";
+                    // Refresh balance to show updated amounts
                     utxos = refresh_and_print();
+                } else {
+                    std::cout << "  " << ui::yellow() << "No transactions could be broadcasted" << ui::reset()
+                              << " - will retry on next refresh\n\n";
                 }
+            } else if(pending_count > 0 && !is_online){
+                std::cout << "  " << ui::yellow() << "[QUEUED]" << ui::reset()
+                          << " " << pending_count << " transaction(s) waiting - connect to network to broadcast\n\n";
             }
         }
         // =================================================================
@@ -6362,7 +6440,7 @@ static bool wallet_session(const std::string& cli_host,
             // =============================================================
             // ISSUES AND QUICK FIXES
             // =============================================================
-            bool has_issues = false;
+            [[maybe_unused]] bool has_issues = false;
             std::vector<std::pair<std::string, std::string>> quick_fixes;
 
             if(health.utxo_count > 50){

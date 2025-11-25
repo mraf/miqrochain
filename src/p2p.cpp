@@ -1002,7 +1002,7 @@ static bool g_sync_green_logged = false;
 static std::mutex g_file_scope_inflight_mu;
 static std::unordered_set<std::string> g_file_scope_inflight_blocks;
 
-static bool is_block_inflight(const std::string& hash) {
+[[maybe_unused]] static bool is_block_inflight(const std::string& hash) {
     std::lock_guard<std::mutex> lk(g_file_scope_inflight_mu);
     return g_file_scope_inflight_blocks.find(hash) != g_file_scope_inflight_blocks.end();
 }
@@ -4389,11 +4389,11 @@ void P2P::loop(){
                             P2P_TRACE(std::string("reject inbound banned(permanent) ip=") + ipbuf);
                             CLOSESOCK(c);
                         } else if (is_ip_banned(ipbuf, now)) {
-                            int64_t ms_left = 0;
+                            [[maybe_unused]] int64_t ban_ms_left = 0;
                             auto itb = timed_bans_.find(std::string(ipbuf));
-                            if (itb != timed_bans_.end() && itb->second > now) ms_left = itb->second - now;
+                            if (itb != timed_bans_.end() && itb->second > now) ban_ms_left = itb->second - now;
                             P2P_TRACE(std::string("reject inbound banned(timed) ip=") + ipbuf +
-                                      " ms_left=" + std::to_string(ms_left));
+                                      " ms_left=" + std::to_string(ban_ms_left));
                             CLOSESOCK(c);
                         } else {
                             P2P_TRACE("calling handle_new_peer for " + std::string(ipbuf) + " socket=" + std::to_string((uintptr_t)c));
@@ -4446,11 +4446,11 @@ void P2P::loop(){
                             P2P_TRACE(std::string("reject inbound banned(permanent) ip6=") + ip);
                             CLOSESOCK(c);
                         } else if (is_ip_banned(ip, now)) {
-                            int64_t ms_left = 0;
+                            [[maybe_unused]] int64_t ban_ms_left = 0;
                             auto itb = timed_bans_.find(ip);
-                            if (itb != timed_bans_.end() && itb->second > now) ms_left = itb->second - now;
+                            if (itb != timed_bans_.end() && itb->second > now) ban_ms_left = itb->second - now;
                             P2P_TRACE(std::string("reject inbound banned(timed) ip6=") + ip +
-                                      " ms_left=" + std::to_string(ms_left));
+                                      " ms_left=" + std::to_string(ban_ms_left));
                             CLOSESOCK(c);
                         } else {
                             handle_new_peer(c, ip);

@@ -707,7 +707,7 @@ std::string RpcService::handle(const std::string& body){
             auto tip = chain_.tip();
 
             // Parse optional params for capabilities/mode
-            bool longpoll = false;
+            [[maybe_unused]] bool longpoll = false;
             std::string mode = "template";
             if (!params.empty() && std::holds_alternative<std::map<std::string, JNode>>(params[0].v)) {
                 auto& p = std::get<std::map<std::string, JNode>>(params[0].v);
