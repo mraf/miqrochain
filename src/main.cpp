@@ -656,6 +656,10 @@ static inline void get_winsize(int& cols, int& rows) {
 }
 
 // Enable VT and probe Unicode ability.
+// IMPORTANT: On Windows, we only enable UTF-8/Unicode mode for terminals that
+// actually support extended Unicode glyphs. PowerShell 5 (legacy) uses fonts
+// like Consolas that don't have glyphs for many Unicode characters, causing
+// garbled output. We detect modern terminals that handle Unicode properly.
 static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
     vt_ok = true; u8_ok = false;
 #ifdef _WIN32
@@ -688,20 +692,39 @@ static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
         if (is_pipe) vt_ok = true;
     }
 
-    // Check if user explicitly disabled UTF-8 (opt-out model)
-    const bool disable_utf8 = []{
-        const char* s = std::getenv("MIQ_TUI_UTF8");
-        return s && *s && (std::strcmp(s,"0")==0 || std::strcmp(s,"false")==0 || std::strcmp(s,"False")==0);
-    }();
+    // Check if user explicitly set UTF-8 preference
+    const char* utf8_env = std::getenv("MIQ_TUI_UTF8");
+    const bool force_utf8 = utf8_env && *utf8_env &&
+        (std::strcmp(utf8_env,"1")==0 || std::strcmp(utf8_env,"true")==0 || std::strcmp(utf8_env,"True")==0);
+    const bool disable_utf8 = utf8_env && *utf8_env &&
+        (std::strcmp(utf8_env,"0")==0 || std::strcmp(utf8_env,"false")==0 || std::strcmp(utf8_env,"False")==0);
 
-    // Enable UTF-8 by default on Windows for PowerShell 5+ compatibility
-    // Only skip if user explicitly sets MIQ_TUI_UTF8=0
-    if (!disable_utf8 && have_console) {
-        // Set console code pages to UTF-8 (65001)
+    // Detect modern terminals that properly support Unicode:
+    // - Windows Terminal (WT_SESSION env var)
+    // - ConEmu (ConEmuANSI env var)
+    // - VS Code integrated terminal (TERM_PROGRAM=vscode)
+    // - MSYS2/Git Bash/MinGW (MSYSTEM or MSYS env var)
+    // - Alacritty, WezTerm, etc (TERM_PROGRAM set)
+    //
+    // Legacy PowerShell 5 running in conhost.exe does NOT properly render
+    // extended Unicode characters (box-drawing, emojis, Braille, etc.)
+    // even with code page 65001 set - the default fonts lack glyphs.
+    const bool is_modern_terminal =
+        std::getenv("WT_SESSION") ||           // Windows Terminal
+        std::getenv("ConEmuANSI") ||           // ConEmu
+        std::getenv("TERM_PROGRAM") ||         // VS Code, Alacritty, WezTerm, etc.
+        std::getenv("MSYSTEM") ||              // MSYS2/MinGW
+        std::getenv("MSYS") ||                 // MSYS
+        std::getenv("TERMINUS_SUBPROC") ||     // Terminus
+        std::getenv("ALACRITTY_LOG") ||        // Alacritty
+        std::getenv("WEZTERM_PANE");           // WezTerm
+
+    // Set UTF-8 code page for proper string handling
+    if (have_console) {
         SetConsoleOutputCP(CP_UTF8);
         SetConsoleCP(CP_UTF8);
 
-        // Also enable stdin for VT sequences if available
+        // Enable stdin VT sequences if available
         HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
         if (hIn && hIn != INVALID_HANDLE_VALUE) {
             DWORD inMode = 0;
@@ -710,8 +733,20 @@ static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
                 SetConsoleMode(hIn, inMode);
             }
         }
+    }
 
+    // Only enable Unicode graphics on modern terminals or if user forces it
+    // Default to ASCII mode for legacy PowerShell 5 / conhost.exe
+    if (force_utf8) {
         u8_ok = true;
+    } else if (disable_utf8) {
+        u8_ok = false;
+    } else if (is_modern_terminal) {
+        u8_ok = true;
+    } else {
+        // Legacy Windows console (PowerShell 5, cmd.exe in conhost)
+        // Use ASCII-safe mode to avoid garbled characters
+        u8_ok = false;
     }
 
     if (hConOut != INVALID_HANDLE_VALUE) CloseHandle(hConOut);
@@ -4077,13 +4112,15 @@ private:
     // =========================================================================
 
     // Animated spinner characters (multiple styles) - enhanced with more frames
+    // Uses ASCII for legacy terminals (PowerShell 5, cmd.exe)
     static const char* splash_spinner(int tick, bool u8) {
         if (u8) {
             // Premium 12-frame braille spinner for ultra-smooth animation
             static const char* frames[] = {"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷", "⠿", "⡿", "⣟", "⣯"};
             return frames[tick % 12];
         } else {
-            static const char* frames[] = {"|", "/", "-", "\\"};
+            // ASCII spinner that works in all terminals
+            static const char* frames[] = {"[|]", "[/]", "[-]", "[\\]"};
             return frames[tick % 4];
         }
     }
@@ -4111,7 +4148,22 @@ private:
 
     // Animated blockchain visualization
     static std::string blockchain_anim(int tick, bool u8, bool vt) {
-        if (!u8 || !vt) return vt ? "\x1b[36m[===CHAIN===]\x1b[0m" : "[===CHAIN===]";
+        if (!vt) return "[===CHAIN===]";
+
+        if (!u8) {
+            // ASCII animation for legacy terminals
+            std::string out = "\x1b[36m[";
+            static const char* ascii_blocks[] = {"#", "O", "o", "#", "O", "o"};
+            for (int i = 0; i < 7; ++i) {
+                int phase = (tick + i * 2) % 6;
+                int color = (phase < 3) ? 36 : 96;  // Cyan / bright cyan
+                out += "\x1b[" + std::to_string(color) + "m";
+                out += ascii_blocks[phase];
+                if (i < 6) out += "-";
+            }
+            out += "\x1b[36m]\x1b[0m";
+            return out;
+        }
 
         std::string out;
         // Animated chain with flowing blocks
@@ -4151,16 +4203,30 @@ private:
         std::string out;
         if (peers == 0) {
             // Searching animation
-            static const char* search[] = {"◜ ", " ◝", " ◞", "◟ "};
-            out += "\x1b[38;5;208m";  // Orange
-            out += u8 ? search[tick % 4] : ".";
+            if (u8) {
+                static const char* search[] = {"◜ ", " ◝", " ◞", "◟ "};
+                out += "\x1b[38;5;208m";  // Orange
+                out += search[tick % 4];
+            } else {
+                // ASCII animated dots
+                static const char* dots[] = {".", "..", "...", ".."};
+                out += "\x1b[33m";  // Yellow
+                out += dots[tick % 4];
+            }
             out += " Searching";
             out += "\x1b[0m";
         } else {
             // Connected with signal strength
-            static const char* signals[] = {"▁▃▅▇", "▁▃▅█", "▂▄▆█", "▁▃▆█"};
-            out += "\x1b[38;5;46m";  // Bright green
-            out += u8 ? signals[tick % 4] : "||||";
+            if (u8) {
+                static const char* signals[] = {"▁▃▅▇", "▁▃▅█", "▂▄▆█", "▁▃▆█"};
+                out += "\x1b[38;5;46m";  // Bright green
+                out += signals[tick % 4];
+            } else {
+                // ASCII signal bars
+                static const char* ascii_sig[] = {"[|  ]", "[|| ]", "[|||]", "[|| ]"};
+                out += "\x1b[32m";  // Green
+                out += ascii_sig[tick % 4];
+            }
             out += " " + std::to_string(peers) + " peer" + (peers != 1 ? "s" : "");
             out += "\x1b[0m";
         }
@@ -4280,16 +4346,17 @@ private:
         // Add subtle glow pulse
         bool bright = (tick % 4) < 2;
 
-        if (u8_ok_) {
-            out += "\x1b[38;5;240m⟨ \x1b[0m";  // Left bracket
-        }
+        // Left bracket - ASCII-safe
+        std::string left_bracket = u8_ok_ ? "⟨ " : "[ ";
+        std::string right_bracket = u8_ok_ ? " ⟩" : " ]";
+        out += "\x1b[38;5;240m" + left_bracket + "\x1b[0m";
+
         out += "\x1b[38;5;" + std::to_string(base_color) + "m";
         if (bright) out += "\x1b[1m";  // Bold on pulse
         out += pct_str;
         out += "\x1b[0m";
-        if (u8_ok_) {
-            out += "\x1b[38;5;240m ⟩\x1b[0m";  // Right bracket
-        }
+
+        out += "\x1b[38;5;240m" + right_bracket + "\x1b[0m";
 
         return out;
     }
@@ -4304,8 +4371,14 @@ private:
         if (!has_network_data) {
             // Still initializing - no network height known yet
             if (vt_ok_) {
-                static const char* init_frames[] = {"◐", "◓", "◑", "◒"};
-                std::string spinner = u8_ok_ ? init_frames[tick_ % 4] : ".";
+                std::string spinner;
+                if (u8_ok_) {
+                    static const char* init_frames[] = {"◐", "◓", "◑", "◒"};
+                    spinner = init_frames[tick_ % 4];
+                } else {
+                    static const char* ascii_frames[] = {".", "o", "O", "o"};
+                    spinner = ascii_frames[tick_ % 4];
+                }
                 return std::string("\x1b[38;5;214m") + spinner + " Initializing...\x1b[0m";
             }
             return "Initializing...";
@@ -4316,7 +4389,7 @@ private:
                 std::string check = u8_ok_ ? "✓ " : "[OK] ";
                 return std::string("\x1b[38;5;46m\x1b[1m") + check + "BLOCKCHAIN SYNCHRONIZED\x1b[0m";
             }
-            return "BLOCKCHAIN SYNCHRONIZED";
+            return "[OK] BLOCKCHAIN SYNCHRONIZED";
         }
 
         // Only show time behind if actually behind
@@ -4326,11 +4399,11 @@ private:
                 std::string check = u8_ok_ ? "✓ " : "[OK] ";
                 return std::string("\x1b[38;5;46m") + check + "Synchronized\x1b[0m";
             }
-            return "Synchronized";
+            return "[OK] Synchronized";
         }
 
         if (vt_ok_) {
-            std::string clock = u8_ok_ ? "⏳ " : "";
+            std::string clock = u8_ok_ ? "⏳ " : "[~] ";
             return std::string("\x1b[38;5;214m") + clock + time_behind + "\x1b[0m";
         }
         return time_behind;
@@ -4370,6 +4443,21 @@ private:
             }
             border += "\x1b[38;5;27m╗\x1b[0m";
             lines.push_back(border);
+        } else if (vt_ok_) {
+            // ANSI colors but ASCII characters
+            std::string border;
+            border += "\x1b[36m+";
+            for (int i = 0; i < box_width - 2; ++i) {
+                int pulse = (tick_ + i) % 4;
+                if (pulse < 2) border += "\x1b[36m";
+                else border += "\x1b[96m";
+                border += "=";
+            }
+            border += "\x1b[36m+\x1b[0m";
+            lines.push_back(border);
+        } else {
+            // Pure ASCII
+            lines.push_back("+" + std::string(box_width - 2, '=') + "+");
         }
 
         // ===== EPIC ASCII ART LOGO =====
@@ -4397,6 +4485,26 @@ private:
             } else {
                 lines.push_back("  MIQROCHAIN NODE");
             }
+        } else if (box_width >= 60) {
+            // ASCII-safe logo for PowerShell 5 and other legacy terminals
+            lines.push_back("");
+            if (vt_ok_) {
+                int color_offset = tick_ % 6;
+                static const int logo_colors[] = {36, 96, 32, 92, 34, 94};  // Cycling ANSI colors
+                std::string col = "\x1b[" + std::to_string(logo_colors[color_offset]) + "m\x1b[1m";
+                std::string rst = "\x1b[0m";
+                lines.push_back(col + "    M   M  III   QQQ   RRRR    OOO    CCCC  H   H   AAA   III  N   N" + rst);
+                lines.push_back(col + "    MM MM   I   Q   Q  R   R  O   O  C      H   H  A   A   I   NN  N" + rst);
+                lines.push_back(col + "    M M M   I   Q   Q  RRRR   O   O  C      HHHHH  AAAAA   I   N N N" + rst);
+                lines.push_back(col + "    M   M   I   Q  QQ  R  R   O   O  C      H   H  A   A   I   N  NN" + rst);
+                lines.push_back(col + "    M   M  III   QQQQ  R   R   OOO    CCCC  H   H  A   A  III  N   N" + rst);
+            } else {
+                lines.push_back("    M   M  III   QQQ   RRRR    OOO    CCCC  H   H   AAA   III  N   N");
+                lines.push_back("    MM MM   I   Q   Q  R   R  O   O  C      H   H  A   A   I   NN  N");
+                lines.push_back("    M M M   I   Q   Q  RRRR   O   O  C      HHHHH  AAAAA   I   N N N");
+                lines.push_back("    M   M   I   Q  QQ  R  R   O   O  C      H   H  A   A   I   N  NN");
+                lines.push_back("    M   M  III   QQQQ  R   R   OOO    CCCC  H   H  A   A  III  N   N");
+            }
         } else {
             lines.push_back("");
             lines.push_back(glow_text("MIQROCHAIN", tick_, vt_ok_));
@@ -4414,9 +4522,10 @@ private:
         // ===== VERSION & NETWORK INFO =====
         std::ostringstream ver;
         if (vt_ok_) {
+            std::string sep = u8_ok_ ? "│" : "|";
             ver << "\x1b[38;5;243mv" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
-                << "\x1b[0m  \x1b[38;5;240m│\x1b[0m  \x1b[38;5;75m" << CHAIN_NAME << "\x1b[0m"
-                << "  \x1b[38;5;240m│\x1b[0m  " << network_pulse(tick_, (int)peer_count, u8_ok_, vt_ok_);
+                << "\x1b[0m  \x1b[38;5;240m" << sep << "\x1b[0m  \x1b[38;5;75m" << CHAIN_NAME << "\x1b[0m"
+                << "  \x1b[38;5;240m" << sep << "\x1b[0m  " << network_pulse(tick_, (int)peer_count, u8_ok_, vt_ok_);
         } else {
             ver << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
                 << " | " << CHAIN_NAME << " | " << peer_count << " peers";
@@ -4614,6 +4723,21 @@ private:
             }
             border += "\x1b[38;5;27m╝\x1b[0m";
             lines.push_back(border);
+        } else if (vt_ok_) {
+            // ANSI colors but ASCII characters
+            std::string border;
+            border += "\x1b[36m+";
+            for (int i = 0; i < box_width - 2; ++i) {
+                int pulse = (tick_ + i) % 4;
+                if (pulse < 2) border += "\x1b[36m";
+                else border += "\x1b[96m";
+                border += "=";
+            }
+            border += "\x1b[36m+\x1b[0m";
+            lines.push_back(border);
+        } else {
+            // Pure ASCII
+            lines.push_back("+" + std::string(box_width - 2, '=') + "+");
         }
         lines.push_back("");
 
