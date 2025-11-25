@@ -85,6 +85,11 @@ namespace wallet_config {
     static constexpr int PENDING_TIMEOUT_MINUTES = 30;
     static constexpr int64_t PENDING_TIMEOUT_SECONDS = PENDING_TIMEOUT_MINUTES * 60;
 
+    // CRITICAL FIX: Rebroadcast interval for unconfirmed transactions
+    // Transactions with "broadcast" status should be rebroadcast periodically
+    static constexpr int REBROADCAST_INTERVAL_MINUTES = 10;
+    static constexpr int64_t REBROADCAST_INTERVAL_SECONDS = REBROADCAST_INTERVAL_MINUTES * 60;
+
     // Animation timings (PowerShell 5+ compatible)
     static constexpr int ANIMATION_FRAME_MS = 80;
     static constexpr int FAST_ANIMATION_MS = 50;
@@ -3825,12 +3830,24 @@ static void add_to_tx_queue(const std::string& wdir, const QueuedTransaction& tx
     queue.push_back(tx);
 
     // Keep only recent transactions (remove expired)
+    // CRITICAL FIX: "broadcast" status should NOT be kept forever - only "confirmed"
+    // A transaction with "broadcast" status that hasn't been confirmed after expiry
+    // should be considered expired (it was probably dropped from mempool)
     int64_t now = (int64_t)time(nullptr);
     int64_t expiry_seconds = wallet_config::TX_EXPIRY_HOURS * 3600;
 
     std::vector<QueuedTransaction> filtered;
     for(const auto& q : queue){
-        if(now - q.created_at < expiry_seconds || q.status == "confirmed" || q.status == "broadcast"){
+        bool keep = false;
+        if(q.status == "confirmed"){
+            // Confirmed transactions are always kept (they're historical record)
+            keep = true;
+        } else if(now - q.created_at < expiry_seconds){
+            // Non-expired transactions are kept
+            keep = true;
+        }
+        // Note: "broadcast" status but expired = NOT kept (it was never confirmed)
+        if(keep){
             filtered.push_back(q);
         }
     }
@@ -3990,8 +4007,53 @@ static bool remove_inputs_from_pending(const std::string& wdir,
                                       std::set<OutpointKey>& pending) {
     int count = (int)pending.size();
     pending.clear();
+    g_pending_map.clear();
     save_pending(wdir, pending);
     return count;
+}
+
+// CRITICAL FIX: Recover stuck transactions - release pending UTXOs for
+// transactions that have been "broadcast" but never confirmed after timeout
+static int recover_stuck_transactions(const std::string& wdir,
+                                       std::set<OutpointKey>& pending,
+                                       bool verbose = true) {
+    std::vector<QueuedTransaction> queue;
+    load_tx_queue(wdir, queue);
+
+    int64_t now = (int64_t)time(nullptr);
+    int64_t stuck_threshold = wallet_config::PENDING_TIMEOUT_SECONDS * 2; // 1 hour
+    int recovered = 0;
+
+    for(auto& tx : queue){
+        // Check for stuck "broadcast" transactions
+        if(tx.status == "broadcast"){
+            int64_t age = now - tx.created_at;
+            if(age > stuck_threshold){
+                // This transaction was broadcast but never confirmed for too long
+                if(verbose){
+                    ui::print_warning("Recovering stuck TX " + tx.txid_hex.substr(0, 16) +
+                                     "... (age: " + std::to_string(age / 3600) + " hours)");
+                }
+
+                // Release the pending UTXOs
+                if(!tx.raw_tx.empty()){
+                    remove_inputs_from_pending(wdir, tx.raw_tx, pending);
+                }
+
+                // Mark as expired
+                tx.status = "expired";
+                tx.error_msg = "Transaction never confirmed - inputs recovered";
+                recovered++;
+            }
+        }
+    }
+
+    if(recovered > 0){
+        save_tx_queue(wdir, queue);
+        save_pending(wdir, pending);
+    }
+
+    return recovered;
 }
 
 // =============================================================================
@@ -4708,8 +4770,22 @@ static int process_tx_queue(
     int64_t now = (int64_t)time(nullptr);
 
     for(auto& tx : queue){
-        // Skip if not queued or already too many attempts
-        if(tx.status != "queued" && tx.status != "broadcasting") continue;
+        // CRITICAL FIX: Also rebroadcast "broadcast" status transactions that haven't been
+        // confirmed for a while. They may have been dropped from mempool.
+        bool needs_rebroadcast = false;
+        if(tx.status == "broadcast"){
+            // Check if it's been too long since last attempt without confirmation
+            int64_t since_last = now - tx.last_attempt;
+            if(since_last >= wallet_config::REBROADCAST_INTERVAL_SECONDS){
+                needs_rebroadcast = true;
+                if(verbose){
+                    ui::print_info("Rebroadcasting unconfirmed TX " + tx.txid_hex.substr(0, 8) + "...");
+                }
+            }
+        }
+
+        // Skip if not queued, broadcasting, or needs rebroadcast
+        if(tx.status != "queued" && tx.status != "broadcasting" && !needs_rebroadcast) continue;
 
         if(tx.broadcast_attempts >= wallet_config::MAX_BROADCAST_ATTEMPTS){
             tx.status = "failed";
@@ -5039,11 +5115,18 @@ static bool wallet_session(const std::string& cli_host,
             // the transaction was likely never accepted or confirmed - release the UTXOs
             int timed_out = cleanup_timed_out_pending(pending, wdir);
 
+            // Third: CRITICAL FIX - Recover stuck transactions
+            // Transactions with "broadcast" status that haven't been confirmed for too long
+            int recovered = recover_stuck_transactions(wdir, pending, false);
+
             if(confirmed_count > 0){
                 ui::print_info(std::to_string(confirmed_count) + " pending transaction(s) confirmed");
             }
             if(timed_out > 0){
                 ui::print_warning(std::to_string(timed_out) + " pending UTXO(s) released (transaction timeout)");
+            }
+            if(recovered > 0){
+                ui::print_warning(std::to_string(recovered) + " stuck transaction(s) recovered - inputs released");
             }
 
             save_pending(wdir, pending);
