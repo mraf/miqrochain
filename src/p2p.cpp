@@ -2603,7 +2603,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 #endif
     }
 
-    log_warn("Peer: connected → " + peers_[s].ip);
+    log_info("Peer: connected → " + peers_[s].ip);
 
     // Gate first, then mark loopback (so flag actually sticks)
     gate_on_connect(s);
@@ -2664,6 +2664,18 @@ static bool violates_group_diversity(const std::unordered_map<Sock, miq::PeerSta
 }
 
 void P2P::handle_new_peer(Sock c, const std::string& ip){
+    // Check for duplicate IP to prevent same peer appearing twice
+    {
+        std::lock_guard<std::mutex> lk(g_peers_mu);
+        for (const auto& kv : peers_) {
+            if (kv.second.ip == ip) {
+                log_info("P2P: rejecting duplicate inbound connection from " + ip);
+                CLOSESOCK(c);
+                return;
+            }
+        }
+    }
+
     PeerState ps{};
     ps.sock = c;
     ps.ip   = ip;
@@ -3568,7 +3580,12 @@ void P2P::loop(){
                     g_ibd_headers_started_ms > 0 &&
                     (tnow - g_ibd_headers_started_ms) > (int64_t)MIQ_IBD_FALLBACK_AFTER_MS)
                 {
-                    log_warn("[IBD] headers phase exceeded fallback threshold; enabling index-by-height pipeline on capable peers");
+                    // Rate-limit this message to once per 60 seconds
+                    static int64_t last_ibd_fallback_log = 0;
+                    if (tnow - last_ibd_fallback_log > 60000) {
+                        last_ibd_fallback_log = tnow;
+                        log_info("[IBD] headers phase exceeded fallback threshold; enabling index-by-height pipeline on capable peers");
+                    }
                     for (auto &kvp : peers_) {
                         auto &pps = kvp.second;
                         if (!pps.verack_ok) continue;
@@ -3958,7 +3975,12 @@ void P2P::loop(){
                         }
                     }
                     
-                    log_warn("[IBD] next_block_fetch_targets empty - activating aggressive index-by-height fallback");
+                    // Rate-limit this warning to once per 60 seconds
+                    static int64_t last_empty_targets_log = 0;
+                    if (now - last_empty_targets_log > 60000) {
+                        last_empty_targets_log = now;
+                        log_info("[IBD] next_block_fetch_targets empty - activating aggressive index-by-height fallback");
+                    }
                     bool activated_any = false;
                     for (auto &kvp : peers_) {
                         auto &pps = kvp.second;
@@ -4100,15 +4122,25 @@ void P2P::loop(){
             // Use continuous batch pipeline: request next blocks every 200ms
             // This works both before AND after headers phase
             bool should_refetch = false;
+            static int64_t last_proactive_log = 0;
+            static int64_t last_stall_log = 0;
             if (g_sequential_sync && (now - last_refetch_time > 200)) {
                 // Proactive pipeline - keep requesting the next batch of blocks
                 should_refetch = true;
-                log_info("[SYNC] Proactive pipeline: requesting next block (height=" + std::to_string(current_height) + ")");
+                // Rate-limit log to once per 30 seconds
+                if (now - last_proactive_log > 30000) {
+                    last_proactive_log = now;
+                    log_info("[SYNC] Proactive pipeline active (height=" + std::to_string(current_height) + ")");
+                }
             } else if (height_stalled && (now - last_refetch_time > refetch_interval)) {
                 // Stall-based refetch (fallback)
                 should_refetch = true;
-                log_warn("[SYNC] Height stalled at " + std::to_string(current_height) + " for " +
-                        std::to_string((now - last_height_time) / 1000) + "s - forcing refetch");
+                // Rate-limit stall warning to once per 30 seconds
+                if (now - last_stall_log > 30000) {
+                    last_stall_log = now;
+                    log_warn("[SYNC] Height stalled at " + std::to_string(current_height) + " for " +
+                            std::to_string((now - last_height_time) / 1000) + "s - forcing refetch");
+                }
             }
 
             if (should_refetch) {
@@ -4578,10 +4610,22 @@ void P2P::loop(){
                 g_inflight_index_ts.erase(s_dead);
                 g_inflight_index_order.erase(s_dead);
 
+                // Log peer disconnection
+                log_info("Peer: disconnected ← " + ps_old.ip + " (remaining_peers=" + std::to_string(peers_.size() - 1) + ")");
+
                 // Finally, close & erase the dead peer.
                 gate_on_close(s_dead);
                 CLOSESOCK(s_dead);
                 peers_.erase(itp);
+
+                // Clean up all peer-related global state to prevent stale entries
+                g_outbounds.erase(s_dead);
+                g_zero_hdr_batches.erase(s_dead);
+                g_peer_stalls.erase(s_dead);
+                g_last_hdr_ok_ms.erase(s_dead);
+                g_preverack_counts.erase(s_dead);
+                g_trickle_last_ms.erase(s_dead);
+                g_cmd_rl.erase(s_dead);
             }
             // we handled the closes ourselves; do not let them be processed elsewhere this tick
             dead.clear();
@@ -5782,11 +5826,8 @@ void P2P::loop(){
             gate_on_close(s);
             auto it = peers_.find(s);
             if (it != peers_.end()) {
-                // Log peer disconnection with context
-                std::string reason = "unknown";
-                size_t inflight = it->second.inflight_blocks.size();
-                bool was_syncing = it->second.syncing;
                 std::string ip = it->second.ip;
+                size_t inflight = it->second.inflight_blocks.size();
                 if (inflight > 0) {
                     std::vector<std::string> keys;
                     keys.reserve(it->second.inflight_blocks.size());
@@ -5824,9 +5865,8 @@ void P2P::loop(){
                     }
                 }
 
-                if (inflight > 0 || was_syncing) {
-                    log_info("P2P: disconnecting peer " + ip + " (inflight_blocks=" + std::to_string(inflight) + ", syncing=" + (was_syncing ? "yes" : "no") + ", remaining_peers=" + std::to_string(peers_.size() - 1) + ")");
-                }
+                // Always log peer disconnection for visibility
+                log_info("Peer: disconnected ← " + ip + " (remaining_peers=" + std::to_string(peers_.size() - 1) + ")");
 
                 if (it->second.sock != MIQ_INVALID_SOCK) {
                     CLOSESOCK(s);
