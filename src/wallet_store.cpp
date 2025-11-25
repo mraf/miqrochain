@@ -37,7 +37,9 @@ static std::string appdata_dir() {
         const char* up = std::getenv("USERPROFILE");
         if (up && *up) {
             fs::path p(up);
-            p /= "AppData" / "Roaming" / "miqro";
+            p /= "AppData";
+            p /= "Roaming";
+            p /= "miqro";
             std::error_code ec;
             fs::create_directories(p, ec);
             return p.string();
@@ -62,7 +64,9 @@ static std::string appdata_dir() {
     const char* home = std::getenv("HOME");
     if (home && *home) {
         fs::path p(home);
-        p /= ".local" / "share" / "miqro";
+        p /= ".local";
+        p /= "share";
+        p /= "miqro";
         std::error_code ec;
         fs::create_directories(p, ec);
         return p.string();
