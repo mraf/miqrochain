@@ -8359,31 +8359,75 @@ static bool wallet_session(const std::string& cli_host,
             }
             save_pending(wdir, pending);
 
-            // v9.0: If we have change, add it to local UTXO list immediately
+            // v9.1: If we have change, add it to local UTXO list immediately
             // This provides instant balance feedback without waiting for SPV sync
+            // CRITICAL FIX: Use correct output index instead of hardcoding vout=1
             if(used_change && change > 0){
                 miq::UtxoLite change_utxo;
                 change_utxo.txid = tx.txid();
-                change_utxo.vout = 1;  // Change is typically output 1
-                change_utxo.value = change;
-                // Get change PKH from the transaction output
-                if(tx.vout.size() > 1){
-                    change_utxo.pkh = tx.vout[1].pkh;
+
+                // Find the change output by matching the change PKH
+                // Change is added after recipient, so it's typically at index 1
+                // but we verify by checking the PKH to be safe
+                uint32_t change_vout = 0;
+                bool found_change = false;
+                for(size_t i = 0; i < tx.vout.size(); ++i){
+                    if(tx.vout[i].pkh == cpkh && tx.vout[i].value == change){
+                        change_vout = (uint32_t)i;
+                        found_change = true;
+                        break;
+                    }
                 }
-                change_utxo.height = 0;  // Not yet confirmed
-                change_utxo.coinbase = false;
-                utxos.push_back(change_utxo);
+
+                if(found_change){
+                    change_utxo.vout = change_vout;
+                    change_utxo.value = change;
+                    change_utxo.pkh = cpkh;
+                    change_utxo.height = 0;  // Not yet confirmed
+                    change_utxo.coinbase = false;
+                    utxos.push_back(change_utxo);
+                } else {
+                    // Fallback: use index 1 if we can't find it by PKH match
+                    // This shouldn't happen in normal operation
+                    if(tx.vout.size() > 1){
+                        change_utxo.vout = 1;
+                        change_utxo.value = change;
+                        change_utxo.pkh = tx.vout[1].pkh;
+                        change_utxo.height = 0;
+                        change_utxo.coinbase = false;
+                        utxos.push_back(change_utxo);
+                    }
+                }
             }
 
-            // Update change index
+            // Update change index with robust save
             if(used_change){
                 auto m = w.meta();
                 m.next_change = meta.next_change + 1;
                 std::string e;
-                if(!miq::SaveHdWallet(wdir, seed, m, pass, e)){
+
+                // CRITICAL FIX: Retry wallet save with exponential backoff
+                // This prevents address reuse if a temporary save failure occurs
+                bool save_success = false;
+                for(int retry = 0; retry < 3 && !save_success; ++retry){
+                    if(miq::SaveHdWallet(wdir, seed, m, pass, e)){
+                        save_success = true;
+                        meta = m;
+                    } else {
+                        if(retry < 2){
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100 * (retry + 1)));
+                        }
+                    }
+                }
+
+                if(!save_success){
+                    // CRITICAL: If save fails after retries, warn user but continue
+                    // The transaction is already broadcast, so we must update in-memory state
+                    // to avoid immediate address reuse in this session
                     ui::print_warning("Could not save wallet state: " + e);
-                } else {
-                    meta = m;
+                    ui::print_warning("Change address index updated in memory only.");
+                    ui::print_warning("IMPORTANT: Please restart wallet to ensure state is synced.");
+                    meta = m;  // Update in-memory even on save failure to prevent address reuse THIS session
                 }
             }
 

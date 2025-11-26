@@ -449,13 +449,26 @@ void Mempool::try_promote_orphans_depending_on(const Key& parent, const UTXOView
     for (const auto& ck : cands){
         auto oit = orphans_.find(ck);
         if (oit == orphans_.end()) continue;
+
+        // CRITICAL FIX: Copy the transaction before removing from orphan pool
+        // This prevents the orphan from being skipped in add_orphan() due to
+        // the exists-in-orphans check, allowing it to be re-added with updated
+        // waiting_on_ entries if it still has missing inputs.
+        Transaction orphan_tx = oit->second;
+
+        // Remove from orphan pool BEFORE attempting to accept
+        // This is essential because accept() -> add_orphan() checks if already exists
+        remove_orphan(ck);
+
         std::string err;
-        if (accept(oit->second, utxo, height, err)) {
-            remove_orphan(ck);
-        } else {
-            // Hard rejected, drop it
-            remove_orphan(ck);
+        if (accept(orphan_tx, utxo, height, err)) {
+            // Successfully promoted to main mempool (or re-added as orphan with new waiting_on_ entries)
+            // Nothing more to do
+        } else if (!err.empty()) {
+            // Hard rejected with specific error - transaction is invalid, already removed
+            // Log for debugging if needed
         }
+        // If err.empty(), accept() already added it back to orphans with updated waiting_on_
     }
 }
 
