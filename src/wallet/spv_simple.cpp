@@ -282,6 +282,56 @@ try_bitcoin:
 
 struct CacheState { uint32_t scanned_upto = 0; };
 
+// =============================================================================
+// IN-MEMORY UTXO CACHE - Avoid repeated disk reads for performance
+// =============================================================================
+struct UtxoMemCache {
+    std::vector<UtxoLite> entries;
+    std::string cache_dir;
+    uint32_t scanned_height{0};
+    int64_t last_load_time{0};
+    bool valid{false};
+
+    static UtxoMemCache& instance() {
+        static UtxoMemCache cache;
+        return cache;
+    }
+
+    void invalidate() {
+        entries.clear();
+        scanned_height = 0;
+        last_load_time = 0;
+        valid = false;
+    }
+
+    bool is_valid(const std::string& dir, uint32_t current_tip) const {
+        // Cache is valid if:
+        // 1. It's been loaded
+        // 2. Same cache directory
+        // 3. We're at or ahead of the cached height (no new blocks)
+        // 4. Within 30 seconds of last load (for mempool changes)
+        if (!valid) return false;
+        if (cache_dir != dir) return false;
+
+        auto now = std::chrono::system_clock::now().time_since_epoch();
+        int64_t now_sec = std::chrono::duration_cast<std::chrono::seconds>(now).count();
+        if ((now_sec - last_load_time) > 30) return false;
+
+        // If tip is the same or behind our cache, we're up to date
+        return current_tip <= scanned_height;
+    }
+
+    void update(const std::string& dir, const std::vector<UtxoLite>& utxos, uint32_t height) {
+        entries = utxos;
+        cache_dir = dir;
+        scanned_height = height;
+
+        auto now = std::chrono::system_clock::now().time_since_epoch();
+        last_load_time = std::chrono::duration_cast<std::chrono::seconds>(now).count();
+        valid = true;
+    }
+};
+
 static inline std::string path_join(const std::string& dir, const char* fname){
     if (dir.empty()) return std::string(fname);
     char sep = '/';
@@ -446,8 +496,24 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
         return false;
     }
 
-    // Show progress: tip height
-    // Note: This runs silently to avoid noise, but the caller can show this info
+    // PERFORMANCE: Check in-memory cache first to avoid disk reads and block scanning
+    // If cache is valid (same wallet, recent, and no new blocks), return cached UTXOs
+    {
+        auto& mem_cache = UtxoMemCache::instance();
+        if(mem_cache.is_valid(opt.cache_dir, tip_height)){
+            // Filter cached UTXOs by current wallet's PKHs
+            std::unordered_set<std::vector<uint8_t>, VecHash> pkhset(pkhs.begin(), pkhs.end());
+            out.clear();
+            out.reserve(mem_cache.entries.size());
+            for(const auto& u : mem_cache.entries){
+                if(pkhset.find(u.pkh) != pkhset.end()){
+                    out.push_back(u);
+                }
+            }
+            p2p.close();
+            return true;
+        }
+    }
 
     // 3) decide start height from cache (or full/genesis on first run)
     CacheState st{};
@@ -685,6 +751,9 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
         if(pkhset.find(u.pkh) == pkhset.end()) continue;
         finalv.push_back(u);
     }
+
+    // PERFORMANCE: Update in-memory cache for instant subsequent loads
+    UtxoMemCache::instance().update(opt.cache_dir, finalv, tip_height);
 
     out.swap(finalv);
     return true;
