@@ -688,9 +688,10 @@ bool P2PLight::get_best_header(uint32_t& tip_height, std::vector<uint8_t>& tip_h
     size_t loops = 0;
 
     // Track progress to detect stalls
+    // BULLETPROOF FIX: Increased stall tolerance from 5 to 15 for slow networks
     size_t last_count = 0;
     int stall_count = 0;
-    const int kMaxStalls = 5;
+    const int kMaxStalls = 15;
 
     while(true){
         if (++loops > kMaxLoops) {
@@ -1091,8 +1092,9 @@ bool P2PLight::send_version(std::string& err){
 }
 
 bool P2PLight::read_until_verack(std::string& err){
-    // Read a few messages, stop when we see verack.
-    for (int i=0;i<50;i++){
+    // Read messages until we see verack - increased limit for slow networks
+    // BULLETPROOF FIX: Increased from 50 to 200 iterations for reliability
+    for (int i=0;i<200;i++){
         std::string cmd; uint32_t len=0, csum=CSUM_NONE;
         if(!read_msg_header(cmd, len, csum, err)) return false;
 

@@ -1,11 +1,12 @@
-// src/miqwallet.cpp - ULTIMATE MIQ Wallet CLI v7.0
-// THE COOLEST WALLET EVER - Single-screen professional dashboard with:
-// - Live animated real-time UI with particle effects
-// - Instant key response system with smooth animations
-// - Advanced transaction tracking with multi-source confirmation
-// - Professional visual effects and matrix-style status displays
+// src/miqwallet.cpp - RYTHMIUM WALLET v8.0
+// THE ULTIMATE PROFESSIONAL CRYPTOCURRENCY WALLET featuring:
+// - Flicker-free live monitor dashboard with smooth rendering
+// - Real-time transaction tracking with instant confirmations
+// - Zero-flicker cursor-based UI updates
+// - Advanced UTXO management with auto-consolidation
 // - Auto-recovery system for stuck transactions
-// - Enterprise-grade security with beautiful UX
+// - Enterprise-grade security with professional UX
+// - Proper wallet isolation - transactions never leak between wallets
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -727,15 +728,15 @@ namespace ui {
     void print_banner() {
         std::cout << cyan() << bold();
         std::cout << R"(
-    __  __ ___ ___   __        __    _ _      _
-   |  \/  |_ _/ _ \  \ \      / /_ _| | | ___| |_
-   | |\/| || | | | |  \ \ /\ / / _` | | |/ _ \ __|
-   | |  | || | |_| |   \ V  V / (_| | | |  __/ |_
-   |_|  |_|___\__\_\    \_/\_/ \__,_|_|_|\___|\__|
-
+    ____        _   _               _
+   |  _ \ _   _| |_| |__  _ __ ___ (_)_   _ _ __ ___
+   | |_) | | | | __| '_ \| '_ ` _ \| | | | | '_ ` _ \
+   |  _ <| |_| | |_| | | | | | | | | | |_| | | | | | |
+   |_| \_\\__, |\__|_| |_|_| |_| |_|_|\__,_|_| |_| |_|
+          |___/
 )" << reset();
-        std::cout << green() << bold() << "      Professional Cryptocurrency Wallet v5.0" << reset() << "\n";
-        std::cout << dim() << "  Bulletproof TX | Auto-Recovery | Splash UI | Full TXID" << reset() << "\n\n";
+        std::cout << magenta() << bold() << "          RYTHMIUM WALLET v8.0" << reset() << "\n";
+        std::cout << dim() << "   Live Monitor | Zero-Flicker | Real-Time TX Tracking" << reset() << "\n\n";
     }
 
     // =========================================================================
@@ -1216,22 +1217,23 @@ namespace ui {
         const int WIDTH = 60;
         std::cout << "\n\n";
 
-        // Logo with colors
+        // Logo with colors - RYTHMIUM WALLET v8.0
         if (g_use_colors) {
             std::cout << cyan() << bold();
-            std::cout << "       __  __ ___ ___   __        __    _ _      _\n";
-            std::cout << "      |  \\/  |_ _/ _ \\  \\ \\      / /_ _| | | ___| |_\n";
-            std::cout << "      | |\\/| || | | | |  \\ \\ /\\ / / _` | | |/ _ \\ __|\n";
-            std::cout << "      | |  | || | |_| |   \\ V  V / (_| | | |  __/ |_\n";
-            std::cout << "      |_|  |_|___\\__\\_\\    \\_/\\_/ \\__,_|_|_|\\___|\\__|\n";
+            std::cout << "       ____        _   _               _\n";
+            std::cout << "      |  _ \\ _   _| |_| |__  _ __ ___ (_)_   _ _ __ ___\n";
+            std::cout << "      | |_) | | | | __| '_ \\| '_ ` _ \\| | | | | '_ ` _ \\\n";
+            std::cout << "      |  _ <| |_| | |_| | | | | | | | | | |_| | | | | | |\n";
+            std::cout << "      |_| \\_\\\\__, |\\__|_| |_|_| |_| |_|_|\\__,_|_| |_| |_|\n";
+            std::cout << "             |___/\n";
             std::cout << reset() << "\n";
         } else {
-            std::cout << "       MIQ WALLET\n\n";
+            std::cout << "      RYTHMIUM WALLET v8.0\n\n";
         }
 
         // Version and subtitle
-        std::cout << green() << bold() << "           Professional Cryptocurrency Wallet v5.0" << reset() << "\n";
-        std::cout << dim() << "        Secure | SPV | Live Dashboard | Auto-TX Queue" << reset() << "\n\n";
+        std::cout << magenta() << bold() << "             RYTHMIUM WALLET v8.0" << reset() << "\n";
+        std::cout << dim() << "      Zero-Flicker | Live Monitor | Real-Time TX Tracking" << reset() << "\n\n";
 
         // Status box
         std::cout << cyan() << "    +";
@@ -1670,7 +1672,7 @@ namespace ui {
 namespace live_dashboard {
 
     // ==========================================================================
-    // ULTIMATE DASHBOARD v7.0 - Single Screen Professional Design
+    // RYTHMIUM DASHBOARD v8.0 - Zero-Flicker Live Monitor Design
     // ==========================================================================
 
     // Menu item with animation state
@@ -1695,7 +1697,7 @@ namespace live_dashboard {
         std::string to_address;
     };
 
-    // Dashboard state
+    // Dashboard state with flicker-free support
     struct DashboardState {
         int animation_tick{0};
         int selected_item{0};
@@ -1704,9 +1706,26 @@ namespace live_dashboard {
         bool is_online{false};
         std::string connected_node;
         std::vector<LiveTxStatus> recent_txs;
+        bool first_draw{true};  // Track if this is the first draw
+        int last_tx_count{0};   // Track transaction count changes
     };
 
     static DashboardState g_state;
+
+    // FLICKER-FREE RENDERING: Move cursor to home position instead of clearing
+    static void cursor_home() {
+        std::cout << "\033[H" << std::flush;
+    }
+
+    // Clear to end of line (for overwriting old content)
+    static void clear_to_eol() {
+        std::cout << "\033[K";
+    }
+
+    // Clear entire screen only once at startup
+    static void initial_clear() {
+        std::cout << "\033[2J\033[H" << std::flush;
+    }
 
     // Get animated network pulse
     static std::string get_network_pulse(int tick, bool online) {
@@ -1913,7 +1932,7 @@ namespace live_dashboard {
         std::cout << ui::cyan() << "|" << ui::reset() << "\n";
     }
 
-    // Draw the ULTIMATE animated dashboard - ALL IN ONE SCREEN
+    // Draw the RYTHMIUM animated dashboard - ZERO FLICKER
     static void draw_dashboard(
         const std::string& title,
         uint64_t balance_total,
@@ -1930,44 +1949,57 @@ namespace live_dashboard {
         int pending_utxo_count,
         int tick
     ) {
+        (void)title;  // Use our own title
         const int W = 80;  // Wider for professional look
 
-        // Clear screen
-        ui::clear_screen();
+        // FLICKER-FREE: Only clear screen on first draw, then use cursor home
+        if (g_state.first_draw) {
+            initial_clear();
+            g_state.first_draw = false;
+        } else {
+            cursor_home();
+        }
 
-        // Top border with animated title
+        // Top border with animated title - RYTHMIUM WALLET
         std::cout << "\n";
-        draw_double_box_top("MIQ WALLET v7.0 - ULTIMATE DASHBOARD", W);
+        draw_double_box_top("RYTHMIUM WALLET v8.0 - LIVE MONITOR", W);
 
-        // Status bar with live network indicator
+        // Status bar with live network indicator - FLICKER-FREE with fixed width
         std::cout << ui::cyan() << "|" << ui::reset();
-        std::cout << " " << get_network_pulse(tick, is_online);
+        std::ostringstream status_line;
+        status_line << " " << get_network_pulse(tick, is_online);
         if (is_online) {
-            std::cout << " " << ui::green() << "ONLINE" << ui::reset();
+            status_line << " " << ui::green() << "ONLINE" << ui::reset();
             if (!connected_node.empty() && connected_node != "<not connected>") {
-                std::cout << ui::dim() << " @ " << connected_node.substr(0, 25) << ui::reset();
+                std::string node_display = connected_node.substr(0, 25);
+                status_line << ui::dim() << " @ " << node_display << ui::reset();
             }
         } else {
-            std::cout << " " << ui::red() << ui::bold() << "OFFLINE" << ui::reset();
+            status_line << " " << ui::red() << ui::bold() << "OFFLINE" << ui::reset();
         }
 
         // Queue and pending indicators with animation
         if (queue_count > 0) {
             const char* q_anim[] = {"[Q]", "<Q>", "{Q}", "<Q>"};
-            std::cout << "  " << ui::yellow() << q_anim[tick % 4] << queue_count << ui::reset();
+            status_line << "  " << ui::yellow() << q_anim[tick % 4] << queue_count << ui::reset();
         }
         if (pending_utxo_count > 0) {
-            std::cout << "  " << ui::magenta() << "[P]" << pending_utxo_count << ui::reset();
+            status_line << "  " << ui::magenta() << "[P]" << pending_utxo_count << ui::reset();
         }
 
-        // Fill and timestamp
+        // Fill with spaces for consistent width and timestamp
         int64_t now = time(nullptr);
         struct tm* t = localtime(&now);
         char time_buf[16];
         strftime(time_buf, sizeof(time_buf), "%H:%M:%S", t);
-        std::cout << std::string(W - 55 - (queue_count > 0 ? 6 : 0) - (pending_utxo_count > 0 ? 6 : 0), ' ');
+
+        std::cout << status_line.str();
+        // Use fixed padding for flicker-free rendering
+        std::cout << std::string(20, ' ');  // Fixed padding
         std::cout << ui::dim() << time_buf << ui::reset();
-        std::cout << " " << ui::cyan() << "|" << ui::reset() << "\n";
+        std::cout << " " << ui::cyan() << "|" << ui::reset();
+        clear_to_eol();
+        std::cout << "\n";
 
         // Animated divider
         draw_gradient_line(W, tick);
@@ -2079,10 +2111,17 @@ namespace live_dashboard {
         for (int i = 0; i < W - 2; i++) std::cout << "=";
         std::cout << "+" << ui::reset() << "\n";
 
-        // Animated instruction line
+        // Animated instruction line with clear to end
         const char* cursor[] = {"_", " ", "_", "|"};
         std::cout << "\n  " << ui::dim() << "Press a key (no Enter): " << ui::reset();
-        std::cout << ui::green() << cursor[tick % 4] << ui::reset() << std::flush;
+        std::cout << ui::magenta() << cursor[tick % 4] << ui::reset();
+        clear_to_eol();
+        std::cout << std::flush;
+    }
+
+    // Reset dashboard state (call when leaving dashboard)
+    static void reset_dashboard_state() {
+        g_state.first_draw = true;
     }
 
     // Wait for instant key with timeout and animation
@@ -2160,6 +2199,36 @@ static void clear_spv_cache(const std::string& wdir){
 }
 
 // =============================================================================
+// FORWARD DECLARATIONS - Needed for wallet isolation fix
+// =============================================================================
+struct OutpointKey {
+    std::string txid_hex;
+    uint32_t vout{0};
+    bool operator<(const OutpointKey& o) const {
+        if (txid_hex != o.txid_hex) return txid_hex < o.txid_hex;
+        return vout < o.vout;
+    }
+};
+
+struct PendingEntry {
+    OutpointKey key;
+    int64_t timestamp{0};
+    std::string source_txid;
+
+    bool operator<(const PendingEntry& o) const {
+        return key < o.key;
+    }
+
+    bool is_timed_out(int64_t now = 0) const {
+        if (now == 0) now = (int64_t)time(nullptr);
+        return (now - timestamp) > wallet_config::PENDING_TIMEOUT_SECONDS;
+    }
+};
+
+// Global map for pending entries - declared here for use in verify_cache_ownership
+static std::map<OutpointKey, PendingEntry> g_pending_map;
+
+// =============================================================================
 // WALLET FINGERPRINT - Prevents cache contamination between wallets
 // =============================================================================
 
@@ -2208,51 +2277,44 @@ static void verify_cache_ownership(const std::string& wdir,
     }
 
     if(cached_fp != current_fp){
-        // Different wallet! Clear ALL cached data
+        // Different wallet! Clear ALL cached data to prevent contamination
         clear_spv_cache(wdir);
 
-        // Also clear pending spent since it's wallet-specific
+        // CRITICAL FIX v8.0: Clear pending spent since it's wallet-specific
         std::remove(join_path(wdir, "pending_spent.dat").c_str());
+
+        // CRITICAL FIX v8.0: Clear in-memory pending map as well!
+        g_pending_map.clear();
+
+        // CRITICAL FIX v8.0: Clear transaction history - this was causing
+        // transactions from one wallet to show in another wallet!
+        std::remove(join_path(wdir, "tx_history.dat").c_str());
+
+        // CRITICAL FIX v8.0: Clear transaction queue
+        std::remove(join_path(wdir, "tx_queue.dat").c_str());
+
+        // CRITICAL FIX v8.0: Clear tracked transactions
+        std::remove(join_path(wdir, "tracked_tx.dat").c_str());
+
+        // CRITICAL FIX v8.0: Clear wallet event log for this wallet
+        std::remove(join_path(wdir, "wallet_events.log").c_str());
+
+        // CRITICAL FIX v8.0: Clear wallet statistics
+        std::remove(join_path(wdir, "wallet_stats.dat").c_str());
 
         // Save new fingerprint
         save_wallet_fingerprint(wdir, current_fp);
 
         // Note: Cache was invalidated due to wallet fingerprint mismatch
         // This happens when switching between different wallets
+        // All wallet-specific data has been cleared to prevent contamination
     }
 }
 
 // =============================================================================
 // PENDING-SPENT CACHE - Enhanced with timestamps for timeout support
+// (OutpointKey, PendingEntry, g_pending_map declared above for wallet isolation)
 // =============================================================================
-struct OutpointKey {
-    std::string txid_hex;
-    uint32_t vout{0};
-    bool operator<(const OutpointKey& o) const {
-        if (txid_hex != o.txid_hex) return txid_hex < o.txid_hex;
-        return vout < o.vout;
-    }
-};
-
-// CRITICAL FIX: Timestamped pending entry for timeout support
-struct PendingEntry {
-    OutpointKey key;
-    int64_t timestamp{0};       // When this was marked as pending
-    std::string source_txid;    // The TX that is spending this UTXO (for tracking)
-
-    bool operator<(const PendingEntry& o) const {
-        return key < o.key;
-    }
-
-    // Check if this pending entry has timed out
-    bool is_timed_out(int64_t now = 0) const {
-        if (now == 0) now = (int64_t)time(nullptr);
-        return (now - timestamp) > wallet_config::PENDING_TIMEOUT_SECONDS;
-    }
-};
-
-// Map from OutpointKey to PendingEntry for fast lookups
-static std::map<OutpointKey, PendingEntry> g_pending_map;
 
 static std::string pending_file_path_for_wdir(const std::string& wdir){
     return join_path(wdir, "pending_spent.dat");
@@ -3144,7 +3206,7 @@ static void save_wallet_stats(const std::string& wdir, const WalletStats& stats)
     std::ofstream f(stats_file_path(wdir), std::ios::out | std::ios::trunc);
     if(!f.good()) return;
 
-    f << "# MIQ Wallet Statistics\n";
+    f << "# Rythmium Wallet Statistics\n";
     f << "total_received=" << stats.total_received << "\n";
     f << "total_sent=" << stats.total_sent << "\n";
     f << "total_fees=" << stats.total_fees_paid << "\n";
@@ -3836,7 +3898,7 @@ static std::string labeled_addresses_path(const std::string& wdir){
     std::ofstream f(labeled_addresses_path(wdir), std::ios::out | std::ios::trunc);
     if(!f.good()) return;
 
-    f << "# MIQ Wallet Labeled Addresses\n";
+    f << "# Rythmium Wallet Labeled Addresses\n";
     f << "# Format: address|label|category|created|last_used|received|sent|tx_count|is_change|watch_only|notes\n";
 
     for(const auto& a : addrs){
@@ -4533,7 +4595,7 @@ static std::string config_file_path(const std::string& wdir){
     std::ofstream f(config_file_path(wdir), std::ios::out | std::ios::trunc);
     if(!f.good()) return;
 
-    f << "# MIQ Wallet Configuration\n";
+    f << "# Rythmium Wallet Configuration\n";
     f << "session_timeout=" << cfg.session_timeout_minutes << "\n";
     f << "require_password=" << (cfg.require_password_for_send ? "1" : "0") << "\n";
     f << "max_failed_attempts=" << cfg.max_failed_attempts << "\n";
@@ -4794,7 +4856,7 @@ static void load_tx_history(const std::string& wdir, std::vector<TxHistoryEntry>
 static void save_tx_history(const std::string& wdir, const std::vector<TxHistoryEntry>& hist){
     std::ofstream f(tx_history_path(wdir), std::ios::out | std::ios::trunc);
     if(!f.good()) return;
-    f << "# MIQ Wallet Transaction History\n";
+    f << "# Rythmium Wallet Transaction History\n";
     for(const auto& e : hist){
         f << e.txid_hex << "|" << e.timestamp << "|" << e.amount << "|"
           << e.fee << "|" << e.confirmations << "|" << e.direction << "|"
@@ -5442,7 +5504,7 @@ static void load_address_book(const std::string& wdir, std::vector<AddressBookEn
 static void save_address_book(const std::string& wdir, const std::vector<AddressBookEntry>& book){
     std::ofstream f(address_book_path(wdir), std::ios::out | std::ios::trunc);
     if(!f.good()) return;
-    f << "# MIQ Wallet Address Book\n";
+    f << "# Rythmium Wallet Address Book\n";
     for(const auto& e : book){
         f << e.address << "|" << e.label << "|" << e.notes << "|"
           << e.created_at << "|" << e.last_used << "\n";
@@ -6952,9 +7014,9 @@ static bool wallet_session(const std::string& cli_host,
 
         int queue_count = count_pending_in_queue(wdir);
 
-        // Draw the ULTIMATE animated dashboard v7.0
+        // Draw the RYTHMIUM animated dashboard v8.0 - ZERO FLICKER
         live_dashboard::draw_dashboard(
-            "MIQ WALLET v7.0 - ULTIMATE DASHBOARD",
+            "RYTHMIUM WALLET v8.0 - LIVE MONITOR",
             menu_wb.total,
             menu_wb.spendable,
             menu_wb.immature,
@@ -6992,6 +7054,10 @@ static bool wallet_session(const std::string& cli_host,
 
         // Disable raw mode for submenu input
         instant_input::disable_raw_mode();
+
+        // FLICKER-FREE: Reset dashboard state when entering submenu
+        // This ensures proper redraw when returning to main dashboard
+        live_dashboard::reset_dashboard_state();
 
         // =================================================================
         // OPTION 3: Transaction History - Professional Viewer
@@ -9432,7 +9498,7 @@ static bool wallet_session(const std::string& cli_host,
             ui::clear_screen();
             std::cout << "\n";
             ui::print_separator(50);
-            std::cout << "\n  " << ui::cyan() << "Thank you for using MIQ Wallet!" << ui::reset() << "\n";
+            std::cout << "\n  " << ui::magenta() << "Thank you for using Rythmium Wallet!" << ui::reset() << "\n";
             std::cout << "  " << ui::dim() << "Your wallet is safely saved." << ui::reset() << "\n\n";
             break;
         }
@@ -9698,7 +9764,7 @@ int main(int argc, char** argv){
             continue;
         }
         if(a == "--help" || a == "-h"){
-            std::cout << "MIQ Wallet - Professional Cryptocurrency Wallet\n\n";
+            std::cout << "Rythmium Wallet v8.0 - Professional Cryptocurrency Wallet\n\n";
             std::cout << "Usage: miqwallet [options]\n\n";
             std::cout << "Options:\n";
             std::cout << "  --p2pseed=host:port   Connect to specific P2P node\n";

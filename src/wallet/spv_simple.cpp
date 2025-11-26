@@ -423,8 +423,21 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
     if(!p2p.connect_and_handshake(po, err)) return false;
 
     // 2) headers -> tip (this syncs all headers which may take time)
+    // BULLETPROOF FIX: Retry header sync up to 3 times for reliability
     uint32_t tip_height=0; std::vector<uint8_t> tip_hash_le;
-    if(!p2p.get_best_header(tip_height, tip_hash_le, err)){ p2p.close(); return false; }
+    bool header_success = false;
+    for(int header_retry = 0; header_retry < 3 && !header_success; ++header_retry){
+        if(p2p.get_best_header(tip_height, tip_hash_le, err)){
+            header_success = true;
+        } else {
+            if(header_retry < 2){
+                // Wait before retry with exponential backoff
+                std::this_thread::sleep_for(std::chrono::milliseconds(500 * (1 << header_retry)));
+                err.clear();
+            }
+        }
+    }
+    if(!header_success){ p2p.close(); return false; }
 
     // Validate tip hash
     if(tip_hash_le.size() != 32){
@@ -565,7 +578,19 @@ bool spv_collect_utxos(const std::string& p2p_host, const std::string& p2p_port,
         }
 
         std::vector<uint8_t> raw;
-        if(!p2p.get_block_by_hash(hash_le, raw, err)){
+        // BULLETPROOF FIX: Retry block fetch up to 3 times before failing
+        bool block_success = false;
+        for(int block_retry = 0; block_retry < 3 && !block_success; ++block_retry){
+            if(p2p.get_block_by_hash(hash_le, raw, err)){
+                block_success = true;
+            } else {
+                // Wait before retry with exponential backoff
+                if(block_retry < 2){
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << block_retry)));
+                }
+            }
+        }
+        if(!block_success){
             // Append height info to error for better debugging
             if(!err.empty()) err += " (at height " + std::to_string(height) + ")";
             p2p.close();
