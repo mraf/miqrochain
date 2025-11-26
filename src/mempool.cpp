@@ -49,17 +49,21 @@ int64_t Mempool::now_ms(){
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Helper: compute a minimal relay fee if a global policy macro is defined.
-// If MIN_RELAY_FEE_RATE is not defined globally, this returns 0 (no floor change).
+// Helper: compute a minimal relay fee based on transaction size.
+// Uses MIQ_MEMPOOL_MIN_FEE_RATE from constants.h (sat/byte)
+// CRITICAL FIX: Always enforce minimum fee - this was previously broken due to macro mismatch
 static inline uint64_t min_fee_for_size_bytes(size_t sz){
-#ifdef MIN_RELAY_FEE_RATE
+    // Default minimum: 1 sat/byte (1000 sat/kB)
+    // This ensures transactions have at least some fee to prevent spam
+#ifdef MIQ_MEMPOOL_MIN_FEE_RATE
+    // MIQ_MEMPOOL_MIN_FEE_RATE is in sat/byte, convert to sat/kB for calculation
+    constexpr uint64_t fee_rate_per_kb = (uint64_t)MIQ_MEMPOOL_MIN_FEE_RATE * 1000ULL;
+#else
+    constexpr uint64_t fee_rate_per_kb = 1000ULL;  // Default: 1 sat/byte = 1000 sat/kB
+#endif
     uint64_t kb = (uint64_t)((sz + 999) / 1000);
     if (kb == 0) kb = 1;
-    return kb * (uint64_t)MIN_RELAY_FEE_RATE;
-#else
-    (void)sz;
-    return 0;
-#endif
+    return kb * fee_rate_per_kb;
 }
 
 bool Mempool::validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView& utxo, uint64_t& fee, std::string& err) const {

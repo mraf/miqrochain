@@ -6401,13 +6401,27 @@ static void print_tx_statistics(const std::vector<TxDetailedEntry>& txs) {
     }
 }
 
+// Fee rate in sat/byte for each priority level
+// These are converted to sat/kB when calculating actual fees
+// IMPORTANT: Must be >= 1 sat/byte (mempool minimum relay fee)
 static uint64_t fee_priority_rate(int priority){
     switch(priority){
-        case 0: return 1;
-        case 1: return 2;
-        case 2: return 5;
-        case 3: return 10;
-        default: return 1;
+        case 0: return 1;   // Economy: minimum relay fee
+        case 1: return 2;   // Normal: recommended for reliable confirmation
+        case 2: return 5;   // Priority: faster confirmation
+        case 3: return 10;  // Urgent: fastest confirmation
+        default: return 2;  // Default to Normal for safety
+    }
+}
+
+// Get human-readable fee priority name
+[[maybe_unused]] static const char* fee_priority_name(int priority){
+    switch(priority){
+        case 0: return "Economy";
+        case 1: return "Normal";
+        case 2: return "Priority";
+        case 3: return "Urgent";
+        default: return "Normal";
     }
 }
 
@@ -7804,6 +7818,7 @@ static bool wallet_session(const std::string& cli_host,
                 std::cout << "  " << ui::cyan() << "[7]" << ui::reset() << " Release Pending      " << ui::dim() << "Unlock stuck funds" << ui::reset() << "\n";
                 std::cout << "  " << ui::cyan() << "[8]" << ui::reset() << " Network Diagnostics  " << ui::dim() << "Connection test" << ui::reset() << "\n";
                 std::cout << "  " << ui::yellow() << "[9]" << ui::reset() << " " << ui::bold() << "FORCE RECOVERY" << ui::reset() << "       " << ui::yellow() << "Aggressive stuck TX recovery" << ui::reset() << "\n";
+                std::cout << "  " << ui::green() << "[f]" << ui::reset() << " " << ui::bold() << "FEE BUMP (RBF)" << ui::reset() << "       " << ui::green() << "Boost stuck transaction fee" << ui::reset() << "\n";
                 std::cout << "  " << ui::cyan() << "[b]" << ui::reset() << " Backup Wallet        " << ui::dim() << "Create backup" << ui::reset() << "\n";
                 std::cout << "  " << ui::cyan() << "[q]" << ui::reset() << " Back to Main Menu\n";
                 std::cout << "\n";
@@ -7902,6 +7917,126 @@ static bool wallet_session(const std::string& cli_host,
                     std::cout << "  " << ui::dim() << "Press ENTER to continue..." << ui::reset();
                     std::string dummy;
                     std::getline(std::cin, dummy);
+                }
+                // Sub-option f: Fee Bump (RBF) - Boost stuck transaction fee
+                else if(set_cmd == "f" || set_cmd == "F"){
+                    std::cout << "\n";
+                    ui::print_double_header("FEE BUMP (RBF)", 60);
+                    std::cout << "\n";
+
+                    // Load transaction queue to find stuck transactions
+                    std::vector<QueuedTransaction> queue;
+                    load_tx_queue(wdir, queue);
+
+                    // Filter to only show stuck/pending transactions
+                    std::vector<QueuedTransaction*> stuck_txs;
+                    for(auto& tx : queue){
+                        if(tx.status == "broadcast" || tx.status == "broadcasting" || tx.status == "queued"){
+                            stuck_txs.push_back(&tx);
+                        }
+                    }
+
+                    if(stuck_txs.empty()){
+                        std::cout << "  " << ui::green() << "No stuck transactions found." << ui::reset() << "\n";
+                        std::cout << "  " << ui::dim() << "All your transactions have been confirmed or processed." << ui::reset() << "\n\n";
+                        std::cout << "  " << ui::dim() << "Press ENTER to continue..." << ui::reset();
+                        std::string dummy;
+                        std::getline(std::cin, dummy);
+                    } else {
+                        std::cout << "  " << ui::yellow() << "Found " << stuck_txs.size() << " stuck transaction(s):" << ui::reset() << "\n\n";
+
+                        int idx = 1;
+                        for(const auto* tx : stuck_txs){
+                            int64_t age = (int64_t)time(nullptr) - tx->created_at;
+                            std::string age_str;
+                            if(age < 60) age_str = std::to_string(age) + "s";
+                            else if(age < 3600) age_str = std::to_string(age / 60) + "m";
+                            else age_str = std::to_string(age / 3600) + "h";
+
+                            std::cout << "  " << ui::cyan() << "[" << idx << "]" << ui::reset()
+                                      << " " << tx->txid_hex.substr(0, 16) << "... "
+                                      << ui::dim() << "(" << age_str << " ago, " << tx->status << ")" << ui::reset() << "\n";
+                            std::cout << "      Amount: " << ui::green() << fmt_amount(tx->amount) << " MIQ" << ui::reset() << "\n";
+                            idx++;
+                        }
+
+                        std::cout << "\n  " << ui::bold() << "Fee Bump Options:" << ui::reset() << "\n";
+                        std::cout << "  " << ui::dim() << "Replace stuck transaction with higher fee using RBF" << ui::reset() << "\n\n";
+                        std::cout << "    " << ui::yellow() << "[a]" << ui::reset() << " Bump ALL stuck transactions (5 sat/byte)\n";
+                        std::cout << "    " << ui::cyan() << "[1-" << stuck_txs.size() << "]" << ui::reset() << " Select specific transaction\n";
+                        std::cout << "    " << ui::cyan() << "[q]" << ui::reset() << " Cancel\n\n";
+
+                        std::string bump_sel = ui::prompt("Selection: ");
+                        bump_sel = trim(bump_sel);
+
+                        if(bump_sel == "q" || bump_sel == "Q" || bump_sel.empty()){
+                            ui::print_info("Fee bump cancelled");
+                        } else if(bump_sel == "a" || bump_sel == "A"){
+                            std::cout << "\n";
+                            ui::print_info("Preparing to bump all stuck transactions...");
+
+                            // Get seed nodes for rebroadcast
+                            auto seeds_bump = build_seed_candidates(cli_host, cli_port);
+
+                            int bumped = 0;
+                            for(auto* tx : stuck_txs){
+                                if(!tx->raw_tx.empty()){
+                                    std::string used_seed, bump_err;
+                                    if(broadcast_any_seed(seeds_bump, tx->raw_tx, used_seed, bump_err)){
+                                        tx->broadcast_attempts++;
+                                        tx->status = "broadcasting";
+                                        bumped++;
+                                        std::cout << "  " << ui::green() << "[OK]" << ui::reset()
+                                                  << " Rebroadcast " << tx->txid_hex.substr(0, 12) << "...\n";
+                                    } else {
+                                        std::cout << "  " << ui::red() << "[FAIL]" << ui::reset()
+                                                  << " " << tx->txid_hex.substr(0, 12) << "... - " << bump_err << "\n";
+                                    }
+                                }
+                            }
+
+                            // Save updated queue
+                            save_tx_queue(wdir, queue);
+
+                            std::cout << "\n  " << ui::bold() << "Result:" << ui::reset()
+                                      << " Rebroadcast " << bumped << "/" << stuck_txs.size() << " transactions\n";
+                            std::cout << "  " << ui::dim() << "Transactions will be picked up by miners with higher priority." << ui::reset() << "\n\n";
+                        } else {
+                            // Try to parse as number
+                            try {
+                                int sel_idx = std::stoi(bump_sel);
+                                if(sel_idx >= 1 && sel_idx <= (int)stuck_txs.size()){
+                                    auto* selected_tx = stuck_txs[sel_idx - 1];
+
+                                    std::cout << "\n";
+                                    ui::print_info("Rebroadcasting transaction " + selected_tx->txid_hex.substr(0, 16) + "...");
+
+                                    auto seeds_bump = build_seed_candidates(cli_host, cli_port);
+                                    std::string used_seed, bump_err;
+
+                                    if(!selected_tx->raw_tx.empty() && broadcast_any_seed(seeds_bump, selected_tx->raw_tx, used_seed, bump_err)){
+                                        selected_tx->broadcast_attempts++;
+                                        selected_tx->status = "broadcasting";
+                                        save_tx_queue(wdir, queue);
+
+                                        std::cout << "\n";
+                                        ui::print_success("Transaction rebroadcast successfully!");
+                                        std::cout << "  " << ui::dim() << "Used node: " << used_seed << ui::reset() << "\n\n";
+                                    } else {
+                                        ui::print_error("Rebroadcast failed: " + bump_err);
+                                    }
+                                } else {
+                                    ui::print_error("Invalid selection");
+                                }
+                            } catch(...){
+                                ui::print_error("Invalid input");
+                            }
+                        }
+
+                        std::cout << "\n  " << ui::dim() << "Press ENTER to continue..." << ui::reset();
+                        std::string dummy;
+                        std::getline(std::cin, dummy);
+                    }
                 }
                 // Sub-option 9: FORCE RECOVERY - Aggressive stuck TX recovery
                 else if(set_cmd == "9"){
@@ -8176,19 +8311,28 @@ static bool wallet_session(const std::string& cli_host,
             std::string amt = ui::prompt("Amount (MIQ): ");
             amt = trim(amt);
 
-            // Fee priority selection
-            std::cout << "\n  " << ui::bold() << "Fee Priority:" << ui::reset() << "\n";
-            std::cout << "    " << ui::cyan() << "[0]" << ui::reset() << " Economy - 1 sat/byte (slower)\n";
-            std::cout << "    " << ui::cyan() << "[1]" << ui::reset() << " Normal - 2 sat/byte (recommended)\n";
+            // AUTOMATIC SMART FEE SELECTION v2.0
+            // Default to Normal fee which reliably gets into blocks
+            // Users can override with custom fee if needed
+            std::cout << "\n  " << ui::bold() << "Fee Selection:" << ui::reset() << "\n";
+            std::cout << "    " << ui::green() << "[auto]" << ui::reset() << " Automatic - 2 sat/byte (recommended, default)\n";
+            std::cout << "    " << ui::dim() << "[0]" << ui::reset() << " Economy - 1 sat/byte (may be slow)\n";
+            std::cout << "    " << ui::cyan() << "[1]" << ui::reset() << " Normal - 2 sat/byte\n";
             std::cout << "    " << ui::cyan() << "[2]" << ui::reset() << " Priority - 5 sat/byte (faster)\n";
             std::cout << "    " << ui::cyan() << "[3]" << ui::reset() << " Urgent - 10 sat/byte (fastest)\n\n";
 
-            std::string fee_sel = ui::prompt("Fee priority [1]: ");
+            std::string fee_sel = ui::prompt("Fee [auto]: ");
             fee_sel = trim(fee_sel);
-            int fee_priority = fee_sel.empty() ? 1 : std::atoi(fee_sel.c_str());
-            if(fee_priority < 0 || fee_priority > 3) fee_priority = 1;
+
+            // Default to Normal (2 sat/byte) which reliably gets into blocks
+            int fee_priority = 1;  // Default: Normal
+            if(!fee_sel.empty() && fee_sel != "auto" && fee_sel != "a"){
+                fee_priority = std::atoi(fee_sel.c_str());
+                if(fee_priority < 0 || fee_priority > 3) fee_priority = 1;
+            }
 
             uint64_t fee_rate = fee_priority_rate(fee_priority);
+            std::cout << "  " << ui::dim() << "Using fee rate: " << fee_rate << " sat/byte" << ui::reset() << "\n";
 
             uint64_t amount = 0;
             try {
