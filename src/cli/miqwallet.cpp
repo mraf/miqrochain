@@ -2575,7 +2575,7 @@ namespace live_dashboard {
         std::cout << "   \033[38;5;51m[5]\033[0m Settings  ";
         std::cout << "\033[38;5;46m[r]\033[0m Refresh   ";
         std::cout << "\033[38;5;51m[t]\033[0m Monitor   ";
-        std::cout << "\033[38;5;51m[h]\033[0m Help      ";
+        std::cout << "\033[38;5;214m[d]\033[0m TX Info   ";
         std::cout << "\033[38;5;196m[q]\033[0m Exit      ";
         std::cout << "\033[38;5;39m║\033[0m\n";
 
@@ -2611,7 +2611,8 @@ namespace live_dashboard {
         return c == '1' || c == '2' || c == '3' || c == '4' || c == '5' ||
                c == 'n' || c == 'N' || c == 'r' || c == 'R' ||
                c == 'b' || c == 'B' || c == 'h' || c == 'H' ||
-               c == 't' || c == 'T' || c == 'q' || c == 'Q' || c == 27;
+               c == 't' || c == 'T' || c == 'd' || c == 'D' ||
+               c == 'q' || c == 'Q' || c == 27;
     }
 
 } // namespace live_dashboard
@@ -5588,6 +5589,317 @@ static int auto_detect_received_transactions(
 }
 
 // =============================================================================
+// ENHANCED TRANSACTION DETAILS v2.0 - Full Blockchain Information
+// =============================================================================
+
+struct BlockchainTxDetails {
+    // Transaction Info
+    std::string txid_hex;
+    int64_t timestamp{0};
+    int64_t amount{0};
+    uint64_t fee{0};
+    uint32_t confirmations{0};
+    std::string direction;
+    std::string to_address;
+    std::string from_address;
+    std::string memo;
+    uint32_t tx_size{0};
+    double fee_rate{0.0};
+
+    // Block Info (if confirmed)
+    uint64_t block_height{0};
+    std::string block_hash;
+    uint64_t block_difficulty{0};
+    double block_difficulty_float{0.0};
+    int64_t block_time{0};
+    uint32_t block_tx_count{0};
+    uint64_t block_size{0};
+
+    // Status
+    bool is_confirmed{false};
+    bool is_mempool{false};
+    std::string status_text;
+};
+
+// Fetch blockchain info via RPC
+static bool fetch_blockchain_info(const std::string& host, uint16_t port,
+                                   uint64_t& height, uint64_t& difficulty, std::string& best_hash) {
+    std::string rpc_body = R"({"method":"getblockchaininfo","params":[]})";
+    miq::HttpResponse resp;
+    std::vector<std::pair<std::string, std::string>> headers;
+
+    if (!miq::http_post(host, port, "/", rpc_body, headers, resp, 5000)) {
+        return false;
+    }
+
+    if (resp.code != 200) return false;
+
+    // Parse response (simple JSON extraction)
+    auto extract_num = [&](const std::string& key) -> uint64_t {
+        size_t pos = resp.body.find("\"" + key + "\"");
+        if (pos == std::string::npos) return 0;
+        pos = resp.body.find(":", pos);
+        if (pos == std::string::npos) return 0;
+        pos++;
+        while (pos < resp.body.size() && (resp.body[pos] == ' ' || resp.body[pos] == '\t')) pos++;
+        uint64_t val = 0;
+        while (pos < resp.body.size() && std::isdigit(resp.body[pos])) {
+            val = val * 10 + (resp.body[pos] - '0');
+            pos++;
+        }
+        return val;
+    };
+
+    auto extract_str = [&](const std::string& key) -> std::string {
+        size_t pos = resp.body.find("\"" + key + "\"");
+        if (pos == std::string::npos) return "";
+        pos = resp.body.find(":", pos);
+        if (pos == std::string::npos) return "";
+        pos = resp.body.find("\"", pos);
+        if (pos == std::string::npos) return "";
+        pos++;
+        size_t end = resp.body.find("\"", pos);
+        if (end == std::string::npos) return "";
+        return resp.body.substr(pos, end - pos);
+    };
+
+    height = extract_num("blocks");
+    difficulty = extract_num("difficulty");
+    best_hash = extract_str("bestblockhash");
+
+    return true;
+}
+
+// Get block by height
+static bool fetch_block_by_height(const std::string& host, uint16_t port, uint64_t height,
+                                   std::string& hash_out, uint64_t& difficulty_out,
+                                   int64_t& time_out, uint32_t& tx_count_out) {
+    // First get block hash
+    std::string rpc_body = R"({"method":"getblockhash","params":[)" + std::to_string(height) + R"(]})";
+    miq::HttpResponse resp;
+    std::vector<std::pair<std::string, std::string>> headers;
+
+    if (!miq::http_post(host, port, "/", rpc_body, headers, resp, 5000)) {
+        return false;
+    }
+
+    if (resp.code != 200) return false;
+
+    // Extract hash from result
+    size_t pos = resp.body.find("\"result\"");
+    if (pos == std::string::npos) return false;
+    pos = resp.body.find("\"", pos + 8);
+    if (pos == std::string::npos) return false;
+    pos++;
+    size_t end = resp.body.find("\"", pos);
+    if (end == std::string::npos) return false;
+    hash_out = resp.body.substr(pos, end - pos);
+
+    // Now get block details
+    rpc_body = R"({"method":"getblock","params":[")" + hash_out + R"("]})";
+    if (!miq::http_post(host, port, "/", rpc_body, headers, resp, 5000)) {
+        return false;
+    }
+
+    if (resp.code != 200) return false;
+
+    // Parse block info
+    auto extract_num = [&](const std::string& key) -> uint64_t {
+        size_t p = resp.body.find("\"" + key + "\"");
+        if (p == std::string::npos) return 0;
+        p = resp.body.find(":", p);
+        if (p == std::string::npos) return 0;
+        p++;
+        while (p < resp.body.size() && (resp.body[p] == ' ' || resp.body[p] == '\t')) p++;
+        uint64_t val = 0;
+        while (p < resp.body.size() && std::isdigit(resp.body[p])) {
+            val = val * 10 + (resp.body[p] - '0');
+            p++;
+        }
+        return val;
+    };
+
+    difficulty_out = extract_num("difficulty");
+    time_out = (int64_t)extract_num("time");
+    tx_count_out = (uint32_t)extract_num("nTx");
+
+    return true;
+}
+
+// Draw professional transaction details window
+static void draw_tx_details_window(const BlockchainTxDetails& tx, int width = 72) {
+    using namespace ui;
+
+    // Window drawing helpers
+    auto draw_top = [&](const std::string& title) {
+        std::cout << cyan() << (g_use_utf8 ? "╔" : "+");
+        int title_space = width - 4 - (int)title.size();
+        int left_pad = title_space / 2;
+        int right_pad = title_space - left_pad;
+        for (int i = 0; i < left_pad; i++) std::cout << (g_use_utf8 ? "═" : "=");
+        std::cout << reset() << bold() << " " << title << " " << reset() << cyan();
+        for (int i = 0; i < right_pad; i++) std::cout << (g_use_utf8 ? "═" : "=");
+        std::cout << (g_use_utf8 ? "╗" : "+") << reset() << "\n";
+    };
+
+    auto draw_line = [&](const std::string& label, const std::string& value, const std::string& color = "") {
+        std::cout << cyan() << (g_use_utf8 ? "║" : "|") << reset();
+        std::cout << "  " << dim() << std::setw(18) << std::left << label << reset();
+        if (!color.empty()) std::cout << color;
+        std::cout << value;
+        if (!color.empty()) std::cout << reset();
+        int used = 2 + 18 + (int)value.size();
+        int pad = width - 2 - used;
+        if (pad > 0) std::cout << std::string(pad, ' ');
+        std::cout << cyan() << (g_use_utf8 ? "║" : "|") << reset() << "\n";
+    };
+
+    [[maybe_unused]] auto draw_divider = [&]() {
+        std::cout << cyan() << (g_use_utf8 ? "╠" : "+");
+        for (int i = 0; i < width - 2; i++) std::cout << (g_use_utf8 ? "═" : "=");
+        std::cout << (g_use_utf8 ? "╣" : "+") << reset() << "\n";
+    };
+
+    auto draw_section = [&](const std::string& title) {
+        std::cout << cyan() << (g_use_utf8 ? "╠" : "+");
+        for (int i = 0; i < width - 2; i++) std::cout << (g_use_utf8 ? "─" : "-");
+        std::cout << (g_use_utf8 ? "╣" : "+") << reset() << "\n";
+        std::cout << cyan() << (g_use_utf8 ? "║" : "|") << reset();
+        std::cout << " " << bold() << (g_use_utf8 ? "▸ " : "> ") << title << reset();
+        int pad = width - 4 - (int)title.size();
+        if (pad > 0) std::cout << std::string(pad, ' ');
+        std::cout << cyan() << (g_use_utf8 ? "║" : "|") << reset() << "\n";
+    };
+
+    auto draw_bottom = [&]() {
+        std::cout << cyan() << (g_use_utf8 ? "╚" : "+");
+        for (int i = 0; i < width - 2; i++) std::cout << (g_use_utf8 ? "═" : "=");
+        std::cout << (g_use_utf8 ? "╝" : "+") << reset() << "\n";
+    };
+
+    // Draw the window
+    std::cout << "\n";
+    draw_top("TRANSACTION DETAILS");
+
+    // Transaction ID section
+    std::cout << cyan() << (g_use_utf8 ? "║" : "|") << reset();
+    std::cout << "  " << dim() << "TXID:" << reset() << "\n";
+    std::cout << cyan() << (g_use_utf8 ? "║" : "|") << reset();
+    std::cout << "  " << yellow() << tx.txid_hex << reset();
+    int txid_pad = width - 4 - (int)tx.txid_hex.size();
+    if (txid_pad > 0) std::cout << std::string(txid_pad, ' ');
+    std::cout << cyan() << (g_use_utf8 ? "║" : "|") << reset() << "\n";
+
+    draw_section("TRANSACTION INFO");
+
+    // Direction with color
+    std::string dir_color = "";
+    std::string dir_icon = "";
+    if (tx.direction == "sent") {
+        dir_color = "\033[38;5;196m";  // Red
+        dir_icon = g_use_utf8 ? "↑ " : "^ ";
+    } else if (tx.direction == "received") {
+        dir_color = "\033[38;5;46m";   // Green
+        dir_icon = g_use_utf8 ? "↓ " : "v ";
+    } else if (tx.direction == "mined") {
+        dir_color = "\033[38;5;220m";  // Gold
+        dir_icon = g_use_utf8 ? "⛏ " : "* ";
+    } else {
+        dir_color = "\033[38;5;51m";   // Cyan
+        dir_icon = g_use_utf8 ? "↔ " : "- ";
+    }
+
+    std::string dir_display = dir_icon + tx.direction;
+    std::transform(dir_display.begin(), dir_display.end(), dir_display.begin(), ::toupper);
+    draw_line("Direction:", dir_display, dir_color);
+
+    // Amount
+    std::ostringstream amt_ss;
+    amt_ss << std::fixed << std::setprecision(8) << (std::abs((double)tx.amount) / (double)COIN) << " MIQ";
+    draw_line("Amount:", amt_ss.str(), tx.direction == "sent" ? "\033[38;5;196m" : "\033[38;5;46m");
+
+    // Fee
+    if (tx.fee > 0) {
+        std::ostringstream fee_ss;
+        fee_ss << std::fixed << std::setprecision(8) << ((double)tx.fee / (double)COIN) << " MIQ";
+        if (tx.fee_rate > 0) {
+            fee_ss << " (" << std::fixed << std::setprecision(2) << tx.fee_rate << " sat/byte)";
+        }
+        draw_line("Fee:", fee_ss.str());
+    }
+
+    // Status
+    std::string status_color = tx.is_confirmed ? "\033[38;5;46m" : "\033[38;5;220m";
+    std::string status_icon = tx.is_confirmed ? (g_use_utf8 ? "✓ " : "+ ") : (g_use_utf8 ? "◐ " : "o ");
+    draw_line("Status:", status_icon + tx.status_text, status_color);
+
+    // Confirmations
+    draw_line("Confirmations:", std::to_string(tx.confirmations),
+              tx.confirmations >= 6 ? "\033[38;5;46m" : (tx.confirmations > 0 ? "\033[38;5;220m" : "\033[38;5;196m"));
+
+    // Time
+    draw_line("Time:", ui::format_time(tx.timestamp));
+
+    // Address
+    if (!tx.to_address.empty()) {
+        draw_line("To Address:", tx.to_address);
+    }
+    if (!tx.from_address.empty()) {
+        draw_line("From Address:", tx.from_address);
+    }
+
+    // Memo
+    if (!tx.memo.empty()) {
+        draw_line("Memo:", tx.memo);
+    }
+
+    // Block section (if confirmed)
+    if (tx.is_confirmed && tx.block_height > 0) {
+        draw_section("BLOCK INFO");
+
+        draw_line("Block Height:", std::to_string(tx.block_height), "\033[38;5;51m");
+
+        if (!tx.block_hash.empty()) {
+            std::string hash_short = tx.block_hash.size() > 48 ?
+                tx.block_hash.substr(0, 24) + "..." + tx.block_hash.substr(tx.block_hash.size() - 16) :
+                tx.block_hash;
+            draw_line("Block Hash:", hash_short);
+        }
+
+        // Difficulty - show raw number
+        if (tx.block_difficulty > 0) {
+            std::ostringstream diff_ss;
+            diff_ss << tx.block_difficulty;
+            // Add human readable suffix
+            if (tx.block_difficulty >= 1000000000000ULL) {
+                diff_ss << " (" << std::fixed << std::setprecision(2) << (tx.block_difficulty / 1000000000000.0) << "T)";
+            } else if (tx.block_difficulty >= 1000000000ULL) {
+                diff_ss << " (" << std::fixed << std::setprecision(2) << (tx.block_difficulty / 1000000000.0) << "G)";
+            } else if (tx.block_difficulty >= 1000000ULL) {
+                diff_ss << " (" << std::fixed << std::setprecision(2) << (tx.block_difficulty / 1000000.0) << "M)";
+            } else if (tx.block_difficulty >= 1000ULL) {
+                diff_ss << " (" << std::fixed << std::setprecision(2) << (tx.block_difficulty / 1000.0) << "K)";
+            }
+            draw_line("Difficulty:", diff_ss.str(), "\033[38;5;214m");
+        }
+
+        if (tx.block_time > 0) {
+            draw_line("Block Time:", ui::format_time(tx.block_time));
+        }
+
+        if (tx.block_tx_count > 0) {
+            draw_line("Block TX Count:", std::to_string(tx.block_tx_count));
+        }
+    } else if (!tx.is_confirmed) {
+        draw_section("MEMPOOL STATUS");
+        draw_line("Status:", "Waiting for confirmation", "\033[38;5;220m");
+        draw_line("Next Block:", "Estimated 1-3 blocks (~8-24 min)");
+    }
+
+    draw_bottom();
+}
+
+// =============================================================================
 // QUEUED TRANSACTION - Offline transaction support with persistence
 // =============================================================================
 struct QueuedTransaction {
@@ -7136,14 +7448,76 @@ static int process_tx_queue(
 // =============================================================================
 // AMOUNT FORMATTING
 // =============================================================================
+
+// Locale-independent amount parsing - handles both . and , as decimal separator
+// This fixes bug where "34.2856" was rounded to "34" due to locale issues
 static uint64_t parse_amount_miqron(const std::string& s){
-    // Supports "1.5" or "150000000"
-    double d = std::stod(s);
-    if(d < 0) throw std::runtime_error("negative amount");
-    if(d > (double)wallet_config::MAX_SINGLE_TX_VALUE / (double)COIN){
+    if(s.empty()) throw std::runtime_error("empty amount");
+
+    // Create a normalized copy - replace commas with periods for consistency
+    std::string normalized = s;
+    for(char& c : normalized){
+        if(c == ',') c = '.';
+    }
+
+    // Remove any whitespace
+    normalized.erase(std::remove_if(normalized.begin(), normalized.end(), ::isspace), normalized.end());
+
+    // Check for valid characters
+    size_t dot_count = 0;
+    for(size_t i = 0; i < normalized.size(); ++i){
+        char c = normalized[i];
+        if(c == '.'){
+            dot_count++;
+            if(dot_count > 1) throw std::runtime_error("multiple decimal points");
+        } else if(c == '-'){
+            if(i != 0) throw std::runtime_error("invalid negative sign position");
+        } else if(!std::isdigit(static_cast<unsigned char>(c))){
+            throw std::runtime_error("invalid character in amount");
+        }
+    }
+
+    // Parse integer and fractional parts separately for precision
+    uint64_t integer_part = 0;
+    uint64_t fractional_part = 0;
+    int fractional_digits = 0;
+
+    size_t dot_pos = normalized.find('.');
+    if(dot_pos == std::string::npos){
+        // No decimal point - integer only
+        integer_part = std::stoull(normalized);
+    } else {
+        // Has decimal point
+        std::string int_str = normalized.substr(0, dot_pos);
+        std::string frac_str = normalized.substr(dot_pos + 1);
+
+        if(!int_str.empty()){
+            integer_part = std::stoull(int_str);
+        }
+
+        // Process fractional part - pad or truncate to 8 digits (COIN = 10^8)
+        fractional_digits = (int)frac_str.size();
+        if(fractional_digits > 0){
+            // Pad with zeros if less than 8 digits
+            while(frac_str.size() < 8) frac_str += '0';
+            // Truncate if more than 8 digits
+            if(frac_str.size() > 8) frac_str = frac_str.substr(0, 8);
+            fractional_part = std::stoull(frac_str);
+        }
+    }
+
+    // Check for negative
+    if(normalized[0] == '-') throw std::runtime_error("negative amount");
+
+    // Calculate total in satoshis/miqron
+    uint64_t total = integer_part * COIN + fractional_part;
+
+    // Validate against maximum
+    if(total > wallet_config::MAX_SINGLE_TX_VALUE){
         throw std::runtime_error("amount too large");
     }
-    return (uint64_t)std::round(d * (double)COIN);
+
+    return total;
 }
 
 static size_t est_size_bytes(size_t nin, size_t nout){
@@ -10085,6 +10459,179 @@ static bool wallet_session(const std::string& cli_host,
                         std::getline(std::cin, dummy);
                     }
                 }
+            }
+        }
+        // =================================================================
+        // OPTION d: Transaction Details - Full Blockchain Info
+        // =================================================================
+        else if(c == "d" || c == "D"){
+            const int DETAIL_WIN_WIDTH = 72;
+            std::cout << "\n";
+
+            std::vector<TxHistoryEntry> all_txs;
+            load_tx_history(wdir, all_txs);
+
+            if(all_txs.empty()){
+                ui::draw_window_top("TRANSACTION DETAILS", DETAIL_WIN_WIDTH);
+                ui::draw_window_line("  No transactions found.", DETAIL_WIN_WIDTH);
+                ui::draw_window_line("  Send or receive MIQ to see transaction details.", DETAIL_WIN_WIDTH);
+                ui::draw_window_bottom(DETAIL_WIN_WIDTH);
+                std::cout << "\n";
+                continue;
+            }
+
+            // Sort by timestamp (most recent first)
+            std::sort(all_txs.begin(), all_txs.end(),
+                [](const TxHistoryEntry& a, const TxHistoryEntry& b){
+                    return a.timestamp > b.timestamp;
+                });
+
+            // Get current chain height from connected node for block info lookups
+            uint64_t current_height = 0;
+            uint64_t current_difficulty = 0;
+            std::string best_hash;
+            std::string rpc_host = "127.0.0.1";
+            uint16_t rpc_port = 8332;
+
+            // Try to parse from last_connected_node
+            if(last_connected_node != "<offline>" && last_connected_node != "<not connected>"){
+                size_t colon = last_connected_node.find(':');
+                if(colon != std::string::npos){
+                    rpc_host = last_connected_node.substr(0, colon);
+                    try {
+                        rpc_port = (uint16_t)std::stoi(last_connected_node.substr(colon + 1));
+                    } catch(...) {}
+                }
+            }
+
+            fetch_blockchain_info(rpc_host, rpc_port, current_height, current_difficulty, best_hash);
+
+            bool details_running = true;
+            while(details_running){
+                std::cout << "\n";
+                ui::draw_window_top("SELECT TRANSACTION", DETAIL_WIN_WIDTH);
+                ui::draw_window_line("  Select a transaction to view full details:", DETAIL_WIN_WIDTH);
+                ui::draw_window_divider(DETAIL_WIN_WIDTH);
+
+                // Show up to 10 recent transactions
+                int count = std::min((int)all_txs.size(), 10);
+                for(int i = 0; i < count; i++){
+                    const auto& tx = all_txs[i];
+
+                    std::ostringstream line;
+                    line << "  [" << (i + 1) << "] ";
+
+                    // Direction icon
+                    if(tx.direction == "sent"){
+                        line << ui::red() << (ui::g_use_utf8 ? "↑" : "^") << ui::reset();
+                    } else if(tx.direction == "mined"){
+                        line << ui::yellow() << (ui::g_use_utf8 ? "⛏" : "*") << ui::reset();
+                    } else {
+                        line << ui::green() << (ui::g_use_utf8 ? "↓" : "v") << ui::reset();
+                    }
+
+                    // Amount
+                    line << " " << std::fixed << std::setprecision(4)
+                         << (std::abs((double)tx.amount) / (double)COIN) << " MIQ";
+
+                    // Status
+                    if(tx.confirmations >= 6){
+                        line << " " << ui::green() << (ui::g_use_utf8 ? "✓" : "+") << ui::reset();
+                    } else if(tx.confirmations > 0){
+                        line << " " << ui::yellow() << tx.confirmations << ui::reset();
+                    } else {
+                        line << " " << ui::red() << (ui::g_use_utf8 ? "◐" : "o") << ui::reset();
+                    }
+
+                    // TXID short
+                    line << " " << ui::dim() << tx.txid_hex.substr(0, 12) << "..." << ui::reset();
+
+                    ui::draw_window_line(line.str(), DETAIL_WIN_WIDTH);
+                }
+
+                ui::draw_window_divider(DETAIL_WIN_WIDTH);
+                ui::draw_window_line("  [b] Back to main menu", DETAIL_WIN_WIDTH);
+                ui::draw_window_bottom(DETAIL_WIN_WIDTH);
+
+                std::cout << "\n";
+                std::string sel = ui::prompt("Select [1-" + std::to_string(count) + "]: ");
+                sel = trim(sel);
+
+                if(sel == "b" || sel == "B" || sel.empty()){
+                    details_running = false;
+                    continue;
+                }
+
+                int idx = 0;
+                try {
+                    idx = std::stoi(sel) - 1;
+                } catch(...) {
+                    ui::print_error("Invalid selection");
+                    continue;
+                }
+
+                if(idx < 0 || idx >= (int)all_txs.size()){
+                    ui::print_error("Invalid selection");
+                    continue;
+                }
+
+                const auto& selected_tx = all_txs[idx];
+
+                // Build detailed transaction info
+                BlockchainTxDetails details;
+                details.txid_hex = selected_tx.txid_hex;
+                details.timestamp = selected_tx.timestamp;
+                details.amount = selected_tx.amount;
+                details.fee = selected_tx.fee;
+                details.confirmations = selected_tx.confirmations;
+                details.direction = selected_tx.direction;
+                details.to_address = selected_tx.to_address;
+                details.from_address = selected_tx.from_address;
+                details.memo = selected_tx.memo;
+                details.tx_size = 225; // Estimated average
+                if(details.fee > 0 && details.tx_size > 0){
+                    details.fee_rate = (double)details.fee / (double)details.tx_size;
+                }
+
+                // Determine status
+                if(details.confirmations >= 6){
+                    details.is_confirmed = true;
+                    details.status_text = "Confirmed";
+                } else if(details.confirmations > 0){
+                    details.is_confirmed = true;
+                    details.status_text = "Confirming (" + std::to_string(details.confirmations) + "/6)";
+                } else {
+                    details.is_confirmed = false;
+                    details.is_mempool = true;
+                    details.status_text = "Pending";
+                }
+
+                // Try to get block info if confirmed
+                if(details.confirmations > 0 && current_height > 0){
+                    // Estimate block height from confirmations
+                    details.block_height = current_height - details.confirmations + 1;
+
+                    // Fetch block details from node
+                    std::string blk_hash;
+                    uint64_t blk_diff = 0;
+                    int64_t blk_time = 0;
+                    uint32_t blk_txcount = 0;
+
+                    if(fetch_block_by_height(rpc_host, rpc_port, details.block_height,
+                                             blk_hash, blk_diff, blk_time, blk_txcount)){
+                        details.block_hash = blk_hash;
+                        details.block_difficulty = blk_diff;
+                        details.block_time = blk_time;
+                        details.block_tx_count = blk_txcount;
+                    }
+                }
+
+                // Draw the detailed transaction window
+                draw_tx_details_window(details, DETAIL_WIN_WIDTH);
+
+                std::cout << "\n  Press ENTER to continue...";
+                std::string dummy;
+                std::getline(std::cin, dummy);
             }
         }
         // =================================================================
