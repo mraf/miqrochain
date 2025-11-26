@@ -43,6 +43,7 @@
 #include <memory>
 #include <functional>
 #include <regex>
+#include <clocale>
 
 // Platform-specific includes for terminal detection and raw input
 #ifdef _WIN32
@@ -59,6 +60,42 @@
   #include <termios.h>
   #include <sys/select.h>
   #include <sys/ioctl.h>
+#endif
+
+// =============================================================================
+// WINDOWS CONSOLE UTF-8 INITIALIZATION
+// Fix for PowerShell 5+ UTF-8 display issues
+// =============================================================================
+#ifdef _WIN32
+static void init_windows_console_utf8() {
+    // Set console code page to UTF-8 for proper Unicode display
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+
+    // Enable virtual terminal processing for ANSI escape sequences
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut != INVALID_HANDLE_VALUE) {
+        DWORD dwMode = 0;
+        if (GetConsoleMode(hOut, &dwMode)) {
+            dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+            dwMode |= ENABLE_PROCESSED_OUTPUT;
+            SetConsoleMode(hOut, dwMode);
+        }
+    }
+
+    // Also set input handle for proper UTF-8 input
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    if (hIn != INVALID_HANDLE_VALUE) {
+        DWORD dwMode = 0;
+        if (GetConsoleMode(hIn, &dwMode)) {
+            dwMode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+            SetConsoleMode(hIn, dwMode);
+        }
+    }
+
+    // Set UTF-8 locale for the C++ streams
+    std::setlocale(LC_ALL, ".UTF-8");
+}
 #endif
 
 // =============================================================================
@@ -10111,6 +10148,11 @@ namespace main_menu {
 // MAIN ENTRY POINT
 // =============================================================================
 int main(int argc, char** argv){
+    // Initialize Windows console for UTF-8 support (PowerShell 5+ fix)
+#ifdef _WIN32
+    init_windows_console_utf8();
+#endif
+
     std::ios::sync_with_stdio(false);
     winsock_ensure();
 
