@@ -186,7 +186,7 @@ namespace instant_input {
     }
 
     // Get single character without Enter (non-blocking)
-    static int get_char_instant() {
+    [[maybe_unused]] static int get_char_instant() {
         if (!g_raw_mode) enable_raw_mode();
 
         char c;
@@ -223,7 +223,7 @@ namespace instant_input {
     }
 
     // Check if input is available
-    static bool input_available() {
+    [[maybe_unused]] static bool input_available() {
         if (!g_raw_mode) enable_raw_mode();
 
         fd_set fds;
@@ -236,7 +236,7 @@ namespace instant_input {
 #endif
 
     // Get terminal dimensions
-    static std::pair<int, int> get_terminal_size() {
+    [[maybe_unused]] static std::pair<int, int> get_terminal_size() {
         int rows = 24, cols = 80;  // Default
 #ifdef _WIN32
         CONSOLE_SCREEN_BUFFER_INFO csbi;
@@ -255,7 +255,7 @@ namespace instant_input {
     }
 
     // Move cursor to position
-    static void move_cursor(int row, int col) {
+    [[maybe_unused]] static void move_cursor(int row, int col) {
         std::cout << "\033[" << row << ";" << col << "H" << std::flush;
     }
 
@@ -270,12 +270,12 @@ namespace instant_input {
     }
 
     // Save cursor position
-    static void save_cursor() {
+    [[maybe_unused]] static void save_cursor() {
         std::cout << "\033[s" << std::flush;
     }
 
     // Restore cursor position
-    static void restore_cursor() {
+    [[maybe_unused]] static void restore_cursor() {
         std::cout << "\033[u" << std::flush;
     }
 
@@ -1547,11 +1547,11 @@ namespace ui {
     }
 
     // Network sync splash for wallet
-    static void draw_wallet_sync_splash(const std::string& node, int headers_synced,
+    [[maybe_unused]] static void draw_wallet_sync_splash(const std::string& node, int headers_synced,
                                         int blocks_scanned, int utxos_found, int tick) {
         std::cout << "\r";
 
-        const char* spinner = splash_spinner(tick);
+        std::string spinner = splash_spinner(tick);
         std::cout << cyan() << "  [" << yellow() << spinner << cyan() << "]" << reset();
 
         std::cout << " Syncing";
@@ -1755,7 +1755,7 @@ namespace ui {
     }
 
     // SYNC Complete Splash
-    static void run_sync_complete_splash(int utxo_count, uint64_t balance) {
+    [[maybe_unused]] static void run_sync_complete_splash(int utxo_count, uint64_t balance) {
         std::ostringstream bal_ss;
         bal_ss << std::fixed << std::setprecision(8) << ((double)balance / 100000000.0) << " MIQ";
 
@@ -1768,7 +1768,7 @@ namespace ui {
     }
 
     // BROADCAST Queue Processing Splash
-    static void run_broadcast_queue_splash(int current, int total, const std::string& txid) {
+    [[maybe_unused]] static void run_broadcast_queue_splash(int current, int total, const std::string& txid) {
         double progress = total > 0 ? (double)current / (double)total : 0.0;
         std::string status = "Processing " + std::to_string(current) + "/" + std::to_string(total);
         std::string detail = txid.empty() ? "Connecting..." : "TXID: " + txid.substr(0, 24) + "...";
@@ -1911,7 +1911,7 @@ namespace live_dashboard {
     }
 
     // Get animated loading bar
-    static std::string get_loading_bar(int tick, int width = 20) {
+    [[maybe_unused]] static std::string get_loading_bar(int tick, int width = 20) {
         std::string bar = "[";
         int pos = tick % (width * 2);
         if (pos >= width) pos = (width * 2) - pos - 1;
@@ -2082,7 +2082,7 @@ namespace live_dashboard {
     }
 
     // Draw quick action menu item
-    static void draw_quick_action(char key, const std::string& label, const std::string& desc, bool highlight, int width) {
+    [[maybe_unused]] static void draw_quick_action(char key, const std::string& label, const std::string& desc, bool highlight, int width) {
         std::cout << ui::cyan() << "|" << ui::reset();
         std::cout << "  ";
 
@@ -2198,7 +2198,8 @@ namespace live_dashboard {
         std::cout << ui::bold() << "  RECENT TRANSACTIONS ";
         int tx_count = (int)recent_txs.size();
         std::cout << ui::dim() << "(" << tx_count << " total)" << ui::reset();
-        for (int i = 0; i < W - 30 - std::to_string(tx_count).size(); i++) std::cout << ui::dim() << "-" << ui::reset();
+        int dash_count = W - 30 - (int)std::to_string(tx_count).size();
+        for (int i = 0; i < dash_count; i++) std::cout << ui::dim() << "-" << ui::reset();
         std::cout << ui::cyan() << "|" << ui::reset() << "\n";
 
         if (recent_txs.empty()) {
@@ -2301,12 +2302,12 @@ namespace live_dashboard {
     }
 
     // Wait for instant key with timeout and animation
-    static int wait_for_key_animated(int timeout_ms = 100) {
+    [[maybe_unused]] static int wait_for_key_animated(int timeout_ms = 100) {
         return instant_input::wait_for_key(timeout_ms);
     }
 
     // Check if a character is a valid menu key
-    static bool is_menu_key(int ch) {
+    [[maybe_unused]] static bool is_menu_key(int ch) {
         if (ch < 0) return false;
         char c = (char)ch;
         return c == '1' || c == '2' || c == '3' || c == '4' || c == '5' ||
@@ -5064,7 +5065,7 @@ static void add_tx_history(const std::string& wdir, const TxHistoryEntry& entry)
 // =============================================================================
 
 // Update a single transaction's confirmation count
-static void update_tx_confirmation(const std::string& wdir,
+[[maybe_unused]] static void update_tx_confirmation(const std::string& wdir,
                                     const std::string& txid_hex,
                                     uint32_t confirmations) {
     std::vector<TxHistoryEntry> hist;
@@ -5272,7 +5273,7 @@ static int auto_detect_received_transactions(
 
 // Quick check to verify a specific transaction is on-chain
 // Returns estimated confirmations, or 0 if not found
-static uint32_t verify_tx_on_chain(const std::vector<miq::UtxoLite>& utxos,
+[[maybe_unused]] static uint32_t verify_tx_on_chain(const std::vector<miq::UtxoLite>& utxos,
                                     const std::string& txid_hex,
                                     uint32_t current_tip_height) {
     for(const auto& u : utxos){
@@ -6839,7 +6840,7 @@ static std::string fmt_amount(uint64_t miqron){
     return os.str();
 }
 
-static std::string fmt_amount_short(uint64_t miqron){
+[[maybe_unused]] static std::string fmt_amount_short(uint64_t miqron){
     std::ostringstream os;
     os << std::fixed << std::setprecision(4) << ((double)miqron / (double)COIN);
     return os.str();
@@ -10042,13 +10043,19 @@ namespace main_menu {
     }
 
     // Draw a menu item with selection highlight
-    static void draw_menu_item(int index, const std::string& key, const std::string& label,
+    [[maybe_unused]] static void draw_menu_item(int index, const std::string& key, const std::string& label,
                                const std::string& desc, bool selected, int tick) {
+        (void)index;  // Reserved for future use
         std::cout << "    ";
 
         if (selected) {
             // Animated selection indicator
-            const char* arrows[] = {"▶", "▷", "▸", "▹"};
+            const char* arrows[] = {
+                ui::g_use_utf8 ? "▶" : ">",
+                ui::g_use_utf8 ? "▷" : ">",
+                ui::g_use_utf8 ? "▸" : ">",
+                ui::g_use_utf8 ? "▹" : ">"
+            };
             std::cout << ui::green() << arrows[tick % 4] << " " << ui::reset();
             std::cout << ui::green() << ui::bold() << "[" << key << "]" << ui::reset();
             std::cout << " " << ui::green() << ui::bold() << label << ui::reset();
