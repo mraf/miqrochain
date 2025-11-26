@@ -469,7 +469,7 @@ std::string RpcService::handle(const std::string& body){
                 "help","version","ping","uptime",
                 "getnetworkinfo","getblockchaininfo","getblockcount","getbestblockhash",
                 "getblock","getblockhash","getcoinbaserecipient",
-                "getrawmempool","gettxout",
+                "getrawmempool","gettxout","getrawtransaction",
                 "validateaddress","decodeaddress","decoderawtx",
                 "getminerstats","sendrawtransaction","sendtoaddress",
                 "estimatemediantime","getdifficulty","getchaintips",
@@ -1114,6 +1114,43 @@ std::string RpcService::handle(const std::string& body){
             } else {
                 return "null";
             }
+        }
+
+        // getrawtransaction - look up transaction by txid (mempool only for now)
+        if(method=="getrawtransaction"){
+            if(params.size()<1 || !std::holds_alternative<std::string>(params[0].v))
+                return err("need txid");
+            const std::string txidhex = std::get<std::string>(params[0].v);
+
+            std::vector<uint8_t> txid;
+            try { txid = from_hex(txidhex); }
+            catch(...) { return err("bad txid"); }
+
+            // Check mempool first
+            Transaction tx;
+            if(mempool_.get_transaction(txid, tx)){
+                // Serialize the transaction
+                std::vector<uint8_t> raw = ser_tx(tx);
+                std::map<std::string,JNode> o;
+                JNode hex; hex.v = std::string(to_hex(raw)); o["hex"] = hex;
+                JNode tid; tid.v = txidhex; o["txid"] = tid;
+                JNode n; n.v = o; return json_dump(n);
+            }
+
+            // Not found in mempool - check if any outputs exist in UTXO set
+            // This indicates the transaction was mined
+            for(uint32_t vout = 0; vout < 100; ++vout) {  // Check first 100 outputs
+                UTXOEntry e;
+                if(chain_.utxo().get(txid, vout, e)){
+                    // Transaction exists in chain (has unspent outputs)
+                    std::map<std::string,JNode> o;
+                    JNode tid; tid.v = txidhex; o["txid"] = tid;
+                    JNode confirmed; confirmed.v = true; o["confirmed"] = confirmed;
+                    JNode n; n.v = o; return json_dump(n);
+                }
+            }
+
+            return err("Transaction not found");
         }
 
         if(method=="sendrawtransaction"){

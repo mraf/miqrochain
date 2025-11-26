@@ -12,6 +12,7 @@
 #include <shared_mutex>
 #include <condition_variable>
 #include <chrono>
+#include <functional>
 
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
@@ -353,6 +354,20 @@ struct PeerSnapshot {
     bool         is_manual;
 };
 
+// Block info passed to telemetry callbacks
+struct P2PBlockInfo {
+    uint64_t height{0};
+    std::string hash_hex;
+    uint32_t tx_count{0};
+    uint64_t fees{0};
+    bool fees_known{false};
+    std::string miner;
+};
+
+// Callback types for telemetry notifications
+using BlockCallback = std::function<void(const P2PBlockInfo&)>;
+using TxidsCallback = std::function<void(const std::vector<std::string>&)>;
+
 class P2P {
 public:
     explicit P2P(Chain& c);
@@ -362,6 +377,10 @@ public:
     inline void set_mempool(Mempool* mp) { mempool_ = mp; }
     inline Mempool*       mempool()       { return mempool_; }
     inline const Mempool* mempool() const { return mempool_; }
+
+    // Telemetry callbacks - called when blocks/txs are received from network
+    inline void set_block_callback(BlockCallback cb) { block_callback_ = std::move(cb); }
+    inline void set_txids_callback(TxidsCallback cb) { txids_callback_ = std::move(cb); }
 
     // key-based helper ("invb","getb", etc.)
     bool check_rate(PeerState& ps, const char* key);
@@ -513,6 +532,11 @@ private:
 
     Mempool* mempool_{nullptr};
     Chain& chain_;
+
+    // Telemetry callbacks (notify main.cpp when blocks/txs received from network)
+    BlockCallback block_callback_;
+    TxidsCallback txids_callback_;
+
     std::thread th_;
     std::atomic<bool> running_{false};
 #ifdef _WIN32

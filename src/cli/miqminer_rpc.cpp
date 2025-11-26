@@ -4595,10 +4595,13 @@ int main(int argc, char** argv){
                 {
                     std::lock_guard<std::mutex> lk(ui.mtx);
                     ui.last_found_block_hash = miq::to_hex(found_block.block_hash());
+                    size_t tx_count = found_block.txs.size();  // Includes coinbase
                     if (confirmed) {
                         ui.mined_blocks.fetch_add(1);
                         std::ostringstream m; m << C("32;1") << "*** BLOCK FOUND & ACCEPTED *** "
-                                                << "Height: " << tpl.height << " | Hash: "
+                                                << "Height: " << tpl.height
+                                                << " | TXs: " << tx_count
+                                                << " | Hash: "
                                                 << ui.last_found_block_hash.substr(0, 16) << "..." << R();
                         ui.last_submit_msg = m.str();
                         ui.last_tip_was_mine.store(true);
@@ -4606,15 +4609,18 @@ int main(int argc, char** argv){
                         rpc_minerlog_best_effort(
                             rpc_host, rpc_port, token,
                             std::string("miner: accepted block at height ")
-                            + std::to_string(tpl.height) + " " + ui.last_found_block_hash
+                            + std::to_string(tpl.height) + " txs=" + std::to_string(tx_count)
+                            + " " + ui.last_found_block_hash
                         );
-                        log_line("*** BLOCK FOUND & ACCEPTED *** height="+std::to_string(tpl.height)+" hash="+ui.last_found_block_hash);
+                        log_line("*** BLOCK FOUND & ACCEPTED *** height="+std::to_string(tpl.height)+" txs="+std::to_string(tx_count)+" hash="+ui.last_found_block_hash);
                     } else {
                         std::ostringstream m; m << C("33;1")
-                                                << "Block submitted (confirming...) | Hash: "
+                                                << "Block submitted (confirming...) | Height: " << tpl.height
+                                                << " | TXs: " << tx_count
+                                                << " | Hash: "
                                                 << ui.last_found_block_hash.substr(0, 16) << "..." << R();
                         ui.last_submit_msg = m.str();
-                        log_line("block submitted (awaiting confirmation), hash="+ui.last_found_block_hash);
+                        log_line("block submitted (awaiting confirmation), height="+std::to_string(tpl.height)+" txs="+std::to_string(tx_count)+" hash="+ui.last_found_block_hash);
                     }
                     ui.last_submit_when = std::chrono::steady_clock::now();
                 }

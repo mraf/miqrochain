@@ -3207,6 +3207,36 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             blocks_since_log = 0;
         }
 
+        // TELEMETRY: Notify main.cpp about received blocks for UI display
+        if (block_callback_) {
+            P2PBlockInfo info;
+            info.height = chain_.height();
+            info.hash_hex = hexkey(bh);
+            info.tx_count = static_cast<uint32_t>(b.txs.size());
+            info.miner = miner;
+            // Calculate fees from coinbase
+            if (!b.txs.empty()) {
+                uint64_t coinbase_total = 0;
+                for (const auto& out : b.txs[0].vout) coinbase_total += out.value;
+                uint64_t subsidy = chain_.subsidy_for_height(info.height);
+                if (coinbase_total >= subsidy) {
+                    info.fees = coinbase_total - subsidy;
+                    info.fees_known = true;
+                }
+            }
+            block_callback_(info);
+
+            // Also notify about transactions in this block
+            if (txids_callback_ && b.txs.size() > 1) {
+                std::vector<std::string> txids;
+                txids.reserve(b.txs.size() - 1);
+                for (size_t i = 1; i < b.txs.size(); ++i) {
+                    txids.push_back(hexkey(b.txs[i].txid()));
+                }
+                txids_callback_(txids);
+            }
+        }
+
         broadcast_inv_block(bh);
         try_connect_orphans(hexkey(bh));
         clear_fulfilled_indices_up_to_height(chain_.height());
@@ -5265,6 +5295,11 @@ void P2P::loop(){
                                 accepted = mempool_->accept(tx, chain_.utxo(), static_cast<uint32_t>(chain_.height()), err);
                             }
                             bool in_mempool = mempool_ && mempool_->exists(tx.txid());
+
+                            // TELEMETRY: Notify about received transaction for UI display
+                            if (accepted && in_mempool && txids_callback_) {
+                                txids_callback_({key});
+                            }
 
                             // WALLET FIX: Don't skip orphan transactions
                             // When tx is accepted as orphan (accepted=true but not in mempool),
