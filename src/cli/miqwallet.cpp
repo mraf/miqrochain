@@ -5246,6 +5246,36 @@ struct TxHistoryEntry {
     std::string to_address;
     std::string from_address;
     std::string memo;
+    uint32_t block_height{0};  // Block height for accurate ordering (0 = unconfirmed)
+};
+
+// =============================================================================
+// TRANSACTION HISTORY CACHE - In-memory cache for fast access
+// =============================================================================
+struct TxHistoryCache {
+    std::vector<TxHistoryEntry> entries;
+    int64_t last_load_time{0};
+    std::string wallet_dir;
+    bool dirty{false};
+
+    static TxHistoryCache& instance() {
+        static TxHistoryCache cache;
+        return cache;
+    }
+
+    void invalidate() {
+        entries.clear();
+        last_load_time = 0;
+        dirty = false;
+    }
+
+    bool is_valid(const std::string& wdir) const {
+        // Cache valid for 2 seconds and same wallet
+        int64_t now = (int64_t)time(nullptr);
+        return !entries.empty() &&
+               wallet_dir == wdir &&
+               (now - last_load_time) < 2;
+    }
 };
 
 // Export functions that use TxHistoryEntry
@@ -5293,14 +5323,40 @@ static std::string tx_history_path(const std::string& wdir){
     return join_path(wdir, "tx_history.dat");
 }
 
-static void load_tx_history(const std::string& wdir, std::vector<TxHistoryEntry>& out){
+// Sort transactions: newest first, using block_height as primary key for accuracy
+// Unconfirmed (height=0) transactions come first, then by height descending
+// Within same height, sort by timestamp descending, then by txid for consistency
+static void sort_tx_history(std::vector<TxHistoryEntry>& entries) {
+    std::sort(entries.begin(), entries.end(), [](const TxHistoryEntry& a, const TxHistoryEntry& b){
+        // Unconfirmed transactions (height 0) always come first
+        if(a.block_height == 0 && b.block_height != 0) return true;
+        if(a.block_height != 0 && b.block_height == 0) return false;
+
+        // Both unconfirmed: sort by timestamp descending
+        if(a.block_height == 0 && b.block_height == 0) {
+            if(a.timestamp != b.timestamp) return a.timestamp > b.timestamp;
+            return a.txid_hex > b.txid_hex;  // Consistent tie-breaker
+        }
+
+        // Both confirmed: sort by block height descending (newest blocks first)
+        if(a.block_height != b.block_height) return a.block_height > b.block_height;
+
+        // Same block: sort by timestamp descending
+        if(a.timestamp != b.timestamp) return a.timestamp > b.timestamp;
+
+        // Same block and timestamp: use txid as tie-breaker for consistency
+        return a.txid_hex > b.txid_hex;
+    });
+}
+
+static void load_tx_history_from_file(const std::string& wdir, std::vector<TxHistoryEntry>& out){
     out.clear();
     std::ifstream f(tx_history_path(wdir));
     if(!f.good()) return;
     std::string line;
     while(std::getline(f, line)){
         if(line.empty() || line[0] == '#') continue;
-        // Format: txid|timestamp|amount|fee|confirmations|direction|to|from|memo
+        // Format: txid|timestamp|amount|fee|confirmations|direction|to|from|memo|block_height
         std::vector<std::string> parts;
         size_t start = 0, end = 0;
         while((end = line.find('|', start)) != std::string::npos){
@@ -5320,24 +5376,48 @@ static void load_tx_history(const std::string& wdir, std::vector<TxHistoryEntry>
             if(parts.size() > 6) e.to_address = parts[6];
             if(parts.size() > 7) e.from_address = parts[7];
             if(parts.size() > 8) e.memo = parts[8];
+            // New field: block_height (optional, defaults to 0 for backward compatibility)
+            if(parts.size() > 9) e.block_height = (uint32_t)std::strtoul(parts[9].c_str(), nullptr, 10);
             out.push_back(e);
         }
     }
-    // Sort by timestamp descending (newest first)
-    std::sort(out.begin(), out.end(), [](const TxHistoryEntry& a, const TxHistoryEntry& b){
-        return a.timestamp > b.timestamp;
-    });
+    // Sort using the improved sorting function
+    sort_tx_history(out);
+}
+
+// Cached version of load_tx_history for performance
+static void load_tx_history(const std::string& wdir, std::vector<TxHistoryEntry>& out){
+    auto& cache = TxHistoryCache::instance();
+
+    // Check if cache is valid
+    if(cache.is_valid(wdir)){
+        out = cache.entries;
+        return;
+    }
+
+    // Load from file
+    load_tx_history_from_file(wdir, out);
+
+    // Update cache
+    cache.entries = out;
+    cache.wallet_dir = wdir;
+    cache.last_load_time = (int64_t)time(nullptr);
 }
 
 static void save_tx_history(const std::string& wdir, const std::vector<TxHistoryEntry>& hist){
     std::ofstream f(tx_history_path(wdir), std::ios::out | std::ios::trunc);
     if(!f.good()) return;
-    f << "# Rythmium Wallet Transaction History\n";
+    f << "# Rythmium Wallet Transaction History v2\n";
     for(const auto& e : hist){
+        // Include block_height in the saved format
         f << e.txid_hex << "|" << e.timestamp << "|" << e.amount << "|"
           << e.fee << "|" << e.confirmations << "|" << e.direction << "|"
-          << e.to_address << "|" << e.from_address << "|" << e.memo << "\n";
+          << e.to_address << "|" << e.from_address << "|" << e.memo << "|"
+          << e.block_height << "\n";
     }
+
+    // Invalidate cache after save so next load gets fresh data
+    TxHistoryCache::instance().invalidate();
 }
 
 static void add_tx_history(const std::string& wdir, const TxHistoryEntry& entry){
@@ -5423,14 +5503,16 @@ static void update_all_tx_confirmations(const std::string& wdir,
     for(auto& e : hist){
         uint32_t old_conf = e.confirmations;
         uint32_t new_conf = old_conf;
+        uint32_t found_height = 0;
 
         // METHOD 1: Direct UTXO matching (works for received AND sent with change)
         // For sent transactions, the change output will appear as a UTXO with the same TXID
         auto it = txid_height.find(e.txid_hex);
         if(it != txid_height.end() && it->second > 0){
             // UTXO found with height - calculate exact confirmations
-            if(current_tip_height >= it->second){
-                new_conf = current_tip_height - it->second + 1;
+            found_height = it->second;
+            if(current_tip_height >= found_height){
+                new_conf = current_tip_height - found_height + 1;
             }
         }
         // METHOD 2: For sent transactions WITHOUT visible change (fully spent or no change)
@@ -5445,6 +5527,10 @@ static void update_all_tx_confirmations(const std::string& wdir,
                 new_conf = std::max(1u, (uint32_t)(age / MIQ_BLOCK_TIME_SECS));
                 // Cap at 100 confirmations for very old transactions
                 if(new_conf > 100) new_conf = 100;
+                // Estimate block height from confirmations
+                if(e.block_height == 0 && new_conf > 0 && current_tip_height > new_conf){
+                    found_height = current_tip_height - new_conf + 1;
+                }
             } else if(age > 60){
                 // Transaction is in-flight (1 min < age < 8 min)
                 // Count as 0 confirmations but mark as "pending in mempool"
@@ -5452,7 +5538,7 @@ static void update_all_tx_confirmations(const std::string& wdir,
             }
         }
         // METHOD 3: For received transactions without UTXO (already spent)
-        else if(e.direction == "received"){
+        else if(e.direction == "received" || e.direction == "mined"){
             // If no UTXO found, the output was spent
             // Use time-based estimation with MIQ block time
             int64_t now = (int64_t)time(nullptr);
@@ -5460,12 +5546,22 @@ static void update_all_tx_confirmations(const std::string& wdir,
             if(age > MIQ_BLOCK_TIME_SECS){
                 new_conf = std::max(1u, (uint32_t)(age / MIQ_BLOCK_TIME_SECS));
                 if(new_conf > 100) new_conf = 100;
+                // Estimate block height from confirmations
+                if(e.block_height == 0 && new_conf > 0 && current_tip_height > new_conf){
+                    found_height = current_tip_height - new_conf + 1;
+                }
             }
         }
 
-        // CRITICAL: Never decrease confirmations (blockchain immutability)
+        // Update confirmations (never decrease - blockchain immutability)
         if(new_conf > old_conf){
             e.confirmations = new_conf;
+            changed = true;
+        }
+
+        // Update block_height if we found one and entry doesn't have one yet
+        if(found_height > 0 && e.block_height == 0){
+            e.block_height = found_height;
             changed = true;
         }
     }
@@ -5546,11 +5642,13 @@ static int auto_detect_received_transactions(
             entry.direction = "received";
         }
 
-        // Calculate confirmations
+        // Calculate confirmations and store block height
         if(agg.min_height < UINT32_MAX && current_tip_height >= agg.min_height){
             entry.confirmations = current_tip_height - agg.min_height + 1;
+            entry.block_height = agg.min_height;  // Store actual block height for accurate sorting
         } else {
             entry.confirmations = 0;
+            entry.block_height = 0;  // Unconfirmed
         }
 
         // Note if multiple outputs or mining reward
