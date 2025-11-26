@@ -278,15 +278,20 @@ namespace wallet_config {
     static constexpr int MAX_BROADCAST_ATTEMPTS = 15;
     static constexpr int CONFIRMATION_TARGET = 6;
 
-    // CRITICAL FIX: Pending transaction timeout (30 minutes)
+    // v9.0 FIX: Reduced pending timeout for faster balance updates
     // If a transaction hasn't been confirmed within this time, release the UTXOs
-    static constexpr int PENDING_TIMEOUT_MINUTES = 30;
+    // 5 minutes is enough for transaction to propagate and be seen in mempool
+    static constexpr int PENDING_TIMEOUT_MINUTES = 5;
     static constexpr int64_t PENDING_TIMEOUT_SECONDS = PENDING_TIMEOUT_MINUTES * 60;
 
-    // CRITICAL FIX: Rebroadcast interval for unconfirmed transactions
+    // v9.0 FIX: Faster rebroadcast for reliable transaction delivery
     // Transactions with "broadcast" status should be rebroadcast periodically
-    static constexpr int REBROADCAST_INTERVAL_MINUTES = 10;
+    static constexpr int REBROADCAST_INTERVAL_MINUTES = 2;
     static constexpr int64_t REBROADCAST_INTERVAL_SECONDS = REBROADCAST_INTERVAL_MINUTES * 60;
+
+    // v9.0: Quick confirmation check interval (seconds)
+    // How often to verify transaction is in mempool/confirmed
+    static constexpr int QUICK_CONFIRM_CHECK_SECONDS = 30;
 
     // Animation timings (PowerShell 5+ compatible)
     static constexpr int ANIMATION_FRAME_MS = 80;
@@ -1672,7 +1677,8 @@ namespace ui {
 namespace live_dashboard {
 
     // ==========================================================================
-    // RYTHMIUM DASHBOARD v8.0 - Zero-Flicker Live Monitor Design
+    // RYTHMIUM DASHBOARD v9.0 - Zero-Flicker Live Monitor Design
+    // CRITICAL FIXES: Correct balance display, instant transaction updates
     // ==========================================================================
 
     // Menu item with animation state
@@ -1962,7 +1968,7 @@ namespace live_dashboard {
 
         // Top border with animated title - RYTHMIUM WALLET
         std::cout << "\n";
-        draw_double_box_top("RYTHMIUM WALLET v8.0 - LIVE MONITOR", W);
+        draw_double_box_top("RYTHMIUM WALLET v9.0 - LIVE MONITOR", W);
 
         // Status bar with live network indicator - FLICKER-FREE with fixed width
         std::cout << ui::cyan() << "|" << ui::reset();
@@ -4911,14 +4917,14 @@ static void update_tx_confirmation(const std::string& wdir,
 }
 
 // =============================================================================
-// ENHANCED TRANSACTION TRACKING v7.0 - Multi-source confirmation system
-// Fixes the issue where transactions don't count/show up properly
+// ENHANCED TRANSACTION TRACKING v9.0 - Multi-source confirmation system
+// CRITICAL FIXES:
+// 1. Use MIQ 8-minute blocks (480s) not Bitcoin 10-minute blocks (600s)
+// 2. Track sent tx confirmations via change outputs
+// 3. Better handling of spent outputs
 // =============================================================================
 
 // Update all transaction confirmations based on UTXOs and chain height
-// CRITICAL FIX: Uses multiple methods to track confirmations:
-// 1. Direct UTXO matching for received transactions
-// 2. Time-based estimation for sent transactions
 static void update_all_tx_confirmations(const std::string& wdir,
                                          const std::vector<miq::UtxoLite>& utxos,
                                          uint32_t current_tip_height) {
@@ -4929,23 +4935,27 @@ static void update_all_tx_confirmations(const std::string& wdir,
 
     bool changed = false;
 
-    // Build map of TXID -> UTXO height (for received transactions)
+    // Build map of TXID -> UTXO height (for received transactions AND change outputs)
     std::map<std::string, uint32_t> txid_height;
     for(const auto& u : utxos){
         std::string tid = miq::to_hex(u.txid);
         // Use the lowest height for this TXID (most conservative)
         auto it = txid_height.find(tid);
-        if(it == txid_height.end() || u.height < it->second){
+        if(it == txid_height.end() || (u.height > 0 && u.height < it->second)){
             txid_height[tid] = u.height;
         }
     }
+
+    // MIQ block time is 8 minutes = 480 seconds
+    const int64_t MIQ_BLOCK_TIME_SECS = 480;
 
     // Update confirmations for each transaction
     for(auto& e : hist){
         uint32_t old_conf = e.confirmations;
         uint32_t new_conf = old_conf;
 
-        // METHOD 1: Direct UTXO matching (works for received transactions)
+        // METHOD 1: Direct UTXO matching (works for received AND sent with change)
+        // For sent transactions, the change output will appear as a UTXO with the same TXID
         auto it = txid_height.find(e.txid_hex);
         if(it != txid_height.end() && it->second > 0){
             // UTXO found with height - calculate exact confirmations
@@ -4953,27 +4963,32 @@ static void update_all_tx_confirmations(const std::string& wdir,
                 new_conf = current_tip_height - it->second + 1;
             }
         }
-        // METHOD 2: For sent/self transactions, use time-based estimation
+        // METHOD 2: For sent transactions WITHOUT visible change (fully spent or no change)
         else if(e.direction == "sent" || e.direction == "self"){
             int64_t now = (int64_t)time(nullptr);
             int64_t age = now - e.timestamp;
 
-            // Time-based estimation: ~10 minutes per block
-            // Give transactions at least 1 minute before counting confirmations
-            if(age > 60){
-                new_conf = std::max(1u, (uint32_t)(age / 600));
+            // v9.0: Use MIQ 8-minute block time, not 10-minute
+            // Start counting confirmations after 1 block time (8 minutes)
+            if(age > MIQ_BLOCK_TIME_SECS){
+                // Estimate: 1 conf per 8 minutes elapsed
+                new_conf = std::max(1u, (uint32_t)(age / MIQ_BLOCK_TIME_SECS));
                 // Cap at 100 confirmations for very old transactions
                 if(new_conf > 100) new_conf = 100;
+            } else if(age > 60){
+                // Transaction is in-flight (1 min < age < 8 min)
+                // Count as 0 confirmations but mark as "pending in mempool"
+                // Don't override existing higher confirmation count
             }
         }
-        // METHOD 3: For received transactions without UTXO (spent or old)
+        // METHOD 3: For received transactions without UTXO (already spent)
         else if(e.direction == "received"){
-            // If no UTXO found, transaction was likely spent or is old
-            // Use time-based estimation as fallback
+            // If no UTXO found, the output was spent
+            // Use time-based estimation with MIQ block time
             int64_t now = (int64_t)time(nullptr);
             int64_t age = now - e.timestamp;
-            if(age > 60){
-                new_conf = std::max(1u, (uint32_t)(age / 600));
+            if(age > MIQ_BLOCK_TIME_SECS){
+                new_conf = std::max(1u, (uint32_t)(age / MIQ_BLOCK_TIME_SECS));
                 if(new_conf > 100) new_conf = 100;
             }
         }
@@ -4991,7 +5006,8 @@ static void update_all_tx_confirmations(const std::string& wdir,
 }
 
 // =============================================================================
-// AUTO-DETECT RECEIVED TRANSACTIONS - Scan for new incoming payments
+// AUTO-DETECT RECEIVED TRANSACTIONS v9.0 - Scan for new incoming payments
+// CRITICAL FIX: Aggregate multiple outputs from same transaction into one entry
 // =============================================================================
 static int auto_detect_received_transactions(
     const std::string& wdir,
@@ -5007,44 +5023,73 @@ static int auto_detect_received_transactions(
         known_txids.insert(e.txid_hex);
     }
 
-    int detected = 0;
+    // v9.0 FIX: First aggregate UTXOs by TXID to handle multi-output transactions
+    struct TxAggregate {
+        uint64_t total_value{0};
+        uint32_t min_height{UINT32_MAX};
+        int output_count{0};
+        bool coinbase{false};
+    };
+    std::map<std::string, TxAggregate> new_txs;
 
-    // Scan UTXOs for transactions we haven't seen
     for(const auto& u : utxos){
         std::string txid = miq::to_hex(u.txid);
 
         // Skip if we already know about this transaction
         if(known_txids.find(txid) != known_txids.end()) continue;
 
-        // This is a new incoming payment!
+        // Skip coinbase outputs - they're mining rewards, not payments
+        if(u.coinbase){
+            // Track coinbase separately if desired, but don't count as "received payment"
+            continue;
+        }
+
+        // Aggregate this output
+        auto& agg = new_txs[txid];
+        agg.total_value += u.value;
+        agg.output_count++;
+        if(u.height > 0 && u.height < agg.min_height){
+            agg.min_height = u.height;
+        }
+        agg.coinbase = u.coinbase;
+    }
+
+    int detected = 0;
+
+    // Now create one history entry per unique TXID
+    for(const auto& [txid, agg] : new_txs){
         TxHistoryEntry entry;
         entry.txid_hex = txid;
 
-        // Estimate timestamp from block height
-        // Assume ~10 minutes per block from current tip
+        // Estimate timestamp from block height using MIQ 8-minute blocks
         int64_t now = (int64_t)time(nullptr);
-        if(u.height > 0 && current_tip_height > 0){
-            int64_t blocks_ago = current_tip_height - u.height;
-            entry.timestamp = now - (blocks_ago * 600);
+        if(agg.min_height < UINT32_MAX && current_tip_height > 0){
+            int64_t blocks_ago = current_tip_height - agg.min_height;
+            entry.timestamp = now - (blocks_ago * 480);  // MIQ = 8 min blocks
         } else {
             entry.timestamp = now;
         }
 
-        entry.amount = (int64_t)u.value;
+        // v9.0: Total of all outputs to this wallet from this transaction
+        entry.amount = (int64_t)agg.total_value;
         entry.fee = 0;  // We don't pay fee on received transactions
         entry.direction = "received";
 
         // Calculate confirmations
-        if(u.height > 0 && current_tip_height >= u.height){
-            entry.confirmations = current_tip_height - u.height + 1;
+        if(agg.min_height < UINT32_MAX && current_tip_height >= agg.min_height){
+            entry.confirmations = current_tip_height - agg.min_height + 1;
         } else {
             entry.confirmations = 0;
         }
 
-        // No specific addresses to track for received
+        // Note if multiple outputs
         entry.to_address = "";
         entry.from_address = "";
-        entry.memo = "Auto-detected incoming payment";
+        if(agg.output_count > 1){
+            entry.memo = "Received (" + std::to_string(agg.output_count) + " outputs)";
+        } else {
+            entry.memo = "Received payment";
+        }
 
         // Add to history
         add_tx_history(wdir, entry);
@@ -6160,9 +6205,10 @@ static bool verify_tx_in_mempool(
     const std::string& txid_hex,
     std::string& err_out)
 {
-    uint16_t rpc_port = (uint16_t)std::stoi(port);
-    // RPC port is typically P2P port + 1
-    rpc_port = (rpc_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : rpc_port;
+    uint16_t p2p_port = (uint16_t)std::stoi(port);
+    // v9.0 FIX: RPC port is always P2P port - 49 (9883 -> 9834)
+    // This matches the default configuration in constants.h
+    uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port - 49);
 
     // Build JSON-RPC request to check if tx is in mempool
     std::string rpc_body = R"({"method":"getrawmempool","params":[]})";
@@ -6672,6 +6718,12 @@ static inline bool safe_add(uint64_t& sum, uint64_t val) {
     return true;
 }
 
+// =============================================================================
+// CRITICAL FIX v9.0: Correct balance calculation
+// - total = spendable + immature (EXCLUDES pending/spent UTXOs)
+// - pending_hold = UTXOs being used in outgoing transactions
+// - This ensures balance immediately reflects sent transactions
+// =============================================================================
 static WalletBalance compute_balance(const std::vector<miq::UtxoLite>& utxos,
                                      const std::set<OutpointKey>& pending)
 {
@@ -6679,9 +6731,6 @@ static WalletBalance compute_balance(const std::vector<miq::UtxoLite>& utxos,
     for(const auto& u : utxos) wb.approx_tip_h = std::max<uint64_t>(wb.approx_tip_h, u.height);
 
     for(const auto& u: utxos){
-        if (!safe_add(wb.total, u.value)) {
-            wb.total = UINT64_MAX;
-        }
         bool is_immature = false;
         if(u.coinbase){
             uint64_t mature_h = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
@@ -6689,14 +6738,22 @@ static WalletBalance compute_balance(const std::vector<miq::UtxoLite>& utxos,
         }
         OutpointKey k{ miq::to_hex(u.txid), u.vout };
         bool held = (pending.find(k) != pending.end());
-        if(is_immature) {
-            if (!safe_add(wb.immature, u.value)) wb.immature = UINT64_MAX;
-        }
-        else if(held) {
+
+        // CRITICAL FIX: Pending/held UTXOs are SPENT - do NOT count them in total!
+        // They will be removed from UTXO set once the transaction confirms
+        if(held) {
+            // Track pending_hold for display purposes only
             if (!safe_add(wb.pending_hold, u.value)) wb.pending_hold = UINT64_MAX;
+            // DO NOT add to total - these UTXOs are being spent
+        }
+        else if(is_immature) {
+            if (!safe_add(wb.immature, u.value)) wb.immature = UINT64_MAX;
+            if (!safe_add(wb.total, u.value)) wb.total = UINT64_MAX;
         }
         else {
+            // Regular spendable UTXO
             if (!safe_add(wb.spendable, u.value)) wb.spendable = UINT64_MAX;
+            if (!safe_add(wb.total, u.value)) wb.total = UINT64_MAX;
         }
     }
     return wb;
@@ -7014,9 +7071,9 @@ static bool wallet_session(const std::string& cli_host,
 
         int queue_count = count_pending_in_queue(wdir);
 
-        // Draw the RYTHMIUM animated dashboard v8.0 - ZERO FLICKER
+        // Draw the RYTHMIUM animated dashboard v9.0 - ZERO FLICKER
         live_dashboard::draw_dashboard(
-            "RYTHMIUM WALLET v8.0 - LIVE MONITOR",
+            "RYTHMIUM WALLET v9.0 - LIVE MONITOR",
             menu_wb.total,
             menu_wb.spendable,
             menu_wb.immature,
@@ -7912,12 +7969,37 @@ static bool wallet_session(const std::string& cli_host,
                 broadcast_success = broadcast_and_verify(seeds_b, raw, txid_hex, used_bcast_seed, berr, false);
             }
 
-            // CRITICAL FIX: Update pending cache with timestamps for timeout tracking
+            // v9.0 CRITICAL FIX: Update pending cache with timestamps for timeout tracking
+            // AND immediately remove spent UTXOs from local list for instant balance update
             for(const auto& in : tx.vin){
                 OutpointKey k{ miq::to_hex(in.prev.txid), in.prev.vout };
                 add_pending_entry(k, txid_hex, pending);
+
+                // v9.0: Also remove from local UTXO list for immediate balance update
+                utxos.erase(
+                    std::remove_if(utxos.begin(), utxos.end(),
+                        [&](const miq::UtxoLite& u){
+                            return miq::to_hex(u.txid) == k.txid_hex && u.vout == k.vout;
+                        }),
+                    utxos.end());
             }
             save_pending(wdir, pending);
+
+            // v9.0: If we have change, add it to local UTXO list immediately
+            // This provides instant balance feedback without waiting for SPV sync
+            if(used_change && change > 0){
+                miq::UtxoLite change_utxo;
+                change_utxo.txid = tx.txid();
+                change_utxo.vout = 1;  // Change is typically output 1
+                change_utxo.value = change;
+                // Get change PKH from the transaction output
+                if(tx.vout.size() > 1){
+                    change_utxo.pkh = tx.vout[1].pkh;
+                }
+                change_utxo.height = 0;  // Not yet confirmed
+                change_utxo.coinbase = false;
+                utxos.push_back(change_utxo);
+            }
 
             // Update change index
             if(used_change){
