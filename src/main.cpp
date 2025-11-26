@@ -4600,6 +4600,23 @@ int main(int argc, char** argv){
         p2p.set_inflight_caps(256, 128);
         p2p.set_datadir(cfg.datadir);
         p2p.set_mempool(&mempool);
+
+        // TELEMETRY FIX: Register callbacks to track blocks/txs received from P2P network
+        // Without this, only locally mined blocks show in recent_blocks_ UI
+        p2p.set_block_callback([](const P2PBlockInfo& info) {
+            BlockSummary bs;
+            bs.height = info.height;
+            bs.hash_hex = info.hash_hex;
+            bs.tx_count = info.tx_count;
+            bs.fees = info.fees;
+            bs.fees_known = info.fees_known;
+            bs.miner = info.miner;
+            g_telemetry.push_block(bs);
+        });
+        p2p.set_txids_callback([](const std::vector<std::string>& txids) {
+            g_telemetry.push_txids(txids);
+        });
+
         rpc.set_p2p(&p2p);
         if (can_tui) tui.set_runtime_refs(&p2p, &chain, &mempool);
 
