@@ -376,6 +376,7 @@ using miq::COIN;
 // =============================================================================
 namespace ui {
     static bool g_use_colors = true;
+    static bool g_use_utf8 = true;  // UTF-8 box drawing support
 
     // Detect if terminal supports ANSI escape codes
     inline bool detect_terminal_colors() {
@@ -419,9 +420,44 @@ namespace ui {
 #endif
     }
 
-    // Initialize colors based on terminal detection
+    // Detect if terminal supports UTF-8
+    inline bool detect_utf8_support() {
+#if defined(_WIN32)
+        // With our UTF-8 console initialization, UTF-8 should work
+        // Check for Windows Terminal, ConEmu, or modern PowerShell
+        const char* wt = std::getenv("WT_SESSION");
+        const char* conemu = std::getenv("ConEmuANSI");
+        const char* term_program = std::getenv("TERM_PROGRAM");
+
+        // Windows Terminal and modern terminals support UTF-8
+        if (wt) return true;
+        if (conemu && std::strcmp(conemu, "ON") == 0) return true;
+        if (term_program) return true;
+
+        // With SetConsoleOutputCP(CP_UTF8), we should have UTF-8 support
+        // Return true as we've already set the console to UTF-8 mode
+        return true;
+#else
+        // Check LANG/LC_ALL for UTF-8
+        const char* lang = std::getenv("LANG");
+        const char* lc_all = std::getenv("LC_ALL");
+
+        if (lc_all && (std::strstr(lc_all, "UTF-8") || std::strstr(lc_all, "utf8"))) return true;
+        if (lang && (std::strstr(lang, "UTF-8") || std::strstr(lang, "utf8"))) return true;
+
+        // Modern Unix terminals generally support UTF-8
+        return true;
+#endif
+    }
+
+    // Initialize colors and UTF-8 based on terminal detection
     inline void init_colors() {
         g_use_colors = detect_terminal_colors();
+        g_use_utf8 = detect_utf8_support();
+
+        // Allow override via environment variable
+        const char* no_utf8 = std::getenv("MIQ_NO_UTF8");
+        if (no_utf8 && *no_utf8) g_use_utf8 = false;
     }
 
     // ANSI color codes
@@ -436,16 +472,59 @@ namespace ui {
     inline std::string magenta() { return g_use_colors ? "\033[35m" : ""; }
     inline std::string white()   { return g_use_colors ? "\033[37m" : ""; }
 
-    // Box drawing characters (ASCII fallback - works everywhere)
-    const char* const BOX_TL = "+";
-    const char* const BOX_TR = "+";
-    const char* const BOX_BL = "+";
-    const char* const BOX_BR = "+";
-    const char* const BOX_H  = "-";
-    const char* const BOX_V  = "|";
-    const char* const BOX_ML = "+";
-    const char* const BOX_MR = "+";
-    const char* const BOX_MC = "+";  // Middle cross
+    // Extended 256-color support
+    inline std::string color256(int code) {
+        return g_use_colors ? "\033[38;5;" + std::to_string(code) + "m" : "";
+    }
+    inline std::string bg256(int code) {
+        return g_use_colors ? "\033[48;5;" + std::to_string(code) + "m" : "";
+    }
+
+    // Box drawing character set - UTF-8 with ASCII fallback
+    struct BoxChars {
+        const char* tl;   // Top-left corner
+        const char* tr;   // Top-right corner
+        const char* bl;   // Bottom-left corner
+        const char* br;   // Bottom-right corner
+        const char* h;    // Horizontal line
+        const char* v;    // Vertical line
+        const char* ml;   // Middle-left (├)
+        const char* mr;   // Middle-right (┤)
+        const char* mt;   // Middle-top (┬)
+        const char* mb;   // Middle-bottom (┴)
+        const char* mc;   // Middle cross (┼)
+        const char* dh;   // Double horizontal (═)
+        const char* dv;   // Double vertical (║)
+    };
+
+    inline BoxChars get_box_chars() {
+        if (g_use_utf8) {
+            return {"╭", "╮", "╰", "╯", "─", "│", "├", "┤", "┬", "┴", "┼", "═", "║"};
+        } else {
+            return {"+", "+", "+", "+", "-", "|", "+", "+", "+", "+", "+", "=", "|"};
+        }
+    }
+
+    // Legacy box character constants for compatibility (will use dynamic detection)
+    inline const char* BOX_TL() { return g_use_utf8 ? "╭" : "+"; }
+    inline const char* BOX_TR() { return g_use_utf8 ? "╮" : "+"; }
+    inline const char* BOX_BL() { return g_use_utf8 ? "╰" : "+"; }
+    inline const char* BOX_BR() { return g_use_utf8 ? "╯" : "+"; }
+    inline const char* BOX_H()  { return g_use_utf8 ? "─" : "-"; }
+    inline const char* BOX_V()  { return g_use_utf8 ? "│" : "|"; }
+    inline const char* BOX_ML() { return g_use_utf8 ? "├" : "+"; }
+    inline const char* BOX_MR() { return g_use_utf8 ? "┤" : "+"; }
+    inline const char* BOX_MC() { return g_use_utf8 ? "┼" : "+"; }
+
+    // Additional Unicode symbols
+    inline const char* SYM_CHECK()   { return g_use_utf8 ? "✓" : "[OK]"; }
+    inline const char* SYM_CROSS()   { return g_use_utf8 ? "✗" : "[X]"; }
+    inline const char* SYM_BULLET()  { return g_use_utf8 ? "●" : "*"; }
+    inline const char* SYM_CIRCLE()  { return g_use_utf8 ? "○" : "o"; }
+    inline const char* SYM_ARROW_R() { return g_use_utf8 ? "▶" : ">"; }
+    inline const char* SYM_ARROW_L() { return g_use_utf8 ? "◀" : "<"; }
+    inline const char* SYM_DIAMOND() { return g_use_utf8 ? "◆" : "*"; }
+    inline const char* SYM_BLOCK()   { return g_use_utf8 ? "█" : "#"; }
 
     // Enhanced UI components for professional display
     std::string progress_bar(double percent, int width = 30) {
@@ -486,26 +565,28 @@ namespace ui {
     }
 
     void print_double_header(const std::string& title, int width = 60) {
+        auto bc = get_box_chars();
         std::cout << cyan() << bold();
-        std::cout << BOX_TL;
-        for(int i = 0; i < width - 2; i++) std::cout << "=";
-        std::cout << BOX_TR << "\n";
+        std::cout << bc.tl;
+        for(int i = 0; i < width - 2; i++) std::cout << bc.dh;
+        std::cout << bc.tr << "\n";
 
         int padding = (width - 2 - (int)title.size()) / 2;
-        std::cout << BOX_V;
+        std::cout << bc.v;
         for(int i = 0; i < padding; i++) std::cout << " ";
         std::cout << title;
         for(int i = 0; i < width - 2 - padding - (int)title.size(); i++) std::cout << " ";
-        std::cout << BOX_V << "\n";
+        std::cout << bc.v << "\n";
 
-        std::cout << BOX_BL;
-        for(int i = 0; i < width - 2; i++) std::cout << "=";
-        std::cout << BOX_BR << reset() << "\n";
+        std::cout << bc.bl;
+        for(int i = 0; i < width - 2; i++) std::cout << bc.dh;
+        std::cout << bc.br << reset() << "\n";
     }
 
     void print_table_row(const std::vector<std::pair<std::string, int>>& cols, int total_width = 60) {
         (void)total_width;  // Unused, kept for API consistency
-        std::cout << BOX_V;
+        auto bc = get_box_chars();
+        std::cout << bc.v;
         for (const auto& col : cols) {
             std::string text = col.first;
             int width = col.second;
@@ -514,16 +595,17 @@ namespace ui {
             }
             std::cout << " " << std::left << std::setw(width - 2) << text << " ";
         }
-        std::cout << BOX_V << "\n";
+        std::cout << bc.v << "\n";
     }
 
     void print_table_separator(const std::vector<int>& widths) {
-        std::cout << BOX_ML;
+        auto bc = get_box_chars();
+        std::cout << bc.ml;
         for (size_t i = 0; i < widths.size(); i++) {
-            for (int j = 0; j < widths[i]; j++) std::cout << BOX_H;
-            if (i < widths.size() - 1) std::cout << BOX_MC;
+            for (int j = 0; j < widths[i]; j++) std::cout << bc.h;
+            if (i < widths.size() - 1) std::cout << bc.mc;
         }
-        std::cout << BOX_MR << "\n";
+        std::cout << bc.mr << "\n";
     }
 
     void print_status_line(const std::string& left, const std::string& right, int width = 60) {
@@ -535,35 +617,36 @@ namespace ui {
 
     // ASCII QR-like code for addresses (simple checkered pattern with address embedded)
     void print_address_display(const std::string& address, int width = 50) {
+        auto bc = get_box_chars();
         std::cout << cyan() << bold();
-        std::cout << BOX_TL;
-        for(int i = 0; i < width - 2; i++) std::cout << BOX_H;
-        std::cout << BOX_TR << "\n";
+        std::cout << bc.tl;
+        for(int i = 0; i < width - 2; i++) std::cout << bc.h;
+        std::cout << bc.tr << "\n";
 
         // Address label
-        std::cout << BOX_V << "  " << dim() << "Receive Address:" << reset() << cyan() << bold();
+        std::cout << bc.v << "  " << dim() << "Receive Address:" << reset() << cyan() << bold();
         for(int i = 0; i < width - 20; i++) std::cout << " ";
-        std::cout << BOX_V << "\n";
+        std::cout << bc.v << "\n";
 
         // Address value (centered)
         int addr_pad = (width - 2 - (int)address.size()) / 2;
-        std::cout << BOX_V;
+        std::cout << bc.v;
         for(int i = 0; i < addr_pad; i++) std::cout << " ";
         std::cout << green() << bold() << address << reset() << cyan() << bold();
         for(int i = 0; i < width - 2 - addr_pad - (int)address.size(); i++) std::cout << " ";
-        std::cout << BOX_V << "\n";
+        std::cout << bc.v << "\n";
 
         // Simple visual pattern for easy recognition
-        std::cout << BOX_V << "  ";
+        std::cout << bc.v << "  ";
         for(int i = 0; i < width - 6; i++) {
             unsigned char c = (i < (int)address.size()) ? (unsigned char)address[i] : (unsigned char)i;
-            std::cout << ((c % 2) ? "#" : " ");
+            std::cout << (g_use_utf8 ? ((c % 2) ? "█" : " ") : ((c % 2) ? "#" : " "));
         }
-        std::cout << "  " << BOX_V << "\n";
+        std::cout << "  " << bc.v << "\n";
 
-        std::cout << BOX_BL;
-        for(int i = 0; i < width - 2; i++) std::cout << BOX_H;
-        std::cout << BOX_BR << reset() << "\n";
+        std::cout << bc.bl;
+        for(int i = 0; i < width - 2; i++) std::cout << bc.h;
+        std::cout << bc.br << reset() << "\n";
     }
 
     void print_amount_highlight(const std::string& label, const std::string& amount, const std::string& color_fn) {
@@ -753,32 +836,46 @@ namespace ui {
     }
 
     void print_header(const std::string& title, int width = 60) {
+        auto bc = get_box_chars();
         std::cout << cyan() << bold();
-        std::cout << BOX_TL;
-        for(int i = 0; i < width - 2; i++) std::cout << BOX_H;
-        std::cout << BOX_TR << "\n";
+        std::cout << bc.tl;
+        for(int i = 0; i < width - 2; i++) std::cout << bc.h;
+        std::cout << bc.tr << "\n";
 
         int padding = (width - 2 - (int)title.size()) / 2;
-        std::cout << BOX_V;
+        std::cout << bc.v;
         for(int i = 0; i < padding; i++) std::cout << " ";
         std::cout << title;
         for(int i = 0; i < width - 2 - padding - (int)title.size(); i++) std::cout << " ";
-        std::cout << BOX_V << "\n";
+        std::cout << bc.v << "\n";
 
-        std::cout << BOX_BL;
-        for(int i = 0; i < width - 2; i++) std::cout << BOX_H;
-        std::cout << BOX_BR << reset() << "\n";
+        std::cout << bc.bl;
+        for(int i = 0; i < width - 2; i++) std::cout << bc.h;
+        std::cout << bc.br << reset() << "\n";
     }
 
     void print_separator(int width = 60) {
+        auto bc = get_box_chars();
         std::cout << dim();
-        for(int i = 0; i < width; i++) std::cout << "-";
+        for(int i = 0; i < width; i++) std::cout << bc.h;
         std::cout << reset() << "\n";
     }
 
     void print_banner() {
-        std::cout << cyan() << bold();
-        std::cout << R"(
+        if (g_use_utf8) {
+            // Professional UTF-8 ASCII art logo
+            std::cout << color256(51) << bold();  // Bright cyan
+            std::cout << "\n";
+            std::cout << "    ██████╗ ██╗   ██╗████████╗██╗  ██╗███╗   ███╗██╗██╗   ██╗███╗   ███╗\n";
+            std::cout << "    ██╔══██╗╚██╗ ██╔╝╚══██╔══╝██║  ██║████╗ ████║██║██║   ██║████╗ ████║\n";
+            std::cout << "    ██████╔╝ ╚████╔╝    ██║   ███████║██╔████╔██║██║██║   ██║██╔████╔██║\n";
+            std::cout << "    ██╔══██╗  ╚██╔╝     ██║   ██╔══██║██║╚██╔╝██║██║██║   ██║██║╚██╔╝██║\n";
+            std::cout << "    ██║  ██║   ██║      ██║   ██║  ██║██║ ╚═╝ ██║██║╚██████╔╝██║ ╚═╝ ██║\n";
+            std::cout << "    ╚═╝  ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝╚═╝     ╚═╝╚═╝ ╚═════╝ ╚═╝     ╚═╝\n";
+            std::cout << reset() << "\n";
+        } else {
+            std::cout << cyan() << bold();
+            std::cout << R"(
     ____        _   _               _
    |  _ \ _   _| |_| |__  _ __ ___ (_)_   _ _ __ ___
    | |_) | | | | __| '_ \| '_ ` _ \| | | | | '_ ` _ \
@@ -786,8 +883,10 @@ namespace ui {
    |_| \_\\__, |\__|_| |_|_| |_| |_|_|\__,_|_| |_| |_|
           |___/
 )" << reset();
-        std::cout << magenta() << bold() << "          RYTHMIUM WALLET v8.0" << reset() << "\n";
-        std::cout << dim() << "   Live Monitor | Zero-Flicker | Real-Time TX Tracking" << reset() << "\n\n";
+        }
+        std::cout << magenta() << bold() << "               W A L L E T   v 1 . 0   S T A B L E" << reset() << "\n";
+        std::cout << dim() << "         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << reset() << "\n";
+        std::cout << dim() << "         Bulletproof " << (g_use_utf8 ? "•" : "|") << " Live Dashboard " << (g_use_utf8 ? "•" : "|") << " Professional" << reset() << "\n\n";
     }
 
     // =========================================================================
@@ -1203,145 +1302,169 @@ namespace ui {
     }
 
     // =========================================================================
-    // PROFESSIONAL SPLASH SCREEN SYSTEM v1.0
-    // Similar to the node daemon splash screen with smooth animations
+    // PROFESSIONAL SPLASH SCREEN SYSTEM v2.0
+    // Clean modern design matching the node splash screen style
     // =========================================================================
 
-    // Animated spinner for splash screen
-    static const char* splash_spinner(int tick) {
-        static const char* frames[] = {"|", "/", "-", "\\"};
-        return frames[tick % 4];
+    // Animated spinner for splash screen - UTF-8 aware
+    static std::string splash_spinner(int tick) {
+        if (g_use_utf8) {
+            static const char* frames[] = {"◐", "◓", "◑", "◒"};
+            return frames[tick % 4];
+        } else {
+            static const char* frames[] = {"|", "/", "-", "\\"};
+            return frames[tick % 4];
+        }
     }
 
-    // Smooth progress bar with gradient effect
+    // Premium gradient progress bar with smooth animation (like node splash)
     static std::string splash_progress_bar(double frac, int width, int tick) {
-        if (width < 10) width = 10;
+        if (width < 20) width = 20;
         if (frac < 0.0) frac = 0.0;
         if (frac > 1.0) frac = 1.0;
 
         int inner = width - 2;
         int filled = (int)(frac * inner);
+        double sub_frac = (frac * inner) - filled;  // Sub-character precision
 
         std::string out;
-        out.reserve((size_t)(width + 50));
+        out.reserve((size_t)(width + 100));
 
-        if (g_use_colors) {
+        if (g_use_colors && g_use_utf8) {
+            // Premium Unicode progress bar with smooth gradient and glow
             out += "\033[48;5;236m";  // Dark background
+
             for (int i = 0; i < inner; ++i) {
                 if (i < filled) {
-                    // Gradient from cyan to green
-                    int phase = (i * 5) / inner;
-                    switch(phase) {
+                    // Gradient from cyan to green based on position
+                    int color_phase = (i * 6) / inner;
+                    switch(color_phase) {
                         case 0: out += "\033[38;5;51m"; break;   // Bright cyan
                         case 1: out += "\033[38;5;50m"; break;   // Cyan-green
                         case 2: out += "\033[38;5;49m"; break;   // Teal
                         case 3: out += "\033[38;5;48m"; break;   // Green-cyan
-                        default: out += "\033[38;5;46m"; break;  // Bright green
+                        case 4: out += "\033[38;5;47m"; break;   // Bright green
+                        default: out += "\033[38;5;46m"; break;  // Pure green
                     }
-                    out += "=";
+                    out += "█";
                 } else if (i == filled && frac < 1.0) {
-                    // Animated leading edge
-                    out += "\033[38;5;51m";
-                    static const char* edge[] = {">", "*", ">", "+"};
-                    out += edge[tick % 4];
+                    // Animated leading edge with smooth transition
+                    out += "\033[38;5;51m";  // Cyan glow
+                    static const char* edge[] = {"▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"};
+                    int edge_idx = (int)(sub_frac * 8);
+                    // Add pulse animation
+                    int pulse = (tick % 4);
+                    edge_idx = std::min(7, std::max(0, edge_idx + (pulse < 2 ? pulse : 4 - pulse) - 1));
+                    out += edge[edge_idx];
                 } else {
-                    out += "\033[38;5;238m ";
+                    // Empty space with subtle pattern
+                    out += "\033[38;5;238m";
+                    out += ((i + tick/2) % 4 == 0) ? "·" : " ";
                 }
             }
             out += "\033[0m";
+        } else if (g_use_colors) {
+            // ANSI fallback with color
+            out += "\033[42m\033[30m";  // Green background
+            for (int i = 0; i < filled; ++i) out += " ";
+            out += "\033[0m\033[47m\033[30m";  // Gray background
+            for (int i = filled; i < inner; ++i) out += " ";
+            out += "\033[0m";
         } else {
+            // Plain ASCII
             out += "[";
             for (int i = 0; i < filled; ++i) out += "=";
             if (filled < inner) out += ">";
             for (int i = filled + 1; i < inner; ++i) out += " ";
             out += "]";
         }
+
         return out;
     }
 
-    // Draw animated splash screen
+    // Draw animated splash screen with clean modern design
     static void draw_splash_screen(const std::string& status, double progress, int tick,
                                    const std::string& detail = "") {
+        auto bc = get_box_chars();
+
         // Clear screen and position cursor
         std::cout << "\033[2J\033[H" << std::flush;
 
-        const int WIDTH = 60;
+        const int WIDTH = 70;
+        std::cout << "\n";
+
+        // Stylized RYTHMIUM logo
+        if (g_use_utf8 && g_use_colors) {
+            std::string logo_color = "\033[38;5;51m\033[1m";  // Bright cyan bold
+            std::cout << logo_color << "    ███╗   ███╗██╗ ██████╗ ██████╗  ██████╗ " << reset() << "\n";
+            std::cout << logo_color << "    ████╗ ████║██║██╔═══██╗██╔══██╗██╔═══██╗" << reset() << "\n";
+            std::cout << logo_color << "    ██╔████╔██║██║██║   ██║██████╔╝██║   ██║" << reset() << "\n";
+            std::cout << logo_color << "    ██║╚██╔╝██║██║██║▄▄ ██║██╔══██╗██║   ██║" << reset() << "\n";
+            std::cout << logo_color << "    ██║ ╚═╝ ██║██║╚██████╔╝██║  ██║╚██████╔╝" << reset() << "\n";
+            std::cout << logo_color << "    ╚═╝     ╚═╝╚═╝ ╚══▀▀═╝ ╚═╝  ╚═╝ ╚═════╝ " << reset() << "\n";
+        } else {
+            std::cout << cyan() << bold() << "    RYTHMIUM WALLET" << reset() << "\n";
+        }
+
+        // Version with chain name
+        std::cout << "\n";
+        std::cout << dim() << "    v1.0  " << (g_use_utf8 ? "│" : "|") << "  WALLET  " << (g_use_utf8 ? "│" : "|") << "  STABLE" << reset() << "\n";
+        std::cout << "\n";
+
+        // Sync status header
+        std::cout << "    ";
+        if (progress >= 1.0) {
+            std::cout << "\033[38;5;46m\033[1m" << (g_use_utf8 ? "✓ " : "[OK] ") << status << reset();
+        } else {
+            std::cout << yellow() << splash_spinner(tick) << reset() << " " << bold() << status << reset();
+        }
         std::cout << "\n\n";
 
-        // Logo with colors - RYTHMIUM WALLET v8.0
-        if (g_use_colors) {
-            std::cout << cyan() << bold();
-            std::cout << "       ____        _   _               _\n";
-            std::cout << "      |  _ \\ _   _| |_| |__  _ __ ___ (_)_   _ _ __ ___\n";
-            std::cout << "      | |_) | | | | __| '_ \\| '_ ` _ \\| | | | | '_ ` _ \\\n";
-            std::cout << "      |  _ <| |_| | |_| | | | | | | | | | |_| | | | | | |\n";
-            std::cout << "      |_| \\_\\\\__, |\\__|_| |_|_| |_| |_|_|\\__,_|_| |_| |_|\n";
-            std::cout << "             |___/\n";
-            std::cout << reset() << "\n";
-        } else {
-            std::cout << "      RYTHMIUM WALLET v1.0 STABLE\n\n";
-        }
+        // Large progress bar
+        int bar_width = WIDTH - 8;
+        std::cout << "    " << splash_progress_bar(progress, bar_width, tick) << "\n";
 
-        // Version and subtitle
-        std::cout << magenta() << bold() << "           RYTHMIUM WALLET v1.0 STABLE" << reset() << "\n";
-        std::cout << dim() << "    Bulletproof Transactions | Live Dashboard | Pro UI" << reset() << "\n\n";
-
-        // Status box
-        std::cout << cyan() << "    +";
-        for (int i = 0; i < WIDTH - 2; i++) std::cout << "-";
-        std::cout << "+" << reset() << "\n";
-
-        // Status line with spinner
-        std::cout << cyan() << "    |" << reset();
-        std::cout << " " << yellow() << splash_spinner(tick) << reset() << " ";
-        std::cout << bold() << status << reset();
-        int padding = WIDTH - 7 - (int)status.size();
-        std::cout << std::string(padding > 0 ? padding : 1, ' ');
-        std::cout << cyan() << "|" << reset() << "\n";
-
-        // Progress bar line
-        std::cout << cyan() << "    |" << reset();
-        std::cout << " " << splash_progress_bar(progress, WIDTH - 6, tick) << " ";
-        std::cout << cyan() << "|" << reset() << "\n";
-
-        // Percentage line
-        std::cout << cyan() << "    |" << reset();
+        // Big percentage display
+        std::cout << "\n";
         std::ostringstream pct;
-        pct << std::fixed << std::setprecision(1) << (progress * 100.0) << "%";
+        pct << std::fixed << std::setprecision(2) << (progress * 100.0) << "%";
         std::string pct_str = pct.str();
-        int pct_pad = (WIDTH - 2 - (int)pct_str.size()) / 2;
-        std::cout << std::string(pct_pad, ' ');
-        if (progress >= 1.0) {
-            std::cout << green() << bold() << pct_str << reset();
+
+        std::cout << "    ";
+        if (progress >= 0.99) {
+            std::cout << "\033[38;5;46m\033[1m" << pct_str << reset();  // Bright green + bold
         } else if (progress >= 0.75) {
-            std::cout << green() << pct_str << reset();
-        } else if (progress >= 0.5) {
-            std::cout << yellow() << pct_str << reset();
+            std::cout << "\033[38;5;47m" << pct_str << reset();  // Green
+        } else if (progress >= 0.50) {
+            std::cout << "\033[38;5;226m" << pct_str << reset();  // Yellow
+        } else if (progress >= 0.25) {
+            std::cout << "\033[38;5;214m" << pct_str << reset();  // Orange
         } else {
-            std::cout << cyan() << pct_str << reset();
+            std::cout << "\033[38;5;51m" << pct_str << reset();  // Cyan
         }
-        std::cout << std::string(WIDTH - 2 - pct_pad - (int)pct_str.size(), ' ');
-        std::cout << cyan() << "|" << reset() << "\n";
 
         // Detail line (optional)
         if (!detail.empty()) {
-            std::cout << cyan() << "    |" << reset();
-            std::string det = detail.size() > (size_t)(WIDTH - 4) ? detail.substr(0, WIDTH - 7) + "..." : detail;
-            int det_pad = (WIDTH - 2 - (int)det.size()) / 2;
-            std::cout << std::string(det_pad, ' ');
-            std::cout << dim() << det << reset();
-            std::cout << std::string(WIDTH - 2 - det_pad - (int)det.size(), ' ');
-            std::cout << cyan() << "|" << reset() << "\n";
-        } else {
-            std::cout << cyan() << "    |" << reset();
-            std::cout << std::string(WIDTH - 2, ' ');
-            std::cout << cyan() << "|" << reset() << "\n";
+            std::cout << "  " << dim() << detail << reset();
         }
+        std::cout << "\n";
 
-        // Bottom border
-        std::cout << cyan() << "    +";
-        for (int i = 0; i < WIDTH - 2; i++) std::cout << "-";
-        std::cout << "+" << reset() << "\n";
+        // Status box
+        std::cout << "\n";
+        std::cout << "    " << dim() << bc.tl;
+        for (int i = 0; i < WIDTH - 10; i++) std::cout << bc.h;
+        std::cout << bc.tr << reset() << "\n";
+
+        std::cout << "    " << dim() << bc.v << reset();
+        std::cout << " " << dim() << "Ready " << (g_use_utf8 ? "•" : "|");
+        std::cout << " Bulletproof " << (g_use_utf8 ? "•" : "|");
+        std::cout << " Professional" << reset();
+        std::cout << std::string(WIDTH - 46, ' ');
+        std::cout << dim() << bc.v << reset() << "\n";
+
+        std::cout << "    " << dim() << bc.bl;
+        for (int i = 0; i < WIDTH - 10; i++) std::cout << bc.h;
+        std::cout << bc.br << reset() << "\n";
 
         std::cout << "\n";
         std::cout << std::flush;
@@ -9867,38 +9990,55 @@ namespace main_menu {
 
     static MenuState g_menu_state;
 
-    // Get animated logo frame
+    // Get animated logo frame - UTF-8 aware
     static std::string get_logo_line(int line, int tick) {
         // Animated color for logo
         const char* colors[] = {"\033[36m", "\033[96m", "\033[94m", "\033[95m", "\033[96m", "\033[36m"};
         std::string c = colors[tick % 6];
         std::string r = "\033[0m";
 
-        switch(line) {
-            case 0: return c + "    ██████╗ ██╗   ██╗████████╗██╗  ██╗███╗   ███╗██╗██╗   ██╗███╗   ███╗" + r;
-            case 1: return c + "    ██╔══██╗╚██╗ ██╔╝╚══██╔══╝██║  ██║████╗ ████║██║██║   ██║████╗ ████║" + r;
-            case 2: return c + "    ██████╔╝ ╚████╔╝    ██║   ███████║██╔████╔██║██║██║   ██║██╔████╔██║" + r;
-            case 3: return c + "    ██╔══██╗  ╚██╔╝     ██║   ██╔══██║██║╚██╔╝██║██║██║   ██║██║╚██╔╝██║" + r;
-            case 4: return c + "    ██║  ██║   ██║      ██║   ██║  ██║██║ ╚═╝ ██║██║╚██████╔╝██║ ╚═╝ ██║" + r;
-            case 5: return c + "    ╚═╝  ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝╚═╝     ╚═╝╚═╝ ╚═════╝ ╚═╝     ╚═╝" + r;
-            default: return "";
+        if (ui::g_use_utf8) {
+            switch(line) {
+                case 0: return c + "    ██████╗ ██╗   ██╗████████╗██╗  ██╗███╗   ███╗██╗██╗   ██╗███╗   ███╗" + r;
+                case 1: return c + "    ██╔══██╗╚██╗ ██╔╝╚══██╔══╝██║  ██║████╗ ████║██║██║   ██║████╗ ████║" + r;
+                case 2: return c + "    ██████╔╝ ╚████╔╝    ██║   ███████║██╔████╔██║██║██║   ██║██╔████╔██║" + r;
+                case 3: return c + "    ██╔══██╗  ╚██╔╝     ██║   ██╔══██║██║╚██╔╝██║██║██║   ██║██║╚██╔╝██║" + r;
+                case 4: return c + "    ██║  ██║   ██║      ██║   ██║  ██║██║ ╚═╝ ██║██║╚██████╔╝██║ ╚═╝ ██║" + r;
+                case 5: return c + "    ╚═╝  ╚═╝   ╚═╝      ╚═╝   ╚═╝  ╚═╝╚═╝     ╚═╝╚═╝ ╚═════╝ ╚═╝     ╚═╝" + r;
+                default: return "";
+            }
+        } else {
+            // ASCII fallback
+            switch(line) {
+                case 0: return c + "    RYTHMIUM WALLET" + r;
+                case 1: return "";
+                default: return "";
+            }
         }
     }
 
-    // Get animated network pulse indicator
+    // Get animated network pulse indicator - UTF-8 aware
     static std::string get_pulse(int tick, bool online) {
-        if (!online) return ui::red() + "●" + ui::reset() + " OFFLINE";
-        const char* pulses[] = {"◐", "◓", "◑", "◒"};
-        return ui::green() + pulses[tick % 4] + ui::reset() + " ONLINE ";
+        if (ui::g_use_utf8) {
+            if (!online) return ui::red() + "●" + ui::reset() + " OFFLINE";
+            const char* pulses[] = {"◐", "◓", "◑", "◒"};
+            return ui::green() + pulses[tick % 4] + ui::reset() + " ONLINE ";
+        } else {
+            if (!online) return ui::red() + "*" + ui::reset() + " OFFLINE";
+            const char* pulses[] = {"*", "o", "O", "o"};
+            return ui::green() + pulses[tick % 4] + ui::reset() + " ONLINE ";
+        }
     }
 
-    // Get animated border char
+    // Get animated border char - UTF-8 aware
     static std::string get_border(int pos, int tick, int width) {
+        (void)width;
         int wave = (pos + tick) % 20;
-        if (wave < 5) return ui::cyan() + "═" + ui::reset();
-        if (wave < 10) return ui::blue() + "═" + ui::reset();
-        if (wave < 15) return ui::magenta() + "═" + ui::reset();
-        return ui::cyan() + "═" + ui::reset();
+        const char* border_char = ui::g_use_utf8 ? "═" : "=";
+        if (wave < 5) return ui::cyan() + border_char + ui::reset();
+        if (wave < 10) return ui::blue() + border_char + ui::reset();
+        if (wave < 15) return ui::magenta() + border_char + ui::reset();
+        return ui::cyan() + border_char + ui::reset();
     }
 
     // Draw a menu item with selection highlight
@@ -9930,6 +10070,7 @@ namespace main_menu {
     // Draw the complete animated main menu
     static void draw_main_menu(int selected, int tick, bool online,
                                const std::vector<std::pair<std::string, std::string>>& seeds) {
+        auto bc = ui::get_box_chars();
         const int W = 78;
 
         // Cursor home for flicker-free update
@@ -9943,31 +10084,53 @@ namespace main_menu {
         std::cout << "\n";
 
         // Animated logo
-        for (int i = 0; i < 6; i++) {
-            std::cout << get_logo_line(i, tick) << "\033[K\n";
+        int logo_lines = ui::g_use_utf8 ? 6 : 2;
+        for (int i = 0; i < logo_lines; i++) {
+            std::string line = get_logo_line(i, tick);
+            if (!line.empty()) {
+                std::cout << line << "\033[K\n";
+            }
+        }
+        // Pad remaining lines for consistent layout
+        for (int i = logo_lines; i < 6; i++) {
+            std::cout << "\033[K\n";
         }
 
         // Version and tagline
         std::cout << "\n";
         std::cout << "              " << ui::magenta() << ui::bold() << "W A L L E T   v 1 . 0   S T A B L E" << ui::reset() << "\033[K\n";
-        std::cout << "          " << ui::dim() << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << ui::reset() << "\033[K\n";
-        std::cout << "          " << ui::dim() << "Bulletproof • Live Dashboard • Professional" << ui::reset() << "\033[K\n";
+        if (ui::g_use_utf8) {
+            std::cout << "          " << ui::dim() << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << ui::reset() << "\033[K\n";
+            std::cout << "          " << ui::dim() << "Bulletproof • Live Dashboard • Professional" << ui::reset() << "\033[K\n";
+        } else {
+            std::cout << "          " << ui::dim() << "-------------------------------------------" << ui::reset() << "\033[K\n";
+            std::cout << "          " << ui::dim() << "Bulletproof | Live Dashboard | Professional" << ui::reset() << "\033[K\n";
+        }
         std::cout << "\n";
 
-        // Top border with wave animation
-        std::cout << "    " << ui::cyan() << "╔" << ui::reset();
+        // Top border with wave animation - using dynamic box chars
+        const char* corner_tl = ui::g_use_utf8 ? "╔" : "+";
+        const char* corner_tr = ui::g_use_utf8 ? "╗" : "+";
+        const char* side_v = ui::g_use_utf8 ? "║" : "|";
+        const char* corner_ml = ui::g_use_utf8 ? "╠" : "+";
+        const char* corner_mr = ui::g_use_utf8 ? "╣" : "+";
+        const char* corner_bl = ui::g_use_utf8 ? "╚" : "+";
+        const char* corner_br = ui::g_use_utf8 ? "╝" : "+";
+        const char* sep_h = ui::g_use_utf8 ? "─" : "-";
+
+        std::cout << "    " << ui::cyan() << corner_tl << ui::reset();
         for (int i = 0; i < W - 2; i++) {
             std::cout << get_border(i, tick, W);
         }
-        std::cout << ui::cyan() << "╗" << ui::reset() << "\033[K\n";
+        std::cout << ui::cyan() << corner_tr << ui::reset() << "\033[K\n";
 
         // Status bar
-        std::cout << "    " << ui::cyan() << "║" << ui::reset();
+        std::cout << "    " << ui::cyan() << side_v << ui::reset();
         std::cout << " " << get_pulse(tick, online);
 
         // Node info
         if (!seeds.empty()) {
-            std::cout << ui::dim() << " │ " << ui::reset();
+            std::cout << ui::dim() << (ui::g_use_utf8 ? " │ " : " | ") << ui::reset();
             std::cout << ui::cyan() << seeds.size() << ui::reset() << " nodes";
         }
 
@@ -9978,25 +10141,25 @@ namespace main_menu {
         strftime(time_buf, sizeof(time_buf), "%H:%M:%S", t);
         std::cout << std::string(W - 45, ' ');
         std::cout << ui::dim() << time_buf << ui::reset();
-        std::cout << " " << ui::cyan() << "║" << ui::reset() << "\033[K\n";
+        std::cout << " " << ui::cyan() << side_v << ui::reset() << "\033[K\n";
 
         // Separator
-        std::cout << "    " << ui::cyan() << "╠" << ui::reset();
+        std::cout << "    " << ui::cyan() << corner_ml << ui::reset();
         for (int i = 0; i < W - 2; i++) {
-            std::cout << ui::cyan() << ((i % 2 == 0) ? "═" : "─") << ui::reset();
+            std::cout << ui::cyan() << ((i % 2 == 0) ? bc.dh : sep_h) << ui::reset();
         }
-        std::cout << ui::cyan() << "╣" << ui::reset() << "\033[K\n";
+        std::cout << ui::cyan() << corner_mr << ui::reset() << "\033[K\n";
 
         // Menu title
-        std::cout << "    " << ui::cyan() << "║" << ui::reset();
-        std::cout << "   " << ui::bold() << ui::white() << "◆ MAIN MENU ◆" << ui::reset();
+        std::cout << "    " << ui::cyan() << side_v << ui::reset();
+        std::cout << "   " << ui::bold() << ui::white() << (ui::g_use_utf8 ? "◆ MAIN MENU ◆" : "* MAIN MENU *") << ui::reset();
         std::cout << std::string(W - 19, ' ');
-        std::cout << ui::cyan() << "║" << ui::reset() << "\033[K\n";
+        std::cout << ui::cyan() << side_v << ui::reset() << "\033[K\n";
 
         // Empty line
-        std::cout << "    " << ui::cyan() << "║" << ui::reset();
+        std::cout << "    " << ui::cyan() << side_v << ui::reset();
         std::cout << std::string(W - 2, ' ');
-        std::cout << ui::cyan() << "║" << ui::reset() << "\033[K\n";
+        std::cout << ui::cyan() << side_v << ui::reset() << "\033[K\n";
 
         // Menu items
         const char* menu_items[][3] = {
@@ -10008,13 +10171,18 @@ namespace main_menu {
         };
 
         for (int i = 0; i < 5; i++) {
-            std::cout << "    " << ui::cyan() << "║" << ui::reset();
+            std::cout << "    " << ui::cyan() << side_v << ui::reset();
             std::cout << "  ";
 
             bool is_selected = (selected == i);
 
             if (is_selected) {
-                const char* arrows[] = {"►", "▻", "▸", "▹"};
+                const char* arrows[] = {
+                    ui::g_use_utf8 ? "►" : ">",
+                    ui::g_use_utf8 ? "▻" : ">",
+                    ui::g_use_utf8 ? "▸" : ">",
+                    ui::g_use_utf8 ? "▹" : ">"
+                };
                 std::cout << ui::green() << arrows[tick % 4] << " " << ui::reset();
                 std::cout << ui::green() << ui::bold() << "[" << menu_items[i][0] << "]" << ui::reset();
                 std::cout << " " << ui::green() << ui::bold() << std::setw(12) << std::left << menu_items[i][1] << ui::reset();
@@ -10030,43 +10198,57 @@ namespace main_menu {
             int used = 2 + 2 + 3 + 1 + 12 + 1 + strlen(menu_items[i][2]);
             int remaining = W - 2 - used;
             if (remaining > 0) std::cout << std::string(remaining, ' ');
-            std::cout << ui::cyan() << "║" << ui::reset() << "\033[K\n";
+            std::cout << ui::cyan() << side_v << ui::reset() << "\033[K\n";
         }
 
         // Empty line
-        std::cout << "    " << ui::cyan() << "║" << ui::reset();
+        std::cout << "    " << ui::cyan() << side_v << ui::reset();
         std::cout << std::string(W - 2, ' ');
-        std::cout << ui::cyan() << "║" << ui::reset() << "\033[K\n";
+        std::cout << ui::cyan() << side_v << ui::reset() << "\033[K\n";
 
         // Bottom separator
-        std::cout << "    " << ui::cyan() << "╠" << ui::reset();
+        std::cout << "    " << ui::cyan() << corner_ml << ui::reset();
         for (int i = 0; i < W - 2; i++) {
-            std::cout << ui::cyan() << "─" << ui::reset();
+            std::cout << ui::cyan() << sep_h << ui::reset();
         }
-        std::cout << ui::cyan() << "╣" << ui::reset() << "\033[K\n";
+        std::cout << ui::cyan() << corner_mr << ui::reset() << "\033[K\n";
 
         // Help line
-        std::cout << "    " << ui::cyan() << "║" << ui::reset();
-        std::cout << "  " << ui::dim() << "↑↓ Navigate" << ui::reset();
-        std::cout << ui::dim() << " │ " << ui::reset();
-        std::cout << ui::dim() << "Enter/Number Select" << ui::reset();
-        std::cout << ui::dim() << " │ " << ui::reset();
-        std::cout << ui::dim() << "Q Quit" << ui::reset();
-        std::cout << std::string(W - 52, ' ');
-        std::cout << ui::cyan() << "║" << ui::reset() << "\033[K\n";
+        std::cout << "    " << ui::cyan() << side_v << ui::reset();
+        if (ui::g_use_utf8) {
+            std::cout << "  " << ui::dim() << "↑↓ Navigate" << ui::reset();
+            std::cout << ui::dim() << " │ " << ui::reset();
+            std::cout << ui::dim() << "Enter/Number Select" << ui::reset();
+            std::cout << ui::dim() << " │ " << ui::reset();
+            std::cout << ui::dim() << "Q Quit" << ui::reset();
+        } else {
+            std::cout << "  " << ui::dim() << "Up/Down Navigate" << ui::reset();
+            std::cout << ui::dim() << " | " << ui::reset();
+            std::cout << ui::dim() << "Enter/Number Select" << ui::reset();
+            std::cout << ui::dim() << " | " << ui::reset();
+            std::cout << ui::dim() << "Q Quit" << ui::reset();
+        }
+        std::cout << std::string(W - 56, ' ');
+        std::cout << ui::cyan() << side_v << ui::reset() << "\033[K\n";
 
         // Bottom border
-        std::cout << "    " << ui::cyan() << "╚" << ui::reset();
+        std::cout << "    " << ui::cyan() << corner_bl << ui::reset();
         for (int i = 0; i < W - 2; i++) {
             std::cout << get_border(i, tick + 10, W);
         }
-        std::cout << ui::cyan() << "╝" << ui::reset() << "\033[K\n";
+        std::cout << ui::cyan() << corner_br << ui::reset() << "\033[K\n";
 
         // Animated cursor prompt
         std::cout << "\n";
-        const char* cursors[] = {"█", "▌", "▐", "▌"};
-        std::cout << "    " << ui::dim() << "Ready" << ui::reset() << " ";
-        std::cout << ui::cyan() << cursors[tick % 4] << ui::reset();
+        if (ui::g_use_utf8) {
+            const char* cursors[] = {"█", "▌", "▐", "▌"};
+            std::cout << "    " << ui::dim() << "Ready" << ui::reset() << " ";
+            std::cout << ui::cyan() << cursors[tick % 4] << ui::reset();
+        } else {
+            const char* cursors[] = {"#", "|", "#", "|"};
+            std::cout << "    " << ui::dim() << "Ready" << ui::reset() << " ";
+            std::cout << ui::cyan() << cursors[tick % 4] << ui::reset();
+        }
         std::cout << "\033[K" << std::flush;
     }
 
