@@ -6530,6 +6530,7 @@ static TxDetailedEntry convert_to_detailed(const TxHistoryEntry& basic) {
     detailed.to_address = basic.to_address;
     detailed.from_address = basic.from_address;
     detailed.memo = basic.memo;
+    detailed.block_height = basic.block_height;  // Copy block height for accurate sorting
     detailed.status = basic.confirmations > 0 ? "confirmed" : "pending";
     detailed.tx_size = 225;
     if (detailed.fee > 0) {
@@ -6604,27 +6605,104 @@ static void sort_transactions(std::vector<TxDetailedEntry>& txs, TxSortOrder ord
     }
 }
 
-// Confirmation progress bar
+// =============================================================================
+// PROFESSIONAL CONFIRMATION PROGRESS BAR
+// Gradient from cyan (unconfirmed) to green (fully confirmed)
+// =============================================================================
+
+// Get ANSI color code for gradient between cyan (0) and green (6 confirmations)
+static std::string get_confirmation_color(uint32_t confirmations) {
+    if (confirmations == 0) return "\033[38;5;214m";  // Orange/amber for pending
+    if (confirmations >= 6) return "\033[38;5;46m";   // Bright green for fully confirmed
+
+    // Gradient from cyan (51) to green (46) through intermediate colors
+    // Confirmation 1: Cyan (51)
+    // Confirmation 2: Cyan-teal (44)
+    // Confirmation 3: Teal (43)
+    // Confirmation 4: Teal-green (42)
+    // Confirmation 5: Light green (41)
+    // Confirmation 6: Bright green (46)
+    static const int colors[] = {214, 51, 44, 43, 42, 41, 46};
+    int idx = std::min((int)confirmations, 6);
+    return "\033[38;5;" + std::to_string(colors[idx]) + "m";
+}
+
+// Professional confirmation progress bar with smooth gradient fill
 static std::string confirmation_bar(uint32_t confirmations, int width = 6) {
     std::string bar;
+    std::string reset = "\033[0m";
+
+    // Calculate fill level (each position = 1 confirmation for width=6)
+    int filled = std::min((int)confirmations, width);
+
+    bar = get_confirmation_color(confirmations) + "[";
+
     if (confirmations == 0) {
-        bar = ui::yellow() + "[";
-        for (int i = 0; i < width; i++) bar += ".";
-        bar += "]" + ui::reset();
-    } else if (confirmations >= 6) {
-        bar = ui::green() + "[";
-        for (int i = 0; i < width; i++) bar += "#";
-        bar += "]" + ui::reset();
-    } else {
-        int filled = (int)(confirmations * width / 6);
-        bar = ui::cyan() + "[";
+        // Pending: show pulsing dots
         for (int i = 0; i < width; i++) {
-            if (i < filled) bar += "#";
-            else bar += ".";
+            bar += "\033[38;5;214m.\033[0m" + get_confirmation_color(0);
         }
-        bar += "]" + ui::reset();
+    } else if (confirmations >= 6) {
+        // Fully confirmed: bright green fill with checkmark effect
+        for (int i = 0; i < width; i++) {
+            bar += "\033[38;5;46m█\033[0m" + get_confirmation_color(6);
+        }
+    } else {
+        // Partial confirmation: gradient fill
+        for (int i = 0; i < width; i++) {
+            if (i < filled) {
+                // Filled portion - color gradient based on position
+                int conf_at_pos = i + 1;
+                bar += get_confirmation_color(conf_at_pos) + "█" + reset + get_confirmation_color(confirmations);
+            } else {
+                // Unfilled portion - dim dots
+                bar += "\033[38;5;240m·" + reset + get_confirmation_color(confirmations);
+            }
+        }
     }
+
+    bar += get_confirmation_color(confirmations) + "]" + reset;
+
     return bar;
+}
+
+// Extended progress bar with percentage and status text
+static std::string confirmation_bar_extended(uint32_t confirmations, int bar_width = 10) {
+    std::string result;
+    std::string reset = "\033[0m";
+
+    // Progress calculation
+    double progress = std::min(100.0, confirmations * 100.0 / 6.0);
+    int filled = (int)(progress * bar_width / 100.0);
+
+    // Status text
+    std::string status;
+    if (confirmations == 0) {
+        status = "\033[38;5;214m⏳ PENDING" + reset;
+    } else if (confirmations >= 6) {
+        status = "\033[38;5;46m✓ CONFIRMED" + reset;
+    } else {
+        status = get_confirmation_color(confirmations) + std::to_string(confirmations) + "/6" + reset;
+    }
+
+    // Build the bar
+    result = get_confirmation_color(confirmations) + "│";
+
+    for (int i = 0; i < bar_width; i++) {
+        if (confirmations == 0) {
+            result += "\033[38;5;214m░" + reset;
+        } else if (i < filled) {
+            // Gradient fill
+            int pos_conf = (i * 6 / bar_width) + 1;
+            result += get_confirmation_color(std::min(pos_conf, (int)confirmations)) + "█" + reset;
+        } else {
+            result += "\033[38;5;240m░" + reset;
+        }
+    }
+
+    result += get_confirmation_color(confirmations) + "│" + reset + " " + status;
+
+    return result;
 }
 
 // Print single transaction row
