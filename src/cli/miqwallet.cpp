@@ -1904,7 +1904,7 @@ namespace live_dashboard {
     }
 
     // Get animated network pulse
-    static std::string get_network_pulse(int tick, bool online) {
+    [[maybe_unused]] static std::string get_network_pulse(int tick, bool online) {
         if (!online) return ui::red() + "[X]" + ui::reset();
         const char* pulse[] = {"[*---]", "[-*--]", "[--*-]", "[---*]", "[--*-]", "[-*--]"};
         return ui::green() + pulse[tick % 6] + ui::reset();
@@ -1925,7 +1925,7 @@ namespace live_dashboard {
     }
 
     // Get animated sparkle effect for amounts
-    static std::string sparkle_amount(const std::string& amt, int tick) {
+    [[maybe_unused]] static std::string sparkle_amount(const std::string& amt, int tick) {
         if (tick % 10 < 2) return ui::bold() + ui::green() + amt + ui::reset();
         return ui::green() + amt + ui::reset();
     }
@@ -2029,7 +2029,7 @@ namespace live_dashboard {
     }
 
     // ASCII fallback for terminals without Unicode support
-    static std::string get_conf_progress_ascii(int confs, int tick) {
+    [[maybe_unused]] static std::string get_conf_progress_ascii(int confs, int tick) {
         if (confs >= 6) {
             return ui::green() + ui::bold() + "[######]" + ui::reset() + " " +
                    ui::green() + "CONFIRMED" + ui::reset();
@@ -2057,40 +2057,39 @@ namespace live_dashboard {
         return bar + " " + ui::cyan() + std::to_string(confs) + "/6" + ui::reset();
     }
 
-    // Draw fancy box with double-line style
+    // Draw professional window header with double-line Unicode box characters
     static void draw_double_box_top(const std::string& title, int width) {
-        std::cout << ui::cyan() << ui::bold();
-        std::cout << "+";
-        for (int i = 0; i < width - 2; i++) std::cout << "=";
-        std::cout << "+\n";
+        // Top border with double-line corners
+        std::cout << "\033[38;5;39m" << ui::bold();  // Bright cyan
+        std::cout << "╔";
+        for (int i = 0; i < width - 2; i++) std::cout << "═";
+        std::cout << "╗\n";
 
+        // Title bar with centered text
         int pad = (width - 4 - (int)title.size()) / 2;
-        std::cout << "||";
+        std::cout << "║";
         for (int i = 0; i < pad; i++) std::cout << " ";
-        std::cout << ui::white() << ui::bold() << title << ui::cyan() << ui::bold();
+        std::cout << "\033[38;5;255m" << ui::bold() << title << "\033[38;5;39m" << ui::bold();
         for (int i = 0; i < width - 4 - pad - (int)title.size(); i++) std::cout << " ";
-        std::cout << "||\n";
+        std::cout << "║\n";
 
-        std::cout << "+";
-        for (int i = 0; i < width - 2; i++) std::cout << "=";
-        std::cout << "+" << ui::reset() << "\n";
+        // Bottom of header with transition to single-line
+        std::cout << "╠";
+        for (int i = 0; i < width - 2; i++) std::cout << "═";
+        std::cout << "╣" << ui::reset() << "\n";
     }
 
-    // Draw a gradient line
-    static void draw_gradient_line(int width, int tick) {
-        std::cout << ui::cyan() << "|" << ui::reset();
-        for (int i = 0; i < width - 2; i++) {
-            int offset = (i + tick) % 20;
-            if (offset < 5) std::cout << ui::cyan() << "-" << ui::reset();
-            else if (offset < 10) std::cout << ui::blue() << "~" << ui::reset();
-            else if (offset < 15) std::cout << ui::magenta() << "*" << ui::reset();
-            else std::cout << ui::cyan() << "-" << ui::reset();
-        }
-        std::cout << ui::cyan() << "|" << ui::reset() << "\n";
+    // Draw a clean separator line (replaces messy gradient)
+    [[maybe_unused]] static void draw_gradient_line(int width, int tick) {
+        (void)tick;  // No longer animated for cleaner look
+        std::cout << "\033[38;5;39m║" << ui::reset();
+        std::cout << "\033[38;5;240m";  // Dark gray
+        for (int i = 0; i < width - 2; i++) std::cout << "─";
+        std::cout << ui::reset() << "\033[38;5;39m║" << ui::reset() << "\n";
     }
 
     // Draw balance display with premium animation and gradient styling
-    static void draw_balance_panel(uint64_t total, uint64_t avail, uint64_t imm, uint64_t pend, int tick, int width) {
+    [[maybe_unused]] static void draw_balance_panel(uint64_t total, uint64_t avail, uint64_t imm, uint64_t pend, int tick, int width) {
         auto fmt = [](uint64_t val) -> std::string {
             std::ostringstream ss;
             ss << std::fixed << std::setprecision(8) << ((double)val / 100000000.0);
@@ -2203,6 +2202,10 @@ namespace live_dashboard {
         } else if (tx.direction == "self") {
             const char* arrows[] = {"◀▶─", "◀═▶", "◀━▶", "◀▶═"};
             std::cout << " " << ui::yellow() << arrows[tick % 4] << ui::reset() << " ";
+        } else if (tx.direction == "mined") {
+            // Special mining reward icon with golden animation
+            const char* mining[] = {"⛏──", "⛏══", "⛏━━", "⛏══"};
+            std::cout << " \033[38;5;220m" << mining[tick % 4] << "\033[0m ";
         } else {
             const char* arrows[] = {"──▶", "══▶", "──▶", "━━▶"};
             std::cout << " " << ui::green() << arrows[tick % 4] << ui::reset() << " ";
@@ -2217,6 +2220,9 @@ namespace live_dashboard {
             std::cout << ui::red() << "-" << std::setw(11) << std::right << amt_str << ui::reset();
         } else if (tx.direction == "self") {
             std::cout << ui::yellow() << " " << std::setw(11) << std::right << amt_str << ui::reset();
+        } else if (tx.direction == "mined") {
+            // Gold color for mining rewards
+            std::cout << "\033[38;5;220m+" << std::setw(11) << std::right << amt_str << "\033[0m";
         } else {
             std::cout << ui::green() << "+" << std::setw(11) << std::right << amt_str << ui::reset();
         }
@@ -2258,7 +2264,7 @@ namespace live_dashboard {
     }
 
     // Draw detailed transaction row for history view - shows TXID
-    static void draw_tx_detailed(const LiveTxStatus& tx, int idx, int tick, int width) {
+    [[maybe_unused]] static void draw_tx_detailed(const LiveTxStatus& tx, int idx, int tick, int width) {
         // First line: main transaction info
         draw_tx_compact(tx, idx, tick, width);
 
@@ -2331,36 +2337,36 @@ namespace live_dashboard {
             cursor_home();
         }
 
-        // Top border with animated title - RYTHMIUM WALLET
+        // Top border with professional title - RYTHMIUM WALLET
         std::cout << "\n";
-        draw_double_box_top("RYTHMIUM WALLET v1.0 - LIVE MONITOR", W);
+        draw_double_box_top("RYTHMIUM WALLET v1.1 - LIVE MONITOR", W);
 
-        // Status bar with live network indicator - FLICKER-FREE with fixed width
-        std::cout << ui::cyan() << "│" << ui::reset();
+        // Status bar with live network indicator
+        std::cout << "\033[38;5;39m║\033[0m";
         std::ostringstream status_line;
 
         // Animated network pulse
         const char* net_pulse[] = {"◉", "◎", "●", "◎"};
         if (is_online) {
             status_line << " \033[38;5;46m" << net_pulse[tick % 4] << "\033[0m";
-            status_line << " " << ui::green() << ui::bold() << "ONLINE" << ui::reset();
+            status_line << " \033[38;5;46m\033[1mONLINE\033[0m";
             if (!connected_node.empty() && connected_node != "<not connected>") {
                 std::string node_display = connected_node.substr(0, 22);
-                status_line << ui::dim() << " @ " << node_display << ui::reset();
+                status_line << "\033[38;5;240m @ " << node_display << "\033[0m";
             }
         } else {
             status_line << " \033[38;5;196m" << net_pulse[tick % 4] << "\033[0m";
-            status_line << " " << ui::red() << ui::bold() << "OFFLINE" << ui::reset();
+            status_line << " \033[38;5;196m\033[1mOFFLINE\033[0m";
         }
 
-        // Queue and pending indicators with animation
+        // Queue and pending indicators
         if (queue_count > 0) {
             const char* q_anim[] = {"⟳", "⟲", "⟳", "⟲"};
-            status_line << "  " << ui::yellow() << q_anim[tick % 4] << " " << queue_count << " queued" << ui::reset();
+            status_line << "  \033[38;5;220m" << q_anim[tick % 4] << " " << queue_count << " queued\033[0m";
         }
         if (pending_utxo_count > 0) {
             const char* p_anim[] = {"◇", "◆", "◇", "◆"};
-            status_line << "  " << ui::magenta() << p_anim[tick % 4] << " " << pending_utxo_count << " pending" << ui::reset();
+            status_line << "  \033[38;5;213m" << p_anim[tick % 4] << " " << pending_utxo_count << " pending\033[0m";
         }
 
         // Fill with spaces for consistent width and timestamp
@@ -2370,130 +2376,219 @@ namespace live_dashboard {
         strftime(time_buf, sizeof(time_buf), "%H:%M:%S", t);
 
         std::cout << status_line.str();
-        // Use fixed padding for flicker-free rendering
-        std::cout << std::string(18, ' ');  // Fixed padding
-        std::cout << ui::dim() << time_buf << ui::reset();
-        std::cout << " " << ui::cyan() << "│" << ui::reset();
+        std::cout << std::string(18, ' ');
+        std::cout << "\033[38;5;240m" << time_buf << "\033[0m";
+        std::cout << " \033[38;5;39m║\033[0m";
         clear_to_eol();
         std::cout << "\n";
 
-        // Animated gradient divider
-        draw_gradient_line(W, tick);
+        // ═══════════════════════════════════════════════════════════════════════
+        // BALANCE SECTION - Professional Box
+        // ═══════════════════════════════════════════════════════════════════════
+        std::cout << "\033[38;5;39m╠";
+        for (int i = 0; i < 24; i++) std::cout << "═";
+        std::cout << "╦";
+        for (int i = 0; i < W - 27; i++) std::cout << "═";
+        std::cout << "╣\033[0m\n";
 
-        // BALANCE SECTION with premium header
-        std::cout << ui::cyan() << "│" << ui::reset();
-        std::cout << " " << "\033[38;5;51m✦\033[0m" << ui::bold() << " BALANCE " << ui::reset();
-        for (int i = 0; i < W - 14; i++) std::cout << ui::dim() << "─" << ui::reset();
-        std::cout << ui::cyan() << "│" << ui::reset() << "\n";
+        std::cout << "\033[38;5;39m║\033[0m";
+        std::cout << " \033[38;5;51m💰\033[0m \033[1mBALANCE\033[0m          ";
+        std::cout << "\033[38;5;39m║\033[0m";
 
-        draw_balance_panel(balance_total, balance_available, balance_immature, balance_pending, tick, W);
+        // Total balance display
+        auto fmt = [](uint64_t val) -> std::string {
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(8) << ((double)val / 100000000.0);
+            return ss.str();
+        };
+        std::cout << " \033[38;5;46m\033[1m" << std::setw(20) << std::right << fmt(balance_total) << "\033[0m MIQ ";
 
-        // Divider with subtle styling
-        std::cout << ui::cyan() << "├";
-        for (int i = 0; i < W - 2; i++) std::cout << "─";
-        std::cout << "┤" << ui::reset() << "\n";
+        // Star indicator for balance
+        const char* stars[] = {"★", "☆", "★", "✦"};
+        std::cout << "\033[38;5;220m" << stars[tick % 4] << "\033[0m";
+        std::cout << std::string(W - 57 - (int)fmt(balance_total).size(), ' ');
+        std::cout << "\033[38;5;39m║\033[0m\n";
 
-        // RECENT TRANSACTIONS SECTION with premium header
-        std::cout << ui::cyan() << "│" << ui::reset();
-        int tx_count = (int)recent_txs.size();
-        std::cout << " " << "\033[38;5;214m⬢\033[0m" << ui::bold() << " RECENT TRANSACTIONS " << ui::reset();
-        std::cout << ui::dim() << "(" << tx_count << " total)" << ui::reset();
-        int dash_count = W - 32 - (int)std::to_string(tx_count).size();
-        if (dash_count < 0) dash_count = 0;
-        for (int i = 0; i < dash_count; i++) std::cout << ui::dim() << "─" << ui::reset();
-        std::cout << ui::cyan() << "│" << ui::reset() << "\n";
+        // Sub-balance line
+        std::cout << "\033[38;5;39m║\033[0m";
+        std::cout << "                         \033[38;5;39m║\033[0m";
+        std::cout << "   \033[38;5;240mSpendable: \033[38;5;46m" << fmt(balance_available) << "\033[0m MIQ";
+        int space_needed = W - 45 - (int)fmt(balance_available).size();
+        if (space_needed > 0) std::cout << std::string(space_needed, ' ');
+        std::cout << "\033[38;5;39m║\033[0m\n";
 
-        if (recent_txs.empty()) {
-            std::cout << ui::cyan() << "│" << ui::reset();
-            std::cout << "   " << ui::dim() << "No transactions yet. Press [1] to get your receive address!" << ui::reset();
-            std::cout << std::string(W - 62, ' ');
-            std::cout << ui::cyan() << "│" << ui::reset() << "\n";
-        } else {
-            int shown = 0;
-            for (const auto& tx : recent_txs) {
-                if (shown >= 4) break;  // Show max 4 for compact view
-                draw_tx_compact(tx, shown, tick, W);
-                shown++;
-            }
-            if (recent_txs.size() > 4) {
-                std::cout << ui::cyan() << "│" << ui::reset();
-                std::cout << "   " << ui::dim() << "▸ Press [3] to see all " << recent_txs.size() << " transactions..." << ui::reset();
-                std::cout << std::string(W - 48, ' ');
-                std::cout << ui::cyan() << "│" << ui::reset() << "\n";
-            }
+        // Immature balance if any
+        if (balance_immature > 0) {
+            std::cout << "\033[38;5;39m║\033[0m";
+            std::cout << "                         \033[38;5;39m║\033[0m";
+            std::cout << "   \033[38;5;240mImmature:  \033[38;5;220m" << fmt(balance_immature) << "\033[0m MIQ \033[38;5;240m⏳\033[0m";
+            int sp = W - 50 - (int)fmt(balance_immature).size();
+            if (sp > 0) std::cout << std::string(sp, ' ');
+            std::cout << "\033[38;5;39m║\033[0m\n";
         }
 
-        // Divider
-        std::cout << ui::cyan() << "├";
-        for (int i = 0; i < W - 2; i++) std::cout << "─";
-        std::cout << "┤" << ui::reset() << "\n";
+        // Pending if any
+        if (balance_pending > 0) {
+            std::cout << "\033[38;5;39m║\033[0m";
+            std::cout << "                         \033[38;5;39m║\033[0m";
+            std::cout << "   \033[38;5;240mPending:   \033[38;5;213m" << fmt(balance_pending) << "\033[0m MIQ";
+            int sp = W - 47 - (int)fmt(balance_pending).size();
+            if (sp > 0) std::cout << std::string(sp, ' ');
+            std::cout << "\033[38;5;39m║\033[0m\n";
+        }
 
-        // UTXO SUMMARY with visual indicators
-        std::cout << ui::cyan() << "│" << ui::reset();
-        std::cout << " " << "\033[38;5;226m◈\033[0m" << ui::bold() << " UTXO: " << ui::reset();
-        std::cout << "\033[38;5;51m" << utxo_count << "\033[0m" << " coins";
+        // ═══════════════════════════════════════════════════════════════════════
+        // TRANSACTIONS SECTION - Professional Box
+        // ═══════════════════════════════════════════════════════════════════════
+        std::cout << "\033[38;5;39m╠";
+        for (int i = 0; i < 24; i++) std::cout << "═";
+        std::cout << "╬";
+        for (int i = 0; i < W - 27; i++) std::cout << "═";
+        std::cout << "╣\033[0m\n";
+
+        int tx_count = (int)recent_txs.size();
+        std::cout << "\033[38;5;39m║\033[0m";
+        std::cout << " \033[38;5;214m📋\033[0m \033[1mTRANSACTIONS\033[0m      ";
+        std::cout << "\033[38;5;39m║\033[0m";
+
+        if (recent_txs.empty()) {
+            std::cout << " \033[38;5;240mNo transactions yet. Press [1] to receive!\033[0m";
+            std::cout << std::string(W - 68, ' ');
+            std::cout << "\033[38;5;39m║\033[0m\n";
+        } else {
+            std::cout << " \033[38;5;240m" << tx_count << " recent\033[0m";
+            std::cout << std::string(W - 34 - (int)std::to_string(tx_count).size(), ' ');
+            std::cout << "\033[38;5;39m║\033[0m\n";
+        }
+
+        // Draw up to 5 transactions
+        int shown = 0;
+        for (const auto& tx : recent_txs) {
+            if (shown >= 5) break;
+            std::cout << "\033[38;5;39m║\033[0m";
+            std::cout << "                         \033[38;5;39m║\033[0m ";
+
+            // Direction icon and color
+            if (tx.direction == "sent") {
+                const char* arrows[] = {"◀─", "◀═", "◀─", "◀━"};
+                std::cout << "\033[38;5;196m" << arrows[tick % 4] << "\033[0m ";
+            } else if (tx.direction == "mined") {
+                const char* mining[] = {"⛏ ", "⛏ ", "⚒ ", "⛏ "};
+                std::cout << "\033[38;5;220m" << mining[tick % 4] << "\033[0m ";
+            } else {
+                const char* arrows[] = {"─▶", "═▶", "─▶", "━▶"};
+                std::cout << "\033[38;5;46m" << arrows[tick % 4] << "\033[0m ";
+            }
+
+            // Amount
+            std::ostringstream amt_ss;
+            amt_ss << std::fixed << std::setprecision(4) << ((double)tx.amount / 100000000.0);
+            std::string amt_str = amt_ss.str();
+
+            if (tx.direction == "sent") {
+                std::cout << "\033[38;5;196m-" << std::setw(11) << std::right << amt_str << "\033[0m MIQ ";
+            } else if (tx.direction == "mined") {
+                std::cout << "\033[38;5;220m+" << std::setw(11) << std::right << amt_str << "\033[0m MIQ ";
+            } else {
+                std::cout << "\033[38;5;46m+" << std::setw(11) << std::right << amt_str << "\033[0m MIQ ";
+            }
+
+            // Confirmation indicator
+            if (tx.confirmations >= 6) {
+                std::cout << "\033[38;5;46m✓\033[0m";
+            } else if (tx.confirmations >= 1) {
+                std::cout << "\033[38;5;220m" << tx.confirmations << "/6\033[0m";
+            } else {
+                std::cout << "\033[38;5;240m⏳\033[0m";
+            }
+
+            // Time ago
+            int64_t diff = now - tx.timestamp;
+            std::string time_str;
+            if (diff < 60) time_str = std::to_string(diff) + "s";
+            else if (diff < 3600) time_str = std::to_string(diff / 60) + "m";
+            else if (diff < 86400) time_str = std::to_string(diff / 3600) + "h";
+            else time_str = std::to_string(diff / 86400) + "d";
+
+            std::cout << " \033[38;5;240m" << std::setw(4) << std::right << time_str << "\033[0m";
+            std::cout << std::string(W - 61, ' ');
+            std::cout << "\033[38;5;39m║\033[0m\n";
+            shown++;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // UTXO SECTION
+        // ═══════════════════════════════════════════════════════════════════════
+        std::cout << "\033[38;5;39m╠";
+        for (int i = 0; i < 24; i++) std::cout << "═";
+        std::cout << "╩";
+        for (int i = 0; i < W - 27; i++) std::cout << "═";
+        std::cout << "╣\033[0m\n";
+
+        std::cout << "\033[38;5;39m║\033[0m";
+        std::cout << " \033[38;5;226m◈\033[0m \033[1mUTXO:\033[0m \033[38;5;51m" << utxo_count << "\033[0m coins";
+
         if (utxo_count > 0) {
             auto fmt_short = [](uint64_t val) -> std::string {
                 std::ostringstream ss;
                 ss << std::fixed << std::setprecision(4) << ((double)val / 100000000.0);
                 return ss.str();
             };
-            std::cout << ui::dim() << " │ Range: " << ui::reset();
-            std::cout << "\033[38;5;214m" << fmt_short(utxo_min) << "\033[0m";
-            std::cout << ui::dim() << " ─ " << ui::reset();
-            std::cout << "\033[38;5;46m" << fmt_short(utxo_max) << "\033[0m" << " MIQ";
+            std::cout << " \033[38;5;240m│\033[0m Range: \033[38;5;214m" << fmt_short(utxo_min) << "\033[0m";
+            std::cout << " \033[38;5;240m─\033[0m \033[38;5;46m" << fmt_short(utxo_max) << "\033[0m MIQ";
 
-            // Fragmentation indicator with better styling
+            // Fragmentation status
             if (utxo_count > 50) {
-                std::cout << "  " << "\033[38;5;196m⚠ FRAGMENT\033[0m";
+                std::cout << " \033[38;5;196m⚠ FRAG\033[0m";
             } else if (utxo_count > 20) {
-                std::cout << "  " << "\033[38;5;226m◉ OK\033[0m";
+                std::cout << " \033[38;5;226m● OK\033[0m";
             } else {
-                std::cout << "  " << "\033[38;5;46m● OPTIMAL\033[0m";
+                std::cout << " \033[38;5;46m● OPT\033[0m";
             }
         }
         std::cout << std::string(4, ' ');
-        std::cout << ui::cyan() << "│" << ui::reset() << "\n";
+        std::cout << "\033[38;5;39m║\033[0m\n";
 
-        // Double divider for section separator
-        std::cout << ui::cyan() << "╞";
+        // ═══════════════════════════════════════════════════════════════════════
+        // QUICK ACTIONS BOX
+        // ═══════════════════════════════════════════════════════════════════════
+        std::cout << "\033[38;5;39m╠";
         for (int i = 0; i < W - 2; i++) std::cout << "═";
-        std::cout << "╡" << ui::reset() << "\n";
+        std::cout << "╣\033[0m\n";
 
-        // QUICK ACTIONS with premium styling
-        std::cout << ui::cyan() << "│" << ui::reset();
-        std::cout << " " << "\033[38;5;46m▸\033[0m" << ui::bold() << "\033[38;5;46m QUICK ACTIONS \033[0m" << ui::reset();
-        for (int i = 0; i < W - 20; i++) std::cout << ui::dim() << "─" << ui::reset();
-        std::cout << ui::cyan() << "│" << ui::reset() << "\n";
+        std::cout << "\033[38;5;39m║\033[0m";
+        std::cout << " \033[38;5;46m▸\033[0m \033[1m\033[38;5;46mQUICK ACTIONS\033[0m";
+        std::cout << std::string(W - 19, ' ');
+        std::cout << "\033[38;5;39m║\033[0m\n";
 
-        // Row 1 - Main actions with icons
-        std::cout << ui::cyan() << "│" << ui::reset();
-        std::cout << "  " << "\033[38;5;51m[1]\033[0m" << " ↓ Receive  ";
-        std::cout << "\033[38;5;214m[2]\033[0m" << " ↑ Send     ";
-        std::cout << "\033[38;5;51m[3]\033[0m" << " ◷ History  ";
-        std::cout << "\033[38;5;51m[4]\033[0m" << " ◇ Contacts ";
-        std::cout << "\033[38;5;51m[n]\033[0m" << " + New    ";
-        std::cout << ui::cyan() << "│" << ui::reset() << "\n";
+        // Row 1 - Main actions
+        std::cout << "\033[38;5;39m║\033[0m";
+        std::cout << "   \033[38;5;51m[1]\033[0m Receive   ";
+        std::cout << "\033[38;5;214m[2]\033[0m Send      ";
+        std::cout << "\033[38;5;51m[3]\033[0m History   ";
+        std::cout << "\033[38;5;51m[4]\033[0m Contacts  ";
+        std::cout << "\033[38;5;51m[n]\033[0m New Addr  ";
+        std::cout << "\033[38;5;39m║\033[0m\n";
 
         // Row 2 - Secondary actions
-        std::cout << ui::cyan() << "│" << ui::reset();
-        std::cout << "  " << "\033[38;5;51m[5]\033[0m" << " ⚙ Settings ";
-        std::cout << "\033[38;5;46m[r]\033[0m" << " ⟳ Refresh  ";
-        std::cout << "\033[38;5;51m[t]\033[0m" << " ◉ Monitor  ";
-        std::cout << "\033[38;5;51m[h]\033[0m" << " ? Help     ";
-        std::cout << "\033[38;5;196m[q]\033[0m" << " ✕ Exit   ";
-        std::cout << ui::cyan() << "│" << ui::reset() << "\n";
+        std::cout << "\033[38;5;39m║\033[0m";
+        std::cout << "   \033[38;5;51m[5]\033[0m Settings  ";
+        std::cout << "\033[38;5;46m[r]\033[0m Refresh   ";
+        std::cout << "\033[38;5;51m[t]\033[0m Monitor   ";
+        std::cout << "\033[38;5;51m[h]\033[0m Help      ";
+        std::cout << "\033[38;5;196m[q]\033[0m Exit      ";
+        std::cout << "\033[38;5;39m║\033[0m\n";
 
-        // Bottom border with premium styling
-        std::cout << ui::cyan() << "╰";
-        for (int i = 0; i < W - 2; i++) std::cout << "─";
-        std::cout << "╯" << ui::reset() << "\n";
+        // Bottom border
+        std::cout << "\033[38;5;39m╚";
+        for (int i = 0; i < W - 2; i++) std::cout << "═";
+        std::cout << "╝\033[0m\n";
 
-        // Animated instruction line with smooth cursor
+        // Animated instruction line
         const char* cursor_frames[] = {"▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"};
         int cursor_phase = tick % 16;
         int cursor_idx = cursor_phase < 8 ? cursor_phase : 15 - cursor_phase;
-        std::cout << "\n  " << ui::dim() << "Press a key (no Enter): " << ui::reset();
+        std::cout << "\n  \033[38;5;240mPress a key (no Enter): \033[0m";
         std::cout << "\033[38;5;51m" << cursor_frames[cursor_idx] << "\033[0m";
         clear_to_eol();
         std::cout << std::flush;
@@ -5146,7 +5241,7 @@ struct TxHistoryEntry {
     int64_t amount{0};       // positive = received, negative = sent
     uint64_t fee{0};
     uint32_t confirmations{0};
-    std::string direction;   // "sent", "received", "self"
+    std::string direction;   // "sent", "received", "self", "mined"
     std::string to_address;
     std::string from_address;
     std::string memo;
@@ -5412,20 +5507,15 @@ static int auto_detect_received_transactions(
         // Skip if we already know about this transaction
         if(known_txids.find(txid) != known_txids.end()) continue;
 
-        // Skip coinbase outputs - they're mining rewards, not payments
-        if(u.coinbase){
-            // Track coinbase separately if desired, but don't count as "received payment"
-            continue;
-        }
-
-        // Aggregate this output
+        // Aggregate this output (INCLUDING coinbase/mining rewards!)
         auto& agg = new_txs[txid];
         agg.total_value += u.value;
         agg.output_count++;
         if(u.height > 0 && u.height < agg.min_height){
             agg.min_height = u.height;
         }
-        agg.coinbase = u.coinbase;
+        // Mark as coinbase if ANY output in this tx is coinbase
+        if(u.coinbase) agg.coinbase = true;
     }
 
     int detected = 0;
@@ -5447,7 +5537,13 @@ static int auto_detect_received_transactions(
         // v9.0: Total of all outputs to this wallet from this transaction
         entry.amount = (int64_t)agg.total_value;
         entry.fee = 0;  // We don't pay fee on received transactions
-        entry.direction = "received";
+
+        // Set direction based on whether it's a coinbase (mining reward) or regular receive
+        if(agg.coinbase){
+            entry.direction = "mined";
+        } else {
+            entry.direction = "received";
+        }
 
         // Calculate confirmations
         if(agg.min_height < UINT32_MAX && current_tip_height >= agg.min_height){
@@ -5456,10 +5552,12 @@ static int auto_detect_received_transactions(
             entry.confirmations = 0;
         }
 
-        // Note if multiple outputs
+        // Note if multiple outputs or mining reward
         entry.to_address = "";
         entry.from_address = "";
-        if(agg.output_count > 1){
+        if(agg.coinbase){
+            entry.memo = "Block reward (mining)";
+        } else if(agg.output_count > 1){
             entry.memo = "Received (" + std::to_string(agg.output_count) + " outputs)";
         } else {
             entry.memo = "Received payment";
@@ -6132,6 +6230,8 @@ static void print_tx_row(const TxDetailedEntry& tx, int index, bool selected,
         std::cout << ui::red() << "[-]" << ui::reset();
     } else if (tx.direction == "received") {
         std::cout << ui::green() << "[+]" << ui::reset();
+    } else if (tx.direction == "mined") {
+        std::cout << "\033[38;5;220m[⛏]\033[0m";  // Gold mining icon
     } else {
         std::cout << ui::yellow() << "[=]" << ui::reset();
     }
@@ -6139,7 +6239,11 @@ static void print_tx_row(const TxDetailedEntry& tx, int index, bool selected,
     std::string amt_str;
     if (tx.amount >= 0) {
         amt_str = "+" + ui_pro::format_miq_professional((uint64_t)tx.amount);
-        std::cout << " " << ui::green() << std::setw(16) << std::right << amt_str << ui::reset();
+        if (tx.direction == "mined") {
+            std::cout << " \033[38;5;220m" << std::setw(16) << std::right << amt_str << "\033[0m";  // Gold for mining
+        } else {
+            std::cout << " " << ui::green() << std::setw(16) << std::right << amt_str << ui::reset();
+        }
     } else {
         amt_str = "-" + ui_pro::format_miq_professional((uint64_t)(-tx.amount));
         std::cout << " " << ui::red() << std::setw(16) << std::right << amt_str << ui::reset();
@@ -7562,7 +7666,7 @@ static bool wallet_session(const std::string& cli_host,
 
                 std::cout << "\n  " << ui::cyan() << "n/p" << ui::reset() << " Page  "
                           << ui::cyan() << "v" << ui::reset() << " View  "
-                          << ui::cyan() << "fs/fr/fp/fc" << ui::reset() << " Filter  "
+                          << ui::cyan() << "fs/fr/fm/fp/fc" << ui::reset() << " Filter  "
                           << ui::cyan() << "/text" << ui::reset() << " Search  "
                           << ui::cyan() << "s" << ui::reset() << " Stats  "
                           << ui::cyan() << "c" << ui::reset() << " Clear  "
@@ -7588,6 +7692,7 @@ static bool wallet_session(const std::string& cli_host,
                 else if (cmd == "c") { view_state.filter = TxHistoryFilter(); view_state.page = 0; view_state.selected = -1; }
                 else if (cmd == "fs") { view_state.filter.direction = "sent"; view_state.page = 0; }
                 else if (cmd == "fr") { view_state.filter.direction = "received"; view_state.page = 0; }
+                else if (cmd == "fm") { view_state.filter.direction = "mined"; view_state.page = 0; }  // Mining rewards filter
                 else if (cmd == "fp") { view_state.filter.status = "pending"; view_state.page = 0; }
                 else if (cmd == "fc") { view_state.filter.status = "confirmed"; view_state.page = 0; }
                 else if (cmd[0] == '/') { view_state.filter.search = cmd.substr(1); view_state.page = 0; }
