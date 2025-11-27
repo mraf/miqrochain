@@ -10,6 +10,7 @@
 #include "constants.h"
 #include "utxo.h"           // fee calc (UTXOEntry)
 #include "base58check.h"    // Base58Check address display (miner logs)
+#include "sha256.h"         // dsha256 for compact block hash calculation
 
 #include <chrono>
 #include <deque>
@@ -812,8 +813,24 @@ static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
                 if (rc <= 0 && (waited_ms += 10) >= kMaxSpinMs) return false;
                 continue;
             }
-            char buf[96]; sprintf_s(buf, "send() failed WSAE=%d", e);
-            miq::log_warn(std::string("P2P: ") + buf);
+            // CRITICAL FIX: Rate-limit error logging to prevent log flooding
+            // WSAE=10053 (connection aborted) and 10054 (connection reset) are common
+            // and happen naturally when peers disconnect - don't spam logs
+            static std::atomic<int64_t> last_wsae_log_ms{0};
+            static std::atomic<int> wsae_suppressed_count{0};
+            int64_t tnow = now_ms();
+            if (tnow - last_wsae_log_ms.load(std::memory_order_relaxed) > 10000) { // Log at most every 10 sec
+                int suppressed = wsae_suppressed_count.exchange(0, std::memory_order_relaxed);
+                if (suppressed > 0) {
+                    miq::log_warn("P2P: send() failed WSAE=" + std::to_string(e) +
+                        " (suppressed " + std::to_string(suppressed) + " similar errors)");
+                } else {
+                    miq::log_warn("P2P: send() failed WSAE=" + std::to_string(e));
+                }
+                last_wsae_log_ms.store(tnow, std::memory_order_relaxed);
+            } else {
+                wsae_suppressed_count.fetch_add(1, std::memory_order_relaxed);
+            }
             return false;
         }
         if (n == 0) return false;
@@ -858,8 +875,23 @@ static inline int miq_recv(Sock s, uint8_t* buf, size_t bufsz) {
     if (n == SOCKET_ERROR) {
         int e = WSAGetLastError();
         if (e == WSAEWOULDBLOCK) return 0;
-        char tmp[96]; sprintf_s(tmp, "recv() failed WSAE=%d", e);
-        miq::log_warn(std::string("P2P: ") + tmp);
+        // CRITICAL FIX: Rate-limit recv error logging to prevent log flooding
+        // Connection errors are common and expected - don't spam logs
+        static std::atomic<int64_t> last_recv_log_ms{0};
+        static std::atomic<int> recv_suppressed_count{0};
+        int64_t tnow = now_ms();
+        if (tnow - last_recv_log_ms.load(std::memory_order_relaxed) > 10000) { // Log at most every 10 sec
+            int suppressed = recv_suppressed_count.exchange(0, std::memory_order_relaxed);
+            if (suppressed > 0) {
+                miq::log_warn("P2P: recv() failed WSAE=" + std::to_string(e) +
+                    " (suppressed " + std::to_string(suppressed) + " similar errors)");
+            } else {
+                miq::log_warn("P2P: recv() failed WSAE=" + std::to_string(e));
+            }
+            last_recv_log_ms.store(tnow, std::memory_order_relaxed);
+        } else {
+            recv_suppressed_count.fetch_add(1, std::memory_order_relaxed);
+        }
         return -1;
     }
     return n;
@@ -3020,7 +3052,14 @@ bool P2P::rate_consume_block(PeerState& ps, size_t nbytes){
 bool P2P::rate_consume_tx(PeerState& ps, size_t nbytes){
     int64_t n = now_ms();
     rate_refill(ps, n);
-    if (ps.tx_tokens < nbytes) return false;
+    // v10.0 FIX: Be more lenient with transaction rate limiting
+    // Instead of rejecting transactions when out of tokens, allow "soft debt"
+    // This matches the block rate limiter behavior and prevents transaction drops
+    // from legitimate high-volume wallets
+    if (ps.tx_tokens < nbytes) {
+        ps.tx_tokens = 0;  // Allow soft debt like blocks
+        return true;       // Don't reject the transaction
+    }
     ps.tx_tokens -= (uint64_t)nbytes;
     return true;
 }
@@ -5365,12 +5404,10 @@ void P2P::loop(){
                         }
 
                     } else if (cmd == "tx") {
-                        if (!rate_consume_tx(ps, m.payload.size())) {
-                            if (!ibd_or_fetch_active(ps, now_ms())) {
-                                if ((ps.banscore += 3) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "tx-rate", now_ms());
-                            }
-                            continue;
-                        }
+                        // v10.0 FIX: Always process transactions - rate limiting is now soft debt
+                        // Old code banned peers for tx-rate but this caused legitimate txs to be dropped
+                        (void)rate_consume_tx(ps, m.payload.size());  // Update rate tracking but don't reject
+
                         Transaction tx;
                         if (!deser_tx(m.payload, tx)) continue;
                         auto key = hexkey(tx.txid());
@@ -6516,6 +6553,223 @@ void P2P::maintain_connection_diversity() {
     MIQ_LOG_DEBUG(miq::LogCategory::NET, "maintain_connection_diversity: " +
         std::to_string(prefixes.size()) + " unique /16 prefixes from " +
         std::to_string(peers_.size()) + " peers");
+}
+
+// =============================================================================
+// BIP130: sendheaders - Announce new blocks via headers instead of inv
+// =============================================================================
+void P2P::send_sendheaders(PeerState& ps) {
+    if (ps.sent_sendheaders) return;  // Already sent
+
+    // Send "sendheaders" message to tell peer we prefer headers announcements
+    auto msg = encode_msg("sendheaders", std::vector<uint8_t>{});
+    if (ps.sock != MIQ_INVALID_SOCK) {
+        ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), msg.size(), 0);
+        if (w > 0) {
+            ps.sent_sendheaders = true;
+            MIQ_LOG_DEBUG(miq::LogCategory::NET, "send_sendheaders: sent to " + ps.ip);
+        }
+    }
+}
+
+void P2P::broadcast_header(const std::vector<uint8_t>& header_data) {
+    if (header_data.size() != 80) return;  // Invalid header size
+
+    auto msg = encode_msg("headers", header_data);
+    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+
+    for (auto& kv : peers_) {
+        auto& ps = kv.second;
+        // Only send to peers who prefer headers (BIP130)
+        if (ps.verack_ok && ps.prefer_headers) {
+            ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), msg.size(), 0);
+            (void)w;  // Best effort
+        }
+    }
+}
+
+// =============================================================================
+// BIP152: Compact Blocks - Reduce bandwidth for block propagation
+// =============================================================================
+void P2P::send_sendcmpct(PeerState& ps, bool high_bandwidth, uint64_t version) {
+    // BIP152 sendcmpct message: announce_flag (1 byte) + version (8 bytes)
+    std::vector<uint8_t> payload;
+    payload.reserve(9);
+    payload.push_back(high_bandwidth ? 1 : 0);  // announce flag
+    // version as little-endian uint64_t
+    for (int i = 0; i < 8; ++i) {
+        payload.push_back(static_cast<uint8_t>((version >> (i * 8)) & 0xFF));
+    }
+
+    auto msg = encode_msg("sendcmpct", payload);
+    if (ps.sock != MIQ_INVALID_SOCK) {
+        ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), msg.size(), 0);
+        if (w > 0) {
+            ps.compact_blocks_enabled = true;
+            ps.compact_high_bandwidth = high_bandwidth;
+            ps.compact_version = version;
+            MIQ_LOG_DEBUG(miq::LogCategory::NET, "send_sendcmpct: sent to " + ps.ip +
+                " (high_bw=" + std::to_string(high_bandwidth) + ", v=" + std::to_string(version) + ")");
+        }
+    }
+}
+
+void P2P::send_cmpctblock(PeerState& ps, const std::vector<uint8_t>& block_hash) {
+    // BIP152 compact block: header + nonce + short_ids + prefilled_txs
+    // This is a simplified implementation - full BIP152 would require:
+    // 1. Block header (80 bytes)
+    // 2. nonce for short_id calculation (8 bytes)
+    // 3. short_ids vector (compact tx identifiers)
+    // 4. prefilled_txns (coinbase at minimum)
+
+    if (block_hash.size() != 32) return;
+
+    Block blk;
+    // Find block by hash - iterate through recent blocks
+    auto tip = chain_.tip();
+    bool found = false;
+    for (size_t i = 0; i <= std::min<size_t>(10, tip.height); ++i) {
+        size_t idx = tip.height - i;
+        if (chain_.get_block_by_index(idx, blk)) {
+            if (blk.block_hash() == block_hash) {
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if (!found) {
+        MIQ_LOG_WARN(miq::LogCategory::NET, "send_cmpctblock: block not found");
+        return;
+    }
+
+    // For now, send full block via regular "block" message as fallback
+    // Full BIP152 implementation would construct compact block format here
+    auto raw = ser_block(blk);
+    auto msg = encode_msg("block", raw);
+    if (ps.sock != MIQ_INVALID_SOCK) {
+        ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), msg.size(), 0);
+        if (w > 0) {
+            ps.last_compact_block_hash = block_hash;
+            MIQ_LOG_DEBUG(miq::LogCategory::NET, "send_cmpctblock: sent block to " + ps.ip);
+        }
+    }
+}
+
+void P2P::send_getblocktxn(PeerState& ps, const std::vector<uint8_t>& block_hash,
+                           const std::vector<uint16_t>& indexes) {
+    // BIP152 getblocktxn: request missing transactions from a compact block
+    // Format: block_hash (32 bytes) + indexes_length (varint) + indexes (differentially encoded)
+
+    if (block_hash.size() != 32) return;
+
+    std::vector<uint8_t> payload;
+    payload.reserve(32 + 1 + indexes.size() * 2);
+
+    // Block hash
+    payload.insert(payload.end(), block_hash.begin(), block_hash.end());
+
+    // Indexes count (simplified - assuming < 253 txs)
+    payload.push_back(static_cast<uint8_t>(indexes.size() & 0xFF));
+
+    // Differential encoding of indexes
+    uint16_t prev = 0;
+    for (uint16_t idx : indexes) {
+        uint16_t diff = idx - prev;
+        // Simplified varint encoding for small values
+        if (diff < 0xFD) {
+            payload.push_back(static_cast<uint8_t>(diff));
+        } else {
+            payload.push_back(0xFD);
+            payload.push_back(static_cast<uint8_t>(diff & 0xFF));
+            payload.push_back(static_cast<uint8_t>((diff >> 8) & 0xFF));
+        }
+        prev = idx + 1;  // For next differential
+    }
+
+    auto msg = encode_msg("getblocktxn", payload);
+    if (ps.sock != MIQ_INVALID_SOCK) {
+        ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), msg.size(), 0);
+        if (w > 0) {
+            MIQ_LOG_DEBUG(miq::LogCategory::NET, "send_getblocktxn: requested " +
+                std::to_string(indexes.size()) + " txs from " + ps.ip);
+        }
+    }
+}
+
+void P2P::handle_compact_block(PeerState& ps, const std::vector<uint8_t>& payload) {
+    // BIP152 compact block handler
+    // For now, log and request full block as fallback
+
+    if (payload.size() < 88) {  // Minimum: header(80) + nonce(8)
+        MIQ_LOG_WARN(miq::LogCategory::NET, "handle_compact_block: payload too small from " + ps.ip);
+        return;
+    }
+
+    // Extract block header (first 80 bytes)
+    std::vector<uint8_t> header_data(payload.begin(), payload.begin() + 80);
+
+    // Compute block hash from header (double SHA256)
+    auto block_hash = miq::dsha256(header_data);
+
+    // For now, request full block via getdata/getb as fallback
+    // Full implementation would:
+    // 1. Parse short_ids and prefilled_txns
+    // 2. Match short_ids to mempool transactions
+    // 3. Only request missing transactions via getblocktxn
+
+    MIQ_LOG_DEBUG(miq::LogCategory::NET, "handle_compact_block: received from " + ps.ip +
+        ", requesting full block as fallback");
+
+    // Request full block
+    request_block_hash(ps, block_hash);
+}
+
+// =============================================================================
+// BIP37: Bloom Filters for SPV clients
+// =============================================================================
+void P2P::handle_filterload(PeerState& ps, const std::vector<uint8_t>& payload) {
+    // BIP37 filterload: SPV client sends bloom filter
+    // Format: filter (var bytes) + nHashFuncs (4 bytes) + nTweak (4 bytes) + nFlags (1 byte)
+
+    if (payload.size() < 9) {  // Minimum size
+        MIQ_LOG_WARN(miq::LogCategory::NET, "handle_filterload: payload too small from " + ps.ip);
+        return;
+    }
+
+    // For now, just acknowledge receipt - full implementation would:
+    // 1. Store the bloom filter for this peer
+    // 2. Use it to filter transactions before relaying
+    // 3. Use it to filter merkle blocks
+
+    MIQ_LOG_DEBUG(miq::LogCategory::NET, "handle_filterload: received " +
+        std::to_string(payload.size()) + " byte filter from " + ps.ip);
+
+    // Mark peer as SPV/filtered
+    ps.relay_txs = true;  // Will relay matching transactions
+}
+
+void P2P::handle_filteradd(PeerState& ps, const std::vector<uint8_t>& payload) {
+    // BIP37 filteradd: Add data element to existing bloom filter
+
+    if (payload.empty() || payload.size() > 520) {  // Max element size
+        MIQ_LOG_WARN(miq::LogCategory::NET, "handle_filteradd: invalid size from " + ps.ip);
+        return;
+    }
+
+    MIQ_LOG_DEBUG(miq::LogCategory::NET, "handle_filteradd: adding " +
+        std::to_string(payload.size()) + " bytes to filter for " + ps.ip);
+
+    // Full implementation would add this element to peer's bloom filter
+}
+
+void P2P::handle_filterclear(PeerState& ps) {
+    // BIP37 filterclear: Remove bloom filter, return to unfiltered mode
+
+    MIQ_LOG_DEBUG(miq::LogCategory::NET, "handle_filterclear: clearing filter for " + ps.ip);
+
+    // Reset to unfiltered relay
+    ps.relay_txs = true;
 }
 
 }

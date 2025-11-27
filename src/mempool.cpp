@@ -894,6 +894,13 @@ bool Mempool::accept_replacement(const Transaction& tx, const UTXOView& utxo,
     return enforce_limits_and_insert(tx, new_fee, err);
 }
 
+// Overload for UTXOSet to keep existing call sites compiling
+bool Mempool::accept_replacement(const Transaction& tx, const UTXOSet& utxo,
+                                  uint32_t height, std::string& err) {
+    UTXOAdapter a(utxo);
+    return accept_replacement(tx, static_cast<const UTXOView&>(a), height, err);
+}
+
 void Mempool::update_cpfp_scores() {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
 
