@@ -551,7 +551,6 @@ private:
     // - seen_txids_ (set of already-seen transaction IDs)
     // - tx_store_ (map of txid -> raw tx bytes for serving to peers)
     // - tx_order_ (LRU order for tx_store_ eviction)
-    // - rebroadcast_q_ (queue for transactions to rebroadcast)
     // - pending_txids_ (recently broadcast txids for rebroadcast tracking)
     //
     // RACE CONDITION FIX: Previously, these were accessed from both RPC threads
