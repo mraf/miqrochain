@@ -8072,11 +8072,10 @@ static bool wallet_session(const std::string& cli_host,
             std::vector<TxHistoryEntry> recent_history;
             load_tx_history(wdir, recent_history);
 
-            // Sort by timestamp (most recent first)
-            std::sort(recent_history.begin(), recent_history.end(),
-                [](const TxHistoryEntry& a, const TxHistoryEntry& b){
-                    return a.timestamp > b.timestamp;
-                });
+            // FIX: load_tx_history already sorts properly using block_height as primary key.
+            // The previous timestamp-only sort was incorrect and caused old transactions
+            // to appear as "recent" when they had future timestamps.
+            // Now we trust the proper sorting from load_tx_history.
 
             // Convert to live format with proper status
             for(const auto& tx : recent_history){
@@ -10461,11 +10460,8 @@ static bool wallet_session(const std::string& cli_host,
                 continue;
             }
 
-            // Sort by timestamp (most recent first)
-            std::sort(all_txs.begin(), all_txs.end(),
-                [](const TxHistoryEntry& a, const TxHistoryEntry& b){
-                    return a.timestamp > b.timestamp;
-                });
+            // FIX: load_tx_history already sorts properly using block_height as primary key.
+            // Removed incorrect timestamp-only re-sort that caused display order issues.
 
             int page = 0;
             int per_page = 8;
@@ -10573,11 +10569,8 @@ static bool wallet_session(const std::string& cli_host,
                     page--;
                 } else if(cmd == "r" || cmd == "R") {
                     // Refresh - reload history
+                    // FIX: load_tx_history already sorts properly by block_height
                     load_tx_history(wdir, all_txs);
-                    std::sort(all_txs.begin(), all_txs.end(),
-                        [](const TxHistoryEntry& a, const TxHistoryEntry& b){
-                            return a.timestamp > b.timestamp;
-                        });
                     total_pages = ((int)all_txs.size() + per_page - 1) / per_page;
                     ui::print_success("Transaction list refreshed");
                 } else if(cmd.length() > 2 && (cmd[0] == 'v' || cmd[0] == 'V')){
@@ -10656,11 +10649,8 @@ static bool wallet_session(const std::string& cli_host,
                 continue;
             }
 
-            // Sort by timestamp (most recent first)
-            std::sort(all_txs.begin(), all_txs.end(),
-                [](const TxHistoryEntry& a, const TxHistoryEntry& b){
-                    return a.timestamp > b.timestamp;
-                });
+            // FIX: load_tx_history already sorts properly using block_height as primary key.
+            // Removed incorrect timestamp-only re-sort that caused display order issues.
 
             // Get current chain height from connected node for block info lookups
             uint64_t current_height = 0;
