@@ -323,7 +323,8 @@ namespace wallet_config {
     static constexpr int AUTO_REFRESH_INTERVAL_SEC = 30;
 
     // Transaction queue system - enhanced
-    static constexpr int MAX_QUEUE_SIZE = 1000;
+    // v10.0 FIX: Increased from 1000 to 10000 to handle high-volume wallets
+    static constexpr int MAX_QUEUE_SIZE = 10000;
     static constexpr int AUTO_BROADCAST_INTERVAL_MS = 15000;
     static constexpr int TX_EXPIRY_HOURS = 72;
     static constexpr int MAX_BROADCAST_ATTEMPTS = 15;
@@ -5438,9 +5439,11 @@ static void add_tx_history(const std::string& wdir, const TxHistoryEntry& entry)
 
     hist.push_back(entry);
 
-    // Keep only last 1000 transactions
-    if(hist.size() > 1000){
-        hist.erase(hist.begin(), hist.begin() + (hist.size() - 1000));
+    // v10.0 FIX: Increased from 1000 to 100000 to support wallets with many transactions
+    // Mining wallets can easily have 4000+ transactions from block rewards alone
+    constexpr size_t MAX_TX_HISTORY = 100000;
+    if(hist.size() > MAX_TX_HISTORY){
+        hist.erase(hist.begin(), hist.begin() + (hist.size() - MAX_TX_HISTORY));
     }
 
     save_tx_history(wdir, hist);

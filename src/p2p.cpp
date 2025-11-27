@@ -3052,7 +3052,14 @@ bool P2P::rate_consume_block(PeerState& ps, size_t nbytes){
 bool P2P::rate_consume_tx(PeerState& ps, size_t nbytes){
     int64_t n = now_ms();
     rate_refill(ps, n);
-    if (ps.tx_tokens < nbytes) return false;
+    // v10.0 FIX: Be more lenient with transaction rate limiting
+    // Instead of rejecting transactions when out of tokens, allow "soft debt"
+    // This matches the block rate limiter behavior and prevents transaction drops
+    // from legitimate high-volume wallets
+    if (ps.tx_tokens < nbytes) {
+        ps.tx_tokens = 0;  // Allow soft debt like blocks
+        return true;       // Don't reject the transaction
+    }
     ps.tx_tokens -= (uint64_t)nbytes;
     return true;
 }
@@ -5397,12 +5404,10 @@ void P2P::loop(){
                         }
 
                     } else if (cmd == "tx") {
-                        if (!rate_consume_tx(ps, m.payload.size())) {
-                            if (!ibd_or_fetch_active(ps, now_ms())) {
-                                if ((ps.banscore += 3) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "tx-rate", now_ms());
-                            }
-                            continue;
-                        }
+                        // v10.0 FIX: Always process transactions - rate limiting is now soft debt
+                        // Old code banned peers for tx-rate but this caused legitimate txs to be dropped
+                        (void)rate_consume_tx(ps, m.payload.size());  // Update rate tracking but don't reject
+
                         Transaction tx;
                         if (!deser_tx(m.payload, tx)) continue;
                         auto key = hexkey(tx.txid());

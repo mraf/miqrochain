@@ -584,7 +584,8 @@ private:
     static constexpr int MAX_REBROADCAST_COUNT = 6;                    // Maximum rebroadcast attempts
     static constexpr int64_t SEEN_TXIDS_CLEANUP_MS = 5 * 60 * 1000;   // Cleanup seen_txids every 5 min
     static constexpr size_t MAX_SEEN_TXIDS = 100000;                   // Maximum seen_txids entries
-    static constexpr size_t MAX_PENDING_TXS = 1000;                    // Maximum pending transactions
+    // v10.0 FIX: Increased from 1000 to 10000 for high-throughput networks
+    static constexpr size_t MAX_PENDING_TXS = 10000;                   // Maximum pending transactions
 
     Mempool* mempool_{nullptr};
     Chain& chain_;
