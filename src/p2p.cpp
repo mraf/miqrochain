@@ -5335,8 +5335,23 @@ void P2P::loop(){
                             }
                             bool in_mempool = mempool_ && mempool_->exists(tx.txid());
 
+                            // CRITICAL FIX: If transaction was rejected with error, remove from seen_txids_
+                            // so it can be retried later. This fixes the bug where failed transactions
+                            // were permanently blocked because they were marked as "seen" before validation.
+                            if (!accepted && !err.empty()) {
+                                seen_txids_.erase(key);
+                                if (!ibd_or_fetch_active(ps, now_ms())) {
+                                    if (++ps.mis > 25) bump_ban(ps, ps.ip, "tx-invalid", now_ms());
+                                } else {
+                                    ++ps.mis; // track but do not ban during sync
+                                }
+                                continue; // Skip further processing for rejected tx
+                            }
+
                             // TELEMETRY: Notify about received transaction for UI display
-                            if (accepted && in_mempool && txids_callback_) {
+                            // CRITICAL FIX: Also notify for orphan transactions (accepted but not in mempool)
+                            // so they appear in "Recent TXIDs" display
+                            if (accepted && txids_callback_) {
                                 txids_callback_({key});
                             }
 
@@ -5390,12 +5405,6 @@ void P2P::loop(){
                                     // no complete inputs: still advertise to help fetch deps
                                     const std::vector<uint8_t> txidv = tx.txid();
                                     for (auto& kvp : peers_) trickle_enqueue(kvp.first, txidv);
-                                }
-                            } else if (!err.empty()) {
-                                if (!ibd_or_fetch_active(ps, now_ms())) {
-                                    if (++ps.mis > 25) bump_ban(ps, ps.ip, "tx-invalid", now_ms());
-                                } else {
-                                    ++ps.mis; // track but do not ban during sync
                                 }
                             }
                         }
