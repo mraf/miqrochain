@@ -5396,6 +5396,26 @@ void P2P::loop(){
                                     tx_data = itx->second; // Copy under lock
                                 }
                             }
+                            // V1.0 FIX: Fallback to mempool if not in tx_store_
+                            // This handles case where tx was evicted from tx_store_ but still in mempool
+                            if (tx_data.empty() && mempool_) {
+                                Transaction tx;
+                                if (mempool_->get_transaction(m.payload, tx)) {
+                                    tx_data = ser_tx(tx);
+                                    // Cache for future requests
+                                    std::lock_guard<std::mutex> lk(tx_store_mu_);
+                                    if (tx_store_.find(key) == tx_store_.end()) {
+                                        tx_store_[key] = tx_data;
+                                        tx_order_.push_back(key);
+                                        if (tx_store_.size() > MIQ_TX_STORE_MAX) {
+                                            auto victim = tx_order_.front();
+                                            tx_order_.pop_front();
+                                            tx_store_.erase(victim);
+                                            pending_txids_.erase(victim);
+                                        }
+                                    }
+                                }
+                            }
                             if (!tx_data.empty()) {
                                 if (rate_consume_tx(ps, tx_data.size())) {
                                     send_tx(s, tx_data);

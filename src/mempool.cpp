@@ -26,6 +26,7 @@ Mempool::Key Mempool::k(const std::vector<uint8_t>& txid){
 }
 
 bool Mempool::exists(const std::vector<uint8_t>& txid) const {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
     return map_.find(k(txid)) != map_.end();
 }
 
@@ -631,6 +632,7 @@ std::vector<Transaction> Mempool::collect(size_t max) const{
 // === SFINAE targets ==========================================================
 // 1) snapshot(out): return parents-first, feerate-desc full list (no size cap)
 void Mempool::snapshot(std::vector<Transaction>& out) const {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
     out.clear();
     // Reuse collect(max) to preserve ordering guarantees; pass full size.
     const size_t n = map_.size();
@@ -640,6 +642,7 @@ void Mempool::snapshot(std::vector<Transaction>& out) const {
 
 // 2) collect_for_block(out, max_bytes): parents-first, feerate-desc with size cap
 void Mempool::collect_for_block(std::vector<Transaction>& out, size_t max_bytes) const {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
     out.clear();
 
     // Build sorted node view by feerate desc (tie-break: smaller size first)
@@ -691,6 +694,7 @@ void Mempool::collect_for_block(std::vector<Transaction>& out, size_t max_bytes)
 // ============================================================================
 
 std::vector<std::vector<uint8_t>> Mempool::txids() const{
+    std::lock_guard<std::recursive_mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
     std::vector<std::vector<uint8_t>> v;
     v.reserve(map_.size());
     for (const auto& kv : map_){
