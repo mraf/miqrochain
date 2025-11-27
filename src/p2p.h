@@ -544,11 +544,48 @@ private:
     // Small caches
     mutable std::mutex announce_mu_;
     std::vector<std::vector<uint8_t>> announce_blocks_q_;
-    mutable std::mutex announce_tx_mu_;
+
+    // CRITICAL FIX v1.0: Unified transaction storage mutex
+    // This mutex protects ALL transaction-related data structures:
+    // - announce_tx_q_ (queue for transactions to broadcast)
+    // - seen_txids_ (set of already-seen transaction IDs)
+    // - tx_store_ (map of txid -> raw tx bytes for serving to peers)
+    // - tx_order_ (LRU order for tx_store_ eviction)
+    // - rebroadcast_q_ (queue for transactions to rebroadcast)
+    // - pending_txids_ (recently broadcast txids for rebroadcast tracking)
+    //
+    // RACE CONDITION FIX: Previously, these were accessed from both RPC threads
+    // (store_tx_for_relay) and the P2P loop thread without proper synchronization.
+    // This caused memory corruption, lost transactions, and undefined behavior.
+    // Now ALL accesses must hold tx_store_mu_ to ensure thread safety.
+    mutable std::mutex tx_store_mu_;
+
     std::vector<std::vector<uint8_t>> announce_tx_q_;
     std::unordered_set<std::string> seen_txids_;
     std::unordered_map<std::string, std::vector<uint8_t>> tx_store_;
     std::deque<std::string> tx_order_;
+
+    // V1.0 ENHANCEMENT: Transaction rebroadcast mechanism
+    // Transactions that don't get confirmed within REBROADCAST_INTERVAL_MS
+    // are automatically rebroadcast to ensure global propagation
+    struct PendingTxInfo {
+        std::vector<uint8_t> txid;
+        std::vector<uint8_t> raw_tx;
+        int64_t first_broadcast_ms{0};
+        int64_t last_broadcast_ms{0};
+        int broadcast_count{0};
+    };
+    std::unordered_map<std::string, PendingTxInfo> pending_txids_;
+    int64_t last_rebroadcast_ms_{0};
+    int64_t last_seen_cleanup_ms_{0};
+
+    // Rebroadcast configuration
+    static constexpr int64_t REBROADCAST_INTERVAL_MS = 30 * 1000;     // 30 seconds between rebroadcast checks
+    static constexpr int64_t REBROADCAST_DELAY_MS = 60 * 1000;        // Wait 60s before first rebroadcast
+    static constexpr int MAX_REBROADCAST_COUNT = 6;                    // Maximum rebroadcast attempts
+    static constexpr int64_t SEEN_TXIDS_CLEANUP_MS = 5 * 60 * 1000;   // Cleanup seen_txids every 5 min
+    static constexpr size_t MAX_SEEN_TXIDS = 100000;                   // Maximum seen_txids entries
+    static constexpr size_t MAX_PENDING_TXS = 1000;                    // Maximum pending transactions
 
     Mempool* mempool_{nullptr};
     Chain& chain_;

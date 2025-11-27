@@ -2759,15 +2759,24 @@ static inline void trickle_enqueue(Sock sock, const std::vector<uint8_t>& txid){
 
 void P2P::broadcast_inv_tx(const std::vector<uint8_t>& txid){
     if (txid.size()!=32) return;
-    // queue for loop thread so only the loop touches peers_
-    std::lock_guard<std::mutex> lk(announce_tx_mu_);
+    // V1.0 FIX: Use unified tx_store_mu_ for all tx-related data structures
+    std::lock_guard<std::mutex> lk(tx_store_mu_);
     if (announce_tx_q_.size() < 8192) announce_tx_q_.push_back(txid);
 }
 
-// CRITICAL FIX: Store raw transaction for serving to peers
-// This is called by RPC sendrawtransaction so peers can fetch the full tx
-// after receiving the invtx announcement. Without this, peers would send
-// gettx but we'd have nothing to serve them!
+// =============================================================================
+// V1.0 CRITICAL FIX: Thread-safe transaction storage for relay
+// =============================================================================
+// This function is called from RPC threads (sendrawtransaction, sendtoaddress)
+// to store raw transaction data so it can be served to peers when they request
+// it via gettx after receiving our invtx announcement.
+//
+// THREAD SAFETY: Uses tx_store_mu_ to protect ALL transaction data structures.
+// The P2P loop also acquires this lock when accessing these structures.
+//
+// REBROADCAST: Adds transaction to pending_txids_ for automatic rebroadcast
+// if it doesn't get confirmed within REBROADCAST_DELAY_MS.
+// =============================================================================
 void P2P::store_tx_for_relay(const std::vector<uint8_t>& txid, const std::vector<uint8_t>& raw_tx){
     if (txid.size() != 32 || raw_tx.empty()) return;
 
@@ -2779,23 +2788,38 @@ void P2P::store_tx_for_relay(const std::vector<uint8_t>& txid, const std::vector
         key.push_back(hex[b & 0xf]);
     }
 
-    // Note: No lock needed here since this is called from RPC thread
-    // and the main loop accesses tx_store_ from its own thread.
-    // However, for safety, we should use the announce_tx_mu_ lock.
-    std::lock_guard<std::mutex> lk(announce_tx_mu_);
+    // V1.0 CRITICAL FIX: Use unified tx_store_mu_ for thread safety
+    // This lock protects: announce_tx_q_, seen_txids_, tx_store_, tx_order_, pending_txids_
+    std::lock_guard<std::mutex> lk(tx_store_mu_);
 
+    // Store raw transaction for serving to peers via gettx
     if (tx_store_.find(key) == tx_store_.end()) {
         tx_store_[key] = raw_tx;
         tx_order_.push_back(key);
+        // Enforce LRU eviction
         if (tx_store_.size() > MIQ_TX_STORE_MAX) {
             auto victim = tx_order_.front();
             tx_order_.pop_front();
             tx_store_.erase(victim);
+            // Also remove from pending if evicted
+            pending_txids_.erase(victim);
         }
     }
 
-    // Also mark as seen so we don't process it again if a peer relays it back
+    // Mark as seen so we don't process it again if a peer relays it back
     seen_txids_.insert(key);
+
+    // V1.0 ENHANCEMENT: Add to pending for rebroadcast tracking
+    // This ensures transactions get rebroadcast if they don't propagate
+    if (pending_txids_.find(key) == pending_txids_.end() && pending_txids_.size() < MAX_PENDING_TXS) {
+        PendingTxInfo info;
+        info.txid = txid;
+        info.raw_tx = raw_tx;
+        info.first_broadcast_ms = now_ms();
+        info.last_broadcast_ms = now_ms();
+        info.broadcast_count = 1;
+        pending_txids_[key] = std::move(info);
+    }
 }
 
 static void trickle_flush(){
@@ -5277,6 +5301,9 @@ void P2P::loop(){
                         }
                           
              }
+         // =====================================================================
+         // V1.0 TRANSACTION HANDLERS - Thread-safe with tx_store_mu_
+         // =====================================================================
          } else if (cmd == "invtx") {
                         if (!check_rate(ps, "inv", 0.25, now_ms())) {
                             if (!ibd_or_fetch_active(ps, now_ms())) {
@@ -5288,13 +5315,14 @@ void P2P::loop(){
                             if (!inv_tick(1)) { continue; }
                             auto key = hexkey(m.payload);
                             if (!remember_inv(key)) { continue; }
-                            // CRITICAL FIX: Do NOT insert into seen_txids_ here!
-                            // Only check if we've already processed this transaction.
-                            // The actual insert into seen_txids_ happens in the "tx" handler
-                            // AFTER successful processing. The old code inserted here which
-                            // caused the tx handler to skip processing when the actual tx
-                            // data arrived (because seen_txids_.insert().second would be false).
-                            if (!seen_txids_.count(key)) {
+
+                            // V1.0 FIX: Thread-safe check of seen_txids_
+                            bool already_seen = false;
+                            {
+                                std::lock_guard<std::mutex> lk(tx_store_mu_);
+                                already_seen = seen_txids_.count(key) > 0;
+                            }
+                            if (!already_seen) {
                                 request_tx(ps, m.payload);
                             }
                         }
@@ -5302,10 +5330,18 @@ void P2P::loop(){
                     } else if (cmd == "gettx") {
                         if (m.payload.size() == 32) {
                             auto key = hexkey(m.payload);
-                            auto itx = tx_store_.find(key);
-                            if (itx != tx_store_.end()) {
-                                if (rate_consume_tx(ps, itx->second.size())) {
-                                    send_tx(s, itx->second);
+                            // V1.0 FIX: Thread-safe access to tx_store_
+                            std::vector<uint8_t> tx_data;
+                            {
+                                std::lock_guard<std::mutex> lk(tx_store_mu_);
+                                auto itx = tx_store_.find(key);
+                                if (itx != tx_store_.end()) {
+                                    tx_data = itx->second; // Copy under lock
+                                }
+                            }
+                            if (!tx_data.empty()) {
+                                if (rate_consume_tx(ps, tx_data.size())) {
+                                    send_tx(s, tx_data);
                                 }
                             }
                         }
@@ -5323,11 +5359,18 @@ void P2P::loop(){
 
                         ps.inflight_tx.erase(key);
                         if (unsolicited_drop(ps, "tx", key)) {
-                        // Polite ignore: remote may proactively relay deps.
-                        continue;
-                    }
+                            // Polite ignore: remote may proactively relay deps.
+                            continue;
+                        }
 
-                        if (seen_txids_.insert(key).second) {
+                        // V1.0 FIX: Thread-safe check-and-insert for seen_txids_
+                        bool is_new_tx = false;
+                        {
+                            std::lock_guard<std::mutex> lk(tx_store_mu_);
+                            is_new_tx = seen_txids_.insert(key).second;
+                        }
+
+                        if (is_new_tx) {
                             std::string err;
                             bool accepted = true;
                             if (mempool_) {
@@ -5335,11 +5378,12 @@ void P2P::loop(){
                             }
                             bool in_mempool = mempool_ && mempool_->exists(tx.txid());
 
-                            // CRITICAL FIX: If transaction was rejected with error, remove from seen_txids_
-                            // so it can be retried later. This fixes the bug where failed transactions
-                            // were permanently blocked because they were marked as "seen" before validation.
+                            // V1.0 FIX: Thread-safe removal from seen_txids_ on rejection
                             if (!accepted && !err.empty()) {
-                                seen_txids_.erase(key);
+                                {
+                                    std::lock_guard<std::mutex> lk(tx_store_mu_);
+                                    seen_txids_.erase(key);
+                                }
                                 if (!ibd_or_fetch_active(ps, now_ms())) {
                                     if (++ps.mis > 25) bump_ban(ps, ps.ip, "tx-invalid", now_ms());
                                 } else {
@@ -5349,37 +5393,39 @@ void P2P::loop(){
                             }
 
                             // TELEMETRY: Notify about received transaction for UI display
-                            // CRITICAL FIX: Also notify for orphan transactions (accepted but not in mempool)
-                            // so they appear in "Recent TXIDs" display
                             if (accepted && txids_callback_) {
                                 txids_callback_({key});
                             }
 
-                            // WALLET FIX: Don't skip orphan transactions
-                            // When tx is accepted as orphan (accepted=true but not in mempool),
-                            // we still need to store it and relay it so it can propagate.
-                            // The previous code had "continue" here which caused wallet txs
-                            // to never propagate if treated as orphans.
+                            // Handle orphan transactions - fetch missing parents
                             if (accepted && !in_mempool) {
-                                // Try to fetch missing parent transactions
                                 for (const auto& in : tx.vin) {
                                     UTXOEntry e;
                                     if (!chain_.utxo().get(in.prev.txid, in.prev.vout, e)) {
                                         send_gettx(s, in.prev.txid);
                                     }
                                 }
-                                // Don't continue - fall through to store and relay the orphan tx
+                                // Fall through to store and relay the orphan tx
                             }
 
-                            if (tx_store_.find(key) == tx_store_.end()) {
-                                tx_store_[key] = m.payload;
-                                tx_order_.push_back(key);
-                                if (tx_store_.size() > MIQ_TX_STORE_MAX) {
-                                    auto victim = tx_order_.front();
-                                    tx_order_.pop_front();
-                                    tx_store_.erase(victim);
+                            // V1.0 FIX: Thread-safe tx_store_ operations
+                            {
+                                std::lock_guard<std::mutex> lk(tx_store_mu_);
+                                if (tx_store_.find(key) == tx_store_.end()) {
+                                    tx_store_[key] = m.payload;
+                                    tx_order_.push_back(key);
+                                    if (tx_store_.size() > MIQ_TX_STORE_MAX) {
+                                        auto victim = tx_order_.front();
+                                        tx_order_.pop_front();
+                                        tx_store_.erase(victim);
+                                        pending_txids_.erase(victim);
+                                    }
                                 }
+                                // Remove from pending since we received it from network
+                                // (it's already propagating)
+                                pending_txids_.erase(key);
                             }
+
                             if (accepted) {
                                 uint64_t in_sum = 0, out_sum = 0;
                                 for (const auto& o : tx.vout) out_sum += o.value;
@@ -5978,11 +6024,15 @@ void P2P::loop(){
             }
         }
 
-        // trickle any queued invtx payloads (enqueued by broadcast_inv_tx)
+        // =====================================================================
+        // V1.0 TRANSACTION BROADCAST & REBROADCAST SYSTEM
+        // =====================================================================
+
+        // Process queued invtx payloads (from broadcast_inv_tx)
         {
             std::vector<std::vector<uint8_t>> todos;
             {
-                std::lock_guard<std::mutex> lk_tx(announce_tx_mu_);
+                std::lock_guard<std::mutex> lk_tx(tx_store_mu_);
                 if (!announce_tx_q_.empty()) { todos.swap(announce_tx_q_); }
             }
             if (!todos.empty()) {
@@ -5990,8 +6040,80 @@ void P2P::loop(){
                 { std::lock_guard<std::recursive_mutex> lk2(g_peers_mu);
                   for (auto& kv : peers_) sockets.push_back(kv.first); }
                 for (const auto& txid : todos) {
-                    for (auto s : sockets) trickle_enqueue(s, txid);
+                    for (auto sock : sockets) trickle_enqueue(sock, txid);
                 }
+            }
+        }
+
+        // V1.0 ENHANCEMENT: Transaction rebroadcast mechanism
+        // Rebroadcast transactions that haven't been confirmed after REBROADCAST_DELAY_MS
+        int64_t current_time = now_ms();
+        if (current_time - last_rebroadcast_ms_ >= REBROADCAST_INTERVAL_MS) {
+            last_rebroadcast_ms_ = current_time;
+
+            std::vector<std::vector<uint8_t>> rebroadcast_txids;
+            std::vector<std::string> expired_keys;
+
+            {
+                std::lock_guard<std::mutex> lk(tx_store_mu_);
+                for (auto& kv : pending_txids_) {
+                    auto& info = kv.second;
+
+                    // Check if transaction is still in mempool (not confirmed)
+                    bool still_pending = mempool_ && mempool_->exists(info.txid);
+
+                    if (still_pending) {
+                        // Check if enough time has passed since last broadcast
+                        if (current_time - info.last_broadcast_ms >= REBROADCAST_DELAY_MS) {
+                            if (info.broadcast_count < MAX_REBROADCAST_COUNT) {
+                                rebroadcast_txids.push_back(info.txid);
+                                info.last_broadcast_ms = current_time;
+                                info.broadcast_count++;
+                            } else {
+                                // Max rebroadcasts reached, remove from pending
+                                expired_keys.push_back(kv.first);
+                            }
+                        }
+                    } else {
+                        // Transaction confirmed or no longer in mempool, remove from pending
+                        expired_keys.push_back(kv.first);
+                    }
+                }
+
+                // Clean up expired entries
+                for (const auto& key : expired_keys) {
+                    pending_txids_.erase(key);
+                }
+            }
+
+            // Rebroadcast to all peers
+            if (!rebroadcast_txids.empty()) {
+                std::vector<Sock> sockets;
+                { std::lock_guard<std::recursive_mutex> lk2(g_peers_mu);
+                  for (auto& kv : peers_) sockets.push_back(kv.first); }
+                for (const auto& txid : rebroadcast_txids) {
+                    for (auto sock : sockets) trickle_enqueue(sock, txid);
+                }
+            }
+        }
+
+        // V1.0 ENHANCEMENT: Periodic cleanup of seen_txids_ to prevent unbounded growth
+        if (current_time - last_seen_cleanup_ms_ >= SEEN_TXIDS_CLEANUP_MS) {
+            last_seen_cleanup_ms_ = current_time;
+
+            std::lock_guard<std::mutex> lk(tx_store_mu_);
+            if (seen_txids_.size() > MAX_SEEN_TXIDS) {
+                // Keep only txids that are in tx_store_ (recent transactions)
+                std::unordered_set<std::string> keep_set;
+                for (const auto& key : tx_order_) {
+                    keep_set.insert(key);
+                }
+                // Also keep pending transactions
+                for (const auto& kv : pending_txids_) {
+                    keep_set.insert(kv.first);
+                }
+                // Replace seen_txids_ with the keep set
+                seen_txids_ = std::move(keep_set);
             }
         }
 
