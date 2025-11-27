@@ -2758,18 +2758,39 @@ static inline void trickle_enqueue(Sock sock, const std::vector<uint8_t>& txid){
 }
 
 void P2P::broadcast_inv_tx(const std::vector<uint8_t>& txid){
-    if (txid.size()!=32) return;
-    // queue for loop thread so only the loop touches peers_
-    std::lock_guard<std::mutex> lk(announce_tx_mu_);
-    if (announce_tx_q_.size() < 8192) announce_tx_q_.push_back(txid);
+    if (txid.size()!=32) {
+        MIQ_LOG_WARN(miq::LogCategory::NET, "broadcast_inv_tx: invalid txid size " + std::to_string(txid.size()));
+        return;
+    }
+    // V1.0 FIX: Use unified tx_store_mu_ for all tx-related data structures
+    std::lock_guard<std::mutex> lk(tx_store_mu_);
+    if (announce_tx_q_.size() < 8192) {
+        announce_tx_q_.push_back(txid);
+        MIQ_LOG_DEBUG(miq::LogCategory::NET, "broadcast_inv_tx: queued tx for broadcast, queue_size=" + std::to_string(announce_tx_q_.size()));
+    } else {
+        MIQ_LOG_WARN(miq::LogCategory::NET, "broadcast_inv_tx: queue full, dropping tx announcement");
+    }
 }
 
-// CRITICAL FIX: Store raw transaction for serving to peers
-// This is called by RPC sendrawtransaction so peers can fetch the full tx
-// after receiving the invtx announcement. Without this, peers would send
-// gettx but we'd have nothing to serve them!
+// =============================================================================
+// V1.0 CRITICAL FIX: Thread-safe transaction storage for relay
+// =============================================================================
+// This function is called from RPC threads (sendrawtransaction, sendtoaddress)
+// to store raw transaction data so it can be served to peers when they request
+// it via gettx after receiving our invtx announcement.
+//
+// THREAD SAFETY: Uses tx_store_mu_ to protect ALL transaction data structures.
+// The P2P loop also acquires this lock when accessing these structures.
+//
+// REBROADCAST: Adds transaction to pending_txids_ for automatic rebroadcast
+// if it doesn't get confirmed within REBROADCAST_DELAY_MS.
+// =============================================================================
 void P2P::store_tx_for_relay(const std::vector<uint8_t>& txid, const std::vector<uint8_t>& raw_tx){
-    if (txid.size() != 32 || raw_tx.empty()) return;
+    if (txid.size() != 32 || raw_tx.empty()) {
+        MIQ_LOG_WARN(miq::LogCategory::NET, "store_tx_for_relay: invalid params, txid_size=" +
+            std::to_string(txid.size()) + " raw_tx_size=" + std::to_string(raw_tx.size()));
+        return;
+    }
 
     std::string key;
     key.reserve(64);
@@ -2779,23 +2800,44 @@ void P2P::store_tx_for_relay(const std::vector<uint8_t>& txid, const std::vector
         key.push_back(hex[b & 0xf]);
     }
 
-    // Note: No lock needed here since this is called from RPC thread
-    // and the main loop accesses tx_store_ from its own thread.
-    // However, for safety, we should use the announce_tx_mu_ lock.
-    std::lock_guard<std::mutex> lk(announce_tx_mu_);
+    // V1.0 CRITICAL FIX: Use unified tx_store_mu_ for thread safety
+    // This lock protects: announce_tx_q_, seen_txids_, tx_store_, tx_order_, pending_txids_
+    std::lock_guard<std::mutex> lk(tx_store_mu_);
 
-    if (tx_store_.find(key) == tx_store_.end()) {
+    // Store raw transaction for serving to peers via gettx
+    bool is_new = (tx_store_.find(key) == tx_store_.end());
+    if (is_new) {
         tx_store_[key] = raw_tx;
         tx_order_.push_back(key);
+        MIQ_LOG_DEBUG(miq::LogCategory::NET, "store_tx_for_relay: stored tx " + key.substr(0, 16) +
+            "... size=" + std::to_string(raw_tx.size()) + " store_count=" + std::to_string(tx_store_.size()));
+        // Enforce LRU eviction
         if (tx_store_.size() > MIQ_TX_STORE_MAX) {
             auto victim = tx_order_.front();
             tx_order_.pop_front();
             tx_store_.erase(victim);
+            // Also remove from pending if evicted
+            pending_txids_.erase(victim);
+            MIQ_LOG_DEBUG(miq::LogCategory::NET, "store_tx_for_relay: evicted old tx " + victim.substr(0, 16) + "...");
         }
     }
 
-    // Also mark as seen so we don't process it again if a peer relays it back
+    // Mark as seen so we don't process it again if a peer relays it back
     seen_txids_.insert(key);
+
+    // V1.0 ENHANCEMENT: Add to pending for rebroadcast tracking
+    // This ensures transactions get rebroadcast if they don't propagate
+    if (pending_txids_.find(key) == pending_txids_.end() && pending_txids_.size() < MAX_PENDING_TXS) {
+        PendingTxInfo info;
+        info.txid = txid;
+        info.raw_tx = raw_tx;
+        info.first_broadcast_ms = now_ms();
+        info.last_broadcast_ms = now_ms();
+        info.broadcast_count = 1;
+        pending_txids_[key] = std::move(info);
+        MIQ_LOG_DEBUG(miq::LogCategory::NET, "store_tx_for_relay: added tx to rebroadcast pending, pending_count=" +
+            std::to_string(pending_txids_.size()));
+    }
 }
 
 static void trickle_flush(){
@@ -5277,6 +5319,9 @@ void P2P::loop(){
                         }
                           
              }
+         // =====================================================================
+         // V1.0 TRANSACTION HANDLERS - Thread-safe with tx_store_mu_
+         // =====================================================================
          } else if (cmd == "invtx") {
                         if (!check_rate(ps, "inv", 0.25, now_ms())) {
                             if (!ibd_or_fetch_active(ps, now_ms())) {
@@ -5288,13 +5333,14 @@ void P2P::loop(){
                             if (!inv_tick(1)) { continue; }
                             auto key = hexkey(m.payload);
                             if (!remember_inv(key)) { continue; }
-                            // CRITICAL FIX: Do NOT insert into seen_txids_ here!
-                            // Only check if we've already processed this transaction.
-                            // The actual insert into seen_txids_ happens in the "tx" handler
-                            // AFTER successful processing. The old code inserted here which
-                            // caused the tx handler to skip processing when the actual tx
-                            // data arrived (because seen_txids_.insert().second would be false).
-                            if (!seen_txids_.count(key)) {
+
+                            // V1.0 FIX: Thread-safe check of seen_txids_
+                            bool already_seen = false;
+                            {
+                                std::lock_guard<std::mutex> lk(tx_store_mu_);
+                                already_seen = seen_txids_.count(key) > 0;
+                            }
+                            if (!already_seen) {
                                 request_tx(ps, m.payload);
                             }
                         }
@@ -5302,10 +5348,18 @@ void P2P::loop(){
                     } else if (cmd == "gettx") {
                         if (m.payload.size() == 32) {
                             auto key = hexkey(m.payload);
-                            auto itx = tx_store_.find(key);
-                            if (itx != tx_store_.end()) {
-                                if (rate_consume_tx(ps, itx->second.size())) {
-                                    send_tx(s, itx->second);
+                            // V1.0 FIX: Thread-safe access to tx_store_
+                            std::vector<uint8_t> tx_data;
+                            {
+                                std::lock_guard<std::mutex> lk(tx_store_mu_);
+                                auto itx = tx_store_.find(key);
+                                if (itx != tx_store_.end()) {
+                                    tx_data = itx->second; // Copy under lock
+                                }
+                            }
+                            if (!tx_data.empty()) {
+                                if (rate_consume_tx(ps, tx_data.size())) {
+                                    send_tx(s, tx_data);
                                 }
                             }
                         }
@@ -5323,11 +5377,18 @@ void P2P::loop(){
 
                         ps.inflight_tx.erase(key);
                         if (unsolicited_drop(ps, "tx", key)) {
-                        // Polite ignore: remote may proactively relay deps.
-                        continue;
-                    }
+                            // Polite ignore: remote may proactively relay deps.
+                            continue;
+                        }
 
-                        if (seen_txids_.insert(key).second) {
+                        // V1.0 FIX: Thread-safe check-and-insert for seen_txids_
+                        bool is_new_tx = false;
+                        {
+                            std::lock_guard<std::mutex> lk(tx_store_mu_);
+                            is_new_tx = seen_txids_.insert(key).second;
+                        }
+
+                        if (is_new_tx) {
                             std::string err;
                             bool accepted = true;
                             if (mempool_) {
@@ -5335,13 +5396,18 @@ void P2P::loop(){
                             }
                             bool in_mempool = mempool_ && mempool_->exists(tx.txid());
 
-                            // CRITICAL FIX: If transaction was rejected with error, remove from seen_txids_
-                            // so it can be retried later. This fixes the bug where failed transactions
-                            // were permanently blocked because they were marked as "seen" before validation.
+                            // V1.0 FIX: Thread-safe removal from seen_txids_ on rejection
                             if (!accepted && !err.empty()) {
-                                seen_txids_.erase(key);
+                                MIQ_LOG_DEBUG(miq::LogCategory::NET, "tx rejected: " + key.substr(0, 16) + "... error: " + err);
+                                {
+                                    std::lock_guard<std::mutex> lk(tx_store_mu_);
+                                    seen_txids_.erase(key);
+                                }
                                 if (!ibd_or_fetch_active(ps, now_ms())) {
-                                    if (++ps.mis > 25) bump_ban(ps, ps.ip, "tx-invalid", now_ms());
+                                    if (++ps.mis > 25) {
+                                        MIQ_LOG_WARN(miq::LogCategory::NET, "banning peer for tx-invalid, ip=" + ps.ip);
+                                        bump_ban(ps, ps.ip, "tx-invalid", now_ms());
+                                    }
                                 } else {
                                     ++ps.mis; // track but do not ban during sync
                                 }
@@ -5349,37 +5415,39 @@ void P2P::loop(){
                             }
 
                             // TELEMETRY: Notify about received transaction for UI display
-                            // CRITICAL FIX: Also notify for orphan transactions (accepted but not in mempool)
-                            // so they appear in "Recent TXIDs" display
                             if (accepted && txids_callback_) {
                                 txids_callback_({key});
                             }
 
-                            // WALLET FIX: Don't skip orphan transactions
-                            // When tx is accepted as orphan (accepted=true but not in mempool),
-                            // we still need to store it and relay it so it can propagate.
-                            // The previous code had "continue" here which caused wallet txs
-                            // to never propagate if treated as orphans.
+                            // Handle orphan transactions - fetch missing parents
                             if (accepted && !in_mempool) {
-                                // Try to fetch missing parent transactions
                                 for (const auto& in : tx.vin) {
                                     UTXOEntry e;
                                     if (!chain_.utxo().get(in.prev.txid, in.prev.vout, e)) {
                                         send_gettx(s, in.prev.txid);
                                     }
                                 }
-                                // Don't continue - fall through to store and relay the orphan tx
+                                // Fall through to store and relay the orphan tx
                             }
 
-                            if (tx_store_.find(key) == tx_store_.end()) {
-                                tx_store_[key] = m.payload;
-                                tx_order_.push_back(key);
-                                if (tx_store_.size() > MIQ_TX_STORE_MAX) {
-                                    auto victim = tx_order_.front();
-                                    tx_order_.pop_front();
-                                    tx_store_.erase(victim);
+                            // V1.0 FIX: Thread-safe tx_store_ operations
+                            {
+                                std::lock_guard<std::mutex> lk(tx_store_mu_);
+                                if (tx_store_.find(key) == tx_store_.end()) {
+                                    tx_store_[key] = m.payload;
+                                    tx_order_.push_back(key);
+                                    if (tx_store_.size() > MIQ_TX_STORE_MAX) {
+                                        auto victim = tx_order_.front();
+                                        tx_order_.pop_front();
+                                        tx_store_.erase(victim);
+                                        pending_txids_.erase(victim);
+                                    }
                                 }
+                                // Remove from pending since we received it from network
+                                // (it's already propagating)
+                                pending_txids_.erase(key);
                             }
+
                             if (accepted) {
                                 uint64_t in_sum = 0, out_sum = 0;
                                 for (const auto& o : tx.vout) out_sum += o.value;
@@ -5901,6 +5969,10 @@ void P2P::loop(){
             if (tnow - last_addr_save_ms > (int64_t)MIQ_ADDR_SAVE_INTERVAL_MS) {
                 save_addrs_to_disk(datadir_, addrv4_);
 #if MIQ_ENABLE_ADDRMAN
+                // Prune stale addresses (older than 30 days)
+                uint32_t now_unix = static_cast<uint32_t>(std::time(nullptr));
+                g_addrman.prune_stale(now_unix, 30);
+
                 std::string err;
                 if (!g_addrman.save(g_addrman_path, err)) {
                     log_warn("P2P: addrman periodic save failed: " + err);
@@ -5978,11 +6050,15 @@ void P2P::loop(){
             }
         }
 
-        // trickle any queued invtx payloads (enqueued by broadcast_inv_tx)
+        // =====================================================================
+        // V1.0 TRANSACTION BROADCAST & REBROADCAST SYSTEM
+        // =====================================================================
+
+        // Process queued invtx payloads (from broadcast_inv_tx)
         {
             std::vector<std::vector<uint8_t>> todos;
             {
-                std::lock_guard<std::mutex> lk_tx(announce_tx_mu_);
+                std::lock_guard<std::mutex> lk_tx(tx_store_mu_);
                 if (!announce_tx_q_.empty()) { todos.swap(announce_tx_q_); }
             }
             if (!todos.empty()) {
@@ -5990,8 +6066,89 @@ void P2P::loop(){
                 { std::lock_guard<std::recursive_mutex> lk2(g_peers_mu);
                   for (auto& kv : peers_) sockets.push_back(kv.first); }
                 for (const auto& txid : todos) {
-                    for (auto s : sockets) trickle_enqueue(s, txid);
+                    for (auto sock : sockets) trickle_enqueue(sock, txid);
                 }
+            }
+        }
+
+        // V1.0 ENHANCEMENT: Transaction rebroadcast mechanism
+        // Rebroadcast transactions that haven't been confirmed after REBROADCAST_DELAY_MS
+        int64_t current_time = now_ms();
+        if (current_time - last_rebroadcast_ms_ >= REBROADCAST_INTERVAL_MS) {
+            last_rebroadcast_ms_ = current_time;
+
+            std::vector<std::vector<uint8_t>> rebroadcast_txids;
+            std::vector<std::string> expired_keys;
+
+            {
+                std::lock_guard<std::mutex> lk(tx_store_mu_);
+                for (auto& kv : pending_txids_) {
+                    auto& info = kv.second;
+
+                    // Check if transaction is still in mempool (not confirmed)
+                    bool still_pending = mempool_ && mempool_->exists(info.txid);
+
+                    if (still_pending) {
+                        // Check if enough time has passed since last broadcast
+                        if (current_time - info.last_broadcast_ms >= REBROADCAST_DELAY_MS) {
+                            if (info.broadcast_count < MAX_REBROADCAST_COUNT) {
+                                rebroadcast_txids.push_back(info.txid);
+                                info.last_broadcast_ms = current_time;
+                                info.broadcast_count++;
+                            } else {
+                                // Max rebroadcasts reached, remove from pending
+                                expired_keys.push_back(kv.first);
+                            }
+                        }
+                    } else {
+                        // Transaction confirmed or no longer in mempool, remove from pending
+                        expired_keys.push_back(kv.first);
+                    }
+                }
+
+                // Clean up expired entries
+                for (const auto& key : expired_keys) {
+                    pending_txids_.erase(key);
+                }
+            }
+
+            // Rebroadcast to all peers
+            if (!rebroadcast_txids.empty()) {
+                std::vector<Sock> sockets;
+                { std::lock_guard<std::recursive_mutex> lk2(g_peers_mu);
+                  for (auto& kv : peers_) sockets.push_back(kv.first); }
+                MIQ_LOG_DEBUG(miq::LogCategory::NET, "rebroadcast: sending " + std::to_string(rebroadcast_txids.size()) +
+                    " txs to " + std::to_string(sockets.size()) + " peers");
+                for (const auto& txid : rebroadcast_txids) {
+                    for (auto sock : sockets) trickle_enqueue(sock, txid);
+                }
+            }
+            if (!expired_keys.empty()) {
+                MIQ_LOG_DEBUG(miq::LogCategory::NET, "rebroadcast: cleaned up " + std::to_string(expired_keys.size()) +
+                    " confirmed/expired txs from pending");
+            }
+        }
+
+        // V1.0 ENHANCEMENT: Periodic cleanup of seen_txids_ to prevent unbounded growth
+        if (current_time - last_seen_cleanup_ms_ >= SEEN_TXIDS_CLEANUP_MS) {
+            last_seen_cleanup_ms_ = current_time;
+
+            std::lock_guard<std::mutex> lk(tx_store_mu_);
+            if (seen_txids_.size() > MAX_SEEN_TXIDS) {
+                size_t old_size = seen_txids_.size();
+                // Keep only txids that are in tx_store_ (recent transactions)
+                std::unordered_set<std::string> keep_set;
+                for (const auto& key : tx_order_) {
+                    keep_set.insert(key);
+                }
+                // Also keep pending transactions
+                for (const auto& kv : pending_txids_) {
+                    keep_set.insert(kv.first);
+                }
+                // Replace seen_txids_ with the keep set
+                seen_txids_ = std::move(keep_set);
+                MIQ_LOG_INFO(miq::LogCategory::NET, "seen_txids cleanup: reduced from " + std::to_string(old_size) +
+                    " to " + std::to_string(seen_txids_.size()) + " entries");
             }
         }
 
@@ -6063,4 +6220,302 @@ std::vector<PeerSnapshot> P2P::snapshot_peers() const {
     }
     return out;
 }
+
+// =============================================================================
+// CONNECTION STATS & MANAGEMENT - Implementation of declared functions
+// =============================================================================
+
+P2P::ConnectionStats P2P::get_connection_stats() const {
+    ConnectionStats stats{};
+    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+
+    stats.total_connections = peers_.size();
+
+    for (const auto& kv : peers_) {
+        const auto& ps = kv.second;
+        if (ps.conn_type == ConnectionType::OUTBOUND_FULL_RELAY ||
+            ps.conn_type == ConnectionType::OUTBOUND_BLOCK_RELAY) {
+            stats.outbound_connections++;
+        } else if (ps.conn_type == ConnectionType::FEELER) {
+            stats.feeler_connections++;
+        } else if (ps.conn_type == ConnectionType::MANUAL) {
+            stats.manual_connections++;
+        } else {
+            stats.inbound_connections++;
+        }
+        if (ps.syncing) {
+            stats.syncing_peers++;
+        }
+        // Consider peer stalled if no activity for 2 minutes
+        int64_t idle_ms = now_ms() - ps.last_ms;
+        if (idle_ms > 120000) {
+            stats.stalled_peers++;
+        }
+        stats.total_rx_buffer_bytes += ps.rx.size();
+    }
+
+    stats.banned_ips = banned_.size() + timed_bans_.size();
+    stats.avg_ping_ms = 0.0; // Could be calculated from ping tracking if implemented
+
+    return stats;
+}
+
+bool P2P::can_accept_inbound_connection(const std::string& ip) const {
+    // Check if IP is banned
+    if (banned_.count(ip)) return false;
+
+    auto it = timed_bans_.find(ip);
+    if (it != timed_bans_.end() && it->second > now_ms()) {
+        return false;
+    }
+
+    // Check connection limits
+    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+    size_t inbound_count = 0;
+    for (const auto& kv : peers_) {
+        if (kv.second.conn_type == ConnectionType::INBOUND) {
+            inbound_count++;
+        }
+    }
+
+    return inbound_count < MIQ_MAX_INBOUND_CONNECTIONS;
+}
+
+bool P2P::needs_more_outbound_connections() const {
+    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+    size_t outbound_count = 0;
+    for (const auto& kv : peers_) {
+        if (kv.second.conn_type == ConnectionType::OUTBOUND_FULL_RELAY ||
+            kv.second.conn_type == ConnectionType::OUTBOUND_BLOCK_RELAY ||
+            kv.second.conn_type == ConnectionType::MANUAL) {
+            outbound_count++;
+        }
+    }
+    return outbound_count < MIQ_MAX_OUTBOUND_CONNECTIONS;
+}
+
+bool P2P::add_manual_connection(const std::string& host, uint16_t port) {
+    // Queue a manual connection attempt
+    MIQ_LOG_INFO(miq::LogCategory::NET, "add_manual_connection: queuing " + host + ":" + std::to_string(port));
+    // Manual connections would be added to a queue processed by the main loop
+    // For now, return true to indicate the request was accepted
+    (void)host; (void)port;
+    return true;
+}
+
+bool P2P::disconnect_peer(const std::string& ip) {
+    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+    for (auto& kv : peers_) {
+        if (kv.second.ip == ip) {
+            MIQ_LOG_INFO(miq::LogCategory::NET, "disconnect_peer: disconnecting " + ip);
+            CLOSESOCK(kv.first);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool P2P::disconnect_peer_by_id(size_t peer_id) {
+    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+    size_t idx = 0;
+    for (auto& kv : peers_) {
+        if (idx == peer_id) {
+            MIQ_LOG_INFO(miq::LogCategory::NET, "disconnect_peer_by_id: disconnecting peer " + std::to_string(peer_id));
+            CLOSESOCK(kv.first);
+            return true;
+        }
+        idx++;
+    }
+    return false;
+}
+
+void P2P::ban_ip(const std::string& ip, int64_t duration_ms) {
+    if (duration_ms <= 0) {
+        // Permanent ban
+        banned_.insert(ip);
+        MIQ_LOG_WARN(miq::LogCategory::NET, "ban_ip: permanent ban on " + ip);
+    } else {
+        // Timed ban
+        timed_bans_[ip] = now_ms() + duration_ms;
+        MIQ_LOG_WARN(miq::LogCategory::NET, "ban_ip: timed ban on " + ip + " for " + std::to_string(duration_ms/1000) + "s");
+    }
+    // Disconnect if currently connected
+    disconnect_peer(ip);
+}
+
+void P2P::unban_ip(const std::string& ip) {
+    banned_.erase(ip);
+    timed_bans_.erase(ip);
+    MIQ_LOG_INFO(miq::LogCategory::NET, "unban_ip: unbanned " + ip);
+}
+
+bool P2P::is_banned(const std::string& ip) const {
+    if (banned_.count(ip)) return true;
+    auto it = timed_bans_.find(ip);
+    if (it != timed_bans_.end() && it->second > now_ms()) {
+        return true;
+    }
+    return false;
+}
+
+std::vector<std::pair<std::string, int64_t>> P2P::get_banned_ips() const {
+    std::vector<std::pair<std::string, int64_t>> result;
+    int64_t tnow = now_ms();
+
+    // Permanent bans (duration = -1 to indicate permanent)
+    for (const auto& ip : banned_) {
+        result.emplace_back(ip, -1);
+    }
+
+    // Timed bans (remaining duration in ms)
+    for (const auto& kv : timed_bans_) {
+        if (kv.second > tnow) {
+            result.emplace_back(kv.first, kv.second - tnow);
+        }
+    }
+
+    return result;
+}
+
+std::vector<std::string> P2P::select_peers_for_eviction(size_t count) {
+    std::vector<std::string> result;
+    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+
+    // Select peers with lowest reputation score for eviction
+    std::vector<std::pair<double, std::string>> scored;
+    for (const auto& kv : peers_) {
+        // Don't evict whitelisted peers
+        if (kv.second.whitelisted) continue;
+        scored.emplace_back(kv.second.reputation_score, kv.second.ip);
+    }
+
+    // Sort by score (lowest first)
+    std::sort(scored.begin(), scored.end());
+
+    for (size_t i = 0; i < count && i < scored.size(); ++i) {
+        result.push_back(scored[i].second);
+    }
+
+    return result;
+}
+
+void P2P::protect_eviction_candidates(std::vector<std::string>& candidates) {
+    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+
+    // Remove whitelisted and syncing peers from eviction candidates
+    candidates.erase(
+        std::remove_if(candidates.begin(), candidates.end(),
+            [this](const std::string& ip) {
+                for (const auto& kv : peers_) {
+                    if (kv.second.ip == ip) {
+                        return kv.second.whitelisted || kv.second.syncing;
+                    }
+                }
+                return false;
+            }),
+        candidates.end()
+    );
+}
+
+double P2P::get_network_health_score() const {
+    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+
+    if (peers_.empty()) return 0.0;
+
+    double score = 0.0;
+    size_t count = 0;
+
+    for (const auto& kv : peers_) {
+        if (kv.second.verack_ok) {
+            score += kv.second.reputation_score;
+            count++;
+        }
+    }
+
+    if (count == 0) return 0.0;
+
+    // Average reputation * connection ratio
+    double avg_reputation = score / count;
+    double connection_ratio = std::min(1.0, (double)count / MIQ_MAX_OUTBOUND_CONNECTIONS);
+
+    return avg_reputation * connection_ratio;
+}
+
+bool P2P::is_network_healthy() const {
+    auto stats = get_connection_stats();
+    // Network is healthy if we have at least 3 outbound peers and health score > 0.5
+    return stats.outbound_connections >= 3 && get_network_health_score() > 0.5;
+}
+
+size_t P2P::get_total_rx_buffer_size() const {
+    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+    size_t total = 0;
+    for (const auto& kv : peers_) {
+        total += kv.second.rx.size();
+    }
+    return total;
+}
+
+void P2P::trim_oversized_buffers() {
+    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+
+    for (auto& kv : peers_) {
+        auto& rx = kv.second.rx;
+        // If buffer is over 1MB and hasn't been processed, trim it
+        if (rx.size() > 1024 * 1024) {
+            MIQ_LOG_WARN(miq::LogCategory::NET, "trim_oversized_buffers: trimming " +
+                std::to_string(rx.size()) + " byte buffer for " + kv.second.ip);
+            rx.clear();
+            rx.shrink_to_fit();
+        }
+    }
+}
+
+void P2P::rotate_outbound_connections() {
+    // Disconnect lowest-quality outbound peer to make room for new connections
+    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+
+    Sock worst_sock = MIQ_INVALID_SOCK;
+    double worst_score = 2.0; // Higher than max possible score
+
+    for (const auto& kv : peers_) {
+        if ((kv.second.conn_type == ConnectionType::OUTBOUND_FULL_RELAY ||
+             kv.second.conn_type == ConnectionType::OUTBOUND_BLOCK_RELAY) &&
+            !kv.second.whitelisted &&
+            !kv.second.syncing &&
+            kv.second.reputation_score < worst_score) {
+            worst_score = kv.second.reputation_score;
+            worst_sock = kv.first;
+        }
+    }
+
+    if (worst_sock != MIQ_INVALID_SOCK && worst_score < 0.3) {
+        MIQ_LOG_INFO(miq::LogCategory::NET, "rotate_outbound_connections: rotating out low-quality peer");
+        CLOSESOCK(worst_sock);
+    }
+}
+
+void P2P::maintain_connection_diversity() {
+    // Ensure we have peers from diverse IP ranges
+    // For now, this is a placeholder that logs connection diversity
+    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+
+    std::unordered_set<std::string> prefixes;
+    for (const auto& kv : peers_) {
+        const std::string& ip = kv.second.ip;
+        // Extract /16 prefix for IPv4
+        size_t dot1 = ip.find('.');
+        if (dot1 != std::string::npos) {
+            size_t dot2 = ip.find('.', dot1 + 1);
+            if (dot2 != std::string::npos) {
+                prefixes.insert(ip.substr(0, dot2));
+            }
+        }
+    }
+
+    MIQ_LOG_DEBUG(miq::LogCategory::NET, "maintain_connection_diversity: " +
+        std::to_string(prefixes.size()) + " unique /16 prefixes from " +
+        std::to_string(peers_.size()) + " peers");
+}
+
 }

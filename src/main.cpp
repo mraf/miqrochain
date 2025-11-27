@@ -4889,6 +4889,15 @@ int main(int argc, char** argv){
                 }
             }
 
+            // Periodic mempool maintenance (every ~30 seconds)
+            static int64_t last_mempool_maint_ms = 0;
+            if (now_ms() - last_mempool_maint_ms > 30'000) {
+                last_mempool_maint_ms = now_ms();
+                mempool.maintenance();
+                mempool.update_cpfp_scores();
+                mempool.update_fee_estimates(static_cast<uint32_t>(chain.height()));
+            }
+
             bool degraded = false;
             if (!cfg.no_p2p){
                 auto n = p2p.snapshot_peers().size();
