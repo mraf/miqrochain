@@ -150,6 +150,9 @@ public:
     // RBF (Replace-By-Fee) support
     bool accept_replacement(const Transaction& tx, const UTXOView& utxo,
                            uint32_t height, std::string& err);
+    // Convenience overload for UTXOSet
+    bool accept_replacement(const Transaction& tx, const UTXOSet& utxo,
+                           uint32_t height, std::string& err);
     bool is_rbf_candidate(const Transaction& tx) const;
 
     // CPFP (Child-Pays-For-Parent) support

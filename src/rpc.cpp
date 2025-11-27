@@ -1166,7 +1166,27 @@ std::string RpcService::handle(const std::string& body){
             if(!deser_tx(raw, tx)) return err("bad tx");
 
             auto tip = chain_.tip(); std::string e;
-            if(mempool_.accept(tx, chain_.utxo(), static_cast<uint32_t>(tip.height), e)){
+
+            // CRITICAL FIX: Check if this transaction conflicts with any existing mempool tx
+            // If so, try RBF (Replace-By-Fee) path instead of regular accept
+            bool has_conflict = false;
+            for (const auto& in : tx.vin) {
+                if (mempool_.has_spent_input(in.prev.txid, in.prev.vout)) {
+                    has_conflict = true;
+                    break;
+                }
+            }
+
+            bool accepted = false;
+            if (has_conflict) {
+                // Try RBF - accept_replacement validates fee bump rules
+                accepted = mempool_.accept_replacement(tx, chain_.utxo(), static_cast<uint32_t>(tip.height), e);
+            } else {
+                // Normal accept path for non-conflicting transactions
+                accepted = mempool_.accept(tx, chain_.utxo(), static_cast<uint32_t>(tip.height), e);
+            }
+
+            if(accepted){
                 // CRITICAL FIX: Broadcast transaction to P2P network
                 // Without this, transactions only sit in local mempool and never propagate!
                 if(p2p_) {
