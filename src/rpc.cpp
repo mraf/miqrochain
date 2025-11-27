@@ -1175,6 +1175,8 @@ std::string RpcService::handle(const std::string& body){
                     // Without this, peers receive invtx, send gettx, but we have nothing to serve!
                     p2p_->store_tx_for_relay(txid, raw);
                     p2p_->broadcast_inv_tx(txid);
+                    // CRITICAL FIX: Notify telemetry so TUI shows the transaction in "Recent TXIDs"
+                    p2p_->notify_local_tx(txid);
                 }
                 JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
             } else {
@@ -1903,7 +1905,12 @@ std::string RpcService::handle(const std::string& body){
                 // Without this, transactions only sit in local mempool and never propagate!
                 if(p2p_) {
                     std::vector<uint8_t> txid = tx.txid();
+                    // Store raw tx so peers can fetch it via gettx after invtx
+                    std::vector<uint8_t> raw = ser_tx(tx);
+                    p2p_->store_tx_for_relay(txid, raw);
                     p2p_->broadcast_inv_tx(txid);
+                    // Notify telemetry so TUI shows the transaction in "Recent TXIDs"
+                    p2p_->notify_local_tx(txid);
                 }
                 if (used_change) {
                     HdAccountMeta newm = w.meta();

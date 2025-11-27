@@ -382,6 +382,21 @@ public:
     inline void set_block_callback(BlockCallback cb) { block_callback_ = std::move(cb); }
     inline void set_txids_callback(TxidsCallback cb) { txids_callback_ = std::move(cb); }
 
+    // CRITICAL FIX: Notify about locally-submitted transactions for TUI display
+    // This allows RPC-submitted transactions to appear in "Recent TXIDs"
+    inline void notify_local_tx(const std::vector<uint8_t>& txid) {
+        if (txids_callback_ && txid.size() == 32) {
+            std::string key;
+            key.reserve(64);
+            static const char hex[] = "0123456789abcdef";
+            for (uint8_t b : txid) {
+                key.push_back(hex[b >> 4]);
+                key.push_back(hex[b & 0xf]);
+            }
+            txids_callback_({key});
+        }
+    }
+
     // key-based helper ("invb","getb", etc.)
     bool check_rate(PeerState& ps, const char* key);
 
