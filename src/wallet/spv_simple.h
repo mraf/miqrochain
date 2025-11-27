@@ -40,4 +40,8 @@ bool spv_collect_utxos(
 // Optional: quick sum helper.
 uint64_t spv_sum_value(const std::vector<UtxoLite>& v);
 
+// CRITICAL FIX: Invalidate in-memory UTXO cache after sending transactions
+// This ensures fresh data is fetched from network after spending UTXOs
+void spv_invalidate_mem_cache();
+
 }
