@@ -2865,6 +2865,174 @@ static void save_pending_enhanced(const std::string& wdir, const std::set<Outpoi
 }
 
 // =============================================================================
+// v11.0 LOCAL CHANGE UTXO CACHE - Immediate balance feedback
+// When sending a transaction, the change UTXO won't appear in network UTXOs until
+// the transaction is mined. This cache tracks our expected change so balance
+// displays correctly immediately after sending.
+// =============================================================================
+
+struct LocalChangeEntry {
+    std::string txid_hex;
+    uint32_t vout{0};
+    uint64_t value{0};
+    std::vector<uint8_t> pkh;
+    int64_t created_at{0};
+
+    // Auto-expire after 30 minutes (enough time for tx to confirm or fail)
+    static constexpr int64_t EXPIRY_SECONDS = 30 * 60;
+
+    bool is_expired(int64_t now = 0) const {
+        if (now == 0) now = (int64_t)time(nullptr);
+        return (now - created_at) > EXPIRY_SECONDS;
+    }
+};
+
+// Global cache for local change (in-memory, also persisted to disk)
+static std::vector<LocalChangeEntry> g_local_change_cache;
+
+static std::string local_change_path(const std::string& wdir) {
+    return join_path(wdir, "local_change.dat");
+}
+
+static void save_local_change(const std::string& wdir) {
+    std::ofstream f(local_change_path(wdir), std::ios::out | std::ios::trunc);
+    if (!f.good()) return;
+
+    int64_t now = (int64_t)time(nullptr);
+    for (const auto& e : g_local_change_cache) {
+        // Skip expired entries
+        if (e.is_expired(now)) continue;
+
+        f << e.txid_hex << "|" << e.vout << "|" << e.value << "|"
+          << miq::to_hex(e.pkh) << "|" << e.created_at << "\n";
+    }
+}
+
+static void load_local_change(const std::string& wdir) {
+    g_local_change_cache.clear();
+
+    std::ifstream f(local_change_path(wdir));
+    if (!f.good()) return;
+
+    std::string line;
+    int64_t now = (int64_t)time(nullptr);
+
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+
+        std::vector<std::string> parts;
+        size_t start = 0, end = 0;
+        while ((end = line.find('|', start)) != std::string::npos) {
+            parts.push_back(line.substr(start, end - start));
+            start = end + 1;
+        }
+        parts.push_back(line.substr(start));
+
+        if (parts.size() >= 5) {
+            LocalChangeEntry e;
+            e.txid_hex = parts[0];
+            e.vout = (uint32_t)std::strtoul(parts[1].c_str(), nullptr, 10);
+            e.value = std::strtoull(parts[2].c_str(), nullptr, 10);
+            e.pkh = miq::from_hex(parts[3]);
+            e.created_at = std::strtoll(parts[4].c_str(), nullptr, 10);
+
+            // Skip expired entries
+            if (!e.is_expired(now)) {
+                g_local_change_cache.push_back(e);
+            }
+        }
+    }
+}
+
+static void add_local_change(const std::string& wdir, const std::string& txid_hex,
+                             uint32_t vout, uint64_t value, const std::vector<uint8_t>& pkh) {
+    LocalChangeEntry e;
+    e.txid_hex = txid_hex;
+    e.vout = vout;
+    e.value = value;
+    e.pkh = pkh;
+    e.created_at = (int64_t)time(nullptr);
+
+    // Check for duplicate
+    for (const auto& existing : g_local_change_cache) {
+        if (existing.txid_hex == txid_hex && existing.vout == vout) {
+            return;  // Already tracked
+        }
+    }
+
+    g_local_change_cache.push_back(e);
+    save_local_change(wdir);
+}
+
+// Remove local change entries that now appear in network UTXOs (confirmed)
+// Returns the number of entries cleaned up
+static int cleanup_confirmed_local_change(const std::string& wdir,
+                                          const std::vector<miq::UtxoLite>& network_utxos) {
+    // Build set of network UTXO keys
+    std::set<std::pair<std::string, uint32_t>> network_keys;
+    for (const auto& u : network_utxos) {
+        network_keys.insert({miq::to_hex(u.txid), u.vout});
+    }
+
+    int64_t now = (int64_t)time(nullptr);
+    int cleaned = 0;
+
+    auto it = g_local_change_cache.begin();
+    while (it != g_local_change_cache.end()) {
+        // Remove if expired
+        if (it->is_expired(now)) {
+            it = g_local_change_cache.erase(it);
+            cleaned++;
+            continue;
+        }
+
+        // Remove if now visible in network (confirmed or in mempool)
+        if (network_keys.find({it->txid_hex, it->vout}) != network_keys.end()) {
+            it = g_local_change_cache.erase(it);
+            cleaned++;
+            continue;
+        }
+
+        ++it;
+    }
+
+    if (cleaned > 0) {
+        save_local_change(wdir);
+    }
+
+    return cleaned;
+}
+
+// Merge local change into UTXO list for balance calculation
+static void merge_local_change_into_utxos(std::vector<miq::UtxoLite>& utxos) {
+    int64_t now = (int64_t)time(nullptr);
+
+    // Build set of existing UTXO keys to avoid duplicates
+    std::set<std::pair<std::string, uint32_t>> existing_keys;
+    for (const auto& u : utxos) {
+        existing_keys.insert({miq::to_hex(u.txid), u.vout});
+    }
+
+    for (const auto& e : g_local_change_cache) {
+        // Skip expired
+        if (e.is_expired(now)) continue;
+
+        // Skip if already in network UTXOs
+        if (existing_keys.find({e.txid_hex, e.vout}) != existing_keys.end()) continue;
+
+        // Add to UTXO list
+        miq::UtxoLite u;
+        u.txid = miq::from_hex(e.txid_hex);
+        u.vout = e.vout;
+        u.value = e.value;
+        u.pkh = e.pkh;
+        u.height = 0;  // Unconfirmed
+        u.coinbase = false;
+        utxos.push_back(u);
+    }
+}
+
+// =============================================================================
 // PROFESSIONAL WALLET FEATURES - v2.0 Stable
 // =============================================================================
 
@@ -5506,88 +5674,59 @@ static void update_all_tx_confirmations(const std::string& wdir,
         }
     }
 
-    // MIQ block time is 8 minutes = 480 seconds
-    const int64_t MIQ_BLOCK_TIME_SECS = 480;
+    // v11.0 CRITICAL FIX: Complete rewrite of confirmation tracking
+    // PROBLEM: Time-based estimation was causing 100 conf bugs and wrong timestamps
+    // SOLUTION: Only use blockchain-proven confirmations, never estimate from time
 
     // Update confirmations for each transaction
     for(auto& e : hist){
         uint32_t old_conf = e.confirmations;
-        uint32_t new_conf = old_conf;
+        uint32_t new_conf = 0;  // Start at 0, only increase with proof
         uint32_t found_height = 0;
 
-        // METHOD 1: Direct UTXO matching (works for received AND sent with change)
-        // For sent transactions, the change output will appear as a UTXO with the same TXID
+        // METHOD 1: Direct UTXO matching - MOST RELIABLE
+        // Works for received transactions AND sent transactions with change
         auto it = txid_height.find(e.txid_hex);
         if(it != txid_height.end() && it->second > 0){
-            // UTXO found with height - calculate exact confirmations
+            // UTXO found with confirmed height - calculate exact confirmations
             found_height = it->second;
             if(current_tip_height >= found_height){
                 new_conf = current_tip_height - found_height + 1;
             }
         }
-        // METHOD 2: For sent transactions WITHOUT visible change (fully spent or no change)
-        else if(e.direction == "sent" || e.direction == "self"){
-            int64_t now = (int64_t)time(nullptr);
-            int64_t age = now - e.timestamp;
-
-            // v9.0: Use MIQ 8-minute block time, not 10-minute
-            // Start counting confirmations after 1 block time (8 minutes)
-            if(age > MIQ_BLOCK_TIME_SECS){
-                // Estimate: 1 conf per 8 minutes elapsed
-                new_conf = std::max(1u, (uint32_t)(age / MIQ_BLOCK_TIME_SECS));
-                // Cap at 100 confirmations for very old transactions
-                if(new_conf > 100) new_conf = 100;
-                // Estimate block height from confirmations
-                if(e.block_height == 0 && new_conf > 0 && current_tip_height > new_conf){
-                    found_height = current_tip_height - new_conf + 1;
-                }
-            } else if(age > 60){
-                // Transaction is in-flight (1 min < age < 8 min)
-                // Count as 0 confirmations but mark as "pending in mempool"
-                // Don't override existing higher confirmation count
-            }
+        // METHOD 2: Use stored block_height if available
+        else if(e.block_height > 0 && current_tip_height >= e.block_height){
+            // We have a previously recorded block height - use it
+            found_height = e.block_height;
+            new_conf = current_tip_height - e.block_height + 1;
         }
-        // METHOD 3: For received transactions without UTXO (already spent)
-        else if(e.direction == "received" || e.direction == "mined"){
-            // v10.0 FIX: If we have block_height, use it for accurate confirmations
-            if(e.block_height > 0 && current_tip_height >= e.block_height){
-                new_conf = current_tip_height - e.block_height + 1;
-            } else {
-                // If no UTXO found and no block height, the output was spent
-                // Use time-based estimation with MIQ block time as last resort
-                int64_t now = (int64_t)time(nullptr);
-                int64_t age = now - e.timestamp;
-                if(age > MIQ_BLOCK_TIME_SECS){
-                    new_conf = std::max(1u, (uint32_t)(age / MIQ_BLOCK_TIME_SECS));
-                    if(new_conf > 100) new_conf = 100;
-                    // Estimate block height from confirmations
-                    if(e.block_height == 0 && new_conf > 0 && current_tip_height > new_conf){
-                        found_height = current_tip_height - new_conf + 1;
-                    }
-                }
-            }
+        // METHOD 3: UTXO exists but height is 0 - transaction is in mempool (unconfirmed)
+        else if(it != txid_height.end() && it->second == 0){
+            // Transaction is in mempool, waiting for confirmation
+            new_conf = 0;
+        }
+        // METHOD 4: No UTXO and no stored height - keep existing confirmations
+        // v11.0 FIX: Do NOT estimate from time - this causes the 100 conf bug
+        // If we have no blockchain proof, preserve existing state
+        else {
+            new_conf = old_conf;  // Keep existing - don't guess
         }
 
-        // Update confirmations (never decrease - blockchain immutability)
-        if(new_conf > old_conf){
+        // Update confirmations - allow both increase AND decrease for accuracy
+        // v11.0 FIX: Blockchain reorgs can decrease confirmations
+        if(new_conf != old_conf){
             e.confirmations = new_conf;
             changed = true;
         }
 
         // Update block_height if we found one and entry doesn't have one yet
+        // v11.0 FIX: Do NOT modify timestamps - keep original creation time
         if(found_height > 0 && e.block_height == 0){
             e.block_height = found_height;
             changed = true;
-
-            // v10.0 FIX: Also update timestamp to be consistent with block height
-            // This fixes old transactions that had wrong timestamps from incomplete sync
-            constexpr int64_t GENESIS_TIME_MIQ = 1758890772;
-            constexpr int64_t BLOCK_TIME_MIQ = 480;
-            int64_t correct_timestamp = GENESIS_TIME_MIQ + (int64_t)(found_height * BLOCK_TIME_MIQ);
-            // Only update if the difference is significant (> 1 hour)
-            if(std::abs(e.timestamp - correct_timestamp) > 3600){
-                e.timestamp = correct_timestamp;
-            }
+            // NOTE: Deliberately NOT updating timestamp here
+            // The original timestamp represents when user created/received the tx
+            // Blockchain timestamp would show ~44 days old due to genesis time offset
         }
     }
 
@@ -5647,18 +5786,13 @@ static int auto_detect_received_transactions(
         TxHistoryEntry entry;
         entry.txid_hex = txid;
 
-        // v10.0 FIX: Calculate timestamp from genesis time + block height
-        // This gives consistent timestamps that don't depend on when wallet discovers the tx
-        // Using GENESIS_TIME (1758890772) + block_height * BLOCK_TIME_SECS (480)
-        // This is more accurate than the old method: now - (blocks_ago * 480)
-        constexpr int64_t GENESIS_TIME_MIQ = 1758890772;  // Same as constants.h
-        constexpr int64_t BLOCK_TIME_MIQ = 480;           // 8 minutes
-        if(agg.min_height < UINT32_MAX && agg.min_height > 0){
-            entry.timestamp = GENESIS_TIME_MIQ + (int64_t)(agg.min_height * BLOCK_TIME_MIQ);
-        } else {
-            // Unconfirmed - use current time
-            entry.timestamp = (int64_t)time(nullptr);
-        }
+        // v11.0 CRITICAL FIX: Always use current real time for timestamps
+        // PROBLEM: Using GENESIS_TIME + block_height * 480 results in timestamps
+        // that are ~44 days in the past because blockchain genesis is in the past
+        // but blocks mine slower than expected (8 min average vs actual time passed)
+        // SOLUTION: Use current time - this is when the user actually discovered/received
+        // the transaction, which is what they care about for display purposes
+        entry.timestamp = (int64_t)time(nullptr);
 
         // v9.0: Total of all outputs to this wallet from this transaction
         entry.amount = (int64_t)agg.total_value;
@@ -7933,6 +8067,9 @@ static bool wallet_session(const std::string& cli_host,
     std::set<OutpointKey> pending;
     load_pending(wdir, pending);
 
+    // v11.0: Load local change cache for immediate balance feedback
+    load_local_change(wdir);
+
     // Cache for derived addresses
     std::unordered_map<uint32_t, std::string> addr_cache;
     for(uint32_t i = 0; i <= meta.next_recv + 10; ++i){
@@ -8024,6 +8161,18 @@ static bool wallet_session(const std::string& cli_host,
             }
 
             save_pending(wdir, pending);
+        }
+
+        // v11.0: Cleanup confirmed local change entries and merge remaining
+        // This ensures balance shows correct change amount after sending
+        {
+            int change_confirmed = cleanup_confirmed_local_change(wdir, utxos);
+            if (change_confirmed > 0) {
+                // Change is now visible on network, no longer need local tracking
+            }
+
+            // Merge any remaining local change into UTXOs for balance calculation
+            merge_local_change_into_utxos(utxos);
         }
 
         // Update metadata
@@ -9316,6 +9465,10 @@ static bool wallet_session(const std::string& cli_host,
                     change_utxo.height = 0;  // Not yet confirmed
                     change_utxo.coinbase = false;
                     utxos.push_back(change_utxo);
+
+                    // v11.0: Persist change to local cache for balance continuity
+                    // This survives the network refresh and ensures balance shows correctly
+                    add_local_change(wdir, txid_hex, change_vout, change, cpkh);
                 } else {
                     // Fallback: use index 1 if we can't find it by PKH match
                     // This shouldn't happen in normal operation
@@ -9326,6 +9479,9 @@ static bool wallet_session(const std::string& cli_host,
                         change_utxo.height = 0;
                         change_utxo.coinbase = false;
                         utxos.push_back(change_utxo);
+
+                        // v11.0: Also persist fallback change to local cache
+                        add_local_change(wdir, txid_hex, 1, change, tx.vout[1].pkh);
                     }
                 }
             }
