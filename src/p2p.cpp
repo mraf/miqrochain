@@ -5376,7 +5376,7 @@ void P2P::loop(){
                             // V1.0 FIX: Thread-safe check of seen_txids_
                             bool already_seen = false;
                             {
-                                std::lock_guard<std::mutex> lk(tx_store_mu_);
+                                std::lock_guard<std::mutex> tx_lk(tx_store_mu_);
                                 already_seen = seen_txids_.count(key) > 0;
                             }
                             if (!already_seen) {
@@ -5390,7 +5390,7 @@ void P2P::loop(){
                             // V1.0 FIX: Thread-safe access to tx_store_
                             std::vector<uint8_t> tx_data;
                             {
-                                std::lock_guard<std::mutex> lk(tx_store_mu_);
+                                std::lock_guard<std::mutex> tx_lk(tx_store_mu_);
                                 auto itx = tx_store_.find(key);
                                 if (itx != tx_store_.end()) {
                                     tx_data = itx->second; // Copy under lock
@@ -5403,7 +5403,7 @@ void P2P::loop(){
                                 if (mempool_->get_transaction(m.payload, tx)) {
                                     tx_data = ser_tx(tx);
                                     // Cache for future requests
-                                    std::lock_guard<std::mutex> lk(tx_store_mu_);
+                                    std::lock_guard<std::mutex> tx_lk(tx_store_mu_);
                                     if (tx_store_.find(key) == tx_store_.end()) {
                                         tx_store_[key] = tx_data;
                                         tx_order_.push_back(key);
@@ -5441,7 +5441,7 @@ void P2P::loop(){
                         // V1.0 FIX: Thread-safe check-and-insert for seen_txids_
                         bool is_new_tx = false;
                         {
-                            std::lock_guard<std::mutex> lk(tx_store_mu_);
+                            std::lock_guard<std::mutex> tx_lk(tx_store_mu_);
                             is_new_tx = seen_txids_.insert(key).second;
                         }
 
@@ -5457,7 +5457,7 @@ void P2P::loop(){
                             if (!accepted && !err.empty()) {
                                 MIQ_LOG_DEBUG(miq::LogCategory::NET, "tx rejected: " + key.substr(0, 16) + "... error: " + err);
                                 {
-                                    std::lock_guard<std::mutex> lk(tx_store_mu_);
+                                    std::lock_guard<std::mutex> tx_lk(tx_store_mu_);
                                     seen_txids_.erase(key);
                                 }
                                 if (!ibd_or_fetch_active(ps, now_ms())) {
@@ -5489,7 +5489,7 @@ void P2P::loop(){
 
                             // V1.0 FIX: Thread-safe tx_store_ operations
                             {
-                                std::lock_guard<std::mutex> lk(tx_store_mu_);
+                                std::lock_guard<std::mutex> tx_lk(tx_store_mu_);
                                 if (tx_store_.find(key) == tx_store_.end()) {
                                     tx_store_[key] = m.payload;
                                     tx_order_.push_back(key);
@@ -6138,7 +6138,7 @@ void P2P::loop(){
             std::vector<std::string> expired_keys;
 
             {
-                std::lock_guard<std::mutex> lk(tx_store_mu_);
+                std::lock_guard<std::mutex> tx_lk(tx_store_mu_);
                 for (auto& kv : pending_txids_) {
                     auto& info = kv.second;
 
@@ -6190,7 +6190,7 @@ void P2P::loop(){
         if (current_time - last_seen_cleanup_ms_ >= SEEN_TXIDS_CLEANUP_MS) {
             last_seen_cleanup_ms_ = current_time;
 
-            std::lock_guard<std::mutex> lk(tx_store_mu_);
+            std::lock_guard<std::mutex> tx_lk(tx_store_mu_);
             if (seen_txids_.size() > MAX_SEEN_TXIDS) {
                 size_t old_size = seen_txids_.size();
                 // Keep only txids that are in tx_store_ (recent transactions)
@@ -6584,7 +6584,7 @@ void P2P::send_sendheaders(PeerState& ps) {
     // Send "sendheaders" message to tell peer we prefer headers announcements
     auto msg = encode_msg("sendheaders", std::vector<uint8_t>{});
     if (ps.sock != MIQ_INVALID_SOCK) {
-        ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), msg.size(), 0);
+        ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), static_cast<int>(msg.size()), 0);
         if (w > 0) {
             ps.sent_sendheaders = true;
             MIQ_LOG_DEBUG(miq::LogCategory::NET, "send_sendheaders: sent to " + ps.ip);
@@ -6602,7 +6602,7 @@ void P2P::broadcast_header(const std::vector<uint8_t>& header_data) {
         auto& ps = kv.second;
         // Only send to peers who prefer headers (BIP130)
         if (ps.verack_ok && ps.prefer_headers) {
-            ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), msg.size(), 0);
+            ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), static_cast<int>(msg.size()), 0);
             (void)w;  // Best effort
         }
     }
@@ -6623,7 +6623,7 @@ void P2P::send_sendcmpct(PeerState& ps, bool high_bandwidth, uint64_t version) {
 
     auto msg = encode_msg("sendcmpct", payload);
     if (ps.sock != MIQ_INVALID_SOCK) {
-        ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), msg.size(), 0);
+        ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), static_cast<int>(msg.size()), 0);
         if (w > 0) {
             ps.compact_blocks_enabled = true;
             ps.compact_high_bandwidth = high_bandwidth;
@@ -6668,7 +6668,7 @@ void P2P::send_cmpctblock(PeerState& ps, const std::vector<uint8_t>& block_hash)
     auto raw = ser_block(blk);
     auto msg = encode_msg("block", raw);
     if (ps.sock != MIQ_INVALID_SOCK) {
-        ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), msg.size(), 0);
+        ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), static_cast<int>(msg.size()), 0);
         if (w > 0) {
             ps.last_compact_block_hash = block_hash;
             MIQ_LOG_DEBUG(miq::LogCategory::NET, "send_cmpctblock: sent block to " + ps.ip);
@@ -6709,7 +6709,7 @@ void P2P::send_getblocktxn(PeerState& ps, const std::vector<uint8_t>& block_hash
 
     auto msg = encode_msg("getblocktxn", payload);
     if (ps.sock != MIQ_INVALID_SOCK) {
-        ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), msg.size(), 0);
+        ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), static_cast<int>(msg.size()), 0);
         if (w > 0) {
             MIQ_LOG_DEBUG(miq::LogCategory::NET, "send_getblocktxn: requested " +
                 std::to_string(indexes.size()) + " txs from " + ps.ip);

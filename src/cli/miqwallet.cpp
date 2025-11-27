@@ -117,7 +117,7 @@ namespace instant_input {
     }
 
     // Get single character without Enter (Windows)
-    static int get_char_instant() {
+    [[maybe_unused]] static int get_char_instant() {
         if (_kbhit()) {
             return _getch();
         }
@@ -145,7 +145,7 @@ namespace instant_input {
     }
 
     // Check if input is available
-    static bool input_available() {
+    [[maybe_unused]] static bool input_available() {
         return _kbhit() != 0;
     }
 
@@ -6865,7 +6865,7 @@ static std::string confirmation_bar(uint32_t confirmations, int width = 6) {
 }
 
 // Extended progress bar with percentage and status text
-static std::string confirmation_bar_extended(uint32_t confirmations, int bar_width = 10) {
+[[maybe_unused]] static std::string confirmation_bar_extended(uint32_t confirmations, int bar_width = 10) {
     std::string result;
     std::string reset = "\033[0m";
 
@@ -11703,7 +11703,7 @@ namespace main_menu {
             }
 
             // Pad to border
-            int used = 2 + 2 + 3 + 1 + 12 + 1 + strlen(menu_items[i][2]);
+            int used = 2 + 2 + 3 + 1 + 12 + 1 + static_cast<int>(strlen(menu_items[i][2]));
             int remaining = W - 2 - used;
             if (remaining > 0) std::cout << std::string(remaining, ' ');
             std::cout << ui::cyan() << side_v << ui::reset() << "\033[K\n";
