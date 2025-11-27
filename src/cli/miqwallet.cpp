@@ -292,12 +292,17 @@ namespace instant_input {
 // PRODUCTION CONSTANTS
 // =============================================================================
 namespace wallet_config {
-    // Network resilience - enhanced for robustness
-    static constexpr int MAX_CONNECTION_RETRIES = 8;
-    static constexpr int BASE_RETRY_DELAY_MS = 500;
-    static constexpr int MAX_RETRY_DELAY_MS = 30000;
-    static constexpr int CONNECTION_TIMEOUT_MS = 20000;
-    static constexpr int BROADCAST_TIMEOUT_MS = 15000;
+    // Network resilience - OPTIMIZED for speed without sacrificing reliability
+    // v10.0 FIX: Reduced from 8 retries to 3 - faster failure, try next seed quickly
+    static constexpr int MAX_CONNECTION_RETRIES = 3;
+    // v10.0 FIX: Reduced from 500ms to 200ms - faster initial retry
+    static constexpr int BASE_RETRY_DELAY_MS = 200;
+    // v10.0 FIX: Reduced from 30s to 3s - don't wait forever on bad peers
+    static constexpr int MAX_RETRY_DELAY_MS = 3000;
+    // v10.0 FIX: Reduced from 20s to 8s - faster connection timeout
+    static constexpr int CONNECTION_TIMEOUT_MS = 8000;
+    // v10.0 FIX: Reduced from 15s to 5s - faster broadcast timeout
+    static constexpr int BROADCAST_TIMEOUT_MS = 5000;
 
     // Security limits - hardened
     static constexpr size_t MAX_UTXO_COUNT = 100000;
@@ -5541,16 +5546,21 @@ static void update_all_tx_confirmations(const std::string& wdir,
         }
         // METHOD 3: For received transactions without UTXO (already spent)
         else if(e.direction == "received" || e.direction == "mined"){
-            // If no UTXO found, the output was spent
-            // Use time-based estimation with MIQ block time
-            int64_t now = (int64_t)time(nullptr);
-            int64_t age = now - e.timestamp;
-            if(age > MIQ_BLOCK_TIME_SECS){
-                new_conf = std::max(1u, (uint32_t)(age / MIQ_BLOCK_TIME_SECS));
-                if(new_conf > 100) new_conf = 100;
-                // Estimate block height from confirmations
-                if(e.block_height == 0 && new_conf > 0 && current_tip_height > new_conf){
-                    found_height = current_tip_height - new_conf + 1;
+            // v10.0 FIX: If we have block_height, use it for accurate confirmations
+            if(e.block_height > 0 && current_tip_height >= e.block_height){
+                new_conf = current_tip_height - e.block_height + 1;
+            } else {
+                // If no UTXO found and no block height, the output was spent
+                // Use time-based estimation with MIQ block time as last resort
+                int64_t now = (int64_t)time(nullptr);
+                int64_t age = now - e.timestamp;
+                if(age > MIQ_BLOCK_TIME_SECS){
+                    new_conf = std::max(1u, (uint32_t)(age / MIQ_BLOCK_TIME_SECS));
+                    if(new_conf > 100) new_conf = 100;
+                    // Estimate block height from confirmations
+                    if(e.block_height == 0 && new_conf > 0 && current_tip_height > new_conf){
+                        found_height = current_tip_height - new_conf + 1;
+                    }
                 }
             }
         }
@@ -5565,6 +5575,16 @@ static void update_all_tx_confirmations(const std::string& wdir,
         if(found_height > 0 && e.block_height == 0){
             e.block_height = found_height;
             changed = true;
+
+            // v10.0 FIX: Also update timestamp to be consistent with block height
+            // This fixes old transactions that had wrong timestamps from incomplete sync
+            constexpr int64_t GENESIS_TIME_MIQ = 1758890772;
+            constexpr int64_t BLOCK_TIME_MIQ = 480;
+            int64_t correct_timestamp = GENESIS_TIME_MIQ + (int64_t)(found_height * BLOCK_TIME_MIQ);
+            // Only update if the difference is significant (> 1 hour)
+            if(std::abs(e.timestamp - correct_timestamp) > 3600){
+                e.timestamp = correct_timestamp;
+            }
         }
     }
 
@@ -5624,13 +5644,17 @@ static int auto_detect_received_transactions(
         TxHistoryEntry entry;
         entry.txid_hex = txid;
 
-        // Estimate timestamp from block height using MIQ 8-minute blocks
-        int64_t now = (int64_t)time(nullptr);
-        if(agg.min_height < UINT32_MAX && current_tip_height > 0){
-            int64_t blocks_ago = current_tip_height - agg.min_height;
-            entry.timestamp = now - (blocks_ago * 480);  // MIQ = 8 min blocks
+        // v10.0 FIX: Calculate timestamp from genesis time + block height
+        // This gives consistent timestamps that don't depend on when wallet discovers the tx
+        // Using GENESIS_TIME (1758890772) + block_height * BLOCK_TIME_SECS (480)
+        // This is more accurate than the old method: now - (blocks_ago * 480)
+        constexpr int64_t GENESIS_TIME_MIQ = 1758890772;  // Same as constants.h
+        constexpr int64_t BLOCK_TIME_MIQ = 480;           // 8 minutes
+        if(agg.min_height < UINT32_MAX && agg.min_height > 0){
+            entry.timestamp = GENESIS_TIME_MIQ + (int64_t)(agg.min_height * BLOCK_TIME_MIQ);
         } else {
-            entry.timestamp = now;
+            // Unconfirmed - use current time
+            entry.timestamp = (int64_t)time(nullptr);
         }
 
         // v9.0: Total of all outputs to this wallet from this transaction
@@ -7162,20 +7186,40 @@ static bool broadcast_any_seed(
     std::string& used_seed,
     std::string& err_out)
 {
+    // v10.0 FIX: Reorder seeds to try localhost FIRST (most reliable if local node running)
+    std::vector<std::pair<std::string,std::string>> ordered_seeds;
+    ordered_seeds.reserve(seeds.size());
+
+    // First add any localhost entries
     for(const auto& [host, port] : seeds){
+        if(host == "127.0.0.1" || host == "localhost"){
+            ordered_seeds.push_back({host, port});
+        }
+    }
+    // Then add all other entries
+    for(const auto& [host, port] : seeds){
+        if(host != "127.0.0.1" && host != "localhost"){
+            ordered_seeds.push_back({host, port});
+        }
+    }
+
+    for(const auto& [host, port] : ordered_seeds){
         std::string seed_str = host + ":" + port;
         ui::print_progress("Broadcasting to " + seed_str + "...");
 
-        for(int attempt = 0; attempt < wallet_config::MAX_CONNECTION_RETRIES; ++attempt){
+        // v10.0 FIX: For localhost, only try once - it either works or doesn't
+        int max_attempts = (host == "127.0.0.1" || host == "localhost") ? 1 : wallet_config::MAX_CONNECTION_RETRIES;
+
+        for(int attempt = 0; attempt < max_attempts; ++attempt){
             if(attempt > 0){
                 int delay = std::min(
-                    wallet_config::BASE_RETRY_DELAY_MS * (1 << std::min(attempt, 5)),
+                    wallet_config::BASE_RETRY_DELAY_MS * (1 << std::min(attempt, 3)),
                     wallet_config::MAX_RETRY_DELAY_MS
                 );
-                // Add jitter
+                // Add small jitter
                 std::random_device rd;
                 std::mt19937 gen(rd());
-                std::uniform_int_distribution<int> jitter(-delay/4, delay/4);
+                std::uniform_int_distribution<int> jitter(-delay/8, delay/8);
                 delay += jitter(gen);
 
                 ui::print_progress("Retry " + std::to_string(attempt+1) + "...");
@@ -7190,7 +7234,9 @@ static bool broadcast_any_seed(
             opts.host = host;
             opts.port = port;
             opts.user_agent = "/miqwallet:1.0/";
-            opts.io_timeout_ms = wallet_config::BROADCAST_TIMEOUT_MS;
+            // v10.0 FIX: Faster timeout for localhost
+            opts.io_timeout_ms = (host == "127.0.0.1" || host == "localhost")
+                ? 3000 : wallet_config::BROADCAST_TIMEOUT_MS;
 
             if(p2p.connect_and_handshake(opts, local_err)){
                 if(p2p.send_tx(raw_tx, local_err)){

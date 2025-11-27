@@ -813,8 +813,24 @@ static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
                 if (rc <= 0 && (waited_ms += 10) >= kMaxSpinMs) return false;
                 continue;
             }
-            char buf[96]; sprintf_s(buf, "send() failed WSAE=%d", e);
-            miq::log_warn(std::string("P2P: ") + buf);
+            // CRITICAL FIX: Rate-limit error logging to prevent log flooding
+            // WSAE=10053 (connection aborted) and 10054 (connection reset) are common
+            // and happen naturally when peers disconnect - don't spam logs
+            static std::atomic<int64_t> last_wsae_log_ms{0};
+            static std::atomic<int> wsae_suppressed_count{0};
+            int64_t tnow = now_ms();
+            if (tnow - last_wsae_log_ms.load(std::memory_order_relaxed) > 10000) { // Log at most every 10 sec
+                int suppressed = wsae_suppressed_count.exchange(0, std::memory_order_relaxed);
+                if (suppressed > 0) {
+                    miq::log_warn("P2P: send() failed WSAE=" + std::to_string(e) +
+                        " (suppressed " + std::to_string(suppressed) + " similar errors)");
+                } else {
+                    miq::log_warn("P2P: send() failed WSAE=" + std::to_string(e));
+                }
+                last_wsae_log_ms.store(tnow, std::memory_order_relaxed);
+            } else {
+                wsae_suppressed_count.fetch_add(1, std::memory_order_relaxed);
+            }
             return false;
         }
         if (n == 0) return false;
@@ -859,8 +875,23 @@ static inline int miq_recv(Sock s, uint8_t* buf, size_t bufsz) {
     if (n == SOCKET_ERROR) {
         int e = WSAGetLastError();
         if (e == WSAEWOULDBLOCK) return 0;
-        char tmp[96]; sprintf_s(tmp, "recv() failed WSAE=%d", e);
-        miq::log_warn(std::string("P2P: ") + tmp);
+        // CRITICAL FIX: Rate-limit recv error logging to prevent log flooding
+        // Connection errors are common and expected - don't spam logs
+        static std::atomic<int64_t> last_recv_log_ms{0};
+        static std::atomic<int> recv_suppressed_count{0};
+        int64_t tnow = now_ms();
+        if (tnow - last_recv_log_ms.load(std::memory_order_relaxed) > 10000) { // Log at most every 10 sec
+            int suppressed = recv_suppressed_count.exchange(0, std::memory_order_relaxed);
+            if (suppressed > 0) {
+                miq::log_warn("P2P: recv() failed WSAE=" + std::to_string(e) +
+                    " (suppressed " + std::to_string(suppressed) + " similar errors)");
+            } else {
+                miq::log_warn("P2P: recv() failed WSAE=" + std::to_string(e));
+            }
+            last_recv_log_ms.store(tnow, std::memory_order_relaxed);
+        } else {
+            recv_suppressed_count.fetch_add(1, std::memory_order_relaxed);
+        }
         return -1;
     }
     return n;
