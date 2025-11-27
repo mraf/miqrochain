@@ -2672,6 +2672,8 @@ static void clear_spv_cache(const std::string& wdir){
     std::string utxo_file = join_path(wdir, "utxo_cache.dat");
     std::remove(state_file.c_str());
     std::remove(utxo_file.c_str());
+    // CRITICAL FIX: Also invalidate in-memory cache to ensure fresh fetch
+    miq::spv_invalidate_mem_cache();
 }
 
 // =============================================================================
@@ -6571,16 +6573,51 @@ static std::vector<TxDetailedEntry> filter_transactions(
 }
 
 // Sort transactions
+// CRITICAL FIX: Use block_height as primary sort key for accurate ordering
+// Timestamp alone is unreliable because it's estimated from block height during sync
 static void sort_transactions(std::vector<TxDetailedEntry>& txs, TxSortOrder order) {
     switch (order) {
         case TxSortOrder::DATE_DESC:
             std::sort(txs.begin(), txs.end(), [](const auto& a, const auto& b) {
-                return a.timestamp > b.timestamp;
+                // Unconfirmed transactions (height 0) always come first
+                if(a.block_height == 0 && b.block_height != 0) return true;
+                if(a.block_height != 0 && b.block_height == 0) return false;
+
+                // Both unconfirmed: sort by timestamp descending
+                if(a.block_height == 0 && b.block_height == 0) {
+                    if(a.timestamp != b.timestamp) return a.timestamp > b.timestamp;
+                    return a.txid_hex > b.txid_hex;  // Consistent tie-breaker
+                }
+
+                // Both confirmed: sort by block height descending (newest blocks first)
+                if(a.block_height != b.block_height) return a.block_height > b.block_height;
+
+                // Same block: sort by timestamp descending
+                if(a.timestamp != b.timestamp) return a.timestamp > b.timestamp;
+
+                // Same block and timestamp: use txid as tie-breaker
+                return a.txid_hex > b.txid_hex;
             });
             break;
         case TxSortOrder::DATE_ASC:
             std::sort(txs.begin(), txs.end(), [](const auto& a, const auto& b) {
-                return a.timestamp < b.timestamp;
+                // Unconfirmed transactions (height 0) come last in ascending order
+                if(a.block_height == 0 && b.block_height != 0) return false;
+                if(a.block_height != 0 && b.block_height == 0) return true;
+
+                // Both unconfirmed: sort by timestamp ascending
+                if(a.block_height == 0 && b.block_height == 0) {
+                    if(a.timestamp != b.timestamp) return a.timestamp < b.timestamp;
+                    return a.txid_hex < b.txid_hex;
+                }
+
+                // Both confirmed: sort by block height ascending (oldest blocks first)
+                if(a.block_height != b.block_height) return a.block_height < b.block_height;
+
+                // Same block: sort by timestamp ascending
+                if(a.timestamp != b.timestamp) return a.timestamp < b.timestamp;
+
+                return a.txid_hex < b.txid_hex;
             });
             break;
         case TxSortOrder::AMOUNT_DESC:
@@ -8138,9 +8175,55 @@ static bool wallet_session(const std::string& cli_host,
         // Check for auto-refresh
         int64_t now = (int64_t)time(nullptr);
         if(now - last_auto_refresh > AUTO_REFRESH_INTERVAL){
-            // Silent background refresh
+            // CRITICAL FIX: Actually perform refresh to update UTXOs and clean up pending
+            // This ensures pending transactions are cleaned up when confirmed
             last_auto_refresh = now;
-            // Note: Full refresh happens when user presses 'r'
+
+            // Invalidate cache to force fresh fetch
+            miq::spv_invalidate_mem_cache();
+
+            // Perform silent background refresh
+            std::vector<miq::UtxoLite> new_utxos;
+            std::string used_seed, err;
+            if(spv_collect_any_seed(seeds, pkhs, spv_win, wdir, new_utxos, used_seed, err)){
+                // Build current UTXO set for pending cleanup
+                std::set<OutpointKey> cur;
+                for(const auto& u : new_utxos) {
+                    cur.insert(OutpointKey{ miq::to_hex(u.txid), u.vout });
+                }
+
+                // Clean up pending entries for confirmed transactions
+                for(auto it = pending.begin(); it != pending.end(); ){
+                    if(cur.find(*it) == cur.end()){
+                        // UTXO no longer exists = transaction confirmed
+                        g_pending_map.erase(*it);
+                        it = pending.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+
+                // Cleanup timed-out pending entries
+                cleanup_timed_out_pending(pending, wdir);
+
+                // Update UTXOs
+                utxos = std::move(new_utxos);
+
+                // Update connection status
+                is_online = true;
+                last_connected_node = used_seed;
+
+                // Save pending changes
+                save_pending(wdir, pending);
+
+                // Update transaction confirmations
+                uint32_t tip_height = 0;
+                for(const auto& u : utxos) tip_height = std::max(tip_height, u.height);
+                if(tip_height > 0){
+                    update_all_tx_confirmations(wdir, utxos, tip_height);
+                    auto_detect_received_transactions(wdir, utxos, tip_height);
+                }
+            }
         }
 
         // No key pressed - continue animation loop
@@ -9325,6 +9408,10 @@ static bool wallet_session(const std::string& cli_host,
             std::getline(std::cin, dummy);
 
             is_online = true;
+
+            // CRITICAL FIX: Invalidate UTXO cache before refresh
+            // This ensures fresh data from network, not cached UTXOs
+            miq::spv_invalidate_mem_cache();
 
             // Refresh balance after send - balance should now show reduced amount
             utxos = refresh_and_print();

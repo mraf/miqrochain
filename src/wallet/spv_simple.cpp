@@ -332,6 +332,12 @@ struct UtxoMemCache {
     }
 };
 
+// CRITICAL FIX: Expose cache invalidation for use after sending transactions
+// This ensures the next UTXO fetch gets fresh data from the network
+void spv_invalidate_mem_cache() {
+    UtxoMemCache::instance().invalidate();
+}
+
 static inline std::string path_join(const std::string& dir, const char* fname){
     if (dir.empty()) return std::string(fname);
     char sep = '/';
