@@ -473,7 +473,7 @@ std::string RpcService::handle(const std::string& body){
                 "validateaddress","decodeaddress","decoderawtx",
                 "getminerstats","sendrawtransaction","sendtoaddress",
                 "estimatemediantime","getdifficulty","getchaintips",
-                "getpeerinfo","getconnectioncount",
+                "getpeerinfo","getconnectioncount","getnetworkinfo","listbanned","setban","disconnectnode",
                 "createhdwallet","restorehdwallet","walletinfo","getnewaddress","deriveaddressat",
                 "walletunlock","walletlock","getwalletinfo","listaddresses","listutxos",
                 "sendfromhd","getaddressutxos","getbalance",
@@ -1958,14 +1958,103 @@ std::string RpcService::handle(const std::string& body){
             JNode out; out.v = arr; return json_dump(out);
         }
 
-        // ---------------- p2p stubs ----------------
+        // ---------------- p2p info ----------------
 
         if(method=="getpeerinfo"){
-            std::vector<JNode> v; JNode out; out.v = v; return json_dump(out);
+            std::vector<JNode> peers;
+            if(p2p_) {
+                auto snapshots = p2p_->snapshot_peers();
+                for(const auto& s : snapshots) {
+                    std::map<std::string, JNode> peer;
+                    peer["addr"] = jstr(s.ip);
+                    peer["syncing"] = jbool(s.syncing);
+                    peer["verack"] = jbool(s.verack_ok);
+                    peer["awaiting_pong"] = jbool(s.awaiting_pong);
+                    peer["misbehavior"] = jnum((double)s.mis);
+                    peer["last_seen_ms"] = jnum(s.last_seen_ms);
+                    peer["peer_tip"] = jnum((double)s.peer_tip);
+                    peer["rx_buffer"] = jnum((double)s.rx_buf);
+                    peer["inflight_tx"] = jnum((double)s.inflight);
+                    JNode pnode; pnode.v = peer;
+                    peers.push_back(pnode);
+                }
+            }
+            JNode out; out.v = peers;
+            return json_dump(out);
         }
 
         if(method=="getconnectioncount"){
-            return json_dump(jnum(0.0));
+            size_t count = 0;
+            if(p2p_) {
+                auto stats = p2p_->get_connection_stats();
+                count = stats.total_connections;
+            }
+            return json_dump(jnum((double)count));
+        }
+
+        if(method=="getnetworkinfo"){
+            std::map<std::string, JNode> info;
+            if(p2p_) {
+                auto stats = p2p_->get_connection_stats();
+                info["connections"] = jnum((double)stats.total_connections);
+                info["inbound"] = jnum((double)stats.inbound_connections);
+                info["outbound"] = jnum((double)stats.outbound_connections);
+                info["syncing_peers"] = jnum((double)stats.syncing_peers);
+                info["stalled_peers"] = jnum((double)stats.stalled_peers);
+                info["banned_ips"] = jnum((double)stats.banned_ips);
+                info["network_healthy"] = jbool(p2p_->is_network_healthy());
+                info["health_score"] = jnum(p2p_->get_network_health_score());
+            } else {
+                info["connections"] = jnum(0.0);
+                info["network_healthy"] = jbool(false);
+            }
+            JNode out; out.v = info;
+            return json_dump(out);
+        }
+
+        if(method=="listbanned"){
+            std::vector<JNode> bans;
+            if(p2p_) {
+                auto banned = p2p_->get_banned_ips();
+                for(const auto& b : banned) {
+                    std::map<std::string, JNode> entry;
+                    entry["ip"] = jstr(b.first);
+                    entry["remaining_ms"] = jnum((double)b.second);
+                    entry["permanent"] = jbool(b.second < 0);
+                    JNode enode; enode.v = entry;
+                    bans.push_back(enode);
+                }
+            }
+            JNode out; out.v = bans;
+            return json_dump(out);
+        }
+
+        if(method=="setban"){
+            if(params.size() < 2) return err("setban requires ip and action");
+            std::string ip = std::get<std::string>(params[0].v);
+            std::string action = std::get<std::string>(params[1].v);
+            if(!p2p_) return err("p2p not available");
+
+            if(action == "add") {
+                int64_t duration_ms = 24 * 60 * 60 * 1000; // Default 24 hours
+                if(params.size() > 2) {
+                    duration_ms = (int64_t)(std::get<double>(params[2].v) * 1000);
+                }
+                p2p_->ban_ip(ip, duration_ms);
+                return json_dump(jbool(true));
+            } else if(action == "remove") {
+                p2p_->unban_ip(ip);
+                return json_dump(jbool(true));
+            }
+            return err("unknown action: " + action);
+        }
+
+        if(method=="disconnectnode"){
+            if(params.empty()) return err("disconnectnode requires ip");
+            std::string ip = std::get<std::string>(params[0].v);
+            if(!p2p_) return err("p2p not available");
+            bool success = p2p_->disconnect_peer(ip);
+            return success ? json_dump(jbool(true)) : err("peer not found");
         }
 
         return err("unknown method");
