@@ -8110,7 +8110,10 @@ static bool wallet_session(const std::string& cli_host,
         std::vector<miq::UtxoLite> utxos;
         std::string used_seed, err;
 
-        if(!spv_collect_any_seed(seeds, pkhs, spv_win, wdir, utxos, used_seed, err)){
+        // CRITICAL FIX: Track SPV success to avoid corrupting pending set on network failure
+        bool spv_success = spv_collect_any_seed(seeds, pkhs, spv_win, wdir, utxos, used_seed, err);
+
+        if(!spv_success){
             std::cout << "\n";
             ui::print_error("Failed to sync with network");
             std::cout << ui::dim() << err << ui::reset() << "\n\n";
@@ -8142,10 +8145,13 @@ static bool wallet_session(const std::string& cli_host,
             utxos = std::move(deduped);
         }
 
-        // CRITICAL FIX: Enhanced pending cleanup with timeout support
-        // 1. Remove pending entries for confirmed transactions (UTXO no longer exists)
-        // 2. Remove pending entries that have timed out (transaction never confirmed)
-        {
+        // CRITICAL FIX: Only run pending cleanup if SPV succeeded
+        // If SPV failed, utxos is empty and we would incorrectly remove all pending entries
+        // This bug caused balance to show wrong after network failures
+        if(spv_success){
+            // CRITICAL FIX: Enhanced pending cleanup with timeout support
+            // 1. Remove pending entries for confirmed transactions (UTXO no longer exists)
+            // 2. Remove pending entries that have timed out (transaction never confirmed)
             std::set<OutpointKey> cur;
             for(const auto& u : utxos) cur.insert(OutpointKey{ miq::to_hex(u.txid), u.vout });
 
@@ -8187,12 +8193,17 @@ static bool wallet_session(const std::string& cli_host,
         // v11.0: Cleanup confirmed local change entries and merge remaining
         // This ensures balance shows correct change amount after sending
         {
-            int change_confirmed = cleanup_confirmed_local_change(wdir, utxos);
-            if (change_confirmed > 0) {
-                // Change is now visible on network, no longer need local tracking
+            // Only cleanup local change if SPV succeeded (otherwise we'd incorrectly
+            // think nothing is confirmed since network_utxos would be empty)
+            if (spv_success) {
+                int change_confirmed = cleanup_confirmed_local_change(wdir, utxos);
+                if (change_confirmed > 0) {
+                    // Change is now visible on network, no longer need local tracking
+                }
             }
 
-            // Merge any remaining local change into UTXOs for balance calculation
+            // Always merge local change into UTXOs for balance calculation
+            // This ensures balance shows correctly even when offline
             merge_local_change_into_utxos(utxos);
         }
 
