@@ -1393,8 +1393,7 @@ static Sock miq_connect_nb(const sockaddr* sa, socklen_t slen, int timeout_ms) {
     if (s == MIQ_INVALID_SOCK) return MIQ_INVALID_SOCK;
     miq_set_cloexec(s);
     (void)miq_set_nonblock(s);
-    (void)miq_set_nodelay(s);
-    miq_set_sockbufs(s);
+    miq_optimize_socket(s);  // Comprehensive socket optimization
 
 #ifdef _WIN32
     int rc = ::connect(s, sa, (int)slen);
@@ -1458,17 +1457,8 @@ static inline void gate_set_loopback(Sock fd, bool is_lb){
 }
 
 static inline void gate_on_close(Sock fd){
-    {
-        auto it = g_inflight_block_ts.find(fd);
-        if (it != g_inflight_block_ts.end()) {
-            for (const auto& kv : it->second) {
-                g_global_inflight_blocks.erase(kv.first);
-            }
-        }
-        g_inflight_block_ts.erase(fd);
-        g_inflight_index_ts.erase(fd);
-        g_inflight_index_order.erase(fd);
-    }
+    // Thread-safe cleanup of all inflight tracking for this socket
+    clear_all_inflight_for_sock(fd);
     g_gate.erase(fd);
     g_trickle_q.erase(fd);
     g_trickle_last_ms.erase(fd);
@@ -1479,7 +1469,6 @@ static inline void gate_on_close(Sock fd){
     g_zero_hdr_batches.erase(fd);
     g_preverack_counts.erase(fd);
     g_cmd_rl.erase(fd); // NEW: clean up per-socket rate-limiter windows
-    g_inflight_block_ts.erase(fd); // also drop any inflight block timers for this socket
     g_hdr_flip.erase(fd);
     g_peer_last_fetch_ms.erase(fd);
     g_peer_last_request_ms.erase(fd);
@@ -2138,6 +2127,7 @@ static Sock create_server(uint16_t port){
 #endif
     if (s == MIQ_INVALID_SOCK) return MIQ_INVALID_SOCK;
     miq_set_cloexec(s);
+    miq_optimize_socket(s);  // Comprehensive socket optimization
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_ANY); a.sin_port = htons(port);
     int yes = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
@@ -2157,6 +2147,7 @@ static Sock create_server_v6(uint16_t port){
 #endif
     if (s == MIQ_INVALID_SOCK) return MIQ_INVALID_SOCK;
     miq_set_cloexec(s);
+    miq_optimize_socket(s);  // Comprehensive socket optimization
     int yes = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
 #ifdef _WIN32
@@ -3000,7 +2991,7 @@ void P2P::request_block_index(PeerState& ps, uint64_t index){
 
 void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     if (h.size()!=32) return;
-  
+
     size_t base_default = g_sequential_sync ? (size_t)1 : (size_t)256;
     const size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : base_default;
     if (ps.inflight_blocks.size() >= max_inflight_blocks) return;
@@ -3009,8 +3000,8 @@ void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     auto msg = encode_msg("getb", h);
     if (send_or_close(ps.sock, msg)) {
         ps.inflight_blocks.insert(key);
-        g_global_inflight_blocks.insert(key);
-        g_inflight_block_ts[(Sock)ps.sock][key] = now_ms();
+        mark_block_inflight(key, (Sock)ps.sock);  // Thread-safe inflight tracking
+        P2P_TRACE_IF(true, "Requested block " + key.substr(0, 16) + "... from peer");
     }
 }
 
@@ -5273,10 +5264,10 @@ void P2P::loop(){
                                 // Polite ignore: unsolicited blocks are common during IBD on some impls.
                                 continue;
                             }
-                            // clear inflight for this block
+                            // clear inflight for this block (thread-safe)
                             ps.inflight_blocks.erase(bh);
-                            g_inflight_block_ts[(Sock)s].erase(bh);
-                            g_global_inflight_blocks.erase(bh);
+                            clear_block_inflight(bh, (Sock)s);
+                            P2P_TRACE_IF(true, "Received block " + bh.substr(0, 16) + "... from peer");
 
                             // NOTE: Don't update peer_tip_height here - it should only be set from
                             // the version message or headers, not from individual blocks.

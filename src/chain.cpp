@@ -1630,10 +1630,14 @@ bool Chain::disconnect_tip_once(std::string& err){
     }
 
     std::vector<UndoIn> undo_tmp;
-    auto it_ram = g_undo.find(hk(tip_.hash));
-    if (it_ram != g_undo.end()) {
-        undo_tmp = it_ram->second;
-    } else {
+    {
+        std::lock_guard<std::mutex> lk(g_undo_mtx);
+        auto it_ram = g_undo.find(hk(tip_.hash));
+        if (it_ram != g_undo.end()) {
+            undo_tmp = it_ram->second;
+        }
+    }
+    if (undo_tmp.empty()) {
         if (!read_undo_file(datadir_, tip_.height, tip_.hash, undo_tmp)) {
             err = "no undo data for tip (restart or missing undo)";
             return false;
@@ -1685,8 +1689,11 @@ bool Chain::disconnect_tip_once(std::string& err){
     tip_.time   = prev.header.time;
     tip_.issued -= cb_sum;
 
-    auto it_ram2 = g_undo.find(hk(cur.block_hash()));
-    if (it_ram2 != g_undo.end()) g_undo.erase(it_ram2);
+    {
+        std::lock_guard<std::mutex> lk(g_undo_mtx);
+        auto it_ram2 = g_undo.find(hk(cur.block_hash()));
+        if (it_ram2 != g_undo.end()) g_undo.erase(it_ram2);
+    }
     remove_undo_file(datadir_, (uint64_t)(tip_.height + 1), cur.block_hash());
 
     save_state();
@@ -1786,8 +1793,11 @@ bool Chain::submit_block(const Block& b, std::string& err){
     tip_.time   = b.header.time;
     tip_.issued += cb_sum;
 
-    // Cache undo in RAM map
-    g_undo[hk(tip_.hash)] = std::move(undo);
+    // Cache undo in RAM map (thread-safe)
+    {
+        std::lock_guard<std::mutex> lk(g_undo_mtx);
+        g_undo[hk(tip_.hash)] = std::move(undo);
+    }
 
     // Also cache the full header for serving to peers
     set_header_full(hk(new_hash), b.header);  // THREAD-SAFE

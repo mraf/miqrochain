@@ -53,6 +53,21 @@ public:
     void set_ibd_progress(double p) { ibd_progress_ = p; }
     void set_uptime_seconds(uint64_t s) { uptime_seconds_ = s; }
 
+    // --- Getter methods for metrics export ---
+    uint64_t chain_height() const { return chain_height_.load(); }
+    uint32_t peers_count() const { return peers_count_.load(); }
+    uint64_t mempool_bytes() const { return mempool_bytes_.load(); }
+    uint32_t mempool_txs() const { return mempool_txs_.load(); }
+    uint64_t utxo_count() const { return utxo_count_.load(); }
+    double difficulty() const { return difficulty_.load(); }
+    double hash_rate() const { return hash_rate_.load(); }
+    double ibd_progress() const { return ibd_progress_.load(); }
+    uint64_t uptime_seconds() const { return uptime_seconds_.load(); }
+    uint64_t blocks_validated() const { return blocks_validated_.load(); }
+    uint64_t blocks_rejected() const { return blocks_rejected_.load(); }
+    uint64_t txs_validated() const { return txs_validated_.load(); }
+    uint64_t txs_rejected() const { return txs_rejected_.load(); }
+
     // --- Histogram observations ---
     void observe_block_validation_ms(double ms) {
         std::lock_guard<std::mutex> lk(hist_mtx_);
@@ -296,5 +311,130 @@ private:
 #define MIQ_METRIC_INC_TXS_REJECTED() miq::Metrics::instance().inc_txs_rejected()
 #define MIQ_METRIC_SET_HEIGHT(h) miq::Metrics::instance().set_chain_height(h)
 #define MIQ_METRIC_SET_PEERS(n) miq::Metrics::instance().set_peers_count(n)
+
+// =============================================================================
+// OPERATOR METRICS v2.0
+// =============================================================================
+// Extended metrics for production node operators
+// =============================================================================
+
+struct NodeHealth {
+    bool is_synced{false};
+    bool has_peers{false};
+    bool is_mining{false};
+    bool rpc_responsive{false};
+    double sync_progress{0.0};   // 0.0 to 1.0
+    int64_t blocks_behind{0};
+    int64_t headers_behind{0};
+    int64_t uptime_seconds{0};
+    int64_t last_block_time{0};  // Unix timestamp of last block received
+
+    // Overall health score (0.0 to 1.0)
+    double health_score() const {
+        double score = 0.0;
+        if (is_synced) score += 0.3;
+        if (has_peers) score += 0.3;
+        if (rpc_responsive) score += 0.2;
+        score += sync_progress * 0.2;
+        return score;
+    }
+
+    // Human-readable status
+    const char* status_string() const {
+        if (!has_peers) return "NO_PEERS";
+        if (!is_synced) return "SYNCING";
+        if (health_score() >= 0.8) return "HEALTHY";
+        if (health_score() >= 0.5) return "DEGRADED";
+        return "UNHEALTHY";
+    }
+};
+
+// Get current node health status
+inline NodeHealth get_node_health() {
+    NodeHealth h;
+    auto& m = Metrics::instance();
+
+    // Get metrics snapshot
+    h.has_peers = m.peers_count() > 0;
+    h.sync_progress = m.ibd_progress();
+    h.is_synced = h.sync_progress >= 0.999;
+    h.uptime_seconds = static_cast<int64_t>(m.uptime_seconds());
+    h.rpc_responsive = true;  // If we're here, RPC is working
+
+    // blocks_behind would need network height comparison
+    // For now, estimate based on sync progress
+    if (h.sync_progress > 0 && h.sync_progress < 1.0) {
+        uint64_t height = m.chain_height();
+        h.blocks_behind = static_cast<int64_t>((height / h.sync_progress) - height);
+    }
+
+    return h;
+}
+
+// Export metrics in JSON format for dashboards
+inline std::string export_metrics_json() {
+    auto& m = Metrics::instance();
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(6);
+    ss << "{\n";
+    ss << "  \"chain_height\": " << m.chain_height() << ",\n";
+    ss << "  \"peers_count\": " << m.peers_count() << ",\n";
+    ss << "  \"mempool_txs\": " << m.mempool_txs() << ",\n";
+    ss << "  \"mempool_bytes\": " << m.mempool_bytes() << ",\n";
+    ss << "  \"utxo_count\": " << m.utxo_count() << ",\n";
+    ss << "  \"difficulty\": " << m.difficulty() << ",\n";
+    ss << "  \"hash_rate\": " << m.hash_rate() << ",\n";
+    ss << "  \"ibd_progress\": " << m.ibd_progress() << ",\n";
+    ss << "  \"uptime_seconds\": " << m.uptime_seconds() << ",\n";
+    ss << "  \"blocks_validated\": " << m.blocks_validated() << ",\n";
+    ss << "  \"blocks_rejected\": " << m.blocks_rejected() << ",\n";
+    ss << "  \"txs_validated\": " << m.txs_validated() << ",\n";
+    ss << "  \"txs_rejected\": " << m.txs_rejected() << "\n";
+    ss << "}";
+    return ss.str();
+}
+
+// =============================================================================
+// SCOPED TIMER FOR PERFORMANCE MEASUREMENT
+// =============================================================================
+
+class ScopedMetricTimer {
+public:
+    enum TimerType { BLOCK_VALIDATION, TX_VALIDATION, PEER_LATENCY };
+
+    explicit ScopedMetricTimer(TimerType type)
+        : type_(type)
+        , start_(std::chrono::high_resolution_clock::now())
+    {}
+
+    ~ScopedMetricTimer() {
+        auto end = std::chrono::high_resolution_clock::now();
+        auto& m = Metrics::instance();
+
+        if (type_ == BLOCK_VALIDATION) {
+            double ms = std::chrono::duration<double, std::milli>(end - start_).count();
+            m.observe_block_validation_ms(ms);
+        } else if (type_ == TX_VALIDATION) {
+            double us = std::chrono::duration<double, std::micro>(end - start_).count();
+            m.observe_tx_validation_us(us);
+        } else if (type_ == PEER_LATENCY) {
+            double ms = std::chrono::duration<double, std::milli>(end - start_).count();
+            m.observe_peer_latency_ms(ms);
+        }
+    }
+
+private:
+    TimerType type_;
+    std::chrono::high_resolution_clock::time_point start_;
+};
+
+#define MIQ_SCOPED_BLOCK_TIMER() \
+    miq::ScopedMetricTimer _block_timer_(miq::ScopedMetricTimer::BLOCK_VALIDATION)
+
+#define MIQ_SCOPED_TX_TIMER() \
+    miq::ScopedMetricTimer _tx_timer_(miq::ScopedMetricTimer::TX_VALIDATION)
+
+#define MIQ_SCOPED_PEER_TIMER() \
+    miq::ScopedMetricTimer _peer_timer_(miq::ScopedMetricTimer::PEER_LATENCY)
 
 } // namespace miq

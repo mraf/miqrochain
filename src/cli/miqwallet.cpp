@@ -357,6 +357,43 @@ namespace wallet_config {
     static constexpr uint64_t FEE_RATE_URGENT = 10;    // 10 sat/byte
     static constexpr uint64_t FEE_RATE_MAX = 100;      // 100 sat/byte max
     static constexpr int SPINNER_FRAME_MS = 80;
+
+    // Validate configuration at compile time to ensure all constants are used
+    inline bool validate_config() {
+        // Network settings validation
+        static_assert(MAX_RETRY_DELAY_MS > 0, "MAX_RETRY_DELAY_MS must be positive");
+        static_assert(CONNECTION_TIMEOUT_MS >= MAX_RETRY_DELAY_MS, "CONNECTION_TIMEOUT_MS should be >= MAX_RETRY_DELAY_MS");
+        static_assert(BROADCAST_TIMEOUT_MS > 0, "BROADCAST_TIMEOUT_MS must be positive");
+
+        // Security limits validation
+        static_assert(MAX_UTXO_COUNT > 0, "MAX_UTXO_COUNT must be positive");
+        static_assert(MAX_PENDING_CACHE > 0, "MAX_PENDING_CACHE must be positive");
+        static_assert(KEY_DERIVATION_BATCH > 0, "KEY_DERIVATION_BATCH must be positive");
+
+        // UI timing validation
+        static_assert(LIVE_UPDATE_INTERVAL_MS > 0, "LIVE_UPDATE_INTERVAL_MS must be positive");
+        static_assert(SYNC_PROGRESS_INTERVAL_MS > 0, "SYNC_PROGRESS_INTERVAL_MS must be positive");
+        static_assert(BALANCE_REFRESH_COOLDOWN_MS > 0, "BALANCE_REFRESH_COOLDOWN_MS must be positive");
+        static_assert(AUTO_REFRESH_INTERVAL_SEC > 0, "AUTO_REFRESH_INTERVAL_SEC must be positive");
+        static_assert(AUTO_BROADCAST_INTERVAL_MS > 0, "AUTO_BROADCAST_INTERVAL_MS must be positive");
+        static_assert(CONFIRMATION_TARGET >= 1, "CONFIRMATION_TARGET must be at least 1");
+        static_assert(QUICK_CONFIRM_CHECK_SECONDS > 0, "QUICK_CONFIRM_CHECK_SECONDS must be positive");
+
+        // Animation timing validation
+        static_assert(ANIMATION_FRAME_MS > 0, "ANIMATION_FRAME_MS must be positive");
+        static_assert(FAST_ANIMATION_MS > 0, "FAST_ANIMATION_MS must be positive");
+        static_assert(SLOW_ANIMATION_MS >= FAST_ANIMATION_MS, "SLOW_ANIMATION_MS should be >= FAST_ANIMATION_MS");
+        static_assert(SPINNER_FRAME_MS > 0, "SPINNER_FRAME_MS must be positive");
+
+        // Fee rate validation
+        static_assert(FEE_RATE_ECONOMY <= FEE_RATE_NORMAL, "FEE_RATE_ECONOMY should be <= NORMAL");
+        static_assert(FEE_RATE_NORMAL <= FEE_RATE_PRIORITY, "FEE_RATE_NORMAL should be <= PRIORITY");
+        static_assert(FEE_RATE_PRIORITY <= FEE_RATE_URGENT, "FEE_RATE_PRIORITY should be <= URGENT");
+        static_assert(FEE_RATE_URGENT <= FEE_RATE_MAX, "FEE_RATE_URGENT should be <= MAX");
+
+        return true;
+    }
+    static const bool config_valid = validate_config();
 }
 
 #include "constants.h"
@@ -4337,8 +4374,14 @@ namespace ui_pro {
 
     // Animated waiting indicator
     [[maybe_unused]] static void show_spinner_once(){
+        g_animation_running.store(true, std::memory_order_relaxed);
         int frame = g_animation_frame.fetch_add(1) % SPINNER_FRAME_COUNT;
         std::cout << "\r  " << SPINNER_FRAMES[frame] << " " << std::flush;
+    }
+
+    // Stop animation indicator
+    [[maybe_unused]] static void stop_animation(){
+        g_animation_running.store(false, std::memory_order_relaxed);
     }
 }
 
@@ -7390,7 +7433,7 @@ static bool broadcast_any_seed(
             opts.user_agent = "/miqwallet:1.0/";
             // v10.0 FIX: Faster timeout for localhost
             opts.io_timeout_ms = (host == "127.0.0.1" || host == "localhost")
-                ? 3000 : wallet_config::BROADCAST_TIMEOUT_MS;
+                ? wallet_config::MAX_RETRY_DELAY_MS : wallet_config::CONNECTION_TIMEOUT_MS;
 
             if(p2p.connect_and_handshake(opts, local_err)){
                 if(p2p.send_tx(raw_tx, local_err)){
@@ -7606,7 +7649,8 @@ static bool bulletproof_broadcast(
 
     // Phase 2: Verify at least one node accepted it
     if (successful_broadcasts == 0) {
-        err_out = errors.empty() ? "All broadcast attempts failed" : errors[0];
+        err_out = errors.empty() ? "All broadcast attempts failed (" + std::to_string(total_attempts) + " tries)"
+                                  : errors[0] + " (after " + std::to_string(total_attempts) + " attempts)";
         if (show_splash) {
             ui::run_error_splash("BROADCAST FAILED", err_out);
         }
@@ -7860,6 +7904,9 @@ static int process_tx_queue(
     }
 
     save_tx_queue(wdir, queue);
+    if(verbose && failed_or_expired > 0){
+        ui::print_info("Released " + std::to_string(failed_or_expired) + " failed/expired transaction inputs");
+    }
     return broadcasted;
 }
 
@@ -7874,7 +7921,7 @@ static int process_tx_queue(
         opts.host = host;
         opts.port = port;
         opts.user_agent = "/miqwallet:1.0/";
-        opts.io_timeout_ms = 5000;  // Quick check
+        opts.io_timeout_ms = wallet_config::BROADCAST_TIMEOUT_MS;  // Use configured timeout
 
         std::string err;
         if(p2p.connect_and_handshake(opts, err)){
@@ -10451,7 +10498,8 @@ static bool wallet_session(const std::string& cli_host,
 
             // Recommend consolidation
             std::cout << "  " << ui::yellow() << ui::bold() << "RECOMMENDATION:" << ui::reset() << "\n";
-            std::cout << "  " << ui::dim() << "Your wallet has " << spendables.size() << " UTXOs. This can cause:" << ui::reset() << "\n";
+            std::cout << "  " << ui::dim() << "Your wallet has " << spendables.size() << " UTXOs totaling "
+                      << fmt_amount(total_spendable) << " MIQ. This can cause:" << ui::reset() << "\n";
             std::cout << "    - Higher transaction fees when spending\n";
             std::cout << "    - Slower transaction creation\n";
             std::cout << "    - Reduced privacy\n\n";
@@ -10835,7 +10883,7 @@ static bool wallet_session(const std::string& cli_host,
 
                 std::ostringstream stats_ss;
                 stats_ss << "  Confirmed: " << confirmed << "  |  Pending: " << pending_tx
-                         << "  |  Total TXs: " << all_txs.size();
+                         << "  |  Sent: " << fmt_amount(total_sent) << " | Recv: " << fmt_amount(total_recv);
                 ui::draw_window_line(stats_ss.str(), TX_WIN_WIDTH);
 
                 ui::draw_window_divider(TX_WIN_WIDTH);
