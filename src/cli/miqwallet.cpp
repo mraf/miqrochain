@@ -13316,9 +13316,9 @@ namespace main_menu {
             if (ch == '2') { result = '2'; break; }
             if (ch == '3') { result = '3'; break; }
             if (ch == '4') { result = '4'; break; }
-            if (ch == 'q' || ch == 'Q' || ch == 27) { result = 'q'; break; }
+            if (ch == 'q' || ch == 'Q') { result = 'q'; break; }
 
-            // Arrow key handling (escape sequences)
+            // Arrow key handling (escape sequences) - must check BEFORE treating ESC as quit
             if (ch == 27) {
                 // Check for escape sequence
                 int ch2 = instant_input::wait_for_key(50);
@@ -13329,11 +13329,13 @@ namespace main_menu {
                     } else if (ch3 == 'B') {  // Down arrow
                         g_menu_state.selected = (g_menu_state.selected + 1) % 5;
                     }
+                    // Left/Right arrows could be handled here too if needed
                 } else if (ch2 < 0) {
-                    // Just escape key
+                    // Just standalone escape key (no sequence followed)
                     result = 'q';
                     break;
                 }
+                // If ch2 was something else, ignore it (incomplete/unknown sequence)
             }
 
             // Enter key
