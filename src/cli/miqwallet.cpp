@@ -186,7 +186,7 @@ namespace instant_input {
     }
 
     // Get single character without Enter (non-blocking)
-    [[maybe_unused]] static int get_char_instant() {
+    static int get_char_instant() {
         if (!g_raw_mode) enable_raw_mode();
 
         char c;
@@ -223,7 +223,7 @@ namespace instant_input {
     }
 
     // Check if input is available
-    [[maybe_unused]] static bool input_available() {
+    static bool input_available() {
         if (!g_raw_mode) enable_raw_mode();
 
         fd_set fds;
@@ -4443,6 +4443,31 @@ struct PasswordStrength {
     return result;
 }
 
+// Display password strength with visual progress bar
+static void show_password_strength(const std::string& password){
+    if(password.empty()) return;
+
+    auto strength = check_password_strength(password);
+
+    // Select color based on score
+    std::string color;
+    if(strength.score < 30) color = ui::red();
+    else if(strength.score < 50) color = ui::yellow();
+    else if(strength.score < 70) color = ui::cyan();
+    else color = ui::green();
+
+    // Use the ui_pro progress bar
+    std::string bar = ui_pro::draw_progress_bar(strength.score, 20, ui_pro::ProgressStyle::BLOCKS);
+
+    std::cout << "  " << ui::dim() << "Strength: " << ui::reset()
+              << color << bar << " " << strength.rating << ui::reset() << "\n";
+
+    // Show suggestions for weak passwords
+    if(strength.score < 50 && !strength.suggestions.empty()){
+        std::cout << ui::dim() << "  Suggestions: " << strength.suggestions[0] << ui::reset() << "\n";
+    }
+}
+
 // =============================================================================
 // SECURE MEMORY OPERATIONS
 // =============================================================================
@@ -6990,17 +7015,9 @@ static void print_tx_details_view(const TxDetailedEntry& tx,
     std::cout << "  " << ui::bold() << "Confirmation Status" << ui::reset() << "\n";
     std::cout << "  " << std::string(66, '-') << "\n";
     ui_pro::print_kv("Confirmations:", std::to_string(tx.confirmations), 18);
+    // Use the extended confirmation bar for detailed view
     std::cout << "  " << ui::dim() << std::setw(18) << std::left << "Progress:" << ui::reset();
-    double conf_percent = tx.confirmations >= 6 ? 100.0 : (tx.confirmations * 100.0 / 6.0);
-    std::cout << ui_pro::draw_progress_bar(conf_percent, 20) << " ";
-    if (tx.confirmations >= 6) {
-        std::cout << ui::green() << "CONFIRMED" << ui::reset();
-    } else if (tx.confirmations > 0) {
-        std::cout << ui::cyan() << tx.confirmations << "/6" << ui::reset();
-    } else {
-        std::cout << ui::yellow() << "PENDING" << ui::reset();
-    }
-    std::cout << "\n\n";
+    std::cout << confirmation_bar_extended(tx.confirmations, 20) << "\n\n";
     std::cout << "  " << ui::bold() << "Addresses" << ui::reset() << "\n";
     std::cout << "  " << std::string(66, '-') << "\n";
     auto resolve_label = [&](const std::string& addr) -> std::string {
@@ -7458,14 +7475,28 @@ static bool broadcast_and_verify(
         return false;
     }
 
-    // Step 2: Show verification animation
+    // Step 2: Show verification animation with user interrupt support
     if (show_animation) {
         std::cout << "\n";
+        instant_input::enable_raw_mode();
+        bool user_cancelled = false;
         for (int tick = 0; tick < 20; tick++) {
             ui::draw_tx_confirmation_splash(txid_hex, 0, 6, tick, "Verifying...");
+            // Check for user interrupt (ESC or 'q') using instant input
+            if (instant_input::input_available()) {
+                int ch = instant_input::get_char_instant();
+                if (ch == 27 || ch == 'q' || ch == 'Q') {
+                    user_cancelled = true;
+                    break;
+                }
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+        instant_input::disable_raw_mode();
         std::cout << "\n";
+        if (user_cancelled) {
+            ui::print_info("Verification skipped by user (transaction still broadcast)");
+        }
     }
 
     // Step 3: Verify the transaction made it to mempool
@@ -7586,9 +7617,24 @@ static bool bulletproof_broadcast(
 
     // Phase 3: Verify transaction is in mempool (try multiple nodes)
     if (show_splash) {
+        instant_input::enable_raw_mode();
+        bool skip_verify = false;
         for (int i = 0; i < 15; i++) {
             ui::draw_inline_progress("Verifying transaction", 0.7 + (i * 0.02), i);
+            // Check for user skip (ESC or 'q')
+            if (instant_input::input_available()) {
+                int ch = instant_input::get_char_instant();
+                if (ch == 27 || ch == 'q' || ch == 'Q') {
+                    skip_verify = true;
+                    break;
+                }
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        }
+        instant_input::disable_raw_mode();
+        if (skip_verify) {
+            ui::finish_inline_progress("Verification (skipped)", true);
+            return true;  // Broadcast succeeded, skip verify
         }
     }
 
@@ -8089,7 +8135,10 @@ static bool wallet_session(const std::string& cli_host,
         std::vector<miq::UtxoLite> utxos;
         std::string used_seed, err;
 
-        if(!spv_collect_any_seed(seeds, pkhs, spv_win, wdir, utxos, used_seed, err)){
+        // CRITICAL FIX: Track SPV success to avoid corrupting pending set on network failure
+        bool spv_success = spv_collect_any_seed(seeds, pkhs, spv_win, wdir, utxos, used_seed, err);
+
+        if(!spv_success){
             std::cout << "\n";
             ui::print_error("Failed to sync with network");
             std::cout << ui::dim() << err << ui::reset() << "\n\n";
@@ -8121,10 +8170,13 @@ static bool wallet_session(const std::string& cli_host,
             utxos = std::move(deduped);
         }
 
-        // CRITICAL FIX: Enhanced pending cleanup with timeout support
-        // 1. Remove pending entries for confirmed transactions (UTXO no longer exists)
-        // 2. Remove pending entries that have timed out (transaction never confirmed)
-        {
+        // CRITICAL FIX: Only run pending cleanup if SPV succeeded
+        // If SPV failed, utxos is empty and we would incorrectly remove all pending entries
+        // This bug caused balance to show wrong after network failures
+        if(spv_success){
+            // CRITICAL FIX: Enhanced pending cleanup with timeout support
+            // 1. Remove pending entries for confirmed transactions (UTXO no longer exists)
+            // 2. Remove pending entries that have timed out (transaction never confirmed)
             std::set<OutpointKey> cur;
             for(const auto& u : utxos) cur.insert(OutpointKey{ miq::to_hex(u.txid), u.vout });
 
@@ -8166,12 +8218,17 @@ static bool wallet_session(const std::string& cli_host,
         // v11.0: Cleanup confirmed local change entries and merge remaining
         // This ensures balance shows correct change amount after sending
         {
-            int change_confirmed = cleanup_confirmed_local_change(wdir, utxos);
-            if (change_confirmed > 0) {
-                // Change is now visible on network, no longer need local tracking
+            // Only cleanup local change if SPV succeeded (otherwise we'd incorrectly
+            // think nothing is confirmed since network_utxos would be empty)
+            if (spv_success) {
+                int change_confirmed = cleanup_confirmed_local_change(wdir, utxos);
+                if (change_confirmed > 0) {
+                    // Change is now visible on network, no longer need local tracking
+                }
             }
 
-            // Merge any remaining local change into UTXOs for balance calculation
+            // Always merge local change into UTXOs for balance calculation
+            // This ensures balance shows correctly even when offline
             merge_local_change_into_utxos(utxos);
         }
 
@@ -11284,6 +11341,7 @@ static bool flow_create_wallet(const std::string& cli_host, const std::string& c
 
     // Encryption passphrase
     std::string wpass = ui::secure_prompt("Encryption passphrase (ENTER for none): ");
+    show_password_strength(wpass);
 
     // Generate mnemonic
     std::string mnemonic;
@@ -11384,6 +11442,7 @@ static bool flow_load_from_seed(const std::string& cli_host, const std::string& 
 
     std::string mpass = ui::secure_prompt("Mnemonic passphrase (ENTER for none): ");
     std::string wpass = ui::secure_prompt("Wallet encryption passphrase (ENTER for none): ");
+    show_password_strength(wpass);
 
     // Convert mnemonic to seed
     std::vector<uint8_t> seed;
@@ -11703,7 +11762,7 @@ namespace main_menu {
             }
 
             // Pad to border
-            int used = 2 + 2 + 3 + 1 + 12 + 1 + strlen(menu_items[i][2]);
+            int used = 2 + 2 + 3 + 1 + 12 + 1 + static_cast<int>(strlen(menu_items[i][2]));
             int remaining = W - 2 - used;
             if (remaining > 0) std::cout << std::string(remaining, ' ');
             std::cout << ui::cyan() << side_v << ui::reset() << "\033[K\n";

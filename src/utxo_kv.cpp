@@ -13,11 +13,12 @@ static inline void put_u64le(std::string& s, uint64_t x){
     for(int i=0;i<8;i++) b[i]=char((x>>(8*i))&0xff);
     s.append(b,8);
 }
+static inline uint64_t get_u64le(const char* p){ uint64_t v=0; for(int i=0;i<8;i++) v|=(uint64_t(uint8_t(p[i]))<<(8*i)); return v; }
+// get_u32le - for parsing keys containing vout (symmetric to put_u32le)
 static inline uint32_t get_u32le(const char* p){ return (uint32_t(uint8_t(p[0]))      ) |
                                                           (uint32_t(uint8_t(p[1]))<<8 ) |
                                                           (uint32_t(uint8_t(p[2]))<<16) |
                                                           (uint32_t(uint8_t(p[3]))<<24); }
-static inline uint64_t get_u64le(const char* p){ uint64_t v=0; for(int i=0;i<8;i++) v|=(uint64_t(uint8_t(p[i]))<<(8*i)); return v; }
 
 bool UTXOKV::open(const std::string& dir, std::string* err){
     return db_.open(dir + "/chainstate", err);
@@ -83,6 +84,16 @@ void UTXOKV::Batch::spend(const std::vector<uint8_t>& txid, uint32_t vout){
 // === NEW: tiny factory to create a batch (non-breaking convenience) ===
 UTXOKV::Batch UTXOKV::make_batch(){
     return UTXOKV::Batch(*this);
+}
+
+// Parse a UTXO key back to txid and vout (useful for iteration/debugging)
+bool UTXOKV::parse_utxo_key(const std::string& key, std::vector<uint8_t>& txid, uint32_t& vout){
+    // Key format: 'u' (1 byte) + txid (32 bytes) + vout (4 bytes) = 37 bytes
+    if (key.size() != 1 + 32 + 4 || key[0] != 'u') return false;
+    txid.assign(reinterpret_cast<const uint8_t*>(key.data() + 1),
+                reinterpret_cast<const uint8_t*>(key.data() + 1 + 32));
+    vout = get_u32le(key.data() + 1 + 32);
+    return true;
 }
 
 }

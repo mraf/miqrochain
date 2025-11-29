@@ -2051,7 +2051,7 @@ std::string RpcService::handle(const std::string& body){
 
         if(method=="setban"){
             if(params.size() < 2) return err("setban requires ip and action");
-            std::string ip = std::get<std::string>(params[0].v);
+            std::string node_ip = std::get<std::string>(params[0].v);
             std::string action = std::get<std::string>(params[1].v);
             if(!p2p_) return err("p2p not available");
 
@@ -2060,10 +2060,10 @@ std::string RpcService::handle(const std::string& body){
                 if(params.size() > 2) {
                     duration_ms = (int64_t)(std::get<double>(params[2].v) * 1000);
                 }
-                p2p_->ban_ip(ip, duration_ms);
+                p2p_->ban_ip(node_ip, duration_ms);
                 return json_dump(jbool(true));
             } else if(action == "remove") {
-                p2p_->unban_ip(ip);
+                p2p_->unban_ip(node_ip);
                 return json_dump(jbool(true));
             }
             return err("unknown action: " + action);
@@ -2071,9 +2071,9 @@ std::string RpcService::handle(const std::string& body){
 
         if(method=="disconnectnode"){
             if(params.empty()) return err("disconnectnode requires ip");
-            std::string ip = std::get<std::string>(params[0].v);
+            std::string node_ip = std::get<std::string>(params[0].v);
             if(!p2p_) return err("p2p not available");
-            bool success = p2p_->disconnect_peer(ip);
+            bool success = p2p_->disconnect_peer(node_ip);
             return success ? json_dump(jbool(true)) : err("peer not found");
         }
 

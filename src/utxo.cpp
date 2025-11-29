@@ -58,6 +58,14 @@ bool UTXOSet::load_log(){
     std::ifstream f(log_path_, std::ios::binary);
     if(!f) return true;
 
+    // CRITICAL: Check file size to prevent DoS via oversized log files
+    f.seekg(0, std::ios::end);
+    auto file_size = f.tellg();
+    if (file_size < 0 || static_cast<size_t>(file_size) > MAX_LOG_SIZE) {
+        return false;  // File too large or seek failed
+    }
+    f.seekg(0, std::ios::beg);
+
     while(f){
         char op;
         f.read(&op,1);
