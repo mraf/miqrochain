@@ -7515,7 +7515,499 @@ static void print_tx_row(const TxDetailedEntry& tx, int index, bool selected,
     std::cout << "\n";
 }
 
-// Print detailed transaction view
+// =============================================================================
+// INTERACTIVE TRANSACTION DETAILS VIEWER v12.0
+// Full-featured viewer with block info, inputs, outputs, arrow key navigation
+// =============================================================================
+
+// Parsed transaction info from RPC
+struct TxFullInfo {
+    std::string txid;
+    bool confirmed{false};
+    bool in_mempool{false};
+    uint32_t confirmations{0};
+    uint32_t block_height{0};
+    std::string block_hash;
+    int64_t block_time{0};
+    uint32_t block_bits{0};
+    double difficulty{0.0};
+    uint32_t tx_index{0};
+    bool is_coinbase{false};
+    std::string hex;
+    size_t size{0};
+    uint64_t total_input{0};
+    uint64_t total_output{0};
+    uint64_t fee{0};
+    double fee_rate{0.0};
+
+    struct Input {
+        int index{0};
+        std::string prev_txid;
+        uint32_t prev_vout{0};
+        uint64_t value{0};
+        std::string address;
+        bool is_coinbase{false};
+        std::string coinbase_data;
+    };
+    std::vector<Input> inputs;
+
+    struct Output {
+        int index{0};
+        uint64_t value{0};
+        std::string address;
+        bool spent{false};
+    };
+    std::vector<Output> outputs;
+};
+
+// Fetch full transaction info via RPC
+static bool fetch_tx_full_info(
+    const std::vector<std::pair<std::string,std::string>>& seeds,
+    const std::string& txid_hex,
+    TxFullInfo& out)
+{
+    std::vector<rpc_wallet::RpcEndpoint> endpoints;
+    for(const auto& [host, port] : seeds){
+        uint16_t p2p_port = (uint16_t)std::stoi(port);
+        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port + 1);
+        endpoints.push_back({host, rpc_port, "", wallet_config::RPC_TIMEOUT_MS});
+    }
+    // Add localhost
+    endpoints.insert(endpoints.begin(), {"127.0.0.1", (uint16_t)miq::RPC_PORT, "", wallet_config::RPC_TIMEOUT_MS});
+
+    std::string body = R"({"method":"gettransactioninfo","params":[")" + txid_hex + R"("]})";
+
+    for(const auto& ep : endpoints){
+        miq::HttpResponse resp;
+        std::vector<std::pair<std::string,std::string>> hdrs;
+        if(miq::http_post(ep.host, ep.port, "/", body, hdrs, resp, ep.timeout_ms)){
+            if(resp.code == 200 && resp.body.find("\"error\"") == std::string::npos){
+                // Parse response
+                const std::string& r = resp.body;
+                out.txid = txid_hex;
+
+                // Parse booleans
+                out.confirmed = r.find("\"confirmed\":true") != std::string::npos;
+                out.in_mempool = r.find("\"in_mempool\":true") != std::string::npos;
+                out.is_coinbase = r.find("\"is_coinbase\":true") != std::string::npos;
+
+                // Parse numbers
+                int64_t tmp;
+                if(rpc_wallet::parse_json_number(r, "confirmations", tmp)) out.confirmations = (uint32_t)tmp;
+                if(rpc_wallet::parse_json_number(r, "block_height", tmp)) out.block_height = (uint32_t)tmp;
+                if(rpc_wallet::parse_json_number(r, "block_time", tmp)) out.block_time = tmp;
+                if(rpc_wallet::parse_json_number(r, "block_bits", tmp)) out.block_bits = (uint32_t)tmp;
+                if(rpc_wallet::parse_json_number(r, "tx_index", tmp)) out.tx_index = (uint32_t)tmp;
+                if(rpc_wallet::parse_json_number(r, "size", tmp)) out.size = (size_t)tmp;
+                if(rpc_wallet::parse_json_number(r, "total_input", tmp)) out.total_input = (uint64_t)tmp;
+                if(rpc_wallet::parse_json_number(r, "total_output", tmp)) out.total_output = (uint64_t)tmp;
+                if(rpc_wallet::parse_json_number(r, "fee", tmp)) out.fee = (uint64_t)tmp;
+
+                // Parse difficulty (double)
+                size_t dpos = r.find("\"difficulty\":");
+                if(dpos != std::string::npos){
+                    size_t start = dpos + 13;
+                    size_t end = r.find_first_of(",}", start);
+                    if(end != std::string::npos){
+                        try { out.difficulty = std::stod(r.substr(start, end - start)); } catch(...) {}
+                    }
+                }
+
+                // Parse fee_rate
+                size_t frpos = r.find("\"fee_rate\":");
+                if(frpos != std::string::npos){
+                    size_t start = frpos + 11;
+                    size_t end = r.find_first_of(",}", start);
+                    if(end != std::string::npos){
+                        try { out.fee_rate = std::stod(r.substr(start, end - start)); } catch(...) {}
+                    }
+                }
+
+                rpc_wallet::parse_json_string(r, "block_hash", out.block_hash);
+                rpc_wallet::parse_json_string(r, "hex", out.hex);
+
+                // Parse inputs (vin array)
+                size_t vin_start = r.find("\"vin\":[");
+                if(vin_start != std::string::npos){
+                    size_t vin_end = r.find("]", vin_start);
+                    std::string vin_arr = r.substr(vin_start, vin_end - vin_start + 1);
+                    size_t pos = 0;
+                    while((pos = vin_arr.find("{", pos)) != std::string::npos){
+                        size_t end = vin_arr.find("}", pos);
+                        if(end == std::string::npos) break;
+                        std::string inp = vin_arr.substr(pos, end - pos + 1);
+
+                        TxFullInfo::Input in;
+                        int64_t idx;
+                        if(rpc_wallet::parse_json_number(inp, "index", idx)) in.index = (int)idx;
+                        rpc_wallet::parse_json_string(inp, "prev_txid", in.prev_txid);
+                        if(rpc_wallet::parse_json_number(inp, "prev_vout", idx)) in.prev_vout = (uint32_t)idx;
+                        if(rpc_wallet::parse_json_number(inp, "value", idx)) in.value = (uint64_t)idx;
+                        rpc_wallet::parse_json_string(inp, "address", in.address);
+                        in.is_coinbase = inp.find("\"coinbase\":true") != std::string::npos;
+                        rpc_wallet::parse_json_string(inp, "coinbase_data", in.coinbase_data);
+                        out.inputs.push_back(in);
+                        pos = end + 1;
+                    }
+                }
+
+                // Parse outputs (vout array)
+                size_t vout_start = r.find("\"vout\":[");
+                if(vout_start != std::string::npos){
+                    size_t vout_end = r.find("]", vout_start);
+                    std::string vout_arr = r.substr(vout_start, vout_end - vout_start + 1);
+                    size_t pos = 0;
+                    while((pos = vout_arr.find("{", pos)) != std::string::npos){
+                        size_t end = vout_arr.find("}", pos);
+                        if(end == std::string::npos) break;
+                        std::string outp = vout_arr.substr(pos, end - pos + 1);
+
+                        TxFullInfo::Output o;
+                        int64_t idx;
+                        if(rpc_wallet::parse_json_number(outp, "index", idx)) o.index = (int)idx;
+                        if(rpc_wallet::parse_json_number(outp, "value", idx)) o.value = (uint64_t)idx;
+                        rpc_wallet::parse_json_string(outp, "address", o.address);
+                        o.spent = outp.find("\"spent\":true") != std::string::npos;
+                        out.outputs.push_back(o);
+                        pos = end + 1;
+                    }
+                }
+
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Interactive transaction details viewer with tabs
+static void show_interactive_tx_details(
+    const TxDetailedEntry& tx,
+    const std::vector<AddressBookEntry>& address_book,
+    const std::vector<std::pair<std::string,std::string>>& seeds)
+{
+    // Fetch full info from RPC
+    TxFullInfo full_info;
+    bool has_full_info = fetch_tx_full_info(seeds, tx.txid_hex, full_info);
+
+    // Tab state: 0=Overview, 1=Block Info, 2=Inputs, 3=Outputs
+    int current_tab = 0;
+    const int NUM_TABS = 4;
+    int scroll_offset = 0;
+    const int MAX_VISIBLE = 10;
+
+    auto resolve_label = [&](const std::string& addr) -> std::string {
+        for (const auto& entry : address_book) {
+            if (entry.address == addr) return entry.label;
+        }
+        return "";
+    };
+
+    instant_input::enable_raw_mode();
+    instant_input::hide_cursor();
+
+    bool running = true;
+    int tick = 0;
+
+    while(running){
+        // Clear and redraw
+        std::cout << "\033[2J\033[H" << std::flush;
+
+        const int W = 78;
+        std::string bc_h = ui::g_use_utf8 ? "═" : "=";
+        std::string bc_v = ui::g_use_utf8 ? "║" : "|";
+        std::string bc_tl = ui::g_use_utf8 ? "╔" : "+";
+        std::string bc_tr = ui::g_use_utf8 ? "╗" : "+";
+        std::string bc_bl = ui::g_use_utf8 ? "╚" : "+";
+        std::string bc_br = ui::g_use_utf8 ? "╝" : "+";
+
+        // Header
+        std::cout << "\n";
+        std::cout << "  " << ui::cyan() << bc_tl;
+        for(int i = 0; i < W - 2; i++) std::cout << bc_h;
+        std::cout << bc_tr << ui::reset() << "\n";
+
+        std::cout << "  " << ui::cyan() << bc_v << ui::reset();
+        std::cout << "  " << ui::bold() << ui::white() << "TRANSACTION DETAILS" << ui::reset();
+        std::cout << std::string(W - 24, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+
+        // Tab bar
+        std::cout << "  " << ui::cyan() << bc_v << ui::reset();
+        const char* tabs[] = {"Overview", "Block Info", "Inputs", "Outputs"};
+        std::cout << " ";
+        for(int t = 0; t < NUM_TABS; t++){
+            if(t == current_tab){
+                std::cout << ui::green() << ui::bold() << "[" << tabs[t] << "]" << ui::reset() << " ";
+            } else {
+                std::cout << ui::dim() << " " << tabs[t] << "  " << ui::reset();
+            }
+        }
+        std::cout << std::string(W - 55, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+
+        std::cout << "  " << ui::cyan() << bc_v;
+        for(int i = 0; i < W - 2; i++) std::cout << (ui::g_use_utf8 ? "─" : "-");
+        std::cout << bc_v << ui::reset() << "\n";
+
+        // Tab content
+        if(current_tab == 0){
+            // OVERVIEW TAB
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Transaction ID:" << ui::reset() << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::cyan() << tx.txid_hex << ui::reset() << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+
+            // Status
+            std::string status_str = tx.confirmations > 0 ?
+                (ui::green() + "CONFIRMED" + ui::reset()) :
+                (ui::yellow() + "PENDING" + ui::reset());
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Status: " << ui::reset() << status_str << "\n";
+
+            // Direction
+            std::string dir_str = tx.direction == "sent" ? (ui::red() + "SENT" + ui::reset()) :
+                                  tx.direction == "received" ? (ui::green() + "RECEIVED" + ui::reset()) :
+                                  tx.direction == "mined" ? (ui::yellow() + "MINED" + ui::reset()) :
+                                  (ui::dim() + "SELF" + ui::reset());
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Type: " << ui::reset() << dir_str << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+
+            // Amount
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Amount:" << ui::reset() << "\n";
+            if(tx.amount >= 0){
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::green() << ui::bold() << "+" << ui_pro::format_miq_professional((uint64_t)tx.amount) << " MIQ" << ui::reset() << "\n";
+            } else {
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::red() << ui::bold() << "-" << ui_pro::format_miq_professional((uint64_t)(-tx.amount)) << " MIQ" << ui::reset() << "\n";
+            }
+            if(tx.fee > 0){
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "Fee: " << ui_pro::format_miq_professional(tx.fee) << " MIQ";
+                if(tx.fee_rate > 0){
+                    std::cout << " (" << std::fixed << std::setprecision(2) << tx.fee_rate << " sat/byte)";
+                }
+                std::cout << ui::reset() << "\n";
+            }
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+
+            // Time
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Date/Time:" << ui::reset() << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::format_time(tx.timestamp) << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::dim() << "(" << ui::format_time_ago(tx.timestamp) << ")" << ui::reset() << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+
+            // Confirmations
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Confirmations: " << ui::reset();
+            std::cout << tx.confirmations << " " << confirmation_bar(tx.confirmations) << "\n";
+
+            // Addresses
+            if(!tx.to_address.empty()){
+                std::string label = resolve_label(tx.to_address);
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "To:" << ui::reset();
+                if(!label.empty()) std::cout << " " << ui::cyan() << label << ui::reset();
+                std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::dim() << tx.to_address << ui::reset() << "\n";
+            }
+            if(!tx.from_address.empty()){
+                std::string label = resolve_label(tx.from_address);
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "From:" << ui::reset();
+                if(!label.empty()) std::cout << " " << ui::cyan() << label << ui::reset();
+                std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::dim() << tx.from_address << ui::reset() << "\n";
+            }
+
+            // Memo
+            if(!tx.memo.empty()){
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Memo:" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::yellow() << tx.memo << ui::reset() << "\n";
+            }
+
+        } else if(current_tab == 1){
+            // BLOCK INFO TAB
+            if(!has_full_info || !full_info.confirmed){
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::yellow() << "Transaction not yet confirmed in a block" << ui::reset() << "\n";
+                if(full_info.in_mempool){
+                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "Currently in mempool, waiting for mining" << ui::reset() << "\n";
+                }
+            } else {
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Block Height:" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::green() << full_info.block_height << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Block Hash:" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::cyan() << full_info.block_hash << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Block Time:" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::format_time(full_info.block_time) << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Difficulty:" << ui::reset() << "\n";
+                std::ostringstream diff_ss;
+                diff_ss << std::fixed << std::setprecision(8) << full_info.difficulty;
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << diff_ss.str() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Difficulty Bits:" << ui::reset() << "\n";
+                std::ostringstream bits_ss;
+                bits_ss << "0x" << std::hex << std::setfill('0') << std::setw(8) << full_info.block_bits;
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << bits_ss.str() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "TX Index in Block:" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << full_info.tx_index;
+                if(full_info.is_coinbase) std::cout << " " << ui::yellow() << "(Coinbase)" << ui::reset();
+                std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "TX Size:" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << full_info.size << " bytes\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Confirmations:" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << full_info.confirmations << " " << confirmation_bar(full_info.confirmations) << "\n";
+            }
+
+        } else if(current_tab == 2){
+            // INPUTS TAB
+            if(!has_full_info || full_info.inputs.empty()){
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "No input information available" << ui::reset() << "\n";
+            } else {
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Inputs (" << full_info.inputs.size() << "):" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+
+                int visible = std::min((int)full_info.inputs.size() - scroll_offset, MAX_VISIBLE);
+                for(int i = scroll_offset; i < scroll_offset + visible && i < (int)full_info.inputs.size(); i++){
+                    const auto& inp = full_info.inputs[i];
+                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::cyan() << "[" << inp.index << "]" << ui::reset();
+                    if(inp.is_coinbase){
+                        std::cout << " " << ui::yellow() << "COINBASE" << ui::reset() << "\n";
+                        std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "      " << ui::dim() << "Data: " << inp.coinbase_data.substr(0, 40) << "..." << ui::reset() << "\n";
+                    } else {
+                        if(inp.value > 0){
+                            std::cout << " " << ui::green() << ui_pro::format_miq_professional(inp.value) << " MIQ" << ui::reset() << "\n";
+                        } else {
+                            std::cout << "\n";
+                        }
+                        std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "      " << ui::dim() << "From: " << inp.prev_txid.substr(0, 16) << "...:" << inp.prev_vout << ui::reset() << "\n";
+                        if(!inp.address.empty()){
+                            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "      " << ui::dim() << "Addr: " << inp.address << ui::reset() << "\n";
+                        }
+                    }
+                }
+
+                if((int)full_info.inputs.size() > MAX_VISIBLE){
+                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "(Use Up/Down arrows to scroll)" << ui::reset() << "\n";
+                }
+            }
+
+        } else if(current_tab == 3){
+            // OUTPUTS TAB
+            if(!has_full_info || full_info.outputs.empty()){
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "No output information available" << ui::reset() << "\n";
+            } else {
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Outputs (" << full_info.outputs.size() << "):" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "Total: " << ui_pro::format_miq_professional(full_info.total_output) << " MIQ" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+
+                int visible = std::min((int)full_info.outputs.size() - scroll_offset, MAX_VISIBLE);
+                for(int i = scroll_offset; i < scroll_offset + visible && i < (int)full_info.outputs.size(); i++){
+                    const auto& out = full_info.outputs[i];
+                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::cyan() << "[" << out.index << "]" << ui::reset();
+                    std::cout << " " << ui::green() << ui_pro::format_miq_professional(out.value) << " MIQ" << ui::reset();
+                    if(out.spent){
+                        std::cout << " " << ui::red() << "(SPENT)" << ui::reset();
+                    } else {
+                        std::cout << " " << ui::green() << "(UNSPENT)" << ui::reset();
+                    }
+                    std::cout << "\n";
+                    std::string label = resolve_label(out.address);
+                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "      ";
+                    if(!label.empty()){
+                        std::cout << ui::cyan() << label << ui::reset() << " ";
+                    }
+                    std::cout << ui::dim() << out.address << ui::reset() << "\n";
+                }
+
+                if((int)full_info.outputs.size() > MAX_VISIBLE){
+                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "(Use Up/Down arrows to scroll)" << ui::reset() << "\n";
+                }
+            }
+        }
+
+        // Padding
+        for(int i = 0; i < 3; i++){
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << std::string(W - 2, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+        }
+
+        // Footer
+        std::cout << "  " << ui::cyan() << bc_v;
+        for(int i = 0; i < W - 2; i++) std::cout << (ui::g_use_utf8 ? "─" : "-");
+        std::cout << bc_v << ui::reset() << "\n";
+
+        std::cout << "  " << ui::cyan() << bc_v << ui::reset();
+        std::cout << "  " << ui::dim() << (ui::g_use_utf8 ? "←→" : "<>") << " Tabs  "
+                  << (ui::g_use_utf8 ? "↑↓" : "^v") << " Scroll  "
+                  << "Q/ESC Back" << ui::reset();
+        std::cout << std::string(W - 38, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+
+        std::cout << "  " << ui::cyan() << bc_bl;
+        for(int i = 0; i < W - 2; i++) std::cout << bc_h;
+        std::cout << bc_br << ui::reset() << "\n";
+
+        // Handle input
+        int ch = instant_input::wait_for_key(100);
+        tick++;
+
+        if(ch < 0) continue;
+
+        if(ch == 'q' || ch == 'Q'){
+            running = false;
+        } else if(ch == 27){  // ESC or arrow sequence
+            int ch2 = instant_input::wait_for_key(50);
+            if(ch2 == '['){
+                int ch3 = instant_input::wait_for_key(50);
+                if(ch3 == 'C'){  // Right arrow
+                    current_tab = (current_tab + 1) % NUM_TABS;
+                    scroll_offset = 0;
+                } else if(ch3 == 'D'){  // Left arrow
+                    current_tab = (current_tab + NUM_TABS - 1) % NUM_TABS;
+                    scroll_offset = 0;
+                } else if(ch3 == 'A'){  // Up arrow
+                    if(scroll_offset > 0) scroll_offset--;
+                } else if(ch3 == 'B'){  // Down arrow
+                    int max_items = (current_tab == 2) ? (int)full_info.inputs.size() :
+                                    (current_tab == 3) ? (int)full_info.outputs.size() : 0;
+                    if(scroll_offset + MAX_VISIBLE < max_items) scroll_offset++;
+                }
+            } else if(ch2 < 0){
+                running = false;  // Just ESC
+            }
+        } else if(ch == 'h' || ch == 'H'){
+            current_tab = (current_tab + NUM_TABS - 1) % NUM_TABS;
+            scroll_offset = 0;
+        } else if(ch == 'l' || ch == 'L'){
+            current_tab = (current_tab + 1) % NUM_TABS;
+            scroll_offset = 0;
+        } else if(ch == 'j' || ch == 'J'){
+            int max_items = (current_tab == 2) ? (int)full_info.inputs.size() :
+                            (current_tab == 3) ? (int)full_info.outputs.size() : 0;
+            if(scroll_offset + MAX_VISIBLE < max_items) scroll_offset++;
+        } else if(ch == 'k' || ch == 'K'){
+            if(scroll_offset > 0) scroll_offset--;
+        } else if(ch >= '1' && ch <= '4'){
+            current_tab = ch - '1';
+            scroll_offset = 0;
+        }
+    }
+
+    instant_input::disable_raw_mode();
+    instant_input::show_cursor();
+}
+
+// Print detailed transaction view (legacy fallback)
 static void print_tx_details_view(const TxDetailedEntry& tx,
                                    const std::vector<AddressBookEntry>& address_book) {
     std::cout << "\n";
@@ -9280,7 +9772,7 @@ static bool wallet_session(const std::string& cli_host,
                           << " | " << (end_idx - start_idx) << "/" << view_state.total_count << " shown" << ui::reset() << "\n";
 
                 std::cout << "\n  " << ui::cyan() << "n/p" << ui::reset() << " Page  "
-                          << ui::cyan() << "v" << ui::reset() << " View  "
+                          << ui::cyan() << "v/d" << ui::reset() << " View TX  "
                           << ui::cyan() << "fs/fr/fm/fp/fc" << ui::reset() << " Filter  "
                           << ui::cyan() << "/text" << ui::reset() << " Search  "
                           << ui::cyan() << "s" << ui::reset() << " Stats  "
@@ -9295,9 +9787,12 @@ static bool wallet_session(const std::string& cli_host,
                 else if (cmd == "n") { if (view_state.page < view_state.total_pages - 1) view_state.page++; }
                 else if (cmd == "p") { if (view_state.page > 0) view_state.page--; }
                 else if (cmd == "v" && view_state.selected >= 0 && view_state.selected < (int)filtered.size()) {
-                    print_tx_details_view(filtered[view_state.selected], address_book);
-                    std::cout << "  " << ui::dim() << "Press ENTER..." << ui::reset();
-                    std::string d; std::getline(std::cin, d);
+                    // v12.0: Use new interactive TX details viewer with block info
+                    show_interactive_tx_details(filtered[view_state.selected], address_book, seeds);
+                }
+                else if (cmd == "d" && view_state.selected >= 0 && view_state.selected < (int)filtered.size()) {
+                    // 'd' for details - same as 'v'
+                    show_interactive_tx_details(filtered[view_state.selected], address_book, seeds);
                 }
                 else if (cmd == "s") {
                     print_tx_statistics(filtered);
