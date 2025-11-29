@@ -527,6 +527,7 @@ static bool rpc_call(
 }
 
 // Try RPC call with failover across multiple endpoints
+// Uses exponential backoff retry on connection failures
 static bool rpc_call_any(
     const std::vector<RpcEndpoint>& endpoints,
     const std::string& method,
@@ -536,12 +537,27 @@ static bool rpc_call_any(
     std::string& err)
 {
     for (const auto& ep : endpoints) {
-        std::string local_err;
-        if (rpc_call(ep, method, params_json, result, local_err)) {
-            used_endpoint = ep.to_string();
-            return true;
+        // Retry with exponential backoff on connection failures
+        int delay_ms = wallet_config::BASE_RETRY_DELAY_MS;
+        for (int attempt = 0; attempt < wallet_config::MAX_CONNECTION_RETRIES; ++attempt) {
+            std::string local_err;
+            if (rpc_call(ep, method, params_json, result, local_err)) {
+                used_endpoint = ep.to_string();
+                return true;
+            }
+            err = local_err;
+
+            // Don't retry on RPC-level errors (only connection failures)
+            if (local_err.find("RPC error:") != std::string::npos) {
+                break;  // Move to next endpoint
+            }
+
+            // Exponential backoff before retry (but not on last attempt)
+            if (attempt + 1 < wallet_config::MAX_CONNECTION_RETRIES) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                delay_ms = std::min(delay_ms * 2, wallet_config::MAX_RETRY_DELAY_MS);
+            }
         }
-        err = local_err;
     }
     return false;
 }
@@ -8372,17 +8388,18 @@ static int process_tx_queue(
     return broadcasted;
 }
 
-// Check network connectivity by attempting to connect to any RPC endpoint
-// v2.0: Uses RPC health check instead of P2P handshake
-[[maybe_unused]] static bool check_network_status(
+// Build RPC endpoints from seeds using helper function
+// v2.0: Centralizes endpoint construction logic
+static std::vector<rpc_wallet::RpcEndpoint> build_endpoints_from_seeds(
     const std::vector<std::pair<std::string,std::string>>& seeds,
-    std::string& connected_node)
+    bool localhost_first = true)
 {
-    // Build RPC endpoints from seeds
     std::vector<rpc_wallet::RpcEndpoint> endpoints;
 
-    // Add localhost first
-    endpoints.push_back(rpc_wallet::RpcEndpoint{"127.0.0.1", (uint16_t)miq::RPC_PORT, "", wallet_config::RPC_TIMEOUT_MS});
+    // Add localhost first if requested (highest priority for local node)
+    if (localhost_first) {
+        endpoints.push_back(rpc_wallet::RpcEndpoint{"127.0.0.1", (uint16_t)miq::RPC_PORT, "", wallet_config::RPC_TIMEOUT_MS});
+    }
 
     for(const auto& [host, port] : seeds){
         if(host == "127.0.0.1" || host == "localhost") continue;
@@ -8392,12 +8409,86 @@ static int process_tx_queue(
         endpoints.push_back(rpc_wallet::RpcEndpoint{host, rpc_port, "", wallet_config::RPC_TIMEOUT_MS});
     }
 
+    // Also use the original build_rpc_endpoints for CLI/env overrides
+    auto cli_endpoints = rpc_wallet::build_rpc_endpoints("", "");
+    for (const auto& ep : cli_endpoints) {
+        bool already_present = false;
+        for (const auto& existing : endpoints) {
+            if (existing.host == ep.host && existing.port == ep.port) {
+                already_present = true;
+                break;
+            }
+        }
+        if (!already_present) {
+            endpoints.push_back(ep);
+        }
+    }
+
+    return endpoints;
+}
+
+// Check network connectivity by attempting to connect to any RPC endpoint
+// v2.0: Uses RPC health check instead of P2P handshake
+[[maybe_unused]] static bool check_network_status(
+    const std::vector<std::pair<std::string,std::string>>& seeds,
+    std::string& connected_node)
+{
+    auto endpoints = build_endpoints_from_seeds(seeds, true);
+
     std::string status;
     if(rpc_wallet::rpc_health_check(endpoints, status, connected_node)){
         return true;
     }
     connected_node = "";
     return false;
+}
+
+// Get detailed network status including blockchain height and mempool info
+// v2.0: Provides rich network diagnostics using all RPC info functions
+[[maybe_unused]] static bool get_detailed_network_status(
+    const std::vector<std::pair<std::string,std::string>>& seeds,
+    std::string& connected_node,
+    uint32_t& block_height,
+    std::string& best_hash,
+    int& peer_connections,
+    int64_t& mempool_size,
+    int64_t& mempool_bytes)
+{
+    auto endpoints = build_endpoints_from_seeds(seeds, true);
+
+    std::string err;
+
+    // Get blockchain info (height, best block)
+    if (!rpc_wallet::rpc_get_blockchain_info(endpoints, block_height, best_hash, connected_node, err)) {
+        return false;
+    }
+
+    // Get network info (peer connections)
+    std::string version;
+    if (!rpc_wallet::rpc_get_network_info(endpoints, peer_connections, version, err)) {
+        peer_connections = -1;  // Unknown
+    }
+
+    // Get mempool info
+    if (!rpc_wallet::rpc_get_mempool_info(endpoints, mempool_size, mempool_bytes, err)) {
+        mempool_size = -1;
+        mempool_bytes = -1;
+    }
+
+    return true;
+}
+
+// Verify a transaction's confirmation status via RPC
+// v2.0: Uses rpc_verify_transaction for transaction status checks
+[[maybe_unused]] static bool verify_tx_confirmation_status(
+    const std::vector<std::pair<std::string,std::string>>& seeds,
+    const std::string& txid_hex,
+    int& confirmations)
+{
+    auto endpoints = build_endpoints_from_seeds(seeds, true);
+
+    std::string err;
+    return rpc_wallet::rpc_verify_transaction(endpoints, txid_hex, confirmations, err);
 }
 
 // =============================================================================
@@ -8990,6 +9081,20 @@ static bool wallet_session(const std::string& cli_host,
                 if(tip_height > 0){
                     update_all_tx_confirmations(wdir, utxos, tip_height);
                     auto_detect_received_transactions(wdir, utxos, tip_height);
+                }
+
+                // v2.0: Use detailed network status for richer diagnostics
+                // This also exercises the RPC info functions for better network awareness
+                uint32_t rpc_height = 0;
+                std::string best_hash;
+                int peer_count = 0;
+                int64_t mempool_size = 0, mempool_bytes = 0;
+                if (get_detailed_network_status(seeds, used_seed, rpc_height, best_hash,
+                                                peer_count, mempool_size, mempool_bytes)) {
+                    // Use RPC-reported height if it's newer
+                    if (rpc_height > tip_height) {
+                        tip_height = rpc_height;
+                    }
                 }
             }
         }
