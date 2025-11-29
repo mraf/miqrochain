@@ -1,4 +1,4 @@
-// src/miqwallet.cpp - RYTHMIUM WALLET v1.0 STABLE
+// src/miqwallet.cpp - MIQ WALLET v1.0 STABLE
 // ═══════════════════════════════════════════════════════════════════════════
 // THE ULTIMATE PROFESSIONAL CRYPTOCURRENCY WALLET
 // ═══════════════════════════════════════════════════════════════════════════
@@ -14,7 +14,7 @@
 // ✓ Proper wallet isolation - transactions never leak between wallets
 // ✓ Live animated menus throughout the entire application
 //
-// v1.0 STABLE - Production Ready Release
+// v1.0 STABLE - Production Ready Release - Full Arrow Key Navigation
 // ═══════════════════════════════════════════════════════════════════════════
 #include <iostream>
 #include <iomanip>
@@ -99,7 +99,7 @@ static void init_windows_console_utf8() {
 #endif
 
 // =============================================================================
-// INSTANT KEY INPUT SYSTEM v1.0
+// INSTANT KEY INPUT SYSTEM v1.0 - Arrow Key Navigation
 // Allows single-key commands without pressing Enter
 // =============================================================================
 namespace instant_input {
@@ -1930,7 +1930,7 @@ namespace ui {
 
         // Version with chain name
         out << "\n";
-        out << dim() << "    v2.0  " << (g_use_utf8 ? "│" : "|") << "  RPC WALLET  " << (g_use_utf8 ? "│" : "|") << "  STABLE" << reset() << "\n";
+        out << dim() << "    v1.0  " << (g_use_utf8 ? "│" : "|") << "  RPC WALLET  " << (g_use_utf8 ? "│" : "|") << "  STABLE" << reset() << "\n";
         out << "\n";
 
         // Sync status header
@@ -2875,7 +2875,7 @@ namespace live_dashboard {
 
         // Top border with professional title - RYTHMIUM WALLET
         std::cout << "\n";
-        draw_double_box_top("RYTHMIUM WALLET v1.1 - LIVE MONITOR", W);
+        draw_double_box_top("MIQ WALLET v1.0 - LIVE MONITOR", W);
 
         // Status bar with live network indicator
         std::cout << "\033[38;5;39m║\033[0m";
@@ -7707,7 +7707,6 @@ static void show_interactive_tx_details(
     instant_input::hide_cursor();
 
     bool running = true;
-    int tick = 0;
 
     while(running){
         // Clear and redraw
@@ -7959,7 +7958,6 @@ static void show_interactive_tx_details(
 
         // Handle input
         int ch = instant_input::wait_for_key(100);
-        tick++;
 
         if(ch < 0) continue;
 
@@ -9596,9 +9594,9 @@ static bool wallet_session(const std::string& cli_host,
 
         int queue_count = count_pending_in_queue(wdir);
 
-        // Draw the RYTHMIUM animated dashboard v1.0 STABLE - ZERO FLICKER
+        // Draw the MIQ animated dashboard v1.0 STABLE - ZERO FLICKER
         live_dashboard::draw_dashboard(
-            "RYTHMIUM WALLET v1.0 - LIVE MONITOR",
+            "MIQ WALLET v1.0 - LIVE MONITOR",
             menu_wb.total,
             menu_wb.spendable,
             menu_wb.immature,
@@ -9702,7 +9700,7 @@ static bool wallet_session(const std::string& cli_host,
         live_dashboard::reset_dashboard_state();
 
         // =================================================================
-        // OPTION 3: Transaction History - Professional Viewer
+        // OPTION 3: Transaction History - v1.0 Full Arrow Key Navigation
         // =================================================================
         if(c == "3"){
             std::vector<TxHistoryEntry> history_raw;
@@ -9711,11 +9709,16 @@ static bool wallet_session(const std::string& cli_host,
             load_address_book(wdir, address_book);
 
             if(history_raw.empty()){
+                std::cout << "\033[2J\033[H" << std::flush;
                 std::cout << "\n";
                 ui::print_double_header("TRANSACTION HISTORY", 60);
                 std::cout << "\n";
                 std::cout << "  " << ui::dim() << "No transactions yet." << ui::reset() << "\n";
                 std::cout << "  " << ui::dim() << "Send or receive MIQ to see transaction history." << ui::reset() << "\n\n";
+                std::cout << "  " << ui::dim() << "Press any key to continue..." << ui::reset() << std::flush;
+                instant_input::enable_raw_mode();
+                instant_input::wait_for_key(-1);
+                instant_input::disable_raw_mode();
                 continue;
             }
 
@@ -9726,7 +9729,11 @@ static bool wallet_session(const std::string& cli_host,
             }
 
             TxHistoryViewState view_state;
+            view_state.selected = 0;  // Start with first item selected
             bool history_running = true;
+
+            instant_input::enable_raw_mode();
+            instant_input::hide_cursor();
 
             while (history_running) {
                 auto filtered = filter_transactions(all_txs, view_state.filter);
@@ -9738,84 +9745,280 @@ static bool wallet_session(const std::string& cli_host,
                 if (view_state.page >= view_state.total_pages) view_state.page = view_state.total_pages - 1;
                 if (view_state.page < 0) view_state.page = 0;
 
-                std::cout << "\n";
-                ui::print_double_header("TRANSACTION HISTORY", 70);
-                std::cout << "\n  " << ui::bold() << "Status: " << ui::reset()
-                          << ui::cyan() << view_state.total_count << ui::reset() << " transactions";
+                // Keep selected within bounds
+                if (view_state.selected < 0) view_state.selected = 0;
+                if (view_state.selected >= view_state.total_count) view_state.selected = view_state.total_count - 1;
 
+                // Clear and redraw
+                std::cout << "\033[2J\033[H" << std::flush;
+
+                const int W = 78;
+                std::string bc_h = ui::g_use_utf8 ? "═" : "=";
+                std::string bc_v = ui::g_use_utf8 ? "║" : "|";
+
+                // Header
+                std::cout << "\n  " << ui::cyan();
+                std::cout << (ui::g_use_utf8 ? "╔" : "+");
+                for(int i = 0; i < W - 2; i++) std::cout << bc_h;
+                std::cout << (ui::g_use_utf8 ? "╗" : "+") << ui::reset() << "\n";
+
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset();
+                std::cout << "  " << ui::bold() << ui::white() << "TRANSACTION HISTORY" << ui::reset();
+                std::cout << "  " << ui::dim() << view_state.total_count << " transactions" << ui::reset();
+                std::cout << std::string(W - 35, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+
+                // Filter status line
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset();
+                std::cout << "  ";
                 if (!view_state.filter.direction.empty()) {
-                    std::cout << " | " << ui::yellow() << "Dir:" << view_state.filter.direction << ui::reset();
+                    std::cout << ui::yellow() << "[" << view_state.filter.direction << "]" << ui::reset() << " ";
                 }
                 if (!view_state.filter.status.empty()) {
-                    std::cout << " | " << ui::yellow() << "Status:" << view_state.filter.status << ui::reset();
+                    std::cout << ui::yellow() << "[" << view_state.filter.status << "]" << ui::reset() << " ";
                 }
                 if (!view_state.filter.search.empty()) {
-                    std::cout << " | " << ui::yellow() << "Search:\"" << view_state.filter.search << "\"" << ui::reset();
+                    std::cout << ui::yellow() << "[/" << view_state.filter.search << "]" << ui::reset() << " ";
                 }
-                std::cout << "\n";
+                if (view_state.filter.direction.empty() && view_state.filter.status.empty() && view_state.filter.search.empty()) {
+                    std::cout << ui::dim() << "No filters" << ui::reset();
+                }
+                std::cout << std::string(W - 30, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
 
-                std::cout << "\n  " << ui::dim() << "     #   Dir  Date        Amount           Conf   Address" << ui::reset() << "\n";
-                std::cout << "  " << std::string(68, '-') << "\n";
+                // Separator
+                std::cout << "  " << ui::cyan();
+                std::cout << (ui::g_use_utf8 ? "╠" : "+");
+                for(int i = 0; i < W - 2; i++) std::cout << (ui::g_use_utf8 ? "─" : "-");
+                std::cout << (ui::g_use_utf8 ? "╣" : "+") << ui::reset() << "\n";
+
+                // Column headers
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset();
+                std::cout << ui::dim() << "   #  Dir  Date        Amount           Conf   Address" << ui::reset();
+                std::cout << std::string(W - 60, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+
+                std::cout << "  " << ui::cyan() << bc_v;
+                for(int i = 0; i < W - 2; i++) std::cout << (ui::g_use_utf8 ? "─" : "-");
+                std::cout << bc_v << ui::reset() << "\n";
 
                 int start_idx = view_state.page * view_state.per_page;
                 int end_idx = std::min(start_idx + view_state.per_page, view_state.total_count);
 
                 if (filtered.empty()) {
-                    std::cout << "\n  " << ui::dim() << "No transactions match filters." << ui::reset() << "\n";
+                    std::cout << "  " << ui::cyan() << bc_v << ui::reset();
+                    std::cout << "  " << ui::dim() << "No transactions match filters." << ui::reset();
+                    std::cout << std::string(W - 36, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
                 } else {
                     for (int i = start_idx; i < end_idx; i++) {
-                        print_tx_row(filtered[i], i, (i == view_state.selected), address_book);
+                        const auto& tx = filtered[i];
+                        bool is_selected = (i == view_state.selected);
+
+                        std::cout << "  " << ui::cyan() << bc_v << ui::reset();
+
+                        if (is_selected) {
+                            std::cout << ui::green() << ui::bold() << " " << (ui::g_use_utf8 ? "►" : ">") << " " << ui::reset();
+                        } else {
+                            std::cout << "   ";
+                        }
+
+                        // Row number
+                        std::cout << std::setw(2) << (i + 1) << " ";
+
+                        // Direction indicator
+                        if (tx.direction == "sent") {
+                            std::cout << ui::red() << (ui::g_use_utf8 ? "↑" : "-") << ui::reset() << " ";
+                        } else if (tx.direction == "received" || tx.direction == "mined") {
+                            std::cout << ui::green() << (ui::g_use_utf8 ? "↓" : "+") << ui::reset() << " ";
+                        } else {
+                            std::cout << ui::dim() << (ui::g_use_utf8 ? "↔" : "~") << ui::reset() << " ";
+                        }
+
+                        // Date
+                        time_t t = (time_t)tx.timestamp;
+                        struct tm* tm_info = localtime(&t);
+                        char date_buf[16];
+                        strftime(date_buf, sizeof(date_buf), "%m/%d %H:%M", tm_info);
+                        std::cout << date_buf << "  ";
+
+                        // Amount
+                        if (tx.amount >= 0) {
+                            std::cout << ui::green() << "+" << std::setw(14) << std::right << ui_pro::format_miq_professional((uint64_t)tx.amount) << ui::reset();
+                        } else {
+                            std::cout << ui::red() << "-" << std::setw(14) << std::right << ui_pro::format_miq_professional((uint64_t)(-tx.amount)) << ui::reset();
+                        }
+                        std::cout << " ";
+
+                        // Confirmations bar
+                        std::cout << confirmation_bar(tx.confirmations) << " ";
+
+                        // Address (truncated)
+                        std::string addr = tx.to_address.empty() ? tx.from_address : tx.to_address;
+                        if (addr.length() > 12) addr = addr.substr(0, 12) + "...";
+                        std::cout << ui::dim() << addr << ui::reset();
+
+                        std::cout << std::string(5, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                    }
+
+                    // Pad remaining rows
+                    for (int i = end_idx - start_idx; i < view_state.per_page; i++) {
+                        std::cout << "  " << ui::cyan() << bc_v << ui::reset();
+                        std::cout << std::string(W - 2, ' ');
+                        std::cout << ui::cyan() << bc_v << ui::reset() << "\n";
                     }
                 }
 
-                std::cout << "\n  " << ui::dim() << "Page " << (view_state.page + 1) << "/" << view_state.total_pages
-                          << " | " << (end_idx - start_idx) << "/" << view_state.total_count << " shown" << ui::reset() << "\n";
+                // Page info
+                std::cout << "  " << ui::cyan();
+                std::cout << (ui::g_use_utf8 ? "╠" : "+");
+                for(int i = 0; i < W - 2; i++) std::cout << (ui::g_use_utf8 ? "─" : "-");
+                std::cout << (ui::g_use_utf8 ? "╣" : "+") << ui::reset() << "\n";
 
-                std::cout << "\n  " << ui::cyan() << "n/p" << ui::reset() << " Page  "
-                          << ui::cyan() << "v/d" << ui::reset() << " View TX  "
-                          << ui::cyan() << "fs/fr/fm/fp/fc" << ui::reset() << " Filter  "
-                          << ui::cyan() << "/text" << ui::reset() << " Search  "
-                          << ui::cyan() << "s" << ui::reset() << " Stats  "
-                          << ui::cyan() << "c" << ui::reset() << " Clear  "
-                          << ui::cyan() << "q" << ui::reset() << " Back\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset();
+                std::cout << "  Page " << (view_state.page + 1) << "/" << view_state.total_pages;
+                std::cout << "  |  " << (end_idx - start_idx) << "/" << view_state.total_count << " shown";
+                std::cout << std::string(W - 35, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
 
-                std::string cmd = ui::prompt("Command: ");
-                cmd = trim(cmd);
+                // Controls
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset();
+                std::cout << "  " << ui::dim();
+                if (ui::g_use_utf8) {
+                    std::cout << "↑↓ Select  ←→ Page  Enter View  s Stats  1-5 Filter  c Clear  q Back";
+                } else {
+                    std::cout << "j/k Select  n/p Page  Enter View  s Stats  1-5 Filter  c Clear  q Back";
+                }
+                std::cout << ui::reset() << " " << ui::cyan() << bc_v << ui::reset() << "\n";
 
-                if (cmd.empty()) continue;
-                else if (cmd == "q" || cmd == "Q") history_running = false;
-                else if (cmd == "n") { if (view_state.page < view_state.total_pages - 1) view_state.page++; }
-                else if (cmd == "p") { if (view_state.page > 0) view_state.page--; }
-                else if (cmd == "v" && view_state.selected >= 0 && view_state.selected < (int)filtered.size()) {
-                    // v12.0: Use new interactive TX details viewer with block info
-                    show_interactive_tx_details(filtered[view_state.selected], address_book, seeds);
-                }
-                else if (cmd == "d" && view_state.selected >= 0 && view_state.selected < (int)filtered.size()) {
-                    // 'd' for details - same as 'v'
-                    show_interactive_tx_details(filtered[view_state.selected], address_book, seeds);
-                }
-                else if (cmd == "s") {
-                    print_tx_statistics(filtered);
-                    std::cout << "  " << ui::dim() << "Press ENTER..." << ui::reset();
-                    std::string d; std::getline(std::cin, d);
-                }
-                else if (cmd == "c") { view_state.filter = TxHistoryFilter(); view_state.page = 0; view_state.selected = -1; }
-                else if (cmd == "fs") { view_state.filter.direction = "sent"; view_state.page = 0; }
-                else if (cmd == "fr") { view_state.filter.direction = "received"; view_state.page = 0; }
-                else if (cmd == "fm") { view_state.filter.direction = "mined"; view_state.page = 0; }  // Mining rewards filter
-                else if (cmd == "fp") { view_state.filter.status = "pending"; view_state.page = 0; }
-                else if (cmd == "fc") { view_state.filter.status = "confirmed"; view_state.page = 0; }
-                else if (cmd[0] == '/') { view_state.filter.search = cmd.substr(1); view_state.page = 0; }
-                else {
-                    try {
-                        int num = std::stoi(cmd);
-                        if (num >= 1 && num <= view_state.total_count) {
-                            view_state.selected = num - 1;
-                            view_state.page = view_state.selected / view_state.per_page;
+                // Filter options
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset();
+                std::cout << "  " << ui::dim() << "Filters: "
+                          << ui::cyan() << "1" << ui::reset() << ui::dim() << "=All  "
+                          << ui::cyan() << "2" << ui::reset() << ui::dim() << "=Sent  "
+                          << ui::cyan() << "3" << ui::reset() << ui::dim() << "=Received  "
+                          << ui::cyan() << "4" << ui::reset() << ui::dim() << "=Mined  "
+                          << ui::cyan() << "5" << ui::reset() << ui::dim() << "=Pending" << ui::reset();
+                std::cout << std::string(W - 65, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+
+                // Bottom border
+                std::cout << "  " << ui::cyan();
+                std::cout << (ui::g_use_utf8 ? "╚" : "+");
+                for(int i = 0; i < W - 2; i++) std::cout << bc_h;
+                std::cout << (ui::g_use_utf8 ? "╝" : "+") << ui::reset() << "\n";
+
+                // Handle input
+                int ch = instant_input::wait_for_key(100);
+                if (ch < 0) continue;
+
+                // Arrow keys and navigation
+                if (ch == 27) {  // ESC sequence
+                    int ch2 = instant_input::wait_for_key(50);
+                    if (ch2 == '[') {
+                        int ch3 = instant_input::wait_for_key(50);
+                        if (ch3 == 'A') {  // Up arrow
+                            if (view_state.selected > 0) {
+                                view_state.selected--;
+                                if (view_state.selected < start_idx) view_state.page--;
+                            }
+                        } else if (ch3 == 'B') {  // Down arrow
+                            if (view_state.selected < view_state.total_count - 1) {
+                                view_state.selected++;
+                                if (view_state.selected >= end_idx) view_state.page++;
+                            }
+                        } else if (ch3 == 'C') {  // Right arrow - next page
+                            if (view_state.page < view_state.total_pages - 1) {
+                                view_state.page++;
+                                view_state.selected = view_state.page * view_state.per_page;
+                            }
+                        } else if (ch3 == 'D') {  // Left arrow - prev page
+                            if (view_state.page > 0) {
+                                view_state.page--;
+                                view_state.selected = view_state.page * view_state.per_page;
+                            }
                         }
-                    } catch (...) {}
+                    } else if (ch2 < 0) {
+                        history_running = false;  // Just ESC
+                    }
+                }
+                else if (ch == 'q' || ch == 'Q') {
+                    history_running = false;
+                }
+                else if (ch == 'j' || ch == 'J') {  // vim down
+                    if (view_state.selected < view_state.total_count - 1) {
+                        view_state.selected++;
+                        if (view_state.selected >= end_idx) view_state.page++;
+                    }
+                }
+                else if (ch == 'k' || ch == 'K') {  // vim up
+                    if (view_state.selected > 0) {
+                        view_state.selected--;
+                        if (view_state.selected < start_idx) view_state.page--;
+                    }
+                }
+                else if (ch == 'n' || ch == 'N') {  // next page
+                    if (view_state.page < view_state.total_pages - 1) {
+                        view_state.page++;
+                        view_state.selected = view_state.page * view_state.per_page;
+                    }
+                }
+                else if (ch == 'p' || ch == 'P') {  // prev page
+                    if (view_state.page > 0) {
+                        view_state.page--;
+                        view_state.selected = view_state.page * view_state.per_page;
+                    }
+                }
+                else if (ch == '\r' || ch == '\n' || ch == ' ') {  // Enter/Space - view details
+                    if (view_state.selected >= 0 && view_state.selected < (int)filtered.size()) {
+                        instant_input::disable_raw_mode();
+                        instant_input::show_cursor();
+                        show_interactive_tx_details(filtered[view_state.selected], address_book, seeds);
+                        instant_input::enable_raw_mode();
+                        instant_input::hide_cursor();
+                    }
+                }
+                else if (ch == 's' || ch == 'S') {  // Statistics
+                    instant_input::disable_raw_mode();
+                    instant_input::show_cursor();
+                    print_tx_statistics(filtered);
+                    std::cout << "  " << ui::dim() << "Press any key..." << ui::reset() << std::flush;
+                    instant_input::enable_raw_mode();
+                    instant_input::wait_for_key(-1);
+                    instant_input::hide_cursor();
+                }
+                else if (ch == 'c' || ch == 'C') {  // Clear filters
+                    view_state.filter = TxHistoryFilter();
+                    view_state.page = 0;
+                    view_state.selected = 0;
+                }
+                else if (ch == '1') {  // All
+                    view_state.filter = TxHistoryFilter();
+                    view_state.page = 0;
+                    view_state.selected = 0;
+                }
+                else if (ch == '2') {  // Sent
+                    view_state.filter = TxHistoryFilter();
+                    view_state.filter.direction = "sent";
+                    view_state.page = 0;
+                    view_state.selected = 0;
+                }
+                else if (ch == '3') {  // Received
+                    view_state.filter = TxHistoryFilter();
+                    view_state.filter.direction = "received";
+                    view_state.page = 0;
+                    view_state.selected = 0;
+                }
+                else if (ch == '4') {  // Mined
+                    view_state.filter = TxHistoryFilter();
+                    view_state.filter.direction = "mined";
+                    view_state.page = 0;
+                    view_state.selected = 0;
+                }
+                else if (ch == '5') {  // Pending
+                    view_state.filter = TxHistoryFilter();
+                    view_state.filter.status = "pending";
+                    view_state.page = 0;
+                    view_state.selected = 0;
                 }
             }
+
+            instant_input::disable_raw_mode();
+            instant_input::show_cursor();
             continue;
         }
 
@@ -12892,7 +13095,7 @@ namespace main_menu {
 
         // Version and tagline
         std::cout << "\n";
-        std::cout << "              " << ui::magenta() << ui::bold() << "W A L L E T   v 1 . 0   S T A B L E" << ui::reset() << "\033[K\n";
+        std::cout << "              " << ui::magenta() << ui::bold() << "M I Q   W A L L E T   v 1 . 0" << ui::reset() << "\033[K\n";
         if (ui::g_use_utf8) {
             std::cout << "          " << ui::dim() << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << ui::reset() << "\033[K\n";
             std::cout << "          " << ui::dim() << "Bulletproof • Live Dashboard • Professional" << ui::reset() << "\033[K\n";
@@ -13171,7 +13374,7 @@ int main(int argc, char** argv){
             continue;
         }
         if(a == "--help" || a == "-h"){
-            std::cout << "Rythmium Wallet v1.0 STABLE - Professional Cryptocurrency Wallet\n\n";
+            std::cout << "MIQ Wallet v1.0 STABLE - Professional Cryptocurrency Wallet\n\n";
             std::cout << "Usage: miqwallet [options]\n\n";
             std::cout << "Options:\n";
             std::cout << "  --p2pseed=host:port   Connect to specific P2P node\n";
