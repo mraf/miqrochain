@@ -10,7 +10,7 @@ int main() {
     // Test 1: Basic filter creation
     {
         miq::BloomFilter filter(10, 0.0001, 0, 0);
-        assert(filter.data().size() > 0);
+        assert(filter.get_data().size() > 0);
         printf("  [PASS] Filter creation\n");
     }
 

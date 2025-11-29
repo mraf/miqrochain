@@ -10,7 +10,8 @@ int main(){
     auto r = miq::ripemd160(std::vector<uint8_t>({'a','b','c'})); assert(r.size()==20);
     auto pkh = miq::hash160(std::vector<uint8_t>({'x'})); (void)pkh;
     auto addr = miq::base58check_encode(0x35, std::vector<uint8_t>(20,1));
-    uint8_t v=0; std::vector<uint8_t> pl;
-    assert(miq::base58check_decode(addr, v, pl) && v==0x35 && pl.size()==20);
+    uint8_t v = 0; std::vector<uint8_t> pl;
+    bool decoded = miq::base58check_decode(addr, v, pl);
+    assert(decoded && v == 0x35 && pl.size() == 20);
     return 0;
 }

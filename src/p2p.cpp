@@ -4480,26 +4480,32 @@ void P2P::loop(){
 #endif
         }
 
+        // OPTIMIZATION: Reduced poll timeout from 200ms to 50ms for faster response
+        // This significantly improves latency for localhost/same-machine wallet connections
+        // while still allowing efficient batching of network events
 #ifdef _WIN32
-        int rc = WSAPoll(fds.data(), (ULONG)fds.size(), 200);
+        int rc = WSAPoll(fds.data(), (ULONG)fds.size(), 50);
 #else
-        int rc = poll(fds.data(), (nfds_t)fds.size(), 200);
+        int rc = poll(fds.data(), (nfds_t)fds.size(), 50);
 #endif
 
-        // DEBUG: Log poll results if it returns immediately (tight loop detection)
+        // Tight loop detection - less aggressive to avoid hurting localhost performance
+        // Only throttle if we're burning CPU with no actual work being done
         static int64_t last_poll_time = 0;
         static int tight_loop_count = 0;
         int64_t poll_now = now_ms();
-        if (poll_now - last_poll_time < 50 && rc > 0) {
-            // Poll returned in less than 50ms - might be a tight loop
+        if (poll_now - last_poll_time < 5 && rc == 0) {
+            // Poll returned immediately with no events - potential CPU burn
             tight_loop_count++;
 
-            // If we're in a tight loop for too long, force a sleep to prevent CPU burn
-            if (tight_loop_count > 100) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // Only sleep if we've been spinning for a while with no work
+            // Increased threshold to 500 iterations to avoid hurting legitimate traffic
+            if (tight_loop_count > 500) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 tight_loop_count = 0;
             }
         } else {
+            // Reset counter when we have actual work to do
             tight_loop_count = 0;
         }
         last_poll_time = poll_now;
