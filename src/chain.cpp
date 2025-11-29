@@ -1277,6 +1277,11 @@ void Chain::rebuild_header_index_from_blocks(){
         }
     }
 
+    MIQ_LOG_INFO(LogCategory::VALIDATION,
+        "rebuild_header_index_from_blocks: rebuilt index with " +
+        std::to_string(actual_block_count) + " blocks (highest=" +
+        std::to_string(highest_block_found) + ", indexed=" +
+        std::to_string(header_index_.size()) + ")");
 }
 
 uint64_t Chain::subsidy_for_height(uint64_t h) const {

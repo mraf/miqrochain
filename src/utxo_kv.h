@@ -40,6 +40,9 @@ public:
     // Factory to create a batch (needed by callers that want atomic UTXO updates)
     Batch make_batch();
 
+    // Parse a UTXO key back to txid and vout (useful for iteration/debugging)
+    static bool parse_utxo_key(const std::string& key, std::vector<uint8_t>& txid, uint32_t& vout);
+
 private:
     friend class Batch;
     KVDB db_;
