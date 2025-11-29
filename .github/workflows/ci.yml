@@ -51,13 +51,20 @@ jobs:
           CXX: ${{ matrix.cxx }}
         run: |
           cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DMIQ_BUILD_TESTS=ON
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
 
       - name: Run Unit Tests
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --verbose
+
+      - name: Run Integration Tests
+        run: |
+          if [ -f "build/test_integration" ]; then
+            ./build/test_integration
+          fi
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
@@ -82,13 +89,20 @@ jobs:
 
       - name: Configure CMake
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} -DMIQ_BUILD_TESTS=ON
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
 
       - name: Run Unit Tests
-        run: ctest --test-dir build -C ${{ env.BUILD_TYPE }} --output-on-failure
+        run: ctest --test-dir build -C ${{ env.BUILD_TYPE }} --output-on-failure --verbose
+
+      - name: Run Integration Tests
+        run: |
+          $testPath = "build\${{ env.BUILD_TYPE }}\test_integration.exe"
+          if (Test-Path $testPath) {
+            & $testPath
+          }
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4

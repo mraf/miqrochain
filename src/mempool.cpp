@@ -6,6 +6,8 @@
 #include "sha256.h"  // dsha256 for sighash
 #include "hash160.h" // hash160(pubkey) to compare with PKH
 #include "crypto/ecdsa_iface.h" // crypto::ECDSA::verify
+#include "log.h"     // Logging for transaction debugging
+#include "hex.h"     // to_hex for logging
 
 #include <algorithm>
 #include <queue>
@@ -311,13 +313,19 @@ bool Mempool::accept(const Transaction& tx, const UTXOView& utxo, uint32_t heigh
     std::lock_guard<std::recursive_mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
     (void)height; // reserved for future height-based rules
 
+    std::string txid_hex = to_hex(tx.txid()).substr(0, 16) + "...";
+
     // Quick dup check
-    if (exists(tx.txid())) return true;
+    if (exists(tx.txid())) {
+        MIQ_LOG_DEBUG(LogCategory::MEMPOOL, "tx " + txid_hex + " already in mempool (dup)");
+        return true;
+    }
 
     // CRITICAL FIX: Validate transaction size before expensive operations
     const size_t sz = est_tx_size(tx);
     if (sz > MIQ_MAX_TX_SIZE) {
         err = "transaction too large";
+        MIQ_LOG_WARN(LogCategory::MEMPOOL, "tx " + txid_hex + " rejected: " + err);
         return false;
     }
 
@@ -327,10 +335,12 @@ bool Mempool::accept(const Transaction& tx, const UTXOView& utxo, uint32_t heigh
     if (!validate_inputs_and_calc_fee(tx, utxo, fee, terr)) {
         if (terr.empty()) {
             // Orphan path: cache and index by missing parents
+            MIQ_LOG_INFO(LogCategory::MEMPOOL, "tx " + txid_hex + " -> orphan pool (missing parent UTXOs)");
             add_orphan(tx);
             return true; // not a hard reject
         }
         err = terr;
+        MIQ_LOG_WARN(LogCategory::MEMPOOL, "tx " + txid_hex + " rejected: " + err);
         return false;
     }
 
@@ -339,9 +349,20 @@ bool Mempool::accept(const Transaction& tx, const UTXOView& utxo, uint32_t heigh
 
     // Min relay fee policy (no behavior change if MIN_RELAY_FEE_RATE isn't defined)
     const uint64_t minfee = min_fee_for_size_bytes(sz);
-    if (fee < minfee) { err = "insufficient fee"; return false; }
+    if (fee < minfee) {
+        err = "insufficient fee";
+        MIQ_LOG_WARN(LogCategory::MEMPOOL, "tx " + txid_hex + " rejected: " + err +
+                     " (fee=" + std::to_string(fee) + ", min=" + std::to_string(minfee) + ")");
+        return false;
+    }
 
-    if (!enforce_limits_and_insert(tx, fee, err)) return false;
+    if (!enforce_limits_and_insert(tx, fee, err)) {
+        MIQ_LOG_WARN(LogCategory::MEMPOOL, "tx " + txid_hex + " rejected: " + err);
+        return false;
+    }
+
+    MIQ_LOG_INFO(LogCategory::MEMPOOL, "tx " + txid_hex + " accepted (fee=" + std::to_string(fee) +
+                 " sat, size=" + std::to_string(sz) + " bytes, pool=" + std::to_string(map_.size()) + " txs)");
 
     // Accepting a tx may unblock orphans
     try_promote_orphans_depending_on(k(tx.txid()), utxo, height);

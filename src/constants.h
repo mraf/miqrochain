@@ -57,6 +57,24 @@
 #ifndef MIQ_MAX_HEADERS_BATCH
 #define MIQ_MAX_HEADERS_BATCH 2000  // Headers per batch
 #endif
+
+// === P2P HEADER FLOOD PROTECTION ===
+// Per-peer header rate limiting to prevent DoS attacks
+#ifndef MIQ_HEADER_RATE_LIMIT_PER_SEC
+#define MIQ_HEADER_RATE_LIMIT_PER_SEC 50  // Max headers per second per peer
+#endif
+#ifndef MIQ_HEADER_RATE_WINDOW_MS
+#define MIQ_HEADER_RATE_WINDOW_MS 10000  // Rate window (10 seconds)
+#endif
+#ifndef MIQ_HEADER_RATE_MAX_BURST
+#define MIQ_HEADER_RATE_MAX_BURST 500  // Max burst of headers before rate limiting
+#endif
+#ifndef MIQ_HEADER_FLOOD_BAN_SCORE
+#define MIQ_HEADER_FLOOD_BAN_SCORE 50  // Ban score for header flooding
+#endif
+#ifndef MIQ_INVALID_HEADER_BAN_SCORE
+#define MIQ_INVALID_HEADER_BAN_SCORE 100  // Ban score for invalid headers (immediate ban)
+#endif
 #ifndef MIQ_PARALLEL_BLOCKS
 #define MIQ_PARALLEL_BLOCKS 16  // Parallel block downloads
 #endif
@@ -353,6 +371,29 @@ static constexpr uint32_t MIN_PEER_PROTO_VERSION = 70015;  // Minimum supported
 #endif
 #ifndef MIQ_CONNECTION_BACKOFF_MAX_MS
 #define MIQ_CONNECTION_BACKOFF_MAX_MS (12 * 60 * 60 * 1000)  // 12 hour max
+#endif
+
+// === P2P BAN AND RATE LIMITING ===
+#ifndef MIQ_P2P_MAX_BANSCORE
+#define MIQ_P2P_MAX_BANSCORE 100  // Ban threshold score
+#endif
+#ifndef MIQ_P2P_BAN_MS
+#define MIQ_P2P_BAN_MS (24 * 60 * 60 * 1000)  // 24 hour ban duration
+#endif
+#ifndef MIQ_MAX_SAME_IP_CONNECTIONS
+#define MIQ_MAX_SAME_IP_CONNECTIONS 3  // Max connections from same IP
+#endif
+#ifndef MIQ_MAX_SUBNET24_CONNECTIONS
+#define MIQ_MAX_SUBNET24_CONNECTIONS 6  // Max connections from same /24 subnet
+#endif
+#ifndef MIQ_P2P_INV_WINDOW_MS
+#define MIQ_P2P_INV_WINDOW_MS 5000  // INV rate limit window (5 seconds)
+#endif
+#ifndef MIQ_P2P_INV_WINDOW_CAP
+#define MIQ_P2P_INV_WINDOW_CAP 500  // Max INVs per window
+#endif
+#ifndef MIQ_P2P_MSG_DEADLINE_MS
+#define MIQ_P2P_MSG_DEADLINE_MS 30000  // 30 second message deadline
 #endif
 
 // === RELIABILITY & FAULT TOLERANCE ===
