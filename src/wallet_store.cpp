@@ -201,6 +201,24 @@ static bool wallet_write_bytes(const std::string& path,
         return false;
     }
 
+    // CRITICAL FIX: fsync the parent directory to ensure the rename is durable
+    // Without this, a crash after rename() but before directory sync can lose the file
+#ifndef _WIN32
+    {
+        std::string dir_path = parent.empty() ? "." : parent.string();
+        int dir_fd = ::open(dir_path.c_str(), O_RDONLY | O_DIRECTORY);
+        if (dir_fd >= 0) {
+            ::fsync(dir_fd);
+            ::close(dir_fd);
+        }
+    }
+#else
+    // On Windows, FlushFileBuffers on the directory handle provides similar guarantee
+    // However, NTFS rename is already durable after the syscall returns in most cases
+    // For extra safety, we could use SetFileInformationByHandle with FileRenameInfo
+    (void)parent; // Suppress unused warning
+#endif
+
     // Clean up backup on success (optional - keep for recovery)
     // std::remove(backup.c_str());
 

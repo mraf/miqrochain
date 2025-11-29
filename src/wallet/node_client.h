@@ -38,6 +38,30 @@ public:
     // NEW: Get endpoint statistics for debugging/monitoring
     std::vector<std::pair<std::string, std::string>> get_endpoint_stats() const;
 
+    // =========================================================================
+    // BIP158 COMPACT BLOCK FILTER SUPPORT
+    // =========================================================================
+
+    // Check if the connected node supports BIP158 filters
+    bool supports_filters();
+
+    // Get filter headers for a range of blocks
+    // Returns array of 32-byte filter header hashes
+    bool get_filter_headers(uint32_t start, uint32_t count,
+                           std::vector<std::vector<uint8_t>>& headers,
+                           std::string& err);
+
+    // Get filters for a range of blocks
+    // Returns pairs of (block_hash, filter_bytes)
+    bool get_filters(uint32_t start, uint32_t count,
+                    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>& filters,
+                    std::string& err);
+
+    // Match script pubkeys against a filter
+    // Returns true if any element matches (may have false positives)
+    static bool filter_match(const std::vector<uint8_t>& filter,
+                            const std::vector<std::vector<uint8_t>>& elements);
+
 private:
     bool call_once(size_t idx, const std::string& body, JNode& out, std::string& err);
 

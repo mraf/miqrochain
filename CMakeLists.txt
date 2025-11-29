@@ -216,6 +216,8 @@ set(MIQ_CORE_SOURCES_NO_NAT
     src/p2p.h src/p2p.cpp
     src/http.h src/http.cpp
     src/rpc.h src/rpc.cpp
+    src/rpc_auth.h src/rpc_auth.cpp
+    src/operator_metrics.h src/operator_metrics.cpp
     src/crypto/ecdsa_iface.h
     src/crypto/ecdsa_libsecp256k1.cpp
     src/reorg_manager.h

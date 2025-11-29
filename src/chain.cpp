@@ -1675,7 +1675,17 @@ bool Chain::disconnect_tip_once(std::string& err){
     // Commit reversals atomically if backend supports it
     if (!utxo_apply_ops(utxo_, ops, err)) return false;
 
-    // NOTE: we do NOT remove filters here. Re-connect overwrites the old entry.
+    // CRITICAL FIX: Rollback BIP158 filters on disconnect to maintain consistency
+    // Without this, SPV clients can receive stale filters after a reorg
+#if MIQ_HAVE_GCS_FILTERS
+    {
+        const uint32_t new_tip_h = (uint32_t)(tip_.height - 1);
+        if (!g_filter_store.rollback_to(new_tip_h)) {
+            log_warn("FilterStore: rollback_to failed for height=" + std::to_string(new_tip_h));
+            // Non-fatal: filters will be rebuilt on next connect
+        }
+    }
+#endif
 
     Block prev;
     if (!get_block_by_hash(cur.header.prev_hash, prev)) {

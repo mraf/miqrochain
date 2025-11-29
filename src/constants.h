@@ -364,6 +364,21 @@ static constexpr uint32_t MIN_PEER_PROTO_VERSION = 70015;  // Minimum supported
 #define MIQ_MAX_REORG_DEPTH 100  // Maximum chain reorganization depth
 #endif
 
+// === IMPROVED IBD STALL DETECTION ===
+// Faster peer switching for peers that send headers but no blocks
+#ifndef MIQ_HEADERS_ONLY_BAN_SCORE
+#define MIQ_HEADERS_ONLY_BAN_SCORE 50  // Ban score for headers-only peer (high penalty)
+#endif
+#ifndef MIQ_BLOCK_STALL_MAX_COUNT
+#define MIQ_BLOCK_STALL_MAX_COUNT 1  // Switch peers after 1 stall (not 3)
+#endif
+#ifndef MIQ_HEADERS_NO_BLOCKS_TIMEOUT_MS
+#define MIQ_HEADERS_NO_BLOCKS_TIMEOUT_MS 30000  // 30s timeout for headers-only stall
+#endif
+#ifndef MIQ_IBD_PEER_SWITCH_THRESHOLD
+#define MIQ_IBD_PEER_SWITCH_THRESHOLD 1  // Switch sync peer after 1 stall
+#endif
+
 // Health monitoring
 #ifndef MIQ_HEALTH_CHECK_INTERVAL_MS
 #define MIQ_HEALTH_CHECK_INTERVAL_MS 60000  // Health check every minute
