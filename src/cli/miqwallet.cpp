@@ -9289,8 +9289,14 @@ static bool wallet_session(const std::string& cli_host,
             for(const auto& u: utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
 
             // Get spendable UTXOs
+            // CRITICAL FIX: Filter out unconfirmed UTXOs (height=0) to prevent orphan transactions
+            // Only spend UTXOs that are confirmed in the blockchain and known to the node
             std::vector<miq::UtxoLite> spendables;
             for(const auto& u: utxos){
+                // Skip unconfirmed UTXOs - they may not be in the node's UTXO set yet
+                // which would cause the transaction to become an orphan
+                if(u.height == 0) continue;
+
                 bool immature = false;
                 if(u.coinbase){
                     uint64_t mh = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
