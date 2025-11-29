@@ -2097,10 +2097,9 @@ private:
         uint64_t blocks_remaining = (network_height > current_height) ? (network_height - current_height) : 0;
         if (blocks_remaining > 0) {
             double pct = (double)current_height / (double)network_height * 100.0;
-            std::ostringstream status;
-            status << std::fixed << std::setprecision(1) << pct << "% synced";
-            if (vt_ok_) return std::string("\x1b[38;5;214m") + status.str() + "\x1b[0m";
-            return status.str();
+            std::string pct_str = fmt_pct(pct) + " synced";
+            if (vt_ok_) return std::string("\x1b[38;5;214m") + pct_str + "\x1b[0m";
+            return pct_str;
         }
 
         // Edge case: we have all blocks but IBD not marked done yet
@@ -2275,6 +2274,10 @@ private:
         // ===== STATUS LINE =====
         std::ostringstream status;
         status << C_dim() << "Status: " << C_reset() << get_sync_status(network_height, current_height, ibd_done_);
+        // Add activity indicator when actively syncing
+        if (!actually_synced && blocks_remaining > 0) {
+            status << " " << activity_indicator(tick_, true, u8_ok_);
+        }
         lines.push_back("   " + status.str());
 
         // ===== NETWORK INFO =====
@@ -2286,6 +2289,7 @@ private:
             net << C_err() << conn_anim[tick_ % 4] << C_reset();
         } else {
             net << C_ok() << peer_count << " peer" << (peer_count != 1 ? "s" : "") << " connected" << C_reset();
+            net << " " << pulse_indicator(tick_, u8_ok_);  // Network pulse
             if (!ibd_seed_host_.empty()) {
                 net << C_dim() << " via " << C_reset() << ibd_seed_host_;
             }
@@ -2714,12 +2718,13 @@ private:
             std::string tip_hex;
             long double tip_diff = 0.0L;
             uint64_t tip_age_s = 0;
+            uint64_t tip_ts = 0;
 
             if (chain_) {
                 auto t = chain_->tip();
                 tip_hex = to_hex(t.hash);
                 tip_diff = difficulty_from_bits(hdr_bits(t));
-                uint64_t tip_ts = hdr_time(t);
+                tip_ts = hdr_time(t);
                 if (tip_ts) {
                     uint64_t now = (uint64_t)std::time(nullptr);
                     tip_age_s = (now > tip_ts) ? (now - tip_ts) : 0;
@@ -2737,15 +2742,16 @@ private:
             h2 << C_dim() << "Tip:" << C_reset() << "        " << short_hex(tip_hex, 24);
             left_panel.push_back(box_row(h2.str(), half_width));
 
-            // Tip age with color coding
+            // Tip age with color coding (using fmt_age for timestamp display)
             std::ostringstream h3;
             h3 << C_dim() << "Tip Age:" << C_reset() << "    ";
+            std::string age_str = tip_ts ? fmt_age(tip_ts) : "unknown";
             if (tip_age_s < 120) {
-                h3 << C_ok() << fmt_uptime(tip_age_s) << C_reset();
+                h3 << C_ok() << age_str << C_reset();
             } else if (tip_age_s < 600) {
-                h3 << C_warn() << fmt_uptime(tip_age_s) << C_reset();
+                h3 << C_warn() << age_str << C_reset();
             } else {
-                h3 << C_err() << fmt_uptime(tip_age_s) << C_reset();
+                h3 << C_err() << age_str << C_reset();
             }
             left_panel.push_back(box_row(h3.str(), half_width));
 
@@ -3333,6 +3339,11 @@ private:
                 std::ostringstream l5;
                 l5 << "  " << C_dim() << "Estimated time left" << C_reset() << "      " << eta_str;
                 left.push_back(l5.str());
+
+                // Chain time remaining at target block rate (60s per block)
+                std::ostringstream l5b;
+                l5b << "  " << C_dim() << "Chain time remaining" << C_reset() << "     " << fmt_block_time(blocks_remaining, 60);
+                left.push_back(l5b.str());
 
                 left.push_back("");
 

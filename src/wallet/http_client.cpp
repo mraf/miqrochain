@@ -359,13 +359,11 @@ bool http_post(const std::string& host,
 
         size_t c = line.find(':');
         if (c != std::string::npos) {
-            std::string k = line.substr(0, c);
+            std::string k = lc(line.substr(0, c));  // Lowercase header name
             std::string v = line.substr(c + 1);
             // Trim whitespace
             while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
             while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
-            // Lowercase header name
-            std::transform(k.begin(), k.end(), k.begin(), [](unsigned char x) { return std::tolower(x); });
             hdrs[k] = v;
         }
     }
