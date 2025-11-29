@@ -1258,44 +1258,64 @@ std::string RpcService::handle(const std::string& body){
 
         // ---------------- address UTXO lookup (for mobile/GUI) ----------------
         if (method == "getaddressutxos") {
-            // Expect params = ["<Base58Check-P2PKH>"]
+            // Expect params = ["<Base58Check-P2PKH>"] or [["addr1", "addr2", ...]]
             auto itParams = obj.find("params");
             if (itParams == obj.end() ||
                 !std::holds_alternative<std::vector<JNode>>(itParams->second.v))
-                return err("usage: getaddressutxos <address>");
+                return err("usage: getaddressutxos <address> or getaddressutxos [addr1, addr2, ...]");
 
             auto& ps = std::get<std::vector<JNode>>(itParams->second.v);
-            if (ps.size() != 1 || !std::holds_alternative<std::string>(ps[0].v))
-                return err("usage: getaddressutxos <address>");
+            if (ps.empty())
+                return err("usage: getaddressutxos <address> or getaddressutxos [addr1, addr2, ...]");
 
-            const std::string addr = std::get<std::string>(ps[0].v);
+            // v12.0: Support batch address queries for faster wallet sync
+            // Accept either single address string or array of addresses
+            std::vector<std::string> addresses;
 
-            // Decode address
-            uint8_t ver = 0; std::vector<uint8_t> payload;
-            if (!base58check_decode(addr, ver, payload))
-                return err("bad address");
-            if (ver != VERSION_P2PKH || payload.size() != 20)
-                return err("bad address");
+            if (std::holds_alternative<std::string>(ps[0].v)) {
+                // Single address (legacy mode)
+                addresses.push_back(std::get<std::string>(ps[0].v));
+            } else if (std::holds_alternative<std::vector<JNode>>(ps[0].v)) {
+                // Array of addresses (batch mode)
+                auto& addr_arr = std::get<std::vector<JNode>>(ps[0].v);
+                addresses.reserve(addr_arr.size());
+                for (const auto& node : addr_arr) {
+                    if (std::holds_alternative<std::string>(node.v)) {
+                        addresses.push_back(std::get<std::string>(node.v));
+                    }
+                }
+            } else {
+                return err("usage: getaddressutxos <address> or getaddressutxos [addr1, addr2, ...]");
+            }
 
-            // Query UTXO set
-            auto entries = chain_.utxo().list_for_pkh(payload);
-
-            // Build array of objects
+            // Build array of UTXOs from all addresses
             std::vector<JNode> arr;
-            arr.reserve(entries.size());
-            for (const auto& t : entries) {
-                const auto& txid = std::get<0>(t);
-                uint32_t vout    = std::get<1>(t);
-                const auto& e    = std::get<2>(t);
+            arr.reserve(addresses.size() * 10);  // Pre-allocate for efficiency
 
-                std::map<std::string,JNode> o;
-                o["coinbase"] = jbool(e.coinbase);
-                o["height"]   = jnum((double)e.height);
-                o["txid"]  = jstr(to_hex(txid));
-                o["vout"]  = jnum((double)vout);
-                o["value"] = jnum((double)e.value);
-                o["pkh"]   = jstr(to_hex(e.pkh));
-                JNode n; n.v = o; arr.push_back(n);
+            for (const auto& addr : addresses) {
+                // Decode address
+                uint8_t ver = 0; std::vector<uint8_t> payload;
+                if (!base58check_decode(addr, ver, payload)) continue;  // Skip invalid
+                if (ver != VERSION_P2PKH || payload.size() != 20) continue;
+
+                // Query UTXO set
+                auto entries = chain_.utxo().list_for_pkh(payload);
+
+                for (const auto& t : entries) {
+                    const auto& txid = std::get<0>(t);
+                    uint32_t vout    = std::get<1>(t);
+                    const auto& e    = std::get<2>(t);
+
+                    std::map<std::string,JNode> o;
+                    o["coinbase"] = jbool(e.coinbase);
+                    o["height"]   = jnum((double)e.height);
+                    o["txid"]  = jstr(to_hex(txid));
+                    o["vout"]  = jnum((double)vout);
+                    o["value"] = jnum((double)e.value);
+                    o["pkh"]   = jstr(to_hex(e.pkh));
+                    o["address"] = jstr(addr);  // Include source address for client convenience
+                    JNode n; n.v = o; arr.push_back(n);
+                }
             }
             JNode out; out.v = arr; return json_dump(out);
         }

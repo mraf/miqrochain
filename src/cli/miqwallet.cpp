@@ -7814,7 +7814,7 @@ static std::vector<std::pair<std::string,std::string>> build_seed_candidates(
 }
 
 // =============================================================================
-// RPC-BASED UTXO COLLECTION v2.0 - Fully replaces P2P SPV
+// RPC-BASED UTXO COLLECTION v12.0 - Batch mode for fast sync
 // =============================================================================
 static bool rpc_collect_utxos(
     const std::vector<std::pair<std::string,std::string>>& seeds,
@@ -7849,17 +7849,113 @@ static bool rpc_collect_utxos(
         endpoints.insert(endpoints.begin(), {"127.0.0.1", (uint16_t)miq::RPC_PORT, "", wallet_config::RPC_TIMEOUT_MS});
     }
 
-    // For each PKH, convert to address and fetch UTXOs via RPC
+    // v12.0 OPTIMIZATION: Use batch RPC call for all addresses at once
+    // This is MUCH faster than one RPC call per address (was causing slow sync)
+    ui::print_progress("Fetching UTXOs for " + std::to_string(pkhs.size()) + " addresses...");
+
+    // Build address array for batch request
+    std::vector<std::string> addresses;
+    addresses.reserve(pkhs.size());
+    for(const auto& pkh : pkhs){
+        addresses.push_back(miq::base58check_encode(miq::VERSION_P2PKH, pkh));
+    }
+
+    // Build batch JSON params: [["addr1", "addr2", ...]]
+    std::ostringstream params_ss;
+    params_ss << "[[";
+    for(size_t i = 0; i < addresses.size(); ++i){
+        if(i > 0) params_ss << ",";
+        params_ss << "\"" << addresses[i] << "\"";
+    }
+    params_ss << "]]";
+    std::string params = params_ss.str();
+
+    // Try batch request first
+    std::string result;
+    bool batch_success = false;
+
+    for(const auto& ep : endpoints){
+        std::string body = R"({"method":"getaddressutxos","params":)" + params + "}";
+        miq::HttpResponse resp;
+        std::vector<std::pair<std::string, std::string>> headers;
+
+        if(miq::http_post(ep.host, ep.port, "/", body, headers, resp, ep.timeout_ms)){
+            if(resp.code == 200){
+                result = resp.body;
+                used_seed = ep.host + ":" + std::to_string(ep.port);
+                batch_success = true;
+                break;
+            }
+        }
+    }
+
+    ui::clear_line();
+
+    if(batch_success){
+        // Parse batch result
+        // Format: {"result":[{"txid":"...","vout":N,"value":N,"height":N,"coinbase":bool,"address":"..."},...]}
+        size_t arr_start = result.find("[");
+        size_t arr_end = result.rfind("]");
+        if(arr_start != std::string::npos && arr_end != std::string::npos){
+            std::string arr = result.substr(arr_start, arr_end - arr_start + 1);
+            size_t pos = 1;
+
+            while(pos < arr.size()){
+                size_t obj_start = arr.find('{', pos);
+                if(obj_start == std::string::npos) break;
+
+                size_t obj_end = arr.find('}', obj_start);
+                if(obj_end == std::string::npos) break;
+
+                std::string obj = arr.substr(obj_start, obj_end - obj_start + 1);
+
+                miq::UtxoLite lite;
+                std::string txid_hex, pkh_hex, addr_str;
+                int64_t vout_val = 0, value_val = 0, height_val = 0;
+
+                rpc_wallet::parse_json_string(obj, "txid", txid_hex);
+                rpc_wallet::parse_json_number(obj, "vout", vout_val);
+                rpc_wallet::parse_json_number(obj, "value", value_val);
+                rpc_wallet::parse_json_number(obj, "height", height_val);
+                rpc_wallet::parse_json_string(obj, "pkh", pkh_hex);
+                rpc_wallet::parse_json_string(obj, "address", addr_str);
+
+                lite.txid = miq::from_hex(txid_hex);
+                lite.vout = (uint32_t)vout_val;
+                lite.value = (uint64_t)value_val;
+                lite.height = (uint32_t)height_val;
+                lite.coinbase = obj.find("\"coinbase\":true") != std::string::npos;
+
+                // Get PKH from address if not in response
+                if(pkh_hex.empty() && !addr_str.empty()){
+                    std::vector<uint8_t> decoded_pkh;
+                    if(miq::AddressToPkh(addr_str, decoded_pkh)){
+                        lite.pkh = decoded_pkh;
+                    }
+                } else {
+                    lite.pkh = miq::from_hex(pkh_hex);
+                }
+
+                if(!lite.txid.empty() && lite.value > 0){
+                    out.push_back(lite);
+                }
+
+                pos = obj_end + 1;
+            }
+        }
+        return true;
+    }
+
+    // Fallback to single-address mode if batch fails (older node version)
+    ui::print_progress("Using legacy sync mode...");
+
     for(const auto& pkh : pkhs){
         std::string address = miq::base58check_encode(miq::VERSION_P2PKH, pkh);
-
-        ui::print_progress("Fetching UTXOs for " + address.substr(0, 12) + "...");
 
         std::vector<rpc_wallet::RpcUtxo> rpc_utxos;
         std::string local_err;
 
         if(rpc_wallet::rpc_get_address_utxos(endpoints, address, rpc_utxos, used_seed, local_err)){
-            // Convert RPC UTXOs to miq::UtxoLite format
             for(const auto& u : rpc_utxos){
                 miq::UtxoLite lite;
                 lite.txid = u.txid;
@@ -7872,20 +7968,17 @@ static bool rpc_collect_utxos(
             }
         } else {
             err_out = local_err;
-            // Continue with other addresses even if one fails
         }
     }
 
     ui::clear_line();
 
     if(out.empty() && !pkhs.empty()){
-        // Double-check health to give better error message
         std::string status;
         if(!rpc_wallet::rpc_health_check(endpoints, status, used_seed)){
             err_out = "Cannot connect to any RPC endpoint";
             return false;
         }
-        // Connected but no UTXOs - that's OK
     }
 
     return true;
@@ -8684,10 +8777,13 @@ static bool wallet_session(const std::string& cli_host,
     const std::string wdir = default_wallet_dir();
 
     // Derive key horizon with GAP lookahead
+    // v12.0 FIX: Reduced default gap limit from 1000 to 20 (BIP-44 standard)
+    // This dramatically improves wallet sync performance - was scanning 2000+ addresses
+    // User can override with MIQ_GAP_LIMIT env var if they have many used addresses
     struct Key { std::vector<uint8_t> priv, pub, pkh; uint32_t chain, index; };
     std::vector<Key> keys;
     auto add_range = [&](uint32_t chain, uint32_t upto){
-        const uint32_t GAP = (uint32_t)env_u64("MIQ_GAP_LIMIT", 1000);
+        const uint32_t GAP = (uint32_t)env_u64("MIQ_GAP_LIMIT", 20);  // BIP-44 standard gap
         for(uint32_t i=0;i<=upto + GAP; ++i){
             Key k; k.chain=chain; k.index=i;
             if(!w.DerivePrivPub(meta.account, chain, i, k.priv, k.pub)) continue;
