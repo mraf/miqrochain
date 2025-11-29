@@ -1153,6 +1153,177 @@ std::string RpcService::handle(const std::string& body){
             return err("Transaction not found");
         }
 
+        // gettransactioninfo - Get comprehensive transaction details including block info
+        // v12.0: Returns full tx details with inputs, outputs, block height, difficulty, block hash
+        if(method=="gettransactioninfo"){
+            if(params.size()<1 || !std::holds_alternative<std::string>(params[0].v))
+                return err("need txid");
+            const std::string txidhex = std::get<std::string>(params[0].v);
+
+            std::vector<uint8_t> txid;
+            try { txid = from_hex(txidhex); }
+            catch(...) { return err("bad txid"); }
+
+            std::map<std::string,JNode> result;
+            result["txid"] = jstr(txidhex);
+
+            // Check mempool first
+            Transaction tx;
+            bool in_mempool = mempool_.get_transaction(txid, tx);
+            if(in_mempool){
+                result["confirmed"] = jbool(false);
+                result["in_mempool"] = jbool(true);
+                result["confirmations"] = jnum(0);
+
+                // Serialize tx for hex
+                std::vector<uint8_t> raw = ser_tx(tx);
+                result["hex"] = jstr(to_hex(raw));
+                result["size"] = jnum((double)raw.size());
+
+                // Inputs
+                std::vector<JNode> inputs;
+                uint64_t total_input = 0;
+                for(size_t i = 0; i < tx.vin.size(); ++i){
+                    std::map<std::string,JNode> inp;
+                    inp["index"] = jnum((double)i);
+                    inp["prev_txid"] = jstr(to_hex(tx.vin[i].prev.txid));
+                    inp["prev_vout"] = jnum((double)tx.vin[i].prev.vout);
+                    // Try to get value from UTXO set
+                    UTXOEntry prev_e;
+                    if(chain_.utxo().get(tx.vin[i].prev.txid, tx.vin[i].prev.vout, prev_e)){
+                        inp["value"] = jnum((double)prev_e.value);
+                        inp["address"] = jstr(base58check_encode(VERSION_P2PKH, prev_e.pkh));
+                        total_input += prev_e.value;
+                    }
+                    JNode n; n.v = inp; inputs.push_back(n);
+                }
+                JNode vin; vin.v = inputs; result["vin"] = vin;
+                result["total_input"] = jnum((double)total_input);
+
+                // Outputs
+                std::vector<JNode> outputs;
+                uint64_t total_output = 0;
+                for(size_t i = 0; i < tx.vout.size(); ++i){
+                    std::map<std::string,JNode> out;
+                    out["index"] = jnum((double)i);
+                    out["value"] = jnum((double)tx.vout[i].value);
+                    out["address"] = jstr(base58check_encode(VERSION_P2PKH, tx.vout[i].pkh));
+                    total_output += tx.vout[i].value;
+                    JNode n; n.v = out; outputs.push_back(n);
+                }
+                JNode vout; vout.v = outputs; result["vout"] = vout;
+                result["total_output"] = jnum((double)total_output);
+
+                // Fee
+                if(total_input > 0){
+                    uint64_t fee = (total_input > total_output) ? (total_input - total_output) : 0;
+                    result["fee"] = jnum((double)fee);
+                    if(raw.size() > 0){
+                        result["fee_rate"] = jnum((double)fee / (double)raw.size());
+                    }
+                }
+
+                JNode out; out.v = result; return json_dump(out);
+            }
+
+            // Search in blockchain - scan recent blocks to find the transaction
+            auto tip = chain_.tip();
+            uint64_t scan_start = (tip.height > 10000) ? (tip.height - 10000) : 0;
+
+            for(uint64_t h = tip.height; h >= scan_start && h <= tip.height; --h){
+                Block blk;
+                if(!chain_.get_block_by_index(h, blk)) continue;
+
+                for(size_t tx_idx = 0; tx_idx < blk.txs.size(); ++tx_idx){
+                    const auto& btx = blk.txs[tx_idx];
+                    if(btx.txid() == txid){
+                        // Found the transaction!
+                        result["confirmed"] = jbool(true);
+                        result["in_mempool"] = jbool(false);
+                        result["confirmations"] = jnum((double)(tip.height - h + 1));
+
+                        // Block info
+                        result["block_height"] = jnum((double)h);
+                        result["block_hash"] = jstr(to_hex(blk.block_hash()));
+                        result["block_time"] = jnum((double)blk.header.time);
+                        result["block_bits"] = jnum((double)blk.header.bits);
+
+                        // Calculate difficulty from bits
+                        uint32_t bits = blk.header.bits;
+                        double difficulty = 1.0;
+                        if(bits > 0){
+                            uint32_t exp = (bits >> 24) & 0xFF;
+                            uint32_t mant = bits & 0x00FFFFFF;
+                            if(mant > 0){
+                                // difficulty = (0xFFFF * 2^208) / target
+                                // Simplified: diff = 0xFFFF00000000... / target
+                                double target = (double)mant * pow(256.0, (double)(exp - 3));
+                                if(target > 0){
+                                    difficulty = (double)0xFFFF * pow(2.0, 208.0) / target;
+                                }
+                            }
+                        }
+                        result["difficulty"] = jnum(difficulty);
+
+                        result["tx_index"] = jnum((double)tx_idx);
+                        result["is_coinbase"] = jbool(tx_idx == 0);
+
+                        // Serialize tx
+                        std::vector<uint8_t> raw = ser_tx(btx);
+                        result["hex"] = jstr(to_hex(raw));
+                        result["size"] = jnum((double)raw.size());
+
+                        // Inputs
+                        std::vector<JNode> inputs;
+                        uint64_t total_input = 0;
+                        bool is_coinbase = (tx_idx == 0);
+                        for(size_t i = 0; i < btx.vin.size(); ++i){
+                            std::map<std::string,JNode> inp;
+                            inp["index"] = jnum((double)i);
+                            if(is_coinbase){
+                                inp["coinbase"] = jbool(true);
+                                inp["coinbase_data"] = jstr(to_hex(btx.vin[i].sig));
+                            } else {
+                                inp["prev_txid"] = jstr(to_hex(btx.vin[i].prev.txid));
+                                inp["prev_vout"] = jnum((double)btx.vin[i].prev.vout);
+                                // Try to get spent value (may not be available for spent outputs)
+                            }
+                            JNode n; n.v = inp; inputs.push_back(n);
+                        }
+                        JNode vin; vin.v = inputs; result["vin"] = vin;
+
+                        // Outputs
+                        std::vector<JNode> outputs;
+                        uint64_t total_output = 0;
+                        for(size_t i = 0; i < btx.vout.size(); ++i){
+                            std::map<std::string,JNode> out;
+                            out["index"] = jnum((double)i);
+                            out["value"] = jnum((double)btx.vout[i].value);
+                            out["address"] = jstr(base58check_encode(VERSION_P2PKH, btx.vout[i].pkh));
+                            // Check if output is spent
+                            UTXOEntry e;
+                            out["spent"] = jbool(!chain_.utxo().get(txid, (uint32_t)i, e));
+                            total_output += btx.vout[i].value;
+                            JNode n; n.v = out; outputs.push_back(n);
+                        }
+                        JNode vout; vout.v = outputs; result["vout"] = vout;
+                        result["total_output"] = jnum((double)total_output);
+
+                        // Fee (for non-coinbase)
+                        if(!is_coinbase && total_input > total_output){
+                            result["fee"] = jnum((double)(total_input - total_output));
+                        }
+
+                        JNode out; out.v = result; return json_dump(out);
+                    }
+                }
+
+                if(h == 0) break;  // Prevent underflow
+            }
+
+            return err("Transaction not found");
+        }
+
         if(method=="sendrawtransaction"){
             if(params.size()<1 || !std::holds_alternative<std::string>(params[0].v))
                 return err("need txhex");
@@ -1258,44 +1429,64 @@ std::string RpcService::handle(const std::string& body){
 
         // ---------------- address UTXO lookup (for mobile/GUI) ----------------
         if (method == "getaddressutxos") {
-            // Expect params = ["<Base58Check-P2PKH>"]
+            // Expect params = ["<Base58Check-P2PKH>"] or [["addr1", "addr2", ...]]
             auto itParams = obj.find("params");
             if (itParams == obj.end() ||
                 !std::holds_alternative<std::vector<JNode>>(itParams->second.v))
-                return err("usage: getaddressutxos <address>");
+                return err("usage: getaddressutxos <address> or getaddressutxos [addr1, addr2, ...]");
 
             auto& ps = std::get<std::vector<JNode>>(itParams->second.v);
-            if (ps.size() != 1 || !std::holds_alternative<std::string>(ps[0].v))
-                return err("usage: getaddressutxos <address>");
+            if (ps.empty())
+                return err("usage: getaddressutxos <address> or getaddressutxos [addr1, addr2, ...]");
 
-            const std::string addr = std::get<std::string>(ps[0].v);
+            // v12.0: Support batch address queries for faster wallet sync
+            // Accept either single address string or array of addresses
+            std::vector<std::string> addresses;
 
-            // Decode address
-            uint8_t ver = 0; std::vector<uint8_t> payload;
-            if (!base58check_decode(addr, ver, payload))
-                return err("bad address");
-            if (ver != VERSION_P2PKH || payload.size() != 20)
-                return err("bad address");
+            if (std::holds_alternative<std::string>(ps[0].v)) {
+                // Single address (legacy mode)
+                addresses.push_back(std::get<std::string>(ps[0].v));
+            } else if (std::holds_alternative<std::vector<JNode>>(ps[0].v)) {
+                // Array of addresses (batch mode)
+                auto& addr_arr = std::get<std::vector<JNode>>(ps[0].v);
+                addresses.reserve(addr_arr.size());
+                for (const auto& node : addr_arr) {
+                    if (std::holds_alternative<std::string>(node.v)) {
+                        addresses.push_back(std::get<std::string>(node.v));
+                    }
+                }
+            } else {
+                return err("usage: getaddressutxos <address> or getaddressutxos [addr1, addr2, ...]");
+            }
 
-            // Query UTXO set
-            auto entries = chain_.utxo().list_for_pkh(payload);
-
-            // Build array of objects
+            // Build array of UTXOs from all addresses
             std::vector<JNode> arr;
-            arr.reserve(entries.size());
-            for (const auto& t : entries) {
-                const auto& txid = std::get<0>(t);
-                uint32_t vout    = std::get<1>(t);
-                const auto& e    = std::get<2>(t);
+            arr.reserve(addresses.size() * 10);  // Pre-allocate for efficiency
 
-                std::map<std::string,JNode> o;
-                o["coinbase"] = jbool(e.coinbase);
-                o["height"]   = jnum((double)e.height);
-                o["txid"]  = jstr(to_hex(txid));
-                o["vout"]  = jnum((double)vout);
-                o["value"] = jnum((double)e.value);
-                o["pkh"]   = jstr(to_hex(e.pkh));
-                JNode n; n.v = o; arr.push_back(n);
+            for (const auto& addr : addresses) {
+                // Decode address
+                uint8_t ver = 0; std::vector<uint8_t> payload;
+                if (!base58check_decode(addr, ver, payload)) continue;  // Skip invalid
+                if (ver != VERSION_P2PKH || payload.size() != 20) continue;
+
+                // Query UTXO set
+                auto entries = chain_.utxo().list_for_pkh(payload);
+
+                for (const auto& t : entries) {
+                    const auto& txid = std::get<0>(t);
+                    uint32_t vout    = std::get<1>(t);
+                    const auto& e    = std::get<2>(t);
+
+                    std::map<std::string,JNode> o;
+                    o["coinbase"] = jbool(e.coinbase);
+                    o["height"]   = jnum((double)e.height);
+                    o["txid"]  = jstr(to_hex(txid));
+                    o["vout"]  = jnum((double)vout);
+                    o["value"] = jnum((double)e.value);
+                    o["pkh"]   = jstr(to_hex(e.pkh));
+                    o["address"] = jstr(addr);  // Include source address for client convenience
+                    JNode n; n.v = o; arr.push_back(n);
+                }
             }
             JNode out; out.v = arr; return json_dump(out);
         }
