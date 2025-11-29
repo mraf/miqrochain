@@ -57,6 +57,24 @@
 #ifndef MIQ_MAX_HEADERS_BATCH
 #define MIQ_MAX_HEADERS_BATCH 2000  // Headers per batch
 #endif
+
+// === P2P HEADER FLOOD PROTECTION ===
+// Per-peer header rate limiting to prevent DoS attacks
+#ifndef MIQ_HEADER_RATE_LIMIT_PER_SEC
+#define MIQ_HEADER_RATE_LIMIT_PER_SEC 50  // Max headers per second per peer
+#endif
+#ifndef MIQ_HEADER_RATE_WINDOW_MS
+#define MIQ_HEADER_RATE_WINDOW_MS 10000  // Rate window (10 seconds)
+#endif
+#ifndef MIQ_HEADER_RATE_MAX_BURST
+#define MIQ_HEADER_RATE_MAX_BURST 500  // Max burst of headers before rate limiting
+#endif
+#ifndef MIQ_HEADER_FLOOD_BAN_SCORE
+#define MIQ_HEADER_FLOOD_BAN_SCORE 50  // Ban score for header flooding
+#endif
+#ifndef MIQ_INVALID_HEADER_BAN_SCORE
+#define MIQ_INVALID_HEADER_BAN_SCORE 100  // Ban score for invalid headers (immediate ban)
+#endif
 #ifndef MIQ_PARALLEL_BLOCKS
 #define MIQ_PARALLEL_BLOCKS 16  // Parallel block downloads
 #endif

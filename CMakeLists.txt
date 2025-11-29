@@ -421,6 +421,8 @@ endif()
 # ---------------- Tests (optional) ----------------
 if(MIQ_BUILD_TESTS)
   enable_testing()
+
+  # Unit tests
   add_executable(test_crypto tests/test_crypto.cpp)
   target_include_directories(test_crypto PRIVATE src)
   target_link_libraries(test_crypto PRIVATE miqcore)
@@ -433,6 +435,35 @@ if(MIQ_BUILD_TESTS)
   target_include_directories(test_ser PRIVATE src)
   target_link_libraries(test_ser PRIVATE miqcore)
   add_test(NAME test_ser COMMAND test_ser)
+
+  # Integration tests (comprehensive test suite)
+  add_executable(test_integration src/tests/integration_tests.cpp)
+  target_include_directories(test_integration PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(test_integration PRIVATE miqcore)
+  if(WIN32)
+    target_link_libraries(test_integration PRIVATE Ws2_32 bcrypt)
+    target_compile_definitions(test_integration PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  endif()
+  set_target_properties(test_integration PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
+  add_test(NAME test_integration COMMAND test_integration)
+
+  # Bloom filter tests (if source exists)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bloom.cpp")
+    add_executable(test_bloom tests/test_bloom.cpp)
+    target_include_directories(test_bloom PRIVATE src)
+    target_link_libraries(test_bloom PRIVATE miqcore)
+    add_test(NAME test_bloom COMMAND test_bloom)
+  endif()
+
+  # Header format tests (if source exists)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_header_format.cpp")
+    add_executable(test_header_format tests/test_header_format.cpp)
+    target_include_directories(test_header_format PRIVATE src)
+    target_link_libraries(test_header_format PRIVATE miqcore)
+    add_test(NAME test_header_format COMMAND test_header_format)
+  endif()
+
+  message(STATUS "Building tests: test_crypto, test_ser, test_integration")
 endif()
 
 # ---------------- Wallet encryption flag note ----------------

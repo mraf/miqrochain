@@ -149,21 +149,42 @@ The node will:
 
 ### Mining
 
-Mining is done with the standalone `miqminer_rpc` client:
+#### Official Mining Path: `miqminer_rpc`
+
+Mining is performed using the standalone `miqminer_rpc` client, which connects to a running node via JSON-RPC. This separation provides:
+
+- **Security**: Mining keys are not stored on the node
+- **Flexibility**: Mine on a different machine than the node
+- **Stability**: Miner crashes don't affect the node
 
 ```bash
-# Generate a mining address first
+# 1. Generate a mining address
 ./build/miq-keygen
+# Output: Address: 5Abc123...  Private Key: ...
 
-# Start mining (connects to local node RPC)
-./build/miqminer_rpc --rpc http://127.0.0.1:9834 --address <your-address> --threads 4
+# 2. Start your node (terminal 1)
+./build/miqrod --datadir ./data
+
+# 3. Start mining (terminal 2)
+./build/miqminer_rpc --rpc http://127.0.0.1:9834 --address 5Abc123... --threads 4
 ```
 
-Options:
-- `--rpc <url>` - Node RPC endpoint
-- `--address <addr>` - Reward address (base58check)
-- `--threads <n>` - Number of mining threads (0 = auto)
-- `--stratum <host:port>` - Connect to stratum pool instead
+#### Miner Options
+
+| Option | Description |
+|--------|-------------|
+| `--rpc <url>` | Node RPC endpoint (default: http://127.0.0.1:9834) |
+| `--address <addr>` | Reward address (base58check format, starts with '5') |
+| `--threads <n>` | CPU mining threads (0 = auto-detect cores) |
+| `--stratum <host:port>` | Connect to stratum pool instead of solo mining |
+| `--gpu` | Enable GPU mining (requires OpenCL) |
+
+#### Mining Economics
+
+- **Initial Block Reward**: 50 MIQ
+- **Halving Interval**: Every 262,800 blocks (~4 years)
+- **Coinbase Maturity**: 100 blocks (rewards locked until 100 confirmations)
+- **Maximum Supply**: 26,280,000 MIQ
 
 ### JSON-RPC API
 
@@ -230,6 +251,30 @@ curl -s -H 'content-type: application/json' \
 | `--seed 1` | Run in seed mode |
 | `--reindex` | Rebuild UTXO set from blocks |
 | `--loglevel <n>` | Log verbosity (0=trace, 5=fatal) |
+| `--network <net>` | Network: mainnet, testnet, or regtest |
+
+### Network Selection
+
+Miqrochain supports three networks:
+
+| Network | P2P Port | RPC Port | Use Case |
+|---------|----------|----------|----------|
+| mainnet | 9883 | 9834 | Production (default) |
+| testnet | 19883 | 19834 | Public testing |
+| regtest | 29883 | 29834 | Local development |
+
+```bash
+# Run on testnet
+./build/miqrod --datadir ./testnet-data --network testnet
+
+# Run on regtest (instant mining for development)
+./build/miqrod --datadir ./regtest-data --network regtest
+```
+
+Regtest features:
+- Minimal difficulty (instant block mining)
+- No DNS seeds (isolated network)
+- Short halving interval for testing
 
 ### Environment Variables
 
@@ -276,6 +321,15 @@ data/
 
 ## Security
 
+For comprehensive security documentation, see **[FIREWALL.md](FIREWALL.md)**.
+
+### Quick Security Checklist
+
+- [ ] RPC bound to 127.0.0.1 only (default)
+- [ ] P2P port (9883) open for network participation
+- [ ] RPC port (9834) blocked from internet
+- [ ] Node running as non-root user
+
 ### RPC Security
 
 ⚠️ **Warning:** RPC is unauthenticated by default. Always:
@@ -290,12 +344,29 @@ sudo ufw allow 9883/tcp           # P2P
 sudo ufw deny 9834/tcp            # Block remote RPC
 ```
 
-### Cookie Authentication
+### RPC Authentication
 
-For local auth, the node can use cookie-based authentication:
+**Cookie-based** (recommended for local):
+```bash
+# Auto-generated at startup
+cat data/.cookie
+# Use: curl -u "$(cat data/.cookie)" ...
 ```
-data/.cookie    # Auto-generated auth token
+
+**Token-based** (for remote access):
+```bash
+export MIQ_RPC_TOKEN="your-secret-token"
+./build/miqrod --datadir ./data
+# Use: curl -H "Authorization: Bearer your-secret-token" ...
 ```
+
+### P2P Security
+
+The node automatically enforces:
+- Per-IP connection limits (max 3 per IP)
+- Per-subnet limits (max 6 per /24)
+- Header flood protection
+- Automatic banning of misbehaving peers
 
 ---
 
