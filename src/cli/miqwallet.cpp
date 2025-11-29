@@ -303,6 +303,8 @@ namespace wallet_config {
     static constexpr int CONNECTION_TIMEOUT_MS = 8000;
     // v10.0 FIX: Reduced from 15s to 5s - faster broadcast timeout
     static constexpr int BROADCAST_TIMEOUT_MS = 5000;
+    // v2.0: RPC timeout for all RPC operations
+    static constexpr int RPC_TIMEOUT_MS = 5000;
 
     // Security limits - hardened
     static constexpr size_t MAX_UTXO_COUNT = 100000;
@@ -407,9 +409,397 @@ namespace wallet_config {
 #include "tx.h"
 #include "crypto/ecdsa_iface.h"
 
-#include "wallet/p2p_light.h"
-#include "wallet/spv_simple.h"
+// v2.0 STABLE: Full RPC-only wallet - Minimal includes for type definitions
 #include "wallet/http_client.h"
+#include "wallet/spv_simple.h"  // For miq::UtxoLite type definition (no P2P calls used)
+
+// =============================================================================
+// FULL RPC WALLET CLIENT v2.0 - Zero P2P dependencies
+// All network operations use JSON-RPC exclusively
+// =============================================================================
+namespace rpc_wallet {
+
+// RPC endpoint configuration
+struct RpcEndpoint {
+    std::string host;
+    uint16_t port;
+    std::string token;
+    int timeout_ms{5000};
+
+    std::string to_string() const {
+        return host + ":" + std::to_string(port);
+    }
+};
+
+// Build RPC endpoints from seed candidates (P2P port -> RPC port conversion)
+static std::vector<RpcEndpoint> build_rpc_endpoints(
+    const std::string& cli_host, const std::string& cli_port)
+{
+    std::vector<RpcEndpoint> out;
+    const uint16_t default_rpc_port = miq::RPC_PORT;
+
+    auto add_endpoint = [&](const std::string& h, uint16_t p) {
+        for (const auto& x : out) {
+            if (x.host == h && x.port == p) return;
+        }
+        out.push_back({h, p, "", 5000});
+    };
+
+    // 1) CLI argument (highest priority)
+    if (!cli_host.empty()) {
+        uint16_t p = cli_port.empty() ? default_rpc_port : (uint16_t)std::stoi(cli_port);
+        add_endpoint(cli_host, p);
+    }
+
+    // 2) Environment variable MIQ_RPC_HOST
+    if (const char* env = std::getenv("MIQ_RPC_HOST")) {
+        std::string s = env;
+        std::string h = s;
+        uint16_t p = default_rpc_port;
+        size_t col = s.find(':');
+        if (col != std::string::npos) {
+            h = s.substr(0, col);
+            p = (uint16_t)std::stoi(s.substr(col + 1));
+        }
+        add_endpoint(h, p);
+    }
+
+    // 3) Localhost (critical for local node)
+    add_endpoint("127.0.0.1", default_rpc_port);
+
+    // 4) Hardcoded public nodes
+    add_endpoint("62.38.73.147", default_rpc_port);
+
+    return out;
+}
+
+// Make RPC call to endpoint
+static bool rpc_call(
+    const RpcEndpoint& ep,
+    const std::string& method,
+    const std::string& params_json,
+    std::string& result,
+    std::string& err)
+{
+    // Build JSON-RPC request
+    std::string body = R"({"jsonrpc":"2.0","id":1,"method":")" + method + "\"";
+    if (!params_json.empty()) {
+        body += ",\"params\":" + params_json;
+    }
+    body += "}";
+
+    std::vector<std::pair<std::string, std::string>> headers;
+    if (!ep.token.empty()) {
+        headers.emplace_back("X-Auth-Token", ep.token);
+    }
+    headers.emplace_back("Content-Type", "application/json");
+
+    miq::HttpResponse resp;
+    if (!miq::http_post(ep.host, ep.port, "/", body, headers, resp, ep.timeout_ms)) {
+        err = "Connection failed to " + ep.to_string();
+        return false;
+    }
+
+    if (resp.code != 200) {
+        err = "HTTP " + std::to_string(resp.code) + " from " + ep.to_string();
+        return false;
+    }
+
+    // Check for RPC error
+    if (resp.body.find("\"error\":null") == std::string::npos &&
+        resp.body.find("\"error\": null") == std::string::npos) {
+        size_t err_pos = resp.body.find("\"error\":");
+        if (err_pos != std::string::npos) {
+            size_t msg_pos = resp.body.find("\"message\":", err_pos);
+            if (msg_pos != std::string::npos) {
+                size_t start = resp.body.find('"', msg_pos + 10) + 1;
+                size_t end = resp.body.find('"', start);
+                if (start < end) {
+                    err = "RPC error: " + resp.body.substr(start, end - start);
+                    return false;
+                }
+            }
+        }
+    }
+
+    result = resp.body;
+    return true;
+}
+
+// Try RPC call with failover across multiple endpoints
+static bool rpc_call_any(
+    const std::vector<RpcEndpoint>& endpoints,
+    const std::string& method,
+    const std::string& params_json,
+    std::string& result,
+    std::string& used_endpoint,
+    std::string& err)
+{
+    for (const auto& ep : endpoints) {
+        std::string local_err;
+        if (rpc_call(ep, method, params_json, result, local_err)) {
+            used_endpoint = ep.to_string();
+            return true;
+        }
+        err = local_err;
+    }
+    return false;
+}
+
+// Parse JSON number from result
+static bool parse_json_number(const std::string& json, const std::string& key, int64_t& out) {
+    std::string search = "\"" + key + "\":";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return false;
+    pos += search.length();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+
+    std::string num;
+    while (pos < json.size() && (std::isdigit(json[pos]) || json[pos] == '-' || json[pos] == '.')) {
+        num += json[pos++];
+    }
+    if (num.empty()) return false;
+    out = std::stoll(num);
+    return true;
+}
+
+// Parse JSON string from result
+static bool parse_json_string(const std::string& json, const std::string& key, std::string& out) {
+    std::string search = "\"" + key + "\":";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return false;
+    pos += search.length();
+    while (pos < json.size() && json[pos] != '"') pos++;
+    if (pos >= json.size()) return false;
+    pos++; // skip opening quote
+    size_t end = json.find('"', pos);
+    if (end == std::string::npos) return false;
+    out = json.substr(pos, end - pos);
+    return true;
+}
+
+// =============================================================================
+// RPC UTXO FETCHING - Replaces P2P SPV
+// =============================================================================
+struct RpcUtxo {
+    std::vector<uint8_t> txid;
+    uint32_t vout;
+    uint64_t value;
+    std::vector<uint8_t> pkh;
+    uint32_t height;
+    bool coinbase;
+};
+
+// Get UTXOs for an address via RPC
+static bool rpc_get_address_utxos(
+    const std::vector<RpcEndpoint>& endpoints,
+    const std::string& address,
+    std::vector<RpcUtxo>& utxos,
+    std::string& used_endpoint,
+    std::string& err)
+{
+    std::string params = "[\"" + address + "\"]";
+    std::string result;
+
+    if (!rpc_call_any(endpoints, "getaddressutxos", params, result, used_endpoint, err)) {
+        return false;
+    }
+
+    // Parse UTXO array from JSON result
+    // Format: {"result":[{"txid":"...","vout":N,"value":N,"height":N,"coinbase":bool},...]}
+    size_t arr_start = result.find("[");
+    size_t arr_end = result.rfind("]");
+    if (arr_start == std::string::npos || arr_end == std::string::npos) {
+        return true; // Empty result is OK
+    }
+
+    // Simple JSON array parsing
+    std::string arr = result.substr(arr_start, arr_end - arr_start + 1);
+    size_t pos = 1; // skip '['
+
+    while (pos < arr.size()) {
+        size_t obj_start = arr.find('{', pos);
+        if (obj_start == std::string::npos) break;
+
+        size_t obj_end = arr.find('}', obj_start);
+        if (obj_end == std::string::npos) break;
+
+        std::string obj = arr.substr(obj_start, obj_end - obj_start + 1);
+
+        RpcUtxo utxo;
+        std::string txid_hex;
+        int64_t vout_val = 0, value_val = 0, height_val = 0;
+
+        if (parse_json_string(obj, "txid", txid_hex)) {
+            utxo.txid = miq::from_hex(txid_hex);
+        }
+        if (parse_json_number(obj, "vout", vout_val)) {
+            utxo.vout = (uint32_t)vout_val;
+        }
+        if (parse_json_number(obj, "value", value_val)) {
+            utxo.value = (uint64_t)value_val;
+        }
+        if (parse_json_number(obj, "height", height_val)) {
+            utxo.height = (uint32_t)height_val;
+        }
+        utxo.coinbase = obj.find("\"coinbase\":true") != std::string::npos;
+
+        // Decode PKH from address
+        std::vector<uint8_t> pkh;
+        if (miq::AddressToPkh(address, pkh)) {
+            utxo.pkh = pkh;
+        }
+
+        if (!utxo.txid.empty() && utxo.value > 0) {
+            utxos.push_back(utxo);
+        }
+
+        pos = obj_end + 1;
+    }
+
+    return true;
+}
+
+// Get blockchain info via RPC
+static bool rpc_get_blockchain_info(
+    const std::vector<RpcEndpoint>& endpoints,
+    uint32_t& height,
+    std::string& best_hash,
+    std::string& used_endpoint,
+    std::string& err)
+{
+    std::string result;
+    if (!rpc_call_any(endpoints, "getblockchaininfo", "", result, used_endpoint, err)) {
+        return false;
+    }
+
+    int64_t h = 0;
+    if (parse_json_number(result, "blocks", h)) {
+        height = (uint32_t)h;
+    }
+    parse_json_string(result, "bestblockhash", best_hash);
+    return true;
+}
+
+// Get mempool info via RPC
+static bool rpc_get_mempool_info(
+    const std::vector<RpcEndpoint>& endpoints,
+    int64_t& size,
+    int64_t& bytes,
+    std::string& err)
+{
+    std::string result, used;
+    if (!rpc_call_any(endpoints, "getmempoolinfo", "", result, used, err)) {
+        return false;
+    }
+
+    parse_json_number(result, "size", size);
+    parse_json_number(result, "bytes", bytes);
+    return true;
+}
+
+// =============================================================================
+// RPC TRANSACTION BROADCAST - Replaces P2P broadcast
+// =============================================================================
+static bool rpc_send_raw_transaction(
+    const std::vector<RpcEndpoint>& endpoints,
+    const std::vector<uint8_t>& raw_tx,
+    std::string& txid_out,
+    std::string& used_endpoint,
+    std::string& err)
+{
+    std::string hex_tx = miq::to_hex(raw_tx);
+    std::string params = "[\"" + hex_tx + "\"]";
+    std::string result;
+
+    if (!rpc_call_any(endpoints, "sendrawtransaction", params, result, used_endpoint, err)) {
+        return false;
+    }
+
+    // Extract txid from result
+    if (!parse_json_string(result, "result", txid_out)) {
+        // Try alternate format
+        size_t start = result.find("\"result\":\"");
+        if (start != std::string::npos) {
+            start += 10;
+            size_t end = result.find('"', start);
+            if (end != std::string::npos) {
+                txid_out = result.substr(start, end - start);
+            }
+        }
+    }
+
+    return !txid_out.empty();
+}
+
+// Verify transaction is in mempool or blockchain
+static bool rpc_verify_transaction(
+    const std::vector<RpcEndpoint>& endpoints,
+    const std::string& txid_hex,
+    int& confirmations,
+    std::string& err)
+{
+    std::string params = "[\"" + txid_hex + "\", true]";
+    std::string result, used;
+
+    if (!rpc_call_any(endpoints, "getrawtransaction", params, result, used, err)) {
+        // Try mempool check
+        std::string mempool_result;
+        if (rpc_call_any(endpoints, "getrawmempool", "", mempool_result, used, err)) {
+            if (mempool_result.find(txid_hex) != std::string::npos) {
+                confirmations = 0;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int64_t conf = 0;
+    parse_json_number(result, "confirmations", conf);
+    confirmations = (int)conf;
+    return true;
+}
+
+// Get network info via RPC
+static bool rpc_get_network_info(
+    const std::vector<RpcEndpoint>& endpoints,
+    int& connections,
+    std::string& version,
+    std::string& err)
+{
+    std::string result, used;
+    if (!rpc_call_any(endpoints, "getnetworkinfo", "", result, used, err)) {
+        return false;
+    }
+
+    int64_t conn = 0;
+    parse_json_number(result, "connections", conn);
+    connections = (int)conn;
+    parse_json_string(result, "subversion", version);
+    return true;
+}
+
+// Health check - verify RPC connectivity
+static bool rpc_health_check(
+    const std::vector<RpcEndpoint>& endpoints,
+    std::string& status,
+    std::string& used_endpoint)
+{
+    std::string result, err;
+    if (rpc_call_any(endpoints, "getinfo", "", result, used_endpoint, err)) {
+        status = "connected";
+        return true;
+    }
+    // Try getblockchaininfo as fallback
+    if (rpc_call_any(endpoints, "getblockchaininfo", "", result, used_endpoint, err)) {
+        status = "connected";
+        return true;
+    }
+    status = "offline: " + err;
+    return false;
+}
+
+} // namespace rpc_wallet
 
 using miq::CHAIN_NAME;
 using miq::COIN;
@@ -501,6 +891,77 @@ namespace ui {
         // Allow override via environment variable
         const char* no_utf8 = std::getenv("MIQ_NO_UTF8");
         if (no_utf8 && *no_utf8) g_use_utf8 = false;
+    }
+
+    // ==========================================================================
+    // ZERO-FLICKER FRAME BUFFER SYSTEM v2.0
+    // All splash screen rendering goes through this buffer for atomic display
+    // ==========================================================================
+    class FrameBuffer {
+    private:
+        std::ostringstream buffer_;
+        bool active_{false};
+        static FrameBuffer* instance_;
+
+    public:
+        static FrameBuffer& get() {
+            static FrameBuffer fb;
+            return fb;
+        }
+
+        void begin() {
+            buffer_.str("");
+            buffer_.clear();
+            active_ = true;
+        }
+
+        void end() {
+            if (active_) {
+                // Atomic flush: move cursor home, output entire buffer at once
+                std::cout << "\033[H" << buffer_.str() << std::flush;
+                active_ = false;
+            }
+        }
+
+        void write(const std::string& s) {
+            if (active_) {
+                buffer_ << s;
+            } else {
+                std::cout << s;
+            }
+        }
+
+        void writeln(const std::string& s = "") {
+            write(s + "\n");
+        }
+
+        bool is_active() const { return active_; }
+
+        std::ostream& stream() {
+            return active_ ? buffer_ : std::cout;
+        }
+    };
+
+    // Global frame buffer helpers
+    inline void fb_begin() { FrameBuffer::get().begin(); }
+    inline void fb_end() { FrameBuffer::get().end(); }
+    inline void fb_write(const std::string& s) { FrameBuffer::get().write(s); }
+    inline void fb_writeln(const std::string& s = "") { FrameBuffer::get().writeln(s); }
+    inline std::ostream& fb_out() { return FrameBuffer::get().stream(); }
+
+    // Prepare screen for buffered rendering (hide cursor, save state)
+    inline void prepare_splash() {
+        std::cout << "\033[?25l" << std::flush; // Hide cursor
+    }
+
+    // Finish splash screen (show cursor, restore state)
+    inline void finish_splash() {
+        std::cout << "\033[?25h" << std::flush; // Show cursor
+    }
+
+    // Clear screen with buffered mode awareness
+    inline void clear_for_splash() {
+        std::cout << "\033[2J\033[H" << std::flush;
     }
 
     // ANSI color codes
@@ -1426,99 +1887,108 @@ namespace ui {
     }
 
     // Draw animated splash screen with clean modern design
+    // v2.0: ZERO-FLICKER using buffered rendering
     static void draw_splash_screen(const std::string& status, double progress, int tick,
                                    const std::string& detail = "") {
         auto bc = get_box_chars();
+        auto& out = fb_out();
 
-        // Clear screen and position cursor
-        std::cout << "\033[2J\033[H" << std::flush;
+        // Start buffered frame for zero-flicker
+        fb_begin();
 
         const int WIDTH = 70;
-        std::cout << "\n";
+        out << "\n";
 
         // Stylized RYTHMIUM logo
         if (g_use_utf8 && g_use_colors) {
             std::string logo_color = "\033[38;5;51m\033[1m";  // Bright cyan bold
-            std::cout << logo_color << "    ███╗   ███╗██╗ ██████╗ ██████╗  ██████╗ " << reset() << "\n";
-            std::cout << logo_color << "    ████╗ ████║██║██╔═══██╗██╔══██╗██╔═══██╗" << reset() << "\n";
-            std::cout << logo_color << "    ██╔████╔██║██║██║   ██║██████╔╝██║   ██║" << reset() << "\n";
-            std::cout << logo_color << "    ██║╚██╔╝██║██║██║▄▄ ██║██╔══██╗██║   ██║" << reset() << "\n";
-            std::cout << logo_color << "    ██║ ╚═╝ ██║██║╚██████╔╝██║  ██║╚██████╔╝" << reset() << "\n";
-            std::cout << logo_color << "    ╚═╝     ╚═╝╚═╝ ╚══▀▀═╝ ╚═╝  ╚═╝ ╚═════╝ " << reset() << "\n";
+            out << logo_color << "    ███╗   ███╗██╗ ██████╗ ██████╗  ██████╗ " << reset() << "\n";
+            out << logo_color << "    ████╗ ████║██║██╔═══██╗██╔══██╗██╔═══██╗" << reset() << "\n";
+            out << logo_color << "    ██╔████╔██║██║██║   ██║██████╔╝██║   ██║" << reset() << "\n";
+            out << logo_color << "    ██║╚██╔╝██║██║██║▄▄ ██║██╔══██╗██║   ██║" << reset() << "\n";
+            out << logo_color << "    ██║ ╚═╝ ██║██║╚██████╔╝██║  ██║╚██████╔╝" << reset() << "\n";
+            out << logo_color << "    ╚═╝     ╚═╝╚═╝ ╚══▀▀═╝ ╚═╝  ╚═╝ ╚═════╝ " << reset() << "\n";
         } else {
-            std::cout << cyan() << bold() << "    RYTHMIUM WALLET" << reset() << "\n";
+            out << cyan() << bold() << "    RYTHMIUM WALLET" << reset() << "\n";
         }
 
         // Version with chain name
-        std::cout << "\n";
-        std::cout << dim() << "    v1.0  " << (g_use_utf8 ? "│" : "|") << "  WALLET  " << (g_use_utf8 ? "│" : "|") << "  STABLE" << reset() << "\n";
-        std::cout << "\n";
+        out << "\n";
+        out << dim() << "    v2.0  " << (g_use_utf8 ? "│" : "|") << "  RPC WALLET  " << (g_use_utf8 ? "│" : "|") << "  STABLE" << reset() << "\n";
+        out << "\n";
 
         // Sync status header
-        std::cout << "    ";
+        out << "    ";
         if (progress >= 1.0) {
-            std::cout << "\033[38;5;46m\033[1m" << (g_use_utf8 ? "✓ " : "[OK] ") << status << reset();
+            out << "\033[38;5;46m\033[1m" << (g_use_utf8 ? "✓ " : "[OK] ") << status << reset();
         } else {
-            std::cout << yellow() << splash_spinner(tick) << reset() << " " << bold() << status << reset();
+            out << yellow() << splash_spinner(tick) << reset() << " " << bold() << status << reset();
         }
-        std::cout << "\n\n";
+        out << "\n\n";
 
         // Large progress bar
         int bar_width = WIDTH - 8;
-        std::cout << "    " << splash_progress_bar(progress, bar_width, tick) << "\n";
+        out << "    " << splash_progress_bar(progress, bar_width, tick) << "\n";
 
         // Big percentage display
-        std::cout << "\n";
+        out << "\n";
         std::ostringstream pct;
         pct << std::fixed << std::setprecision(2) << (progress * 100.0) << "%";
         std::string pct_str = pct.str();
 
-        std::cout << "    ";
+        out << "    ";
         if (progress >= 0.99) {
-            std::cout << "\033[38;5;46m\033[1m" << pct_str << reset();  // Bright green + bold
+            out << "\033[38;5;46m\033[1m" << pct_str << reset();  // Bright green + bold
         } else if (progress >= 0.75) {
-            std::cout << "\033[38;5;47m" << pct_str << reset();  // Green
+            out << "\033[38;5;47m" << pct_str << reset();  // Green
         } else if (progress >= 0.50) {
-            std::cout << "\033[38;5;226m" << pct_str << reset();  // Yellow
+            out << "\033[38;5;226m" << pct_str << reset();  // Yellow
         } else if (progress >= 0.25) {
-            std::cout << "\033[38;5;214m" << pct_str << reset();  // Orange
+            out << "\033[38;5;214m" << pct_str << reset();  // Orange
         } else {
-            std::cout << "\033[38;5;51m" << pct_str << reset();  // Cyan
+            out << "\033[38;5;51m" << pct_str << reset();  // Cyan
         }
 
         // Detail line (optional)
         if (!detail.empty()) {
-            std::cout << "  " << dim() << detail << reset();
+            out << "  " << dim() << detail << reset();
         }
-        std::cout << "\n";
+        out << "\n";
 
         // Status box
-        std::cout << "\n";
-        std::cout << "    " << dim() << bc.tl;
-        for (int i = 0; i < WIDTH - 10; i++) std::cout << bc.h;
-        std::cout << bc.tr << reset() << "\n";
+        out << "\n";
+        out << "    " << dim() << bc.tl;
+        for (int i = 0; i < WIDTH - 10; i++) out << bc.h;
+        out << bc.tr << reset() << "\n";
 
-        std::cout << "    " << dim() << bc.v << reset();
-        std::cout << " " << dim() << "Ready " << (g_use_utf8 ? "•" : "|");
-        std::cout << " Bulletproof " << (g_use_utf8 ? "•" : "|");
-        std::cout << " Professional" << reset();
-        std::cout << std::string(WIDTH - 46, ' ');
-        std::cout << dim() << bc.v << reset() << "\n";
+        out << "    " << dim() << bc.v << reset();
+        out << " " << dim() << "RPC Mode " << (g_use_utf8 ? "•" : "|");
+        out << " Zero-P2P " << (g_use_utf8 ? "•" : "|");
+        out << " Professional" << reset();
+        out << std::string(WIDTH - 45, ' ');
+        out << dim() << bc.v << reset() << "\n";
 
-        std::cout << "    " << dim() << bc.bl;
-        for (int i = 0; i < WIDTH - 10; i++) std::cout << bc.h;
-        std::cout << bc.br << reset() << "\n";
+        out << "    " << dim() << bc.bl;
+        for (int i = 0; i < WIDTH - 10; i++) out << bc.h;
+        out << bc.br << reset() << "\n";
 
-        std::cout << "\n";
-        std::cout << std::flush;
+        out << "\n";
+
+        // End buffered frame - atomic flush
+        fb_end();
     }
 
     // Complete startup splash sequence
+    // v2.0: Uses buffered rendering for zero-flicker
     static void run_startup_splash(const std::string& chain_name,
                                    const std::vector<std::pair<std::string, std::string>>& seeds) {
+        // Prepare for splash rendering
+        prepare_splash();
+        clear_for_splash();
+
         // Phase 1: Initializing
         for (int i = 0; i < 8; i++) {
-            draw_splash_screen("Initializing wallet engine...", 0.1 + (i * 0.05), i);
+            draw_splash_screen("Initializing RPC wallet engine...", 0.1 + (i * 0.05), i);
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
 
@@ -1529,10 +1999,10 @@ namespace ui {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
 
-        // Phase 3: Discovering nodes
-        std::string seed_info = seeds.empty() ? "localhost" : seeds[0].first;
+        // Phase 3: Connecting to RPC
+        std::string seed_info = seeds.empty() ? "localhost:9834" : seeds[0].first + ":" + seeds[0].second;
         for (int i = 0; i < 10; i++) {
-            draw_splash_screen("Discovering network nodes...", 0.5 + (i * 0.03), i + 16,
+            draw_splash_screen("Connecting to RPC endpoint...", 0.5 + (i * 0.03), i + 16,
                               "Primary: " + seed_info);
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
@@ -1545,13 +2015,16 @@ namespace ui {
 
         // Phase 5: Ready
         for (int i = 0; i < 10; i++) {
-            draw_splash_screen("WALLET READY", 1.0, i + 34,
-                              seeds.size() > 0 ? std::to_string(seeds.size()) + " seed node(s) available" : "");
+            draw_splash_screen("RPC WALLET READY", 1.0, i + 34,
+                              seeds.size() > 0 ? std::to_string(seeds.size()) + " RPC endpoint(s) available" : "");
             std::this_thread::sleep_for(std::chrono::milliseconds(60));
         }
 
         // Final pause at 100%
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // Finish splash rendering
+        finish_splash();
     }
 
     // Transaction confirmation splash with progress
@@ -1616,14 +2089,17 @@ namespace ui {
     // =========================================================================
 
     // Generic action splash screen with customizable content
+    // v2.0: ZERO-FLICKER using buffered rendering
     static void draw_action_splash(const std::string& title, const std::string& status,
                                    double progress, int tick, const std::string& detail = "",
                                    const std::string& color = "cyan") {
-        // Clear screen and position cursor
-        std::cout << "\033[2J\033[H" << std::flush;
+        auto& out = fb_out();
+
+        // Start buffered frame for zero-flicker
+        fb_begin();
 
         const int WIDTH = 62;
-        std::cout << "\n\n";
+        out << "\n\n";
 
         // Get color based on action
         std::string title_col = cyan();
@@ -1634,81 +2110,82 @@ namespace ui {
         else if (color == "blue") { title_col = blue(); accent_col = blue(); }
 
         // Title box
-        std::cout << title_col << bold();
-        std::cout << "    +";
-        for (int i = 0; i < WIDTH - 2; i++) std::cout << "=";
-        std::cout << "+" << reset() << "\n";
+        out << title_col << bold();
+        out << "    +";
+        for (int i = 0; i < WIDTH - 2; i++) out << "=";
+        out << "+" << reset() << "\n";
 
         // Title centered
         int title_pad = (WIDTH - 2 - (int)title.size()) / 2;
-        std::cout << title_col << bold() << "    |" << reset();
-        std::cout << std::string(title_pad, ' ');
-        std::cout << title_col << bold() << title << reset();
-        std::cout << std::string(WIDTH - 2 - title_pad - (int)title.size(), ' ');
-        std::cout << title_col << bold() << "|" << reset() << "\n";
+        out << title_col << bold() << "    |" << reset();
+        out << std::string(title_pad, ' ');
+        out << title_col << bold() << title << reset();
+        out << std::string(WIDTH - 2 - title_pad - (int)title.size(), ' ');
+        out << title_col << bold() << "|" << reset() << "\n";
 
-        std::cout << title_col << bold();
-        std::cout << "    +";
-        for (int i = 0; i < WIDTH - 2; i++) std::cout << "-";
-        std::cout << "+" << reset() << "\n";
+        out << title_col << bold();
+        out << "    +";
+        for (int i = 0; i < WIDTH - 2; i++) out << "-";
+        out << "+" << reset() << "\n";
 
         // Status line with spinner
-        std::cout << title_col << "    |" << reset();
-        std::cout << " " << yellow() << splash_spinner(tick) << reset() << " ";
-        std::cout << status;
+        out << title_col << "    |" << reset();
+        out << " " << yellow() << splash_spinner(tick) << reset() << " ";
+        out << status;
         int stat_pad = WIDTH - 7 - (int)status.size();
-        std::cout << std::string(stat_pad > 0 ? stat_pad : 1, ' ');
-        std::cout << title_col << "|" << reset() << "\n";
+        out << std::string(stat_pad > 0 ? stat_pad : 1, ' ');
+        out << title_col << "|" << reset() << "\n";
 
         // Empty line
-        std::cout << title_col << "    |" << reset();
-        std::cout << std::string(WIDTH - 2, ' ');
-        std::cout << title_col << "|" << reset() << "\n";
+        out << title_col << "    |" << reset();
+        out << std::string(WIDTH - 2, ' ');
+        out << title_col << "|" << reset() << "\n";
 
         // Progress bar line
-        std::cout << title_col << "    |" << reset();
-        std::cout << " " << splash_progress_bar(progress, WIDTH - 6, tick) << " ";
-        std::cout << title_col << "|" << reset() << "\n";
+        out << title_col << "    |" << reset();
+        out << " " << splash_progress_bar(progress, WIDTH - 6, tick) << " ";
+        out << title_col << "|" << reset() << "\n";
 
         // Percentage line
-        std::cout << title_col << "    |" << reset();
+        out << title_col << "    |" << reset();
         std::ostringstream pct;
         pct << std::fixed << std::setprecision(1) << (progress * 100.0) << "%";
         std::string pct_str = pct.str();
         int pct_pad = (WIDTH - 2 - (int)pct_str.size()) / 2;
-        std::cout << std::string(pct_pad, ' ');
+        out << std::string(pct_pad, ' ');
         if (progress >= 1.0) {
-            std::cout << green() << bold() << pct_str << reset();
+            out << green() << bold() << pct_str << reset();
         } else if (progress >= 0.75) {
-            std::cout << green() << pct_str << reset();
+            out << green() << pct_str << reset();
         } else {
-            std::cout << accent_col << pct_str << reset();
+            out << accent_col << pct_str << reset();
         }
-        std::cout << std::string(WIDTH - 2 - pct_pad - (int)pct_str.size(), ' ');
-        std::cout << title_col << "|" << reset() << "\n";
+        out << std::string(WIDTH - 2 - pct_pad - (int)pct_str.size(), ' ');
+        out << title_col << "|" << reset() << "\n";
 
         // Detail line (optional)
         if (!detail.empty()) {
-            std::cout << title_col << "    |" << reset();
+            out << title_col << "    |" << reset();
             std::string det = detail.size() > (size_t)(WIDTH - 4) ? detail.substr(0, WIDTH - 7) + "..." : detail;
             int det_pad = (WIDTH - 2 - (int)det.size()) / 2;
-            std::cout << std::string(det_pad, ' ');
-            std::cout << dim() << det << reset();
-            std::cout << std::string(WIDTH - 2 - det_pad - (int)det.size(), ' ');
-            std::cout << title_col << "|" << reset() << "\n";
+            out << std::string(det_pad, ' ');
+            out << dim() << det << reset();
+            out << std::string(WIDTH - 2 - det_pad - (int)det.size(), ' ');
+            out << title_col << "|" << reset() << "\n";
         } else {
-            std::cout << title_col << "    |" << reset();
-            std::cout << std::string(WIDTH - 2, ' ');
-            std::cout << title_col << "|" << reset() << "\n";
+            out << title_col << "    |" << reset();
+            out << std::string(WIDTH - 2, ' ');
+            out << title_col << "|" << reset() << "\n";
         }
 
         // Bottom border
-        std::cout << title_col << bold();
-        std::cout << "    +";
-        for (int i = 0; i < WIDTH - 2; i++) std::cout << "=";
-        std::cout << "+" << reset() << "\n\n";
+        out << title_col << bold();
+        out << "    +";
+        for (int i = 0; i < WIDTH - 2; i++) out << "=";
+        out << "+" << reset() << "\n\n";
 
-        std::cout << std::flush;
+        // End buffered frame - atomic flush
+        fb_end();
     }
 
     // SEND Transaction Splash Screen
@@ -7321,8 +7798,84 @@ static std::vector<std::pair<std::string,std::string>> build_seed_candidates(
 }
 
 // =============================================================================
-// SPV COLLECTION WITH PROGRESS
+// RPC-BASED UTXO COLLECTION v2.0 - Fully replaces P2P SPV
 // =============================================================================
+static bool rpc_collect_utxos(
+    const std::vector<std::pair<std::string,std::string>>& seeds,
+    const std::vector<std::vector<uint8_t>>& pkhs,
+    uint32_t window,
+    const std::string& cache_dir,
+    std::vector<miq::UtxoLite>& out,
+    std::string& used_seed,
+    std::string& err_out)
+{
+    (void)window;     // Not needed for RPC mode
+    (void)cache_dir;  // Not needed for RPC mode
+
+    // Clear output to prevent accumulation from previous failed attempts
+    out.clear();
+
+    // Build RPC endpoints from seeds (convert P2P port to RPC port)
+    std::vector<rpc_wallet::RpcEndpoint> endpoints;
+    for(const auto& [host, port] : seeds){
+        uint16_t p2p_port = (uint16_t)std::stoi(port);
+        // Convert P2P port to RPC port (P2P 9883 -> RPC 9834)
+        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port + 1);
+        endpoints.push_back({host, rpc_port, "", wallet_config::RPC_TIMEOUT_MS});
+    }
+
+    // Add localhost as fallback
+    bool has_localhost = false;
+    for(const auto& ep : endpoints){
+        if(ep.host == "127.0.0.1") has_localhost = true;
+    }
+    if(!has_localhost){
+        endpoints.insert(endpoints.begin(), {"127.0.0.1", (uint16_t)miq::RPC_PORT, "", wallet_config::RPC_TIMEOUT_MS});
+    }
+
+    // For each PKH, convert to address and fetch UTXOs via RPC
+    for(const auto& pkh : pkhs){
+        std::string address = miq::base58check_encode(miq::VERSION_P2PKH, pkh);
+
+        ui::print_progress("Fetching UTXOs for " + address.substr(0, 12) + "...");
+
+        std::vector<rpc_wallet::RpcUtxo> rpc_utxos;
+        std::string local_err;
+
+        if(rpc_wallet::rpc_get_address_utxos(endpoints, address, rpc_utxos, used_seed, local_err)){
+            // Convert RPC UTXOs to miq::UtxoLite format
+            for(const auto& u : rpc_utxos){
+                miq::UtxoLite lite;
+                lite.txid = u.txid;
+                lite.vout = u.vout;
+                lite.value = u.value;
+                lite.pkh = u.pkh;
+                lite.height = u.height;
+                lite.coinbase = u.coinbase;
+                out.push_back(lite);
+            }
+        } else {
+            err_out = local_err;
+            // Continue with other addresses even if one fails
+        }
+    }
+
+    ui::clear_line();
+
+    if(out.empty() && !pkhs.empty()){
+        // Double-check health to give better error message
+        std::string status;
+        if(!rpc_wallet::rpc_health_check(endpoints, status, used_seed)){
+            err_out = "Cannot connect to any RPC endpoint";
+            return false;
+        }
+        // Connected but no UTXOs - that's OK
+    }
+
+    return true;
+}
+
+// Alias for backwards compatibility
 static bool spv_collect_any_seed(
     const std::vector<std::pair<std::string,std::string>>& seeds,
     const std::vector<std::vector<uint8_t>>& pkhs,
@@ -7332,126 +7885,56 @@ static bool spv_collect_any_seed(
     std::string& used_seed,
     std::string& err_out)
 {
-    // Clear output to prevent accumulation from previous failed attempts
-    out.clear();
-
-    for(const auto& [host, port] : seeds){
-        std::string seed_str = host + ":" + port;
-        ui::print_progress("Connecting to " + seed_str + "...");
-
-        miq::SpvOptions opts;
-        opts.recent_block_window = window;
-        opts.cache_dir = cache_dir;  // CRITICAL: Set cache directory for proper UTXO caching
-
-        int max_attempts = (host == "127.0.0.1") ? 1 : wallet_config::MAX_CONNECTION_RETRIES;
-
-        for(int attempt = 0; attempt < max_attempts; ++attempt){
-            if(attempt > 0){
-                int delay = std::min(
-                    wallet_config::BASE_RETRY_DELAY_MS * (1 << std::min(attempt, 5)),
-                    wallet_config::MAX_RETRY_DELAY_MS
-                );
-                ui::print_progress("Retry " + std::to_string(attempt+1) + "/" +
-                                   std::to_string(max_attempts) + " in " +
-                                   std::to_string(delay/1000) + "s...");
-                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-            }
-
-            std::string local_err;
-
-            if(miq::spv_collect_utxos(host, port, pkhs, opts, out, local_err)){
-                ui::clear_line();
-                used_seed = seed_str;
-                return true;
-            }
-
-            err_out = seed_str + ": " + local_err;
-        }
-    }
-
-    ui::clear_line();
-    if(err_out.empty()) err_out = "No seed nodes available";
-    return false;
+    return rpc_collect_utxos(seeds, pkhs, window, cache_dir, out, used_seed, err_out);
 }
 
 // =============================================================================
-// TRANSACTION BROADCASTING WITH PROGRESS
+// RPC-BASED TRANSACTION BROADCAST v2.0 - Fully replaces P2P broadcast
 // =============================================================================
+static bool rpc_broadcast_transaction(
+    const std::vector<std::pair<std::string,std::string>>& seeds,
+    const std::vector<uint8_t>& raw_tx,
+    std::string& txid_out,
+    std::string& used_seed,
+    std::string& err_out)
+{
+    // Build RPC endpoints from seeds (convert P2P port to RPC port)
+    std::vector<rpc_wallet::RpcEndpoint> endpoints;
+
+    // Add localhost first (highest priority)
+    endpoints.push_back({"127.0.0.1", (uint16_t)miq::RPC_PORT, "", wallet_config::RPC_TIMEOUT_MS});
+
+    for(const auto& [host, port] : seeds){
+        if(host == "127.0.0.1" || host == "localhost") continue; // Already added
+
+        uint16_t p2p_port = (uint16_t)std::stoi(port);
+        // Convert P2P port to RPC port
+        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port + 1);
+        endpoints.push_back({host, rpc_port, "", wallet_config::RPC_TIMEOUT_MS});
+    }
+
+    ui::print_progress("Broadcasting transaction via RPC...");
+
+    std::string local_err;
+    if(rpc_wallet::rpc_send_raw_transaction(endpoints, raw_tx, txid_out, used_seed, local_err)){
+        ui::clear_line();
+        return true;
+    }
+
+    err_out = local_err;
+    ui::clear_line();
+    return false;
+}
+
+// Alias for backwards compatibility
 static bool broadcast_any_seed(
     const std::vector<std::pair<std::string,std::string>>& seeds,
     const std::vector<uint8_t>& raw_tx,
     std::string& used_seed,
     std::string& err_out)
 {
-    // v10.0 FIX: Reorder seeds to try localhost FIRST (most reliable if local node running)
-    std::vector<std::pair<std::string,std::string>> ordered_seeds;
-    ordered_seeds.reserve(seeds.size());
-
-    // First add any localhost entries
-    for(const auto& [host, port] : seeds){
-        if(host == "127.0.0.1" || host == "localhost"){
-            ordered_seeds.push_back({host, port});
-        }
-    }
-    // Then add all other entries
-    for(const auto& [host, port] : seeds){
-        if(host != "127.0.0.1" && host != "localhost"){
-            ordered_seeds.push_back({host, port});
-        }
-    }
-
-    for(const auto& [host, port] : ordered_seeds){
-        std::string seed_str = host + ":" + port;
-        ui::print_progress("Broadcasting to " + seed_str + "...");
-
-        // v10.0 FIX: For localhost, only try once - it either works or doesn't
-        int max_attempts = (host == "127.0.0.1" || host == "localhost") ? 1 : wallet_config::MAX_CONNECTION_RETRIES;
-
-        for(int attempt = 0; attempt < max_attempts; ++attempt){
-            if(attempt > 0){
-                int delay = std::min(
-                    wallet_config::BASE_RETRY_DELAY_MS * (1 << std::min(attempt, 3)),
-                    wallet_config::MAX_RETRY_DELAY_MS
-                );
-                // Add small jitter
-                std::random_device rd;
-                std::mt19937 gen(rd());
-                std::uniform_int_distribution<int> jitter(-delay/8, delay/8);
-                delay += jitter(gen);
-
-                ui::print_progress("Retry " + std::to_string(attempt+1) + "...");
-                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-            }
-
-            std::string local_err;
-
-            // Use P2PLight to broadcast transaction
-            miq::P2PLight p2p;
-            miq::P2POpts opts;
-            opts.host = host;
-            opts.port = port;
-            opts.user_agent = "/miqwallet:1.0/";
-            // v10.0 FIX: Faster timeout for localhost
-            opts.io_timeout_ms = (host == "127.0.0.1" || host == "localhost")
-                ? wallet_config::MAX_RETRY_DELAY_MS : wallet_config::CONNECTION_TIMEOUT_MS;
-
-            if(p2p.connect_and_handshake(opts, local_err)){
-                if(p2p.send_tx(raw_tx, local_err)){
-                    p2p.close();
-                    ui::clear_line();
-                    used_seed = seed_str;
-                    return true;
-                }
-                p2p.close();
-            }
-
-            err_out = seed_str + ": " + local_err;
-        }
-    }
-
-    ui::clear_line();
-    if(err_out.empty()) err_out = "All broadcast attempts failed";
-    return false;
+    std::string txid;
+    return rpc_broadcast_transaction(seeds, raw_tx, txid, used_seed, err_out);
 }
 
 // =============================================================================
@@ -7573,7 +8056,7 @@ static bool broadcast_and_verify(
 }
 
 // =============================================================================
-// BULLETPROOF TRANSACTION BROADCASTING v2.0
+// BULLETPROOF TRANSACTION BROADCASTING v2.0 - RPC-ONLY
 // Multi-node verification and aggressive retry with exponential backoff
 // =============================================================================
 
@@ -7586,6 +8069,8 @@ static bool bulletproof_broadcast(
     std::string& err_out,
     bool show_splash = true)
 {
+    (void)txid_hex; // Available for logging if needed
+
     if (seeds.empty()) {
         err_out = "No seed nodes available";
         return false;
@@ -7593,71 +8078,48 @@ static bool bulletproof_broadcast(
 
     // Show sending splash screen
     if (show_splash) {
-        // Calculate amount from raw tx (estimated - actual would need deserialize)
         ui::run_send_splash("", 0, 0);  // Simple version
     }
 
-    int successful_broadcasts = 0;
-    int total_attempts = 0;
-    std::string first_success;
-    std::vector<std::string> errors;
+    // Build RPC endpoints from seeds
+    std::vector<rpc_wallet::RpcEndpoint> endpoints;
 
-    // Phase 1: Broadcast to all available seeds (up to 5)
-    int max_parallel = std::min((int)seeds.size(), 5);
+    // Add localhost first (highest priority)
+    endpoints.push_back({"127.0.0.1", (uint16_t)miq::RPC_PORT, "", wallet_config::RPC_TIMEOUT_MS});
 
-    for (int i = 0; i < max_parallel; i++) {
-        const auto& [host, port] = seeds[i];
-        std::string seed_str = host + ":" + port;
+    for(const auto& [host, port] : seeds){
+        if(host == "127.0.0.1" || host == "localhost") continue;
 
-        if (show_splash) {
-            ui::draw_inline_progress("Broadcasting to " + seed_str, 0.3 + (i * 0.1), i);
-        }
-
-        for (int attempt = 0; attempt < 3; attempt++) {
-            total_attempts++;
-            std::string local_err;
-
-            miq::P2PLight p2p;
-            miq::P2POpts opts;
-            opts.host = host;
-            opts.port = port;
-            opts.user_agent = "/miqwallet:2.0/";
-            opts.io_timeout_ms = wallet_config::BROADCAST_TIMEOUT_MS;
-
-            if (p2p.connect_and_handshake(opts, local_err)) {
-                if (p2p.send_tx(raw_tx, local_err)) {
-                    p2p.close();
-                    successful_broadcasts++;
-                    if (first_success.empty()) first_success = seed_str;
-                    break;  // Success on this seed, move to next
-                }
-                p2p.close();
-            }
-
-            errors.push_back(seed_str + ": " + local_err);
-
-            // Brief delay before retry
-            if (attempt < 2) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            }
-        }
+        uint16_t p2p_port = (uint16_t)std::stoi(port);
+        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port + 1);
+        endpoints.push_back({host, rpc_port, "", wallet_config::RPC_TIMEOUT_MS});
     }
 
     if (show_splash) {
-        ui::finish_inline_progress("Broadcast phase", successful_broadcasts > 0);
+        ui::draw_inline_progress("Broadcasting via RPC...", 0.5, 0);
     }
 
-    // Phase 2: Verify at least one node accepted it
-    if (successful_broadcasts == 0) {
-        err_out = errors.empty() ? "All broadcast attempts failed (" + std::to_string(total_attempts) + " tries)"
-                                  : errors[0] + " (after " + std::to_string(total_attempts) + " attempts)";
+    // Phase 1: Broadcast via RPC
+    std::string local_err;
+    std::string txid_out;
+    std::string used_endpoint;
+
+    bool success = rpc_wallet::rpc_send_raw_transaction(endpoints, raw_tx, txid_out, used_endpoint, local_err);
+
+    if (show_splash) {
+        ui::finish_inline_progress("Broadcast phase", success);
+    }
+
+    // Phase 2: Verify broadcast succeeded
+    if (!success) {
+        err_out = local_err.empty() ? "RPC broadcast failed" : local_err;
         if (show_splash) {
             ui::run_error_splash("BROADCAST FAILED", err_out);
         }
         return false;
     }
 
-    primary_seed = first_success;
+    primary_seed = used_endpoint;
 
     // Phase 3: Verify transaction is in mempool (try multiple nodes)
     if (show_splash) {
@@ -7709,7 +8171,7 @@ static bool bulletproof_broadcast(
     if (!verified) {
         // Transaction was sent but verification failed
         // This is NOT necessarily an error - mempool might be full, or RPC might not be available
-        err_out = "Sent to " + std::to_string(successful_broadcasts) + " node(s) but verification pending";
+        err_out = "Transaction broadcast via RPC but verification pending";
         return true;  // Still consider it a success
     }
 
@@ -7910,25 +8372,29 @@ static int process_tx_queue(
     return broadcasted;
 }
 
-// Check network connectivity by attempting to connect to any seed
+// Check network connectivity by attempting to connect to any RPC endpoint
+// v2.0: Uses RPC health check instead of P2P handshake
 [[maybe_unused]] static bool check_network_status(
     const std::vector<std::pair<std::string,std::string>>& seeds,
     std::string& connected_node)
 {
-    for(const auto& [host, port] : seeds){
-        miq::P2PLight p2p;
-        miq::P2POpts opts;
-        opts.host = host;
-        opts.port = port;
-        opts.user_agent = "/miqwallet:1.0/";
-        opts.io_timeout_ms = wallet_config::BROADCAST_TIMEOUT_MS;  // Use configured timeout
+    // Build RPC endpoints from seeds
+    std::vector<rpc_wallet::RpcEndpoint> endpoints;
 
-        std::string err;
-        if(p2p.connect_and_handshake(opts, err)){
-            p2p.close();
-            connected_node = host + ":" + port;
-            return true;
-        }
+    // Add localhost first
+    endpoints.push_back(rpc_wallet::RpcEndpoint{"127.0.0.1", (uint16_t)miq::RPC_PORT, "", wallet_config::RPC_TIMEOUT_MS});
+
+    for(const auto& [host, port] : seeds){
+        if(host == "127.0.0.1" || host == "localhost") continue;
+
+        uint16_t p2p_port = (uint16_t)std::stoi(port);
+        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port + 1);
+        endpoints.push_back(rpc_wallet::RpcEndpoint{host, rpc_port, "", wallet_config::RPC_TIMEOUT_MS});
+    }
+
+    std::string status;
+    if(rpc_wallet::rpc_health_check(endpoints, status, connected_node)){
+        return true;
     }
     connected_node = "";
     return false;
@@ -11494,14 +11960,25 @@ static bool flow_load_from_seed(const std::string& cli_host, const std::string& 
         return false;
     }
 
+    // v2.0 STABLE: Strict BIP-39 mnemonic validation
+    // Only accept valid miqrochain wallet seeds with correct checksum
+    std::string validation_err;
+    if(!miq::HdWallet::ValidateMnemonic(mnemonic, validation_err)){
+        ui::print_error("Invalid recovery phrase");
+        std::cout << "\n  " << ui::dim() << validation_err << ui::reset() << "\n";
+        std::cout << "  " << ui::dim() << "Please ensure you have a valid 12 or 24-word" << ui::reset() << "\n";
+        std::cout << "  " << ui::dim() << "miqrochain wallet recovery phrase." << ui::reset() << "\n\n";
+        return false;
+    }
+
     std::string mpass = ui::secure_prompt("Mnemonic passphrase (ENTER for none): ");
     std::string wpass = ui::secure_prompt("Wallet encryption passphrase (ENTER for none): ");
     show_password_strength(wpass);
 
-    // Convert mnemonic to seed
+    // Convert validated mnemonic to seed
     std::vector<uint8_t> seed;
     if(!miq::HdWallet::MnemonicToSeed(mnemonic, mpass, seed)){
-        ui::print_error("Invalid recovery phrase");
+        ui::print_error("Failed to convert recovery phrase to seed");
         return false;
     }
 
