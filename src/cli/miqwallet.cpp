@@ -7680,6 +7680,10 @@ static bool fetch_tx_full_info(
     return false;
 }
 
+// Forward declaration for simple text fallback view
+static void print_tx_details_view(const TxDetailedEntry& tx,
+                                   const std::vector<AddressBookEntry>& address_book);
+
 // Interactive transaction details viewer with tabs
 static void show_interactive_tx_details(
     const TxDetailedEntry& tx,
@@ -7949,8 +7953,8 @@ static void show_interactive_tx_details(
         std::cout << "  " << ui::cyan() << bc_v << ui::reset();
         std::cout << "  " << ui::dim() << (ui::g_use_utf8 ? "←→" : "<>") << " Tabs  "
                   << (ui::g_use_utf8 ? "↑↓" : "^v") << " Scroll  "
-                  << "Q/ESC Back" << ui::reset();
-        std::cout << std::string(W - 38, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                  << "P Print  Q/ESC Back" << ui::reset();
+        std::cout << std::string(W - 47, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
 
         std::cout << "  " << ui::cyan() << bc_bl;
         for(int i = 0; i < W - 2; i++) std::cout << bc_h;
@@ -7998,6 +8002,16 @@ static void show_interactive_tx_details(
         } else if(ch >= '1' && ch <= '4'){
             current_tab = ch - '1';
             scroll_offset = 0;
+        } else if(ch == 'p' || ch == 'P'){
+            // Print simple text view using legacy fallback function
+            instant_input::disable_raw_mode();
+            instant_input::show_cursor();
+            std::cout << "\033[2J\033[H" << std::flush;
+            print_tx_details_view(tx, address_book);
+            std::cout << "\n  " << ui::dim() << "Press any key to return to interactive view..." << ui::reset() << std::flush;
+            instant_input::enable_raw_mode();
+            instant_input::wait_for_key(-1);
+            instant_input::hide_cursor();
         }
     }
 
@@ -8005,7 +8019,7 @@ static void show_interactive_tx_details(
     instant_input::show_cursor();
 }
 
-// Print detailed transaction view (legacy fallback)
+// Print detailed transaction view (simple text fallback)
 static void print_tx_details_view(const TxDetailedEntry& tx,
                                    const std::vector<AddressBookEntry>& address_book) {
     std::cout << "\n";
@@ -9880,11 +9894,11 @@ static bool wallet_session(const std::string& cli_host,
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset();
                 std::cout << "  " << ui::dim();
                 if (ui::g_use_utf8) {
-                    std::cout << "↑↓ Select  ←→ Page  Enter View  s Stats  1-5 Filter  c Clear  q Back";
+                    std::cout << "↑↓ Select  ←→ Page  Enter View  s Stats  t Text  1-5 Filter  q Back";
                 } else {
-                    std::cout << "j/k Select  n/p Page  Enter View  s Stats  1-5 Filter  c Clear  q Back";
+                    std::cout << "j/k Select  n/p Page  Enter View  s Stats  t Text  1-5 Filter  q Back";
                 }
-                std::cout << ui::reset() << " " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << ui::reset() << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
 
                 // Filter options
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset();
@@ -10014,6 +10028,29 @@ static bool wallet_session(const std::string& cli_host,
                     view_state.filter.status = "pending";
                     view_state.page = 0;
                     view_state.selected = 0;
+                }
+                else if (ch == 't' || ch == 'T') {  // Text list - print simple transaction rows
+                    instant_input::disable_raw_mode();
+                    instant_input::show_cursor();
+                    std::cout << "\033[2J\033[H" << std::flush;
+                    std::cout << "\n";
+                    ui::print_double_header("TRANSACTION LIST (TEXT)", 78);
+                    std::cout << "\n";
+                    if (filtered.empty()) {
+                        std::cout << "  " << ui::dim() << "No transactions match current filters." << ui::reset() << "\n";
+                    } else {
+                        std::cout << ui::dim() << "   #   Dir  Time         Amount            Status   Address" << ui::reset() << "\n";
+                        std::cout << "  " << std::string(74, '-') << "\n";
+                        for (int i = 0; i < (int)filtered.size(); i++) {
+                            print_tx_row(filtered[i], i, (i == view_state.selected), address_book);
+                        }
+                        std::cout << "  " << std::string(74, '-') << "\n";
+                        std::cout << "  " << ui::dim() << "Total: " << filtered.size() << " transactions" << ui::reset() << "\n";
+                    }
+                    std::cout << "\n  " << ui::dim() << "Press any key to return..." << ui::reset() << std::flush;
+                    instant_input::enable_raw_mode();
+                    instant_input::wait_for_key(-1);
+                    instant_input::hide_cursor();
                 }
             }
 
