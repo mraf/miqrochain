@@ -9,6 +9,8 @@
 #include <mutex>
 #include <random>
 #include <chrono>
+#include <algorithm>
+#include <ctime>
 
 #ifndef _WIN32
 #include <unistd.h>  // for fsync
