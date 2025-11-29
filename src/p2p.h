@@ -35,6 +35,7 @@
 #endif
 
 #include "mempool.h"
+#include "block.h"      // For Block struct in notify_local_block
 
 namespace miq {
     class ThreadPool;
@@ -396,6 +397,11 @@ public:
             txids_callback_({key});
         }
     }
+
+    // CRITICAL FIX: Notify about locally-submitted blocks for TUI display
+    // This allows RPC-submitted blocks to appear in "Recent Blocks" and update mempool stats
+    // Note: subsidy is passed in to avoid depending on Chain (which is incomplete here)
+    void notify_local_block(const Block& b, uint64_t height, uint64_t subsidy, const std::string& miner_addr = "");
 
     // key-based helper ("invb","getb", etc.)
     bool check_rate(PeerState& ps, const char* key);

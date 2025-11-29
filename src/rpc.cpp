@@ -1396,6 +1396,29 @@ std::string RpcService::handle(const std::string& body){
             // CRITICAL FIX: Notify mempool to remove confirmed transactions
             mempool_.on_block_connect(b);
 
+            // CRITICAL FIX: Notify TUI about the new locally-mined block
+            // This ensures Recent Blocks and Recent TXIDs update for local mining
+            if(p2p_) {
+                uint64_t block_height = chain_.tip().height;
+
+                // Calculate subsidy for this block height
+                uint64_t subsidy = INITIAL_SUBSIDY;
+                uint64_t halvings = block_height / HALVING_INTERVAL;
+                if (halvings < 64) subsidy = INITIAL_SUBSIDY >> halvings;
+                else subsidy = 0;
+
+                // Extract miner address from coinbase if available
+                std::string miner_addr;
+                if (!b.txs.empty() && !b.txs[0].vout.empty()) {
+                    // Try to get base58 address from coinbase output
+                    const auto& pkh = b.txs[0].vout[0].pkh;
+                    if (pkh.size() == 20) {
+                        miner_addr = base58check_encode(VERSION_P2PKH, pkh);
+                    }
+                }
+                p2p_->notify_local_block(b, block_height, subsidy, miner_addr);
+            }
+
             // Build a small success object
             std::map<std::string,JNode> o;
             o["accepted"] = jbool(true);

@@ -6337,8 +6337,9 @@ static void update_all_tx_confirmations(const std::string& wdir,
 }
 
 // =============================================================================
-// AUTO-DETECT RECEIVED TRANSACTIONS v9.0 - Scan for new incoming payments
-// CRITICAL FIX: Aggregate multiple outputs from same transaction into one entry
+// AUTO-DETECT RECEIVED TRANSACTIONS v12.0 - Scan for new incoming payments
+// CRITICAL FIX v12.0: Exclude change outputs from our own sent transactions
+// CRITICAL FIX v9.0: Aggregate multiple outputs from same transaction into one entry
 // =============================================================================
 static int auto_detect_received_transactions(
     const std::string& wdir,
@@ -6350,8 +6351,19 @@ static int auto_detect_received_transactions(
 
     // Build set of known txids
     std::set<std::string> known_txids;
+    // v12.0 FIX: Also track TXIDs of our sent transactions to exclude change
+    std::set<std::string> sent_txids;
     for(const auto& e : hist){
         known_txids.insert(e.txid_hex);
+        if(e.direction == "sent"){
+            sent_txids.insert(e.txid_hex);
+        }
+    }
+
+    // v12.0 FIX: Build set of known change outputs from local_change_cache
+    std::set<std::pair<std::string, uint32_t>> change_outputs;
+    for(const auto& lc : g_local_change_cache){
+        change_outputs.insert({lc.txid_hex, lc.vout});
     }
 
     // v9.0 FIX: First aggregate UTXOs by TXID to handle multi-output transactions
@@ -6360,6 +6372,7 @@ static int auto_detect_received_transactions(
         uint32_t min_height{UINT32_MAX};
         int output_count{0};
         bool coinbase{false};
+        bool is_change{false};  // v12.0: Track if this is change from our own tx
     };
     std::map<std::string, TxAggregate> new_txs;
 
@@ -6368,6 +6381,20 @@ static int auto_detect_received_transactions(
 
         // Skip if we already know about this transaction
         if(known_txids.find(txid) != known_txids.end()) continue;
+
+        // v12.0 CRITICAL FIX: Skip change outputs from our own sent transactions
+        // This prevents change from appearing as a separate "received" transaction
+        if(change_outputs.find({txid, u.vout}) != change_outputs.end()){
+            // This is a change output - skip it entirely
+            continue;
+        }
+
+        // v12.0: Also skip if the transaction is in our sent history
+        // (This catches change even after local_change_cache expires)
+        if(sent_txids.find(txid) != sent_txids.end()){
+            // This UTXO is from a transaction we sent - it's change, not a new receive
+            continue;
+        }
 
         // Aggregate this output (INCLUDING coinbase/mining rewards!)
         auto& agg = new_txs[txid];
@@ -6410,6 +6437,8 @@ static int auto_detect_received_transactions(
         if(agg.min_height < UINT32_MAX && current_tip_height >= agg.min_height){
             entry.confirmations = current_tip_height - agg.min_height + 1;
             entry.block_height = agg.min_height;  // Store actual block height for accurate sorting
+            // v12.0: Set confirmation_time when first detected as confirmed
+            entry.confirmation_time = (int64_t)time(nullptr);
         } else {
             entry.confirmations = 0;
             entry.block_height = 0;  // Unconfirmed
@@ -9720,6 +9749,12 @@ static bool wallet_session(const std::string& cli_host,
                 // Update UTXOs
                 utxos = std::move(new_utxos);
 
+                // CRITICAL FIX: Cleanup confirmed local change and merge unconfirmed
+                // This mirrors the logic in refresh_and_print() for consistent balance display
+                // Without this, balance may not reflect pending change correctly after auto-refresh
+                cleanup_confirmed_local_change(wdir, utxos);
+                merge_local_change_into_utxos(utxos);
+
                 // Update connection status
                 is_online = true;
                 last_connected_node = used_seed;
@@ -9852,6 +9887,9 @@ static bool wallet_session(const std::string& cli_host,
             instant_input::enable_raw_mode();
             instant_input::hide_cursor();
 
+            // v12.0: Zero-flicker rendering - track first draw for initial clear
+            bool history_first_draw = true;
+
             while (history_running) {
                 auto filtered = filter_transactions(all_txs, view_state.filter);
                 sort_transactions(filtered, view_state.sort_order);
@@ -9866,23 +9904,31 @@ static bool wallet_session(const std::string& cli_host,
                 if (view_state.selected < 0) view_state.selected = 0;
                 if (view_state.selected >= view_state.total_count) view_state.selected = view_state.total_count - 1;
 
-                // Clear and redraw
-                std::cout << "\033[2J\033[H" << std::flush;
+                // v12.0: Zero-flicker rendering - only clear on first draw, then use cursor home
+                if (history_first_draw) {
+                    std::cout << "\033[2J\033[H" << std::flush;
+                    history_first_draw = false;
+                } else {
+                    std::cout << "\033[H" << std::flush;  // Cursor home only
+                }
 
                 const int W = 78;
                 std::string bc_h = ui::g_use_utf8 ? "═" : "=";
                 std::string bc_v = ui::g_use_utf8 ? "║" : "|";
 
+                // v12.0: Zero-flicker helper - clear to end of line before newline
+                auto eol = []() { std::cout << "\033[K"; };
+
                 // Header
                 std::cout << "\n  " << ui::cyan();
                 std::cout << (ui::g_use_utf8 ? "╔" : "+");
                 for(int i = 0; i < W - 2; i++) std::cout << bc_h;
-                std::cout << (ui::g_use_utf8 ? "╗" : "+") << ui::reset() << "\n";
+                std::cout << (ui::g_use_utf8 ? "╗" : "+") << ui::reset(); eol(); std::cout << "\n";
 
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset();
                 std::cout << "  " << ui::bold() << ui::white() << "TRANSACTION HISTORY" << ui::reset();
                 std::cout << "  " << ui::dim() << view_state.total_count << " transactions" << ui::reset();
-                std::cout << std::string(W - 35, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << std::string(W - 35, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 // Filter status line
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset();
@@ -9899,22 +9945,22 @@ static bool wallet_session(const std::string& cli_host,
                 if (view_state.filter.direction.empty() && view_state.filter.status.empty() && view_state.filter.search.empty()) {
                     std::cout << ui::dim() << "No filters" << ui::reset();
                 }
-                std::cout << std::string(W - 30, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << std::string(W - 30, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 // Separator
                 std::cout << "  " << ui::cyan();
                 std::cout << (ui::g_use_utf8 ? "╠" : "+");
                 for(int i = 0; i < W - 2; i++) std::cout << (ui::g_use_utf8 ? "─" : "-");
-                std::cout << (ui::g_use_utf8 ? "╣" : "+") << ui::reset() << "\n";
+                std::cout << (ui::g_use_utf8 ? "╣" : "+") << ui::reset(); eol(); std::cout << "\n";
 
                 // Column headers
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset();
                 std::cout << ui::dim() << "   #  Dir  Date        Amount           Conf   Address" << ui::reset();
-                std::cout << std::string(W - 60, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << std::string(W - 60, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 std::cout << "  " << ui::cyan() << bc_v;
                 for(int i = 0; i < W - 2; i++) std::cout << (ui::g_use_utf8 ? "─" : "-");
-                std::cout << bc_v << ui::reset() << "\n";
+                std::cout << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 int start_idx = view_state.page * view_state.per_page;
                 int end_idx = std::min(start_idx + view_state.per_page, view_state.total_count);
@@ -9922,7 +9968,7 @@ static bool wallet_session(const std::string& cli_host,
                 if (filtered.empty()) {
                     std::cout << "  " << ui::cyan() << bc_v << ui::reset();
                     std::cout << "  " << ui::dim() << "No transactions match filters." << ui::reset();
-                    std::cout << std::string(W - 36, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                    std::cout << std::string(W - 36, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
                 } else {
                     for (int i = start_idx; i < end_idx; i++) {
                         const auto& tx = filtered[i];
@@ -9971,14 +10017,14 @@ static bool wallet_session(const std::string& cli_host,
                         if (addr.length() > 12) addr = addr.substr(0, 12) + "...";
                         std::cout << ui::dim() << addr << ui::reset();
 
-                        std::cout << std::string(5, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                        std::cout << std::string(5, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
                     }
 
                     // Pad remaining rows
                     for (int i = end_idx - start_idx; i < view_state.per_page; i++) {
                         std::cout << "  " << ui::cyan() << bc_v << ui::reset();
                         std::cout << std::string(W - 2, ' ');
-                        std::cout << ui::cyan() << bc_v << ui::reset() << "\n";
+                        std::cout << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
                     }
                 }
 
@@ -9986,12 +10032,12 @@ static bool wallet_session(const std::string& cli_host,
                 std::cout << "  " << ui::cyan();
                 std::cout << (ui::g_use_utf8 ? "╠" : "+");
                 for(int i = 0; i < W - 2; i++) std::cout << (ui::g_use_utf8 ? "─" : "-");
-                std::cout << (ui::g_use_utf8 ? "╣" : "+") << ui::reset() << "\n";
+                std::cout << (ui::g_use_utf8 ? "╣" : "+") << ui::reset(); eol(); std::cout << "\n";
 
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset();
                 std::cout << "  Page " << (view_state.page + 1) << "/" << view_state.total_pages;
                 std::cout << "  |  " << (end_idx - start_idx) << "/" << view_state.total_count << " shown";
-                std::cout << std::string(W - 35, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << std::string(W - 35, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 // Controls
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset();
@@ -10001,7 +10047,7 @@ static bool wallet_session(const std::string& cli_host,
                 } else {
                     std::cout << "j/k Select  n/p Page  Enter View  s Stats  t Text  1-5 Filter  q Back";
                 }
-                std::cout << ui::reset() << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << ui::reset() << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 // Filter options
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset();
@@ -10011,13 +10057,13 @@ static bool wallet_session(const std::string& cli_host,
                           << ui::cyan() << "3" << ui::reset() << ui::dim() << "=Received  "
                           << ui::cyan() << "4" << ui::reset() << ui::dim() << "=Mined  "
                           << ui::cyan() << "5" << ui::reset() << ui::dim() << "=Pending" << ui::reset();
-                std::cout << std::string(W - 65, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << std::string(W - 65, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 // Bottom border
                 std::cout << "  " << ui::cyan();
                 std::cout << (ui::g_use_utf8 ? "╚" : "+");
                 for(int i = 0; i < W - 2; i++) std::cout << bc_h;
-                std::cout << (ui::g_use_utf8 ? "╝" : "+") << ui::reset() << "\n";
+                std::cout << (ui::g_use_utf8 ? "╝" : "+") << ui::reset(); eol(); std::cout << "\n";
 
                 // Handle input
                 int ch = instant_input::wait_for_key(100);
