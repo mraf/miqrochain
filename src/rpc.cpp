@@ -2033,7 +2033,17 @@ std::string RpcService::handle(const std::string& body){
                         total_balance += ou.e.value;
 
                         bool is_spendable = true;
-                        if (ou.e.coinbase) {
+
+                        // CRITICAL FIX: Skip UTXOs already spent in mempool
+                        // This prevents double-spend attempts when sending multiple transactions
+                        // before the first one confirms
+                        if (mempool_.has_spent_input(ou.txid, ou.vout)) {
+                            is_spendable = false;
+                            // Don't add to locked_balance - these are pending, not locked
+                        }
+
+                        // Check coinbase maturity
+                        if (is_spendable && ou.e.coinbase) {
                             uint64_t m_h = ou.e.height + COINBASE_MATURITY;
                             if (curH + 1 < m_h) {
                                 is_spendable = false;
@@ -2051,7 +2061,78 @@ std::string RpcService::handle(const std::string& body){
             maybe_push(0, meta.next_recv);
             maybe_push(1, meta.next_change);
 
-            if (owned_all.empty()) return err("no funds");
+            // CRITICAL FIX: Also consider unconfirmed outputs from our own mempool transactions
+            // This enables transaction chaining: send tx1 with change, then immediately
+            // spend that change in tx2 without waiting for tx1 to confirm.
+            {
+                // Build a set of our PKHs for fast lookup
+                std::unordered_set<std::string> our_pkhs;
+                for (const auto& ou : owned_all) {
+                    std::string pkh_hex;
+                    pkh_hex.reserve(40);
+                    for (uint8_t b : ou.pkh) {
+                        static const char hex[] = "0123456789abcdef";
+                        pkh_hex.push_back(hex[b >> 4]);
+                        pkh_hex.push_back(hex[b & 0xf]);
+                    }
+                    our_pkhs.insert(pkh_hex);
+                }
+
+                // Scan mempool for transactions with outputs paying to our addresses
+                std::vector<Transaction> mempool_txs;
+                mempool_.snapshot(mempool_txs);
+
+                for (const auto& mtx : mempool_txs) {
+                    auto mtxid = mtx.txid();
+                    for (size_t vout = 0; vout < mtx.vout.size(); ++vout) {
+                        const auto& mout = mtx.vout[vout];
+                        if (mout.pkh.size() != 20) continue;
+
+                        // Check if this output pays to one of our addresses
+                        std::string out_pkh_hex;
+                        out_pkh_hex.reserve(40);
+                        for (uint8_t b : mout.pkh) {
+                            static const char hex[] = "0123456789abcdef";
+                            out_pkh_hex.push_back(hex[b >> 4]);
+                            out_pkh_hex.push_back(hex[b & 0xf]);
+                        }
+
+                        if (our_pkhs.count(out_pkh_hex)) {
+                            // This mempool output pays to us!
+                            // Check if it's already spent in mempool
+                            if (!mempool_.has_spent_input(mtxid, (uint32_t)vout)) {
+                                // Find the private key for this PKH
+                                for (const auto& ou : owned_all) {
+                                    std::string ou_pkh_hex;
+                                    ou_pkh_hex.reserve(40);
+                                    for (uint8_t b : ou.pkh) {
+                                        static const char hex[] = "0123456789abcdef";
+                                        ou_pkh_hex.push_back(hex[b >> 4]);
+                                        ou_pkh_hex.push_back(hex[b & 0xf]);
+                                    }
+                                    if (ou_pkh_hex == out_pkh_hex) {
+                                        OwnedUtxo unconf;
+                                        unconf.txid = mtxid;
+                                        unconf.vout = (uint32_t)vout;
+                                        unconf.e.value = mout.value;
+                                        unconf.e.pkh = mout.pkh;
+                                        unconf.e.height = UINT64_MAX;  // Mark as unconfirmed (will sort last)
+                                        unconf.e.coinbase = false;
+                                        unconf.priv = ou.priv;
+                                        unconf.pub = ou.pub;
+                                        unconf.pkh = ou.pkh;
+                                        spendables.push_back(unconf);
+                                        spendable_balance += mout.value;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (owned_all.empty() && spendables.empty()) return err("no funds");
 
             if (spendables.empty()) {
                 if (locked_balance > 0 && soonest_mature_h != (std::numeric_limits<uint64_t>::max)()) {
