@@ -18,6 +18,7 @@
 #include <fstream>
 #include <random>
 #include <algorithm>
+#include <cctype>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -63,6 +64,82 @@ static bool pbkdf2_hmac_sha512(const std::string& pass, const std::string& salt,
 }
 
 // ---------- BIP39 ----------
+
+// Find word index in BIP39 wordlist (returns -1 if not found)
+static int find_word_index(const std::string& word) {
+    for (int i = 0; i < 2048; ++i) {
+        if (word == BIP39_EN_WORDS[i]) return i;
+    }
+    return -1;
+}
+
+// Validate BIP39 mnemonic checksum
+bool HdWallet::ValidateMnemonic(const std::string& mnemonic, std::string& err) {
+    // Tokenize mnemonic
+    std::istringstream iss(mnemonic);
+    std::vector<std::string> words;
+    std::string word;
+    while (iss >> word) {
+        // Convert to lowercase for validation
+        std::transform(word.begin(), word.end(), word.begin(),
+            [](unsigned char c) { return std::tolower(c); });
+        words.push_back(word);
+    }
+
+    // Validate word count (12 or 24 words)
+    if (words.size() != 12 && words.size() != 24) {
+        err = "Invalid mnemonic: must be 12 or 24 words (got " + std::to_string(words.size()) + ")";
+        return false;
+    }
+
+    // Validate each word is in BIP39 wordlist and get indices
+    std::vector<int> indices;
+    for (size_t i = 0; i < words.size(); ++i) {
+        int idx = find_word_index(words[i]);
+        if (idx < 0) {
+            err = "Invalid word at position " + std::to_string(i + 1) + ": '" + words[i] + "'";
+            return false;
+        }
+        indices.push_back(idx);
+    }
+
+    // Convert word indices back to bits (11 bits per word)
+    int total_bits = (int)words.size() * 11;
+    int ent_bits = (total_bits * 32) / 33;  // entropy bits
+    int cs_bits = total_bits - ent_bits;     // checksum bits
+
+    std::vector<int> bits(total_bits, 0);
+    for (size_t w = 0; w < indices.size(); ++w) {
+        int idx = indices[w];
+        for (int b = 0; b < 11; ++b) {
+            bits[w * 11 + b] = (idx >> (10 - b)) & 1;
+        }
+    }
+
+    // Extract entropy bytes
+    std::vector<uint8_t> entropy(ent_bits / 8, 0);
+    for (int i = 0; i < ent_bits; ++i) {
+        if (bits[i]) {
+            entropy[i / 8] |= (1 << (7 - (i % 8)));
+        }
+    }
+
+    // Compute checksum from entropy
+    uint8_t hash[32];
+    sha256_once(entropy.data(), entropy.size(), hash);
+
+    // Verify checksum bits match
+    for (int i = 0; i < cs_bits; ++i) {
+        int expected = (hash[0] >> (7 - i)) & 1;
+        int actual = bits[ent_bits + i];
+        if (expected != actual) {
+            err = "Invalid mnemonic checksum - words may be incorrect or in wrong order";
+            return false;
+        }
+    }
+
+    return true;
+}
 
 static bool entropy_to_mnemonic(const std::vector<uint8_t>& ent, std::string& out_mn){
     if(ent.size()!=16 && ent.size()!=32) return false;
@@ -354,6 +431,20 @@ bool ImportWalletBackup(const std::string& backup_path,
 
     // Save to wallet location
     return SaveHdWallet(wallet_dir, seed, meta, walletpass, err);
+}
+
+// Decode address to pubkey hash (20 bytes)
+bool AddressToPkh(const std::string& address, std::vector<uint8_t>& pkh) {
+    uint8_t version;
+    std::vector<uint8_t> payload;
+    if (!base58check_decode(address, version, payload)) {
+        return false;
+    }
+    if (version != VERSION_P2PKH || payload.size() != 20) {
+        return false;
+    }
+    pkh = std::move(payload);
+    return true;
 }
 
 }
