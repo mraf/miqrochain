@@ -1,8 +1,8 @@
 # Miqrochain
 
-A compact, experimental blockchain node written in modern C++.
+A compact blockchain codebase written in modern C++.
 
-> **Status:** Core node is stable. Wallet is in active development.
+> **Status:** Core node is stable. Wallet is in active development to become fully stable.
 
 ---
 
