@@ -53,16 +53,16 @@ int64_t Mempool::now_ms(){
 }
 
 // Helper: compute a minimal relay fee based on transaction size.
-// Uses MIQ_MEMPOOL_MIN_FEE_RATE from constants.h (sat/byte)
+// Uses MIQ_MEMPOOL_MIN_FEE_RATE from constants.h (miqron/byte)
 // CRITICAL FIX: Always enforce minimum fee - this was previously broken due to macro mismatch
 static inline uint64_t min_fee_for_size_bytes(size_t sz){
-    // Default minimum: 1 sat/byte (1000 sat/kB)
+    // Default minimum: 1 miqron/byte (1000 miqron/kB)
     // This ensures transactions have at least some fee to prevent spam
 #ifdef MIQ_MEMPOOL_MIN_FEE_RATE
-    // MIQ_MEMPOOL_MIN_FEE_RATE is in sat/byte, convert to sat/kB for calculation
+    // MIQ_MEMPOOL_MIN_FEE_RATE is in miqron/byte, convert to miqron/kB for calculation
     constexpr uint64_t fee_rate_per_kb = (uint64_t)MIQ_MEMPOOL_MIN_FEE_RATE * 1000ULL;
 #else
-    constexpr uint64_t fee_rate_per_kb = 1000ULL;  // Default: 1 sat/byte = 1000 sat/kB
+    constexpr uint64_t fee_rate_per_kb = 1000ULL;  // Default: 1 miqron/byte = 1000 miqron/kB
 #endif
     uint64_t kb = (uint64_t)((sz + 999) / 1000);
     if (kb == 0) kb = 1;

@@ -58,7 +58,7 @@
 #endif
 
 #ifndef MIN_RELAY_FEE_RATE
-// sat/KB (miqron per kilobyte)
+// miqron/KB (miqron per kilobyte)
 static constexpr uint64_t MIN_RELAY_FEE_RATE = 1000;
 #endif
 #ifndef DUST_THRESHOLD
@@ -350,7 +350,7 @@ static size_t estimate_size_bytes(size_t nin, size_t nout){
 }
 
 [[maybe_unused]] static uint64_t min_fee_for_size(size_t sz_bytes){
-    const uint64_t rate = MIN_RELAY_FEE_RATE; // sat/kB
+    const uint64_t rate = MIN_RELAY_FEE_RATE; // miqron/kB
     uint64_t kb = (uint64_t)((sz_bytes + 999) / 1000);
     if(kb==0) kb=1;
     return kb * rate;
