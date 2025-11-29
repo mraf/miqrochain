@@ -35,6 +35,7 @@
 #include "ibd_monitor.h"
 #include "utxo_kv.h"
 #include "stratum/stratum_server.h"
+#include "rpc_auth.h"
 
 #if __has_include("reindex_utxo.h")
 #  include "reindex_utxo.h"
@@ -4753,6 +4754,46 @@ int main(int argc, char** argv){
             rpc.start(rpc_port);
             rpc_ok = true;
             log_info("RPC listening on " + std::to_string(rpc_port));
+
+            // =========================================================
+            // CRITICAL SECURITY WARNINGS FOR RPC
+            // =========================================================
+            {
+                // Check if auth is enabled
+                std::string expected_tok;
+                bool has_auth = miq::rpc_load_expected_token(cfg.datadir, expected_tok, nullptr);
+
+                // Check if binding to non-localhost
+                bool is_remote = false;
+                if (!cfg.rpc_bind.empty()) {
+                    // Remote if bind address is not 127.0.0.1 or localhost
+                    if (cfg.rpc_bind.find("127.0.0.1") == std::string::npos &&
+                        cfg.rpc_bind.find("localhost") == std::string::npos &&
+                        cfg.rpc_bind.find("::1") == std::string::npos) {
+                        is_remote = true;
+                    }
+                }
+
+                // Log security warnings
+                if (is_remote && !has_auth) {
+                    log_warn("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                    log_warn("! CRITICAL SECURITY WARNING: RPC is INSECURE by default!   !");
+                    log_warn("! - Remote binding detected WITHOUT authentication         !");
+                    log_warn("! - Anyone can access your wallet and steal funds!         !");
+                    log_warn("! FIX: Set MIQ_RPC_TOKEN environment variable OR use .cookie!");
+                    log_warn("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                } else if (is_remote) {
+                    log_warn("=============================================================");
+                    log_warn("= SECURITY WARNING: RPC is accessible from remote hosts     =");
+                    log_warn("= Authentication is enabled, but TLS is recommended         =");
+                    log_warn("= Consider using --tls_proxy to enable encrypted connections=");
+                    log_warn("=============================================================");
+                } else if (!has_auth) {
+                    log_warn("RPC authentication not configured (no .cookie or MIQ_RPC_TOKEN)");
+                    log_warn("This is OK for localhost-only access, but DANGEROUS if remote.");
+                }
+            }
+
             if (can_tui) { tui.mark_step_ok("Start RPC server"); tui.mark_step_ok("RPC ready"); }
         } else if (can_tui) {
             tui.mark_step_ok("Start RPC server");

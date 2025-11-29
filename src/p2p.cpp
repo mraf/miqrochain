@@ -259,7 +259,9 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
 #define MIQ_RX_TRIM_CHUNK (64u * 1024u)         /* trim in 64 KiB slices when stuck */
 #endif
 #ifndef MIQ_P2P_BAD_PEER_MAX_STALLS
-#define MIQ_P2P_BAD_PEER_MAX_STALLS 3           /* disconnect peers that stall repeatedly */
+// CRITICAL FIX: Reduced from 3 to 1 for faster peer switching during IBD
+// When a peer stalls (sends headers but no blocks), switch immediately
+#define MIQ_P2P_BAD_PEER_MAX_STALLS MIQ_BLOCK_STALL_MAX_COUNT
 #endif
 #ifndef MIQ_HEADERS_EMPTY_LIMIT
 #define MIQ_HEADERS_EMPTY_LIMIT 8
@@ -5445,19 +5447,36 @@ void P2P::loop(){
                             bool in_mempool = mempool_ && mempool_->exists(tx.txid());
 
                             // V1.0 FIX: Thread-safe removal from seen_txids_ on rejection
+                            // CRITICAL FIX: Enhanced ban scoring for different rejection types
                             if (!accepted && !err.empty()) {
                                 MIQ_LOG_DEBUG(miq::LogCategory::NET, "tx rejected: " + key.substr(0, 16) + "... error: " + err);
                                 {
                                     std::lock_guard<std::mutex> tx_lk(tx_store_mu_);
                                     seen_txids_.erase(key);
                                 }
+
+                                // CRITICAL FIX: Aggressive ban scoring for bad signatures
+                                // Bad signatures are likely malicious, not accidental
+                                int ban_increment = 1;
+                                if (err.find("bad signature") != std::string::npos ||
+                                    err.find("sig") != std::string::npos) {
+                                    ban_increment = 20; // Severe penalty for invalid signatures
+                                    MIQ_LOG_WARN(miq::LogCategory::NET, "bad signature from peer " + ps.ip + " - high ban score");
+                                } else if (err.find("double-spend") != std::string::npos) {
+                                    ban_increment = 10; // Medium penalty for double-spend attempts
+                                } else if (err.find("insufficient fee") != std::string::npos ||
+                                           err.find("too many ancestors") != std::string::npos) {
+                                    ban_increment = 1; // Low penalty for policy violations
+                                }
+
                                 if (!ibd_or_fetch_active(ps, now_ms())) {
-                                    if (++ps.mis > 25) {
-                                        MIQ_LOG_WARN(miq::LogCategory::NET, "banning peer for tx-invalid, ip=" + ps.ip);
+                                    ps.mis += ban_increment;
+                                    if (ps.mis > 25) {
+                                        MIQ_LOG_WARN(miq::LogCategory::NET, "banning peer for tx-invalid (" + err + "), ip=" + ps.ip);
                                         bump_ban(ps, ps.ip, "tx-invalid", now_ms());
                                     }
                                 } else {
-                                    ++ps.mis; // track but do not ban during sync
+                                    ps.mis += ban_increment; // track during sync
                                 }
                                 continue; // Skip further processing for rejected tx
                             }

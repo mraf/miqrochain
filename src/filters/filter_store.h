@@ -105,6 +105,39 @@ public:
         return true;
     }
 
+    // Rollback filter chain to specified height (delete filters above this height)
+    // This is critical for reorg handling - filters must stay consistent with chain tip
+    bool rollback_to(uint32_t new_tip_height) {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        if (new_tip_height >= headers_.size()) return true; // Nothing to rollback
+
+        // Clear entries above new_tip_height
+        for (size_t h = new_tip_height + 1; h < headers_.size(); ++h) {
+            headers_[h] = std::array<uint8_t,32>{};
+            hashes_[h] = std::array<uint8_t,32>{};
+            filters_[h].clear();
+        }
+
+        // Resize vectors to new height + 1
+        headers_.resize(new_tip_height + 1);
+        hashes_.resize(new_tip_height + 1);
+        filters_.resize(new_tip_height + 1);
+
+        // Rewrite the entire file (could be optimized with truncate but this is safer)
+        return persist_full();
+    }
+
+    // Get the current filter chain tip height
+    uint32_t tip_height() const {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        if (headers_.empty()) return 0;
+        // Find highest non-zero entry
+        for (size_t h = headers_.size(); h-- > 0; ) {
+            if (!is_zero(headers_[h])) return (uint32_t)h;
+        }
+        return 0;
+    }
+
 private:
     mutable std::recursive_mutex mtx_;
     std::string dir_;
@@ -166,6 +199,22 @@ private:
         out.write((const char*)&fl, 4);
         if (fl) out.write((const char*)fb.data(), fl);
         out.write((const char*)header.data(), 32);
+        return out.good();
+    }
+
+    // Rewrite entire filter store (used after rollback)
+    bool persist_full() {
+        std::ofstream out(path().c_str(), std::ios::binary | std::ios::trunc);
+        if (!out.good()) return false;
+        for (uint32_t h = 0; h < headers_.size(); ++h) {
+            if (is_zero(headers_[h])) continue; // Skip empty entries
+            const uint32_t fl = (uint32_t)filters_[h].size();
+            out.write((const char*)&h, 4);
+            out.write((const char*)hashes_[h].data(), 32);
+            out.write((const char*)&fl, 4);
+            if (fl) out.write((const char*)filters_[h].data(), fl);
+            out.write((const char*)headers_[h].data(), 32);
+        }
         return out.good();
     }
 

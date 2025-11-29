@@ -2077,6 +2077,109 @@ std::string RpcService::handle(const std::string& body){
             return success ? json_dump(jbool(true)) : err("peer not found");
         }
 
+        // ================== BIP158 COMPACT BLOCK FILTER RPC ENDPOINTS ==================
+        // These endpoints allow SPV clients to fetch compact block filters and filter headers
+
+#if MIQ_HAVE_GCS_FILTERS
+        // getcfilterheaders(start_height, count) -> array of filter header hashes
+        if(method=="getcfilterheaders" || method=="getfilterheaders" || method=="getcfheaders"){
+            uint32_t start = 0, count = 2000;
+            if(params.size() >= 1 && std::holds_alternative<double>(params[0].v))
+                start = (uint32_t)std::get<double>(params[0].v);
+            if(params.size() >= 2 && std::holds_alternative<double>(params[1].v))
+                count = (uint32_t)std::get<double>(params[1].v);
+            if(count > 2000) count = 2000; // Safety limit
+
+            std::vector<std::array<uint8_t,32>> headers;
+            if(!chain_.get_filter_headers(start, count, headers))
+                return err("failed to get filter headers");
+
+            std::vector<JNode> arr;
+            arr.reserve(headers.size());
+            for(const auto& h : headers){
+                arr.push_back(jstr(to_hex(std::vector<uint8_t>(h.begin(), h.end()))));
+            }
+            JNode out; out.v = arr; return json_dump(out);
+        }
+
+        // getcfilter(start_height, count) -> array of {block_hash, filter_hex} objects
+        if(method=="getcfilter" || method=="getblockfilter" || method=="getcffilter"){
+            uint32_t start = 0, count = 100;
+            if(params.size() >= 1 && std::holds_alternative<double>(params[0].v))
+                start = (uint32_t)std::get<double>(params[0].v);
+            if(params.size() >= 2 && std::holds_alternative<double>(params[1].v))
+                count = (uint32_t)std::get<double>(params[1].v);
+            if(count > 100) count = 100; // Safety limit (filters can be large)
+
+            std::vector<std::pair<std::array<uint8_t,32>, std::vector<uint8_t>>> filters;
+            if(!chain_.get_filters_with_hash(start, count, filters))
+                return err("failed to get filters");
+
+            std::vector<JNode> arr;
+            arr.reserve(filters.size());
+            for(const auto& f : filters){
+                std::map<std::string,JNode> o;
+                o["block_hash"] = jstr(to_hex(std::vector<uint8_t>(f.first.begin(), f.first.end())));
+                o["filter"] = jstr(to_hex(f.second));
+                o["height"] = jnum((double)(start + arr.size()));
+                JNode n; n.v = o; arr.push_back(n);
+            }
+            JNode out; out.v = arr; return json_dump(out);
+        }
+
+        // getfiltercount -> number of filters stored
+        if(method=="getfiltercount"){
+            auto tip = chain_.tip();
+            std::map<std::string,JNode> o;
+            o["filter_height"] = jnum((double)tip.height);
+            o["tip_height"] = jnum((double)tip.height);
+            JNode out; out.v = o; return json_dump(out);
+        }
+#endif
+
+        // ================== NODE INFO AND DIAGNOSTICS ==================
+
+        // getnodeinfo -> comprehensive node status (for operators)
+        if(method=="getnodeinfo"){
+            auto tip = chain_.tip();
+            std::map<std::string,JNode> o;
+            o["version"] = jstr("1.0.0");
+            o["height"] = jnum((double)tip.height);
+            o["hash"] = jstr(to_hex(tip.hash));
+            o["time"] = jnum((double)tip.time);
+            o["issued"] = jnum((double)tip.issued);
+
+            // Mempool stats
+            o["mempool_size"] = jnum((double)mempool_.size());
+            o["mempool_bytes"] = jnum((double)mempool_.bytes_used());
+
+            // P2P stats if available
+            if(p2p_) {
+                auto stats = p2p_->get_connection_stats();
+                o["peers"] = jnum((double)stats.total_connections);
+                o["inbound"] = jnum((double)stats.inbound_connections);
+                o["outbound"] = jnum((double)stats.outbound_connections);
+                o["syncing_peers"] = jnum((double)stats.syncing_peers);
+            }
+
+#if MIQ_HAVE_GCS_FILTERS
+            o["filters_enabled"] = jbool(true);
+#else
+            o["filters_enabled"] = jbool(false);
+#endif
+
+            JNode out; out.v = o; return json_dump(out);
+        }
+
+        // getreorginfo -> reorg manager status
+        if(method=="getreorginfo"){
+            std::map<std::string,JNode> o;
+            o["tip_height"] = jnum((double)chain_.tip().height);
+            o["tip_hash"] = jstr(to_hex(chain_.tip().hash));
+            // Could add more reorg stats here
+            JNode out; out.v = o; return json_dump(out);
+        }
+
         return err("unknown method");
     } catch(const std::exception& ex){
         log_error(std::string("rpc handle exception: ")+ex.what());

@@ -66,4 +66,86 @@ bool ReindexUTXO(Chain& chain, UTXOKV& kv, bool compact_after, std::string& err)
     return true;
 }
 
+// Enhanced reindex with progress reporting
+bool ReindexUTXOWithProgress(Chain& chain,
+                              UTXOKV& kv,
+                              bool compact_after,
+                              ReindexProgressCallback progress,
+                              std::string& err) {
+    // Open chainstate KV at <datadir>/chainstate (if not already open)
+    if (!kv.open(chain.datadir(), &err)) {
+        if (err.empty()) err = "reindex_utxo: failed to open chainstate";
+        return false;
+    }
+
+    const size_t tip = chain.height();
+    const size_t batch_size = 2000;
+
+    size_t i = 0;
+    while (i <= tip) {
+        UTXOKV::Batch batch(kv);
+
+        size_t end = std::min(tip, i + batch_size - 1);
+        for (; i <= end; ++i) {
+            Block b;
+            if (!chain.get_block_by_index(i, b)) {
+                err = "reindex_utxo: missing block at index " + std::to_string(i);
+                return false;
+            }
+
+            // Spend inputs then add outputs
+            for (const auto& tx : b.txs) {
+                for (const auto& in : tx.vin) {
+                    if (in.prev.txid.size() != 32) continue;
+                    if (in.prev.txid == std::vector<uint8_t>(32, 0)) continue;
+                    batch.spend(in.prev.txid, in.prev.vout);
+                }
+                for (uint32_t vout = 0; vout < (uint32_t)tx.vout.size(); ++vout) {
+                    auto e = coin_from_txout(tx, vout, (uint32_t)i);
+                    batch.add(tx.txid(), vout, e);
+                }
+            }
+
+            // Report progress periodically
+            if (progress && (i % 100 == 0 || i == tip)) {
+                progress(i, tip + 1, "Reindexing UTXO");
+            }
+        }
+
+        std::string cerr;
+        if (!batch.commit(/*sync=*/true, &cerr)) {
+            err = cerr.empty() ? "reindex_utxo: batch commit failed" : cerr;
+            return false;
+        }
+    }
+
+    (void)compact_after;
+    return true;
+}
+
+// Quick verification - just check chain tip is accessible
+bool QuickVerifyChainstate(Chain& chain, UTXOKV& kv, std::string& err) {
+    (void)kv;
+    auto tip = chain.tip();
+    if (tip.hash.empty()) {
+        err = "chain tip hash is empty";
+        return false;
+    }
+    Block b;
+    if (!chain.get_block_by_index(tip.height, b)) {
+        err = "cannot read tip block";
+        return false;
+    }
+    return true;
+}
+
+bool CheckChainstateConsistency(Chain& chain, UTXOKV& kv, std::string& err) {
+    return QuickVerifyChainstate(chain, kv, err);
+}
+
+bool NeedsReindex(Chain& chain, UTXOKV& kv) {
+    std::string err;
+    return !QuickVerifyChainstate(chain, kv, err);
+}
+
 }

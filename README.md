@@ -2,17 +2,21 @@
 
 A compact, experimental blockchain node written in modern C++.
 
-> **Wallet status:** wallets are still being forged and actively in progress. Expect breaking changes until the first tagged wallet preview.
+> **Status:** Core node is stable. Wallet is in active development.
 
 ---
 
 ## Quick Facts
 
-- **P2P port:** `9883` (TCP)
-- **RPC port:** `9834` (JSON-RPC over HTTP)
-- **Default daemons:** `miqrod` (node), `miqwallet` (WIP)
-- **Build:** CMake + C++17
-- **Status:** Experimental (not production-ready)
+| Component | Description |
+|-----------|-------------|
+| **P2P Port** | `9883` (TCP) |
+| **RPC Port** | `9834` (JSON-RPC over HTTP) |
+| **Node Daemon** | `miqrod` |
+| **Wallet** | `miqwallet` (WIP) |
+| **Miner** | `miqminer_rpc` (standalone RPC miner) |
+| **Key Generator** | `miq-keygen` |
+| **Build System** | CMake + C++17 |
 
 ---
 
@@ -24,32 +28,49 @@ A compact, experimental blockchain node written in modern C++.
   - [Windows (MSVC)](#windows-msvc)
   - [macOS](#macos)
 - [Quick Start](#quick-start)
-  - [Run a node](#run-a-node)
-  - [Use JSON-RPC](#use-json-rpc)
-  - [Mining (testing only)](#mining-testing-only)
+  - [Run a Node](#run-a-node)
+  - [Mining](#mining)
+  - [JSON-RPC API](#json-rpc-api)
 - [Configuration](#configuration)
-  - [Command-line flags](#command-line-flags)
-  - [Environment variables](#environment-variables)
-- [Networking Notes](#networking-notes)
-- [Data & Logs](#data--logs)
-- [Troubleshooting](#troubleshooting)
+- [Architecture](#architecture)
+- [Security](#security)
 - [Contributing](#contributing)
-- [Security & Production Readiness](#security--production-readiness)
 - [License](#license)
 
 ---
 
 ## Features
 
-- Dual-stack networking (IPv4/IPv6), non-blocking sockets; hardened for Windows & POSIX
-- Headers-first initial sync with automatic fallback to by-index on stalls
-- Per-peer rate limiting; transaction trickle relay; fee filtering (min relay fee)
-- Orphan block manager with memory/entry caps
-- Optional peer address manager (if compiled in), legacy peer store compatibility
-- NAT/UPnP try-open for friendlier home setups
-- Minimal JSON-RPC interface for node control and inspection
+### Networking
+- Dual-stack IPv4/IPv6 with non-blocking sockets
+- Headers-first initial block download (IBD) with stall detection
+- Per-peer rate limiting and transaction trickle relay
+- NAT/UPnP port mapping for home setups
+- Peer address manager with persistence
 
-> Source layout lives under `src/` (e.g., `p2p.*`, `chain.*`, `mempool.*`, `rpc.*`, `wallet/*` [WIP]).
+### Consensus & Validation
+- LWMA difficulty adjustment algorithm
+- Full UTXO set tracking with LevelDB backend
+- Orphan block management with memory caps
+- Chain reorganization handling with metrics
+
+### Wallet (WIP)
+- HD key derivation (BIP32-style)
+- BIP158 compact block filter support for SPV
+- Encrypted wallet storage (optional)
+- Multi-endpoint RPC failover
+
+### Monitoring & Observability
+- Prometheus-compatible metrics export (`/metrics`)
+- Real-time TUI dashboard in `miqrod`
+- Operator metrics: peer stalls, bans, reorgs, validation times
+- JSON metrics API for dashboards
+
+### Mining
+- Standalone `miqminer_rpc` client (connects via RPC)
+- Stratum protocol support
+- Multi-threaded CPU mining
+- Optional OpenCL GPU support
 
 ---
 
@@ -58,161 +79,253 @@ A compact, experimental blockchain node written in modern C++.
 ### Prerequisites
 
 - CMake ≥ 3.16
-- A C++17 compiler
-  - Linux/macOS: GCC ≥ 9 or Clang ≥ 10
-  - Windows: Visual Studio 2019/2022 (MSVC)
-- Standard system threads (pthread on POSIX; Win32 on Windows)
-
-> If your environment uses a package manager, install **cmake** and a **C++ toolchain** first.
+- C++17 compiler (GCC ≥ 9, Clang ≥ 10, or MSVC 2019+)
+- OpenSSL development libraries
+- LevelDB (bundled)
 
 ### Linux / Ubuntu
 
-Tested on Ubuntu 20.04/22.04+.
-
 ```bash
-# 1) Install toolchain
+# Install dependencies
 sudo apt update
-sudo apt install -y build-essential cmake git
+sudo apt install -y build-essential cmake git libssl-dev
 
-# 2) Clone
+# Clone and build
 git clone https://github.com/takumichronen/miqrochain.git
 cd miqrochain
-
-# 3) Configure + build (Release)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake --build build -j$(nproc)
+```
 
-# (optional) Install to /usr/local
-# sudo cmake --install build
-Windows (MSVC)
-Requires Visual Studio with the Desktop development with C++ workload.
+Binaries will be in `build/`:
+- `miqrod` - Node daemon
+- `miqwallet` - Wallet CLI
+- `miqminer_rpc` - Standalone miner
+- `miq-keygen` - Key generation tool
 
-powershell
+### Windows (MSVC)
 
-# Use "x64 Native Tools Command Prompt" or "Developer PowerShell for VS"
+Use "x64 Native Tools Command Prompt" or "Developer PowerShell for VS":
+
+```powershell
 git clone https://github.com/takumichronen/miqrochain.git
 cd miqrochain
-
 cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
-Artifacts will be under build\Release\.
+```
 
-macOS
-Tested on macOS 12+ (Apple Silicon & Intel).
+Artifacts will be in `build\Release\`.
 
-bash
+### macOS
 
-# 1) Install Xcode command line tools
+```bash
+# Install Xcode CLI tools and cmake
 xcode-select --install
+brew install cmake openssl
 
-# 2) Install cmake via Homebrew (recommended)
-brew install cmake
-
-# 3) Clone + build
+# Build
 git clone https://github.com/takumichronen/miqrochain.git
 cd miqrochain
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DOPENSSL_ROOT_DIR=$(brew --prefix openssl)
 cmake --build build -j
-Quick Start
-Run a node
-bash
+```
 
-# stores chain data in ./data, listens on P2P 9883 and RPC 9833
-./build/miqrod --datadir ./data --p2p 9883 --rpc 9833
-Keep RPC bound to 127.0.0.1 unless you know what you’re doing. If you expose it, protect it (auth, firewall, or a TLS reverse proxy).
+---
 
-Use JSON-RPC
-From the same machine:
+## Quick Start
 
-bash
+### Run a Node
 
-# Basic chain info
+```bash
+# Start node with data in ./data directory
+./build/miqrod --datadir ./data --p2p 9883 --rpc 9834
+```
+
+The node will:
+- Listen for P2P connections on port 9883
+- Serve RPC on 127.0.0.1:9834 (localhost only by default)
+- Display a real-time TUI dashboard
+
+### Mining
+
+Mining is done with the standalone `miqminer_rpc` client:
+
+```bash
+# Generate a mining address first
+./build/miq-keygen
+
+# Start mining (connects to local node RPC)
+./build/miqminer_rpc --rpc http://127.0.0.1:9834 --address <your-address> --threads 4
+```
+
+Options:
+- `--rpc <url>` - Node RPC endpoint
+- `--address <addr>` - Reward address (base58check)
+- `--threads <n>` - Number of mining threads (0 = auto)
+- `--stratum <host:port>` - Connect to stratum pool instead
+
+### JSON-RPC API
+
+```bash
+# Get blockchain info
 curl -s -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}' \
-  http://127.0.0.1:9833
+  http://127.0.0.1:9834
 
-# Best block hash
+# Get best block hash
 curl -s -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"getbestblockhash","params":[]}' \
-  http://127.0.0.1:9833
-Common methods (non-exhaustive):
+  -d '{"jsonrpc":"2.0","id":1,"method":"getbestblockhash","params":[]}' \
+  http://127.0.0.1:9834
+```
 
-getblockchaininfo, getnetworkinfo, getbestblockhash
+#### Available RPC Methods
 
-getblock <hash|height>, getrawblock <hash|height>
+**Chain:**
+- `getblockchaininfo` - Chain height, difficulty, sync status
+- `getbestblockhash` - Current tip hash
+- `getblock <hash|height>` - Block data
+- `getblockheader <hash|height>` - Header only
+- `gettxout <txid> <vout>` - UTXO lookup
 
-getmempoolinfo, getrawmempool
+**Network:**
+- `getnetworkinfo` - Node version, connections
+- `getpeerinfo` - Connected peers detail
+- `peers` - Simple peer list
+- `getnodeinfo` - Comprehensive node status
 
-submitblock <hex>, sendrawtransaction <hex>
+**Mempool:**
+- `getmempoolinfo` - Size, bytes, fee stats
+- `getrawmempool` - List of txids
+- `sendrawtransaction <hex>` - Broadcast transaction
 
-peers, ban <ip>, unban <ip>, getbans
+**Mining:**
+- `getblocktemplate` - Template for mining
+- `submitblock <hex>` - Submit mined block
+- `getminerstats` - Hash rate statistics
 
-Mining helpers: setgenerate <on> <threads>, getminerstats
+**BIP158 Filters:**
+- `getcfilterheaders <start> <count>` - Filter header chain
+- `getcfilter <start> <count>` - Compact block filters
+- `getfiltercount` - Number of indexed filters
 
-Mining (testing only)
-bash
+**Admin:**
+- `ban <ip>` / `unban <ip>` - Manage bans
+- `getbans` - List banned peers
+- `stop` - Shutdown node
 
-# Enable 2 mining threads (development/testing only)
-curl -s -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"setgenerate","params":[true, 2]}' \
-  http://127.0.0.1:9833
-Configuration
-Command-line flags
-Flag	Description
---datadir <path>	Where to store chain state and logs (e.g., ./data).
---p2p <port>	P2P listen port (default used here: 9883).
---rpc <port>	RPC listen port (default used here: 9833).
---seed 1	Seed mode (reduced outbound target; also settable via env).
---upnp 1	Attempt to open the P2P port via UPnP/NAT-PMP.
---loglevel <lvl>	Adjust logging verbosity (if available in your build).
+---
 
-Run miqrod --help to see the exact flags exposed by your build.
+## Configuration
 
-Environment variables
-Variable	Meaning
-MIQ_IS_SEED=1	Enable seed mode (affects outbound connection targets).
-MIQ_MIN_RELAY_FEE_RATE=<miqr/kB>	Local fee filter for transaction relay.
-MIQ_SELF_IP=<ip1,ip2,...>	Mark local/self IPv4s to avoid self-dials/hairpins.
+### Command-Line Flags
 
-Networking Notes
-Open/forward P2P TCP 9883 if you want to accept inbound peers.
+| Flag | Description |
+|------|-------------|
+| `--datadir <path>` | Data directory (default: `./data`) |
+| `--p2p <port>` | P2P listen port (default: 9883) |
+| `--rpc <port>` | RPC listen port (default: 9834) |
+| `--rpc-bind <ip>` | RPC bind address (default: 127.0.0.1) |
+| `--upnp 1` | Enable UPnP port mapping |
+| `--seed 1` | Run in seed mode |
+| `--reindex` | Rebuild UTXO set from blocks |
+| `--loglevel <n>` | Log verbosity (0=trace, 5=fatal) |
 
-RPC runs on TCP 9833. Keep it localhost-only unless you have strong protections.
+### Environment Variables
 
-The node avoids dialing loopback/self and limits outbound peers per /16 to reduce eclipse risk.
+| Variable | Description |
+|----------|-------------|
+| `MIQ_IS_SEED=1` | Enable seed node mode |
+| `MIQ_MIN_RELAY_FEE_RATE=<rate>` | Minimum relay fee (miqr/kB) |
+| `MIQ_SELF_IP=<ip1,ip2>` | Self IP addresses (prevent self-dial) |
 
-IPv4 and IPv6 are supported; sockets are non-blocking with keep-alive.
+---
 
-Ubuntu UFW example:
+## Architecture
 
-bash:
+```
+src/
+├── main.cpp          # Node entry point with TUI
+├── chain.h/cpp       # Blockchain state machine
+├── block.h           # Block/header structures
+├── tx.h              # Transaction structures
+├── mempool.h/cpp     # Transaction pool
+├── p2p.h/cpp         # P2P networking layer
+├── rpc.h/cpp         # JSON-RPC server
+├── metrics.h         # Prometheus metrics
+├── utxo_kv.h/cpp     # UTXO database (LevelDB)
+├── filters/          # BIP158 compact block filters
+├── wallet/           # Wallet components (WIP)
+└── cli/
+    └── miqminer_rpc.cpp  # Standalone miner
+```
 
-sudo ufw allow 9883/tcp     # P2P
-# rpc is typically local only; if you must expose:
-# sudo ufw allow from <your-ip> to any port 9833 proto tcp
-Data & Logs
-Chain data and logs live under --datadir (e.g., ./data).
+### Data Directory Structure
 
-Peer addresses persist to peers.dat / peers2.dat (if addrman is compiled in).
+```
+data/
+├── blocks/           # Raw block storage
+├── chainstate/       # UTXO set (LevelDB)
+├── filters/          # BIP158 filter cache
+├── peers.dat         # Known peer addresses
+├── bans.txt          # Banned peer list
+└── debug.log         # Node logs
+```
 
-Bans are stored in bans.txt (supports permanent and timed entries).
+---
 
-Troubleshooting
-No peers? Ensure TCP 9883 is reachable (firewall/NAT). Consider --upnp 1 for home networks. Give DNS seeds some time.
+## Security
 
-RPC errors? Confirm the node is running and you’re calling http://127.0.0.1:9833. Check logs under --datadir.
+### RPC Security
 
-Sync stalls? The node auto-falls back from headers-first to by-index; ensure multiple peers and stable connectivity.
+⚠️ **Warning:** RPC is unauthenticated by default. Always:
 
-Contributing
-PRs and issues are welcome! Please include:
+1. Bind to localhost only (`--rpc-bind 127.0.0.1`)
+2. Use firewall rules if exposing remotely
+3. Consider a reverse proxy with TLS for production
 
-OS & compiler (e.g., Ubuntu 22.04 + GCC 13, Windows 11 + MSVC 2022, macOS 14 + Apple Clang)
+```bash
+# UFW example - allow P2P, restrict RPC
+sudo ufw allow 9883/tcp           # P2P
+sudo ufw deny 9834/tcp            # Block remote RPC
+```
 
-Exact build steps and relevant logs
+### Cookie Authentication
 
-Small, focused PRs for easier review
+For local auth, the node can use cookie-based authentication:
+```
+data/.cookie    # Auto-generated auth token
+```
 
-Security & Production Readiness
-This repository is experimental.
-Wallet components are in flux and not production-ready yet. Still being forged to work 100% with miqrochain and sending miq successfully.
+---
+
+## Metrics
+
+The node exports Prometheus-compatible metrics:
+
+```bash
+curl http://127.0.0.1:9834/metrics
+```
+
+Key metrics:
+- `miq_chain_height` - Current block height
+- `miq_peers_count` - Connected peers
+- `miq_mempool_txs` - Mempool transaction count
+- `miq_blocks_validated_total` - Blocks validated
+- `miq_peer_stalls_total` - Peer stall events
+- `miq_reorgs_total` - Chain reorganizations
+
+---
+
+## Contributing
+
+PRs and issues welcome! Please include:
+- OS & compiler version
+- Build steps and logs
+- Small, focused changes
+
+---
+
+## License
+
+MIT License - see LICENSE file.
