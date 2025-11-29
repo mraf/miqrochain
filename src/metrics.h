@@ -42,6 +42,16 @@ public:
     void add_bytes_sent(uint64_t n) { bytes_sent_ += n; }
     void add_bytes_received(uint64_t n) { bytes_received_ += n; }
 
+    // CRITICAL v1 FIX: Additional metrics for operator visibility
+    void inc_peer_stalls() { peer_stalls_++; }
+    void inc_peer_bans() { peer_bans_++; }
+    void inc_blocks_disconnected() { blocks_disconnected_++; }
+    void inc_blocks_reconnected() { blocks_reconnected_++; }
+    void set_max_reorg_depth(uint64_t d) {
+        uint64_t cur = max_reorg_depth_.load();
+        while (d > cur && !max_reorg_depth_.compare_exchange_weak(cur, d)) {}
+    }
+
     // --- Gauge metrics (can go up and down) ---
     void set_chain_height(uint64_t h) { chain_height_ = h; }
     void set_peers_count(uint32_t n) { peers_count_ = n; }
@@ -164,6 +174,26 @@ public:
         ss << "# TYPE miq_bytes_received_total counter\n";
         ss << "miq_bytes_received_total " << bytes_received_.load() << "\n\n";
 
+        ss << "# HELP miq_peer_stalls_total Total peer stalls detected\n";
+        ss << "# TYPE miq_peer_stalls_total counter\n";
+        ss << "miq_peer_stalls_total " << peer_stalls_.load() << "\n\n";
+
+        ss << "# HELP miq_peer_bans_total Total peers banned\n";
+        ss << "# TYPE miq_peer_bans_total counter\n";
+        ss << "miq_peer_bans_total " << peer_bans_.load() << "\n\n";
+
+        ss << "# HELP miq_blocks_disconnected_total Total blocks disconnected during reorgs\n";
+        ss << "# TYPE miq_blocks_disconnected_total counter\n";
+        ss << "miq_blocks_disconnected_total " << blocks_disconnected_.load() << "\n\n";
+
+        ss << "# HELP miq_blocks_reconnected_total Total blocks reconnected during reorgs\n";
+        ss << "# TYPE miq_blocks_reconnected_total counter\n";
+        ss << "miq_blocks_reconnected_total " << blocks_reconnected_.load() << "\n\n";
+
+        ss << "# HELP miq_max_reorg_depth Maximum reorg depth observed\n";
+        ss << "# TYPE miq_max_reorg_depth gauge\n";
+        ss << "miq_max_reorg_depth " << max_reorg_depth_.load() << "\n\n";
+
         // Gauges
         ss << "# HELP miq_chain_height Current blockchain height\n";
         ss << "# TYPE miq_chain_height gauge\n";
@@ -262,6 +292,11 @@ private:
     std::atomic<uint64_t> reorgs_{0};
     std::atomic<uint64_t> bytes_sent_{0};
     std::atomic<uint64_t> bytes_received_{0};
+    std::atomic<uint64_t> peer_stalls_{0};
+    std::atomic<uint64_t> peer_bans_{0};
+    std::atomic<uint64_t> blocks_disconnected_{0};
+    std::atomic<uint64_t> blocks_reconnected_{0};
+    std::atomic<uint64_t> max_reorg_depth_{0};
 
     // Gauges
     std::atomic<uint64_t> chain_height_{0};
