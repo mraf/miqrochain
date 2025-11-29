@@ -25,7 +25,7 @@ m_balance = new QLabel("Balance: 0"); lay->addWidget(m_balance);
 auto *form = new QHBoxLayout();
 m_to = new QLineEdit(); m_to->setPlaceholderText("To Address");
 m_amt = new QLineEdit(); m_amt->setPlaceholderText("Amount (miqron)");
-m_fee = new QLineEdit(); m_fee->setPlaceholderText("Fee rate (sat/vB, optional)");
+m_fee = new QLineEdit(); m_fee->setPlaceholderText("Fee rate (miqron/vB, optional)");
 auto *send = new QPushButton("Send");
 form->addWidget(m_to); form->addWidget(m_amt); form->addWidget(m_fee); form->addWidget(send);
 lay->addLayout(form);

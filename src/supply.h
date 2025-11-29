@@ -30,9 +30,9 @@ namespace miq {
 // Public, fixed total supply in whole coins.
 static constexpr uint64_t MAX_SUPPLY_COINS = 26280000ULL; // 26.28 million
 // Precompute max in smallest units (fits in uint64_t: 2.628e15 << 2^64)
-static constexpr uint64_t MAX_SUPPLY_SATS  = MAX_SUPPLY_COINS * COIN;
+static constexpr uint64_t MAX_SUPPLY_MIQRONS  = MAX_SUPPLY_COINS * COIN;
 
-// Return the per-block subsidy (in sats) at height.
+// Return the per-block subsidy (in miqrons) at height.
 inline uint64_t GetBlockSubsidy(uint32_t height) {
     uint64_t eras = static_cast<uint64_t>(height) / HALVING_INTERVAL;
     if (eras >= 64) return 0ULL;
@@ -75,11 +75,11 @@ inline bool WouldExceedMaxSupply(uint32_t height, uint64_t coinbase_value_withou
     // minted_so_far is the sum of past subsidies only (no fees)
     const uint64_t minted = TotalSubsidyUpTo(height);
 
-    // Remaining = MAX_SUPPLY_SATS - minted  (with underflow guard)
-    if (minted >= MAX_SUPPLY_SATS) {
+    // Remaining = MAX_SUPPLY_MIQRONS - minted  (with underflow guard)
+    if (minted >= MAX_SUPPLY_MIQRONS) {
         return (coinbase_value_without_fees > 0ULL);
     }
-    const uint64_t remaining = MAX_SUPPLY_SATS - minted;
+    const uint64_t remaining = MAX_SUPPLY_MIQRONS - minted;
 
     return coinbase_value_without_fees > remaining;
 }

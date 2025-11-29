@@ -35,10 +35,10 @@ class  UTXOSet;          // defined in utxo.h
 #define MIQ_MEMPOOL_TX_EXPIRY_SECS (14u * 24u * 60u * 60u) // 14 days
 #endif
 #ifndef MIQ_MEMPOOL_MIN_RELAY_FEE
-#define MIQ_MEMPOOL_MIN_RELAY_FEE 1  // 1 sat/byte minimum
+#define MIQ_MEMPOOL_MIN_RELAY_FEE 1  // 1 miqron/byte minimum
 #endif
 #ifndef MIQ_MEMPOOL_INCREMENTAL_FEE
-#define MIQ_MEMPOOL_INCREMENTAL_FEE 1  // 1 sat/byte for RBF bump
+#define MIQ_MEMPOOL_INCREMENTAL_FEE 1  // 1 miqron/byte for RBF bump
 #endif
 #ifndef MIQ_MEMPOOL_RBF_ENABLED
 #define MIQ_MEMPOOL_RBF_ENABLED 1  // Enable Replace-By-Fee
@@ -64,7 +64,7 @@ struct MempoolEntry {
     Transaction tx;
     size_t      size_bytes{0};
     uint64_t    fee{0};
-    double      fee_rate{0.0}; // sat/byte
+    double      fee_rate{0.0}; // miqron/byte
     int64_t     added_ms{0};
 
     // Graph links
@@ -95,9 +95,9 @@ struct MempoolEntry {
 
 // Fee estimation bucket for production-grade fee estimation
 struct FeeEstimateBucket {
-    double low_priority{1.0};    // sat/byte for 6+ blocks
-    double medium_priority{2.0}; // sat/byte for 2-6 blocks
-    double high_priority{5.0};   // sat/byte for next block
+    double low_priority{1.0};    // miqron/byte for 6+ blocks
+    double medium_priority{2.0}; // miqron/byte for 2-6 blocks
+    double high_priority{5.0};   // miqron/byte for next block
     int64_t last_updated_ms{0};
 };
 
@@ -142,7 +142,7 @@ public:
 
     // === PRODUCTION-GRADE ENHANCEMENTS ===
 
-    // Fee estimation (returns sat/byte for target confirmation)
+    // Fee estimation (returns miqron/byte for target confirmation)
     double estimate_fee(int target_blocks) const;
     FeeEstimateBucket get_fee_estimates() const;
     void update_fee_estimates(uint32_t height);
@@ -200,7 +200,7 @@ private:
     bool compute_descendant_stats(const Key& k, size_t& cnt, size_t& bytes) const;
 
     // Acceptance path
-    bool validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView& utxo, uint64_t& fee, std::string& err) const;
+    bool validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView& utxo, uint32_t height, uint64_t& fee, std::string& err) const;
     bool enforce_limits_and_insert(const Transaction& tx, uint64_t fee, std::string& err);
 
     // Orphan handling
@@ -235,7 +235,7 @@ private:
     // === PRODUCTION FEE ESTIMATION ===
     FeeEstimateBucket fee_estimates_;
 
-    // Fee rate histogram for estimation (buckets: 1, 2, 5, 10, 20, 50, 100+ sat/byte)
+    // Fee rate histogram for estimation (buckets: 1, 2, 5, 10, 20, 50, 100+ miqron/byte)
     std::vector<std::pair<double, size_t>> fee_histogram_;  // (feerate, count)
 
     // Track confirmed transactions for fee estimation

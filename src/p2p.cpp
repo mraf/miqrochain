@@ -6808,4 +6808,59 @@ void P2P::handle_filterclear(PeerState& ps) {
     ps.relay_txs = true;
 }
 
+// =============================================================================
+// CRITICAL FIX: Local block notification for TUI display
+// =============================================================================
+void P2P::notify_local_block(const Block& b, uint64_t height, uint64_t subsidy, const std::string& miner_addr) {
+    if (block_callback_) {
+        P2PBlockInfo info;
+        info.height = height;
+
+        // Build hash hex
+        auto bh = b.block_hash();
+        std::string hash_hex;
+        hash_hex.reserve(64);
+        static const char hex[] = "0123456789abcdef";
+        for (uint8_t byte : bh) {
+            hash_hex.push_back(hex[byte >> 4]);
+            hash_hex.push_back(hex[byte & 0xf]);
+        }
+        info.hash_hex = hash_hex;
+        info.tx_count = static_cast<uint32_t>(b.txs.size());
+        info.miner = miner_addr;
+
+        // Calculate fees from coinbase
+        if (!b.txs.empty()) {
+            uint64_t coinbase_total = 0;
+            for (const auto& out : b.txs[0].vout) coinbase_total += out.value;
+            if (coinbase_total >= subsidy) {
+                info.fees = coinbase_total - subsidy;
+                info.fees_known = true;
+            }
+        }
+        block_callback_(info);
+    }
+
+    // Also notify about transactions in this block
+    if (txids_callback_ && b.txs.size() > 1) {
+        std::vector<std::string> txids;
+        txids.reserve(b.txs.size() - 1);
+        static const char hex[] = "0123456789abcdef";
+        for (size_t i = 1; i < b.txs.size(); ++i) {
+            auto tid = b.txs[i].txid();
+            std::string key;
+            key.reserve(64);
+            for (uint8_t byte : tid) {
+                key.push_back(hex[byte >> 4]);
+                key.push_back(hex[byte & 0xf]);
+            }
+            txids.push_back(key);
+        }
+        txids_callback_(txids);
+    }
+
+    // Broadcast the block to peers
+    broadcast_inv_block(b.block_hash());
+}
+
 }

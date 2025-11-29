@@ -353,11 +353,11 @@ namespace wallet_config {
     static constexpr int SLOW_ANIMATION_MS = 150;
 
     // Smart fee estimation
-    static constexpr uint64_t FEE_RATE_ECONOMY = 1;    // 1 sat/byte
-    static constexpr uint64_t FEE_RATE_NORMAL = 2;     // 2 sat/byte
-    static constexpr uint64_t FEE_RATE_PRIORITY = 5;   // 5 sat/byte
-    static constexpr uint64_t FEE_RATE_URGENT = 10;    // 10 sat/byte
-    static constexpr uint64_t FEE_RATE_MAX = 100;      // 100 sat/byte max
+    static constexpr uint64_t FEE_RATE_ECONOMY = 1;    // 1 miqron/byte
+    static constexpr uint64_t FEE_RATE_NORMAL = 2;     // 2 miqron/byte
+    static constexpr uint64_t FEE_RATE_PRIORITY = 5;   // 5 miqron/byte
+    static constexpr uint64_t FEE_RATE_URGENT = 10;    // 10 miqron/byte
+    static constexpr uint64_t FEE_RATE_MAX = 100;      // 100 miqron/byte max
     static constexpr int SPINNER_FRAME_MS = 80;
 
     // Validate configuration at compile time to ensure all constants are used
@@ -3086,7 +3086,7 @@ namespace live_dashboard {
         std::cout << "\033[38;5;39m║\033[0m\n";
 
         // ═══════════════════════════════════════════════════════════════════════
-        // QUICK ACTIONS BOX
+        // QUICK ACTIONS BOX - Arrow Key Navigation
         // ═══════════════════════════════════════════════════════════════════════
         std::cout << "\033[38;5;39m╠";
         for (int i = 0; i < W - 2; i++) std::cout << "═";
@@ -3097,35 +3097,58 @@ namespace live_dashboard {
         std::cout << std::string(W - 19, ' ');
         std::cout << "\033[38;5;39m║\033[0m\n";
 
+        // Menu items with arrow key navigation
+        // Row 1: 0=Receive, 1=Send, 2=History, 3=Contacts, 4=NewAddr
+        // Row 2: 5=Settings, 6=Refresh, 7=Monitor, 8=TXInfo, 9=Exit
+        int sel = g_state.selected_item;
+
+        // Animated selection arrows
+        const char* sel_arrows[] = {"►", "▻", "▸", "▹"};
+        std::string sel_arrow = sel_arrows[tick % 4];
+
+        // Helper lambda to draw a menu item
+        auto draw_item = [&](int idx, const char* key, const char* label, const char* base_color) {
+            bool is_sel = (sel == idx);
+            if (is_sel) {
+                std::cout << "\033[38;5;46m" << sel_arrow << "\033[0m";
+                std::cout << "\033[38;5;46m\033[1m[" << key << "]\033[0m ";
+                std::cout << "\033[38;5;46m\033[1m" << label << "\033[0m";
+            } else {
+                std::cout << " " << base_color << "[" << key << "]\033[0m " << label;
+            }
+        };
+
         // Row 1 - Main actions
-        std::cout << "\033[38;5;39m║\033[0m";
-        std::cout << "   \033[38;5;51m[1]\033[0m Receive   ";
-        std::cout << "\033[38;5;214m[2]\033[0m Send      ";
-        std::cout << "\033[38;5;51m[3]\033[0m History   ";
-        std::cout << "\033[38;5;51m[4]\033[0m Contacts  ";
-        std::cout << "\033[38;5;51m[n]\033[0m New Addr  ";
-        std::cout << "\033[38;5;39m║\033[0m\n";
+        std::cout << "\033[38;5;39m║\033[0m  ";
+        draw_item(0, "1", "Receive ", "\033[38;5;51m");
+        draw_item(1, "2", "Send    ", "\033[38;5;214m");
+        draw_item(2, "3", "History ", "\033[38;5;51m");
+        draw_item(3, "4", "Contacts", "\033[38;5;51m");
+        draw_item(4, "n", "NewAddr ", "\033[38;5;51m");
+        std::cout << " \033[38;5;39m║\033[0m\n";
 
         // Row 2 - Secondary actions
-        std::cout << "\033[38;5;39m║\033[0m";
-        std::cout << "   \033[38;5;51m[5]\033[0m Settings  ";
-        std::cout << "\033[38;5;46m[r]\033[0m Refresh   ";
-        std::cout << "\033[38;5;51m[t]\033[0m Monitor   ";
-        std::cout << "\033[38;5;214m[d]\033[0m TX Info   ";
-        std::cout << "\033[38;5;196m[q]\033[0m Exit      ";
-        std::cout << "\033[38;5;39m║\033[0m\n";
+        std::cout << "\033[38;5;39m║\033[0m  ";
+        draw_item(5, "5", "Settings", "\033[38;5;51m");
+        draw_item(6, "r", "Refresh ", "\033[38;5;46m");
+        draw_item(7, "t", "Monitor ", "\033[38;5;51m");
+        draw_item(8, "d", "TX Info ", "\033[38;5;214m");
+        draw_item(9, "q", "Exit    ", "\033[38;5;196m");
+        std::cout << " \033[38;5;39m║\033[0m\n";
 
         // Bottom border
         std::cout << "\033[38;5;39m╚";
         for (int i = 0; i < W - 2; i++) std::cout << "═";
         std::cout << "╝\033[0m\n";
 
-        // Animated instruction line
-        const char* cursor_frames[] = {"▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"};
-        int cursor_phase = tick % 16;
-        int cursor_idx = cursor_phase < 8 ? cursor_phase : 15 - cursor_phase;
-        std::cout << "\n  \033[38;5;240mPress a key (no Enter): \033[0m";
-        std::cout << "\033[38;5;51m" << cursor_frames[cursor_idx] << "\033[0m";
+        // Navigation help line
+        std::cout << "\n  \033[38;5;240m";
+        if (ui::g_use_utf8) {
+            std::cout << "↑↓←→ Navigate | Enter Select | 1-9/keys Direct";
+        } else {
+            std::cout << "Arrow keys Navigate | Enter Select | 1-9/keys Direct";
+        }
+        std::cout << "\033[0m";
         clear_to_eol();
         std::cout << std::flush;
     }
@@ -3574,7 +3597,7 @@ struct TxValidationResult {
     uint64_t total_output{0};
     uint64_t fee{0};
     size_t size_bytes{0};
-    double fee_rate{0.0};  // sat/byte
+    double fee_rate{0.0};  // miqron/byte
 };
 
 // UTXO selection strategies
@@ -3983,7 +4006,7 @@ struct TransactionBuildResult {
 struct TransactionBuildRequest {
     std::string recipient_address;
     uint64_t amount{0};
-    uint64_t fee_rate{2};  // sat/byte
+    uint64_t fee_rate{2};  // miqron/byte
     bool allow_unconfirmed{false};
     bool optimize_for_privacy{false};
     std::string memo;
@@ -4415,9 +4438,9 @@ static void update_stats_for_send(const std::string& wdir, uint64_t amount, uint
 // =============================================================================
 
 struct FeeEstimate {
-    uint64_t low_priority;      // sat/byte - next 6 blocks
-    uint64_t medium_priority;   // sat/byte - next 3 blocks
-    uint64_t high_priority;     // sat/byte - next block
+    uint64_t low_priority;      // miqron/byte - next 6 blocks
+    uint64_t medium_priority;   // miqron/byte - next 3 blocks
+    uint64_t high_priority;     // miqron/byte - next block
     int64_t estimated_time;     // seconds for medium priority
 };
 
@@ -5323,7 +5346,7 @@ struct ChangeOptimizationResult {
 // =============================================================================
 
 struct FeeRecommendation {
-    uint64_t economy_rate{1};       // sat/byte
+    uint64_t economy_rate{1};       // miqron/byte
     uint64_t normal_rate{2};
     uint64_t priority_rate{5};
     uint64_t urgent_rate{10};
@@ -5687,7 +5710,7 @@ static std::string confirmations_file_path(const std::string& wdir){
 }
 
 [[maybe_unused]] static bool is_valid_fee_rate(uint64_t rate){
-    return rate >= 1 && rate <= 1000;  // 1-1000 sat/byte
+    return rate >= 1 && rate <= 1000;  // 1-1000 miqron/byte
 }
 
 // =============================================================================
@@ -5975,15 +5998,17 @@ static bool remove_inputs_from_pending(const std::string& wdir,
 // =============================================================================
 struct TxHistoryEntry {
     std::string txid_hex;
-    int64_t timestamp{0};
-    int64_t amount{0};       // positive = received, negative = sent
+    int64_t timestamp{0};        // When transaction was created/detected
+    int64_t amount{0};           // positive = received, negative = sent
     uint64_t fee{0};
     uint32_t confirmations{0};
-    std::string direction;   // "sent", "received", "self", "mined"
+    std::string direction;       // "sent", "received", "self", "mined"
     std::string to_address;
     std::string from_address;
     std::string memo;
-    uint32_t block_height{0};  // Block height for accurate ordering (0 = unconfirmed)
+    uint32_t block_height{0};    // Block height for accurate ordering (0 = unconfirmed)
+    int64_t confirmation_time{0}; // Timestamp when first confirmed (block time)
+    double fee_rate{0.0};        // Fee rate in miqron/byte
 };
 
 // =============================================================================
@@ -6115,6 +6140,10 @@ static void load_tx_history_from_file(const std::string& wdir, std::vector<TxHis
             if(parts.size() > 8) e.memo = parts[8];
             // New field: block_height (optional, defaults to 0 for backward compatibility)
             if(parts.size() > 9) e.block_height = (uint32_t)std::strtoul(parts[9].c_str(), nullptr, 10);
+            // New field: confirmation_time (optional)
+            if(parts.size() > 10) e.confirmation_time = std::strtoll(parts[10].c_str(), nullptr, 10);
+            // New field: fee_rate (optional)
+            if(parts.size() > 11) e.fee_rate = std::strtod(parts[11].c_str(), nullptr);
             out.push_back(e);
         }
     }
@@ -6144,13 +6173,14 @@ static void load_tx_history(const std::string& wdir, std::vector<TxHistoryEntry>
 static void save_tx_history(const std::string& wdir, const std::vector<TxHistoryEntry>& hist){
     std::ofstream f(tx_history_path(wdir), std::ios::out | std::ios::trunc);
     if(!f.good()) return;
-    f << "# Rythmium Wallet Transaction History v2\n";
+    f << "# Rythmium Wallet Transaction History v3\n";
     for(const auto& e : hist){
-        // Include block_height in the saved format
+        // Include all fields in the saved format (v3 adds confirmation_time and fee_rate)
         f << e.txid_hex << "|" << e.timestamp << "|" << e.amount << "|"
           << e.fee << "|" << e.confirmations << "|" << e.direction << "|"
           << e.to_address << "|" << e.from_address << "|" << e.memo << "|"
-          << e.block_height << "\n";
+          << e.block_height << "|" << e.confirmation_time << "|"
+          << std::fixed << std::setprecision(2) << e.fee_rate << "\n";
     }
 
     // Invalidate cache after save so next load gets fresh data
@@ -6278,6 +6308,11 @@ static void update_all_tx_confirmations(const std::string& wdir,
         if(new_conf != old_conf){
             e.confirmations = new_conf;
             changed = true;
+
+            // v12.0: Set confirmation_time when first confirmed (0 -> 1+)
+            if(old_conf == 0 && new_conf >= 1 && e.confirmation_time == 0){
+                e.confirmation_time = (int64_t)time(nullptr);
+            }
         }
 
         // Update block_height if we found one and entry doesn't have one yet
@@ -6288,6 +6323,11 @@ static void update_all_tx_confirmations(const std::string& wdir,
             // NOTE: Deliberately NOT updating timestamp here
             // The original timestamp represents when user created/received the tx
             // Blockchain timestamp would show ~44 days old due to genesis time offset
+
+            // v12.0: Also set confirmation_time here if not set
+            if(e.confirmation_time == 0){
+                e.confirmation_time = (int64_t)time(nullptr);
+            }
         }
     }
 
@@ -6297,8 +6337,9 @@ static void update_all_tx_confirmations(const std::string& wdir,
 }
 
 // =============================================================================
-// AUTO-DETECT RECEIVED TRANSACTIONS v9.0 - Scan for new incoming payments
-// CRITICAL FIX: Aggregate multiple outputs from same transaction into one entry
+// AUTO-DETECT RECEIVED TRANSACTIONS v12.0 - Scan for new incoming payments
+// CRITICAL FIX v12.0: Exclude change outputs from our own sent transactions
+// CRITICAL FIX v9.0: Aggregate multiple outputs from same transaction into one entry
 // =============================================================================
 static int auto_detect_received_transactions(
     const std::string& wdir,
@@ -6310,8 +6351,19 @@ static int auto_detect_received_transactions(
 
     // Build set of known txids
     std::set<std::string> known_txids;
+    // v12.0 FIX: Also track TXIDs of our sent transactions to exclude change
+    std::set<std::string> sent_txids;
     for(const auto& e : hist){
         known_txids.insert(e.txid_hex);
+        if(e.direction == "sent"){
+            sent_txids.insert(e.txid_hex);
+        }
+    }
+
+    // v12.0 FIX: Build set of known change outputs from local_change_cache
+    std::set<std::pair<std::string, uint32_t>> change_outputs;
+    for(const auto& lc : g_local_change_cache){
+        change_outputs.insert({lc.txid_hex, lc.vout});
     }
 
     // v9.0 FIX: First aggregate UTXOs by TXID to handle multi-output transactions
@@ -6320,6 +6372,7 @@ static int auto_detect_received_transactions(
         uint32_t min_height{UINT32_MAX};
         int output_count{0};
         bool coinbase{false};
+        bool is_change{false};  // v12.0: Track if this is change from our own tx
     };
     std::map<std::string, TxAggregate> new_txs;
 
@@ -6328,6 +6381,20 @@ static int auto_detect_received_transactions(
 
         // Skip if we already know about this transaction
         if(known_txids.find(txid) != known_txids.end()) continue;
+
+        // v12.0 CRITICAL FIX: Skip change outputs from our own sent transactions
+        // This prevents change from appearing as a separate "received" transaction
+        if(change_outputs.find({txid, u.vout}) != change_outputs.end()){
+            // This is a change output - skip it entirely
+            continue;
+        }
+
+        // v12.0: Also skip if the transaction is in our sent history
+        // (This catches change even after local_change_cache expires)
+        if(sent_txids.find(txid) != sent_txids.end()){
+            // This UTXO is from a transaction we sent - it's change, not a new receive
+            continue;
+        }
 
         // Aggregate this output (INCLUDING coinbase/mining rewards!)
         auto& agg = new_txs[txid];
@@ -6370,6 +6437,8 @@ static int auto_detect_received_transactions(
         if(agg.min_height < UINT32_MAX && current_tip_height >= agg.min_height){
             entry.confirmations = current_tip_height - agg.min_height + 1;
             entry.block_height = agg.min_height;  // Store actual block height for accurate sorting
+            // v12.0: Set confirmation_time when first detected as confirmed
+            entry.confirmation_time = (int64_t)time(nullptr);
         } else {
             entry.confirmations = 0;
             entry.block_height = 0;  // Unconfirmed
@@ -6645,7 +6714,7 @@ static void draw_tx_details_window(const BlockchainTxDetails& tx, int width = 72
         std::ostringstream fee_ss;
         fee_ss << std::fixed << std::setprecision(8) << ((double)tx.fee / (double)COIN) << " MIQ";
         if (tx.fee_rate > 0) {
-            fee_ss << " (" << std::fixed << std::setprecision(2) << tx.fee_rate << " sat/byte)";
+            fee_ss << " (" << std::fixed << std::setprecision(2) << tx.fee_rate << " miqron/byte)";
         }
         draw_line("Fee:", fee_ss.str());
     }
@@ -7209,6 +7278,7 @@ struct TxDetailedEntry {
     size_t tx_size{0};
     double fee_rate{0.0};
     std::string status;
+    int64_t confirmation_time{0}; // Timestamp when first confirmed
 };
 
 // Transaction history filter options
@@ -7256,9 +7326,13 @@ static TxDetailedEntry convert_to_detailed(const TxHistoryEntry& basic) {
     detailed.memo = basic.memo;
     detailed.block_height = basic.block_height;  // Copy block height for accurate sorting
     detailed.status = basic.confirmations > 0 ? "confirmed" : "pending";
+    detailed.confirmation_time = basic.confirmation_time;  // Copy confirmation timestamp
     detailed.tx_size = 225;
     if (detailed.fee > 0) {
         detailed.fee_rate = (double)detailed.fee / detailed.tx_size;
+    }
+    if (basic.fee_rate > 0) {
+        detailed.fee_rate = basic.fee_rate;  // Use stored fee rate if available
     }
     return detailed;
 }
@@ -7782,16 +7856,23 @@ static void show_interactive_tx_details(
             if(tx.fee > 0){
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "Fee: " << ui_pro::format_miq_professional(tx.fee) << " MIQ";
                 if(tx.fee_rate > 0){
-                    std::cout << " (" << std::fixed << std::setprecision(2) << tx.fee_rate << " sat/byte)";
+                    std::cout << " (" << std::fixed << std::setprecision(2) << tx.fee_rate << " miqron/byte)";
                 }
                 std::cout << ui::reset() << "\n";
             }
             std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
 
             // Time
-            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Date/Time:" << ui::reset() << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Created:" << ui::reset() << "\n";
             std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::format_time(tx.timestamp) << "\n";
             std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::dim() << "(" << ui::format_time_ago(tx.timestamp) << ")" << ui::reset() << "\n";
+
+            // Confirmation time (when first confirmed)
+            if(tx.confirmation_time > 0){
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "First Confirmed:" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::green() << ui::format_time(tx.confirmation_time) << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::dim() << "(" << ui::format_time_ago(tx.confirmation_time) << ")" << ui::reset() << "\n";
+            }
             std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
 
             // Confirmations
@@ -8048,7 +8129,7 @@ static void print_tx_details_view(const TxDetailedEntry& tx,
     ui_pro::print_kv("Fee:", ui_pro::format_miq_professional(tx.fee) + " MIQ", 18);
     if (tx.fee_rate > 0) {
         std::ostringstream fee_rate_ss;
-        fee_rate_ss << std::fixed << std::setprecision(2) << tx.fee_rate << " sat/byte";
+        fee_rate_ss << std::fixed << std::setprecision(2) << tx.fee_rate << " miqron/byte";
         ui_pro::print_kv("Fee Rate:", fee_rate_ss.str(), 18);
     }
     std::cout << "\n";
@@ -8136,17 +8217,17 @@ static void print_tx_statistics(const std::vector<TxDetailedEntry>& txs) {
 // =============================================================================
 [[maybe_unused]] static std::string fee_priority_label(int priority){
     switch(priority){
-        case 0: return "Economy (1 sat/byte)";
-        case 1: return "Normal (2 sat/byte)";
-        case 2: return "Priority (5 sat/byte)";
-        case 3: return "Urgent (10 sat/byte)";
+        case 0: return "Economy (1 miqron/byte)";
+        case 1: return "Normal (2 miqron/byte)";
+        case 2: return "Priority (5 miqron/byte)";
+        case 3: return "Urgent (10 miqron/byte)";
         default: return "Custom";
     }
 }
 
-// Fee rate in sat/byte for each priority level
-// These are converted to sat/kB when calculating actual fees
-// IMPORTANT: Must be >= 1 sat/byte (mempool minimum relay fee)
+// Fee rate in miqron/byte for each priority level
+// These are converted to miqron/kB when calculating actual fees
+// IMPORTANT: Must be >= 1 miqron/byte (mempool minimum relay fee)
 static uint64_t fee_priority_rate(int priority){
     switch(priority){
         case 0: return 1;   // Economy: minimum relay fee
@@ -9668,6 +9749,12 @@ static bool wallet_session(const std::string& cli_host,
                 // Update UTXOs
                 utxos = std::move(new_utxos);
 
+                // CRITICAL FIX: Cleanup confirmed local change and merge unconfirmed
+                // This mirrors the logic in refresh_and_print() for consistent balance display
+                // Without this, balance may not reflect pending change correctly after auto-refresh
+                cleanup_confirmed_local_change(wdir, utxos);
+                merge_local_change_into_utxos(utxos);
+
                 // Update connection status
                 is_online = true;
                 last_connected_node = used_seed;
@@ -9702,7 +9789,58 @@ static bool wallet_session(const std::string& cli_host,
         // No key pressed - continue animation loop
         if(ch < 0) continue;
 
-        // Convert to lowercase for consistency
+        // Arrow key navigation for wallet menu
+        // Menu layout: Row 1: 0-4, Row 2: 5-9
+        if (ch == 27) {  // ESC sequence for arrow keys
+            int ch2 = instant_input::wait_for_key(50);
+            if (ch2 == '[') {
+                int ch3 = instant_input::wait_for_key(50);
+                int& sel = live_dashboard::g_state.selected_item;
+                if (ch3 == 'A') {  // Up arrow - move to row above
+                    if (sel >= 5) sel -= 5;
+                } else if (ch3 == 'B') {  // Down arrow - move to row below
+                    if (sel < 5) sel += 5;
+                } else if (ch3 == 'C') {  // Right arrow - move right
+                    if (sel == 4) sel = 5;  // Wrap from end of row 1 to start of row 2
+                    else if (sel == 9) sel = 0;  // Wrap from end of row 2 to start of row 1
+                    else sel++;
+                } else if (ch3 == 'D') {  // Left arrow - move left
+                    if (sel == 0) sel = 9;  // Wrap from start of row 1 to end of row 2
+                    else if (sel == 5) sel = 4;  // Wrap from start of row 2 to end of row 1
+                    else sel--;
+                }
+                continue;  // Continue animation loop after arrow key
+            } else if (ch2 < 0) {
+                // Just ESC key - treat as quit
+                ch = 'q';
+            } else {
+                continue;  // Unknown escape sequence
+            }
+        }
+
+        // Enter key - select current menu item
+        if (ch == '\r' || ch == '\n' || ch == ' ') {
+            // Map selected item to key
+            const char* key_map[] = {"1", "2", "3", "4", "n", "5", "r", "t", "d", "q"};
+            int sel = live_dashboard::g_state.selected_item;
+            if (sel >= 0 && sel < 10) {
+                ch = key_map[sel][0];
+            }
+        }
+
+        // j/k vim-style navigation
+        if (ch == 'j' || ch == 'J') {
+            int& sel = live_dashboard::g_state.selected_item;
+            if (sel < 5) sel += 5;
+            continue;
+        }
+        if (ch == 'k' || ch == 'K') {
+            int& sel = live_dashboard::g_state.selected_item;
+            if (sel >= 5) sel -= 5;
+            continue;
+        }
+
+        // Convert to character for consistency
         char c_char = (char)ch;
         std::string c(1, c_char);
 
@@ -9749,6 +9887,9 @@ static bool wallet_session(const std::string& cli_host,
             instant_input::enable_raw_mode();
             instant_input::hide_cursor();
 
+            // v12.0: Zero-flicker rendering - track first draw for initial clear
+            bool history_first_draw = true;
+
             while (history_running) {
                 auto filtered = filter_transactions(all_txs, view_state.filter);
                 sort_transactions(filtered, view_state.sort_order);
@@ -9763,23 +9904,31 @@ static bool wallet_session(const std::string& cli_host,
                 if (view_state.selected < 0) view_state.selected = 0;
                 if (view_state.selected >= view_state.total_count) view_state.selected = view_state.total_count - 1;
 
-                // Clear and redraw
-                std::cout << "\033[2J\033[H" << std::flush;
+                // v12.0: Zero-flicker rendering - only clear on first draw, then use cursor home
+                if (history_first_draw) {
+                    std::cout << "\033[2J\033[H" << std::flush;
+                    history_first_draw = false;
+                } else {
+                    std::cout << "\033[H" << std::flush;  // Cursor home only
+                }
 
                 const int W = 78;
                 std::string bc_h = ui::g_use_utf8 ? "═" : "=";
                 std::string bc_v = ui::g_use_utf8 ? "║" : "|";
 
+                // v12.0: Zero-flicker helper - clear to end of line before newline
+                auto eol = []() { std::cout << "\033[K"; };
+
                 // Header
                 std::cout << "\n  " << ui::cyan();
                 std::cout << (ui::g_use_utf8 ? "╔" : "+");
                 for(int i = 0; i < W - 2; i++) std::cout << bc_h;
-                std::cout << (ui::g_use_utf8 ? "╗" : "+") << ui::reset() << "\n";
+                std::cout << (ui::g_use_utf8 ? "╗" : "+") << ui::reset(); eol(); std::cout << "\n";
 
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset();
                 std::cout << "  " << ui::bold() << ui::white() << "TRANSACTION HISTORY" << ui::reset();
                 std::cout << "  " << ui::dim() << view_state.total_count << " transactions" << ui::reset();
-                std::cout << std::string(W - 35, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << std::string(W - 35, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 // Filter status line
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset();
@@ -9796,22 +9945,22 @@ static bool wallet_session(const std::string& cli_host,
                 if (view_state.filter.direction.empty() && view_state.filter.status.empty() && view_state.filter.search.empty()) {
                     std::cout << ui::dim() << "No filters" << ui::reset();
                 }
-                std::cout << std::string(W - 30, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << std::string(W - 30, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 // Separator
                 std::cout << "  " << ui::cyan();
                 std::cout << (ui::g_use_utf8 ? "╠" : "+");
                 for(int i = 0; i < W - 2; i++) std::cout << (ui::g_use_utf8 ? "─" : "-");
-                std::cout << (ui::g_use_utf8 ? "╣" : "+") << ui::reset() << "\n";
+                std::cout << (ui::g_use_utf8 ? "╣" : "+") << ui::reset(); eol(); std::cout << "\n";
 
                 // Column headers
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset();
                 std::cout << ui::dim() << "   #  Dir  Date        Amount           Conf   Address" << ui::reset();
-                std::cout << std::string(W - 60, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << std::string(W - 60, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 std::cout << "  " << ui::cyan() << bc_v;
                 for(int i = 0; i < W - 2; i++) std::cout << (ui::g_use_utf8 ? "─" : "-");
-                std::cout << bc_v << ui::reset() << "\n";
+                std::cout << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 int start_idx = view_state.page * view_state.per_page;
                 int end_idx = std::min(start_idx + view_state.per_page, view_state.total_count);
@@ -9819,7 +9968,7 @@ static bool wallet_session(const std::string& cli_host,
                 if (filtered.empty()) {
                     std::cout << "  " << ui::cyan() << bc_v << ui::reset();
                     std::cout << "  " << ui::dim() << "No transactions match filters." << ui::reset();
-                    std::cout << std::string(W - 36, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                    std::cout << std::string(W - 36, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
                 } else {
                     for (int i = start_idx; i < end_idx; i++) {
                         const auto& tx = filtered[i];
@@ -9868,14 +10017,14 @@ static bool wallet_session(const std::string& cli_host,
                         if (addr.length() > 12) addr = addr.substr(0, 12) + "...";
                         std::cout << ui::dim() << addr << ui::reset();
 
-                        std::cout << std::string(5, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                        std::cout << std::string(5, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
                     }
 
                     // Pad remaining rows
                     for (int i = end_idx - start_idx; i < view_state.per_page; i++) {
                         std::cout << "  " << ui::cyan() << bc_v << ui::reset();
                         std::cout << std::string(W - 2, ' ');
-                        std::cout << ui::cyan() << bc_v << ui::reset() << "\n";
+                        std::cout << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
                     }
                 }
 
@@ -9883,12 +10032,12 @@ static bool wallet_session(const std::string& cli_host,
                 std::cout << "  " << ui::cyan();
                 std::cout << (ui::g_use_utf8 ? "╠" : "+");
                 for(int i = 0; i < W - 2; i++) std::cout << (ui::g_use_utf8 ? "─" : "-");
-                std::cout << (ui::g_use_utf8 ? "╣" : "+") << ui::reset() << "\n";
+                std::cout << (ui::g_use_utf8 ? "╣" : "+") << ui::reset(); eol(); std::cout << "\n";
 
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset();
                 std::cout << "  Page " << (view_state.page + 1) << "/" << view_state.total_pages;
                 std::cout << "  |  " << (end_idx - start_idx) << "/" << view_state.total_count << " shown";
-                std::cout << std::string(W - 35, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << std::string(W - 35, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 // Controls
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset();
@@ -9898,7 +10047,7 @@ static bool wallet_session(const std::string& cli_host,
                 } else {
                     std::cout << "j/k Select  n/p Page  Enter View  s Stats  t Text  1-5 Filter  q Back";
                 }
-                std::cout << ui::reset() << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << ui::reset() << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 // Filter options
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset();
@@ -9908,13 +10057,13 @@ static bool wallet_session(const std::string& cli_host,
                           << ui::cyan() << "3" << ui::reset() << ui::dim() << "=Received  "
                           << ui::cyan() << "4" << ui::reset() << ui::dim() << "=Mined  "
                           << ui::cyan() << "5" << ui::reset() << ui::dim() << "=Pending" << ui::reset();
-                std::cout << std::string(W - 65, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << std::string(W - 65, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 // Bottom border
                 std::cout << "  " << ui::cyan();
                 std::cout << (ui::g_use_utf8 ? "╚" : "+");
                 for(int i = 0; i < W - 2; i++) std::cout << bc_h;
-                std::cout << (ui::g_use_utf8 ? "╝" : "+") << ui::reset() << "\n";
+                std::cout << (ui::g_use_utf8 ? "╝" : "+") << ui::reset(); eol(); std::cout << "\n";
 
                 // Handle input
                 int ch = instant_input::wait_for_key(100);
@@ -10298,7 +10447,7 @@ static bool wallet_session(const std::string& cli_host,
 
                         std::cout << "\n  " << ui::bold() << "Fee Bump Options:" << ui::reset() << "\n";
                         std::cout << "  " << ui::dim() << "Replace stuck transaction with higher fee using RBF" << ui::reset() << "\n\n";
-                        std::cout << "    " << ui::yellow() << "[a]" << ui::reset() << " Bump ALL stuck transactions (5 sat/byte)\n";
+                        std::cout << "    " << ui::yellow() << "[a]" << ui::reset() << " Bump ALL stuck transactions (5 miqron/byte)\n";
                         std::cout << "    " << ui::cyan() << "[1-" << stuck_txs.size() << "]" << ui::reset() << " Select specific transaction\n";
                         std::cout << "    " << ui::cyan() << "[q]" << ui::reset() << " Cancel\n\n";
 
@@ -10470,10 +10619,10 @@ static bool wallet_session(const std::string& cli_host,
             std::cout << "  - Immature: Mining rewards, need 100 confirmations\n\n";
 
             std::cout << ui::bold() << "  Fee Priorities:" << ui::reset() << "\n";
-            std::cout << "  - Economy (1 sat/byte): Cheap, may take longer\n";
-            std::cout << "  - Normal (2 sat/byte): Standard speed\n";
-            std::cout << "  - Priority (5 sat/byte): Faster confirmation\n";
-            std::cout << "  - Urgent (10 sat/byte): Fastest confirmation\n\n";
+            std::cout << "  - Economy (1 miqron/byte): Cheap, may take longer\n";
+            std::cout << "  - Normal (2 miqron/byte): Standard speed\n";
+            std::cout << "  - Priority (5 miqron/byte): Faster confirmation\n";
+            std::cout << "  - Urgent (10 miqron/byte): Fastest confirmation\n\n";
 
             std::cout << "  " << ui::dim() << "Press ENTER to return..." << ui::reset();
             std::string dummy;
@@ -10651,16 +10800,16 @@ static bool wallet_session(const std::string& cli_host,
             // Default to Normal fee which reliably gets into blocks
             // Users can override with custom fee if needed
             std::cout << "\n  " << ui::bold() << "Fee Selection:" << ui::reset() << "\n";
-            std::cout << "    " << ui::green() << "[auto]" << ui::reset() << " Automatic - 2 sat/byte (recommended, default)\n";
-            std::cout << "    " << ui::dim() << "[0]" << ui::reset() << " Economy - 1 sat/byte (may be slow)\n";
-            std::cout << "    " << ui::cyan() << "[1]" << ui::reset() << " Normal - 2 sat/byte\n";
-            std::cout << "    " << ui::cyan() << "[2]" << ui::reset() << " Priority - 5 sat/byte (faster)\n";
-            std::cout << "    " << ui::cyan() << "[3]" << ui::reset() << " Urgent - 10 sat/byte (fastest)\n\n";
+            std::cout << "    " << ui::green() << "[auto]" << ui::reset() << " Automatic - 2 miqron/byte (recommended, default)\n";
+            std::cout << "    " << ui::dim() << "[0]" << ui::reset() << " Economy - 1 miqron/byte (may be slow)\n";
+            std::cout << "    " << ui::cyan() << "[1]" << ui::reset() << " Normal - 2 miqron/byte\n";
+            std::cout << "    " << ui::cyan() << "[2]" << ui::reset() << " Priority - 5 miqron/byte (faster)\n";
+            std::cout << "    " << ui::cyan() << "[3]" << ui::reset() << " Urgent - 10 miqron/byte (fastest)\n\n";
 
             std::string fee_sel = ui::prompt("Fee [auto]: ");
             fee_sel = trim(fee_sel);
 
-            // Default to Normal (2 sat/byte) which reliably gets into blocks
+            // Default to Normal (2 miqron/byte) which reliably gets into blocks
             int fee_priority = 1;  // Default: Normal
             if(!fee_sel.empty() && fee_sel != "auto" && fee_sel != "a"){
                 fee_priority = std::atoi(fee_sel.c_str());
@@ -10668,7 +10817,7 @@ static bool wallet_session(const std::string& cli_host,
             }
 
             uint64_t fee_rate = fee_priority_rate(fee_priority);
-            std::cout << "  " << ui::dim() << "Using fee rate: " << fee_rate << " sat/byte" << ui::reset() << "\n";
+            std::cout << "  " << ui::dim() << "Using fee rate: " << fee_rate << " miqron/byte" << ui::reset() << "\n";
 
             uint64_t amount = 0;
             try {
@@ -10723,7 +10872,7 @@ static bool wallet_session(const std::string& cli_host,
                 });
 
             // Select inputs (use selected fee rate)
-            uint64_t fee_rate_kb = fee_rate * 1000;  // Convert sat/byte to sat/kB
+            uint64_t fee_rate_kb = fee_rate * 1000;  // Convert miqron/byte to miqron/kB
             miq::Transaction tx;
             uint64_t in_sum = 0;
             for(const auto& u : spendables){
@@ -12344,6 +12493,14 @@ static bool wallet_session(const std::string& cli_host,
                         std::ostringstream addr_line;
                         addr_line << "      " << ui::dim() << "To:   " << ui::reset() << tx.to_address;
                         ui::draw_window_line(addr_line.str(), TX_WIN_WIDTH);
+                    }
+
+                    // Confirmation time (when first confirmed)
+                    if(tx.confirmation_time > 0){
+                        std::ostringstream conf_time_line;
+                        conf_time_line << "      " << ui::dim() << "Confirmed: " << ui::reset()
+                                       << ui::format_time(tx.confirmation_time);
+                        ui::draw_window_line(conf_time_line.str(), TX_WIN_WIDTH);
                     }
 
                     // Fee if sent

@@ -261,7 +261,7 @@ static constexpr const char* RPC_TOKEN_DEFAULT = "";
 #define MIQ_MEMPOOL_MAX_BYTES_PROD (300u * 1024u * 1024u)  // 300 MiB mempool
 #endif
 #ifndef MIQ_MEMPOOL_MIN_FEE_RATE
-#define MIQ_MEMPOOL_MIN_FEE_RATE 1  // 1 sat/byte minimum relay fee
+#define MIQ_MEMPOOL_MIN_FEE_RATE 1  // 1 miqron/byte minimum relay fee
 #endif
 #ifndef MIQ_MEMPOOL_MAX_ANCESTORS_PROD
 #define MIQ_MEMPOOL_MAX_ANCESTORS_PROD 50  // Allow deeper chains
@@ -286,7 +286,7 @@ static constexpr const char* RPC_TOKEN_DEFAULT = "";
 #define MIQ_DEFAULT_MINING_THREADS 0  // 0 = auto-detect CPU cores
 #endif
 #ifndef MIQ_BLOCK_MIN_TX_FEE
-#define MIQ_BLOCK_MIN_TX_FEE 1000  // Minimum 1000 sats fee for inclusion
+#define MIQ_BLOCK_MIN_TX_FEE 1000  // Minimum 1000 miqrons fee for inclusion
 #endif
 
 // === PRODUCTION LOGGING & MONITORING ===

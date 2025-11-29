@@ -58,7 +58,7 @@
 #endif
 
 #ifndef MIN_RELAY_FEE_RATE
-// sat/KB (miqron per kilobyte)
+// miqron/KB (miqron per kilobyte)
 static constexpr uint64_t MIN_RELAY_FEE_RATE = 1000;
 #endif
 #ifndef DUST_THRESHOLD
@@ -350,7 +350,7 @@ static size_t estimate_size_bytes(size_t nin, size_t nout){
 }
 
 [[maybe_unused]] static uint64_t min_fee_for_size(size_t sz_bytes){
-    const uint64_t rate = MIN_RELAY_FEE_RATE; // sat/kB
+    const uint64_t rate = MIN_RELAY_FEE_RATE; // miqron/kB
     uint64_t kb = (uint64_t)((sz_bytes + 999) / 1000);
     if(kb==0) kb=1;
     return kb * rate;
@@ -892,6 +892,8 @@ std::string RpcService::handle(const std::string& body){
 
             // Collect mempool txs with simple fee & size estimates.
             auto txs_vec = mempool_.collect(5000);
+            log_info("getminertemplate: mempool size=" + std::to_string(mempool_.size()) +
+                     ", collected " + std::to_string(txs_vec.size()) + " txs for template");
             std::vector<JNode> arr;
 
             // Build a quick index from txid -> (fee, vsize, hex, depends[])
@@ -1091,6 +1093,21 @@ std::string RpcService::handle(const std::string& body){
             JNode arr; std::vector<JNode> v;
             for(auto& id: ids){ JNode s; s.v = std::string(to_hex(id)); v.push_back(s); }
             arr.v = v; return json_dump(arr);
+        }
+
+        // DIAGNOSTIC: Get mempool statistics including orphan info
+        if(method=="getmempoolinfo"){
+            auto stats = mempool_.get_stats();
+            std::map<std::string, JNode> o;
+            o["size"] = jnum((double)stats.tx_count);
+            o["bytes"] = jnum((double)stats.bytes_used);
+            o["orphan_count"] = jnum((double)stats.orphan_count);
+            o["orphan_bytes"] = jnum((double)stats.orphan_bytes);
+            o["min_fee_rate"] = jnum(stats.min_fee_rate);
+            o["max_fee_rate"] = jnum(stats.max_fee_rate);
+            o["avg_fee_rate"] = jnum(stats.avg_fee_rate);
+            o["total_fees"] = jnum((double)stats.total_fees);
+            JNode out; out.v = o; return json_dump(out);
         }
 
         if(method=="gettxout"){
@@ -1349,8 +1366,12 @@ std::string RpcService::handle(const std::string& body){
             }
 
             bool accepted = false;
+            std::string txid_hex = to_hex(tx.txid());
+            log_info("sendrawtransaction: attempting to accept tx " + txid_hex.substr(0, 16) + "...");
+
             if (has_conflict) {
                 // Try RBF - accept_replacement validates fee bump rules
+                log_info("sendrawtransaction: tx has conflict, trying RBF path");
                 accepted = mempool_.accept_replacement(tx, chain_.utxo(), static_cast<uint32_t>(tip.height), e);
             } else {
                 // Normal accept path for non-conflicting transactions
@@ -1358,6 +1379,7 @@ std::string RpcService::handle(const std::string& body){
             }
 
             if(accepted){
+                log_info("sendrawtransaction: tx " + txid_hex.substr(0, 16) + "... ACCEPTED into mempool (size=" + std::to_string(mempool_.size()) + ")");
                 // CRITICAL FIX: Broadcast transaction to P2P network
                 // Without this, transactions only sit in local mempool and never propagate!
                 if(p2p_) {
@@ -1371,6 +1393,7 @@ std::string RpcService::handle(const std::string& body){
                 }
                 JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
             } else {
+                log_warn("sendrawtransaction: tx " + txid_hex.substr(0, 16) + "... REJECTED: " + e);
                 return err(e);
             }
         }
@@ -1395,6 +1418,29 @@ std::string RpcService::handle(const std::string& body){
 
             // CRITICAL FIX: Notify mempool to remove confirmed transactions
             mempool_.on_block_connect(b);
+
+            // CRITICAL FIX: Notify TUI about the new locally-mined block
+            // This ensures Recent Blocks and Recent TXIDs update for local mining
+            if(p2p_) {
+                uint64_t block_height = chain_.tip().height;
+
+                // Calculate subsidy for this block height
+                uint64_t subsidy = INITIAL_SUBSIDY;
+                uint64_t halvings = block_height / HALVING_INTERVAL;
+                if (halvings < 64) subsidy = INITIAL_SUBSIDY >> halvings;
+                else subsidy = 0;
+
+                // Extract miner address from coinbase if available
+                std::string miner_addr;
+                if (!b.txs.empty() && !b.txs[0].vout.empty()) {
+                    // Try to get base58 address from coinbase output
+                    const auto& pkh = b.txs[0].vout[0].pkh;
+                    if (pkh.size() == 20) {
+                        miner_addr = base58check_encode(VERSION_P2PKH, pkh);
+                    }
+                }
+                p2p_->notify_local_block(b, block_height, subsidy, miner_addr);
+            }
 
             // Build a small success object
             std::map<std::string,JNode> o;
@@ -1987,7 +2033,17 @@ std::string RpcService::handle(const std::string& body){
                         total_balance += ou.e.value;
 
                         bool is_spendable = true;
-                        if (ou.e.coinbase) {
+
+                        // CRITICAL FIX: Skip UTXOs already spent in mempool
+                        // This prevents double-spend attempts when sending multiple transactions
+                        // before the first one confirms
+                        if (mempool_.has_spent_input(ou.txid, ou.vout)) {
+                            is_spendable = false;
+                            // Don't add to locked_balance - these are pending, not locked
+                        }
+
+                        // Check coinbase maturity
+                        if (is_spendable && ou.e.coinbase) {
                             uint64_t m_h = ou.e.height + COINBASE_MATURITY;
                             if (curH + 1 < m_h) {
                                 is_spendable = false;
@@ -2005,7 +2061,78 @@ std::string RpcService::handle(const std::string& body){
             maybe_push(0, meta.next_recv);
             maybe_push(1, meta.next_change);
 
-            if (owned_all.empty()) return err("no funds");
+            // CRITICAL FIX: Also consider unconfirmed outputs from our own mempool transactions
+            // This enables transaction chaining: send tx1 with change, then immediately
+            // spend that change in tx2 without waiting for tx1 to confirm.
+            {
+                // Build a set of our PKHs for fast lookup
+                std::unordered_set<std::string> our_pkhs;
+                for (const auto& ou : owned_all) {
+                    std::string pkh_hex;
+                    pkh_hex.reserve(40);
+                    for (uint8_t b : ou.pkh) {
+                        static const char hex[] = "0123456789abcdef";
+                        pkh_hex.push_back(hex[b >> 4]);
+                        pkh_hex.push_back(hex[b & 0xf]);
+                    }
+                    our_pkhs.insert(pkh_hex);
+                }
+
+                // Scan mempool for transactions with outputs paying to our addresses
+                std::vector<Transaction> mempool_txs;
+                mempool_.snapshot(mempool_txs);
+
+                for (const auto& mtx : mempool_txs) {
+                    auto mtxid = mtx.txid();
+                    for (size_t vout = 0; vout < mtx.vout.size(); ++vout) {
+                        const auto& mout = mtx.vout[vout];
+                        if (mout.pkh.size() != 20) continue;
+
+                        // Check if this output pays to one of our addresses
+                        std::string out_pkh_hex;
+                        out_pkh_hex.reserve(40);
+                        for (uint8_t b : mout.pkh) {
+                            static const char hex[] = "0123456789abcdef";
+                            out_pkh_hex.push_back(hex[b >> 4]);
+                            out_pkh_hex.push_back(hex[b & 0xf]);
+                        }
+
+                        if (our_pkhs.count(out_pkh_hex)) {
+                            // This mempool output pays to us!
+                            // Check if it's already spent in mempool
+                            if (!mempool_.has_spent_input(mtxid, (uint32_t)vout)) {
+                                // Find the private key for this PKH
+                                for (const auto& ou : owned_all) {
+                                    std::string ou_pkh_hex;
+                                    ou_pkh_hex.reserve(40);
+                                    for (uint8_t b : ou.pkh) {
+                                        static const char hex[] = "0123456789abcdef";
+                                        ou_pkh_hex.push_back(hex[b >> 4]);
+                                        ou_pkh_hex.push_back(hex[b & 0xf]);
+                                    }
+                                    if (ou_pkh_hex == out_pkh_hex) {
+                                        OwnedUtxo unconf;
+                                        unconf.txid = mtxid;
+                                        unconf.vout = (uint32_t)vout;
+                                        unconf.e.value = mout.value;
+                                        unconf.e.pkh = mout.pkh;
+                                        unconf.e.height = UINT64_MAX;  // Mark as unconfirmed (will sort last)
+                                        unconf.e.coinbase = false;
+                                        unconf.priv = ou.priv;
+                                        unconf.pub = ou.pub;
+                                        unconf.pkh = ou.pkh;
+                                        spendables.push_back(unconf);
+                                        spendable_balance += mout.value;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (owned_all.empty() && spendables.empty()) return err("no funds");
 
             if (spendables.empty()) {
                 if (locked_balance > 0 && soonest_mature_h != (std::numeric_limits<uint64_t>::max)()) {
