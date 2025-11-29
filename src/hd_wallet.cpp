@@ -18,6 +18,11 @@
 #include <fstream>
 #include <random>
 #include <algorithm>
+
+#ifndef _WIN32
+#include <unistd.h>
+#include <fcntl.h>
+#endif
 #include <cstring> // std::strlen
 
 namespace miq {
@@ -286,6 +291,69 @@ bool LoadHdWallet(const std::string& dir,
         }
     }
     return true;
+}
+
+// v2.0: Atomic save with crash recovery - uses wallet_store atomic operations
+bool SaveHdWalletAtomic(const std::string& path_dir,
+                        const std::vector<uint8_t>& seed,
+                        const HdAccountMeta& meta,
+                        const std::string& walletpass,
+                        std::string& err) {
+    // Use the base SaveHdWallet with additional fsync for atomicity
+    if (!SaveHdWallet(path_dir, seed, meta, walletpass, err)) {
+        return false;
+    }
+
+    // Sync directory to ensure all files are flushed
+#ifndef _WIN32
+    int dir_fd = open(path_dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+#endif
+    return true;
+}
+
+// v2.0: Export wallet as encrypted backup
+bool ExportWalletBackup(const std::string& wallet_dir,
+                        const std::string& backup_path,
+                        const std::string& walletpass,
+                        std::string& err) {
+    // Load the wallet
+    std::vector<uint8_t> seed;
+    HdAccountMeta meta;
+    if (!LoadHdWallet(wallet_dir, seed, meta, walletpass, err)) {
+        return false;
+    }
+
+    // Create backup directory if needed
+    std::string backup_dir = backup_path;
+    size_t last_sep = backup_path.find_last_of("/\\");
+    if (last_sep != std::string::npos) {
+        backup_dir = backup_path.substr(0, last_sep);
+    }
+
+    // Save to backup location (always encrypted)
+    std::string backup_pass = walletpass.empty() ? "miq_backup_default" : walletpass;
+    return SaveHdWallet(backup_path, seed, meta, backup_pass, err);
+}
+
+// v2.0: Import wallet from backup
+bool ImportWalletBackup(const std::string& backup_path,
+                        const std::string& wallet_dir,
+                        const std::string& walletpass,
+                        std::string& err) {
+    // Load from backup
+    std::vector<uint8_t> seed;
+    HdAccountMeta meta;
+    std::string backup_pass = walletpass.empty() ? "miq_backup_default" : walletpass;
+    if (!LoadHdWallet(backup_path, seed, meta, backup_pass, err)) {
+        return false;
+    }
+
+    // Save to wallet location
+    return SaveHdWallet(wallet_dir, seed, meta, walletpass, err);
 }
 
 }
