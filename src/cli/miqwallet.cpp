@@ -4443,6 +4443,31 @@ struct PasswordStrength {
     return result;
 }
 
+// Display password strength with visual progress bar
+static void show_password_strength(const std::string& password){
+    if(password.empty()) return;
+
+    auto strength = check_password_strength(password);
+
+    // Select color based on score
+    std::string color;
+    if(strength.score < 30) color = ui::red();
+    else if(strength.score < 50) color = ui::yellow();
+    else if(strength.score < 70) color = ui::cyan();
+    else color = ui::green();
+
+    // Use the ui_pro progress bar
+    std::string bar = ui_pro::draw_progress_bar(strength.score, 20, ui_pro::ProgressStyle::BLOCKS);
+
+    std::cout << "  " << ui::dim() << "Strength: " << ui::reset()
+              << color << bar << " " << strength.rating << ui::reset() << "\n";
+
+    // Show suggestions for weak passwords
+    if(strength.score < 50 && !strength.suggestions.empty()){
+        std::cout << ui::dim() << "  Suggestions: " << strength.suggestions[0] << ui::reset() << "\n";
+    }
+}
+
 // =============================================================================
 // SECURE MEMORY OPERATIONS
 // =============================================================================
@@ -11316,6 +11341,7 @@ static bool flow_create_wallet(const std::string& cli_host, const std::string& c
 
     // Encryption passphrase
     std::string wpass = ui::secure_prompt("Encryption passphrase (ENTER for none): ");
+    show_password_strength(wpass);
 
     // Generate mnemonic
     std::string mnemonic;
@@ -11416,6 +11442,7 @@ static bool flow_load_from_seed(const std::string& cli_host, const std::string& 
 
     std::string mpass = ui::secure_prompt("Mnemonic passphrase (ENTER for none): ");
     std::string wpass = ui::secure_prompt("Wallet encryption passphrase (ENTER for none): ");
+    show_password_strength(wpass);
 
     // Convert mnemonic to seed
     std::vector<uint8_t> seed;
