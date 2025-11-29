@@ -49,7 +49,7 @@ A compact blockchain codebase written in modern C++.
 - Peer address manager with persistence
 
 ### Consensus & Validation
-- LWMA difficulty adjustment algorithm
+- Epoch retarget difficulty adjustment algorithm
 - Full UTXO set tracking with LevelDB backend
 - Orphan block management with memory caps
 - Chain reorganization handling with metrics
