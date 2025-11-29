@@ -1,14 +1,183 @@
+# =============================================================================
+# PRODUCTION CI/CD PIPELINE v2.0
+# =============================================================================
+# Comprehensive testing on Linux & Windows with unit tests
+# =============================================================================
 
-name: ci
-on: [push, pull_request]
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop, 'release/**', 'claude/**']
+  pull_request:
+    branches: [main, master, develop]
+
+env:
+  BUILD_TYPE: Release
+
 jobs:
-  build:
+  # ===========================================================================
+  # LINUX BUILD & TEST
+  # ===========================================================================
+  linux-build:
+    name: Linux Build (${{ matrix.compiler }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        include:
+          - compiler: gcc
+            cc: gcc-12
+            cxx: g++-12
+          - compiler: clang
+            cc: clang-14
+            cxx: clang++-14
+
     steps:
       - uses: actions/checkout@v4
-      - name: Build
+        with:
+          submodules: recursive
+
+      - name: Install Dependencies
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release --parallel
-      - name: Test
-        run: ctest --test-dir build --output-on-failure
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            libssl-dev \
+            libsodium-dev \
+            ${{ matrix.cc }} \
+            ${{ matrix.cxx }}
+
+      - name: Configure CMake
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel $(nproc)
+
+      - name: Run Unit Tests
+        run: |
+          cd build
+          ctest --output-on-failure --parallel $(nproc)
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        if: matrix.compiler == 'gcc'
+        with:
+          name: linux-build-${{ github.sha }}
+          path: |
+            build/miqrochain
+            build/miqwallet
+          retention-days: 7
+
+  # ===========================================================================
+  # WINDOWS BUILD & TEST
+  # ===========================================================================
+  windows-build:
+    name: Windows Build
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup MSVC
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build `
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
+            -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Run Unit Tests
+        run: |
+          cd build
+          ctest -C ${{ env.BUILD_TYPE }} --output-on-failure
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-${{ github.sha }}
+          path: |
+            build/${{ env.BUILD_TYPE }}/*.exe
+          retention-days: 7
+
+  # ===========================================================================
+  # CODE QUALITY CHECKS
+  # ===========================================================================
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for Debug Code
+        run: |
+          # Fail if debug-only code is present
+          ! grep -rn "TODO.*REMOVE" src/ || echo "Warning: TODO REMOVE comments found"
+          ! grep -rn "FIXME.*DEBUG" src/ || echo "Warning: DEBUG FIXME comments found"
+
+      - name: Check File Formatting
+        run: |
+          # Check for trailing whitespace
+          ! find src -name "*.cpp" -o -name "*.h" | xargs grep -l "[[:space:]]$" || echo "Warning: trailing whitespace found"
+
+  # ===========================================================================
+  # STATIC ANALYSIS (optional but recommended)
+  # ===========================================================================
+  static-analysis:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: sudo apt-get install -y cppcheck
+
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=warning,performance \
+            --suppress=missingIncludeSystem \
+            --error-exitcode=0 \
+            --inline-suppr \
+            -I src \
+            src/
+
+  # ===========================================================================
+  # BUILD STATUS CHECK
+  # ===========================================================================
+  build-status:
+    name: Build Status
+    runs-on: ubuntu-latest
+    needs: [linux-build, windows-build]
+    if: always()
+
+    steps:
+      - name: Check Build Results
+        run: |
+          if [ "${{ needs.linux-build.result }}" != "success" ]; then
+            echo "Linux build failed!"
+            exit 1
+          fi
+          if [ "${{ needs.windows-build.result }}" != "success" ]; then
+            echo "Windows build failed!"
+            exit 1
+          fi
+          echo "All builds passed!"

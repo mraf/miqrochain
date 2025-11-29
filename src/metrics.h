@@ -297,4 +297,90 @@ private:
 #define MIQ_METRIC_SET_HEIGHT(h) miq::Metrics::instance().set_chain_height(h)
 #define MIQ_METRIC_SET_PEERS(n) miq::Metrics::instance().set_peers_count(n)
 
+// =============================================================================
+// OPERATOR METRICS v2.0
+// =============================================================================
+// Extended metrics for production node operators
+// =============================================================================
+
+struct NodeHealth {
+    bool is_synced{false};
+    bool has_peers{false};
+    bool is_mining{false};
+    bool rpc_responsive{false};
+    double sync_progress{0.0};   // 0.0 to 1.0
+    int64_t blocks_behind{0};
+    int64_t headers_behind{0};
+    int64_t uptime_seconds{0};
+    int64_t last_block_time{0};  // Unix timestamp of last block received
+
+    // Overall health score (0.0 to 1.0)
+    double health_score() const {
+        double score = 0.0;
+        if (is_synced) score += 0.3;
+        if (has_peers) score += 0.3;
+        if (rpc_responsive) score += 0.2;
+        score += sync_progress * 0.2;
+        return score;
+    }
+
+    // Human-readable status
+    const char* status_string() const {
+        if (!has_peers) return "NO_PEERS";
+        if (!is_synced) return "SYNCING";
+        if (health_score() >= 0.8) return "HEALTHY";
+        if (health_score() >= 0.5) return "DEGRADED";
+        return "UNHEALTHY";
+    }
+};
+
+// Get current node health status
+NodeHealth get_node_health();
+
+// Export metrics in JSON format for dashboards
+std::string export_metrics_json();
+
+// =============================================================================
+// SCOPED TIMER FOR PERFORMANCE MEASUREMENT
+// =============================================================================
+
+class ScopedMetricTimer {
+public:
+    enum TimerType { BLOCK_VALIDATION, TX_VALIDATION, PEER_LATENCY };
+
+    explicit ScopedMetricTimer(TimerType type)
+        : type_(type)
+        , start_(std::chrono::high_resolution_clock::now())
+    {}
+
+    ~ScopedMetricTimer() {
+        auto end = std::chrono::high_resolution_clock::now();
+        auto& m = Metrics::instance();
+
+        if (type_ == BLOCK_VALIDATION) {
+            double ms = std::chrono::duration<double, std::milli>(end - start_).count();
+            m.observe_block_validation_ms(ms);
+        } else if (type_ == TX_VALIDATION) {
+            double us = std::chrono::duration<double, std::micro>(end - start_).count();
+            m.observe_tx_validation_us(us);
+        } else if (type_ == PEER_LATENCY) {
+            double ms = std::chrono::duration<double, std::milli>(end - start_).count();
+            m.observe_peer_latency_ms(ms);
+        }
+    }
+
+private:
+    TimerType type_;
+    std::chrono::high_resolution_clock::time_point start_;
+};
+
+#define MIQ_SCOPED_BLOCK_TIMER() \
+    miq::ScopedMetricTimer _block_timer_(miq::ScopedMetricTimer::BLOCK_VALIDATION)
+
+#define MIQ_SCOPED_TX_TIMER() \
+    miq::ScopedMetricTimer _tx_timer_(miq::ScopedMetricTimer::TX_VALIDATION)
+
+#define MIQ_SCOPED_PEER_TIMER() \
+    miq::ScopedMetricTimer _peer_timer_(miq::ScopedMetricTimer::PEER_LATENCY)
+
 } // namespace miq
