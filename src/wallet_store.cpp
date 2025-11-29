@@ -14,6 +14,10 @@
 
 #ifndef _WIN32
 #include <unistd.h>  // for fsync
+#include <fcntl.h>
+#include <sys/file.h>
+#else
+#include <windows.h>  // Must be before namespace to avoid pollution
 #endif
 
 // Optional encryption hooks (compile-time switch in CMake)
@@ -543,7 +547,6 @@ bool wallet_read_metadata(const std::string& path, WalletMetadata& meta, std::st
 
 // Lock file support
 #ifdef _WIN32
-#include <windows.h>
 int wallet_acquire_lock(const std::string& wallet_path, std::string& err) {
     std::string lock_path = wallet_path + ".lock";
     HANDLE h = CreateFileA(lock_path.c_str(), GENERIC_WRITE, 0, NULL,
@@ -572,9 +575,6 @@ bool wallet_is_locked(const std::string& wallet_path) {
     return false;
 }
 #else
-#include <fcntl.h>
-#include <sys/file.h>
-
 int wallet_acquire_lock(const std::string& wallet_path, std::string& err) {
     std::string lock_path = wallet_path + ".lock";
     int fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0644);
