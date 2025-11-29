@@ -13,5 +13,6 @@ int main(){
     uint8_t v = 0; std::vector<uint8_t> pl;
     bool decoded = miq::base58check_decode(addr, v, pl);
     assert(decoded && v == 0x35 && pl.size() == 20);
+    if(!decoded) return 1;  // Use decoded to silence -Wunused-variable in release builds
     return 0;
 }

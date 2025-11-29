@@ -1292,12 +1292,24 @@ template<typename T> struct has_size_method<T,  std::void_t<decltype(std::declva
 template<typename, typename = void> struct has_count_method : std::false_type{};
 template<typename T> struct has_count_method<T, std::void_t<decltype(std::declval<T&>().count())>> : std::true_type{};
 
-struct MempoolView { uint64_t count=0, bytes=0, recent_adds=0; };
+struct MempoolView { uint64_t count=0, bytes=0, recent_adds=0, orphans=0; };
+
+// SFINAE to check for get_stats method
+template<typename, typename = void> struct has_get_stats_method : std::false_type{};
+template<typename T> struct has_get_stats_method<T, std::void_t<decltype(std::declval<T&>().get_stats())>> : std::true_type{};
+
 template<typename MP>
 static MempoolView mempool_view_fallback(MP* mp){
     MempoolView v{};
     if (!mp) return v;
-    if constexpr (has_stats_method<MP>::value) {
+
+    // Prefer get_stats() as it includes orphan count
+    if constexpr (has_get_stats_method<MP>::value) {
+        auto s = mp->get_stats();
+        v.count = (uint64_t)s.tx_count;
+        v.bytes = (uint64_t)s.bytes_used;
+        v.orphans = (uint64_t)s.orphan_count;
+    } else if constexpr (has_stats_method<MP>::value) {
         auto s = mp->stats();
         v.count = (uint64_t)s.count;
         v.bytes = (uint64_t)s.bytes;
@@ -2915,9 +2927,12 @@ private:
 
             auto stat = mempool_view_fallback(mempool_);
 
-            // Transaction count
+            // Transaction count with orphan info
             std::ostringstream p1;
             p1 << C_dim() << "Pending TX:" << C_reset() << " " << C_info() << stat.count << C_reset();
+            if (stat.orphans > 0) {
+                p1 << " " << C_dim() << "(" << stat.orphans << " orphan)" << C_reset();
+            }
             right_panel2.push_back(box_row(p1.str(), half_width));
 
             // Size
@@ -2925,9 +2940,14 @@ private:
             p2 << C_dim() << "Size:" << C_reset() << "       " << fmt_bytes(stat.bytes);
             right_panel2.push_back(box_row(p2.str(), half_width));
 
-            // Recent adds
+            // Recent adds (or total if orphans exist for better visibility)
             std::ostringstream p3;
-            p3 << C_dim() << "Recent:" << C_reset() << "     +" << stat.recent_adds << " added";
+            if (stat.count > 0 || stat.orphans > 0) {
+                uint64_t total = stat.count + stat.orphans;
+                p3 << C_dim() << "Total:" << C_reset() << "      " << total << " tx seen";
+            } else {
+                p3 << C_dim() << "Recent:" << C_reset() << "     +" << stat.recent_adds << " added";
+            }
             right_panel2.push_back(box_row(p3.str(), half_width));
 
             // Recent TXIDs header
