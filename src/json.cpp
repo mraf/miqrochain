@@ -1,6 +1,8 @@
 #include "json.h"
 #include <cctype>
 #include <sstream>
+#include <iomanip>
+#include <cmath>
 
 namespace miq {
 
@@ -149,10 +151,22 @@ bool json_parse(const std::string& s, JNode& out) {
     return i == s.size();
 }
 
+// Output double without scientific notation to ensure parsers can read large values
+static void dump_number(double val, std::ostringstream& o) {
+    // Check if the value is an integer (no fractional part)
+    if (val == std::floor(val) && std::abs(val) < 1e15) {
+        // Output as integer to avoid unnecessary decimal point
+        o << std::fixed << std::setprecision(0) << val;
+    } else {
+        // Output with enough precision to preserve the value
+        o << std::fixed << std::setprecision(8) << val;
+    }
+}
+
 static void dump(const JNode& n, std::ostringstream& o) {
     if (std::holds_alternative<JNull>(n.v)) o << "null";
     else if (std::holds_alternative<bool>(n.v)) o << (std::get<bool>(n.v) ? "true" : "false");
-    else if (std::holds_alternative<double>(n.v)) o << std::get<double>(n.v);
+    else if (std::holds_alternative<double>(n.v)) dump_number(std::get<double>(n.v), o);
     else if (std::holds_alternative<std::string>(n.v)) o << '"' << std::get<std::string>(n.v) << '"';
     else if (std::holds_alternative<std::vector<JNode>>(n.v)) {
         o << '[';
