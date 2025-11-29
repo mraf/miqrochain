@@ -373,6 +373,29 @@ static constexpr uint32_t MIN_PEER_PROTO_VERSION = 70015;  // Minimum supported
 #define MIQ_CONNECTION_BACKOFF_MAX_MS (12 * 60 * 60 * 1000)  // 12 hour max
 #endif
 
+// === P2P BAN AND RATE LIMITING ===
+#ifndef MIQ_P2P_MAX_BANSCORE
+#define MIQ_P2P_MAX_BANSCORE 100  // Ban threshold score
+#endif
+#ifndef MIQ_P2P_BAN_MS
+#define MIQ_P2P_BAN_MS (24 * 60 * 60 * 1000)  // 24 hour ban duration
+#endif
+#ifndef MIQ_MAX_SAME_IP_CONNECTIONS
+#define MIQ_MAX_SAME_IP_CONNECTIONS 3  // Max connections from same IP
+#endif
+#ifndef MIQ_MAX_SUBNET24_CONNECTIONS
+#define MIQ_MAX_SUBNET24_CONNECTIONS 6  // Max connections from same /24 subnet
+#endif
+#ifndef MIQ_P2P_INV_WINDOW_MS
+#define MIQ_P2P_INV_WINDOW_MS 5000  // INV rate limit window (5 seconds)
+#endif
+#ifndef MIQ_P2P_INV_WINDOW_CAP
+#define MIQ_P2P_INV_WINDOW_CAP 500  // Max INVs per window
+#endif
+#ifndef MIQ_P2P_MSG_DEADLINE_MS
+#define MIQ_P2P_MSG_DEADLINE_MS 30000  // 30 second message deadline
+#endif
+
 // === RELIABILITY & FAULT TOLERANCE ===
 // Automatic recovery settings
 #ifndef MIQ_AUTO_REINDEX_ON_CORRUPTION
