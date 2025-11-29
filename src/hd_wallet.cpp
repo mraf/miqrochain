@@ -176,7 +176,8 @@ static bool entropy_to_mnemonic(const std::vector<uint8_t>& ent, std::string& ou
 bool HdWallet::GenerateMnemonic(int entropy_bits, std::string& out_mnemonic){
     if(entropy_bits!=128 && entropy_bits!=256) return false;
     std::vector<uint8_t> ent(entropy_bits/8);
-    RAND_bytes(ent.data(), (int)ent.size());
+    // RAND_bytes returns 1 on success, 0 or -1 on failure
+    if(RAND_bytes(ent.data(), (int)ent.size()) != 1) return false;
     return entropy_to_mnemonic(ent, out_mnemonic);
 }
 
