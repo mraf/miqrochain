@@ -200,7 +200,7 @@ private:
     bool compute_descendant_stats(const Key& k, size_t& cnt, size_t& bytes) const;
 
     // Acceptance path
-    bool validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView& utxo, uint64_t& fee, std::string& err) const;
+    bool validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView& utxo, uint32_t height, uint64_t& fee, std::string& err) const;
     bool enforce_limits_and_insert(const Transaction& tx, uint64_t fee, std::string& err);
 
     // Orphan handling

@@ -69,7 +69,7 @@ static inline uint64_t min_fee_for_size_bytes(size_t sz){
     return kb * fee_rate_per_kb;
 }
 
-bool Mempool::validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView& utxo, uint64_t& fee, std::string& err) const {
+bool Mempool::validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView& utxo, uint32_t height, uint64_t& fee, std::string& err) const {
     // coinbase cannot be in mempool (loose check)
     if (tx.vin.size()==1 &&
         tx.vin[0].prev.vout==0 &&
@@ -119,9 +119,27 @@ bool Mempool::validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView
             UTXOEntry e;
             if (!utxo.get(in.prev.txid, in.prev.vout, e)) {
                 // Not found in UTXO or mempool -> orphan candidate
+                MIQ_LOG_DEBUG(LogCategory::MEMPOOL, "Input UTXO not found: txid=" +
+                              to_hex(in.prev.txid).substr(0, 16) + "... vout=" + std::to_string(in.prev.vout));
                 err.clear();
                 return false; // caller treats empty err as orphan
             }
+
+            // CRITICAL FIX: Check coinbase maturity
+            // Coinbase outputs cannot be spent until COINBASE_MATURITY (100) blocks have passed.
+            // This prevents issues with chain reorgs and ensures consensus with block validation.
+            // A coinbase created at height H is spendable at height H + COINBASE_MATURITY + 1.
+            if (e.coinbase) {
+                uint64_t mature_height = e.height + COINBASE_MATURITY;
+                if (height + 1 <= mature_height) {
+                    MIQ_LOG_DEBUG(LogCategory::MEMPOOL, "Input is immature coinbase: created at height " +
+                                  std::to_string(e.height) + ", spendable at height " +
+                                  std::to_string(mature_height + 1) + ", current height " + std::to_string(height));
+                    err = "immature coinbase";
+                    return false;
+                }
+            }
+
             prev_value = e.value;
             expect_pkh = e.pkh;
         }
@@ -332,10 +350,12 @@ bool Mempool::accept(const Transaction& tx, const UTXOView& utxo, uint32_t heigh
     // Calculate fee; if missing inputs, store as orphan
     uint64_t fee = 0;
     std::string terr;
-    if (!validate_inputs_and_calc_fee(tx, utxo, fee, terr)) {
+    MIQ_LOG_DEBUG(LogCategory::MEMPOOL, "tx " + txid_hex + " validating " + std::to_string(tx.vin.size()) + " inputs");
+    if (!validate_inputs_and_calc_fee(tx, utxo, height, fee, terr)) {
         if (terr.empty()) {
             // Orphan path: cache and index by missing parents
-            MIQ_LOG_INFO(LogCategory::MEMPOOL, "tx " + txid_hex + " -> orphan pool (missing parent UTXOs)");
+            MIQ_LOG_INFO(LogCategory::MEMPOOL, "tx " + txid_hex + " -> orphan pool (missing parent UTXOs, " +
+                        std::to_string(tx.vin.size()) + " inputs checked)");
             add_orphan(tx);
             return true; // not a hard reject
         }
@@ -863,7 +883,7 @@ bool Mempool::accept_replacement(const Transaction& tx, const UTXOView& utxo,
     // Calculate new transaction fee
     uint64_t new_fee = 0;
     std::string fee_err;
-    if (!validate_inputs_and_calc_fee(tx, utxo, new_fee, fee_err)) {
+    if (!validate_inputs_and_calc_fee(tx, utxo, height, new_fee, fee_err)) {
         err = fee_err.empty() ? "cannot calculate fee" : fee_err;
         return false;
     }

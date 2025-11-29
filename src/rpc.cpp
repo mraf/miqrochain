@@ -892,6 +892,8 @@ std::string RpcService::handle(const std::string& body){
 
             // Collect mempool txs with simple fee & size estimates.
             auto txs_vec = mempool_.collect(5000);
+            log_info("getminertemplate: mempool size=" + std::to_string(mempool_.size()) +
+                     ", collected " + std::to_string(txs_vec.size()) + " txs for template");
             std::vector<JNode> arr;
 
             // Build a quick index from txid -> (fee, vsize, hex, depends[])
@@ -1091,6 +1093,21 @@ std::string RpcService::handle(const std::string& body){
             JNode arr; std::vector<JNode> v;
             for(auto& id: ids){ JNode s; s.v = std::string(to_hex(id)); v.push_back(s); }
             arr.v = v; return json_dump(arr);
+        }
+
+        // DIAGNOSTIC: Get mempool statistics including orphan info
+        if(method=="getmempoolinfo"){
+            auto stats = mempool_.get_stats();
+            std::map<std::string, JNode> o;
+            o["size"] = jnum((double)stats.tx_count);
+            o["bytes"] = jnum((double)stats.bytes_used);
+            o["orphan_count"] = jnum((double)stats.orphan_count);
+            o["orphan_bytes"] = jnum((double)stats.orphan_bytes);
+            o["min_fee_rate"] = jnum(stats.min_fee_rate);
+            o["max_fee_rate"] = jnum(stats.max_fee_rate);
+            o["avg_fee_rate"] = jnum(stats.avg_fee_rate);
+            o["total_fees"] = jnum((double)stats.total_fees);
+            JNode out; out.v = o; return json_dump(out);
         }
 
         if(method=="gettxout"){
@@ -1349,8 +1366,12 @@ std::string RpcService::handle(const std::string& body){
             }
 
             bool accepted = false;
+            std::string txid_hex = to_hex(tx.txid());
+            log_info("sendrawtransaction: attempting to accept tx " + txid_hex.substr(0, 16) + "...");
+
             if (has_conflict) {
                 // Try RBF - accept_replacement validates fee bump rules
+                log_info("sendrawtransaction: tx has conflict, trying RBF path");
                 accepted = mempool_.accept_replacement(tx, chain_.utxo(), static_cast<uint32_t>(tip.height), e);
             } else {
                 // Normal accept path for non-conflicting transactions
@@ -1358,6 +1379,7 @@ std::string RpcService::handle(const std::string& body){
             }
 
             if(accepted){
+                log_info("sendrawtransaction: tx " + txid_hex.substr(0, 16) + "... ACCEPTED into mempool (size=" + std::to_string(mempool_.size()) + ")");
                 // CRITICAL FIX: Broadcast transaction to P2P network
                 // Without this, transactions only sit in local mempool and never propagate!
                 if(p2p_) {
@@ -1371,6 +1393,7 @@ std::string RpcService::handle(const std::string& body){
                 }
                 JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
             } else {
+                log_warn("sendrawtransaction: tx " + txid_hex.substr(0, 16) + "... REJECTED: " + e);
                 return err(e);
             }
         }
