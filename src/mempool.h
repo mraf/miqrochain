@@ -183,6 +183,15 @@ public:
     // Memory usage details
     size_t dynamic_memory_usage() const;
 
+    // === MEMPOOL PERSISTENCE ===
+    // Save mempool to disk for recovery after restart
+    bool save_to_disk(const std::string& path) const;
+    // Load mempool from disk (call after construction, before accepting new txs)
+    bool load_from_disk(const std::string& path, const UTXOView& utxo, uint32_t height);
+
+    // Get all raw transactions for persistence/relay
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> get_all_raw_txs() const;
+
 private:
     using Key = std::string; // binary-safe txid key
 

@@ -4626,6 +4626,25 @@ int main(int argc, char** argv){
 #endif
         if (can_tui) tui.mark_step_started("Initialize mempool & RPC");
         Mempool mempool; RpcService rpc(chain, mempool);
+
+        // PRODUCTION FIX: Load saved mempool from disk
+        // This ensures unconfirmed transactions survive node restarts
+        {
+            std::string mempool_path = cfg.datadir + "/mempool.dat";
+            // Simple adapter to convert UTXOSet to UTXOView interface
+            struct LocalUTXOAdapter : public UTXOView {
+                const UTXOSet& u;
+                explicit LocalUTXOAdapter(const UTXOSet& uu) : u(uu) {}
+                bool get(const std::vector<uint8_t>& txid, uint32_t vout, UTXOEntry& out) const override {
+                    return u.get(txid, vout, out);
+                }
+            };
+            LocalUTXOAdapter utxo_view(chain.utxo());
+            if (mempool.load_from_disk(mempool_path, utxo_view, static_cast<uint32_t>(chain.height()))) {
+                log_info("Loaded mempool from disk (" + std::to_string(mempool.size()) + " transactions)");
+            }
+        }
+
         if (can_tui) tui.mark_step_ok("Initialize mempool & RPC");
 
         P2P p2p(chain);
@@ -5035,6 +5054,21 @@ int main(int argc, char** argv){
             g_extminer.stop();
             if (can_tui) tui.set_shutdown_phase("Stopping miner watch...", true);
         } catch(...) { log_warn("Miner watch stop threw"); }
+
+        // PRODUCTION FIX: Save mempool to disk before shutdown
+        // This ensures unconfirmed transactions survive node restarts
+        try {
+            if (can_tui) tui.set_shutdown_phase("Saving mempool...", false);
+            std::string mempool_path = cfg.datadir + "/mempool.dat";
+            if (mempool.save_to_disk(mempool_path)) {
+                log_info("Saved mempool to disk (" + std::to_string(mempool.size()) + " transactions)");
+            }
+            if (can_tui) tui.set_shutdown_phase("Saving mempool...", true);
+        } catch(const std::exception& e) {
+            log_warn(std::string("Mempool save failed: ") + e.what());
+        } catch(...) {
+            log_warn("Mempool save failed (unknown error)");
+        }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(140));
 
