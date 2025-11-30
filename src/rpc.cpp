@@ -1391,7 +1391,7 @@ std::string RpcService::handle(const std::string& body){
                 result["hex"] = jstr(to_hex(raw));
                 result["size"] = jnum((double)raw.size());
 
-                // Inputs
+                // Inputs - CRITICAL FIX: Look up value/address from parent transactions
                 std::vector<JNode> inputs;
                 uint64_t total_input = 0;
                 bool is_coinbase = (found_tx_idx == 0);
@@ -1404,10 +1404,29 @@ std::string RpcService::handle(const std::string& body){
                     } else {
                         inp["prev_txid"] = jstr(to_hex(btx.vin[i].prev.txid));
                         inp["prev_vout"] = jnum((double)btx.vin[i].prev.vout);
+
+                        // CRITICAL FIX: Look up the parent transaction to get value and address
+                        // First try TxIndex for O(1) lookup
+                        TxLocation parent_loc;
+                        if (chain_.txindex().get(btx.vin[i].prev.txid, parent_loc) && parent_loc.valid) {
+                            Block parent_blk;
+                            if (chain_.get_block_by_index(parent_loc.block_height, parent_blk)) {
+                                if (parent_loc.tx_position < parent_blk.txs.size()) {
+                                    const auto& parent_tx = parent_blk.txs[parent_loc.tx_position];
+                                    if (btx.vin[i].prev.vout < parent_tx.vout.size()) {
+                                        const auto& spent_out = parent_tx.vout[btx.vin[i].prev.vout];
+                                        inp["value"] = jnum((double)spent_out.value);
+                                        inp["address"] = jstr(base58check_encode(VERSION_P2PKH, spent_out.pkh));
+                                        total_input += spent_out.value;
+                                    }
+                                }
+                            }
+                        }
                     }
                     JNode n; n.v = inp; inputs.push_back(n);
                 }
                 JNode vin; vin.v = inputs; result["vin"] = vin;
+                result["total_input"] = jnum((double)total_input);
 
                 // Outputs
                 std::vector<JNode> outputs;
@@ -1426,9 +1445,13 @@ std::string RpcService::handle(const std::string& body){
                 JNode vout; vout.v = outputs; result["vout"] = vout;
                 result["total_output"] = jnum((double)total_output);
 
-                // Fee (for non-coinbase)
+                // Fee (for non-coinbase) - CRITICAL FIX: Also calculate fee_rate
                 if(!is_coinbase && total_input > total_output){
-                    result["fee"] = jnum((double)(total_input - total_output));
+                    uint64_t fee = total_input - total_output;
+                    result["fee"] = jnum((double)fee);
+                    if(raw.size() > 0){
+                        result["fee_rate"] = jnum((double)fee / (double)raw.size());
+                    }
                 }
 
                 JNode out; out.v = result; return json_dump(out);
