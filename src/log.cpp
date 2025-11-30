@@ -28,9 +28,9 @@ namespace miq {
 // ============================================================================
 // Configuration
 // ============================================================================
-// PRODUCTION FIX: Default to WARN level to reduce log spam
-// Only important events (new blocks, peer health, errors) should show by default
-static std::atomic<LogLevel> g_log_level{LogLevel::WARN};
+// Default to INFO level so users can see transaction events and important messages
+// Use config option -loglevel=warn to reduce log verbosity if needed
+static std::atomic<LogLevel> g_log_level{LogLevel::INFO};
 static std::atomic<uint32_t> g_log_categories{static_cast<uint32_t>(LogCategory::ALL)};
 static std::atomic<bool> g_timestamps_enabled{true};
 static std::atomic<bool> g_async_mode{false};

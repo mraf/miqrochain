@@ -361,7 +361,7 @@ static std::string ok_num(double d){
     return ok(v);
 }
 
-static std::string ok_bool(bool b){
+[[maybe_unused]] static std::string ok_bool(bool b){
     miq::JNode v; v.v = b;
     return ok(v);
 }
