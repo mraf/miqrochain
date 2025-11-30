@@ -71,6 +71,23 @@ static inline uint64_t min_fee_for_size_bytes(size_t sz){
 }
 
 bool Mempool::validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView& utxo, uint32_t height, uint64_t& fee, std::string& err) const {
+    // CRITICAL FIX: Reject empty transactions early
+    // Chain validation (chain.cpp:1445) rejects empty tx, so reject here too
+    // to avoid transactions getting stuck in mempool that can never confirm
+    if (tx.vin.empty() || tx.vout.empty()) {
+        err = "empty transaction";
+        return false;
+    }
+
+    // CRITICAL FIX: Reject zero-value outputs
+    // These create unspendable dust and waste UTXO space
+    for (size_t i = 0; i < tx.vout.size(); ++i) {
+        if (tx.vout[i].value == 0) {
+            err = "zero-value output at index " + std::to_string(i);
+            return false;
+        }
+    }
+
     // coinbase cannot be in mempool (loose check)
     if (tx.vin.size()==1 &&
         tx.vin[0].prev.vout==0 &&

@@ -2071,9 +2071,12 @@ std::string RpcService::handle(const std::string& body){
                         }
 
                         // Check coinbase maturity
+                        // CRITICAL FIX: Use <= to match mempool validation (mempool.cpp:135)
+                        // Mempool rejects if: height + 1 <= coinbase_height + COINBASE_MATURITY
+                        // Using < here would allow spending 1 block too early, causing tx rejection
                         if (ue.coinbase) {
                             uint64_t mature_h = ue.height + COINBASE_MATURITY;
-                            if (curH + 1 < mature_h) {
+                            if (curH + 1 <= mature_h) {
                                 immature_balance += ue.value;
                                 continue;
                             }
@@ -2226,9 +2229,11 @@ std::string RpcService::handle(const std::string& body){
                     if (e2.coinbase) {
                         uint64_t mature_h = e2.height + COINBASE_MATURITY;
                         at_h = mature_h;
-                        if (curH + 1 < mature_h) { // next block height still < mature
+                        // CRITICAL FIX: Use <= to match mempool validation (mempool.cpp:135)
+                        // Mempool rejects if: height + 1 <= coinbase_height + COINBASE_MATURITY
+                        if (curH + 1 <= mature_h) { // next block height still <= mature
                             spendable = false;
-                            mat_in = mature_h - (curH + 1);
+                            mat_in = mature_h - curH; // blocks until spendable (at mature_h + 1)
                         }
                     }
 
@@ -2571,9 +2576,12 @@ std::string RpcService::handle(const std::string& body){
                         }
 
                         // Check coinbase maturity
+                        // CRITICAL FIX: Use <= to match mempool validation (mempool.cpp:135)
+                        // Mempool rejects if: height + 1 <= coinbase_height + COINBASE_MATURITY
+                        // Using < here would build tx with immature coinbase, causing mempool rejection
                         if (is_spendable && ou.e.coinbase) {
                             uint64_t m_h = ou.e.height + COINBASE_MATURITY;
-                            if (curH + 1 < m_h) {
+                            if (curH + 1 <= m_h) {
                                 is_spendable = false;
                                 locked_balance += ou.e.value;
                                 soonest_mature_h = std::min<uint64_t>(soonest_mature_h, m_h);
