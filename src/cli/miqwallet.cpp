@@ -4055,11 +4055,13 @@ struct TransactionBuildRequest {
     // Filter to spendable UTXOs only
     std::vector<miq::UtxoLite> spendables;
     for(const auto& u : all_utxos){
-        // Check maturity
+        // Check maturity - CRITICAL FIX: Must match mempool check (<=, not <)
+        // Mempool rejects if: height + 1 <= coinbase_height + MATURITY
+        // So we must use the same check to avoid trying to spend immature coinbase
         bool is_mature = true;
         if(u.coinbase){
             uint64_t maturity_height = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
-            if(tip_h + 1 < maturity_height){
+            if(tip_h + 1 <= maturity_height){
                 is_mature = false;
             }
         }
@@ -9606,7 +9608,8 @@ static WalletBalance compute_balance(const std::vector<miq::UtxoLite>& utxos,
         bool is_immature = false;
         if(u.coinbase){
             uint64_t mature_h = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
-            if(wb.approx_tip_h + 1 < mature_h) is_immature = true;
+            // CRITICAL FIX: Must use <= to match mempool maturity check
+            if(wb.approx_tip_h + 1 <= mature_h) is_immature = true;
         }
         OutpointKey k{ miq::to_hex(u.txid), u.vout };
         bool held = (pending.find(k) != pending.end());
@@ -11205,7 +11208,8 @@ static bool wallet_session(const std::string& cli_host,
                 bool immature = false;
                 if(u.coinbase){
                     uint64_t mh = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
-                    if(tip_h + 1 < mh) immature = true;
+                    // CRITICAL FIX: Must use <= to match mempool maturity check
+                    if(tip_h + 1 <= mh) immature = true;
                 }
                 OutpointKey k{ miq::to_hex(u.txid), u.vout };
                 if(!immature && pending.find(k) == pending.end())
@@ -12374,7 +12378,8 @@ static bool wallet_session(const std::string& cli_host,
                 bool immature = false;
                 if(u.coinbase){
                     uint64_t mh = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
-                    if(tip_h + 1 < mh) immature = true;
+                    // CRITICAL FIX: Must use <= to match mempool maturity check
+                    if(tip_h + 1 <= mh) immature = true;
                 }
                 OutpointKey k{ miq::to_hex(u.txid), u.vout };
                 if(!immature && pending.find(k) == pending.end())
@@ -13193,7 +13198,8 @@ static bool wallet_session(const std::string& cli_host,
                 bool is_mature = true;
                 if(u.coinbase){
                     uint64_t mh = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
-                    if(tip_h + 1 < mh) is_mature = false;
+                    // CRITICAL FIX: Must use <= to match mempool maturity check
+                    if(tip_h + 1 <= mh) is_mature = false;
                 }
                 OutpointKey k{ miq::to_hex(u.txid), u.vout };
                 bool is_pend = pending.find(k) != pending.end();
@@ -13276,7 +13282,8 @@ static bool wallet_session(const std::string& cli_host,
                     bool is_mature = true;
                     if(u.coinbase){
                         uint64_t mh = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
-                        if(tip_h + 1 < mh) is_mature = false;
+                        // CRITICAL FIX: Must use <= to match mempool maturity check
+                        if(tip_h + 1 <= mh) is_mature = false;
                     }
                     OutpointKey k{ txid_hex, u.vout };
                     bool is_pend = pending.find(k) != pending.end();
