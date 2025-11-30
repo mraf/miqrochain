@@ -5452,9 +5452,15 @@ void P2P::loop(){
                             }
                             bool in_mempool = mempool_ && mempool_->exists(tx.txid());
 
+                            // CRITICAL FIX: Detect orphan transactions
+                            // Orphans return accepted=false with err starting with "orphan:"
+                            // These should not penalize the peer, and we should fetch missing parents
+                            bool is_orphan = !accepted && err.find("orphan:") == 0;
+
                             // V1.0 FIX: Thread-safe removal from seen_txids_ on rejection
                             // CRITICAL FIX: Enhanced ban scoring for different rejection types
-                            if (!accepted && !err.empty()) {
+                            // Skip ban scoring for orphans - they are valid txs waiting for parents
+                            if (!accepted && !err.empty() && !is_orphan) {
                                 MIQ_LOG_DEBUG(miq::LogCategory::NET, "tx rejected: " + key.substr(0, 16) + "... error: " + err);
                                 {
                                     std::lock_guard<std::mutex> tx_lk(tx_store_mu_);
@@ -5488,12 +5494,13 @@ void P2P::loop(){
                             }
 
                             // TELEMETRY: Notify about received transaction for UI display
-                            if (accepted && txids_callback_) {
+                            if ((accepted || is_orphan) && txids_callback_) {
                                 txids_callback_({key});
                             }
 
                             // Handle orphan transactions - fetch missing parents
-                            if (accepted && !in_mempool) {
+                            if (is_orphan || (accepted && !in_mempool)) {
+                                MIQ_LOG_DEBUG(miq::LogCategory::NET, "orphan tx " + key.substr(0, 16) + "... fetching missing parents");
                                 for (const auto& in : tx.vin) {
                                     UTXOEntry e;
                                     if (!chain_.utxo().get(in.prev.txid, in.prev.vout, e)) {
@@ -5521,7 +5528,9 @@ void P2P::loop(){
                                 pending_txids_.erase(key);
                             }
 
-                            if (accepted) {
+                            // Relay transaction to peers (both accepted and orphans)
+                            // Orphans should also be relayed - other nodes may have the parent
+                            if (accepted || is_orphan) {
                                 uint64_t in_sum = 0, out_sum = 0;
                                 for (const auto& o : tx.vout) out_sum += o.value;
                                 bool inputs_ok = true;

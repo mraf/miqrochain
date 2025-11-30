@@ -24,6 +24,13 @@ public:
     QJsonValue walletLock();
     QJsonValue sendFromHd(const QString &to, const QString &amount, quint64 feeRate=0);
 
+    // Mempool methods
+    QJsonValue getMempoolInfo();
+    QJsonValue getRawMempool();
+
+    // Wallet history
+    QJsonValue getWalletHistory(int limit=50);
+
 private:
     AppSettings &m_settings;
     QString authToken(QString *err) const;

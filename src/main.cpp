@@ -28,7 +28,6 @@
 #include "hash160.h"
 #include "crypto/ecdsa_iface.h"
 #include "difficulty.h"
-#include "miner.h"
 #include "sha256.h"
 #include "hex.h"
 #include "tls_proxy.h"
@@ -389,11 +388,6 @@ static std::string default_datadir() {
     if (home && *home) return std::string(home) + "/.miqrochain";
     return "./miqdata";
 #endif
-}
-static inline void trim_inplace(std::string& s){
-    auto notspace = [](unsigned char ch){ return !std::isspace(ch); };
-    s.erase(s.begin(), std::find_if(s.begin(), s.end(), notspace));
-    s.erase(std::find_if(s.rbegin(), s.rend(), notspace).base(), s.end());
 }
 static bool read_file_all(const std::string& path, std::vector<uint8_t>& out){
     std::ifstream f(path, std::ios::binary);
@@ -1851,7 +1845,6 @@ private:
         running_ = true;
         auto last_hs_time = clock::now();
         auto last_draw_time = clock::now();
-        uint64_t last_stats_ms = now_ms();
         uint64_t last_net_ms   = now_ms();
 
         // IMPROVED: Adaptive refresh rate for smoother animations
@@ -1889,13 +1882,6 @@ private:
 
             // Handle snapshot requests
             if (global::tui_snapshot_requested.exchange(false)) snapshot_to_disk();
-
-            // Update miner stats every second
-            if (now_ms() - last_stats_ms > 1000) {
-                last_stats_ms = now_ms();
-                miq::MinerStats ms = miq::miner_stats_now();
-                g_miner_stats.hps.store(ms.hps);
-            }
 
             // Update network hashrate every second
             if (now_ms() - last_net_ms > 1000){
@@ -3903,144 +3889,6 @@ static void fatal_terminate() noexcept {
 }
 
 // ==================================================================
-/*                               Miner worker                                   */
-// ==================================================================
-static uint64_t sum_coinbase_outputs(const Block& b) {
-    if (b.txs.empty()) return 0;
-    uint64_t s = 0; for (const auto& o : b.txs[0].vout) s += o.value; return s;
-}
-static void miner_worker(Chain* chain, Mempool* mempool, P2P* p2p,
-                         const std::vector<uint8_t> mine_pkh,
-                         unsigned threads) {
-    g_miner_stats.active.store(true);
-    g_miner_stats.threads.store(threads);
-    g_miner_stats.start = std::chrono::steady_clock::now();
-
-    std::random_device rd;
-    const uint64_t seed =
-        uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count()) ^
-        uint64_t(rd()) ^
-        uint64_t(std::hash<std::thread::id>{}(std::this_thread::get_id()));
-    std::mt19937_64 gen(seed);
-
-    const size_t kBlockMaxBytes = 900 * 1024;
-
-    while (!global::shutdown_requested.load()) {
-        try {
-            auto t = chain->tip();
-            Transaction cbt; TxIn cin; cin.prev.txid = std::vector<uint8_t>(32, 0); cin.prev.vout = 0;
-            cbt.vin.push_back(cin);
-            TxOut cbout; cbout.value = chain->subsidy_for_height(t.height + 1);
-            if (mine_pkh.size() != 20) {
-                log_error(std::string("miner assign pkh fatal: pkh size != 20 (got ") + std::to_string(mine_pkh.size()) + ")");
-                std::this_thread::sleep_for(std::chrono::milliseconds(80));
-                continue;
-            }
-            cbout.pkh.resize(20);
-            std::memcpy(cbout.pkh.data(), mine_pkh.data(), 20);
-            cbt.vout.push_back(cbout);
-            cbt.lock_time = static_cast<uint32_t>(t.height + 1);
-
-            const uint32_t ch = static_cast<uint32_t>(t.height + 1);
-            const uint32_t now = static_cast<uint32_t>(time(nullptr));
-            const uint64_t extraNonce = gen();
-            std::vector<uint8_t> tag; tag.reserve(1+4+4+8);
-            tag.push_back(0x01);
-            tag.push_back(uint8_t(ch      & 0xff)); tag.push_back(uint8_t((ch>>8) & 0xff));
-            tag.push_back(uint8_t((ch>>16)& 0xff)); tag.push_back(uint8_t((ch>>24)& 0xff));
-            tag.push_back(uint8_t(now      & 0xff)); tag.push_back(uint8_t((now>>8) & 0xff));
-            tag.push_back(uint8_t((now>>16)& 0xff)); tag.push_back(uint8_t((now>>24)& 0xff));
-            for (int i=0;i<8;i++) tag.push_back(uint8_t((extraNonce >> (8*i)) & 0xff));
-            cbt.vin[0].sig = std::move(tag);
-
-            std::vector<Transaction> txs;
-            try {
-                const size_t coinbase_sz = ser_tx(cbt).size();
-                const size_t budget = (kBlockMaxBytes > coinbase_sz) ? (kBlockMaxBytes - coinbase_sz) : 0;
-                auto cands = mempool->collect(120000);
-                size_t used=0;
-                for (auto& tx : cands) {
-                    size_t sz = ser_tx(tx).size();
-                    if (used + sz > budget) continue;
-                    txs.emplace_back(std::move(tx));
-                    used += sz;
-                    if (used >= budget) break;
-                }
-            } catch(...) { txs.clear(); }
-
-            Block b;
-            try {
-                auto last = chain->last_headers(MIQ_RETARGET_INTERVAL);
-                uint32_t nb = miq::epoch_next_bits(
-                    last, BLOCK_TIME_SECS, GENESIS_BITS,
-                    /*next_height=*/ t.height + 1, /*interval=*/ MIQ_RETARGET_INTERVAL);
-                b = miq::mine_block(t.hash, nb, cbt, txs, threads);
-            } catch (...) {
-                log_error("miner mine_block fatal");
-                continue;
-            }
-
-            try {
-                std::string err;
-                if (chain->submit_block(b, err)) {
-                    // CRITICAL FIX: Notify mempool to remove confirmed transactions
-                    if (mempool) {
-                        mempool->on_block_connect(b);
-                    }
-                    std::string miner_addr = "(unknown)";
-                    std::string cb_txid_hex = "(n/a)";
-                    if (!b.txs.empty()) {
-                        cb_txid_hex = to_hex(b.txs[0].txid());
-                        if (!b.txs[0].vout.empty() && b.txs[0].vout[0].pkh.size()==20) {
-                            miner_addr = base58check_encode(VERSION_P2PKH, b.txs[0].vout[0].pkh);
-                        }
-                    }
-                    int noncb = (int)b.txs.size() - 1;
-                    g_miner_stats.accepted.fetch_add(1);
-                    g_miner_stats.last_height_ok.store(t.height + 1);
-                    g_miner_stats.last_height_rx.store(t.height + 1);
-
-                    BlockSummary bs;
-                    bs.height    = t.height + 1;
-                    bs.hash_hex  = to_hex(b.block_hash());
-                    bs.tx_count  = (uint32_t)b.txs.size();
-                    uint64_t coinbase_total = sum_coinbase_outputs(b);
-                    uint64_t subsidy = chain->subsidy_for_height(bs.height);
-                    if (coinbase_total >= subsidy) { bs.fees = coinbase_total - subsidy; bs.fees_known = true; }
-                    bs.miner = miner_addr;
-                    g_telemetry.push_block(bs);
-                    if (noncb > 0) {
-                        std::vector<std::string> txids; txids.reserve((size_t)noncb);
-                        for (size_t i=1;i<b.txs.size();++i) txids.push_back(to_hex(b.txs[i].txid()));
-                        g_telemetry.push_txids(txids);
-                    }
-
-                    log_warn("⛏ MINED block height=" + std::to_string(bs.height)
-                             + " txs=" + std::to_string(std::max(0, noncb))
-                             + (bs.fees_known ? (" fees=" + std::to_string(bs.fees)) : ""));
-                    if (!global::shutdown_requested.load() && p2p) {
-                        p2p->announce_block_async(b.block_hash());
-                    }
-                    // Notify Stratum server of new block for job refresh
-                    if (auto* ss = g_stratum_server.load()) {
-                        ss->notify_new_block();
-                    }
-                } else {
-                    g_miner_stats.rejected.fetch_add(1);
-                    log_warn(std::string("mined block rejected: ") + err);
-                }
-            } catch (...) {
-                log_error("miner submit_block fatal");
-            }
-
-        } catch (...) {
-            log_error("miner outer fatal");
-            std::this_thread::sleep_for(std::chrono::milliseconds(80));
-        }
-    }
-}
-
-// ==================================================================
 /*                                     CLI                                     */
 // ==================================================================
 static void print_usage(){
@@ -4054,15 +3902,16 @@ static void print_usage(){
       << "  --conf=<path>        Configuration file (key=value format)\n"
       << "  --datadir=<path>     Data directory (default: ~/.miqrochain)\n"
       << "  --no-tui             Plain log output instead of TUI\n"
-      << "  --mine               Enable built-in miner\n"
       << "  --genaddress         Generate new wallet address\n"
       << "  --reindex_utxo       Rebuild UTXO from chain data\n"
       << "  --telemetry          Enable telemetry logging\n"
       << "  --help               Show this help\n"
       << "\n"
+      << "Mining:\n"
+      << "  Use external miner (miqminer) for mining support.\n"
+      << "\n"
       << "Environment:\n"
       << "  MIQ_NO_TUI=1             Disable TUI\n"
-      << "  MIQ_MINER_THREADS=N      Miner threads (default: auto)\n"
       << "  MIQ_RPC_TOKEN=<token>    RPC auth token\n"
       << "  MIQ_SEED_HOST=<host>     Override seed host\n"
       << "\n"
@@ -4077,7 +3926,6 @@ static bool is_recognized_arg(const std::string& s){
     if(s=="--genaddress") return true;
     if(s=="--buildtx") return true;
     if(s=="--reindex_utxo") return true;
-    if(s=="--mine") return true;
     if(s=="--telemetry") return true;
     if(s=="--help") return true;
     return false;
@@ -4484,7 +4332,7 @@ int main(int argc, char** argv){
     // Parse CLI
     Config cfg;
     std::string conf;
-    bool genaddr=false, buildtx=false, mine_flag=false, flag_reindex_utxo=false;
+    bool genaddr=false, buildtx=false, flag_reindex_utxo=false;
     std::string privh, prevtxid_hex, toaddr;
     uint32_t vout=0; uint64_t value=0;
     for(int i=1;i<argc;i++){
@@ -4512,7 +4360,6 @@ int main(int argc, char** argv){
             value       = (uint64_t)std::stoull(argv[++i]);
             toaddr      = argv[++i];
         } else if(a=="--reindex_utxo"){ flag_reindex_utxo = true;
-        } else if(a=="--mine"){ mine_flag = true;
         } else if(a=="--telemetry"){ telemetry_flag = true;
         } else if(a=="--help"){ print_usage(); if (can_tui){ capture.stop(); tui.stop(); } return 0; }
     }
@@ -4874,52 +4721,8 @@ int main(int argc, char** argv){
             }
         }
 
-        // Prepare built-in miner (address prompt), but DO NOT start until synced.
-        unsigned thr_count = 0;
-        std::vector<uint8_t> mine_pkh;
-        bool miner_spawned = false;
-        bool miner_armed   = false;
-
-        if (mine_flag) {
-            if (cfg.miner_threads) thr_count = cfg.miner_threads;
-            if (thr_count == 0) {
-                if (const char* s = std::getenv("MIQ_MINER_THREADS")) {
-                    char* end = nullptr; long v = std::strtol(s, &end, 10);
-                    if (end != s && v > 0 && v <= 256) thr_count = (unsigned)v;
-                }
-            }
-            if (thr_count == 0) thr_count = std::max(1u, std::thread::hardware_concurrency());
-
-            // First try to use mining_address from config file
-            std::string addr = cfg.mining_address;
-
-            // If no config address, try interactive prompt (only if TTY available)
-            if (addr.empty() && MIQ_ISATTY()) {
-                std::cout << "Enter P2PKH Base58 address to mine to (will start when synced; empty to cancel): ";
-                std::getline(std::cin, addr);
-                trim_inplace(addr);
-            }
-
-            if (!addr.empty()) {
-                uint8_t ver=0; std::vector<uint8_t> payload;
-                if (base58check_decode(addr, ver, payload) && ver==VERSION_P2PKH && payload.size()==20) {
-                    mine_pkh = payload;
-                    g_miner_address_b58 = addr;
-                    miner_armed = true;
-                    log_info("Miner armed; waiting for node to finish syncing before start.");
-                } else {
-                    log_error("Invalid mining address; built-in miner disabled.");
-                }
-            } else {
-                if (cfg.mining_address.empty() && !MIQ_ISATTY()) {
-                    log_info("No mining address in config and no TTY available; built-in miner disabled.");
-                } else {
-                    log_info("No address entered; built-in miner disabled.");
-                }
-            }
-        } else {
-            log_info("Miner not started (use external miner or pass --mine).");
-        }
+        // Built-in miner removed - use external miner (miqminer) for mining
+        log_info("Use external miner (miqminer) for mining support.");
 
         log_info(std::string(CHAIN_NAME) + " node running. RPC " + std::to_string(RPC_PORT) +
                  ", P2P " + std::to_string(P2P_PORT));
@@ -4963,21 +4766,11 @@ int main(int argc, char** argv){
                 last_tip_change_ms = now_ms();
             }
 
-            // Sync gate & mining availability
+            // Sync gate for TUI display (external miner checks sync state via RPC)
             {
                 std::string why;
                 bool synced = compute_sync_gate(chain, &p2p, why);
                 if (can_tui) tui.set_mining_gate(synced, synced ? "" : why);
-
-                if (synced && miner_armed && !miner_spawned) {
-                    // Start miner now
-                    P2P* p2p_ptr = cfg.no_p2p ? nullptr : &p2p;
-                    std::thread th(miner_worker, &chain, &mempool, p2p_ptr, mine_pkh, thr_count);
-                    th.detach();
-                    miner_spawned = true;
-                    log_info("Sync complete — mining can start.");
-                    if (can_tui) tui.set_hot_warning("Mining started");
-                }
             }
 
             // Periodic mempool maintenance (every ~30 seconds)
@@ -4999,7 +4792,8 @@ int main(int argc, char** argv){
                 if (n == 0 && now_ms() - start_of_run_ms > 60'000) degraded = true;
             }
             if (now_ms() - last_tip_change_ms > 10*60*1000) degraded = true;
-            if (!miner_armed && std::getenv("MIQ_MINER_HEARTBEAT") && !g_extminer.alive.load()) degraded = true;
+            // Check external miner heartbeat - degraded if expected but not responding
+            if (std::getenv("MIQ_MINER_HEARTBEAT") && !g_extminer.alive.load()) degraded = true;
             if (g_we_are_seed.load()){
                 // Seed host with no peers is definitely degraded
                 if (p2p.snapshot_peers().empty()) degraded = true;

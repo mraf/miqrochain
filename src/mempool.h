@@ -128,6 +128,7 @@ public:
     // Snapshots
     size_t size()        const { return map_.size(); }
     size_t bytes_used()  const { return total_bytes_; }
+    size_t orphan_count() const { return orphans_.size(); }
     bool   exists(const std::vector<uint8_t>& txid) const;
 
     // For miner: simple parents-first, highest-feerate up to `max` transactions
