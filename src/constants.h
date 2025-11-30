@@ -242,8 +242,9 @@ static constexpr size_t DNS_SEEDS_COUNT = sizeof(DNS_SEEDS) / sizeof(DNS_SEEDS[0
 static constexpr int64_t MAX_TIME_SKEW = 2*60*60; // 2 hours
 
 // === PRODUCTION SECURITY CAPS ===
+// Like Bitcoin, allow large transactions that can fill the entire block
 static constexpr size_t MAX_BLOCK_SIZE = 4 * 1024 * 1024;  // 4 MiB (scalable)
-static constexpr size_t MAX_TX_SIZE    = 400 * 1024;       // 400 KiB
+static constexpr size_t MAX_TX_SIZE    = 4 * 1024 * 1024;  // 4 MiB (no tx size limit within block)
 static constexpr size_t MAX_MSG_SIZE   = 8 * 1024 * 1024;  // 8 MiB (for large INVs)
 
 // Optional: default RPC token (empty = no token unless MIQ_RPC_TOKEN env set)
@@ -429,9 +430,9 @@ static constexpr uint32_t MIN_PEER_PROTO_VERSION = 70015;  // Minimum supported
 #endif
 
 // === WALLET TRANSFER LIMITS ===
-// Maximum amount that can be sent in a single transfer (anti-fraud protection)
+// No transfer limit - like Bitcoin, users can send any amount up to their balance
 #ifndef MIQ_MAX_TRANSFER_AMOUNT
-#define MIQ_MAX_TRANSFER_AMOUNT (2000ULL * COIN)  // 2000 MIQ per transfer
+#define MIQ_MAX_TRANSFER_AMOUNT MAX_MONEY  // No limit - can send up to total supply
 #endif
 
 // === RBF (Replace-By-Fee) SUPPORT ===

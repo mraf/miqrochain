@@ -310,7 +310,8 @@ namespace wallet_config {
     static constexpr size_t MAX_UTXO_COUNT = 100000;
     static constexpr size_t MAX_TX_INPUTS = 500;
     static constexpr size_t MAX_TX_OUTPUTS = 50;
-    static constexpr uint64_t MAX_SINGLE_TX_VALUE = 1000000ULL * 100000000ULL;
+    // No transfer limit - like Bitcoin, allow any amount up to total supply
+    static constexpr uint64_t MAX_SINGLE_TX_VALUE = 26280000ULL * 100000000ULL;  // MAX_MONEY
     static constexpr uint64_t DUST_THRESHOLD = 546;
     static constexpr uint64_t MIN_RELAY_FEE = 1000;  // Minimum fee for relay
 
