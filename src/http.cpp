@@ -164,7 +164,7 @@ static std::unordered_set<std::string> default_safe_methods(){
         // Wallet methods (needed for balance checking and sending)
         "getbalance","listutxos","listaddresses","sendfromhd","getaddressutxos",
         "getnewaddress","walletinfo","getwalletinfo","createrawtx","signrawtx",
-        "sendrawtx","decodeaddress","createhdwallet","restorehdwallet","scanaddresses"
+        "sendrawtx","sendrawtransaction","decodeaddress","createhdwallet","restorehdwallet","scanaddresses"
     };
 }
 
