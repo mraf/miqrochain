@@ -11560,6 +11560,21 @@ static bool wallet_session(const std::string& cli_host,
                 }
             }
 
+            // CRITICAL FIX: Always add to transaction history, regardless of broadcast success
+            // This ensures the transaction shows in the dashboard even when queued for later broadcast
+            // The confirmations=0 status indicates it's still pending
+            {
+                TxHistoryEntry hist;
+                hist.txid_hex = txid_hex;
+                hist.timestamp = (int64_t)time(nullptr);
+                hist.amount = -(int64_t)amount;
+                hist.fee = fee_final;
+                hist.confirmations = 0;
+                hist.direction = "sent";
+                hist.to_address = to;
+                add_tx_history(wdir, hist);
+            }
+
             if(!broadcast_success){
                 // Save transaction to queue for later broadcast
                 QueuedTransaction qtx;
@@ -11592,16 +11607,7 @@ static bool wallet_session(const std::string& cli_host,
                 continue;
             }
 
-            // Add to transaction history
-            TxHistoryEntry hist;
-            hist.txid_hex = txid_hex;
-            hist.timestamp = (int64_t)time(nullptr);
-            hist.amount = -(int64_t)amount;
-            hist.fee = fee_final;
-            hist.confirmations = 0;
-            hist.direction = "sent";
-            hist.to_address = to;
-            add_tx_history(wdir, hist);
+            // Transaction already added to history above
 
             // V1.1 STABILITY FIX: Also add to queue for rebroadcast tracking
             // Even successful broadcasts may not propagate properly, so we track them
