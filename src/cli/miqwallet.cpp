@@ -7643,7 +7643,8 @@ static bool fetch_tx_full_info(
     std::vector<rpc_wallet::RpcEndpoint> endpoints;
     for(const auto& [host, port] : seeds){
         uint16_t p2p_port = (uint16_t)std::stoi(port);
-        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port + 1);
+        // CRITICAL FIX: RPC port is P2P port - 49 (9883 -> 9834)
+        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port - 49);
         endpoints.push_back({host, rpc_port, "", wallet_config::RPC_TIMEOUT_MS});
     }
     // Add localhost
@@ -8420,8 +8421,8 @@ static bool rpc_collect_utxos(
     std::vector<rpc_wallet::RpcEndpoint> endpoints;
     for(const auto& [host, port] : seeds){
         uint16_t p2p_port = (uint16_t)std::stoi(port);
-        // Convert P2P port to RPC port (P2P 9883 -> RPC 9834)
-        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port + 1);
+        // CRITICAL FIX: RPC port is P2P port - 49 (9883 -> 9834)
+        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port - 49);
         endpoints.push_back({host, rpc_port, "", wallet_config::RPC_TIMEOUT_MS});
     }
 
@@ -8602,8 +8603,8 @@ static bool rpc_broadcast_transaction(
         if(host == "127.0.0.1" || host == "localhost") continue; // Already added
 
         uint16_t p2p_port = (uint16_t)std::stoi(port);
-        // Convert P2P port to RPC port
-        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port + 1);
+        // CRITICAL FIX: RPC port is P2P port - 49 (9883 -> 9834)
+        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port - 49);
         endpoints.push_back({host, rpc_port, "", wallet_config::RPC_TIMEOUT_MS});
     }
 
@@ -8785,7 +8786,9 @@ static bool bulletproof_broadcast(
         if(host == "127.0.0.1" || host == "localhost") continue;
 
         uint16_t p2p_port = (uint16_t)std::stoi(port);
-        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port + 1);
+        // CRITICAL FIX: RPC port is P2P port - 49 (9883 -> 9834)
+        // This matches the default configuration and verify_tx_in_mempool
+        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port - 49);
         endpoints.push_back({host, rpc_port, "", wallet_config::RPC_TIMEOUT_MS});
     }
 
@@ -9083,7 +9086,8 @@ static std::vector<rpc_wallet::RpcEndpoint> build_endpoints_from_seeds(
         if(host == "127.0.0.1" || host == "localhost") continue;
 
         uint16_t p2p_port = (uint16_t)std::stoi(port);
-        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port + 1);
+        // CRITICAL FIX: RPC port is P2P port - 49 (9883 -> 9834)
+        uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port - 49);
         endpoints.push_back(rpc_wallet::RpcEndpoint{host, rpc_port, "", wallet_config::RPC_TIMEOUT_MS});
     }
 
