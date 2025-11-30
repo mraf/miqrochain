@@ -323,21 +323,12 @@ if(WIN32)
 endif()
 
 # ---------------- Wallet CLI ----------------
-set(MIQ_P2P_LIGHT_SRC "")
-foreach(cand IN ITEMS
-        src/p2p_light.cpp
-        src/wallet/p2p_light.cpp
-        src/light/p2p_light.cpp)
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${cand}")
-    list(APPEND MIQ_P2P_LIGHT_SRC "${cand}")
-  endif()
-endforeach()
+# v2.0 STABLE: RPC-only wallet - No P2P dependencies
+# All network operations use JSON-RPC via http_client
 
 add_executable(miqwallet
   src/cli/miqwallet.cpp
   src/nat.cpp
-  ${MIQ_P2P_LIGHT_SRC}
-  src/wallet/spv_simple.cpp
   src/wallet/http_client.cpp
 )
 target_include_directories(miqwallet PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})

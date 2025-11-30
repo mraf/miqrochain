@@ -410,9 +410,22 @@ namespace wallet_config {
 #include "tx.h"
 #include "crypto/ecdsa_iface.h"
 
-// v2.0 STABLE: Full RPC-only wallet - Minimal includes for type definitions
+// v2.0 STABLE: Full RPC-only wallet - HTTP client for JSON-RPC
 #include "wallet/http_client.h"
-#include "wallet/spv_simple.h"  // For miq::UtxoLite type definition (no P2P calls used)
+
+// =============================================================================
+// UTXO TYPE DEFINITION - Local definition (no P2P dependencies)
+// =============================================================================
+namespace miq {
+struct UtxoLite {
+    std::vector<uint8_t> txid;   // 32 bytes (LE)
+    uint32_t vout;               // output index
+    uint64_t value;              // in miqron
+    std::vector<uint8_t> pkh;    // 20 bytes
+    uint32_t height;             // block height (0 for mempool)
+    bool coinbase;
+};
+} // namespace miq
 
 // =============================================================================
 // FULL RPC WALLET CLIENT v2.0 - Zero P2P dependencies
@@ -3232,8 +3245,7 @@ static void clear_spv_cache(const std::string& wdir){
     std::string utxo_file = join_path(wdir, "utxo_cache.dat");
     std::remove(state_file.c_str());
     std::remove(utxo_file.c_str());
-    // CRITICAL FIX: Also invalidate in-memory cache to ensure fresh fetch
-    miq::spv_invalidate_mem_cache();
+    // NOTE: No in-memory cache to invalidate in RPC-only mode
 }
 
 // =============================================================================
@@ -10000,10 +10012,9 @@ static bool wallet_session(const std::string& cli_host,
             // This ensures pending transactions are cleaned up when confirmed
             last_auto_refresh = now;
 
-            // Invalidate cache to force fresh fetch
-            miq::spv_invalidate_mem_cache();
+            // NOTE: No in-memory cache to invalidate in RPC-only mode
 
-            // Perform silent background refresh
+            // Perform silent background refresh via RPC
             std::vector<miq::UtxoLite> new_utxos;
             std::string used_seed, err;
             if(spv_collect_any_seed(seeds, pkhs, spv_win, wdir, new_utxos, used_seed, err)){
@@ -11655,9 +11666,8 @@ static bool wallet_session(const std::string& cli_host,
 
             is_online = true;
 
-            // CRITICAL FIX: Invalidate UTXO cache before refresh
-            // This ensures fresh data from network, not cached UTXOs
-            miq::spv_invalidate_mem_cache();
+            // NOTE: No in-memory cache to invalidate in RPC-only mode
+            // Fresh data is always fetched from node via RPC
 
             // Refresh balance after send - balance should now show reduced amount
             utxos = refresh_and_print();
@@ -12269,9 +12279,11 @@ static bool wallet_session(const std::string& cli_host,
                 ui::print_header("NETWORK SETTINGS", 50);
                 std::cout << "\n";
 
-                std::cout << ui::dim() << "  Current P2P Seeds:" << ui::reset() << "\n";
+                std::cout << ui::dim() << "  Current RPC Endpoints:" << ui::reset() << "\n";
                 for(const auto& seed_entry : seeds){
-                    std::cout << "  - " << seed_entry.first << ":" << seed_entry.second << "\n";
+                    uint16_t p2p_port = (uint16_t)std::stoi(seed_entry.second);
+                    uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port - 49);
+                    std::cout << "  - " << seed_entry.first << ":" << rpc_port << " (RPC)\n";
                 }
                 std::cout << "\n";
 
@@ -12300,23 +12312,25 @@ static bool wallet_session(const std::string& cli_host,
             NetworkDiagnostics diag;
             diag.timestamp = std::time(nullptr);
 
-            // Test each seed
-            std::cout << ui::dim() << "  Testing P2P connections:" << ui::reset() << "\n\n";
+            // Test each seed via RPC (fully RPC-only wallet)
+            std::cout << ui::dim() << "  Testing RPC connections:" << ui::reset() << "\n\n";
 
             for(const auto& seed_entry : seeds){
-                std::cout << "  " << seed_entry.first << ":" << seed_entry.second << " ... ";
+                uint16_t p2p_port = (uint16_t)std::stoi(seed_entry.second);
+                uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port - 49);
+
+                std::cout << "  " << seed_entry.first << ":" << rpc_port << " (RPC) ... ";
                 std::cout.flush();
 
                 auto start = std::chrono::steady_clock::now();
 
-                // Try to connect
-                miq::SpvOptions opts;
-                opts.timeout_ms = 5000;
-                std::vector<miq::UtxoLite> test_utxos;
-                std::string err;
+                // Test RPC connection with getblockcount
+                std::vector<rpc_wallet::RpcEndpoint> test_eps;
+                test_eps.push_back({seed_entry.first, rpc_port, "", 5000});
 
-                bool success = miq::spv_collect_utxos(
-                    seed_entry.first, seed_entry.second, pkhs, opts, test_utxos, err);
+                std::string status;
+                std::string used_seed;
+                bool success = rpc_wallet::rpc_health_check(test_eps, status, used_seed);
 
                 auto end = std::chrono::steady_clock::now();
                 int latency = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
