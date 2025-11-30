@@ -178,6 +178,11 @@ public:
     // Get transaction by txid
     bool get_transaction(const std::vector<uint8_t>& txid, Transaction& out) const;
 
+    // Remove a transaction from mempool (for canceling stuck transactions)
+    // Returns true if transaction was found and removed, false otherwise
+    // Also removes any descendant transactions that depend on this one
+    bool remove_transaction(const std::vector<uint8_t>& txid, std::string& err);
+
     // Check if inputs are spent in mempool
     bool has_spent_input(const std::vector<uint8_t>& txid, uint32_t vout) const;
 

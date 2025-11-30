@@ -1087,6 +1087,68 @@ bool Mempool::get_transaction(const std::vector<uint8_t>& txid, Transaction& out
     return true;
 }
 
+bool Mempool::remove_transaction(const std::vector<uint8_t>& txid, std::string& err) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+
+    Key kk = k(txid);
+    auto it = map_.find(kk);
+    if (it == map_.end()) {
+        err = "transaction not found in mempool";
+        return false;
+    }
+
+    // Collect all descendant transactions that must also be removed
+    // (they depend on outputs from this transaction)
+    std::vector<Key> to_remove;
+    to_remove.push_back(kk);
+
+    std::unordered_set<std::string> seen;
+    seen.insert(kk);
+
+    // BFS to find all descendants
+    std::deque<Key> q;
+    for (const auto& child : it->second.children) {
+        q.push_back(child);
+    }
+
+    while (!q.empty()) {
+        Key ck = q.front();
+        q.pop_front();
+        if (!seen.insert(ck).second) continue;
+
+        auto cit = map_.find(ck);
+        if (cit == map_.end()) continue;
+
+        to_remove.push_back(ck);
+        for (const auto& child : cit->second.children) {
+            q.push_back(child);
+        }
+    }
+
+    // Remove all transactions (descendants first, then the target)
+    // Process in reverse order so children are removed before parents
+    size_t removed_count = 0;
+    for (auto rit = to_remove.rbegin(); rit != to_remove.rend(); ++rit) {
+        auto mit = map_.find(*rit);
+        if (mit == map_.end()) continue;
+
+        // Log removal
+        MIQ_LOG_INFO(LogCategory::MEMPOOL, "Removing tx " + to_hex(mit->second.tx.txid()).substr(0, 16) +
+                     "... from mempool (cancel request)");
+
+        // Unlink and remove
+        unlink_entry(*rit);
+        total_bytes_ -= mit->second.size_bytes;
+        map_.erase(mit);
+        removed_count++;
+    }
+
+    MIQ_LOG_INFO(LogCategory::MEMPOOL, "Removed " + std::to_string(removed_count) +
+                 " transaction(s) from mempool");
+
+    return true;
+}
+
 bool Mempool::has_spent_input(const std::vector<uint8_t>& txid, uint32_t vout) const {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
 
