@@ -340,6 +340,42 @@ static std::string err(const std::string& m){
     return json_dump(n);
 }
 
+// CRITICAL FIX: Wrap successful responses in {"result":...} format
+// This ensures wallet clients can properly parse responses
+static std::string ok(const miq::JNode& value){
+    miq::JNode n;
+    std::map<std::string,miq::JNode> o;
+    o["result"] = value;
+    n.v = o;
+    return json_dump(n);
+}
+
+// Convenience overloads for common types
+static std::string ok_str(const std::string& s){
+    miq::JNode v; v.v = s;
+    return ok(v);
+}
+
+static std::string ok_num(double d){
+    miq::JNode v; v.v = d;
+    return ok(v);
+}
+
+static std::string ok_bool(bool b){
+    miq::JNode v; v.v = b;
+    return ok(v);
+}
+
+static std::string ok_arr(const std::vector<miq::JNode>& arr){
+    miq::JNode v; v.v = arr;
+    return ok(v);
+}
+
+static std::string ok_obj(const std::map<std::string, miq::JNode>& obj){
+    miq::JNode v; v.v = obj;
+    return ok(v);
+}
+
 // Local difficulty helper (same formula as Chain::work_from_bits, but public here)
 [[maybe_unused]] static double difficulty_from_bits(uint32_t bits){
     uint32_t exp  = bits >> 24;
@@ -597,13 +633,13 @@ std::string RpcService::handle(const std::string& body){
 
         if(method=="getblockchaininfo"){
             auto tip = chain_.tip();
-            JNode n; std::map<std::string,JNode> o;
+            std::map<std::string,JNode> o;
             JNode a; a.v = std::string(CHAIN_NAME);              o["chain"] = a;
             JNode h; h.v = (double)tip.height;                   o["height"] = h;
             JNode b; b.v = (double)tip.height;                   o["blocks"] = b;  // alias for height
             JNode hh; hh.v = to_hex(tip.hash);                   o["bestblockhash"] = hh;
             JNode d; d.v = (double)Chain::work_from_bits_public(tip.bits); o["difficulty"] = d;
-            JNode r; r.v = o; return json_dump(r);
+            return ok_obj(o);
         }
 
         // --- IBD snapshot ---
@@ -622,13 +658,11 @@ std::string RpcService::handle(const std::string& body){
         }
 
         if(method=="getblockcount"){
-            JNode n; n.v = (double)chain_.tip().height;
-            return json_dump(n);
+            return ok_num((double)chain_.tip().height);
         }
 
         if(method=="getbestblockhash"){
-            JNode n; n.v = std::string(to_hex(chain_.tip().hash));
-            return json_dump(n);
+            return ok_str(to_hex(chain_.tip().hash));
         }
 
         if(method=="getblockhash"){
@@ -1140,9 +1174,10 @@ std::string RpcService::handle(const std::string& body){
 
         if(method=="getrawmempool"){
             auto ids = mempool_.txids();
-            JNode arr; std::vector<JNode> v;
+            std::vector<JNode> v;
             for(auto& id: ids){ JNode s; s.v = std::string(to_hex(id)); v.push_back(s); }
-            arr.v = v; return json_dump(arr);
+            // CRITICAL FIX: Wrap in {"result":...} format
+            return ok_arr(v);
         }
 
         // DIAGNOSTIC: Get mempool statistics including orphan info
@@ -1522,7 +1557,8 @@ std::string RpcService::handle(const std::string& body){
                     // CRITICAL FIX: Notify telemetry so TUI shows the transaction in "Recent TXIDs"
                     p2p_->notify_local_tx(txid);
                 }
-                JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
+                // CRITICAL FIX: Return properly formatted {"result":"txid"} response
+                return ok_str(to_hex(tx.txid()));
             } else {
                 log_warn("sendrawtransaction: tx " + txid_hex.substr(0, 16) + "... REJECTED: " + e);
                 return err(e);
@@ -1728,7 +1764,8 @@ std::string RpcService::handle(const std::string& body){
                     JNode n; n.v = o; arr.push_back(n);
                 }
             }
-            JNode out; out.v = arr; return json_dump(out);
+            // CRITICAL FIX: Wrap in {"result":...} format
+            return ok_arr(arr);
         }
 
         // --- HD wallet RPCs ---
@@ -2816,7 +2853,8 @@ std::string RpcService::handle(const std::string& body){
                         log_warn(std::string("sendfromhd: SaveHdWallet failed: ") + e);
                     }
                 }
-                JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
+                // CRITICAL FIX: Return properly formatted {"result":"txid"} response
+                return ok_str(to_hex(tx.txid()));
             } else {
                 log_warn("sendfromhd: tx rejected: " + e);
                 return err(e);
@@ -2828,19 +2866,19 @@ std::string RpcService::handle(const std::string& body){
         if(method=="estimatemediantime"){
             auto hdrs = chain_.last_headers(11);
             if(hdrs.empty()){
-                return json_dump(jnum(0.0));
+                return ok_num(0.0);
             }
             std::vector<int64_t> ts;
             ts.reserve(hdrs.size());
             for(auto& p : hdrs) ts.push_back(p.first);
             std::sort(ts.begin(), ts.end());
             double mtp = (double)ts[ts.size()/2];
-            return json_dump(jnum(mtp));
+            return ok_num(mtp);
         }
 
         if(method=="getdifficulty"){
             double d = (double)Chain::work_from_bits_public(chain_.tip().bits);
-            return json_dump(jnum(d));
+            return ok_num(d);
         }
 
         if(method=="getchaintips"){

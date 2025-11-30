@@ -535,17 +535,40 @@ static bool rpc_call(
     }
 
     // Check for RPC error
+    // CRITICAL FIX: Handle both error formats:
+    // 1. Standard JSON-RPC: {"error":{"message":"..."}}
+    // 2. Simple format:     {"error":"..."}
     if (resp.body.find("\"error\":null") == std::string::npos &&
         resp.body.find("\"error\": null") == std::string::npos) {
         size_t err_pos = resp.body.find("\"error\":");
         if (err_pos != std::string::npos) {
-            size_t msg_pos = resp.body.find("\"message\":", err_pos);
-            if (msg_pos != std::string::npos) {
-                size_t start = resp.body.find('"', msg_pos + 10) + 1;
-                size_t end = resp.body.find('"', start);
-                if (start < end) {
-                    err = "RPC error: " + resp.body.substr(start, end - start);
-                    return false;
+            size_t after_colon = err_pos + 8; // length of "\"error\":"
+            // Skip whitespace
+            while (after_colon < resp.body.size() &&
+                   (resp.body[after_colon] == ' ' || resp.body[after_colon] == '\t')) {
+                after_colon++;
+            }
+
+            if (after_colon < resp.body.size()) {
+                if (resp.body[after_colon] == '{') {
+                    // Format 1: {"error":{"message":"..."}}
+                    size_t msg_pos = resp.body.find("\"message\":", err_pos);
+                    if (msg_pos != std::string::npos) {
+                        size_t start = resp.body.find('"', msg_pos + 10) + 1;
+                        size_t end = resp.body.find('"', start);
+                        if (start < end && start > 0) {
+                            err = "RPC error: " + resp.body.substr(start, end - start);
+                            return false;
+                        }
+                    }
+                } else if (resp.body[after_colon] == '"') {
+                    // Format 2: {"error":"..."} - simple string error
+                    size_t start = after_colon + 1;
+                    size_t end = resp.body.find('"', start);
+                    if (end != std::string::npos && end > start) {
+                        err = "RPC error: " + resp.body.substr(start, end - start);
+                        return false;
+                    }
                 }
             }
         }
