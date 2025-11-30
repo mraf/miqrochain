@@ -210,6 +210,7 @@ set(MIQ_CORE_SOURCES_NO_NAT
     src/hasher.h src/hasher.cpp
     src/lut.h src/lut.cpp
     src/blockindex.h src/blockindex.cpp
+    src/txindex.h src/txindex.cpp
     src/chain.h src/chain.cpp
     src/miner.h src/miner.cpp
     src/netmsg.h src/netmsg.cpp

@@ -25,12 +25,12 @@ bool TxIndex::open(const std::string& datadir) {
     // Try to load existing index
     if (std::filesystem::exists(path_)) {
         if (!load_from_disk()) {
-            MIQ_LOG_WARN(LogCategory::CHAIN, "Failed to load txindex, starting fresh");
+            log_warn("Failed to load txindex, starting fresh");
             index_.clear();
         }
     }
 
-    MIQ_LOG_INFO(LogCategory::CHAIN, "TxIndex opened with " + std::to_string(index_.size()) + " entries");
+    log_info("TxIndex opened with " + std::to_string(index_.size()) + " entries");
     return true;
 }
 
