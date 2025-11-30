@@ -74,3 +74,12 @@ QJsonValue RpcClient::walletLock()     { return call("walletlock"); }
 QJsonValue RpcClient::sendFromHd(const QString &to, const QString &amt, quint64 fee){
     return call("sendfromhd", QJsonArray{ to, amt, QString::number(fee) });
 }
+
+// Mempool methods
+QJsonValue RpcClient::getMempoolInfo() { return call("getmempoolinfo"); }
+QJsonValue RpcClient::getRawMempool()  { return call("getrawmempool"); }
+
+// Wallet history
+QJsonValue RpcClient::getWalletHistory(int limit) {
+    return call("getwallethistory", QJsonArray{ limit });
+}

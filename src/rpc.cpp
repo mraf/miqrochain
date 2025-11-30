@@ -470,14 +470,14 @@ std::string RpcService::handle(const std::string& body){
                 "help","version","ping","uptime",
                 "getnetworkinfo","getblockchaininfo","getblockcount","getbestblockhash",
                 "getblock","getblockhash","getcoinbaserecipient",
-                "getrawmempool","gettxout","getrawtransaction",
+                "getrawmempool","getmempoolinfo","gettxout","getrawtransaction",
                 "validateaddress","decodeaddress","decoderawtx",
                 "getminerstats","sendrawtransaction","sendtoaddress",
                 "estimatemediantime","getdifficulty","getchaintips",
                 "getpeerinfo","getconnectioncount","getnetworkinfo","listbanned","setban","disconnectnode",
                 "createhdwallet","restorehdwallet","walletinfo","getnewaddress","deriveaddressat",
                 "walletunlock","walletlock","getwalletinfo","listaddresses","listutxos",
-                "sendfromhd","getaddressutxos","getbalance",
+                "sendfromhd","getaddressutxos","getbalance","getwallethistory",
                 "getblocktemplate","getminertemplate", // Mining pool support
                 "submitblock","submitrawblock","sendrawblock"
                 // (getibdinfo exists but not listed here to keep help stable)
@@ -1890,11 +1890,18 @@ std::string RpcService::handle(const std::string& body){
             return "\"ok\"";
         }
 
-        // --- getwalletinfo (unlocked status + meta if readable) ---
+        // --- getwalletinfo (unlocked status + meta + balance + pending) ---
         if (method == "getwalletinfo") {
             std::map<std::string,JNode> o;
             o["unlocked"]          = jbool(wallet_is_unlocked());
             o["unlocked_until_ms"] = jnum((double)g_pass_expires_ms);
+
+            // Time remaining
+            int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            int unlock_left = (g_pass_expires_ms > now_ms) ? (int)((g_pass_expires_ms - now_ms) / 1000) : 0;
+            o["unlock_seconds_left"] = jnum((double)unlock_left);
+            o["locked"] = jbool(!wallet_is_unlocked());
 
             // Try to surface meta from disk using helper (env or cached pass)
             std::string wdir = default_wallet_file();
@@ -1908,6 +1915,114 @@ std::string RpcService::handle(const std::string& body){
             if (LoadHdWallet(wdir, seed, meta, pass, e)) {
                 o["next_recv"]   = jnum((double)meta.next_recv);
                 o["next_change"] = jnum((double)meta.next_change);
+
+                // Compute balance
+                miq::HdWallet w(seed, meta);
+                const uint64_t curH = chain_.tip().height;
+                constexpr uint32_t GAP_LIMIT = 20;
+
+                uint64_t confirmed_balance = 0;
+                uint64_t pending_balance = 0;
+                uint64_t immature_balance = 0;
+                int pending_tx_count = 0;
+
+                // Collect PKHs
+                std::unordered_set<std::string> our_pkhs_hex;
+                auto collect_pkhs = [&](uint32_t chain_idx, uint32_t max_idx) {
+                    for (uint32_t i = 0; i <= max_idx + GAP_LIMIT; ++i) {
+                        std::vector<uint8_t> priv, pub;
+                        if (!w.DerivePrivPub(meta.account, chain_idx, i, priv, pub)) continue;
+                        auto pkh = hash160(pub);
+                        our_pkhs_hex.insert(to_hex(pkh));
+                    }
+                };
+                collect_pkhs(0, meta.next_recv);
+                collect_pkhs(1, meta.next_change);
+
+                // Scan UTXOs for confirmed balance
+                for (const auto& pkh_hex : our_pkhs_hex) {
+                    auto pkh_vec = from_hex(pkh_hex);
+                    auto lst = chain_.utxo().list_for_pkh(pkh_vec);
+                    for (const auto& t : lst) {
+                        const auto& txid = std::get<0>(t);
+                        uint32_t vout = std::get<1>(t);
+                        const auto& ue = std::get<2>(t);
+
+                        // Skip if already spent in mempool
+                        if (mempool_.has_spent_input(txid, vout)) {
+                            continue;
+                        }
+
+                        // Check coinbase maturity
+                        if (ue.coinbase) {
+                            uint64_t mature_h = ue.height + COINBASE_MATURITY;
+                            if (curH + 1 < mature_h) {
+                                immature_balance += ue.value;
+                                continue;
+                            }
+                        }
+
+                        confirmed_balance += ue.value;
+                    }
+                }
+
+                // Check mempool for pending transactions and balances
+                std::unordered_set<std::string> counted_txids;
+                {
+                    std::vector<Transaction> mempool_txs;
+                    mempool_.snapshot(mempool_txs);
+
+                    for (const auto& tx : mempool_txs) {
+                        bool involves_us = false;
+
+                        // Check outputs (incoming pending)
+                        for (size_t vout = 0; vout < tx.vout.size(); ++vout) {
+                            const auto& out = tx.vout[vout];
+                            if (out.pkh.size() == 20) {
+                                std::string pkh_hex = to_hex(out.pkh);
+                                if (our_pkhs_hex.count(pkh_hex)) {
+                                    // Only count if not already spent in mempool
+                                    auto txid = tx.txid();
+                                    if (!mempool_.has_spent_input(txid, (uint32_t)vout)) {
+                                        pending_balance += out.value;
+                                    }
+                                    involves_us = true;
+                                }
+                            }
+                        }
+
+                        // Check inputs (outgoing)
+                        for (const auto& in : tx.vin) {
+                            UTXOEntry spent_utxo;
+                            if (chain_.utxo().get(in.prev.txid, in.prev.vout, spent_utxo)) {
+                                std::string pkh_hex = to_hex(spent_utxo.pkh);
+                                if (our_pkhs_hex.count(pkh_hex)) {
+                                    involves_us = true;
+                                }
+                            }
+                        }
+
+                        if (involves_us) {
+                            std::string txid_hex = to_hex(tx.txid());
+                            if (!counted_txids.count(txid_hex)) {
+                                counted_txids.insert(txid_hex);
+                                pending_tx_count++;
+                            }
+                        }
+                    }
+                }
+
+                uint64_t total_balance = confirmed_balance + pending_balance;
+
+                // Format balance as MIQ string
+                std::ostringstream bal_str;
+                bal_str << (total_balance/COIN) << "." << std::setw(8) << std::setfill('0') << (total_balance%COIN);
+                o["balance"] = jstr(bal_str.str());
+                o["balance_miqron"] = jnum((double)total_balance);
+                o["confirmed_balance"] = jnum((double)confirmed_balance);
+                o["pending_balance"] = jnum((double)pending_balance);
+                o["immature_balance"] = jnum((double)immature_balance);
+                o["pending_tx_count"] = jnum((double)pending_tx_count);
             }
             JNode out; out.v = o; return json_dump(out);
         }
@@ -2013,6 +2128,230 @@ std::string RpcService::handle(const std::string& body){
                 }
             }
             JNode out; out.v = outarr; return json_dump(out);
+        }
+
+        // --- getwallethistory - Get all transactions involving wallet addresses ---
+        // This scans the blockchain for all transactions that:
+        // 1. Have outputs paying to our addresses (incoming)
+        // 2. Have inputs spending from our addresses (outgoing)
+        // Returns a list sorted by block height (most recent first)
+        if (method == "getwallethistory") {
+            int limit = 100;  // Default limit
+            if (params.size() >= 1) {
+                if (std::holds_alternative<double>(params[0].v)) {
+                    limit = (int)std::get<double>(params[0].v);
+                } else if (std::holds_alternative<std::string>(params[0].v)) {
+                    try { limit = std::stoi(std::get<std::string>(params[0].v)); }
+                    catch(...) { limit = 100; }
+                }
+            }
+            if (limit <= 0) limit = 100;
+            if (limit > 1000) limit = 1000;  // Cap at 1000
+
+            // Load wallet
+            std::string wdir = default_wallet_file();
+            if(!wdir.empty()){
+                size_t pos = wdir.find_last_of("/\\"); if(pos!=std::string::npos) wdir = wdir.substr(0,pos);
+            } else {
+                wdir = "wallets/default";
+            }
+            std::vector<uint8_t> seed; miq::HdAccountMeta meta{}; std::string e;
+            std::string pass = get_wallet_pass_or_cached();
+            if(!LoadHdWallet(wdir, seed, meta, pass, e)) return err(e);
+
+            miq::HdWallet w(seed, meta);
+            const uint64_t curH = chain_.tip().height;
+
+            // Collect all our PKHs as hex strings for fast lookup
+            constexpr uint32_t GAP_LIMIT = 20;
+            std::unordered_set<std::string> our_pkhs_hex;
+
+            auto collect_pkhs = [&](uint32_t chain_idx, uint32_t max_idx) {
+                for (uint32_t i = 0; i <= max_idx + GAP_LIMIT; ++i) {
+                    std::vector<uint8_t> priv, pub;
+                    if (!w.DerivePrivPub(meta.account, chain_idx, i, priv, pub)) continue;
+                    auto pkh = hash160(pub);
+                    our_pkhs_hex.insert(to_hex(pkh));
+                }
+            };
+            collect_pkhs(0, meta.next_recv);   // External addresses
+            collect_pkhs(1, meta.next_change); // Change addresses
+
+            // Structure to hold transaction details
+            struct WalletTx {
+                std::vector<uint8_t> txid;
+                uint64_t block_height;
+                int64_t net_value;  // Positive = incoming, negative = outgoing
+                bool confirmed;
+                uint64_t timestamp;
+                std::string type;  // "receive", "send", "self"
+            };
+            std::vector<WalletTx> history;
+
+            // First, check mempool for pending transactions
+            {
+                std::vector<Transaction> mempool_txs;
+                mempool_.snapshot(mempool_txs);
+
+                for (const auto& tx : mempool_txs) {
+                    int64_t incoming = 0, outgoing = 0;
+                    bool involves_us = false;
+
+                    // Check outputs (incoming)
+                    for (const auto& out : tx.vout) {
+                        if (out.pkh.size() == 20) {
+                            std::string pkh_hex = to_hex(out.pkh);
+                            if (our_pkhs_hex.count(pkh_hex)) {
+                                incoming += out.value;
+                                involves_us = true;
+                            }
+                        }
+                    }
+
+                    // Check inputs (outgoing) - need to look up the spent outputs
+                    for (const auto& in : tx.vin) {
+                        UTXOEntry spent_utxo;
+                        // Check if input spends one of our UTXOs
+                        if (chain_.utxo().get(in.prev.txid, in.prev.vout, spent_utxo)) {
+                            std::string pkh_hex = to_hex(spent_utxo.pkh);
+                            if (our_pkhs_hex.count(pkh_hex)) {
+                                outgoing += spent_utxo.value;
+                                involves_us = true;
+                            }
+                        }
+                        // Also check mempool for chained transactions
+                        Transaction parent_tx;
+                        if (mempool_.get_transaction(in.prev.txid, parent_tx)) {
+                            if (in.prev.vout < parent_tx.vout.size()) {
+                                const auto& parent_out = parent_tx.vout[in.prev.vout];
+                                std::string pkh_hex = to_hex(parent_out.pkh);
+                                if (our_pkhs_hex.count(pkh_hex)) {
+                                    outgoing += parent_out.value;
+                                    involves_us = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if (involves_us) {
+                        WalletTx wtx;
+                        wtx.txid = tx.txid();
+                        wtx.block_height = UINT64_MAX;
+                        wtx.net_value = incoming - outgoing;
+                        wtx.confirmed = false;
+                        wtx.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        wtx.type = (outgoing == 0) ? "receive" : (incoming == 0 || incoming == outgoing) ? "send" : "self";
+                        history.push_back(wtx);
+                    }
+                }
+            }
+
+            // Scan confirmed blocks (from most recent to oldest)
+            size_t blocks_scanned = 0;
+            for (int64_t h = (int64_t)curH; h >= 0 && (int)history.size() < limit; --h) {
+                Block blk;
+                if (!chain_.get_block_by_index((size_t)h, blk)) continue;
+                blocks_scanned++;
+
+                for (const auto& tx : blk.txs) {
+                    int64_t incoming = 0, outgoing = 0;
+                    bool involves_us = false;
+                    bool is_coinbase = tx.vin.size() > 0 && tx.vin[0].prev.txid.empty();
+
+                    // Check outputs (incoming)
+                    for (const auto& out : tx.vout) {
+                        if (out.pkh.size() == 20) {
+                            std::string pkh_hex = to_hex(out.pkh);
+                            if (our_pkhs_hex.count(pkh_hex)) {
+                                incoming += out.value;
+                                involves_us = true;
+                            }
+                        }
+                    }
+
+                    // Check inputs (outgoing) - for non-coinbase transactions
+                    if (!is_coinbase) {
+                        for (const auto& in : tx.vin) {
+                            // We need to find what UTXO was spent
+                            // Look up the parent transaction to get the output value/pkh
+                            miq::TxLocation loc;
+                            if (chain_.txindex().get(in.prev.txid, loc)) {
+                                Block parent_blk;
+                                if (chain_.get_block_by_index(loc.block_height, parent_blk)) {
+                                    if (loc.tx_position < parent_blk.txs.size()) {
+                                        const auto& parent_tx = parent_blk.txs[loc.tx_position];
+                                        if (in.prev.vout < parent_tx.vout.size()) {
+                                            const auto& spent_out = parent_tx.vout[in.prev.vout];
+                                            std::string pkh_hex = to_hex(spent_out.pkh);
+                                            if (our_pkhs_hex.count(pkh_hex)) {
+                                                outgoing += spent_out.value;
+                                                involves_us = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (involves_us) {
+                        WalletTx wtx;
+                        wtx.txid = tx.txid();
+                        wtx.block_height = (uint64_t)h;
+                        wtx.net_value = incoming - outgoing;
+                        wtx.confirmed = true;
+                        wtx.timestamp = blk.header.time;
+                        wtx.type = is_coinbase ? "coinbase" :
+                                   (outgoing == 0) ? "receive" :
+                                   (incoming == 0) ? "send" : "self";
+                        history.push_back(wtx);
+                    }
+                }
+
+                // Stop early if we have enough transactions
+                if ((int)history.size() >= limit * 2) break;
+            }
+
+            // Sort by block height (pending first, then most recent confirmed)
+            std::sort(history.begin(), history.end(), [](const WalletTx& a, const WalletTx& b) {
+                // Pending transactions (UINT64_MAX) come first
+                if (a.block_height == UINT64_MAX && b.block_height != UINT64_MAX) return true;
+                if (b.block_height == UINT64_MAX && a.block_height != UINT64_MAX) return false;
+                // Then sort by height descending
+                return a.block_height > b.block_height;
+            });
+
+            // Limit results
+            if ((int)history.size() > limit) {
+                history.resize(limit);
+            }
+
+            // Build response
+            std::vector<JNode> arr;
+            for (const auto& wtx : history) {
+                std::map<std::string, JNode> o;
+                o["txid"] = jstr(to_hex(wtx.txid));
+                o["confirmations"] = jnum(wtx.confirmed ? (double)(curH - wtx.block_height + 1) : 0.0);
+                o["block_height"] = jnum(wtx.confirmed ? (double)wtx.block_height : -1.0);
+                o["amount"] = jnum((double)wtx.net_value);
+
+                // Format amount as MIQ string
+                bool negative = wtx.net_value < 0;
+                uint64_t abs_val = negative ? (uint64_t)(-wtx.net_value) : (uint64_t)wtx.net_value;
+                std::ostringstream s;
+                if (negative) s << "-";
+                s << (abs_val/COIN) << "." << std::setw(8) << std::setfill('0') << (abs_val%COIN);
+                o["amount_miq"] = jstr(s.str());
+
+                o["type"] = jstr(wtx.type);
+                o["confirmed"] = jbool(wtx.confirmed);
+                o["timestamp"] = jnum((double)wtx.timestamp);
+
+                JNode n; n.v = o; arr.push_back(n);
+            }
+
+            JNode out; out.v = arr; return json_dump(out);
         }
 
         // -------- Spend from HD wallet (filters immature coinbase) --------
