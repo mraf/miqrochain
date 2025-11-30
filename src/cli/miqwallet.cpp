@@ -329,7 +329,6 @@ namespace wallet_config {
     static constexpr int MAX_QUEUE_SIZE = 10000;
     static constexpr int AUTO_BROADCAST_INTERVAL_MS = 15000;
     static constexpr int TX_EXPIRY_HOURS = 72;
-    static constexpr int MAX_BROADCAST_ATTEMPTS = 15;
     static constexpr int CONFIRMATION_TARGET = 6;
 
     // v9.0 FIX: Reduced pending timeout for faster balance updates
@@ -338,11 +337,7 @@ namespace wallet_config {
     static constexpr int PENDING_TIMEOUT_MINUTES = 5;
     static constexpr int64_t PENDING_TIMEOUT_SECONDS = PENDING_TIMEOUT_MINUTES * 60;
 
-    // V1.1 STABILITY FIX: Rebroadcast tuned for ~8 minute blocks
-    // Transactions with "broadcast" status should be rebroadcast periodically
-    // 3 minutes interval is appropriate - transactions propagate fast, but blocks are ~8 min
-    static constexpr int REBROADCAST_INTERVAL_MINUTES = 3;
-    static constexpr int64_t REBROADCAST_INTERVAL_SECONDS = REBROADCAST_INTERVAL_MINUTES * 60;
+    // V1.2: Auto-rebroadcast removed - manual rebroadcast only via Stuck TX Manager
 
     // v9.0: Quick confirmation check interval (seconds)
     // How often to verify transaction is in mempool/confirmed
@@ -2336,20 +2331,6 @@ namespace ui {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-
-    // RECOVERY Splash (for stuck transactions)
-    static void run_recovery_splash(int recovered, int total) {
-        (void)total;  // Available for future progress display
-        std::string status = recovered > 0 ?
-            "Recovered " + std::to_string(recovered) + " stuck transaction(s)" :
-            "No stuck transactions found";
-
-        for (int i = 0; i < 6; i++) {
-            draw_action_splash("RECOVERY COMPLETE", status, 1.0, i,
-                              "UTXOs released and available", "yellow");
-            std::this_thread::sleep_for(std::chrono::milliseconds(80));
-        }
     }
 
     // Compact inline progress for single-line updates
