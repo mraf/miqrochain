@@ -2998,7 +2998,7 @@ namespace live_dashboard {
 
         // Fill with spaces for consistent width and timestamp
         int64_t now = time(nullptr);
-        struct tm* t = localtime(&now);
+        struct tm* t = localtime((time_t*)&now);
         char time_buf[16];
         strftime(time_buf, sizeof(time_buf), "%H:%M:%S", t);
 
@@ -14016,7 +14016,7 @@ namespace main_menu {
 
         // Time
         int64_t now = time(nullptr);
-        struct tm* t = localtime(&now);
+        struct tm* t = localtime((time_t*)&now);
         char time_buf[16];
         strftime(time_buf, sizeof(time_buf), "%H:%M:%S", t);
         std::cout << std::string(W - 45, ' ');
