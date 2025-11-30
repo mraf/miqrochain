@@ -331,10 +331,30 @@ namespace wallet_config {
     static constexpr int TX_EXPIRY_HOURS = 72;
     static constexpr int CONFIRMATION_TARGET = 6;
 
-    // v9.0 FIX: Reduced pending timeout for faster balance updates
-    // If a transaction hasn't been confirmed within this time, release the UTXOs
-    // 5 minutes is enough for transaction to propagate and be seen in mempool
-    static constexpr int PENDING_TIMEOUT_MINUTES = 5;
+    // ==========================================================================
+    // PENDING TRANSACTION TIMEOUT (Design Decision)
+    // ==========================================================================
+    // This timeout controls when the wallet releases UTXOs that were reserved
+    // for a pending (unconfirmed) transaction. After this timeout, the wallet
+    // assumes the transaction failed/was dropped and makes the UTXOs available again.
+    //
+    // IMPORTANT: This is SHORTER than mempool expiry (14 days) by design:
+    // - Mempool keeps transactions for 14 days (MIQ_MEMPOOL_EXPIRY_HOURS = 336)
+    // - Wallet releases UTXOs after 30 minutes for better UX
+    //
+    // SAFEGUARDS against double-spend:
+    // 1. The original transaction may still be in mempool and get mined
+    // 2. If user creates a new transaction spending same UTXOs:
+    //    a) If original tx confirms first -> new tx is invalid (inputs spent)
+    //    b) If new tx confirms first -> original tx is invalid (inputs spent)
+    //    c) Only ONE of the conflicting transactions can ever confirm
+    // 3. The blockchain consensus ensures only one spend is valid
+    //
+    // This is a UX tradeoff: users get their balance back quickly if a tx
+    // fails, at the cost of potentially having two conflicting txs in mempool.
+    // The worst case is one tx gets mined and the other becomes invalid.
+    // ==========================================================================
+    static constexpr int PENDING_TIMEOUT_MINUTES = 30;  // Increased from 5 to 30 for safety
     static constexpr int64_t PENDING_TIMEOUT_SECONDS = PENDING_TIMEOUT_MINUTES * 60;
 
     // V1.2: Auto-rebroadcast removed - manual rebroadcast only via Stuck TX Manager
@@ -5405,9 +5425,11 @@ struct TransactionPlan {
         const auto& u = utxos[i];
 
         // Skip immature coinbase
+        // CRITICAL FIX: Use <= to match mempool/chain validation (was <, off-by-one)
+        // Mempool rejects: height + 1 <= coinbase_height + COINBASE_MATURITY
         if(u.coinbase){
-            uint64_t mature_h = (uint64_t)u.height + 100ULL;
-            if(tip_height + 1 < mature_h) continue;
+            uint64_t mature_h = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
+            if(tip_height + 1 <= mature_h) continue;
         }
 
         // Skip pending
@@ -5504,10 +5526,12 @@ struct BatchTransactionPlan {
     }
 
     // Filter spendable UTXOs
+    // CRITICAL FIX: Use <= to match mempool/chain validation (was <, off-by-one)
+    // Mempool rejects: height + 1 <= coinbase_height + COINBASE_MATURITY
     std::vector<std::pair<size_t, uint64_t>> spendable;
     for(size_t i = 0; i < utxos.size(); ++i){
         const auto& u = utxos[i];
-        if(u.coinbase && tip_height + 1 < u.height + 100) continue;
+        if(u.coinbase && tip_height + 1 <= u.height + miq::COINBASE_MATURITY) continue;
         OutpointKey k{ miq::to_hex(u.txid), u.vout };
         if(pending.find(k) != pending.end()) continue;
         spendable.push_back({i, u.value});

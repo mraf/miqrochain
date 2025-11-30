@@ -327,6 +327,19 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
 #define MIQ_TX_STORE_MAX 10000
 #endif
 
+// =============================================================================
+// P2P ANNOUNCE QUEUE CONFIGURATION (FIX: Increased limits for high-volume networks)
+// =============================================================================
+// The announce queue holds transaction IDs waiting to be broadcast to peers.
+// Previous limit of 8192 caused transaction loss during high-volume periods.
+// New design: larger queue with priority-based eviction.
+#ifndef MIQ_TX_ANNOUNCE_QUEUE_MAX
+#define MIQ_TX_ANNOUNCE_QUEUE_MAX 32768  // 32K entries (was 8192)
+#endif
+#ifndef MIQ_TX_ANNOUNCE_QUEUE_EVICT_BATCH
+#define MIQ_TX_ANNOUNCE_QUEUE_EVICT_BATCH 1024  // Evict oldest 1K when full
+#endif
+
 #ifndef MIQ_P2P_GETADDR_INTERVAL_MS
 #define MIQ_P2P_GETADDR_INTERVAL_MS 120000
 #endif
@@ -2779,7 +2792,13 @@ void P2P::announce_block_async(const std::vector<uint8_t>& h) {
 static inline void trickle_enqueue(Sock sock, const std::vector<uint8_t>& txid){
     if (txid.size()!=32) return;
     auto& q = g_trickle_q[sock];
-    if (q.size() < 4096) q.push_back(txid);
+    if (q.size() < 4096) {
+        q.push_back(txid);
+    } else {
+        // CRITICAL FIX: Log when trickle queue is full - this can cause transactions
+        // to not propagate to specific peers, potentially preventing mining
+        MIQ_LOG_WARN(miq::LogCategory::NET, "trickle_enqueue: peer queue full (4096), dropping tx announcement for sock=" + std::to_string(sock));
+    }
 }
 
 void P2P::broadcast_inv_tx(const std::vector<uint8_t>& txid){
@@ -2789,12 +2808,22 @@ void P2P::broadcast_inv_tx(const std::vector<uint8_t>& txid){
     }
     // V1.0 FIX: Use unified tx_store_mu_ for all tx-related data structures
     std::lock_guard<std::mutex> lk(tx_store_mu_);
-    if (announce_tx_q_.size() < 8192) {
-        announce_tx_q_.push_back(txid);
-        MIQ_LOG_DEBUG(miq::LogCategory::NET, "broadcast_inv_tx: queued tx for broadcast, queue_size=" + std::to_string(announce_tx_q_.size()));
-    } else {
-        MIQ_LOG_WARN(miq::LogCategory::NET, "broadcast_inv_tx: queue full, dropping tx announcement");
+
+    // FIX: Increased queue limit with FIFO eviction instead of dropping
+    // When queue is full, evict oldest entries to make room for new ones
+    // This ensures recent transactions always get announced while older ones
+    // (which have likely already propagated) are evicted first
+    if (announce_tx_q_.size() >= MIQ_TX_ANNOUNCE_QUEUE_MAX) {
+        // Evict oldest entries (FIFO) to make room
+        size_t to_evict = MIQ_TX_ANNOUNCE_QUEUE_EVICT_BATCH;
+        if (to_evict > announce_tx_q_.size()) to_evict = announce_tx_q_.size();
+        announce_tx_q_.erase(announce_tx_q_.begin(), announce_tx_q_.begin() + to_evict);
+        MIQ_LOG_INFO(miq::LogCategory::NET, "broadcast_inv_tx: queue overflow, evicted " +
+            std::to_string(to_evict) + " oldest entries, queue_size=" + std::to_string(announce_tx_q_.size()));
     }
+
+    announce_tx_q_.push_back(txid);
+    MIQ_LOG_DEBUG(miq::LogCategory::NET, "broadcast_inv_tx: queued tx for broadcast, queue_size=" + std::to_string(announce_tx_q_.size()));
 }
 
 // =============================================================================

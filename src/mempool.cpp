@@ -71,6 +71,23 @@ static inline uint64_t min_fee_for_size_bytes(size_t sz){
 }
 
 bool Mempool::validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView& utxo, uint32_t height, uint64_t& fee, std::string& err) const {
+    // CRITICAL FIX: Reject empty transactions early
+    // Chain validation (chain.cpp:1445) rejects empty tx, so reject here too
+    // to avoid transactions getting stuck in mempool that can never confirm
+    if (tx.vin.empty() || tx.vout.empty()) {
+        err = "empty transaction";
+        return false;
+    }
+
+    // CRITICAL FIX: Reject zero-value outputs
+    // These create unspendable dust and waste UTXO space
+    for (size_t i = 0; i < tx.vout.size(); ++i) {
+        if (tx.vout[i].value == 0) {
+            err = "zero-value output at index " + std::to_string(i);
+            return false;
+        }
+    }
+
     // coinbase cannot be in mempool (loose check)
     if (tx.vin.size()==1 &&
         tx.vin[0].prev.vout==0 &&
@@ -423,41 +440,41 @@ void Mempool::add_orphan(const Transaction& tx){
     // CRITICAL FIX: Enforce orphan pool limits to prevent DoS
     size_t tx_size = est_tx_size(tx);
 
-    // Check count limit
-    if (orphans_.size() >= MAX_ORPHANS) {
-        // Evict oldest orphan (FIFO-ish: just remove the first one)
-        if (!orphans_.empty()) {
-            auto oldest = orphans_.begin();
-            size_t old_size = est_tx_size(oldest->second);
-            // Clean up waiting_on_ entries for the evicted orphan
-            for (const auto& in : oldest->second.vin) {
-                Key pk = k(in.prev.txid);
-                auto wit = waiting_on_.find(pk);
-                if (wit != waiting_on_.end()) {
-                    wit->second.erase(oldest->first);
-                    if (wit->second.empty()) waiting_on_.erase(wit);
-                }
-            }
-            orphan_bytes_ -= old_size;
-            orphans_.erase(oldest);
-        }
-    }
+    // FIX: Helper lambda for proper FIFO eviction using orphan_order_ deque
+    // This ensures oldest orphans (by insertion time) are evicted first,
+    // rather than arbitrary hash-order eviction from orphans_.begin()
+    auto evict_oldest_orphan = [this]() -> bool {
+        if (orphan_order_.empty()) return false;
 
-    // Check byte limit
-    while (orphan_bytes_ + tx_size > MAX_ORPHAN_BYTES && !orphans_.empty()) {
-        auto oldest = orphans_.begin();
-        size_t old_size = est_tx_size(oldest->second);
-        // Clean up waiting_on_ entries
-        for (const auto& in : oldest->second.vin) {
+        Key oldest_key = orphan_order_.front();
+        orphan_order_.pop_front();
+
+        auto it = orphans_.find(oldest_key);
+        if (it == orphans_.end()) return false;  // Already removed
+
+        size_t old_size = est_tx_size(it->second);
+        // Clean up waiting_on_ entries for the evicted orphan
+        for (const auto& in : it->second.vin) {
             Key pk = k(in.prev.txid);
             auto wit = waiting_on_.find(pk);
             if (wit != waiting_on_.end()) {
-                wit->second.erase(oldest->first);
+                wit->second.erase(oldest_key);
                 if (wit->second.empty()) waiting_on_.erase(wit);
             }
         }
         orphan_bytes_ -= old_size;
-        orphans_.erase(oldest);
+        orphans_.erase(it);
+        return true;
+    };
+
+    // Check count limit - evict oldest orphan if at capacity
+    if (orphans_.size() >= MAX_ORPHANS) {
+        evict_oldest_orphan();
+    }
+
+    // Check byte limit - evict oldest orphans until under limit
+    while (orphan_bytes_ + tx_size > MAX_ORPHAN_BYTES && !orphan_order_.empty()) {
+        evict_oldest_orphan();
     }
 
     // If still over limit after evictions, reject this orphan
@@ -467,6 +484,7 @@ void Mempool::add_orphan(const Transaction& tx){
 
     orphans_.emplace(ck, tx);
     orphan_bytes_ += tx_size;
+    orphan_order_.push_back(ck);  // FIX: Track insertion order for FIFO eviction
 
     for (const auto& in : tx.vin){
         Key pk = k(in.prev.txid);
@@ -495,6 +513,14 @@ void Mempool::remove_orphan(const Key& ck){
         }
     }
     orphans_.erase(it);
+
+    // FIX: Remove from FIFO order tracking
+    // Note: This is O(n) scan but acceptable since orphan removal is infrequent
+    // and correctness is more important than micro-optimization here
+    auto order_it = std::find(orphan_order_.begin(), orphan_order_.end(), ck);
+    if (order_it != orphan_order_.end()) {
+        orphan_order_.erase(order_it);
+    }
 }
 
 void Mempool::try_promote_orphans_depending_on(const Key& parent, const UTXOView& utxo, uint32_t height){

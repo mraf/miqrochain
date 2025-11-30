@@ -799,8 +799,14 @@ std::string RpcService::handle(const std::string& body){
             if (halvings < 64) subsidy = INITIAL_SUBSIDY >> halvings;
             else subsidy = 0;
 
-            // Collect mempool transactions
-            auto txs_vec = mempool_.collect(5000);
+            // FIX: Collect mempool transactions using SIZE limit instead of COUNT limit
+            // Previously used collect(5000) which limited by count, missing profitable txs
+            // Now uses collect_for_block with proper size limit (MAX_BLOCK_SIZE - coinbase overhead)
+            // Reserve ~1KB for coinbase transaction
+            static constexpr size_t COINBASE_RESERVED_SIZE = 1024;
+            static constexpr size_t BLOCK_TX_SIZE_LIMIT = MAX_BLOCK_SIZE - COINBASE_RESERVED_SIZE;
+            std::vector<Transaction> txs_vec;
+            mempool_.collect_for_block(txs_vec, BLOCK_TX_SIZE_LIMIT);
             std::vector<JNode> tx_arr;
             uint64_t total_fees = 0;
 
@@ -922,11 +928,17 @@ std::string RpcService::handle(const std::string& body){
             // so just return zeros; miners MUST override.
             std::vector<uint8_t> pkh(20, 0);
 
-            // Collect mempool txs with simple fee & size estimates.
-            auto txs_vec = mempool_.collect(5000);
+            // FIX: Collect mempool txs using SIZE limit instead of COUNT limit
+            // Previously used collect(5000) which limited by count, missing profitable txs
+            // Now uses collect_for_block with proper size limit (MAX_BLOCK_SIZE - coinbase overhead)
+            static constexpr size_t COINBASE_RESERVED_SIZE = 1024;
+            static constexpr size_t BLOCK_TX_SIZE_LIMIT = MAX_BLOCK_SIZE - COINBASE_RESERVED_SIZE;
+            std::vector<Transaction> txs_vec;
+            mempool_.collect_for_block(txs_vec, BLOCK_TX_SIZE_LIMIT);
             log_info("getminertemplate: mempool size=" + std::to_string(mempool_.size()) +
                      ", orphan pool size=" + std::to_string(mempool_.orphan_count()) +
-                     ", collected " + std::to_string(txs_vec.size()) + " txs for template");
+                     ", collected " + std::to_string(txs_vec.size()) + " txs for template (size-limited to " +
+                     std::to_string(BLOCK_TX_SIZE_LIMIT) + " bytes)");
 
             // DIAGNOSTIC: If no transactions and mempool is empty, log the state
             if (txs_vec.empty() && mempool_.size() == 0) {
@@ -2071,9 +2083,12 @@ std::string RpcService::handle(const std::string& body){
                         }
 
                         // Check coinbase maturity
+                        // CRITICAL FIX: Use <= to match mempool validation (mempool.cpp:135)
+                        // Mempool rejects if: height + 1 <= coinbase_height + COINBASE_MATURITY
+                        // Using < here would allow spending 1 block too early, causing tx rejection
                         if (ue.coinbase) {
                             uint64_t mature_h = ue.height + COINBASE_MATURITY;
-                            if (curH + 1 < mature_h) {
+                            if (curH + 1 <= mature_h) {
                                 immature_balance += ue.value;
                                 continue;
                             }
@@ -2226,9 +2241,11 @@ std::string RpcService::handle(const std::string& body){
                     if (e2.coinbase) {
                         uint64_t mature_h = e2.height + COINBASE_MATURITY;
                         at_h = mature_h;
-                        if (curH + 1 < mature_h) { // next block height still < mature
+                        // CRITICAL FIX: Use <= to match mempool validation (mempool.cpp:135)
+                        // Mempool rejects if: height + 1 <= coinbase_height + COINBASE_MATURITY
+                        if (curH + 1 <= mature_h) { // next block height still <= mature
                             spendable = false;
-                            mat_in = mature_h - (curH + 1);
+                            mat_in = mature_h - curH; // blocks until spendable (at mature_h + 1)
                         }
                     }
 
@@ -2571,9 +2588,12 @@ std::string RpcService::handle(const std::string& body){
                         }
 
                         // Check coinbase maturity
+                        // CRITICAL FIX: Use <= to match mempool validation (mempool.cpp:135)
+                        // Mempool rejects if: height + 1 <= coinbase_height + COINBASE_MATURITY
+                        // Using < here would build tx with immature coinbase, causing mempool rejection
                         if (is_spendable && ou.e.coinbase) {
                             uint64_t m_h = ou.e.height + COINBASE_MATURITY;
-                            if (curH + 1 < m_h) {
+                            if (curH + 1 <= m_h) {
                                 is_spendable = false;
                                 locked_balance += ou.e.value;
                                 soonest_mature_h = std::min<uint64_t>(soonest_mature_h, m_h);
