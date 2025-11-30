@@ -4370,7 +4370,7 @@ void P2P::loop(){
                         }
 
                         // Request blocks up to max_height (or current_height + adaptive_batch_size, whichever is smaller)
-                        uint64_t batch_end = std::min(max_height, current_height + pps.adaptive_batch_size);
+                        uint64_t batch_end = std::min<uint64_t>(max_height, current_height + pps.adaptive_batch_size);
 
                         for (uint64_t h = current_height + 1; h <= batch_end; h++) {
                             request_block_index(pps, (uint64_t)h);
