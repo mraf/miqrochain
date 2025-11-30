@@ -9940,26 +9940,19 @@ static bool wallet_session(const std::string& cli_host,
 
     auto utxos = refresh_and_print();
 
-    // Track network status
-    bool is_online = (last_connected_node != "<offline>" && last_connected_node != "<not connected>");
-
-    // CRITICAL FIX: Automatically broadcast queued transactions at startup
-    // This ensures transactions are immediately sent when the wallet starts
+    // V1.2 CLEANUP: Just inform user about pending transactions - NO auto-broadcast
+    // User must manually choose to rebroadcast with 'b' or fee bump option
     {
         int pending_count = count_pending_in_queue(wdir);
-        if(pending_count > 0 && is_online){
+        if(pending_count > 0){
             std::cout << "\n";
-            ui::print_info("Broadcasting " + std::to_string(pending_count) + " queued transaction(s)...");
-            int broadcasted = process_tx_queue(wdir, seeds, pending, true);
-            if(broadcasted > 0){
-                save_pending(wdir, pending);
-                ui::print_success("Broadcasted " + std::to_string(broadcasted) + " transaction(s)");
-            } else if(pending_count > 0){
-                ui::print_warning("Could not broadcast queued transactions - will retry automatically");
-            }
-            std::cout << "\n";
+            ui::print_warning("Found " + std::to_string(pending_count) + " pending transaction(s) in queue");
+            std::cout << "  " << ui::dim() << "Use [b] to broadcast or [7] to view queue and fee-bump" << ui::reset() << "\n\n";
         }
     }
+
+    // Track network status
+    bool is_online = (last_connected_node != "<offline>" && last_connected_node != "<not connected>");
 
     // =============================================================================
     // LIVE ANIMATED DASHBOARD v6.0 - Main Menu Loop
@@ -10098,14 +10091,6 @@ static bool wallet_session(const std::string& cli_host,
                 if(tip_height > 0){
                     update_all_tx_confirmations(wdir, utxos, tip_height);
                     auto_detect_received_transactions(wdir, utxos, tip_height);
-                }
-
-                // CRITICAL FIX: Automatically broadcast queued transactions
-                // This ensures transactions don't get stuck in the queue forever
-                // when the wallet is online and connected to the network
-                int auto_broadcasted = process_tx_queue(wdir, seeds, pending, false);
-                if(auto_broadcasted > 0){
-                    save_pending(wdir, pending);
                 }
 
                 // v2.0: Use detailed network status for richer diagnostics
