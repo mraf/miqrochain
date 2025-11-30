@@ -799,8 +799,14 @@ std::string RpcService::handle(const std::string& body){
             if (halvings < 64) subsidy = INITIAL_SUBSIDY >> halvings;
             else subsidy = 0;
 
-            // Collect mempool transactions
-            auto txs_vec = mempool_.collect(5000);
+            // FIX: Collect mempool transactions using SIZE limit instead of COUNT limit
+            // Previously used collect(5000) which limited by count, missing profitable txs
+            // Now uses collect_for_block with proper size limit (MAX_BLOCK_SIZE - coinbase overhead)
+            // Reserve ~1KB for coinbase transaction
+            static constexpr size_t COINBASE_RESERVED_SIZE = 1024;
+            static constexpr size_t BLOCK_TX_SIZE_LIMIT = MAX_BLOCK_SIZE - COINBASE_RESERVED_SIZE;
+            std::vector<Transaction> txs_vec;
+            mempool_.collect_for_block(txs_vec, BLOCK_TX_SIZE_LIMIT);
             std::vector<JNode> tx_arr;
             uint64_t total_fees = 0;
 
@@ -922,11 +928,17 @@ std::string RpcService::handle(const std::string& body){
             // so just return zeros; miners MUST override.
             std::vector<uint8_t> pkh(20, 0);
 
-            // Collect mempool txs with simple fee & size estimates.
-            auto txs_vec = mempool_.collect(5000);
+            // FIX: Collect mempool txs using SIZE limit instead of COUNT limit
+            // Previously used collect(5000) which limited by count, missing profitable txs
+            // Now uses collect_for_block with proper size limit (MAX_BLOCK_SIZE - coinbase overhead)
+            static constexpr size_t COINBASE_RESERVED_SIZE = 1024;
+            static constexpr size_t BLOCK_TX_SIZE_LIMIT = MAX_BLOCK_SIZE - COINBASE_RESERVED_SIZE;
+            std::vector<Transaction> txs_vec;
+            mempool_.collect_for_block(txs_vec, BLOCK_TX_SIZE_LIMIT);
             log_info("getminertemplate: mempool size=" + std::to_string(mempool_.size()) +
                      ", orphan pool size=" + std::to_string(mempool_.orphan_count()) +
-                     ", collected " + std::to_string(txs_vec.size()) + " txs for template");
+                     ", collected " + std::to_string(txs_vec.size()) + " txs for template (size-limited to " +
+                     std::to_string(BLOCK_TX_SIZE_LIMIT) + " bytes)");
 
             // DIAGNOSTIC: If no transactions and mempool is empty, log the state
             if (txs_vec.empty() && mempool_.size() == 0) {

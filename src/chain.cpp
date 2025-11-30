@@ -317,6 +317,17 @@ static void remove_undo_file(const std::string& base_dir,
 }
 
 // Limits (override via env if you like)
+// =============================================================================
+// BLOCK ORPHAN POOL - Stores blocks whose parent is not yet known
+// =============================================================================
+// Design notes on FIFO eviction:
+// - We use FIFO (First-In-First-Out) eviction for block orphans
+// - This is appropriate because older orphan blocks are less likely to be needed:
+//   their parent has had more time to arrive and hasn't, suggesting it may never
+// - Fee-rate based eviction doesn't make sense for blocks (fee rates are per-tx)
+// - Random eviction would be unfair to recently received orphans
+// - FIFO ensures fairness: new arrivals have equal chance of being connected
+// =============================================================================
 static const size_t ORPHAN_MAX_BLOCKS = ::env_szt("MIQ_ORPHAN_MAX_BLOCKS", 1024);      // 1k blocks
 static const size_t ORPHAN_MAX_BYTES  = ::env_szt("MIQ_ORPHAN_MAX_BYTES",  64ull<<20); // 64 MiB
 
@@ -329,7 +340,7 @@ struct OrphanRec {
 // CRITICAL FIX: Add mutex to protect global orphan structures from race conditions
 static std::mutex g_orphan_mtx;
 static std::unordered_map<std::string, OrphanRec> g_orphans; // key = hash (binary string)
-static std::deque<std::string> g_orphan_order;               // FIFO/LRU-ish
+static std::deque<std::string> g_orphan_order;               // True FIFO order for fair eviction
 static size_t g_orphan_bytes = 0;
 
 // CRITICAL FIX: Internal helper called with lock already held

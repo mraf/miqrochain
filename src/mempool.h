@@ -237,6 +237,13 @@ private:
     // Reverse index: missing parent txid key -> set of orphans waiting on it
     std::unordered_map<Key, std::unordered_set<Key>> waiting_on_;
 
+    // FIX: FIFO eviction order tracking for orphan pool
+    // Previously used orphans_.begin() which iterates in hash order (not insertion order)
+    // This deque maintains true FIFO order for fair eviction
+    // Design note: Fee-rate based eviction isn't possible for orphans since
+    // their parent tx (and thus fee) is unknown until the parent arrives
+    std::deque<Key> orphan_order_;
+
     // CRITICAL FIX: Orphan pool limits
     static constexpr size_t MAX_ORPHANS = 10000;  // Production: 10x more
     static constexpr size_t MAX_ORPHAN_BYTES = 64 * 1024 * 1024; // 64 MiB production
