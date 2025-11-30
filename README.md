@@ -174,7 +174,7 @@ Mining is performed using the standalone `miqminer_rpc` client, which connects t
 | Option | Description |
 |--------|-------------|
 | `--rpc <url>` | Node RPC endpoint (default: http://127.0.0.1:9834) |
-| `--address <addr>` | Reward address (base58check format, starts with '5') |
+| `--address <addr>` | Reward address (base58check format, starts with 'N or M') |
 | `--threads <n>` | CPU mining threads (0 = auto-detect cores) |
 | `--stratum <host:port>` | Connect to stratum pool instead of solo mining |
 | `--gpu` | Enable GPU mining (requires OpenCL) |
