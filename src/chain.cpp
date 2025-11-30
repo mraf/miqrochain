@@ -42,7 +42,7 @@
 #endif
 
 #ifndef MAX_TX_SIZE
-#define MIQ_FALLBACK_MAX_TX_SIZE (100u * 1024u) // 100 KiB default
+#define MIQ_FALLBACK_MAX_TX_SIZE (4u * 1024u * 1024u) // 4 MiB default (no tx size limit)
 #else
 #define MIQ_FALLBACK_MAX_TX_SIZE (MAX_TX_SIZE)
 #endif
@@ -407,7 +407,7 @@ static miq::ReorgManager g_reorg;
 static miq::gcs::FilterStore g_filter_store;
 #endif
 
-static constexpr size_t MAX_BLOCK_SIZE_LOCAL = 1 * 1024 * 1024; // 1 MiB
+static constexpr size_t MAX_BLOCK_SIZE_LOCAL = 4 * 1024 * 1024; // 4 MiB (match MAX_BLOCK_SIZE)
 
 // CRITICAL FIX: Add mutex to protect global header cache from race conditions
 static std::mutex g_header_full_mtx;

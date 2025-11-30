@@ -31,7 +31,7 @@
 #endif
 
 #ifndef MAX_TX_SIZE
-#define MIQ_FALLBACK_MAX_TX_SIZE  (1024u * 1024u)        // 1 MiB cap for tx wire payloads
+#define MIQ_FALLBACK_MAX_TX_SIZE  (4u * 1024u * 1024u)   // 4 MiB (no tx size limit)
 #else
 #define MIQ_FALLBACK_MAX_TX_SIZE  (MAX_TX_SIZE)
 #endif

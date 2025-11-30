@@ -2611,14 +2611,8 @@ std::string RpcService::handle(const std::string& body){
             catch(...) { return err("bad amount"); }
             if (amount == 0) return err("amount must be >0");
 
-            // SECURITY: Enforce maximum transfer limit
-            if (amount > MIQ_MAX_TRANSFER_AMOUNT) {
-                char buf[256];
-                std::snprintf(buf, sizeof(buf),
-                    "amount exceeds maximum transfer limit of %llu MIQ per transaction",
-                    (unsigned long long)(MIQ_MAX_TRANSFER_AMOUNT / COIN));
-                return err(buf);
-            }
+            // No transfer limit - like Bitcoin, allow any amount up to user's balance
+            // The only limit is MAX_MONEY (total supply) which is checked elsewhere
 
             // Load wallet data
             std::string wdir = default_wallet_file();
