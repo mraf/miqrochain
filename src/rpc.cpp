@@ -539,7 +539,7 @@ std::string RpcService::handle(const std::string& body){
                 "getblock","getblockhash","getcoinbaserecipient",
                 "getrawmempool","getmempoolinfo","gettxout","getrawtransaction",
                 "validateaddress","decodeaddress","decoderawtx",
-                "getminerstats","sendrawtransaction","sendtoaddress",
+                "getminerstats","sendrawtransaction","sendtoaddress","canceltx",
                 "estimatemediantime","getdifficulty","getchaintips",
                 "getpeerinfo","getconnectioncount","getnetworkinfo","listbanned","setban","disconnectnode",
                 "createhdwallet","restorehdwallet","walletinfo","getnewaddress","deriveaddressat",
@@ -1565,6 +1565,49 @@ std::string RpcService::handle(const std::string& body){
             }
         }
 
+        // ------------- canceltx: Cancel a pending transaction from mempool -------------
+        // This allows users to cancel stuck transactions that exceed limits or have issues
+        // The funds will be released back to the wallet's spendable balance
+        if (method == "canceltx") {
+            if (params.size() < 1 || !std::holds_alternative<std::string>(params[0].v))
+                return err("need txid");
+
+            const std::string txid_hex = std::get<std::string>(params[0].v);
+
+            // Validate hex
+            if (txid_hex.length() != 64 || !is_hex(txid_hex))
+                return err("invalid txid (must be 64 hex characters)");
+
+            std::vector<uint8_t> txid;
+            try { txid = from_hex(txid_hex); }
+            catch (...) { return err("invalid txid hex"); }
+
+            // Verify the transaction is in mempool and belongs to our wallet
+            Transaction tx;
+            if (!mempool_.get_transaction(txid, tx)) {
+                return err("transaction not found in mempool (may already be confirmed or never existed)");
+            }
+
+            // Optional: Verify ownership (check if inputs are from our wallet)
+            // For now, we allow canceling any mempool transaction the user knows the txid of
+            // This is a security consideration - in production you might want to verify ownership
+
+            std::string cancel_err;
+            if (!mempool_.remove_transaction(txid, cancel_err)) {
+                return err(cancel_err);
+            }
+
+            log_info("canceltx: Successfully canceled transaction " + txid_hex.substr(0, 16) + "...");
+
+            // Return success with details
+            std::map<std::string, JNode> result;
+            result["success"] = jbool(true);
+            result["txid"] = jstr(txid_hex);
+            result["message"] = jstr("Transaction canceled and removed from mempool. Funds released to wallet.");
+
+            return ok_obj(result);
+        }
+
         // ------------- NEW: submitblock / submitrawblock / sendrawblock -------------
         if (method=="submitblock" || method=="submitrawblock" || method=="sendrawblock") {
             if (params.size()<1 || !std::holds_alternative<std::string>(params[0].v))
@@ -2567,6 +2610,15 @@ std::string RpcService::handle(const std::string& body){
             try { amount = parse_amount_str(amtstr); }
             catch(...) { return err("bad amount"); }
             if (amount == 0) return err("amount must be >0");
+
+            // SECURITY: Enforce maximum transfer limit
+            if (amount > MIQ_MAX_TRANSFER_AMOUNT) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "amount exceeds maximum transfer limit of %llu MIQ per transaction",
+                    (unsigned long long)(MIQ_MAX_TRANSFER_AMOUNT / COIN));
+                return err(buf);
+            }
 
             // Load wallet data
             std::string wdir = default_wallet_file();

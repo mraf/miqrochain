@@ -847,6 +847,58 @@ static bool rpc_get_network_info(
     return true;
 }
 
+// Cancel a pending transaction from mempool via RPC
+// This releases the funds back to the wallet
+static bool rpc_cancel_transaction(
+    const std::vector<RpcEndpoint>& endpoints,
+    const std::string& txid_hex,
+    std::string& err)
+{
+    std::string params = "[\"" + txid_hex + "\"]";
+    std::string result, used;
+
+    if (!rpc_call_any(endpoints, "canceltx", params, result, used, err)) {
+        // Parse error message if available
+        if (result.find("error") != std::string::npos) {
+            size_t start = result.find("\"error\":\"");
+            if (start != std::string::npos) {
+                start += 9;
+                size_t end = result.find('"', start);
+                if (end != std::string::npos) {
+                    err = result.substr(start, end - start);
+                }
+            }
+        }
+        return false;
+    }
+
+    // Check for success in result
+    if (result.find("\"success\":true") != std::string::npos ||
+        result.find("\"success\": true") != std::string::npos) {
+        return true;
+    }
+
+    // Check for error in result
+    if (result.find("error") != std::string::npos) {
+        size_t start = result.find("\"error\":\"");
+        if (start == std::string::npos) {
+            start = result.find("\"error\": \"");
+            if (start != std::string::npos) start += 10;
+        } else {
+            start += 9;
+        }
+        if (start != std::string::npos) {
+            size_t end = result.find('"', start);
+            if (end != std::string::npos) {
+                err = result.substr(start, end - start);
+            }
+        }
+        return false;
+    }
+
+    return true;
+}
+
 // Health check - verify RPC connectivity
 static bool rpc_health_check(
     const std::vector<RpcEndpoint>& endpoints,
@@ -8404,8 +8456,13 @@ static void show_interactive_tx_details(
         std::cout << "  " << ui::cyan() << bc_v << ui::reset();
         std::cout << "  " << ui::dim() << (ui::g_use_utf8 ? "←→" : "<>") << " Tabs  "
                   << (ui::g_use_utf8 ? "↑↓" : "^v") << " Scroll  "
-                  << "R Refresh  P Print  Q Back" << ui::reset();
-        std::cout << std::string(W - 51, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
+                  << "R Refresh  P Print";
+        // Show cancel option only for pending (unconfirmed) transactions
+        if (tx.confirmations == 0) {
+            std::cout << "  " << ui::yellow() << "X Cancel" << ui::reset() << ui::dim();
+        }
+        std::cout << "  Q Back" << ui::reset();
+        std::cout << std::string(tx.confirmations == 0 ? (W - 62) : (W - 51), ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
         std::cout << "  " << ui::cyan() << bc_bl;
         for(int i = 0; i < W - 2; i++) std::cout << bc_h;
@@ -8475,6 +8532,77 @@ static void show_interactive_tx_details(
             instant_input::enable_raw_mode();
             instant_input::wait_for_key(-1);
             instant_input::hide_cursor();
+        } else if((ch == 'x' || ch == 'X') && tx.confirmations == 0){
+            // Cancel pending transaction
+            instant_input::disable_raw_mode();
+            instant_input::show_cursor();
+            std::cout << "\033[2J\033[H" << std::flush;
+            std::cout << "\n";
+            ui::print_double_header("CANCEL TRANSACTION", 60);
+            std::cout << "\n";
+            std::cout << "  " << ui::yellow() << "WARNING: " << ui::reset() << "You are about to cancel this pending transaction.\n";
+            std::cout << "  This will remove it from the mempool and release the funds back to your wallet.\n";
+            std::cout << "\n";
+            std::cout << "  " << ui::bold() << "Transaction ID:" << ui::reset() << "\n";
+            std::cout << "  " << ui::cyan() << tx.txid_hex << ui::reset() << "\n";
+            std::cout << "\n";
+            std::cout << "  " << ui::bold() << "Amount:" << ui::reset() << " ";
+            if(tx.amount < 0){
+                std::cout << ui::red() << "-" << ui_pro::format_miq_professional((uint64_t)(-tx.amount)) << " MIQ" << ui::reset();
+            } else {
+                std::cout << ui::green() << "+" << ui_pro::format_miq_professional((uint64_t)tx.amount) << " MIQ" << ui::reset();
+            }
+            std::cout << "\n\n";
+
+            std::cout << "  Are you sure you want to cancel this transaction? (y/N): " << std::flush;
+
+            std::string confirm;
+            std::getline(std::cin, confirm);
+
+            if(confirm == "y" || confirm == "Y" || confirm == "yes" || confirm == "Yes" || confirm == "YES"){
+                std::cout << "\n  " << ui::dim() << "Canceling transaction..." << ui::reset() << std::flush;
+
+                // Create seeds list from the passed seeds parameter
+                std::vector<rpc_wallet::RpcEndpoint> endpoints;
+                for(const auto& s : seeds){
+                    rpc_wallet::RpcEndpoint ep;
+                    ep.host = s.first;
+                    size_t colon = s.second.find(':');
+                    if(colon != std::string::npos){
+                        ep.port = std::stoi(s.second.substr(colon + 1));
+                    } else {
+                        ep.port = 9834;
+                    }
+                    ep.token = "";  // Will use cookie auth
+                    endpoints.push_back(ep);
+                }
+
+                std::string cancel_err;
+                if(rpc_wallet::rpc_cancel_transaction(endpoints, tx.txid_hex, cancel_err)){
+                    std::cout << "\n\n";
+                    std::cout << "  " << ui::green() << ui::bold() << "SUCCESS!" << ui::reset() << " Transaction canceled.\n";
+                    std::cout << "  " << ui::dim() << "The funds have been released back to your wallet." << ui::reset() << "\n";
+                    std::cout << "\n  " << ui::dim() << "Press any key to continue..." << ui::reset() << std::flush;
+                    instant_input::enable_raw_mode();
+                    instant_input::wait_for_key(-1);
+                    running = false;  // Exit the transaction details view
+                } else {
+                    std::cout << "\n\n";
+                    std::cout << "  " << ui::red() << ui::bold() << "FAILED!" << ui::reset() << " Could not cancel transaction.\n";
+                    std::cout << "  " << ui::dim() << "Reason: " << cancel_err << ui::reset() << "\n";
+                    std::cout << "\n  Note: The transaction may already be confirmed or broadcast to the network.\n";
+                    std::cout << "\n  " << ui::dim() << "Press any key to continue..." << ui::reset() << std::flush;
+                    instant_input::enable_raw_mode();
+                    instant_input::wait_for_key(-1);
+                }
+            } else {
+                std::cout << "\n  " << ui::dim() << "Canceled - transaction not removed." << ui::reset() << "\n";
+                std::cout << "  " << ui::dim() << "Press any key to continue..." << ui::reset() << std::flush;
+                instant_input::enable_raw_mode();
+                instant_input::wait_for_key(-1);
+            }
+            instant_input::hide_cursor();
+            first_draw = true;  // Force full redraw
         }
     }
 

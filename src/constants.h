@@ -428,6 +428,12 @@ static constexpr uint32_t MIN_PEER_PROTO_VERSION = 70015;  // Minimum supported
 #define MIQ_STALE_PEER_TIMEOUT_MS (30 * 60 * 1000)  // 30 minute stale timeout
 #endif
 
+// === WALLET TRANSFER LIMITS ===
+// Maximum amount that can be sent in a single transfer (anti-fraud protection)
+#ifndef MIQ_MAX_TRANSFER_AMOUNT
+#define MIQ_MAX_TRANSFER_AMOUNT (2000ULL * COIN)  // 2000 MIQ per transfer
+#endif
+
 // === RBF (Replace-By-Fee) SUPPORT ===
 #ifndef MIQ_RBF_ENABLED
 #define MIQ_RBF_ENABLED 1  // Enable replace-by-fee
