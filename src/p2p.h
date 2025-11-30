@@ -584,10 +584,12 @@ private:
     int64_t last_rebroadcast_ms_{0};
     int64_t last_seen_cleanup_ms_{0};
 
-    // Rebroadcast configuration
-    static constexpr int64_t REBROADCAST_INTERVAL_MS = 30 * 1000;     // 30 seconds between rebroadcast checks
-    static constexpr int64_t REBROADCAST_DELAY_MS = 60 * 1000;        // Wait 60s before first rebroadcast
-    static constexpr int MAX_REBROADCAST_COUNT = 6;                    // Maximum rebroadcast attempts
+    // Rebroadcast configuration - V1.1 STABILITY FIX: Tuned for ~8 minute blocks
+    // Wait appropriate time before rebroadcast - network propagates quickly, blocks are slow
+    // Transaction should propagate within seconds, but blocks take ~8 minutes
+    static constexpr int64_t REBROADCAST_INTERVAL_MS = 60 * 1000;     // 60s between rebroadcast checks
+    static constexpr int64_t REBROADCAST_DELAY_MS = 3 * 60 * 1000;    // Wait 3 minutes before first rebroadcast
+    static constexpr int MAX_REBROADCAST_COUNT = 8;                    // Max rebroadcast attempts (~24 min coverage)
     static constexpr int64_t SEEN_TXIDS_CLEANUP_MS = 5 * 60 * 1000;   // Cleanup seen_txids every 5 min
     static constexpr size_t MAX_SEEN_TXIDS = 100000;                   // Maximum seen_txids entries
     // v10.0 FIX: Increased from 1000 to 10000 for high-throughput networks

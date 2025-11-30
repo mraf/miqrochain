@@ -329,7 +329,6 @@ namespace wallet_config {
     static constexpr int MAX_QUEUE_SIZE = 10000;
     static constexpr int AUTO_BROADCAST_INTERVAL_MS = 15000;
     static constexpr int TX_EXPIRY_HOURS = 72;
-    static constexpr int MAX_BROADCAST_ATTEMPTS = 15;
     static constexpr int CONFIRMATION_TARGET = 6;
 
     // v9.0 FIX: Reduced pending timeout for faster balance updates
@@ -338,10 +337,7 @@ namespace wallet_config {
     static constexpr int PENDING_TIMEOUT_MINUTES = 5;
     static constexpr int64_t PENDING_TIMEOUT_SECONDS = PENDING_TIMEOUT_MINUTES * 60;
 
-    // v9.0 FIX: Faster rebroadcast for reliable transaction delivery
-    // Transactions with "broadcast" status should be rebroadcast periodically
-    static constexpr int REBROADCAST_INTERVAL_MINUTES = 2;
-    static constexpr int64_t REBROADCAST_INTERVAL_SECONDS = REBROADCAST_INTERVAL_MINUTES * 60;
+    // V1.2: Auto-rebroadcast removed - manual rebroadcast only via Stuck TX Manager
 
     // v9.0: Quick confirmation check interval (seconds)
     // How often to verify transaction is in mempool/confirmed
@@ -409,9 +405,22 @@ namespace wallet_config {
 #include "tx.h"
 #include "crypto/ecdsa_iface.h"
 
-// v2.0 STABLE: Full RPC-only wallet - Minimal includes for type definitions
+// v2.0 STABLE: Full RPC-only wallet - HTTP client for JSON-RPC
 #include "wallet/http_client.h"
-#include "wallet/spv_simple.h"  // For miq::UtxoLite type definition (no P2P calls used)
+
+// =============================================================================
+// UTXO TYPE DEFINITION - Local definition (no P2P dependencies)
+// =============================================================================
+namespace miq {
+struct UtxoLite {
+    std::vector<uint8_t> txid;   // 32 bytes (LE)
+    uint32_t vout;               // output index
+    uint64_t value;              // in miqron
+    std::vector<uint8_t> pkh;    // 20 bytes
+    uint32_t height;             // block height (0 for mempool)
+    bool coinbase;
+};
+} // namespace miq
 
 // =============================================================================
 // FULL RPC WALLET CLIENT v2.0 - Zero P2P dependencies
@@ -2324,20 +2333,6 @@ namespace ui {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
-    // RECOVERY Splash (for stuck transactions)
-    static void run_recovery_splash(int recovered, int total) {
-        (void)total;  // Available for future progress display
-        std::string status = recovered > 0 ?
-            "Recovered " + std::to_string(recovered) + " stuck transaction(s)" :
-            "No stuck transactions found";
-
-        for (int i = 0; i < 6; i++) {
-            draw_action_splash("RECOVERY COMPLETE", status, 1.0, i,
-                              "UTXOs released and available", "yellow");
-            std::this_thread::sleep_for(std::chrono::milliseconds(80));
-        }
-    }
-
     // Compact inline progress for single-line updates
     static void draw_inline_progress(const std::string& action, double progress, int tick) {
         std::cout << "\r  " << cyan() << "[" << reset();
@@ -3231,8 +3226,7 @@ static void clear_spv_cache(const std::string& wdir){
     std::string utxo_file = join_path(wdir, "utxo_cache.dat");
     std::remove(state_file.c_str());
     std::remove(utxo_file.c_str());
-    // CRITICAL FIX: Also invalidate in-memory cache to ensure fresh fetch
-    miq::spv_invalidate_mem_cache();
+    // NOTE: No in-memory cache to invalidate in RPC-only mode
 }
 
 // =============================================================================
@@ -6510,6 +6504,22 @@ struct BlockchainTxDetails {
     bool is_confirmed{false};
     bool is_mempool{false};
     std::string status_text;
+
+    // V1.1 FIX: Inputs and Outputs for full transaction details
+    struct TxInput {
+        std::string prev_txid;
+        uint32_t prev_vout{0};
+        uint64_t value{0};
+        std::string address;
+    };
+    struct TxOutput {
+        uint64_t value{0};
+        std::string address;
+        uint32_t vout_index{0};
+    };
+    std::vector<TxInput> inputs;
+    std::vector<TxOutput> outputs;
+    bool has_io_data{false};
 };
 
 // Fetch blockchain info via RPC
@@ -6614,6 +6624,213 @@ static bool fetch_block_by_height(const std::string& host, uint16_t port, uint64
     time_out = (int64_t)extract_num("time");
     tx_count_out = (uint32_t)extract_num("nTx");
 
+    return true;
+}
+
+// V1.1 FIX: Fetch full transaction details from blockchain including inputs/outputs
+static bool fetch_tx_details_from_node(const std::string& host, uint16_t port,
+                                        const std::string& txid,
+                                        BlockchainTxDetails& details) {
+    // Use getrawtransaction with verbose=true to get decoded tx
+    std::string rpc_body = R"({"method":"getrawtransaction","params":[")" + txid + R"(", true]})";
+    miq::HttpResponse resp;
+    std::vector<std::pair<std::string, std::string>> headers;
+
+    if (!miq::http_post(host, port, "/", rpc_body, headers, resp, 8000)) {
+        return false;
+    }
+
+    if (resp.code != 200) return false;
+
+    // Check for error
+    if (resp.body.find("\"error\":null") == std::string::npos &&
+        resp.body.find("\"error\": null") == std::string::npos) {
+        // There's an error - transaction might not exist
+        return false;
+    }
+
+    // Parse confirmations
+    {
+        size_t pos = resp.body.find("\"confirmations\"");
+        if (pos != std::string::npos) {
+            pos = resp.body.find(":", pos);
+            if (pos != std::string::npos) {
+                pos++;
+                while (pos < resp.body.size() && (resp.body[pos] == ' ' || resp.body[pos] == '\t')) pos++;
+                uint32_t val = 0;
+                while (pos < resp.body.size() && std::isdigit(resp.body[pos])) {
+                    val = val * 10 + (resp.body[pos] - '0');
+                    pos++;
+                }
+                details.confirmations = val;
+                details.is_confirmed = (val >= 1);
+            }
+        }
+    }
+
+    // Parse blockhash (if confirmed)
+    {
+        size_t pos = resp.body.find("\"blockhash\"");
+        if (pos != std::string::npos) {
+            pos = resp.body.find("\"", pos + 11);
+            if (pos != std::string::npos) {
+                pos++;
+                size_t end = resp.body.find("\"", pos);
+                if (end != std::string::npos) {
+                    details.block_hash = resp.body.substr(pos, end - pos);
+                }
+            }
+        }
+    }
+
+    // Parse blocktime
+    {
+        size_t pos = resp.body.find("\"blocktime\"");
+        if (pos != std::string::npos) {
+            pos = resp.body.find(":", pos);
+            if (pos != std::string::npos) {
+                pos++;
+                while (pos < resp.body.size() && (resp.body[pos] == ' ' || resp.body[pos] == '\t')) pos++;
+                int64_t val = 0;
+                while (pos < resp.body.size() && std::isdigit(resp.body[pos])) {
+                    val = val * 10 + (resp.body[pos] - '0');
+                    pos++;
+                }
+                details.block_time = val;
+            }
+        }
+    }
+
+    // Parse size
+    {
+        size_t pos = resp.body.find("\"size\"");
+        if (pos != std::string::npos) {
+            pos = resp.body.find(":", pos);
+            if (pos != std::string::npos) {
+                pos++;
+                while (pos < resp.body.size() && (resp.body[pos] == ' ' || resp.body[pos] == '\t')) pos++;
+                uint32_t val = 0;
+                while (pos < resp.body.size() && std::isdigit(resp.body[pos])) {
+                    val = val * 10 + (resp.body[pos] - '0');
+                    pos++;
+                }
+                details.tx_size = val;
+            }
+        }
+    }
+
+    // Parse vout (outputs)
+    {
+        size_t vout_start = resp.body.find("\"vout\"");
+        if (vout_start != std::string::npos) {
+            size_t vout_end = resp.body.find("]", vout_start);
+            if (vout_end != std::string::npos) {
+                std::string vout_str = resp.body.substr(vout_start, vout_end - vout_start);
+
+                // Find each output entry
+                size_t pos = 0;
+                uint32_t vout_idx = 0;
+                while ((pos = vout_str.find("\"value\"", pos)) != std::string::npos) {
+                    BlockchainTxDetails::TxOutput out;
+                    out.vout_index = vout_idx++;
+
+                    // Parse value (in MIQ)
+                    pos = vout_str.find(":", pos);
+                    if (pos != std::string::npos) {
+                        pos++;
+                        while (pos < vout_str.size() && (vout_str[pos] == ' ' || vout_str[pos] == '\t')) pos++;
+                        double val = 0;
+                        std::string num_str;
+                        while (pos < vout_str.size() && (std::isdigit(vout_str[pos]) || vout_str[pos] == '.')) {
+                            num_str += vout_str[pos];
+                            pos++;
+                        }
+                        if (!num_str.empty()) {
+                            val = std::stod(num_str);
+                            out.value = (uint64_t)(val * (double)COIN);
+                        }
+                    }
+
+                    // Parse address from scriptPubKey
+                    size_t addr_pos = vout_str.find("\"address\"", pos);
+                    if (addr_pos != std::string::npos && addr_pos < vout_str.find("\"value\"", pos + 1)) {
+                        addr_pos = vout_str.find("\"", addr_pos + 9);
+                        if (addr_pos != std::string::npos) {
+                            addr_pos++;
+                            size_t addr_end = vout_str.find("\"", addr_pos);
+                            if (addr_end != std::string::npos) {
+                                out.address = vout_str.substr(addr_pos, addr_end - addr_pos);
+                            }
+                        }
+                    }
+
+                    if (out.value > 0) {
+                        details.outputs.push_back(out);
+                    }
+                }
+            }
+        }
+    }
+
+    // Parse vin (inputs)
+    {
+        size_t vin_start = resp.body.find("\"vin\"");
+        if (vin_start != std::string::npos) {
+            size_t vin_end = resp.body.find("]", vin_start);
+            if (vin_end != std::string::npos) {
+                std::string vin_str = resp.body.substr(vin_start, vin_end - vin_start);
+
+                // Check for coinbase (mining reward)
+                if (vin_str.find("\"coinbase\"") != std::string::npos) {
+                    BlockchainTxDetails::TxInput in;
+                    in.prev_txid = "COINBASE";
+                    in.prev_vout = 0;
+                    in.value = 0;
+                    in.address = "Block Reward";
+                    details.inputs.push_back(in);
+                } else {
+                    // Find each input entry
+                    size_t pos = 0;
+                    while ((pos = vin_str.find("\"txid\"", pos)) != std::string::npos) {
+                        BlockchainTxDetails::TxInput in;
+
+                        // Parse txid
+                        pos = vin_str.find("\"", pos + 6);
+                        if (pos != std::string::npos) {
+                            pos++;
+                            size_t end = vin_str.find("\"", pos);
+                            if (end != std::string::npos) {
+                                in.prev_txid = vin_str.substr(pos, end - pos);
+                                pos = end;
+                            }
+                        }
+
+                        // Parse vout
+                        size_t vout_pos = vin_str.find("\"vout\"", pos);
+                        if (vout_pos != std::string::npos) {
+                            vout_pos = vin_str.find(":", vout_pos);
+                            if (vout_pos != std::string::npos) {
+                                vout_pos++;
+                                while (vout_pos < vin_str.size() && (vin_str[vout_pos] == ' ' || vin_str[vout_pos] == '\t')) vout_pos++;
+                                uint32_t val = 0;
+                                while (vout_pos < vin_str.size() && std::isdigit(vin_str[vout_pos])) {
+                                    val = val * 10 + (vin_str[vout_pos] - '0');
+                                    vout_pos++;
+                                }
+                                in.prev_vout = val;
+                            }
+                        }
+
+                        if (!in.prev_txid.empty()) {
+                            details.inputs.push_back(in);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    details.has_io_data = !details.inputs.empty() || !details.outputs.empty();
     return true;
 }
 
@@ -6785,6 +7002,53 @@ static void draw_tx_details_window(const BlockchainTxDetails& tx, int width = 72
         draw_section("MEMPOOL STATUS");
         draw_line("Status:", "Waiting for confirmation", "\033[38;5;220m");
         draw_line("Next Block:", "Estimated 1-3 blocks (~8-24 min)");
+    }
+
+    // V1.1 FIX: Display inputs and outputs
+    if (tx.has_io_data) {
+        // Inputs section
+        if (!tx.inputs.empty()) {
+            draw_section("INPUTS (" + std::to_string(tx.inputs.size()) + ")");
+            for (size_t i = 0; i < tx.inputs.size() && i < 5; i++) {
+                const auto& in = tx.inputs[i];
+                std::ostringstream line;
+                if (in.prev_txid == "COINBASE") {
+                    line << "\033[38;5;220m" << (g_use_utf8 ? "⛏ " : "* ") << "COINBASE (Mining Reward)" << reset();
+                } else {
+                    std::string short_txid = in.prev_txid.size() > 16 ?
+                        in.prev_txid.substr(0, 12) + "..." : in.prev_txid;
+                    line << dim() << short_txid << ":" << in.prev_vout << reset();
+                }
+                draw_line("[" + std::to_string(i) + "]", line.str());
+            }
+            if (tx.inputs.size() > 5) {
+                draw_line("", "... and " + std::to_string(tx.inputs.size() - 5) + " more inputs");
+            }
+        }
+
+        // Outputs section
+        if (!tx.outputs.empty()) {
+            draw_section("OUTPUTS (" + std::to_string(tx.outputs.size()) + ")");
+            for (size_t i = 0; i < tx.outputs.size() && i < 5; i++) {
+                const auto& out = tx.outputs[i];
+                std::ostringstream line;
+                line << std::fixed << std::setprecision(8) << ((double)out.value / (double)COIN) << " MIQ";
+                if (!out.address.empty()) {
+                    std::string short_addr = out.address.size() > 20 ?
+                        out.address.substr(0, 12) + "..." + out.address.substr(out.address.size() - 6) :
+                        out.address;
+                    line << " -> " << short_addr;
+                }
+                draw_line("[" + std::to_string(out.vout_index) + "]", line.str(), "\033[38;5;46m");
+            }
+            if (tx.outputs.size() > 5) {
+                draw_line("", "... and " + std::to_string(tx.outputs.size() - 5) + " more outputs");
+            }
+        }
+    } else {
+        draw_section("RAW DATA");
+        draw_line("Note:", "Input/output data not available", "\033[38;5;220m");
+        draw_line("", "Connect to node for full details");
     }
 
     draw_bottom();
@@ -8875,12 +9139,13 @@ static bool bulletproof_broadcast(
     return true;
 }
 
-// AGGRESSIVE recovery for older stuck transactions
-// This function tries harder to recover stuck UTXOs
+// V1.2 CLEANUP: Recovery for stuck transactions - NO auto-rebroadcast
+// Only releases very old stuck transactions to free UTXOs
+// User must manually rebroadcast or fee-bump if needed
 static int aggressive_stuck_recovery(
     const std::string& wdir,
     std::set<OutpointKey>& pending,
-    const std::vector<std::pair<std::string, std::string>>& seeds,
+    [[maybe_unused]] const std::vector<std::pair<std::string, std::string>>& seeds,
     bool verbose = true)
 {
     std::vector<QueuedTransaction> queue;
@@ -8888,40 +9153,20 @@ static int aggressive_stuck_recovery(
 
     int64_t now = (int64_t)time(nullptr);
     int recovered = 0;
-    int rebroadcast_count = 0;
 
-    // PASS 1: Release very old stuck transactions (> 2 hours)
-    int64_t very_stuck_threshold = 2 * 3600;  // 2 hours
+    // Release very old stuck transactions (> 4 hours) - NO rebroadcast
+    int64_t very_stuck_threshold = 4 * 3600;  // 4 hours
 
     for (auto& tx : queue) {
         if (tx.status == "broadcast" || tx.status == "broadcasting") {
             int64_t age = now - tx.created_at;
             if (age > very_stuck_threshold) {
-                // This transaction is very old and still not confirmed
-                // Attempt one final rebroadcast
-                if (!tx.raw_tx.empty() && tx.broadcast_attempts < 20) {
-                    if (verbose) {
-                        ui::print_info("Rebroadcasting old TX " + tx.txid_hex.substr(0, 12) + "... (age: " +
-                                      std::to_string(age / 3600) + "h)");
-                    }
-
-                    std::string used_seed, err;
-                    if (broadcast_any_seed(seeds, tx.raw_tx, used_seed, err)) {
-                        tx.last_attempt = now;
-                        tx.broadcast_attempts++;
-                        rebroadcast_count++;
-                    } else {
-                        // Rebroadcast failed - mark as expired and release UTXOs
-                        if (verbose) {
-                            ui::print_warning("TX " + tx.txid_hex.substr(0, 12) + "... expired after " +
-                                            std::to_string(age / 3600) + " hours - releasing UTXOs");
-                        }
-                        remove_inputs_from_pending(wdir, tx.raw_tx, pending);
-                        tx.status = "expired";
-                        tx.error_msg = "Transaction expired - UTXOs recovered";
-                        recovered++;
-                    }
+                // Very old transaction - mark as stuck, suggest fee-bump
+                if (verbose) {
+                    ui::print_warning("TX " + tx.txid_hex.substr(0, 12) + "... stuck for " +
+                                    std::to_string(age / 3600) + "h - use fee-bump to rebroadcast");
                 }
+                // Don't auto-expire, let user decide to fee-bump or cancel
             }
         }
     }
@@ -8943,20 +9188,18 @@ static int aggressive_stuck_recovery(
         }
     }
 
-    if (recovered > 0 || rebroadcast_count > 0) {
+    if (recovered > 0) {
         save_tx_queue(wdir, queue);
         save_pending(wdir, pending);
-    }
-
-    if (verbose && (recovered > 0 || rebroadcast_count > 0)) {
-        ui::run_recovery_splash(recovered, recovered + rebroadcast_count);
     }
 
     return recovered;
 }
 
 // =============================================================================
-// TRANSACTION QUEUE PROCESSING - Auto-broadcast pending transactions
+// TRANSACTION QUEUE PROCESSING - V1.2 CLEANUP: Manual broadcast only
+// NO automatic rebroadcast of "broadcast" status transactions
+// User must manually choose to rebroadcast or fee-bump stuck transactions
 // =============================================================================
 static int process_tx_queue(
     const std::string& wdir,
@@ -8974,45 +9217,18 @@ static int process_tx_queue(
     int64_t now = (int64_t)time(nullptr);
 
     for(auto& tx : queue){
-        // CRITICAL FIX: Also rebroadcast "broadcast" status transactions that haven't been
-        // confirmed for a while. They may have been dropped from mempool.
-        bool needs_rebroadcast = false;
-        if(tx.status == "broadcast"){
-            // Check if it's been too long since last attempt without confirmation
-            int64_t since_last = now - tx.last_attempt;
-            if(since_last >= wallet_config::REBROADCAST_INTERVAL_SECONDS){
-                needs_rebroadcast = true;
-                if(verbose){
-                    ui::print_info("Rebroadcasting unconfirmed TX " + tx.txid_hex.substr(0, 8) + "...");
-                }
-            }
-        }
+        // V1.2 CLEANUP: Only process "queued" transactions
+        // "broadcast" status = already sent to network, wait for confirmation
+        // User must manually rebroadcast or fee-bump if stuck
+        if(tx.status != "queued") continue;
 
-        // Skip if not queued, broadcasting, or needs rebroadcast
-        if(tx.status != "queued" && tx.status != "broadcasting" && !needs_rebroadcast) continue;
-
-        if(tx.broadcast_attempts >= wallet_config::MAX_BROADCAST_ATTEMPTS){
-            tx.status = "failed";
-            tx.error_msg = "Max broadcast attempts exceeded";
-
-            // CRITICAL FIX: Release inputs back to spendable pool
-            if(!tx.raw_tx.empty()){
-                remove_inputs_from_pending(wdir, tx.raw_tx, pending);
-                failed_or_expired++;
-                if(verbose){
-                    ui::print_warning("TX " + tx.txid_hex.substr(0, 8) + "... failed - inputs released");
-                }
-            }
-            continue;
-        }
-
-        // Check expiry
+        // Check expiry (very long - 72 hours)
         int64_t age_hours = (now - tx.created_at) / 3600;
         if(age_hours >= wallet_config::TX_EXPIRY_HOURS){
             tx.status = "expired";
             tx.error_msg = "Transaction expired after " + std::to_string(wallet_config::TX_EXPIRY_HOURS) + " hours";
 
-            // CRITICAL FIX: Release inputs back to spendable pool
+            // Release inputs back to spendable pool
             if(!tx.raw_tx.empty()){
                 remove_inputs_from_pending(wdir, tx.raw_tx, pending);
                 failed_or_expired++;
@@ -9033,7 +9249,7 @@ static int process_tx_queue(
 
         std::string used_seed, err;
         if(broadcast_any_seed(seeds, tx.raw_tx, used_seed, err)){
-            tx.status = "broadcast";  // Changed from "confirmed" - more accurate
+            tx.status = "broadcast";  // Successfully sent to network
             tx.error_msg = "";
             broadcasted++;
 
@@ -9054,6 +9270,8 @@ static int process_tx_queue(
             hist.memo = tx.memo;
             add_tx_history(wdir, hist);
         } else {
+            // Failed to broadcast - keep as "queued" for manual retry
+            tx.status = "queued";
             tx.error_msg = err;
             if(verbose){
                 ui::clear_line();
@@ -9067,6 +9285,66 @@ static int process_tx_queue(
         ui::print_info("Released " + std::to_string(failed_or_expired) + " failed/expired transaction inputs");
     }
     return broadcasted;
+}
+
+// Forward declaration for build_endpoints_from_seeds (defined below)
+static std::vector<rpc_wallet::RpcEndpoint> build_endpoints_from_seeds(
+    const std::vector<std::pair<std::string,std::string>>& seeds,
+    bool localhost_first);
+
+// =============================================================================
+// V1.1 STABILITY FIX: Clean up confirmed transactions from queue
+// This prevents the queue from growing indefinitely and rebroadcasting
+// transactions that have already been confirmed in the blockchain
+// =============================================================================
+static int cleanup_confirmed_queue_txs(
+    const std::string& wdir,
+    const std::vector<std::pair<std::string,std::string>>& seeds,
+    std::set<OutpointKey>& pending,
+    bool verbose = true)
+{
+    std::vector<QueuedTransaction> queue;
+    load_tx_queue(wdir, queue);
+
+    if(queue.empty()) return 0;
+
+    auto endpoints = build_endpoints_from_seeds(seeds, true);
+    int cleaned = 0;
+
+    for(auto& tx : queue){
+        // Only check transactions that have been broadcast
+        if(tx.status != "broadcast" && tx.status != "broadcasting") continue;
+
+        // Check confirmation status via RPC (using rpc_verify_transaction)
+        int confirmations = 0;
+        std::string err;
+        if(rpc_wallet::rpc_verify_transaction(endpoints, tx.txid_hex, confirmations, err)){
+            if(confirmations >= 1){
+                // Transaction is confirmed! Mark it and release pending UTXOs
+                tx.status = "confirmed";
+                tx.error_msg = "";
+
+                // Release inputs from pending set
+                if(!tx.raw_tx.empty()){
+                    remove_inputs_from_pending(wdir, tx.raw_tx, pending);
+                }
+
+                cleaned++;
+
+                if(verbose){
+                    ui::print_success("TX " + tx.txid_hex.substr(0, 12) + "... confirmed (" +
+                                     std::to_string(confirmations) + " confirmations)");
+                }
+            }
+        }
+    }
+
+    if(cleaned > 0){
+        save_tx_queue(wdir, queue);
+        save_pending(wdir, pending);
+    }
+
+    return cleaned;
 }
 
 // Build RPC endpoints from seeds using helper function
@@ -9612,22 +9890,14 @@ static bool wallet_session(const std::string& cli_host,
 
     auto utxos = refresh_and_print();
 
-    // Process any pending transactions on startup
+    // V1.2 CLEANUP: Just inform user about pending transactions - NO auto-broadcast
+    // User must manually choose to rebroadcast with 'b' or fee bump option
     {
         int pending_count = count_pending_in_queue(wdir);
         if(pending_count > 0){
             std::cout << "\n";
-            ui::print_info("Found " + std::to_string(pending_count) + " pending transaction(s) in queue");
-            std::cout << "  " << ui::dim() << "Attempting to broadcast..." << ui::reset() << "\n";
-
-            int broadcasted = process_tx_queue(wdir, seeds, pending, true);
-            if(broadcasted > 0){
-                std::cout << "\n";
-                ui::print_success("Successfully broadcasted " + std::to_string(broadcasted) + " transaction(s)");
-                // Refresh balance after cleanup
-                utxos = refresh_and_print();
-            }
-            std::cout << "\n";
+            ui::print_warning("Found " + std::to_string(pending_count) + " pending transaction(s) in queue");
+            std::cout << "  " << ui::dim() << "Use [b] to broadcast or [7] to view queue and fee-bump" << ui::reset() << "\n\n";
         }
     }
 
@@ -9723,10 +9993,9 @@ static bool wallet_session(const std::string& cli_host,
             // This ensures pending transactions are cleaned up when confirmed
             last_auto_refresh = now;
 
-            // Invalidate cache to force fresh fetch
-            miq::spv_invalidate_mem_cache();
+            // NOTE: No in-memory cache to invalidate in RPC-only mode
 
-            // Perform silent background refresh
+            // Perform silent background refresh via RPC
             std::vector<miq::UtxoLite> new_utxos;
             std::string used_seed, err;
             if(spv_collect_any_seed(seeds, pkhs, spv_win, wdir, new_utxos, used_seed, err)){
@@ -10307,7 +10576,7 @@ static bool wallet_session(const std::string& cli_host,
                 std::cout << "  " << ui::cyan() << "[7]" << ui::reset() << " Release Pending      " << ui::dim() << "Unlock stuck funds" << ui::reset() << "\n";
                 std::cout << "  " << ui::cyan() << "[8]" << ui::reset() << " Network Diagnostics  " << ui::dim() << "Connection test" << ui::reset() << "\n";
                 std::cout << "  " << ui::yellow() << "[9]" << ui::reset() << " " << ui::bold() << "FORCE RECOVERY" << ui::reset() << "       " << ui::yellow() << "Aggressive stuck TX recovery" << ui::reset() << "\n";
-                std::cout << "  " << ui::green() << "[f]" << ui::reset() << " " << ui::bold() << "FEE BUMP (RBF)" << ui::reset() << "       " << ui::green() << "Boost stuck transaction fee" << ui::reset() << "\n";
+                std::cout << "  " << ui::green() << "[f]" << ui::reset() << " " << ui::bold() << "STUCK TX MANAGER" << ui::reset() << "     " << ui::green() << "Rebroadcast or cancel stuck TXs" << ui::reset() << "\n";
                 std::cout << "  " << ui::cyan() << "[b]" << ui::reset() << " Backup Wallet        " << ui::dim() << "Create backup" << ui::reset() << "\n";
                 std::cout << "  " << ui::cyan() << "[q]" << ui::reset() << " Back to Main Menu\n";
                 std::cout << "\n";
@@ -10407,10 +10676,11 @@ static bool wallet_session(const std::string& cli_host,
                     std::string dummy;
                     std::getline(std::cin, dummy);
                 }
-                // Sub-option f: Fee Bump (RBF) - Boost stuck transaction fee
+                // Sub-option f: Manage Stuck Transactions - V1.2 CLEANUP
+                // Options: Rebroadcast OR Cancel (release UTXOs so user can send new tx with higher fee)
                 else if(set_cmd == "f" || set_cmd == "F"){
                     std::cout << "\n";
-                    ui::print_double_header("FEE BUMP (RBF)", 60);
+                    ui::print_double_header("MANAGE STUCK TRANSACTIONS", 60);
                     std::cout << "\n";
 
                     // Load transaction queue to find stuck transactions
@@ -10443,40 +10713,47 @@ static bool wallet_session(const std::string& cli_host,
                             else age_str = std::to_string(age / 3600) + "h";
 
                             std::cout << "  " << ui::cyan() << "[" << idx << "]" << ui::reset()
-                                      << " " << tx->txid_hex.substr(0, 16) << "... "
-                                      << ui::dim() << "(" << age_str << " ago, " << tx->status << ")" << ui::reset() << "\n";
-                            std::cout << "      Amount: " << ui::green() << fmt_amount(tx->amount) << " MIQ" << ui::reset() << "\n";
+                                      << " " << tx->txid_hex.substr(0, 16) << "...\n";
+                            std::cout << "      " << ui::dim() << "Status: " << tx->status << " (" << age_str << " ago)" << ui::reset() << "\n";
+                            std::cout << "      Amount: " << ui::green() << fmt_amount(tx->amount) << " MIQ" << ui::reset();
+                            std::cout << " | Fee: " << ui::yellow() << fmt_amount(tx->fee) << " MIQ" << ui::reset() << "\n";
+                            if(!tx->to_address.empty()){
+                                std::cout << "      To: " << ui::dim() << tx->to_address << ui::reset() << "\n";
+                            }
+                            std::cout << "\n";
                             idx++;
                         }
 
-                        std::cout << "\n  " << ui::bold() << "Fee Bump Options:" << ui::reset() << "\n";
-                        std::cout << "  " << ui::dim() << "Replace stuck transaction with higher fee using RBF" << ui::reset() << "\n\n";
-                        std::cout << "    " << ui::yellow() << "[a]" << ui::reset() << " Bump ALL stuck transactions (5 miqron/byte)\n";
-                        std::cout << "    " << ui::cyan() << "[1-" << stuck_txs.size() << "]" << ui::reset() << " Select specific transaction\n";
-                        std::cout << "    " << ui::cyan() << "[q]" << ui::reset() << " Cancel\n\n";
+                        std::cout << "  " << ui::bold() << "Options:" << ui::reset() << "\n";
+                        std::cout << "  " << ui::dim() << "Manage stuck transactions - rebroadcast or cancel to send with higher fee" << ui::reset() << "\n\n";
+                        std::cout << "    " << ui::cyan() << "[1-" << stuck_txs.size() << "]" << ui::reset() << " Select transaction to manage\n";
+                        std::cout << "    " << ui::yellow() << "[r]" << ui::reset() << " Rebroadcast ALL stuck transactions\n";
+                        std::cout << "    " << ui::red() << "[c]" << ui::reset() << " Cancel ALL and release UTXOs (dangerous!)\n";
+                        std::cout << "    " << ui::cyan() << "[q]" << ui::reset() << " Back to menu\n\n";
 
                         std::string bump_sel = ui::prompt("Selection: ");
                         bump_sel = trim(bump_sel);
 
                         if(bump_sel == "q" || bump_sel == "Q" || bump_sel.empty()){
-                            ui::print_info("Fee bump cancelled");
-                        } else if(bump_sel == "a" || bump_sel == "A"){
+                            ui::print_info("Returning to menu");
+                        } else if(bump_sel == "r" || bump_sel == "R"){
+                            // Rebroadcast all stuck transactions
                             std::cout << "\n";
-                            ui::print_info("Preparing to bump all stuck transactions...");
+                            ui::print_info("Rebroadcasting all stuck transactions...");
 
-                            // Get seed nodes for rebroadcast
                             auto seeds_bump = build_seed_candidates(cli_host, cli_port);
 
-                            int bumped = 0;
+                            int rebroadcast_ok = 0;
                             for(auto* tx : stuck_txs){
                                 if(!tx->raw_tx.empty()){
                                     std::string used_seed, bump_err;
                                     if(broadcast_any_seed(seeds_bump, tx->raw_tx, used_seed, bump_err)){
                                         tx->broadcast_attempts++;
-                                        tx->status = "broadcasting";
-                                        bumped++;
+                                        tx->status = "broadcast";
+                                        tx->last_attempt = (int64_t)time(nullptr);
+                                        rebroadcast_ok++;
                                         std::cout << "  " << ui::green() << "[OK]" << ui::reset()
-                                                  << " Rebroadcast " << tx->txid_hex.substr(0, 12) << "...\n";
+                                                  << " " << tx->txid_hex.substr(0, 12) << "...\n";
                                     } else {
                                         std::cout << "  " << ui::red() << "[FAIL]" << ui::reset()
                                                   << " " << tx->txid_hex.substr(0, 12) << "... - " << bump_err << "\n";
@@ -10484,35 +10761,108 @@ static bool wallet_session(const std::string& cli_host,
                                 }
                             }
 
-                            // Save updated queue
                             save_tx_queue(wdir, queue);
 
                             std::cout << "\n  " << ui::bold() << "Result:" << ui::reset()
-                                      << " Rebroadcast " << bumped << "/" << stuck_txs.size() << " transactions\n";
-                            std::cout << "  " << ui::dim() << "Transactions will be picked up by miners with higher priority." << ui::reset() << "\n\n";
+                                      << " Rebroadcast " << rebroadcast_ok << "/" << stuck_txs.size() << " transactions\n\n";
+                        } else if(bump_sel == "c" || bump_sel == "C"){
+                            // Cancel all and release UTXOs
+                            std::cout << "\n";
+                            ui::print_warning("WARNING: This will cancel all stuck transactions!");
+                            std::cout << "  " << ui::dim() << "The UTXOs will be released so you can send a new transaction." << ui::reset() << "\n";
+                            std::cout << "  " << ui::dim() << "The original transaction may still confirm if already in mempool." << ui::reset() << "\n\n";
+
+                            if(!ui::confirm("Cancel all stuck transactions?")){
+                                ui::print_info("Cancelled");
+                            } else {
+                                int cancelled = 0;
+                                for(auto* tx : stuck_txs){
+                                    // Release UTXOs from this transaction
+                                    if(!tx->raw_tx.empty()){
+                                        remove_inputs_from_pending(wdir, tx->raw_tx, pending);
+                                    }
+                                    tx->status = "cancelled";
+                                    tx->error_msg = "Cancelled by user - UTXOs released";
+                                    cancelled++;
+                                    std::cout << "  " << ui::yellow() << "[CANCELLED]" << ui::reset()
+                                              << " " << tx->txid_hex.substr(0, 12) << "...\n";
+                                }
+
+                                save_tx_queue(wdir, queue);
+                                save_pending(wdir, pending);
+
+                                std::cout << "\n  " << ui::green() << "Cancelled " << cancelled << " transaction(s)" << ui::reset() << "\n";
+                                std::cout << "  " << ui::dim() << "UTXOs released - you can now send a new transaction with higher fee." << ui::reset() << "\n\n";
+                            }
                         } else {
-                            // Try to parse as number
+                            // Try to parse as number for individual transaction management
                             try {
                                 int sel_idx = std::stoi(bump_sel);
                                 if(sel_idx >= 1 && sel_idx <= (int)stuck_txs.size()){
                                     auto* selected_tx = stuck_txs[sel_idx - 1];
 
+                                    // Show submenu for this transaction
                                     std::cout << "\n";
-                                    ui::print_info("Rebroadcasting transaction " + selected_tx->txid_hex.substr(0, 16) + "...");
+                                    ui::print_double_header("TRANSACTION DETAILS", 60);
+                                    std::cout << "\n";
+                                    std::cout << "  " << ui::bold() << "TXID:" << ui::reset() << " " << selected_tx->txid_hex << "\n";
+                                    std::cout << "  " << ui::bold() << "Status:" << ui::reset() << " " << selected_tx->status << "\n";
+                                    std::cout << "  " << ui::bold() << "Amount:" << ui::reset() << " " << fmt_amount(selected_tx->amount) << " MIQ\n";
+                                    std::cout << "  " << ui::bold() << "Fee:" << ui::reset() << " " << fmt_amount(selected_tx->fee) << " MIQ\n";
+                                    if(!selected_tx->to_address.empty()){
+                                        std::cout << "  " << ui::bold() << "To:" << ui::reset() << " " << selected_tx->to_address << "\n";
+                                    }
+                                    std::cout << "  " << ui::bold() << "Attempts:" << ui::reset() << " " << selected_tx->broadcast_attempts << "\n\n";
 
-                                    auto seeds_bump = build_seed_candidates(cli_host, cli_port);
-                                    std::string used_seed, bump_err;
+                                    std::cout << "  " << ui::bold() << "Actions:" << ui::reset() << "\n";
+                                    std::cout << "    " << ui::cyan() << "[r]" << ui::reset() << " Rebroadcast this transaction\n";
+                                    std::cout << "    " << ui::red() << "[c]" << ui::reset() << " Cancel and release UTXOs\n";
+                                    std::cout << "    " << ui::cyan() << "[q]" << ui::reset() << " Back\n\n";
 
-                                    if(!selected_tx->raw_tx.empty() && broadcast_any_seed(seeds_bump, selected_tx->raw_tx, used_seed, bump_err)){
-                                        selected_tx->broadcast_attempts++;
-                                        selected_tx->status = "broadcasting";
-                                        save_tx_queue(wdir, queue);
+                                    std::string action = ui::prompt("Action: ");
+                                    action = trim(action);
 
+                                    if(action == "r" || action == "R"){
                                         std::cout << "\n";
-                                        ui::print_success("Transaction rebroadcast successfully!");
-                                        std::cout << "  " << ui::dim() << "Used node: " << used_seed << ui::reset() << "\n\n";
-                                    } else {
-                                        ui::print_error("Rebroadcast failed: " + bump_err);
+                                        ui::print_info("Rebroadcasting transaction...");
+
+                                        auto seeds_bump = build_seed_candidates(cli_host, cli_port);
+                                        std::string used_seed, bump_err;
+
+                                        if(!selected_tx->raw_tx.empty() && broadcast_any_seed(seeds_bump, selected_tx->raw_tx, used_seed, bump_err)){
+                                            selected_tx->broadcast_attempts++;
+                                            selected_tx->status = "broadcast";
+                                            selected_tx->last_attempt = (int64_t)time(nullptr);
+                                            save_tx_queue(wdir, queue);
+
+                                            std::cout << "\n";
+                                            ui::print_success("Transaction rebroadcast successfully!");
+                                            std::cout << "  " << ui::dim() << "Used node: " << used_seed << ui::reset() << "\n\n";
+                                        } else {
+                                            ui::print_error("Rebroadcast failed: " + bump_err);
+                                        }
+                                    } else if(action == "c" || action == "C"){
+                                        std::cout << "\n";
+                                        ui::print_warning("WARNING: This will cancel this transaction!");
+                                        std::cout << "  " << ui::dim() << "The UTXOs will be released so you can send a new transaction." << ui::reset() << "\n\n";
+
+                                        if(!ui::confirm("Cancel this transaction?")){
+                                            ui::print_info("Cancelled");
+                                        } else {
+                                            // Release UTXOs
+                                            if(!selected_tx->raw_tx.empty()){
+                                                remove_inputs_from_pending(wdir, selected_tx->raw_tx, pending);
+                                            }
+                                            selected_tx->status = "cancelled";
+                                            selected_tx->error_msg = "Cancelled by user - UTXOs released";
+
+                                            save_tx_queue(wdir, queue);
+                                            save_pending(wdir, pending);
+
+                                            std::cout << "\n";
+                                            ui::print_success("Transaction cancelled - UTXOs released");
+                                            std::cout << "  " << ui::dim() << "You can now send a new transaction with a higher fee." << ui::reset() << "\n\n";
+                                        }
                                     }
                                 } else {
                                     ui::print_error("Invalid selection");
@@ -11225,6 +11575,24 @@ static bool wallet_session(const std::string& cli_host,
             hist.to_address = to;
             add_tx_history(wdir, hist);
 
+            // V1.1 STABILITY FIX: Also add to queue for rebroadcast tracking
+            // Even successful broadcasts may not propagate properly, so we track them
+            // The queue will automatically rebroadcast if the transaction doesn't confirm
+            {
+                QueuedTransaction qtx;
+                qtx.txid_hex = txid_hex;
+                qtx.raw_tx = raw;
+                qtx.created_at = (int64_t)time(nullptr);
+                qtx.last_attempt = qtx.created_at;
+                qtx.broadcast_attempts = 1;
+                qtx.status = "broadcast";  // Already broadcast, but track for rebroadcast
+                qtx.to_address = to;
+                qtx.amount = amount;
+                qtx.fee = fee_final;
+                qtx.error_msg = "";
+                add_to_tx_queue(wdir, qtx);
+            }
+
             // Update wallet statistics
             update_stats_for_send(wdir, amount, fee_final);
 
@@ -11279,9 +11647,8 @@ static bool wallet_session(const std::string& cli_host,
 
             is_online = true;
 
-            // CRITICAL FIX: Invalidate UTXO cache before refresh
-            // This ensures fresh data from network, not cached UTXOs
-            miq::spv_invalidate_mem_cache();
+            // NOTE: No in-memory cache to invalidate in RPC-only mode
+            // Fresh data is always fetched from node via RPC
 
             // Refresh balance after send - balance should now show reduced amount
             utxos = refresh_and_print();
@@ -11500,33 +11867,30 @@ static bool wallet_session(const std::string& cli_host,
             }
         }
         // =================================================================
-        // OPTION r: Refresh Balance (with auto-broadcast)
+        // OPTION r: Refresh Balance (NO auto-broadcast - V1.2 CLEANUP)
         // =================================================================
         else if(c == "r" || c == "R"){
             std::cout << "\n";
-            ui::print_info("Syncing wallet and processing queued transactions...");
+            ui::print_info("Syncing wallet with network...");
 
             utxos = refresh_and_print();
             is_online = (last_connected_node != "<offline>" && last_connected_node != "<not connected>");
 
-            // AUTO-BROADCAST: Automatically broadcast any pending transactions
-            int pending_count = count_pending_in_queue(wdir);
-            if(pending_count > 0 && is_online){
-                std::cout << "  " << ui::cyan() << "[AUTO]" << ui::reset()
-                          << " Broadcasting " << pending_count << " queued transaction(s)...\n";
-                int broadcasted = process_tx_queue(wdir, seeds, pending, false);
-                if(broadcasted > 0){
-                    std::cout << "  " << ui::green() << "SUCCESS:" << ui::reset()
-                              << " Broadcasted " << broadcasted << " transaction(s)\n\n";
-                    // Refresh balance to show updated amounts
-                    utxos = refresh_and_print();
-                } else {
-                    std::cout << "  " << ui::yellow() << "No transactions could be broadcasted" << ui::reset()
-                              << " - will retry on next refresh\n\n";
+            // Clean up confirmed transactions from queue
+            if(is_online){
+                int cleaned = cleanup_confirmed_queue_txs(wdir, seeds, pending, false);
+                if(cleaned > 0){
+                    std::cout << "  " << ui::green() << "[CLEANUP]" << ui::reset()
+                              << " " << cleaned << " transaction(s) confirmed and removed from queue\n";
                 }
-            } else if(pending_count > 0 && !is_online){
+            }
+
+            // V1.2 CLEANUP: Just inform about pending - NO auto-broadcast
+            int pending_count = count_pending_in_queue(wdir);
+            if(pending_count > 0){
                 std::cout << "  " << ui::yellow() << "[QUEUED]" << ui::reset()
-                          << " " << pending_count << " transaction(s) waiting - connect to network to broadcast\n\n";
+                          << " " << pending_count << " transaction(s) in queue\n";
+                std::cout << "  " << ui::dim() << "Use [b] to broadcast or [7] to view queue and fee-bump" << ui::reset() << "\n\n";
             }
         }
         // =================================================================
@@ -11896,9 +12260,11 @@ static bool wallet_session(const std::string& cli_host,
                 ui::print_header("NETWORK SETTINGS", 50);
                 std::cout << "\n";
 
-                std::cout << ui::dim() << "  Current P2P Seeds:" << ui::reset() << "\n";
+                std::cout << ui::dim() << "  Current RPC Endpoints:" << ui::reset() << "\n";
                 for(const auto& seed_entry : seeds){
-                    std::cout << "  - " << seed_entry.first << ":" << seed_entry.second << "\n";
+                    uint16_t p2p_port = (uint16_t)std::stoi(seed_entry.second);
+                    uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port - 49);
+                    std::cout << "  - " << seed_entry.first << ":" << rpc_port << " (RPC)\n";
                 }
                 std::cout << "\n";
 
@@ -11927,23 +12293,25 @@ static bool wallet_session(const std::string& cli_host,
             NetworkDiagnostics diag;
             diag.timestamp = std::time(nullptr);
 
-            // Test each seed
-            std::cout << ui::dim() << "  Testing P2P connections:" << ui::reset() << "\n\n";
+            // Test each seed via RPC (fully RPC-only wallet)
+            std::cout << ui::dim() << "  Testing RPC connections:" << ui::reset() << "\n\n";
 
             for(const auto& seed_entry : seeds){
-                std::cout << "  " << seed_entry.first << ":" << seed_entry.second << " ... ";
+                uint16_t p2p_port = (uint16_t)std::stoi(seed_entry.second);
+                uint16_t rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port - 49);
+
+                std::cout << "  " << seed_entry.first << ":" << rpc_port << " (RPC) ... ";
                 std::cout.flush();
 
                 auto start = std::chrono::steady_clock::now();
 
-                // Try to connect
-                miq::SpvOptions opts;
-                opts.timeout_ms = 5000;
-                std::vector<miq::UtxoLite> test_utxos;
-                std::string err;
+                // Test RPC connection with getblockcount
+                std::vector<rpc_wallet::RpcEndpoint> test_eps;
+                test_eps.push_back({seed_entry.first, rpc_port, "", 5000});
 
-                bool success = miq::spv_collect_utxos(
-                    seed_entry.first, seed_entry.second, pkhs, opts, test_utxos, err);
+                std::string status;
+                std::string used_seed;
+                bool success = rpc_wallet::rpc_health_check(test_eps, status, used_seed);
 
                 auto end = std::chrono::steady_clock::now();
                 int latency = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -12623,15 +12991,18 @@ static bool wallet_session(const std::string& cli_host,
             uint64_t current_difficulty = 0;
             std::string best_hash;
             std::string rpc_host = "127.0.0.1";
-            uint16_t rpc_port = 8332;
+            // V1.1 FIX: Use correct RPC port (default 9834, not Bitcoin's 8332)
+            uint16_t rpc_port = (uint16_t)miq::RPC_PORT;
 
-            // Try to parse from last_connected_node
+            // Try to parse from last_connected_node (this is P2P port, convert to RPC)
             if(last_connected_node != "<offline>" && last_connected_node != "<not connected>"){
                 size_t colon = last_connected_node.find(':');
                 if(colon != std::string::npos){
                     rpc_host = last_connected_node.substr(0, colon);
                     try {
-                        rpc_port = (uint16_t)std::stoi(last_connected_node.substr(colon + 1));
+                        uint16_t p2p_port = (uint16_t)std::stoi(last_connected_node.substr(colon + 1));
+                        // V1.1 FIX: Convert P2P port to RPC port (P2P - 49)
+                        rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port - 49);
                     } catch(...) {}
                 }
             }
@@ -12737,6 +13108,25 @@ static bool wallet_session(const std::string& cli_host,
                     details.is_mempool = true;
                     details.status_text = "Pending";
                 }
+
+                // V1.1 FIX: Fetch full transaction details from node (inputs/outputs)
+                ui::print_info("Fetching transaction details from node...");
+                if(fetch_tx_details_from_node(rpc_host, rpc_port, details.txid_hex, details)){
+                    // Update confirmations and status from live data
+                    if(details.confirmations >= 6){
+                        details.is_confirmed = true;
+                        details.status_text = "Confirmed";
+                    } else if(details.confirmations > 0){
+                        details.is_confirmed = true;
+                        details.status_text = "Confirming (" + std::to_string(details.confirmations) + "/6)";
+                    }
+
+                    // Update fee rate if we got actual size
+                    if(details.fee > 0 && details.tx_size > 0){
+                        details.fee_rate = (double)details.fee / (double)details.tx_size;
+                    }
+                }
+                ui::clear_line();
 
                 // Try to get block info if confirmed
                 if(details.confirmations > 0 && current_height > 0){
