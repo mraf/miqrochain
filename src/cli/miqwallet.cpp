@@ -11240,8 +11240,23 @@ static bool wallet_session(const std::string& cli_host,
             // Refresh balance
             utxos = refresh_and_print();
 
+            // CRITICAL FIX: Get actual blockchain tip height from node, NOT from UTXO heights
+            // Previously used max(UTXO heights) which is wrong if user only has old coinbase rewards
+            // This caused mature coinbase to be marked as immature, making funds unspendable
             uint64_t tip_h = 0;
-            for(const auto& u: utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
+            {
+                // First try to get actual height from node
+                auto rpc_endpoints = build_endpoints_from_seeds(
+                    build_seed_candidates(cli_host, cli_port), true);
+                uint32_t node_height = 0;
+                std::string best_hash, used_ep, err;
+                if (rpc_wallet::rpc_get_blockchain_info(rpc_endpoints, node_height, best_hash, used_ep, err)) {
+                    tip_h = node_height;
+                } else {
+                    // Fallback: use max UTXO height (less accurate but better than 0)
+                    for(const auto& u: utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
+                }
+            }
 
             // Get spendable UTXOs
             // CRITICAL FIX: Filter out unconfirmed UTXOs (height=0) to prevent orphan transactions
@@ -12423,8 +12438,20 @@ static bool wallet_session(const std::string& cli_host,
             std::cout << "  +============================================================+" << ui::reset() << "\n\n";
 
             // Calculate current fragmentation
+            // CRITICAL FIX: Get actual blockchain tip height from node
             uint64_t tip_h = 0;
-            for(const auto& u: utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
+            {
+                auto rpc_endpoints = build_endpoints_from_seeds(
+                    build_seed_candidates(cli_host, cli_port), true);
+                uint32_t node_height = 0;
+                std::string best_hash, used_ep, err;
+                if (rpc_wallet::rpc_get_blockchain_info(rpc_endpoints, node_height, best_hash, used_ep, err)) {
+                    tip_h = node_height;
+                } else {
+                    // Fallback: use max UTXO height
+                    for(const auto& u: utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
+                }
+            }
 
             std::vector<miq::UtxoLite> spendables;
             for(const auto& u: utxos){
@@ -13238,8 +13265,19 @@ static bool wallet_session(const std::string& cli_host,
             int spendable_count = 0;
             int pending_count = 0;
 
+            // CRITICAL FIX: Get actual blockchain tip height from node
             uint64_t tip_h = 0;
-            for(const auto& u : utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
+            {
+                auto rpc_endpoints = build_endpoints_from_seeds(
+                    build_seed_candidates(cli_host, cli_port), true);
+                uint32_t node_height = 0;
+                std::string best_hash, used_ep, err;
+                if (rpc_wallet::rpc_get_blockchain_info(rpc_endpoints, node_height, best_hash, used_ep, err)) {
+                    tip_h = node_height;
+                } else {
+                    for(const auto& u : utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
+                }
+            }
 
             for(const auto& u : utxos){
                 total_val += u.value;
