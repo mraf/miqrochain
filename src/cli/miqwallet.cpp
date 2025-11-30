@@ -535,17 +535,40 @@ static bool rpc_call(
     }
 
     // Check for RPC error
+    // CRITICAL FIX: Handle both error formats:
+    // 1. Standard JSON-RPC: {"error":{"message":"..."}}
+    // 2. Simple format:     {"error":"..."}
     if (resp.body.find("\"error\":null") == std::string::npos &&
         resp.body.find("\"error\": null") == std::string::npos) {
         size_t err_pos = resp.body.find("\"error\":");
         if (err_pos != std::string::npos) {
-            size_t msg_pos = resp.body.find("\"message\":", err_pos);
-            if (msg_pos != std::string::npos) {
-                size_t start = resp.body.find('"', msg_pos + 10) + 1;
-                size_t end = resp.body.find('"', start);
-                if (start < end) {
-                    err = "RPC error: " + resp.body.substr(start, end - start);
-                    return false;
+            size_t after_colon = err_pos + 8; // length of "\"error\":"
+            // Skip whitespace
+            while (after_colon < resp.body.size() &&
+                   (resp.body[after_colon] == ' ' || resp.body[after_colon] == '\t')) {
+                after_colon++;
+            }
+
+            if (after_colon < resp.body.size()) {
+                if (resp.body[after_colon] == '{') {
+                    // Format 1: {"error":{"message":"..."}}
+                    size_t msg_pos = resp.body.find("\"message\":", err_pos);
+                    if (msg_pos != std::string::npos) {
+                        size_t start = resp.body.find('"', msg_pos + 10) + 1;
+                        size_t end = resp.body.find('"', start);
+                        if (start < end && start > 0) {
+                            err = "RPC error: " + resp.body.substr(start, end - start);
+                            return false;
+                        }
+                    }
+                } else if (resp.body[after_colon] == '"') {
+                    // Format 2: {"error":"..."} - simple string error
+                    size_t start = after_colon + 1;
+                    size_t end = resp.body.find('"', start);
+                    if (end != std::string::npos && end > start) {
+                        err = "RPC error: " + resp.body.substr(start, end - start);
+                        return false;
+                    }
                 }
             }
         }
@@ -11217,8 +11240,23 @@ static bool wallet_session(const std::string& cli_host,
             // Refresh balance
             utxos = refresh_and_print();
 
+            // CRITICAL FIX: Get actual blockchain tip height from node, NOT from UTXO heights
+            // Previously used max(UTXO heights) which is wrong if user only has old coinbase rewards
+            // This caused mature coinbase to be marked as immature, making funds unspendable
             uint64_t tip_h = 0;
-            for(const auto& u: utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
+            {
+                // First try to get actual height from node
+                auto rpc_endpoints = build_endpoints_from_seeds(
+                    build_seed_candidates(cli_host, cli_port), true);
+                uint32_t node_height = 0;
+                std::string best_hash, used_ep, err;
+                if (rpc_wallet::rpc_get_blockchain_info(rpc_endpoints, node_height, best_hash, used_ep, err)) {
+                    tip_h = node_height;
+                } else {
+                    // Fallback: use max UTXO height (less accurate but better than 0)
+                    for(const auto& u: utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
+                }
+            }
 
             // Get spendable UTXOs
             // CRITICAL FIX: Filter out unconfirmed UTXOs (height=0) to prevent orphan transactions
@@ -11560,6 +11598,21 @@ static bool wallet_session(const std::string& cli_host,
                 }
             }
 
+            // CRITICAL FIX: Always add to transaction history, regardless of broadcast success
+            // This ensures the transaction shows in the dashboard even when queued for later broadcast
+            // The confirmations=0 status indicates it's still pending
+            {
+                TxHistoryEntry hist;
+                hist.txid_hex = txid_hex;
+                hist.timestamp = (int64_t)time(nullptr);
+                hist.amount = -(int64_t)amount;
+                hist.fee = fee_final;
+                hist.confirmations = 0;
+                hist.direction = "sent";
+                hist.to_address = to;
+                add_tx_history(wdir, hist);
+            }
+
             if(!broadcast_success){
                 // Save transaction to queue for later broadcast
                 QueuedTransaction qtx;
@@ -11592,16 +11645,7 @@ static bool wallet_session(const std::string& cli_host,
                 continue;
             }
 
-            // Add to transaction history
-            TxHistoryEntry hist;
-            hist.txid_hex = txid_hex;
-            hist.timestamp = (int64_t)time(nullptr);
-            hist.amount = -(int64_t)amount;
-            hist.fee = fee_final;
-            hist.confirmations = 0;
-            hist.direction = "sent";
-            hist.to_address = to;
-            add_tx_history(wdir, hist);
+            // Transaction already added to history above
 
             // V1.1 STABILITY FIX: Also add to queue for rebroadcast tracking
             // Even successful broadcasts may not propagate properly, so we track them
@@ -12394,8 +12438,20 @@ static bool wallet_session(const std::string& cli_host,
             std::cout << "  +============================================================+" << ui::reset() << "\n\n";
 
             // Calculate current fragmentation
+            // CRITICAL FIX: Get actual blockchain tip height from node
             uint64_t tip_h = 0;
-            for(const auto& u: utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
+            {
+                auto rpc_endpoints = build_endpoints_from_seeds(
+                    build_seed_candidates(cli_host, cli_port), true);
+                uint32_t node_height = 0;
+                std::string best_hash, used_ep, err;
+                if (rpc_wallet::rpc_get_blockchain_info(rpc_endpoints, node_height, best_hash, used_ep, err)) {
+                    tip_h = node_height;
+                } else {
+                    // Fallback: use max UTXO height
+                    for(const auto& u: utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
+                }
+            }
 
             std::vector<miq::UtxoLite> spendables;
             for(const auto& u: utxos){
@@ -13209,8 +13265,19 @@ static bool wallet_session(const std::string& cli_host,
             int spendable_count = 0;
             int pending_count = 0;
 
+            // CRITICAL FIX: Get actual blockchain tip height from node
             uint64_t tip_h = 0;
-            for(const auto& u : utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
+            {
+                auto rpc_endpoints = build_endpoints_from_seeds(
+                    build_seed_candidates(cli_host, cli_port), true);
+                uint32_t node_height = 0;
+                std::string best_hash, used_ep, err;
+                if (rpc_wallet::rpc_get_blockchain_info(rpc_endpoints, node_height, best_hash, used_ep, err)) {
+                    tip_h = node_height;
+                } else {
+                    for(const auto& u : utxos) tip_h = std::max<uint64_t>(tip_h, u.height);
+                }
+            }
 
             for(const auto& u : utxos){
                 total_val += u.value;
