@@ -1075,6 +1075,19 @@ static bool rpc_getminerstats(const std::string& host, uint16_t port, const std:
     if(json_find_double(r.body, "network_hash_ps", out_net_hs)) return true;
     return false;
 }
+
+// Report miner stats to node for display in node's TUI
+static bool rpc_setminerstats(const std::string& host, uint16_t port, const std::string& auth,
+                              double hps, uint64_t hashes, uint64_t accepted, uint64_t rejected, unsigned threads){
+    std::ostringstream ps;
+    ps << "[" << std::fixed << std::setprecision(2) << hps << "," << hashes << ","
+       << accepted << "," << rejected << "," << threads << "]";
+    HttpResp r;
+    // Fire-and-forget, don't retry heavily
+    if(!http_post(host, port, "/", auth, rpc_build("setminerstats", ps.str()), r)) return false;
+    return r.code == 200 && !json_has_error(r.body);
+}
+
 static bool rpc_getblockhash(const std::string& host, uint16_t port, const std::string& auth, uint64_t height, std::string& out){
     std::ostringstream ps; ps<<"["<<height<<"]";
     HttpResp r;
@@ -1606,6 +1619,7 @@ struct UIState {
     std::atomic<uint64_t> node_blocks{0};
     std::atomic<double>   node_verification{0.0};
     std::atomic<int>      rpc_errors{0};
+    std::atomic<unsigned> cpu_threads{0};
 
     // Pool mining statistics
     std::atomic<bool>     pool_mode{false};
@@ -3232,6 +3246,7 @@ int main(int argc, char** argv){
         ui.my_pkh = pkh;
         ui.rpc_host = rpc_host;
         ui.rpc_port = rpc_port;
+        ui.cpu_threads.store(threads);
 
 #if defined(_WIN32)
         SetConsoleCtrlHandler(ctrl_handler, TRUE);
@@ -3736,6 +3751,18 @@ int main(int argc, char** argv){
                             ui.est_total_base.store(est_total);
                             ui.total_received_base.store(est_matured);
                         }
+                    }
+
+                    // Report miner stats to node for TUI display
+                    {
+                        double cpu_hs = ui.hps_smooth.load();
+                        double gpu_hs = ui.gpu_available.load() ? ui.gpu_hps_smooth.load() : 0.0;
+                        double total_hs = cpu_hs + gpu_hs;
+                        uint64_t hashes = ui.tries_total.load();
+                        uint64_t accepted = ui.mined_blocks.load() + ui.shares_accepted.load();
+                        uint64_t rejected = ui.shares_rejected.load();
+                        unsigned threads = ui.cpu_threads.load();
+                        (void)rpc_setminerstats(rpc_host, rpc_port, token, total_hs, hashes, accepted, rejected, threads);
                     }
                 } else {
                     // RPC call failed - mark node as unreachable

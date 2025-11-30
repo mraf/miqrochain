@@ -68,6 +68,38 @@ static constexpr uint64_t DUST_THRESHOLD = 1000; // 0.00001000 MIQ
 // --- RPC request limits ---
 static constexpr size_t RPC_MAX_BODY_BYTES = 512 * 1024; // 512 KiB
 
+// --- External miner stats (updated via setminerstats RPC) ---
+struct ExternalMinerStats {
+    std::atomic<double> hps{0.0};
+    std::atomic<uint64_t> hashes{0};
+    std::atomic<uint64_t> accepted{0};
+    std::atomic<uint64_t> rejected{0};
+    std::atomic<unsigned> threads{0};
+    std::atomic<bool> active{false};
+    std::atomic<int64_t> last_update_ms{0};
+    std::atomic<int64_t> start_time_ms{0};
+};
+static ExternalMinerStats g_ext_miner_stats;
+
+// --- TUI miner stats (defined in main.cpp) ---
+// We declare extern to update TUI display when external miner reports stats
+struct MinerStats {
+    std::atomic<bool> active{false};
+    std::atomic<unsigned> threads{0};
+    std::atomic<uint64_t> accepted{0};
+    std::atomic<uint64_t> rejected{0};
+    std::atomic<uint64_t> last_height_ok{0};
+    std::atomic<uint64_t> last_height_rx{0};
+    std::chrono::steady_clock::time_point start{};
+    std::atomic<double>   hps{0.0};
+};
+extern MinerStats g_miner_stats;
+
+static int64_t rpc_now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
 namespace miq {
 
 // ======== Cookie/static-token auth helpers (HTTP layer checks MIQ_RPC_TOKEN) ========
@@ -1514,16 +1546,90 @@ std::string RpcService::handle(const std::string& body){
             JNode out; out.v = o; return json_dump(out);
         }
 
-        // Miner stats - built-in miner removed, return zeros
-        // Use external miner (miqminer) for mining
+        // Miner stats - returns external miner stats if active
         if(method=="getminerstats"){
             std::map<std::string,JNode> o;
-            JNode jh; jh.v = (double)0;      o["hashes"]  = jh;
-            JNode js; js.v = 0.0;            o["seconds"] = js;
-            JNode jj; jj.v = 0.0;            o["hps"]     = jj;
-            JNode jt; jt.v = (double)0;      o["total"]   = jt;
+
+            // Check if external miner is active (updated within last 30 seconds)
+            int64_t now = rpc_now_ms();
+            int64_t last_update = g_ext_miner_stats.last_update_ms.load();
+            bool ext_active = g_ext_miner_stats.active.load() && (now - last_update < 30000);
+
+            if (ext_active) {
+                // Return external miner stats
+                double hps = g_ext_miner_stats.hps.load();
+                uint64_t hashes = g_ext_miner_stats.hashes.load();
+                uint64_t accepted = g_ext_miner_stats.accepted.load();
+                uint64_t rejected = g_ext_miner_stats.rejected.load();
+                unsigned threads = g_ext_miner_stats.threads.load();
+                int64_t start = g_ext_miner_stats.start_time_ms.load();
+                double seconds = (now - start) / 1000.0;
+                if (seconds < 0) seconds = 0;
+
+                o["hps"] = jnum(hps);
+                o["hashes"] = jnum((double)hashes);
+                o["total"] = jnum((double)hashes);
+                o["seconds"] = jnum(seconds);
+                o["accepted"] = jnum((double)accepted);
+                o["rejected"] = jnum((double)rejected);
+                o["threads"] = jnum((double)threads);
+                o["active"] = jbool(true);
+            } else {
+                // No active miner
+                o["hps"] = jnum(0.0);
+                o["hashes"] = jnum(0.0);
+                o["total"] = jnum(0.0);
+                o["seconds"] = jnum(0.0);
+                o["active"] = jbool(false);
+            }
 
             JNode out; out.v = o; return json_dump(out);
+        }
+
+        // Set miner stats - for external miner to report its stats
+        if(method=="setminerstats"){
+            // params: [hps, hashes, accepted, rejected, threads]
+            double hps = 0.0;
+            uint64_t hashes = 0, accepted = 0, rejected = 0;
+            unsigned threads = 0;
+
+            if (params.size() >= 1 && std::holds_alternative<double>(params[0].v))
+                hps = std::get<double>(params[0].v);
+            if (params.size() >= 2 && std::holds_alternative<double>(params[1].v))
+                hashes = (uint64_t)std::get<double>(params[1].v);
+            if (params.size() >= 3 && std::holds_alternative<double>(params[2].v))
+                accepted = (uint64_t)std::get<double>(params[2].v);
+            if (params.size() >= 4 && std::holds_alternative<double>(params[3].v))
+                rejected = (uint64_t)std::get<double>(params[3].v);
+            if (params.size() >= 5 && std::holds_alternative<double>(params[4].v))
+                threads = (unsigned)std::get<double>(params[4].v);
+
+            int64_t now = rpc_now_ms();
+
+            // Initialize start time if first update
+            if (!g_ext_miner_stats.active.load()) {
+                g_ext_miner_stats.start_time_ms.store(now);
+            }
+
+            g_ext_miner_stats.hps.store(hps);
+            g_ext_miner_stats.hashes.store(hashes);
+            g_ext_miner_stats.accepted.store(accepted);
+            g_ext_miner_stats.rejected.store(rejected);
+            g_ext_miner_stats.threads.store(threads);
+            g_ext_miner_stats.active.store(true);
+            g_ext_miner_stats.last_update_ms.store(now);
+
+            // Also update TUI miner stats (g_miner_stats defined in main.cpp)
+            if (!g_miner_stats.active.load()) {
+                g_miner_stats.start = std::chrono::steady_clock::now();
+            }
+            g_miner_stats.hps.store(hps);
+            g_miner_stats.accepted.store(accepted);
+            g_miner_stats.rejected.store(rejected);
+            g_miner_stats.threads.store(threads);
+            g_miner_stats.active.store(true);
+
+            return "{\"result\":\"ok\"}";
         }
 
         // ---------------- address UTXO lookup (for mobile/GUI) ----------------

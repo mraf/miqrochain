@@ -389,11 +389,6 @@ static std::string default_datadir() {
     return "./miqdata";
 #endif
 }
-static inline void trim_inplace(std::string& s){
-    auto notspace = [](unsigned char ch){ return !std::isspace(ch); };
-    s.erase(s.begin(), std::find_if(s.begin(), s.end(), notspace));
-    s.erase(std::find_if(s.rbegin(), s.rend(), notspace).base(), s.end());
-}
 static bool read_file_all(const std::string& path, std::vector<uint8_t>& out){
     std::ifstream f(path, std::ios::binary);
     if(!f) return false;
