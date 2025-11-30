@@ -338,9 +338,10 @@ namespace wallet_config {
     static constexpr int PENDING_TIMEOUT_MINUTES = 5;
     static constexpr int64_t PENDING_TIMEOUT_SECONDS = PENDING_TIMEOUT_MINUTES * 60;
 
-    // v9.0 FIX: Faster rebroadcast for reliable transaction delivery
+    // V1.1 STABILITY FIX: Rebroadcast tuned for ~8 minute blocks
     // Transactions with "broadcast" status should be rebroadcast periodically
-    static constexpr int REBROADCAST_INTERVAL_MINUTES = 2;
+    // 3 minutes interval is appropriate - transactions propagate fast, but blocks are ~8 min
+    static constexpr int REBROADCAST_INTERVAL_MINUTES = 3;
     static constexpr int64_t REBROADCAST_INTERVAL_SECONDS = REBROADCAST_INTERVAL_MINUTES * 60;
 
     // v9.0: Quick confirmation check interval (seconds)
@@ -6510,6 +6511,22 @@ struct BlockchainTxDetails {
     bool is_confirmed{false};
     bool is_mempool{false};
     std::string status_text;
+
+    // V1.1 FIX: Inputs and Outputs for full transaction details
+    struct TxInput {
+        std::string prev_txid;
+        uint32_t prev_vout{0};
+        uint64_t value{0};
+        std::string address;
+    };
+    struct TxOutput {
+        uint64_t value{0};
+        std::string address;
+        uint32_t vout_index{0};
+    };
+    std::vector<TxInput> inputs;
+    std::vector<TxOutput> outputs;
+    bool has_io_data{false};
 };
 
 // Fetch blockchain info via RPC
@@ -6614,6 +6631,213 @@ static bool fetch_block_by_height(const std::string& host, uint16_t port, uint64
     time_out = (int64_t)extract_num("time");
     tx_count_out = (uint32_t)extract_num("nTx");
 
+    return true;
+}
+
+// V1.1 FIX: Fetch full transaction details from blockchain including inputs/outputs
+static bool fetch_tx_details_from_node(const std::string& host, uint16_t port,
+                                        const std::string& txid,
+                                        BlockchainTxDetails& details) {
+    // Use getrawtransaction with verbose=true to get decoded tx
+    std::string rpc_body = R"({"method":"getrawtransaction","params":[")" + txid + R"(", true]})";
+    miq::HttpResponse resp;
+    std::vector<std::pair<std::string, std::string>> headers;
+
+    if (!miq::http_post(host, port, "/", rpc_body, headers, resp, 8000)) {
+        return false;
+    }
+
+    if (resp.code != 200) return false;
+
+    // Check for error
+    if (resp.body.find("\"error\":null") == std::string::npos &&
+        resp.body.find("\"error\": null") == std::string::npos) {
+        // There's an error - transaction might not exist
+        return false;
+    }
+
+    // Parse confirmations
+    {
+        size_t pos = resp.body.find("\"confirmations\"");
+        if (pos != std::string::npos) {
+            pos = resp.body.find(":", pos);
+            if (pos != std::string::npos) {
+                pos++;
+                while (pos < resp.body.size() && (resp.body[pos] == ' ' || resp.body[pos] == '\t')) pos++;
+                uint32_t val = 0;
+                while (pos < resp.body.size() && std::isdigit(resp.body[pos])) {
+                    val = val * 10 + (resp.body[pos] - '0');
+                    pos++;
+                }
+                details.confirmations = val;
+                details.is_confirmed = (val >= 1);
+            }
+        }
+    }
+
+    // Parse blockhash (if confirmed)
+    {
+        size_t pos = resp.body.find("\"blockhash\"");
+        if (pos != std::string::npos) {
+            pos = resp.body.find("\"", pos + 11);
+            if (pos != std::string::npos) {
+                pos++;
+                size_t end = resp.body.find("\"", pos);
+                if (end != std::string::npos) {
+                    details.block_hash = resp.body.substr(pos, end - pos);
+                }
+            }
+        }
+    }
+
+    // Parse blocktime
+    {
+        size_t pos = resp.body.find("\"blocktime\"");
+        if (pos != std::string::npos) {
+            pos = resp.body.find(":", pos);
+            if (pos != std::string::npos) {
+                pos++;
+                while (pos < resp.body.size() && (resp.body[pos] == ' ' || resp.body[pos] == '\t')) pos++;
+                int64_t val = 0;
+                while (pos < resp.body.size() && std::isdigit(resp.body[pos])) {
+                    val = val * 10 + (resp.body[pos] - '0');
+                    pos++;
+                }
+                details.block_time = val;
+            }
+        }
+    }
+
+    // Parse size
+    {
+        size_t pos = resp.body.find("\"size\"");
+        if (pos != std::string::npos) {
+            pos = resp.body.find(":", pos);
+            if (pos != std::string::npos) {
+                pos++;
+                while (pos < resp.body.size() && (resp.body[pos] == ' ' || resp.body[pos] == '\t')) pos++;
+                uint32_t val = 0;
+                while (pos < resp.body.size() && std::isdigit(resp.body[pos])) {
+                    val = val * 10 + (resp.body[pos] - '0');
+                    pos++;
+                }
+                details.tx_size = val;
+            }
+        }
+    }
+
+    // Parse vout (outputs)
+    {
+        size_t vout_start = resp.body.find("\"vout\"");
+        if (vout_start != std::string::npos) {
+            size_t vout_end = resp.body.find("]", vout_start);
+            if (vout_end != std::string::npos) {
+                std::string vout_str = resp.body.substr(vout_start, vout_end - vout_start);
+
+                // Find each output entry
+                size_t pos = 0;
+                uint32_t vout_idx = 0;
+                while ((pos = vout_str.find("\"value\"", pos)) != std::string::npos) {
+                    BlockchainTxDetails::TxOutput out;
+                    out.vout_index = vout_idx++;
+
+                    // Parse value (in MIQ)
+                    pos = vout_str.find(":", pos);
+                    if (pos != std::string::npos) {
+                        pos++;
+                        while (pos < vout_str.size() && (vout_str[pos] == ' ' || vout_str[pos] == '\t')) pos++;
+                        double val = 0;
+                        std::string num_str;
+                        while (pos < vout_str.size() && (std::isdigit(vout_str[pos]) || vout_str[pos] == '.')) {
+                            num_str += vout_str[pos];
+                            pos++;
+                        }
+                        if (!num_str.empty()) {
+                            val = std::stod(num_str);
+                            out.value = (uint64_t)(val * (double)COIN);
+                        }
+                    }
+
+                    // Parse address from scriptPubKey
+                    size_t addr_pos = vout_str.find("\"address\"", pos);
+                    if (addr_pos != std::string::npos && addr_pos < vout_str.find("\"value\"", pos + 1)) {
+                        addr_pos = vout_str.find("\"", addr_pos + 9);
+                        if (addr_pos != std::string::npos) {
+                            addr_pos++;
+                            size_t addr_end = vout_str.find("\"", addr_pos);
+                            if (addr_end != std::string::npos) {
+                                out.address = vout_str.substr(addr_pos, addr_end - addr_pos);
+                            }
+                        }
+                    }
+
+                    if (out.value > 0) {
+                        details.outputs.push_back(out);
+                    }
+                }
+            }
+        }
+    }
+
+    // Parse vin (inputs)
+    {
+        size_t vin_start = resp.body.find("\"vin\"");
+        if (vin_start != std::string::npos) {
+            size_t vin_end = resp.body.find("]", vin_start);
+            if (vin_end != std::string::npos) {
+                std::string vin_str = resp.body.substr(vin_start, vin_end - vin_start);
+
+                // Check for coinbase (mining reward)
+                if (vin_str.find("\"coinbase\"") != std::string::npos) {
+                    BlockchainTxDetails::TxInput in;
+                    in.prev_txid = "COINBASE";
+                    in.prev_vout = 0;
+                    in.value = 0;
+                    in.address = "Block Reward";
+                    details.inputs.push_back(in);
+                } else {
+                    // Find each input entry
+                    size_t pos = 0;
+                    while ((pos = vin_str.find("\"txid\"", pos)) != std::string::npos) {
+                        BlockchainTxDetails::TxInput in;
+
+                        // Parse txid
+                        pos = vin_str.find("\"", pos + 6);
+                        if (pos != std::string::npos) {
+                            pos++;
+                            size_t end = vin_str.find("\"", pos);
+                            if (end != std::string::npos) {
+                                in.prev_txid = vin_str.substr(pos, end - pos);
+                                pos = end;
+                            }
+                        }
+
+                        // Parse vout
+                        size_t vout_pos = vin_str.find("\"vout\"", pos);
+                        if (vout_pos != std::string::npos) {
+                            vout_pos = vin_str.find(":", vout_pos);
+                            if (vout_pos != std::string::npos) {
+                                vout_pos++;
+                                while (vout_pos < vin_str.size() && (vin_str[vout_pos] == ' ' || vin_str[vout_pos] == '\t')) vout_pos++;
+                                uint32_t val = 0;
+                                while (vout_pos < vin_str.size() && std::isdigit(vin_str[vout_pos])) {
+                                    val = val * 10 + (vin_str[vout_pos] - '0');
+                                    vout_pos++;
+                                }
+                                in.prev_vout = val;
+                            }
+                        }
+
+                        if (!in.prev_txid.empty()) {
+                            details.inputs.push_back(in);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    details.has_io_data = !details.inputs.empty() || !details.outputs.empty();
     return true;
 }
 
@@ -6785,6 +7009,53 @@ static void draw_tx_details_window(const BlockchainTxDetails& tx, int width = 72
         draw_section("MEMPOOL STATUS");
         draw_line("Status:", "Waiting for confirmation", "\033[38;5;220m");
         draw_line("Next Block:", "Estimated 1-3 blocks (~8-24 min)");
+    }
+
+    // V1.1 FIX: Display inputs and outputs
+    if (tx.has_io_data) {
+        // Inputs section
+        if (!tx.inputs.empty()) {
+            draw_section("INPUTS (" + std::to_string(tx.inputs.size()) + ")");
+            for (size_t i = 0; i < tx.inputs.size() && i < 5; i++) {
+                const auto& in = tx.inputs[i];
+                std::ostringstream line;
+                if (in.prev_txid == "COINBASE") {
+                    line << "\033[38;5;220m" << (g_use_utf8 ? "⛏ " : "* ") << "COINBASE (Mining Reward)" << reset();
+                } else {
+                    std::string short_txid = in.prev_txid.size() > 16 ?
+                        in.prev_txid.substr(0, 12) + "..." : in.prev_txid;
+                    line << dim() << short_txid << ":" << in.prev_vout << reset();
+                }
+                draw_line("[" + std::to_string(i) + "]", line.str());
+            }
+            if (tx.inputs.size() > 5) {
+                draw_line("", "... and " + std::to_string(tx.inputs.size() - 5) + " more inputs");
+            }
+        }
+
+        // Outputs section
+        if (!tx.outputs.empty()) {
+            draw_section("OUTPUTS (" + std::to_string(tx.outputs.size()) + ")");
+            for (size_t i = 0; i < tx.outputs.size() && i < 5; i++) {
+                const auto& out = tx.outputs[i];
+                std::ostringstream line;
+                line << std::fixed << std::setprecision(8) << ((double)out.value / (double)COIN) << " MIQ";
+                if (!out.address.empty()) {
+                    std::string short_addr = out.address.size() > 20 ?
+                        out.address.substr(0, 12) + "..." + out.address.substr(out.address.size() - 6) :
+                        out.address;
+                    line << " -> " << short_addr;
+                }
+                draw_line("[" + std::to_string(out.vout_index) + "]", line.str(), "\033[38;5;46m");
+            }
+            if (tx.outputs.size() > 5) {
+                draw_line("", "... and " + std::to_string(tx.outputs.size() - 5) + " more outputs");
+            }
+        }
+    } else {
+        draw_section("RAW DATA");
+        draw_line("Note:", "Input/output data not available", "\033[38;5;220m");
+        draw_line("", "Connect to node for full details");
     }
 
     draw_bottom();
@@ -9069,6 +9340,66 @@ static int process_tx_queue(
     return broadcasted;
 }
 
+// Forward declaration for build_endpoints_from_seeds (defined below)
+static std::vector<rpc_wallet::RpcEndpoint> build_endpoints_from_seeds(
+    const std::vector<std::pair<std::string,std::string>>& seeds,
+    bool localhost_first);
+
+// =============================================================================
+// V1.1 STABILITY FIX: Clean up confirmed transactions from queue
+// This prevents the queue from growing indefinitely and rebroadcasting
+// transactions that have already been confirmed in the blockchain
+// =============================================================================
+static int cleanup_confirmed_queue_txs(
+    const std::string& wdir,
+    const std::vector<std::pair<std::string,std::string>>& seeds,
+    std::set<OutpointKey>& pending,
+    bool verbose = true)
+{
+    std::vector<QueuedTransaction> queue;
+    load_tx_queue(wdir, queue);
+
+    if(queue.empty()) return 0;
+
+    auto endpoints = build_endpoints_from_seeds(seeds, true);
+    int cleaned = 0;
+
+    for(auto& tx : queue){
+        // Only check transactions that have been broadcast
+        if(tx.status != "broadcast" && tx.status != "broadcasting") continue;
+
+        // Check confirmation status via RPC (using rpc_verify_transaction)
+        int confirmations = 0;
+        std::string err;
+        if(rpc_wallet::rpc_verify_transaction(endpoints, tx.txid_hex, confirmations, err)){
+            if(confirmations >= 1){
+                // Transaction is confirmed! Mark it and release pending UTXOs
+                tx.status = "confirmed";
+                tx.error_msg = "";
+
+                // Release inputs from pending set
+                if(!tx.raw_tx.empty()){
+                    remove_inputs_from_pending(wdir, tx.raw_tx, pending);
+                }
+
+                cleaned++;
+
+                if(verbose){
+                    ui::print_success("TX " + tx.txid_hex.substr(0, 12) + "... confirmed (" +
+                                     std::to_string(confirmations) + " confirmations)");
+                }
+            }
+        }
+    }
+
+    if(cleaned > 0){
+        save_tx_queue(wdir, queue);
+        save_pending(wdir, pending);
+    }
+
+    return cleaned;
+}
+
 // Build RPC endpoints from seeds using helper function
 // v2.0: Centralizes endpoint construction logic
 static std::vector<rpc_wallet::RpcEndpoint> build_endpoints_from_seeds(
@@ -11225,6 +11556,24 @@ static bool wallet_session(const std::string& cli_host,
             hist.to_address = to;
             add_tx_history(wdir, hist);
 
+            // V1.1 STABILITY FIX: Also add to queue for rebroadcast tracking
+            // Even successful broadcasts may not propagate properly, so we track them
+            // The queue will automatically rebroadcast if the transaction doesn't confirm
+            {
+                QueuedTransaction qtx;
+                qtx.txid_hex = txid_hex;
+                qtx.raw_tx = raw;
+                qtx.created_at = (int64_t)time(nullptr);
+                qtx.last_attempt = qtx.created_at;
+                qtx.broadcast_attempts = 1;
+                qtx.status = "broadcast";  // Already broadcast, but track for rebroadcast
+                qtx.to_address = to;
+                qtx.amount = amount;
+                qtx.fee = fee_final;
+                qtx.error_msg = "";
+                add_to_tx_queue(wdir, qtx);
+            }
+
             // Update wallet statistics
             update_stats_for_send(wdir, amount, fee_final);
 
@@ -11508,6 +11857,16 @@ static bool wallet_session(const std::string& cli_host,
 
             utxos = refresh_and_print();
             is_online = (last_connected_node != "<offline>" && last_connected_node != "<not connected>");
+
+            // V1.1 FIX: Clean up confirmed transactions from queue first
+            // This prevents unnecessary rebroadcasting of already-confirmed transactions
+            if(is_online){
+                int cleaned = cleanup_confirmed_queue_txs(wdir, seeds, pending, false);
+                if(cleaned > 0){
+                    std::cout << "  " << ui::green() << "[CLEANUP]" << ui::reset()
+                              << " " << cleaned << " transaction(s) confirmed and removed from queue\n";
+                }
+            }
 
             // AUTO-BROADCAST: Automatically broadcast any pending transactions
             int pending_count = count_pending_in_queue(wdir);
@@ -12623,15 +12982,18 @@ static bool wallet_session(const std::string& cli_host,
             uint64_t current_difficulty = 0;
             std::string best_hash;
             std::string rpc_host = "127.0.0.1";
-            uint16_t rpc_port = 8332;
+            // V1.1 FIX: Use correct RPC port (default 9834, not Bitcoin's 8332)
+            uint16_t rpc_port = (uint16_t)miq::RPC_PORT;
 
-            // Try to parse from last_connected_node
+            // Try to parse from last_connected_node (this is P2P port, convert to RPC)
             if(last_connected_node != "<offline>" && last_connected_node != "<not connected>"){
                 size_t colon = last_connected_node.find(':');
                 if(colon != std::string::npos){
                     rpc_host = last_connected_node.substr(0, colon);
                     try {
-                        rpc_port = (uint16_t)std::stoi(last_connected_node.substr(colon + 1));
+                        uint16_t p2p_port = (uint16_t)std::stoi(last_connected_node.substr(colon + 1));
+                        // V1.1 FIX: Convert P2P port to RPC port (P2P - 49)
+                        rpc_port = (p2p_port == miq::P2P_PORT) ? (uint16_t)miq::RPC_PORT : (p2p_port - 49);
                     } catch(...) {}
                 }
             }
@@ -12737,6 +13099,25 @@ static bool wallet_session(const std::string& cli_host,
                     details.is_mempool = true;
                     details.status_text = "Pending";
                 }
+
+                // V1.1 FIX: Fetch full transaction details from node (inputs/outputs)
+                ui::print_info("Fetching transaction details from node...");
+                if(fetch_tx_details_from_node(rpc_host, rpc_port, details.txid_hex, details)){
+                    // Update confirmations and status from live data
+                    if(details.confirmations >= 6){
+                        details.is_confirmed = true;
+                        details.status_text = "Confirmed";
+                    } else if(details.confirmations > 0){
+                        details.is_confirmed = true;
+                        details.status_text = "Confirming (" + std::to_string(details.confirmations) + "/6)";
+                    }
+
+                    // Update fee rate if we got actual size
+                    if(details.fee > 0 && details.tx_size > 0){
+                        details.fee_rate = (double)details.fee / (double)details.tx_size;
+                    }
+                }
+                ui::clear_line();
 
                 // Try to get block info if confirmed
                 if(details.confirmations > 0 && current_height > 0){

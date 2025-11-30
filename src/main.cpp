@@ -4782,6 +4782,21 @@ int main(int argc, char** argv){
                 mempool.update_fee_estimates(static_cast<uint32_t>(chain.height()));
             }
 
+            // V1.1 STABILITY FIX: Periodic mempool persistence (every ~5 minutes)
+            // This ensures transactions survive unexpected crashes/restarts
+            // Critical for transaction reliability - don't lose mempool on node crash
+            static int64_t last_mempool_save_ms = 0;
+            if (now_ms() - last_mempool_save_ms > 5 * 60 * 1000) {
+                last_mempool_save_ms = now_ms();
+                std::string mempool_path = cfg.datadir + "/mempool.dat";
+                if (mempool.size() > 0) {
+                    mempool.save_to_disk(mempool_path);
+                    // Log at debug level to avoid spam
+                    MIQ_LOG_DEBUG(miq::LogCategory::MEMPOOL, "Periodic mempool save: " +
+                                  std::to_string(mempool.size()) + " transactions");
+                }
+            }
+
             bool degraded = false;
             if (!cfg.no_p2p){
                 auto n = p2p.snapshot_peers().size();
