@@ -2351,7 +2351,14 @@ std::string RpcService::handle(const std::string& body){
                 JNode n; n.v = o; arr.push_back(n);
             }
 
-            JNode out; out.v = arr; return json_dump(out);
+            // Build result with metadata including blocks_scanned for monitoring
+            std::map<std::string, JNode> result;
+            JNode txArr; txArr.v = arr;
+            result["transactions"] = txArr;
+            result["blocks_scanned"] = jnum((double)blocks_scanned);
+            result["count"] = jnum((double)arr.size());
+
+            JNode out; out.v = result; return json_dump(out);
         }
 
         // -------- Spend from HD wallet (filters immature coinbase) --------

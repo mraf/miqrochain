@@ -8,6 +8,7 @@
 #include "chain.h"
 #include "p2p.h"
 #include "mempool.h"
+#include "utxo.h"
 #include "log.h"
 
 #include <thread>
@@ -235,12 +236,43 @@ bool Miner::build_template(Block& b, uint32_t& bits){
     b.txs.clear();
     b.txs.push_back(make_coinbase_for(chain_, reward_pkh20_));
 
+    uint64_t total_fees = 0;
     if (p2p_) {
         // Pull high-fee txs (already policy-checked by mempool)
         auto picked = (p2p_ && p2p_->mempool())
                 ? p2p_->mempool()->collect(max_txs_)
                 : std::vector<Transaction>{};
+
+        // CRITICAL FIX: Calculate fees for all collected transactions
+        // This ensures miners get paid for including transactions
+        for (const auto& tx : picked) {
+            uint64_t in_sum = 0, out_sum = 0;
+            bool fee_ok = true;
+
+            for (const auto& inp : tx.vin) {
+                UTXOEntry e;
+                if (chain_.utxo().get(inp.prev.txid, inp.prev.vout, e)) {
+                    in_sum += e.value;
+                } else {
+                    fee_ok = false;
+                    break;
+                }
+            }
+            for (const auto& outp : tx.vout) {
+                out_sum += outp.value;
+            }
+            if (fee_ok && in_sum >= out_sum) {
+                total_fees += (in_sum - out_sum);
+            }
+        }
+
         b.txs.insert(b.txs.end(), picked.begin(), picked.end());
+    }
+
+    // CRITICAL FIX: Add collected fees to coinbase output
+    // This incentivizes miners to include transactions
+    if (total_fees > 0 && !b.txs.empty() && !b.txs[0].vout.empty()) {
+        b.txs[0].vout[0].value += total_fees;
     }
 
     // merkle

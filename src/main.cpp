@@ -3954,6 +3954,7 @@ static void miner_worker(Chain* chain, Mempool* mempool, P2P* p2p,
             cbt.vin[0].sig = std::move(tag);
 
             std::vector<Transaction> txs;
+            uint64_t total_fees = 0;
             try {
                 const size_t coinbase_sz = ser_tx(cbt).size();
                 const size_t budget = (kBlockMaxBytes > coinbase_sz) ? (kBlockMaxBytes - coinbase_sz) : 0;
@@ -3962,11 +3963,38 @@ static void miner_worker(Chain* chain, Mempool* mempool, P2P* p2p,
                 for (auto& tx : cands) {
                     size_t sz = ser_tx(tx).size();
                     if (used + sz > budget) continue;
+
+                    // CRITICAL FIX: Calculate fee for this transaction
+                    // Fee = sum(inputs) - sum(outputs)
+                    uint64_t in_sum = 0, out_sum = 0;
+                    bool fee_ok = true;
+                    for (const auto& inp : tx.vin) {
+                        miq::UTXOEntry e;
+                        if (chain->utxo().get(inp.prev.txid, inp.prev.vout, e)) {
+                            in_sum += e.value;
+                        } else {
+                            fee_ok = false;
+                            break;
+                        }
+                    }
+                    for (const auto& outp : tx.vout) {
+                        out_sum += outp.value;
+                    }
+                    if (fee_ok && in_sum >= out_sum) {
+                        total_fees += (in_sum - out_sum);
+                    }
+
                     txs.emplace_back(std::move(tx));
                     used += sz;
                     if (used >= budget) break;
                 }
-            } catch(...) { txs.clear(); }
+            } catch(...) { txs.clear(); total_fees = 0; }
+
+            // CRITICAL FIX: Add collected fees to coinbase output
+            // This incentivizes miners to include transactions
+            if (total_fees > 0 && !cbt.vout.empty()) {
+                cbt.vout[0].value += total_fees;
+            }
 
             Block b;
             try {
