@@ -355,10 +355,23 @@ bool Mempool::accept(const Transaction& tx, const UTXOView& utxo, uint32_t heigh
     if (!validate_inputs_and_calc_fee(tx, utxo, height, fee, terr)) {
         if (terr.empty()) {
             // Orphan path: cache and index by missing parents
-            MIQ_LOG_INFO(LogCategory::MEMPOOL, "tx " + txid_hex + " -> orphan pool (missing parent UTXOs, " +
-                        std::to_string(tx.vin.size()) + " inputs checked)");
+            // Log with details about which inputs are missing
+            std::string missing_info;
+            for (const auto& in : tx.vin) {
+                UTXOEntry e;
+                if (!utxo.get(in.prev.txid, in.prev.vout, e)) {
+                    Key pk = k(in.prev.txid);
+                    if (map_.find(pk) == map_.end()) {
+                        // Not in UTXO and not in mempool - truly missing
+                        missing_info += to_hex(in.prev.txid).substr(0, 16) + ":" + std::to_string(in.prev.vout) + " ";
+                    }
+                }
+            }
+            MIQ_LOG_WARN(LogCategory::MEMPOOL, "tx " + txid_hex + " -> orphan pool (missing: " + missing_info +
+                        ", " + std::to_string(tx.vin.size()) + " inputs)");
             add_orphan(tx);
-            return true; // not a hard reject
+            err = "orphan: input(s) not found - " + missing_info;
+            return false;
         }
         err = terr;
         MIQ_LOG_WARN(LogCategory::MEMPOOL, "tx " + txid_hex + " rejected: " + err);

@@ -894,7 +894,13 @@ std::string RpcService::handle(const std::string& body){
             // Collect mempool txs with simple fee & size estimates.
             auto txs_vec = mempool_.collect(5000);
             log_info("getminertemplate: mempool size=" + std::to_string(mempool_.size()) +
+                     ", orphan pool size=" + std::to_string(mempool_.orphan_count()) +
                      ", collected " + std::to_string(txs_vec.size()) + " txs for template");
+
+            // DIAGNOSTIC: If no transactions and mempool is empty, log the state
+            if (txs_vec.empty() && mempool_.size() == 0) {
+                log_info("getminertemplate: empty mempool - no pending transactions");
+            }
             std::vector<JNode> arr;
 
             // Build a quick index from txid -> (fee, vsize, hex, depends[])
@@ -2297,7 +2303,18 @@ std::string RpcService::handle(const std::string& body){
             }
 
             auto tip = chain_.tip(); std::string e;
+
+            // DIAGNOSTIC: Log transaction details before submission
+            log_info("sendfromhd: attempting tx with " + std::to_string(tx.vin.size()) + " inputs, " +
+                     std::to_string(tx.vout.size()) + " outputs, tip height=" + std::to_string(tip.height));
+            for (size_t i = 0; i < tx.vin.size(); ++i) {
+                const auto& in = tx.vin[i];
+                log_info("  input[" + std::to_string(i) + "]: " + to_hex(in.prev.txid).substr(0, 16) + ":" + std::to_string(in.prev.vout));
+            }
+
             if(mempool_.accept(tx, chain_.utxo(), static_cast<uint32_t>(tip.height), e)){
+                log_info("sendfromhd: tx " + to_hex(tx.txid()).substr(0, 16) + " accepted into mempool (size=" +
+                         std::to_string(mempool_.size()) + ")");
                 // CRITICAL FIX: Broadcast transaction to P2P network
                 // Without this, transactions only sit in local mempool and never propagate!
                 if(p2p_) {
@@ -2318,6 +2335,7 @@ std::string RpcService::handle(const std::string& body){
                 }
                 JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
             } else {
+                log_warn("sendfromhd: tx rejected: " + e);
                 return err(e);
             }
         }
