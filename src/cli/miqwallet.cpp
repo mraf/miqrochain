@@ -5405,9 +5405,11 @@ struct TransactionPlan {
         const auto& u = utxos[i];
 
         // Skip immature coinbase
+        // CRITICAL FIX: Use <= to match mempool/chain validation (was <, off-by-one)
+        // Mempool rejects: height + 1 <= coinbase_height + COINBASE_MATURITY
         if(u.coinbase){
-            uint64_t mature_h = (uint64_t)u.height + 100ULL;
-            if(tip_height + 1 < mature_h) continue;
+            uint64_t mature_h = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
+            if(tip_height + 1 <= mature_h) continue;
         }
 
         // Skip pending
@@ -5504,10 +5506,12 @@ struct BatchTransactionPlan {
     }
 
     // Filter spendable UTXOs
+    // CRITICAL FIX: Use <= to match mempool/chain validation (was <, off-by-one)
+    // Mempool rejects: height + 1 <= coinbase_height + COINBASE_MATURITY
     std::vector<std::pair<size_t, uint64_t>> spendable;
     for(size_t i = 0; i < utxos.size(); ++i){
         const auto& u = utxos[i];
-        if(u.coinbase && tip_height + 1 < u.height + 100) continue;
+        if(u.coinbase && tip_height + 1 <= u.height + miq::COINBASE_MATURITY) continue;
         OutpointKey k{ miq::to_hex(u.txid), u.vout };
         if(pending.find(k) != pending.end()) continue;
         spendable.push_back({i, u.value});
