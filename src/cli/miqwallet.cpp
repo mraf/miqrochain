@@ -3188,7 +3188,10 @@ namespace live_dashboard {
         }
         std::cout << "\033[0m";
         clear_to_eol();
-        std::cout << std::flush;
+
+        // v1.0 STABLE: Clear remaining screen area for complete zero-flicker
+        // This ensures any leftover content from previous views is cleared
+        std::cout << "\033[J" << std::flush;
     }
 
     // Reset dashboard state (call when leaving dashboard)
@@ -8073,14 +8076,56 @@ static void print_tx_details_view(const TxDetailedEntry& tx,
                                    const std::vector<AddressBookEntry>& address_book);
 
 // Interactive transaction details viewer with tabs
+// =============================================================================
+// TX FULL INFO CACHE - Prevents repeated RPC calls for same transaction
+// Cache entry expires after 60 seconds for fresh data on re-view
+// =============================================================================
+static std::unordered_map<std::string, std::pair<TxFullInfo, int64_t>> g_tx_info_cache;
+static const int64_t TX_INFO_CACHE_EXPIRY_SEC = 60;
+
+static bool get_cached_tx_info(const std::string& txid, TxFullInfo& out) {
+    auto it = g_tx_info_cache.find(txid);
+    if (it != g_tx_info_cache.end()) {
+        int64_t now = (int64_t)time(nullptr);
+        if (now - it->second.second < TX_INFO_CACHE_EXPIRY_SEC) {
+            out = it->second.first;
+            return true;
+        }
+        // Cache expired, remove it
+        g_tx_info_cache.erase(it);
+    }
+    return false;
+}
+
+static void cache_tx_info(const std::string& txid, const TxFullInfo& info) {
+    int64_t now = (int64_t)time(nullptr);
+    g_tx_info_cache[txid] = {info, now};
+    // Prune old entries if cache gets too large
+    if (g_tx_info_cache.size() > 100) {
+        for (auto it = g_tx_info_cache.begin(); it != g_tx_info_cache.end(); ) {
+            if (now - it->second.second > TX_INFO_CACHE_EXPIRY_SEC) {
+                it = g_tx_info_cache.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
 static void show_interactive_tx_details(
     const TxDetailedEntry& tx,
     const std::vector<AddressBookEntry>& address_book,
     const std::vector<std::pair<std::string,std::string>>& seeds)
 {
-    // Fetch full info from RPC
+    // v1.0 STABLE: Use cached tx info if available, otherwise fetch and cache
     TxFullInfo full_info;
-    bool has_full_info = fetch_tx_full_info(seeds, tx.txid_hex, full_info);
+    bool has_full_info = get_cached_tx_info(tx.txid_hex, full_info);
+    if (!has_full_info) {
+        has_full_info = fetch_tx_full_info(seeds, tx.txid_hex, full_info);
+        if (has_full_info) {
+            cache_tx_info(tx.txid_hex, full_info);
+        }
+    }
 
     // Tab state: 0=Overview, 1=Block Info, 2=Inputs, 3=Outputs
     int current_tab = 0;
@@ -8099,10 +8144,19 @@ static void show_interactive_tx_details(
     instant_input::hide_cursor();
 
     bool running = true;
+    bool first_draw = true;  // v1.0 STABLE: Zero-flicker rendering
+
+    // v1.0 STABLE: Clear-to-end-of-line helper for zero-flicker
+    auto eol = []() { std::cout << "\033[K"; };
 
     while(running){
-        // Clear and redraw
-        std::cout << "\033[2J\033[H" << std::flush;
+        // v1.0 STABLE: ZERO-FLICKER - Only clear screen on first draw, then cursor home
+        if (first_draw) {
+            std::cout << "\033[2J\033[H" << std::flush;
+            first_draw = false;
+        } else {
+            std::cout << "\033[H" << std::flush;
+        }
 
         const int W = 78;
         std::string bc_h = ui::g_use_utf8 ? "═" : "=";
@@ -8112,15 +8166,15 @@ static void show_interactive_tx_details(
         std::string bc_bl = ui::g_use_utf8 ? "╚" : "+";
         std::string bc_br = ui::g_use_utf8 ? "╝" : "+";
 
-        // Header
+        // Header - v1.0 STABLE: Added eol() for zero-flicker
         std::cout << "\n";
         std::cout << "  " << ui::cyan() << bc_tl;
         for(int i = 0; i < W - 2; i++) std::cout << bc_h;
-        std::cout << bc_tr << ui::reset() << "\n";
+        std::cout << bc_tr << ui::reset(); eol(); std::cout << "\n";
 
         std::cout << "  " << ui::cyan() << bc_v << ui::reset();
         std::cout << "  " << ui::bold() << ui::white() << "TRANSACTION DETAILS" << ui::reset();
-        std::cout << std::string(W - 24, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+        std::cout << std::string(W - 24, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
         // Tab bar
         std::cout << "  " << ui::cyan() << bc_v << ui::reset();
@@ -8133,181 +8187,183 @@ static void show_interactive_tx_details(
                 std::cout << ui::dim() << " " << tabs[t] << "  " << ui::reset();
             }
         }
-        std::cout << std::string(W - 55, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+        std::cout << std::string(W - 55, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
         std::cout << "  " << ui::cyan() << bc_v;
         for(int i = 0; i < W - 2; i++) std::cout << (ui::g_use_utf8 ? "─" : "-");
-        std::cout << bc_v << ui::reset() << "\n";
+        std::cout << bc_v << ui::reset(); eol(); std::cout << "\n";
 
-        // Tab content
+        // Tab content - v1.0 STABLE: All lines have eol() for zero-flicker
         if(current_tab == 0){
             // OVERVIEW TAB
-            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Transaction ID:" << ui::reset() << "\n";
-            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::cyan() << tx.txid_hex << ui::reset() << "\n";
-            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Transaction ID:" << ui::reset(); eol(); std::cout << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::cyan() << tx.txid_hex << ui::reset(); eol(); std::cout << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
             // Status
             std::string status_str = tx.confirmations > 0 ?
                 (ui::green() + "CONFIRMED" + ui::reset()) :
                 (ui::yellow() + "PENDING" + ui::reset());
-            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Status: " << ui::reset() << status_str << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Status: " << ui::reset() << status_str; eol(); std::cout << "\n";
 
             // Direction
             std::string dir_str = tx.direction == "sent" ? (ui::red() + "SENT" + ui::reset()) :
                                   tx.direction == "received" ? (ui::green() + "RECEIVED" + ui::reset()) :
                                   tx.direction == "mined" ? (ui::yellow() + "MINED" + ui::reset()) :
                                   (ui::dim() + "SELF" + ui::reset());
-            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Type: " << ui::reset() << dir_str << "\n";
-            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Type: " << ui::reset() << dir_str; eol(); std::cout << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
             // Amount
-            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Amount:" << ui::reset() << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Amount:" << ui::reset(); eol(); std::cout << "\n";
             if(tx.amount >= 0){
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::green() << ui::bold() << "+" << ui_pro::format_miq_professional((uint64_t)tx.amount) << " MIQ" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::green() << ui::bold() << "+" << ui_pro::format_miq_professional((uint64_t)tx.amount) << " MIQ" << ui::reset(); eol(); std::cout << "\n";
             } else {
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::red() << ui::bold() << "-" << ui_pro::format_miq_professional((uint64_t)(-tx.amount)) << " MIQ" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::red() << ui::bold() << "-" << ui_pro::format_miq_professional((uint64_t)(-tx.amount)) << " MIQ" << ui::reset(); eol(); std::cout << "\n";
             }
             if(tx.fee > 0){
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "Fee: " << ui_pro::format_miq_professional(tx.fee) << " MIQ";
                 if(tx.fee_rate > 0){
                     std::cout << " (" << std::fixed << std::setprecision(2) << tx.fee_rate << " miqron/byte)";
                 }
-                std::cout << ui::reset() << "\n";
+                std::cout << ui::reset(); eol(); std::cout << "\n";
             }
-            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
             // Time
-            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Created:" << ui::reset() << "\n";
-            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::format_time(tx.timestamp) << "\n";
-            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::dim() << "(" << ui::format_time_ago(tx.timestamp) << ")" << ui::reset() << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Created:" << ui::reset(); eol(); std::cout << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::format_time(tx.timestamp); eol(); std::cout << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::dim() << "(" << ui::format_time_ago(tx.timestamp) << ")" << ui::reset(); eol(); std::cout << "\n";
 
             // Confirmation time (when first confirmed)
             if(tx.confirmation_time > 0){
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "First Confirmed:" << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::green() << ui::format_time(tx.confirmation_time) << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::dim() << "(" << ui::format_time_ago(tx.confirmation_time) << ")" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "First Confirmed:" << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::green() << ui::format_time(tx.confirmation_time) << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::dim() << "(" << ui::format_time_ago(tx.confirmation_time) << ")" << ui::reset(); eol(); std::cout << "\n";
             }
-            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
             // Confirmations
             std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Confirmations: " << ui::reset();
-            std::cout << tx.confirmations << " " << confirmation_bar(tx.confirmations) << "\n";
+            std::cout << tx.confirmations << " " << confirmation_bar(tx.confirmations); eol(); std::cout << "\n";
 
             // Addresses
             if(!tx.to_address.empty()){
                 std::string label = resolve_label(tx.to_address);
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "To:" << ui::reset();
                 if(!label.empty()) std::cout << " " << ui::cyan() << label << ui::reset();
-                std::cout << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::dim() << tx.to_address << ui::reset() << "\n";
+                eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::dim() << tx.to_address << ui::reset(); eol(); std::cout << "\n";
             }
             if(!tx.from_address.empty()){
                 std::string label = resolve_label(tx.from_address);
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "From:" << ui::reset();
                 if(!label.empty()) std::cout << " " << ui::cyan() << label << ui::reset();
-                std::cout << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::dim() << tx.from_address << ui::reset() << "\n";
+                eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::dim() << tx.from_address << ui::reset(); eol(); std::cout << "\n";
             }
 
             // Memo
             if(!tx.memo.empty()){
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Memo:" << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::yellow() << tx.memo << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Memo:" << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::yellow() << tx.memo << ui::reset(); eol(); std::cout << "\n";
             }
 
         } else if(current_tab == 1){
-            // BLOCK INFO TAB
+            // BLOCK INFO TAB - v1.0 STABLE: Zero-flicker with eol() on all lines
             if(!has_full_info || !full_info.confirmed){
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::yellow() << "Transaction not yet confirmed in a block" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::yellow() << "Transaction not yet confirmed in a block" << ui::reset(); eol(); std::cout << "\n";
                 if(full_info.in_mempool){
-                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "Currently in mempool, waiting for mining" << ui::reset() << "\n";
+                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "Currently in mempool, waiting for mining" << ui::reset(); eol(); std::cout << "\n";
                 }
             } else {
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Block Height:" << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::green() << full_info.block_height << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Block Height:" << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::green() << full_info.block_height << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Block Hash:" << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::cyan() << full_info.block_hash << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Block Hash:" << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::cyan() << full_info.block_hash << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Block Time:" << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::format_time(full_info.block_time) << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Block Time:" << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << ui::format_time(full_info.block_time); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Difficulty:" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Difficulty:" << ui::reset(); eol(); std::cout << "\n";
                 std::ostringstream diff_ss;
                 diff_ss << std::fixed << std::setprecision(8) << full_info.difficulty;
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << diff_ss.str() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << diff_ss.str(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Difficulty Bits:" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Difficulty Bits:" << ui::reset(); eol(); std::cout << "\n";
                 std::ostringstream bits_ss;
                 bits_ss << "0x" << std::hex << std::setfill('0') << std::setw(8) << full_info.block_bits;
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << bits_ss.str() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << bits_ss.str(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "TX Index in Block:" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "TX Index in Block:" << ui::reset(); eol(); std::cout << "\n";
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << full_info.tx_index;
                 if(full_info.is_coinbase) std::cout << " " << ui::yellow() << "(Coinbase)" << ui::reset();
-                std::cout << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "TX Size:" << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << full_info.size << " bytes\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "TX Size:" << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << full_info.size << " bytes"; eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Confirmations:" << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << full_info.confirmations << " " << confirmation_bar(full_info.confirmations) << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Confirmations:" << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "    " << full_info.confirmations << " " << confirmation_bar(full_info.confirmations); eol(); std::cout << "\n";
             }
 
         } else if(current_tab == 2){
-            // INPUTS TAB
+            // INPUTS TAB - v1.0 STABLE: Zero-flicker with eol() on all lines
             if(!has_full_info || full_info.inputs.empty()){
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "No input information available" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "No input information available" << ui::reset(); eol(); std::cout << "\n";
             } else {
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Inputs (" << full_info.inputs.size() << "):" << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Inputs (" << full_info.inputs.size() << "):" << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 int visible = std::min((int)full_info.inputs.size() - scroll_offset, MAX_VISIBLE);
                 for(int i = scroll_offset; i < scroll_offset + visible && i < (int)full_info.inputs.size(); i++){
                     const auto& inp = full_info.inputs[i];
                     std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::cyan() << "[" << inp.index << "]" << ui::reset();
                     if(inp.is_coinbase){
-                        std::cout << " " << ui::yellow() << "COINBASE" << ui::reset() << "\n";
-                        std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "      " << ui::dim() << "Data: " << inp.coinbase_data.substr(0, 40) << "..." << ui::reset() << "\n";
+                        std::cout << " " << ui::yellow() << "COINBASE" << ui::reset(); eol(); std::cout << "\n";
+                        std::string cb_data = inp.coinbase_data.length() > 40 ? inp.coinbase_data.substr(0, 40) + "..." : inp.coinbase_data;
+                        std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "      " << ui::dim() << "Data: " << cb_data << ui::reset(); eol(); std::cout << "\n";
                     } else {
                         if(inp.value > 0){
-                            std::cout << " " << ui::green() << ui_pro::format_miq_professional(inp.value) << " MIQ" << ui::reset() << "\n";
+                            std::cout << " " << ui::green() << ui_pro::format_miq_professional(inp.value) << " MIQ" << ui::reset(); eol(); std::cout << "\n";
                         } else {
-                            std::cout << "\n";
+                            eol(); std::cout << "\n";
                         }
-                        std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "      " << ui::dim() << "From: " << inp.prev_txid.substr(0, 16) << "...:" << inp.prev_vout << ui::reset() << "\n";
+                        std::string txid_short = inp.prev_txid.length() > 16 ? inp.prev_txid.substr(0, 16) + "..." : inp.prev_txid;
+                        std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "      " << ui::dim() << "From: " << txid_short << ":" << inp.prev_vout << ui::reset(); eol(); std::cout << "\n";
                         if(!inp.address.empty()){
-                            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "      " << ui::dim() << "Addr: " << inp.address << ui::reset() << "\n";
+                            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "      " << ui::dim() << "Addr: " << inp.address << ui::reset(); eol(); std::cout << "\n";
                         }
                     }
                 }
 
                 if((int)full_info.inputs.size() > MAX_VISIBLE){
-                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
-                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "(Use Up/Down arrows to scroll)" << ui::reset() << "\n";
+                    std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
+                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "(Use Up/Down arrows to scroll)" << ui::reset(); eol(); std::cout << "\n";
                 }
             }
 
         } else if(current_tab == 3){
-            // OUTPUTS TAB
+            // OUTPUTS TAB - v1.0 STABLE: Zero-flicker with eol() on all lines
             if(!has_full_info || full_info.outputs.empty()){
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "No output information available" << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "No output information available" << ui::reset(); eol(); std::cout << "\n";
             } else {
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Outputs (" << full_info.outputs.size() << "):" << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "Total: " << ui_pro::format_miq_professional(full_info.total_output) << " MIQ" << ui::reset() << "\n";
-                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::bold() << "Outputs (" << full_info.outputs.size() << "):" << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "Total: " << ui_pro::format_miq_professional(full_info.total_output) << " MIQ" << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
                 int visible = std::min((int)full_info.outputs.size() - scroll_offset, MAX_VISIBLE);
                 for(int i = scroll_offset; i < scroll_offset + visible && i < (int)full_info.outputs.size(); i++){
@@ -8319,41 +8375,44 @@ static void show_interactive_tx_details(
                     } else {
                         std::cout << " " << ui::green() << "(UNSPENT)" << ui::reset();
                     }
-                    std::cout << "\n";
+                    eol(); std::cout << "\n";
                     std::string label = resolve_label(out.address);
                     std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "      ";
                     if(!label.empty()){
                         std::cout << ui::cyan() << label << ui::reset() << " ";
                     }
-                    std::cout << ui::dim() << out.address << ui::reset() << "\n";
+                    std::cout << ui::dim() << out.address << ui::reset(); eol(); std::cout << "\n";
                 }
 
                 if((int)full_info.outputs.size() > MAX_VISIBLE){
-                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "\n";
-                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "(Use Up/Down arrows to scroll)" << ui::reset() << "\n";
+                    std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
+                    std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "(Use Up/Down arrows to scroll)" << ui::reset(); eol(); std::cout << "\n";
                 }
             }
         }
 
-        // Padding
+        // Padding - v1.0 STABLE: Zero-flicker with eol()
         for(int i = 0; i < 3; i++){
-            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << std::string(W - 2, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+            std::cout << "  " << ui::cyan() << bc_v << ui::reset() << std::string(W - 2, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
         }
 
-        // Footer
+        // Footer - v1.0 STABLE: Zero-flicker with eol()
         std::cout << "  " << ui::cyan() << bc_v;
         for(int i = 0; i < W - 2; i++) std::cout << (ui::g_use_utf8 ? "─" : "-");
-        std::cout << bc_v << ui::reset() << "\n";
+        std::cout << bc_v << ui::reset(); eol(); std::cout << "\n";
 
         std::cout << "  " << ui::cyan() << bc_v << ui::reset();
         std::cout << "  " << ui::dim() << (ui::g_use_utf8 ? "←→" : "<>") << " Tabs  "
                   << (ui::g_use_utf8 ? "↑↓" : "^v") << " Scroll  "
-                  << "P Print  Q/ESC Back" << ui::reset();
-        std::cout << std::string(W - 47, ' ') << ui::cyan() << bc_v << ui::reset() << "\n";
+                  << "R Refresh  P Print  Q Back" << ui::reset();
+        std::cout << std::string(W - 51, ' ') << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
 
         std::cout << "  " << ui::cyan() << bc_bl;
         for(int i = 0; i < W - 2; i++) std::cout << bc_h;
-        std::cout << bc_br << ui::reset() << "\n";
+        std::cout << bc_br << ui::reset(); eol(); std::cout << "\n";
+
+        // v1.0 STABLE: Clear remaining screen area for zero-flicker
+        std::cout << "\033[J" << std::flush;
 
         // Handle input
         int ch = instant_input::wait_for_key(100);
@@ -8397,6 +8456,15 @@ static void show_interactive_tx_details(
         } else if(ch >= '1' && ch <= '4'){
             current_tab = ch - '1';
             scroll_offset = 0;
+        } else if(ch == 'r' || ch == 'R'){
+            // v1.0 STABLE: Refresh transaction info from RPC
+            // Clear cache entry to force fresh fetch
+            g_tx_info_cache.erase(tx.txid_hex);
+            has_full_info = fetch_tx_full_info(seeds, tx.txid_hex, full_info);
+            if (has_full_info) {
+                cache_tx_info(tx.txid_hex, full_info);
+            }
+            first_draw = true;  // Force full redraw
         } else if(ch == 'p' || ch == 'P'){
             // Print simple text view using legacy fallback function
             instant_input::disable_raw_mode();
@@ -13932,7 +14000,10 @@ namespace main_menu {
             std::cout << "    " << ui::dim() << "Ready" << ui::reset() << " ";
             std::cout << ui::cyan() << cursors[tick % 4] << ui::reset();
         }
-        std::cout << "\033[K" << std::flush;
+        std::cout << "\033[K";
+
+        // v1.0 STABLE: Clear remaining screen area for complete zero-flicker
+        std::cout << "\033[J" << std::flush;
     }
 
     // Run the interactive animated main menu
