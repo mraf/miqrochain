@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <deque>
+#include <fstream>      // For mempool persistence
 
 namespace miq {
 
@@ -1081,6 +1082,127 @@ size_t Mempool::dynamic_memory_usage() const {
     }
 
     return usage;
+}
+
+// =============================================================================
+// MEMPOOL PERSISTENCE - Save/Load mempool to disk
+// =============================================================================
+// This allows mempool transactions to survive node restarts, ensuring
+// unconfirmed transactions are not lost when the node is restarted.
+// Format: [4-byte magic][4-byte version][4-byte count][tx1_len][tx1_data][tx2_len][tx2_data]...
+
+static const uint32_t MEMPOOL_MAGIC = 0x4D504F4C;  // "MPOL"
+static const uint32_t MEMPOOL_VERSION = 1;
+
+bool Mempool::save_to_disk(const std::string& path) const {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+
+    try {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            MIQ_LOG_WARN(LogCategory::MEMPOOL, "Failed to open mempool file for writing: " + path);
+            return false;
+        }
+
+        // Write header
+        f.write(reinterpret_cast<const char*>(&MEMPOOL_MAGIC), sizeof(MEMPOOL_MAGIC));
+        f.write(reinterpret_cast<const char*>(&MEMPOOL_VERSION), sizeof(MEMPOOL_VERSION));
+
+        uint32_t count = static_cast<uint32_t>(map_.size());
+        f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+
+        // Write each transaction
+        for (const auto& kv : map_) {
+            std::vector<uint8_t> raw = ser_tx(kv.second.tx);
+            uint32_t len = static_cast<uint32_t>(raw.size());
+            f.write(reinterpret_cast<const char*>(&len), sizeof(len));
+            f.write(reinterpret_cast<const char*>(raw.data()), len);
+        }
+
+        f.flush();
+        MIQ_LOG_INFO(LogCategory::MEMPOOL, "Saved " + std::to_string(count) + " transactions to mempool file");
+        return true;
+    } catch (const std::exception& e) {
+        MIQ_LOG_WARN(LogCategory::MEMPOOL, "Failed to save mempool: " + std::string(e.what()));
+        return false;
+    }
+}
+
+bool Mempool::load_from_disk(const std::string& path, const UTXOView& utxo, uint32_t height) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+
+    try {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) {
+            // File doesn't exist - not an error, just no saved mempool
+            return true;
+        }
+
+        // Read and verify header
+        uint32_t magic = 0, version = 0, count = 0;
+        f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+        if (magic != MEMPOOL_MAGIC) {
+            MIQ_LOG_WARN(LogCategory::MEMPOOL, "Invalid mempool file magic");
+            return false;
+        }
+
+        f.read(reinterpret_cast<char*>(&version), sizeof(version));
+        if (version != MEMPOOL_VERSION) {
+            MIQ_LOG_WARN(LogCategory::MEMPOOL, "Unsupported mempool file version: " + std::to_string(version));
+            return false;
+        }
+
+        f.read(reinterpret_cast<char*>(&count), sizeof(count));
+
+        // Read and re-accept each transaction
+        uint32_t loaded = 0, rejected = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t len = 0;
+            f.read(reinterpret_cast<char*>(&len), sizeof(len));
+            if (!f || len == 0 || len > 1000000) break;  // Sanity check
+
+            std::vector<uint8_t> raw(len);
+            f.read(reinterpret_cast<char*>(raw.data()), len);
+            if (!f) break;
+
+            Transaction tx;
+            if (!deser_tx(raw, tx)) continue;
+
+            // Try to re-accept the transaction
+            // We temporarily release the lock during validation since accept() also locks
+            mtx_.unlock();
+            std::string err;
+            bool accepted = accept(tx, utxo, height, err);
+            mtx_.lock();
+
+            if (accepted) {
+                ++loaded;
+            } else {
+                ++rejected;
+                MIQ_LOG_DEBUG(LogCategory::MEMPOOL, "Rejected saved tx on reload: " + err);
+            }
+        }
+
+        MIQ_LOG_INFO(LogCategory::MEMPOOL, "Loaded " + std::to_string(loaded) + " transactions from mempool file (" +
+                     std::to_string(rejected) + " rejected)");
+        return true;
+    } catch (const std::exception& e) {
+        MIQ_LOG_WARN(LogCategory::MEMPOOL, "Failed to load mempool: " + std::string(e.what()));
+        return false;
+    }
+}
+
+std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> Mempool::get_all_raw_txs() const {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> result;
+    result.reserve(map_.size());
+
+    for (const auto& kv : map_) {
+        result.emplace_back(kv.second.tx.txid(), ser_tx(kv.second.tx));
+    }
+
+    return result;
 }
 
 }  // namespace miq

@@ -1047,8 +1047,34 @@ bool Chain::open(const std::string& dir){
     ensure_dir_exists(undo_dir(datadir_));
     (void)load_state();
 
+    // CRITICAL FIX: Initialize transaction index for fast tx lookups
+    if (!txindex_.open(datadir_)) {
+        log_warn("Failed to open TxIndex, will rebuild");
+    }
+
     // Rebuild header index from blocks if needed (for seed nodes with blocks but no headers)
     rebuild_header_index_from_blocks();
+
+    // CRITICAL FIX: Rebuild TxIndex from existing blocks if it's empty but we have blocks
+    // This ensures backwards compatibility when upgrading from versions without TxIndex
+    if (txindex_.size() == 0 && tip_.height > 0) {
+        log_info("Rebuilding TxIndex from " + std::to_string(tip_.height + 1) + " blocks...");
+        size_t indexed_txs = 0;
+        for (uint64_t h = 0; h <= tip_.height; ++h) {
+            Block blk;
+            if (!get_block_by_index(h, blk)) continue;
+            for (size_t i = 0; i < blk.txs.size(); ++i) {
+                txindex_.add(blk.txs[i].txid(), h, static_cast<uint32_t>(i));
+                indexed_txs++;
+            }
+            // Log progress every 1000 blocks
+            if (h % 1000 == 0 && h > 0) {
+                log_info("TxIndex rebuild progress: " + std::to_string(h) + "/" + std::to_string(tip_.height) + " blocks");
+            }
+        }
+        txindex_.flush();
+        log_info("TxIndex rebuilt: " + std::to_string(indexed_txs) + " transactions indexed");
+    }
 
 #if MIQ_HAVE_GCS_FILTERS
     {
@@ -1675,6 +1701,10 @@ bool Chain::disconnect_tip_once(std::string& err){
     // Commit reversals atomically if backend supports it
     if (!utxo_apply_ops(utxo_, ops, err)) return false;
 
+    // CRITICAL FIX: Remove transactions from TxIndex on block disconnect (reorg handling)
+    // This ensures the transaction index stays consistent with the active chain
+    txindex_.remove_block(tip_.height);
+
     // CRITICAL FIX: Rollback BIP158 filters on disconnect to maintain consistency
     // Without this, SPV clients can receive stale filters after a reorg
 #if MIQ_HAVE_GCS_FILTERS
@@ -1811,6 +1841,16 @@ bool Chain::submit_block(const Block& b, std::string& err){
 
     // Also cache the full header for serving to peers
     set_header_full(hk(new_hash), b.header);  // THREAD-SAFE
+
+    // CRITICAL FIX: Add all transactions to the transaction index for fast lookups
+    // This enables O(1) transaction lookup by txid instead of scanning blocks
+    for (size_t i = 0; i < b.txs.size(); ++i) {
+        txindex_.add(b.txs[i].txid(), new_height, static_cast<uint32_t>(i));
+    }
+    // Periodically flush TxIndex to disk (every 100 blocks)
+    if (new_height % 100 == 0) {
+        txindex_.flush();
+    }
 
     // Prune old undo if beyond window
     if (tip_.height >= UNDO_WINDOW) {

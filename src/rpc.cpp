@@ -17,6 +17,7 @@
 #include "hash160.h"
 #include "utxo.h"          // UTXOEntry & list_for_pkh
 #include "difficulty.h"    // MIQ_RETARGET_INTERVAL & epoch_next_bits
+#include "txindex.h"       // Fast transaction lookup by txid
 
 #include <sstream>
 #include <array>
@@ -1133,7 +1134,8 @@ std::string RpcService::handle(const std::string& body){
             }
         }
 
-        // getrawtransaction - look up transaction by txid (mempool only for now)
+        // getrawtransaction - look up transaction by txid
+        // CRITICAL FIX: Now uses TxIndex for O(1) lookup of confirmed transactions
         if(method=="getrawtransaction"){
             if(params.size()<1 || !std::holds_alternative<std::string>(params[0].v))
                 return err("need txid");
@@ -1149,20 +1151,44 @@ std::string RpcService::handle(const std::string& body){
                 // Serialize the transaction
                 std::vector<uint8_t> raw = ser_tx(tx);
                 std::map<std::string,JNode> o;
-                JNode hex; hex.v = std::string(to_hex(raw)); o["hex"] = hex;
-                JNode tid; tid.v = txidhex; o["txid"] = tid;
+                o["hex"] = jstr(to_hex(raw));
+                o["txid"] = jstr(txidhex);
+                o["in_mempool"] = jbool(true);
+                o["confirmed"] = jbool(false);
+                o["confirmations"] = jnum(0);
                 JNode n; n.v = o; return json_dump(n);
             }
 
-            // Not found in mempool - check if any outputs exist in UTXO set
-            // This indicates the transaction was mined
-            for(uint32_t vout = 0; vout < 100; ++vout) {  // Check first 100 outputs
+            // CRITICAL FIX: Use TxIndex for O(1) lookup of confirmed transactions
+            TxLocation loc;
+            if (chain_.txindex().get(txid, loc) && loc.valid) {
+                Block blk;
+                if (chain_.get_block_by_index(loc.block_height, blk)) {
+                    if (loc.tx_position < blk.txs.size()) {
+                        const auto& btx = blk.txs[loc.tx_position];
+                        std::vector<uint8_t> raw = ser_tx(btx);
+                        auto tip = chain_.tip();
+                        std::map<std::string,JNode> o;
+                        o["hex"] = jstr(to_hex(raw));
+                        o["txid"] = jstr(txidhex);
+                        o["in_mempool"] = jbool(false);
+                        o["confirmed"] = jbool(true);
+                        o["confirmations"] = jnum((double)(tip.height - loc.block_height + 1));
+                        o["block_height"] = jnum((double)loc.block_height);
+                        o["block_hash"] = jstr(to_hex(blk.block_hash()));
+                        JNode n; n.v = o; return json_dump(n);
+                    }
+                }
+            }
+
+            // Fallback: check if any outputs exist in UTXO set (for backwards compatibility)
+            for(uint32_t vout = 0; vout < 100; ++vout) {
                 UTXOEntry e;
                 if(chain_.utxo().get(txid, vout, e)){
                     // Transaction exists in chain (has unspent outputs)
                     std::map<std::string,JNode> o;
-                    JNode tid; tid.v = txidhex; o["txid"] = tid;
-                    JNode confirmed; confirmed.v = true; o["confirmed"] = confirmed;
+                    o["txid"] = jstr(txidhex);
+                    o["confirmed"] = jbool(true);
                     JNode n; n.v = o; return json_dump(n);
                 }
             }
@@ -1243,99 +1269,132 @@ std::string RpcService::handle(const std::string& body){
                 JNode out; out.v = result; return json_dump(out);
             }
 
-            // Search in blockchain - scan recent blocks to find the transaction
+            // CRITICAL FIX: Use TxIndex for O(1) transaction lookup instead of scanning blocks
+            // This makes transaction lookups instant instead of scanning up to 10,000 blocks
             auto tip = chain_.tip();
-            uint64_t scan_start = (tip.height > 10000) ? (tip.height - 10000) : 0;
+            TxLocation loc;
+            bool found_in_index = chain_.txindex().get(txid, loc);
 
-            for(uint64_t h = tip.height; h >= scan_start && h <= tip.height; --h){
-                Block blk;
-                if(!chain_.get_block_by_index(h, blk)) continue;
+            // If not in index, fall back to block scanning (for backwards compatibility during index build)
+            uint64_t found_height = 0;
+            size_t found_tx_idx = 0;
+            Block found_blk;
+            bool found_in_chain = false;
 
-                for(size_t tx_idx = 0; tx_idx < blk.txs.size(); ++tx_idx){
-                    const auto& btx = blk.txs[tx_idx];
-                    if(btx.txid() == txid){
-                        // Found the transaction!
-                        result["confirmed"] = jbool(true);
-                        result["in_mempool"] = jbool(false);
-                        result["confirmations"] = jnum((double)(tip.height - h + 1));
-
-                        // Block info
-                        result["block_height"] = jnum((double)h);
-                        result["block_hash"] = jstr(to_hex(blk.block_hash()));
-                        result["block_time"] = jnum((double)blk.header.time);
-                        result["block_bits"] = jnum((double)blk.header.bits);
-
-                        // Calculate difficulty from bits
-                        uint32_t bits = blk.header.bits;
-                        double difficulty = 1.0;
-                        if(bits > 0){
-                            uint32_t exp = (bits >> 24) & 0xFF;
-                            uint32_t mant = bits & 0x00FFFFFF;
-                            if(mant > 0){
-                                // difficulty = (0xFFFF * 2^208) / target
-                                // Simplified: diff = 0xFFFF00000000... / target
-                                double target = (double)mant * pow(256.0, (double)(exp - 3));
-                                if(target > 0){
-                                    difficulty = (double)0xFFFF * pow(2.0, 208.0) / target;
-                                }
-                            }
+            if (found_in_index && loc.valid) {
+                // Fast path: use TxIndex result
+                if (chain_.get_block_by_index(loc.block_height, found_blk)) {
+                    if (loc.tx_position < found_blk.txs.size()) {
+                        const auto& btx = found_blk.txs[loc.tx_position];
+                        if (btx.txid() == txid) {
+                            found_in_chain = true;
+                            found_height = loc.block_height;
+                            found_tx_idx = loc.tx_position;
                         }
-                        result["difficulty"] = jnum(difficulty);
-
-                        result["tx_index"] = jnum((double)tx_idx);
-                        result["is_coinbase"] = jbool(tx_idx == 0);
-
-                        // Serialize tx
-                        std::vector<uint8_t> raw = ser_tx(btx);
-                        result["hex"] = jstr(to_hex(raw));
-                        result["size"] = jnum((double)raw.size());
-
-                        // Inputs
-                        std::vector<JNode> inputs;
-                        uint64_t total_input = 0;
-                        bool is_coinbase = (tx_idx == 0);
-                        for(size_t i = 0; i < btx.vin.size(); ++i){
-                            std::map<std::string,JNode> inp;
-                            inp["index"] = jnum((double)i);
-                            if(is_coinbase){
-                                inp["coinbase"] = jbool(true);
-                                inp["coinbase_data"] = jstr(to_hex(btx.vin[i].sig));
-                            } else {
-                                inp["prev_txid"] = jstr(to_hex(btx.vin[i].prev.txid));
-                                inp["prev_vout"] = jnum((double)btx.vin[i].prev.vout);
-                                // Try to get spent value (may not be available for spent outputs)
-                            }
-                            JNode n; n.v = inp; inputs.push_back(n);
-                        }
-                        JNode vin; vin.v = inputs; result["vin"] = vin;
-
-                        // Outputs
-                        std::vector<JNode> outputs;
-                        uint64_t total_output = 0;
-                        for(size_t i = 0; i < btx.vout.size(); ++i){
-                            std::map<std::string,JNode> out;
-                            out["index"] = jnum((double)i);
-                            out["value"] = jnum((double)btx.vout[i].value);
-                            out["address"] = jstr(base58check_encode(VERSION_P2PKH, btx.vout[i].pkh));
-                            // Check if output is spent
-                            UTXOEntry e;
-                            out["spent"] = jbool(!chain_.utxo().get(txid, (uint32_t)i, e));
-                            total_output += btx.vout[i].value;
-                            JNode n; n.v = out; outputs.push_back(n);
-                        }
-                        JNode vout; vout.v = outputs; result["vout"] = vout;
-                        result["total_output"] = jnum((double)total_output);
-
-                        // Fee (for non-coinbase)
-                        if(!is_coinbase && total_input > total_output){
-                            result["fee"] = jnum((double)(total_input - total_output));
-                        }
-
-                        JNode out; out.v = result; return json_dump(out);
                     }
                 }
+            }
 
-                if(h == 0) break;  // Prevent underflow
+            // Fallback: scan recent blocks if not found in index (during initial index build)
+            if (!found_in_chain) {
+                uint64_t scan_start = (tip.height > 10000) ? (tip.height - 10000) : 0;
+                for(uint64_t h = tip.height; h >= scan_start && h <= tip.height; --h){
+                    Block blk;
+                    if(!chain_.get_block_by_index(h, blk)) continue;
+
+                    for(size_t tx_idx = 0; tx_idx < blk.txs.size(); ++tx_idx){
+                        const auto& btx = blk.txs[tx_idx];
+                        if(btx.txid() == txid){
+                            found_in_chain = true;
+                            found_height = h;
+                            found_tx_idx = tx_idx;
+                            found_blk = blk;
+                            break;
+                        }
+                    }
+                    if (found_in_chain) break;
+                    if(h == 0) break;
+                }
+            }
+
+            if (found_in_chain) {
+                const auto& btx = found_blk.txs[found_tx_idx];
+
+                // Found the transaction!
+                result["confirmed"] = jbool(true);
+                result["in_mempool"] = jbool(false);
+                result["confirmations"] = jnum((double)(tip.height - found_height + 1));
+
+                // Block info
+                result["block_height"] = jnum((double)found_height);
+                result["block_hash"] = jstr(to_hex(found_blk.block_hash()));
+                result["block_time"] = jnum((double)found_blk.header.time);
+                result["block_bits"] = jnum((double)found_blk.header.bits);
+
+                // Calculate difficulty from bits
+                uint32_t bits = found_blk.header.bits;
+                double difficulty = 1.0;
+                if(bits > 0){
+                    uint32_t exp = (bits >> 24) & 0xFF;
+                    uint32_t mant = bits & 0x00FFFFFF;
+                    if(mant > 0){
+                        double target = (double)mant * pow(256.0, (double)(exp - 3));
+                        if(target > 0){
+                            difficulty = (double)0xFFFF * pow(2.0, 208.0) / target;
+                        }
+                    }
+                }
+                result["difficulty"] = jnum(difficulty);
+
+                result["tx_index"] = jnum((double)found_tx_idx);
+                result["is_coinbase"] = jbool(found_tx_idx == 0);
+
+                // Serialize tx
+                std::vector<uint8_t> raw = ser_tx(btx);
+                result["hex"] = jstr(to_hex(raw));
+                result["size"] = jnum((double)raw.size());
+
+                // Inputs
+                std::vector<JNode> inputs;
+                uint64_t total_input = 0;
+                bool is_coinbase = (found_tx_idx == 0);
+                for(size_t i = 0; i < btx.vin.size(); ++i){
+                    std::map<std::string,JNode> inp;
+                    inp["index"] = jnum((double)i);
+                    if(is_coinbase){
+                        inp["coinbase"] = jbool(true);
+                        inp["coinbase_data"] = jstr(to_hex(btx.vin[i].sig));
+                    } else {
+                        inp["prev_txid"] = jstr(to_hex(btx.vin[i].prev.txid));
+                        inp["prev_vout"] = jnum((double)btx.vin[i].prev.vout);
+                    }
+                    JNode n; n.v = inp; inputs.push_back(n);
+                }
+                JNode vin; vin.v = inputs; result["vin"] = vin;
+
+                // Outputs
+                std::vector<JNode> outputs;
+                uint64_t total_output = 0;
+                for(size_t i = 0; i < btx.vout.size(); ++i){
+                    std::map<std::string,JNode> out;
+                    out["index"] = jnum((double)i);
+                    out["value"] = jnum((double)btx.vout[i].value);
+                    out["address"] = jstr(base58check_encode(VERSION_P2PKH, btx.vout[i].pkh));
+                    // Check if output is spent
+                    UTXOEntry e;
+                    out["spent"] = jbool(!chain_.utxo().get(txid, (uint32_t)i, e));
+                    total_output += btx.vout[i].value;
+                    JNode n; n.v = out; outputs.push_back(n);
+                }
+                JNode vout; vout.v = outputs; result["vout"] = vout;
+                result["total_output"] = jnum((double)total_output);
+
+                // Fee (for non-coinbase)
+                if(!is_coinbase && total_input > total_output){
+                    result["fee"] = jnum((double)(total_input - total_output));
+                }
+
+                JNode out; out.v = result; return json_dump(out);
             }
 
             return err("Transaction not found");

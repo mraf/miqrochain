@@ -16,6 +16,7 @@
 #include "difficulty.h"
 #include "constants.h"
 #include "blockindex.h"
+#include "txindex.h"
 
 // --- Optional GCS block filters (header-level guard; matches chain.cpp) ---
 #ifndef __has_include
@@ -98,6 +99,10 @@ public:
     // Expose datadir path (useful for tools)
     const std::string& datadir() const { return datadir_; }
 
+    // Transaction index for fast lookup of confirmed transactions
+    TxIndex& txindex() { return txindex_; }
+    const TxIndex& txindex() const { return txindex_; }
+
 #if MIQ_HAVE_GCS_FILTERS
     // === Compact filter RPC helpers for the P2P server ===
     // Returns rolling filter headers (BIP158-style) for [start, start+count).
@@ -116,6 +121,7 @@ private:
     Storage     storage_;
     std::string datadir_;
     UTXOSet     utxo_;
+    TxIndex     txindex_;
     Tip         tip_{0, std::vector<uint8_t>(32,0), GENESIS_BITS, GENESIS_TIME, 0};
     BlockIndex  index_;
 
