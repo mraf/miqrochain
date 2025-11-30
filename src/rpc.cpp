@@ -12,7 +12,6 @@
 #include "tx.h"
 #include "log.h"
 #include "crypto/ecdsa_iface.h"
-#include "miner.h"
 #include "base58check.h"
 #include "hash160.h"
 #include "utxo.h"          // UTXOEntry & list_for_pkh
@@ -1515,25 +1514,14 @@ std::string RpcService::handle(const std::string& body){
             JNode out; out.v = o; return json_dump(out);
         }
 
-        // Miner stats
+        // Miner stats - built-in miner removed, return zeros
+        // Use external miner (miqminer) for mining
         if(method=="getminerstats"){
-            using clock = std::chrono::steady_clock;
-            static clock::time_point prev = clock::now();
-
-            const uint64_t hashes = miner_hashes_snapshot_and_reset();
-            const auto now = clock::now();
-            double secs = std::chrono::duration<double>(now - prev).count();
-            if (secs <= 0) secs = 1e-9;
-            prev = now;
-
-            const double hps = double(hashes) / secs;
-            const uint64_t total = miner_hashes_total();
-
             std::map<std::string,JNode> o;
-            JNode jh; jh.v = (double)hashes;         o["hashes"]  = jh;
-            JNode js; js.v = secs;                   o["seconds"] = js;
-            JNode jj; jj.v = hps;                    o["hps"]     = jj;
-            JNode jt; jt.v = (double)total;          o["total"]   = jt;
+            JNode jh; jh.v = (double)0;      o["hashes"]  = jh;
+            JNode js; js.v = 0.0;            o["seconds"] = js;
+            JNode jj; jj.v = 0.0;            o["hps"]     = jj;
+            JNode jt; jt.v = (double)0;      o["total"]   = jt;
 
             JNode out; out.v = o; return json_dump(out);
         }

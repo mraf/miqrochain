@@ -212,7 +212,6 @@ set(MIQ_CORE_SOURCES_NO_NAT
     src/blockindex.h src/blockindex.cpp
     src/txindex.h src/txindex.cpp
     src/chain.h src/chain.cpp
-    src/miner.h src/miner.cpp
     src/netmsg.h src/netmsg.cpp
     src/p2p.h src/p2p.cpp
     src/http.h src/http.cpp
