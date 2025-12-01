@@ -546,7 +546,10 @@ std::string RpcService::handle(const std::string& body){
                 "walletunlock","walletlock","getwalletinfo","listaddresses","listutxos",
                 "sendfromhd","getaddressutxos","getbalance","getwallethistory",
                 "getblocktemplate","getminertemplate", // Mining pool support
-                "submitblock","submitrawblock","sendrawblock"
+                "submitblock","submitrawblock","sendrawblock",
+                // Blockchain Explorer API
+                "getaddresstxids","getaddresshistory","getaddressbalance","getaddressdeltas",
+                "getaddressindexinfo","reindexaddresses"
                 // (getibdinfo exists but not listed here to keep help stable)
             };
             std::vector<JNode> v;
@@ -690,13 +693,8 @@ std::string RpcService::handle(const std::string& body){
                 std::vector<uint8_t> want;
                 try { want = from_hex(hstr); } catch(...) { return err("bad hash hex"); }
 
-                auto tip = chain_.tip();
-                for(size_t i=0;i<= (size_t)tip.height;i++){
-                    Block tb;
-                    if(chain_.get_block_by_index(i, tb)){
-                        if(tb.block_hash() == want){ b = tb; ok = true; break; }
-                    }
-                }
+                // OPTIMIZATION: Use hash index for O(1) lookup instead of O(n) scan
+                ok = chain_.get_block_by_hash_fast(want, b);
             } else {
                 return err("bad arg");
             }
@@ -3140,6 +3138,277 @@ std::string RpcService::handle(const std::string& body){
             o["tip_hash"] = jstr(to_hex(chain_.tip().hash));
             // Could add more reorg stats here
             JNode out; out.v = o; return json_dump(out);
+        }
+
+        // ================== BLOCKCHAIN EXPLORER API ==================
+        // These endpoints enable full-featured blockchain explorer functionality
+
+        // getaddresstxids(address, [start_height], [end_height], [skip], [limit])
+        // Returns transaction IDs for an address, sorted by height (most recent first)
+        if(method=="getaddresstxids"){
+            if(params.size() < 1 || !std::holds_alternative<std::string>(params[0].v))
+                return err("usage: getaddresstxids <address> [start_height] [end_height] [skip] [limit]");
+
+            const std::string addr = std::get<std::string>(params[0].v);
+
+            // Decode address to PKH
+            uint8_t ver = 0;
+            std::vector<uint8_t> pkh;
+            if (!base58check_decode(addr, ver, pkh) || pkh.size() != 20 || ver != VERSION_P2PKH)
+                return err("invalid address");
+
+            // Parse optional parameters
+            uint64_t start_height = 0;
+            uint64_t end_height = UINT64_MAX;
+            size_t skip = 0;
+            size_t limit = 100;
+
+            if (params.size() >= 2 && std::holds_alternative<double>(params[1].v))
+                start_height = (uint64_t)std::get<double>(params[1].v);
+            if (params.size() >= 3 && std::holds_alternative<double>(params[2].v))
+                end_height = (uint64_t)std::get<double>(params[2].v);
+            if (params.size() >= 4 && std::holds_alternative<double>(params[3].v))
+                skip = (size_t)std::get<double>(params[3].v);
+            if (params.size() >= 5 && std::holds_alternative<double>(params[4].v))
+                limit = (size_t)std::get<double>(params[4].v);
+
+            if (limit > 1000) limit = 1000;  // Safety limit
+
+            // Query address index
+            auto txids = chain_.addressindex().get_address_txids(pkh, start_height, end_height, skip, limit);
+
+            std::vector<JNode> arr;
+            arr.reserve(txids.size());
+            for (const auto& txid : txids) {
+                arr.push_back(jstr(to_hex(txid)));
+            }
+
+            std::map<std::string, JNode> result;
+            JNode txid_arr; txid_arr.v = arr;
+            result["txids"] = txid_arr;
+            result["count"] = jnum((double)arr.size());
+            result["address"] = jstr(addr);
+            result["start_height"] = jnum((double)start_height);
+            result["end_height"] = jnum((double)end_height);
+
+            JNode out; out.v = result; return json_dump(out);
+        }
+
+        // getaddresshistory(address, [start_height], [end_height], [skip], [limit])
+        // Returns full transaction history for an address with details
+        if(method=="getaddresshistory"){
+            if(params.size() < 1 || !std::holds_alternative<std::string>(params[0].v))
+                return err("usage: getaddresshistory <address> [start_height] [end_height] [skip] [limit]");
+
+            const std::string addr = std::get<std::string>(params[0].v);
+
+            // Decode address to PKH
+            uint8_t ver = 0;
+            std::vector<uint8_t> pkh;
+            if (!base58check_decode(addr, ver, pkh) || pkh.size() != 20 || ver != VERSION_P2PKH)
+                return err("invalid address");
+
+            // Parse optional parameters
+            uint64_t start_height = 0;
+            uint64_t end_height = UINT64_MAX;
+            size_t skip = 0;
+            size_t limit = 100;
+
+            if (params.size() >= 2 && std::holds_alternative<double>(params[1].v))
+                start_height = (uint64_t)std::get<double>(params[1].v);
+            if (params.size() >= 3 && std::holds_alternative<double>(params[2].v))
+                end_height = (uint64_t)std::get<double>(params[2].v);
+            if (params.size() >= 4 && std::holds_alternative<double>(params[3].v))
+                skip = (size_t)std::get<double>(params[3].v);
+            if (params.size() >= 5 && std::holds_alternative<double>(params[4].v))
+                limit = (size_t)std::get<double>(params[4].v);
+
+            if (limit > 500) limit = 500;  // Safety limit (history entries are larger)
+
+            // Query address index
+            auto history = chain_.addressindex().get_address_history(pkh, start_height, end_height, skip, limit);
+
+            std::vector<JNode> arr;
+            arr.reserve(history.size());
+            for (const auto& entry : history) {
+                std::map<std::string, JNode> o;
+                o["txid"] = jstr(to_hex(entry.txid));
+                o["height"] = jnum((double)entry.block_height);
+                o["tx_pos"] = jnum((double)entry.tx_position);
+                o["timestamp"] = jnum((double)entry.timestamp);
+                o["is_input"] = jbool(entry.is_input);
+                o["value"] = jnum((double)entry.value);
+                o["io_index"] = jnum((double)entry.io_index);
+
+                // Format value as MIQ string
+                std::ostringstream s;
+                s << (entry.value / COIN) << "." << std::setw(8) << std::setfill('0') << (entry.value % COIN);
+                o["value_miq"] = jstr(s.str());
+
+                if (entry.is_input && !entry.spent_txid.empty()) {
+                    o["spent_txid"] = jstr(to_hex(entry.spent_txid));
+                    o["spent_vout"] = jnum((double)entry.spent_vout);
+                }
+
+                // Confirmations
+                auto tip = chain_.tip();
+                if (entry.block_height > 0 && entry.block_height <= tip.height) {
+                    o["confirmations"] = jnum((double)(tip.height - entry.block_height + 1));
+                } else {
+                    o["confirmations"] = jnum(0);
+                }
+
+                JNode n; n.v = o; arr.push_back(n);
+            }
+
+            std::map<std::string, JNode> result;
+            JNode hist_arr; hist_arr.v = arr;
+            result["history"] = hist_arr;
+            result["count"] = jnum((double)arr.size());
+            result["address"] = jstr(addr);
+            result["tx_count"] = jnum((double)chain_.addressindex().get_address_tx_count(pkh));
+
+            JNode out; out.v = result; return json_dump(out);
+        }
+
+        // getaddressbalance(address)
+        // Returns balance details for an address
+        if(method=="getaddressbalance"){
+            if(params.size() < 1 || !std::holds_alternative<std::string>(params[0].v))
+                return err("usage: getaddressbalance <address>");
+
+            const std::string addr = std::get<std::string>(params[0].v);
+
+            // Decode address to PKH
+            uint8_t ver = 0;
+            std::vector<uint8_t> pkh;
+            if (!base58check_decode(addr, ver, pkh) || pkh.size() != 20 || ver != VERSION_P2PKH)
+                return err("invalid address");
+
+            // Get balance from address index
+            auto tip = chain_.tip();
+            auto bal = chain_.addressindex().get_address_balance(pkh, tip.height, COINBASE_MATURITY);
+
+            std::map<std::string, JNode> result;
+            result["address"] = jstr(addr);
+
+            // Balances in miqrons
+            result["confirmed"] = jnum((double)bal.confirmed);
+            result["unconfirmed"] = jnum((double)bal.unconfirmed);
+            result["immature"] = jnum((double)bal.immature);
+            result["total_received"] = jnum((double)bal.total_received);
+            result["total_sent"] = jnum((double)bal.total_sent);
+
+            // Balances as MIQ strings
+            auto fmt_miq = [](uint64_t v) -> std::string {
+                std::ostringstream s;
+                s << (v / COIN) << "." << std::setw(8) << std::setfill('0') << (v % COIN);
+                return s.str();
+            };
+            result["confirmed_miq"] = jstr(fmt_miq(bal.confirmed));
+            result["unconfirmed_miq"] = jstr(fmt_miq(bal.unconfirmed));
+            result["immature_miq"] = jstr(fmt_miq(bal.immature));
+            result["total_received_miq"] = jstr(fmt_miq(bal.total_received));
+            result["total_sent_miq"] = jstr(fmt_miq(bal.total_sent));
+
+            // Statistics
+            result["tx_count"] = jnum((double)bal.tx_count);
+            result["utxo_count"] = jnum((double)bal.utxo_count);
+
+            JNode out; out.v = result; return json_dump(out);
+        }
+
+        // getaddressdeltas(address, [start_height], [end_height])
+        // Returns balance changes (deltas) for an address per block
+        if(method=="getaddressdeltas"){
+            if(params.size() < 1 || !std::holds_alternative<std::string>(params[0].v))
+                return err("usage: getaddressdeltas <address> [start_height] [end_height]");
+
+            const std::string addr = std::get<std::string>(params[0].v);
+
+            // Decode address to PKH
+            uint8_t ver = 0;
+            std::vector<uint8_t> pkh;
+            if (!base58check_decode(addr, ver, pkh) || pkh.size() != 20 || ver != VERSION_P2PKH)
+                return err("invalid address");
+
+            uint64_t start_height = 0;
+            uint64_t end_height = UINT64_MAX;
+
+            if (params.size() >= 2 && std::holds_alternative<double>(params[1].v))
+                start_height = (uint64_t)std::get<double>(params[1].v);
+            if (params.size() >= 3 && std::holds_alternative<double>(params[2].v))
+                end_height = (uint64_t)std::get<double>(params[2].v);
+
+            // Get full history and compute deltas per block
+            auto history = chain_.addressindex().get_address_history(pkh, start_height, end_height, 0, 10000);
+
+            // Aggregate by block height
+            std::map<uint64_t, int64_t> deltas;  // height -> net change
+            for (const auto& entry : history) {
+                if (entry.is_input) {
+                    deltas[entry.block_height] -= (int64_t)entry.value;
+                } else {
+                    deltas[entry.block_height] += (int64_t)entry.value;
+                }
+            }
+
+            std::vector<JNode> arr;
+            for (const auto& kv : deltas) {
+                std::map<std::string, JNode> o;
+                o["height"] = jnum((double)kv.first);
+                o["satoshis"] = jnum((double)kv.second);
+
+                // Format as MIQ
+                bool negative = kv.second < 0;
+                uint64_t abs_val = negative ? (uint64_t)(-kv.second) : (uint64_t)kv.second;
+                std::ostringstream s;
+                if (negative) s << "-";
+                s << (abs_val / COIN) << "." << std::setw(8) << std::setfill('0') << (abs_val % COIN);
+                o["miq"] = jstr(s.str());
+
+                JNode n; n.v = o; arr.push_back(n);
+            }
+
+            std::map<std::string, JNode> result;
+            JNode deltas_arr; deltas_arr.v = arr;
+            result["deltas"] = deltas_arr;
+            result["count"] = jnum((double)arr.size());
+            result["address"] = jstr(addr);
+
+            JNode out; out.v = result; return json_dump(out);
+        }
+
+        // reindexaddresses -> trigger address index rebuild
+        if(method=="reindexaddresses"){
+            // This is a long-running operation, run synchronously for now
+            bool success = chain_.reindex_addresses([](uint64_t cur, uint64_t total) {
+                // Log progress periodically
+                if (cur % 1000 == 0) {
+                    log_info("Address reindex: " + std::to_string(cur) + "/" + std::to_string(total));
+                }
+                return true;
+            });
+
+            std::map<std::string, JNode> result;
+            result["success"] = jbool(success);
+            result["address_count"] = jnum((double)chain_.addressindex().address_count());
+            result["indexed_height"] = jnum((double)chain_.addressindex().best_indexed_height());
+
+            JNode out; out.v = result; return json_dump(out);
+        }
+
+        // getaddressindexinfo -> address index statistics
+        if(method=="getaddressindexinfo"){
+            std::map<std::string, JNode> result;
+            result["enabled"] = jbool(chain_.addressindex().is_enabled());
+            result["address_count"] = jnum((double)chain_.addressindex().address_count());
+            result["transaction_count"] = jnum((double)chain_.addressindex().transaction_count());
+            result["block_hash_count"] = jnum((double)chain_.addressindex().block_hash_count());
+            result["best_indexed_height"] = jnum((double)chain_.addressindex().best_indexed_height());
+            result["disk_usage_bytes"] = jnum((double)chain_.addressindex().disk_usage());
+
+            JNode out; out.v = result; return json_dump(out);
         }
 
         return err("unknown method");

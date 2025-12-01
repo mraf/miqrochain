@@ -17,6 +17,7 @@
 #include "constants.h"
 #include "blockindex.h"
 #include "txindex.h"
+#include "addressindex.h"
 
 // --- Optional GCS block filters (header-level guard; matches chain.cpp) ---
 #ifndef __has_include
@@ -103,6 +104,23 @@ public:
     TxIndex& txindex() { return txindex_; }
     const TxIndex& txindex() const { return txindex_; }
 
+    // Address index for blockchain explorer functionality
+    AddressIndex& addressindex() { return addrindex_; }
+    const AddressIndex& addressindex() const { return addrindex_; }
+
+    // Block hash index for O(1) block-by-hash lookup
+    BlockHashIndex& hashindex() { return hashindex_; }
+    const BlockHashIndex& hashindex() const { return hashindex_; }
+
+    // Fast block lookup by hash using hash index (O(1) instead of O(n))
+    bool get_block_by_hash_fast(const std::vector<uint8_t>& hash, Block& out) const;
+
+    // Get block height by hash (O(1))
+    int64_t get_height_by_hash(const std::vector<uint8_t>& hash) const;
+
+    // Reindex address index from genesis
+    bool reindex_addresses(std::function<bool(uint64_t, uint64_t)> progress = nullptr);
+
 #if MIQ_HAVE_GCS_FILTERS
     // === Compact filter RPC helpers for the P2P server ===
     // Returns rolling filter headers (BIP158-style) for [start, start+count).
@@ -122,6 +140,8 @@ private:
     std::string datadir_;
     UTXOSet     utxo_;
     TxIndex     txindex_;
+    AddressIndex addrindex_;    // Address index for explorer queries
+    BlockHashIndex hashindex_;  // Block hash → height for O(1) lookup
     Tip         tip_{0, std::vector<uint8_t>(32,0), GENESIS_BITS, GENESIS_TIME, 0};
     BlockIndex  index_;
 
