@@ -7,6 +7,7 @@
 #include "tx.h"
 #include "hex.h"
 #include "log.h"
+#include "hash160.h"
 
 #include <cstring>
 #include <filesystem>
@@ -282,14 +283,8 @@ bool AddressIndex::index_transaction(const Transaction& tx, uint64_t height,
             const auto& in = tx.vin[vin];
             if (in.prev.txid.empty() || in.pubkey.size() < 33) continue;
 
-            // Compute PKH from pubkey
-            // Note: We need hash160 function - for now, store pubkey hash
-            // The pubkey is available, we compute hash160(pubkey) for the address
-            std::vector<uint8_t> pkh;
-
-            // If pubkey is 33 bytes (compressed), compute RIPEMD160(SHA256(pubkey))
-            extern std::vector<uint8_t> hash160(const std::vector<uint8_t>& data);
-            pkh = hash160(in.pubkey);
+            // Compute PKH from pubkey: RIPEMD160(SHA256(pubkey))
+            std::vector<uint8_t> pkh = hash160(in.pubkey);
 
             if (pkh.size() != 20) continue;
 
