@@ -211,6 +211,7 @@ set(MIQ_CORE_SOURCES_NO_NAT
     src/lut.h src/lut.cpp
     src/blockindex.h src/blockindex.cpp
     src/txindex.h src/txindex.cpp
+    src/addressindex.h src/addressindex.cpp
     src/chain.h src/chain.cpp
     src/netmsg.h src/netmsg.cpp
     src/p2p.h src/p2p.cpp

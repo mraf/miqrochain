@@ -1096,6 +1096,40 @@ bool Chain::open(const std::string& dir){
         }
     }
 #endif
+
+    // === EXPLORER INDEXES ===
+
+    // Initialize Address Index for blockchain explorer functionality
+    if (!addrindex_.open(datadir_)) {
+        log_warn("Failed to open AddressIndex, explorer queries will be slower");
+    }
+
+    // Initialize Block Hash Index for O(1) block-by-hash lookups
+    std::string hash_index_path = datadir_ + "/hashindex.dat";
+    if (!hashindex_.load(hash_index_path)) {
+        log_info("Building block hash index...");
+        // Rebuild hash index from blocks
+        for (uint64_t h = 0; h <= tip_.height; ++h) {
+            Block blk;
+            if (get_block_by_index(h, blk)) {
+                hashindex_.add(blk.block_hash(), h);
+            }
+        }
+        hashindex_.save(hash_index_path);
+        log_info("Block hash index built with " + std::to_string(hashindex_.size()) + " entries");
+    }
+
+    // Rebuild Address Index if empty but we have blocks
+    if (addrindex_.is_enabled() && addrindex_.address_count() == 0 && tip_.height > 0) {
+        log_info("AddressIndex empty, triggering rebuild...");
+        reindex_addresses([](uint64_t cur, uint64_t total) {
+            if (cur % 1000 == 0) {
+                log_info("AddressIndex rebuild: " + std::to_string(cur) + "/" + std::to_string(total));
+            }
+            return true;
+        });
+    }
+
     return true;
 }
 
@@ -1716,6 +1750,16 @@ bool Chain::disconnect_tip_once(std::string& err){
     // This ensures the transaction index stays consistent with the active chain
     txindex_.remove_block(tip_.height);
 
+    // === EXPLORER INDEX ROLLBACK ===
+
+    // Remove block from Address Index
+    if (addrindex_.is_enabled()) {
+        addrindex_.unindex_block(cur, tip_.height);
+    }
+
+    // Remove block from Hash Index
+    hashindex_.remove(cur.block_hash());
+
     // CRITICAL FIX: Rollback BIP158 filters on disconnect to maintain consistency
     // Without this, SPV clients can receive stale filters after a reorg
 #if MIQ_HAVE_GCS_FILTERS
@@ -1863,6 +1907,16 @@ bool Chain::submit_block(const Block& b, std::string& err){
         txindex_.flush();
     }
 
+    // === EXPLORER INDEX UPDATES ===
+
+    // Update Address Index for blockchain explorer queries
+    if (addrindex_.is_enabled()) {
+        addrindex_.index_block(b, new_height);
+    }
+
+    // Update Block Hash Index for O(1) block-by-hash lookups
+    hashindex_.add(new_hash, new_height);
+
     // Prune old undo if beyond window
     if (tip_.height >= UNDO_WINDOW) {
         size_t prune_h = (size_t)(tip_.height - UNDO_WINDOW);
@@ -1953,5 +2007,55 @@ bool Chain::get_filters_with_hash(uint32_t start, uint32_t count,
     return g_filter_store.get_filters(start, count, out);
 }
 #endif
+
+// =============================================================================
+// EXPLORER INDEX METHODS
+// =============================================================================
+
+bool Chain::get_block_by_hash_fast(const std::vector<uint8_t>& hash, Block& out) const {
+    MIQ_CHAIN_GUARD();
+
+    // Use hash index for O(1) lookup
+    int64_t height = hashindex_.get(hash);
+    if (height < 0) {
+        // Fallback to storage lookup (slower, O(n))
+        return get_block_by_hash(hash, out);
+    }
+
+    return get_block_by_index(static_cast<size_t>(height), out);
+}
+
+int64_t Chain::get_height_by_hash(const std::vector<uint8_t>& hash) const {
+    MIQ_CHAIN_GUARD();
+    return hashindex_.get(hash);
+}
+
+bool Chain::reindex_addresses(std::function<bool(uint64_t, uint64_t)> progress) {
+    MIQ_CHAIN_GUARD();
+
+    if (!addrindex_.is_enabled()) {
+        log_error("AddressIndex not enabled");
+        return false;
+    }
+
+    log_info("Starting address index rebuild from genesis to height " + std::to_string(tip_.height));
+
+    auto get_block = [this](uint64_t h, Block& b) -> bool {
+        return this->get_block_by_index(static_cast<size_t>(h), b);
+    };
+
+    bool result = addrindex_.reindex(get_block, tip_.height, progress);
+
+    if (result) {
+        // Save hash index as well
+        std::string hash_index_path = datadir_ + "/hashindex.dat";
+        hashindex_.save(hash_index_path);
+        log_info("Address index rebuild complete");
+    } else {
+        log_error("Address index rebuild failed");
+    }
+
+    return result;
+}
 
 }
