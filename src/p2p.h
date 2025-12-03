@@ -543,7 +543,8 @@ public:
 
 private:
     // tx relay (basic)
-    void request_tx(PeerState& ps, const std::vector<uint8_t>& txid);
+    // CRITICAL FIX: Returns bool to indicate if gettx was actually sent
+    bool request_tx(PeerState& ps, const std::vector<uint8_t>& txid);
     void send_tx(Sock sock, const std::vector<uint8_t>& raw);
     void send_block(Sock s, const std::vector<uint8_t>& raw);
 
