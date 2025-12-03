@@ -969,7 +969,10 @@ static inline void maybe_send_feefilter(miq::PeerState& ps){
     for (int i=0;i<8;i++) pl[i] = (uint8_t)((mrf >> (8*i)) & 0xFF);
     auto msg = miq::encode_msg("feefilter", pl);
     if (send_or_close(ps.sock, msg)) {
-        set_peer_feefilter((Sock)ps.sock, mrf);
+        // CRITICAL FIX: Only update the timestamp, NOT the peer's feefilter value!
+        // The peer's feefilter should only be set when we RECEIVE their feefilter message.
+        // Previously this was setting our own value as the peer's, which was incorrect.
+        g_peer_last_ff_ms[(Sock)ps.sock] = now;
     }
 }
 
@@ -2813,24 +2816,70 @@ void P2P::broadcast_inv_tx(const std::vector<uint8_t>& txid){
         MIQ_LOG_WARN(miq::LogCategory::NET, "broadcast_inv_tx: invalid txid size " + std::to_string(txid.size()));
         return;
     }
-    // V1.0 FIX: Use unified tx_store_mu_ for all tx-related data structures
-    std::lock_guard<std::mutex> lk(tx_store_mu_);
 
-    // FIX: Increased queue limit with FIFO eviction instead of dropping
-    // When queue is full, evict oldest entries to make room for new ones
-    // This ensures recent transactions always get announced while older ones
-    // (which have likely already propagated) are evicted first
-    if (announce_tx_q_.size() >= MIQ_TX_ANNOUNCE_QUEUE_MAX) {
-        // Evict oldest entries (FIFO) to make room
-        size_t to_evict = MIQ_TX_ANNOUNCE_QUEUE_EVICT_BATCH;
-        if (to_evict > announce_tx_q_.size()) to_evict = announce_tx_q_.size();
-        announce_tx_q_.erase(announce_tx_q_.begin(), announce_tx_q_.begin() + to_evict);
-        MIQ_LOG_INFO(miq::LogCategory::NET, "broadcast_inv_tx: queue overflow, evicted " +
-            std::to_string(to_evict) + " oldest entries, queue_size=" + std::to_string(announce_tx_q_.size()));
+    // CRITICAL FIX: Get the raw tx data from tx_store_ for direct sending
+    // This must be done BEFORE acquiring g_peers_mu to avoid lock order issues
+    std::vector<uint8_t> raw_tx;
+    std::string key = hexkey(txid);
+    {
+        std::lock_guard<std::mutex> tx_lk(tx_store_mu_);
+        auto itx = tx_store_.find(key);
+        if (itx != tx_store_.end()) {
+            raw_tx = itx->second;
+        }
     }
 
-    announce_tx_q_.push_back(txid);
-    MIQ_LOG_DEBUG(miq::LogCategory::NET, "broadcast_inv_tx: queued tx for broadcast, queue_size=" + std::to_string(announce_tx_q_.size()));
+    // CRITICAL FIX: Send BOTH invtx AND full tx directly to all connected peers
+    // This ensures immediate propagation without waiting for the gettx round-trip
+    // The receiving peer will:
+    // - Process invtx first (if it arrives first): mark as known, request via gettx
+    // - Process tx first (if it arrives first): validate and accept to mempool
+    // - If tx arrives after invtx request: accept and add to mempool
+    // Either way, the transaction will be received and processed
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+        auto invtx_msg = encode_msg("invtx", txid);
+        std::vector<uint8_t> tx_msg;
+        if (!raw_tx.empty()) {
+            tx_msg = encode_msg("tx", raw_tx);
+        }
+
+        int inv_sent = 0;
+        int tx_sent = 0;
+        for (auto& kv : peers_) {
+            if (kv.second.verack_ok) {
+                // Send invtx announcement
+                if (send_or_close(kv.first, invtx_msg)) {
+                    inv_sent++;
+                }
+                // CRITICAL: Also send the full transaction directly
+                // This bypasses the invtx→gettx→tx round-trip entirely
+                if (!tx_msg.empty()) {
+                    if (send_or_close(kv.first, tx_msg)) {
+                        tx_sent++;
+                    }
+                }
+            }
+        }
+        if (inv_sent > 0 || tx_sent > 0) {
+            MIQ_LOG_DEBUG(miq::LogCategory::NET, "broadcast_inv_tx: sent invtx to " +
+                std::to_string(inv_sent) + " peers, tx directly to " + std::to_string(tx_sent) + " peers");
+        }
+    }
+
+    // Also queue for trickle broadcast (handles peers that connect later, rebroadcast, etc.)
+    {
+        std::lock_guard<std::mutex> lk(tx_store_mu_);
+
+        // FIX: Increased queue limit with FIFO eviction instead of dropping
+        if (announce_tx_q_.size() >= MIQ_TX_ANNOUNCE_QUEUE_MAX) {
+            size_t to_evict = MIQ_TX_ANNOUNCE_QUEUE_EVICT_BATCH;
+            if (to_evict > announce_tx_q_.size()) to_evict = announce_tx_q_.size();
+            announce_tx_q_.erase(announce_tx_q_.begin(), announce_tx_q_.begin() + to_evict);
+        }
+
+        announce_tx_q_.push_back(txid);
+    }
 }
 
 // =============================================================================
