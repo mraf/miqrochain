@@ -2928,18 +2928,32 @@ static void trickle_flush(){
     }
 }
 
-void P2P::request_tx(PeerState& ps, const std::vector<uint8_t>& txid){
-    if (txid.size()!=32) return;
-    if (!check_rate(ps, "get", 1.0, now_ms())) return;
+// CRITICAL FIX: request_tx now returns bool to indicate success
+// This allows callers to know if the gettx was actually sent
+bool P2P::request_tx(PeerState& ps, const std::vector<uint8_t>& txid){
+    if (txid.size()!=32) {
+        MIQ_LOG_WARN(miq::LogCategory::NET, "request_tx: invalid txid size " + std::to_string(txid.size()));
+        return false;
+    }
+    if (!check_rate(ps, "get", 1.0, now_ms())) {
+        MIQ_LOG_DEBUG(miq::LogCategory::NET, "request_tx: rate limited for peer " + ps.ip);
+        return false;
+    }
     const size_t max_inflight_tx = caps_.max_txs ? caps_.max_txs : (size_t)128;
-    if (ps.inflight_tx.size() >= max_inflight_tx) return;
+    if (ps.inflight_tx.size() >= max_inflight_tx) {
+        MIQ_LOG_DEBUG(miq::LogCategory::NET, "request_tx: max inflight (" + std::to_string(max_inflight_tx) +
+            ") reached for peer " + ps.ip + ", cannot request tx");
+        return false;
+    }
     auto m = encode_msg("gettx", txid);
     if (send_or_close(ps.sock, m)) {
         std::string key = hexkey(txid);
         ps.inflight_tx.insert(key);
         // CRITICAL FIX: Track request timestamp for timeout cleanup
         g_inflight_tx_ts[(Sock)ps.sock][key] = now_ms();
+        return true;
     }
+    return false;
 }
 
 void P2P::send_tx(Sock sock, const std::vector<uint8_t>& raw){
@@ -5436,7 +5450,12 @@ void P2P::loop(){
                         if (m.payload.size() == 32) {
                             if (!inv_tick(1)) { continue; }
                             auto key = hexkey(m.payload);
-                            if (!remember_inv(key)) { continue; }
+
+                            // CRITICAL FIX: Check if already in recent_inv_keys WITHOUT inserting
+                            // Only insert AFTER we successfully request or already have the tx
+                            // This prevents a bug where failed request_tx calls would block
+                            // subsequent invtx messages for the same transaction
+                            if (ps.recent_inv_keys.count(key) > 0) { continue; }
 
                             // V1.0 FIX: Thread-safe check of seen_txids_
                             bool already_seen = false;
@@ -5444,8 +5463,18 @@ void P2P::loop(){
                                 std::lock_guard<std::mutex> tx_lk(tx_store_mu_);
                                 already_seen = seen_txids_.count(key) > 0;
                             }
-                            if (!already_seen) {
-                                request_tx(ps, m.payload);
+
+                            if (already_seen) {
+                                // Already have this tx - mark as remembered and skip
+                                remember_inv(key);
+                            } else {
+                                // CRITICAL FIX: Only mark as remembered if request actually succeeds
+                                // If request_tx fails (rate limited, max inflight, etc), we want
+                                // to be able to try again when the peer re-announces
+                                if (request_tx(ps, m.payload)) {
+                                    remember_inv(key);
+                                }
+                                // If request failed, don't add to recent_inv_keys so we can retry
                             }
                         }
 
@@ -5630,6 +5659,10 @@ void P2P::loop(){
 
                                     const std::vector<uint8_t> txidv = tx.txid();
                                     for (auto& kvp : peers_) {
+                                        // CRITICAL FIX: Only relay to peers with completed handshake
+                                        if (!kvp.second.verack_ok) continue;
+                                        // Don't relay back to sender
+                                        if (kvp.first == s) continue;
                                         Sock psock = kvp.first;
                                         uint64_t peer_min = peer_feefilter_kb(psock);
                                         if (peer_min && feerate_kb < peer_min) continue;
@@ -5638,7 +5671,13 @@ void P2P::loop(){
                                 } else {
                                     // no complete inputs: still advertise to help fetch deps
                                     const std::vector<uint8_t> txidv = tx.txid();
-                                    for (auto& kvp : peers_) trickle_enqueue(kvp.first, txidv);
+                                    for (auto& kvp : peers_) {
+                                        // CRITICAL FIX: Only relay to peers with completed handshake
+                                        if (!kvp.second.verack_ok) continue;
+                                        // Don't relay back to sender
+                                        if (kvp.first == s) continue;
+                                        trickle_enqueue(kvp.first, txidv);
+                                    }
                                 }
                             }
                         }
@@ -6231,10 +6270,33 @@ void P2P::loop(){
             }
             if (!todos.empty()) {
                 std::vector<Sock> sockets;
+                // CRITICAL FIX: Only broadcast to peers that have completed handshake
+                // Peers without verack_ok will ignore or buffer messages, wasting bandwidth
+                // and potentially causing message ordering issues
                 { std::lock_guard<std::recursive_mutex> lk2(g_peers_mu);
-                  for (auto& kv : peers_) sockets.push_back(kv.first); }
-                for (const auto& txid : todos) {
-                    for (auto sock : sockets) trickle_enqueue(sock, txid);
+                  for (auto& kv : peers_) {
+                      if (kv.second.verack_ok) {
+                          sockets.push_back(kv.first);
+                      }
+                  }
+                }
+                if (!sockets.empty()) {
+                    for (const auto& txid : todos) {
+                        for (auto sock : sockets) trickle_enqueue(sock, txid);
+                    }
+                    MIQ_LOG_DEBUG(miq::LogCategory::NET, "broadcast_inv_tx: enqueued " +
+                        std::to_string(todos.size()) + " tx(s) to " + std::to_string(sockets.size()) + " peers");
+                } else {
+                    // CRITICAL: No connected peers with completed handshake!
+                    // Re-queue for next iteration
+                    {
+                        std::lock_guard<std::mutex> lk_tx(tx_store_mu_);
+                        for (const auto& txid : todos) {
+                            announce_tx_q_.push_back(txid);
+                        }
+                    }
+                    MIQ_LOG_WARN(miq::LogCategory::NET, "broadcast_inv_tx: no peers ready, re-queued " +
+                        std::to_string(todos.size()) + " tx(s)");
                 }
             }
         }
