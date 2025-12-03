@@ -4101,6 +4101,10 @@ void P2P::loop(){
                 auto pit = peers_.find(e.first);
                 if (pit != peers_.end()) {
                     pit->second.inflight_tx.erase(e.second);
+                    // CRITICAL FIX: Also clear from recent_inv_keys so the peer can re-announce
+                    // Without this, if a request times out, the peer would never be able to
+                    // successfully announce this tx to us again (we'd skip it in invtx handler)
+                    pit->second.recent_inv_keys.erase(e.second);
                 }
             }
             if (!expired_tx.empty()) {
