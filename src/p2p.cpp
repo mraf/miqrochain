@@ -2918,6 +2918,15 @@ static void trickle_flush(){
             const auto& txid = q.back();
             auto m = miq::encode_msg("invtx", txid);
             if (send_or_close(s, m)) {
+                // Log the txid being sent
+                std::string key;
+                key.reserve(64);
+                static const char hex[] = "0123456789abcdef";
+                for (uint8_t b : txid) {
+                    key.push_back(hex[b >> 4]);
+                    key.push_back(hex[b & 0xf]);
+                }
+                MIQ_LOG_INFO(miq::LogCategory::NET, "trickle_flush: sent invtx " + key.substr(0, 16) + "... to sock=" + std::to_string(s));
                 q.pop_back();
             } else {
                 break; // scheduled for close; stop emitting
@@ -5471,17 +5480,24 @@ void P2P::loop(){
                             if (!ibd_or_fetch_active(ps, now_ms())) {
                                 bump_ban(ps, ps.ip, "inv-flood", now_ms());
                             }
+                            MIQ_LOG_DEBUG(miq::LogCategory::NET, "invtx: rate limited from " + ps.ip);
                             continue;
                         }
                         if (m.payload.size() == 32) {
-                            if (!inv_tick(1)) { continue; }
+                            if (!inv_tick(1)) {
+                                MIQ_LOG_DEBUG(miq::LogCategory::NET, "invtx: inv_tick failed from " + ps.ip);
+                                continue;
+                            }
                             auto key = hexkey(m.payload);
 
                             // CRITICAL FIX: Check if already in recent_inv_keys WITHOUT inserting
                             // Only insert AFTER we successfully request or already have the tx
                             // This prevents a bug where failed request_tx calls would block
                             // subsequent invtx messages for the same transaction
-                            if (ps.recent_inv_keys.count(key) > 0) { continue; }
+                            if (ps.recent_inv_keys.count(key) > 0) {
+                                MIQ_LOG_DEBUG(miq::LogCategory::NET, "invtx: already in recent_inv_keys " + key.substr(0, 16) + "...");
+                                continue;
+                            }
 
                             // V1.0 FIX: Thread-safe check of seen_txids_
                             bool already_seen = false;
@@ -5492,13 +5508,18 @@ void P2P::loop(){
 
                             if (already_seen) {
                                 // Already have this tx - mark as remembered and skip
+                                MIQ_LOG_DEBUG(miq::LogCategory::NET, "invtx: already seen " + key.substr(0, 16) + "...");
                                 remember_inv(key);
                             } else {
                                 // CRITICAL FIX: Only mark as remembered if request actually succeeds
                                 // If request_tx fails (rate limited, max inflight, etc), we want
                                 // to be able to try again when the peer re-announces
+                                MIQ_LOG_INFO(miq::LogCategory::NET, "invtx: requesting tx " + key.substr(0, 16) + "... from " + ps.ip);
                                 if (request_tx(ps, m.payload)) {
                                     remember_inv(key);
+                                    MIQ_LOG_INFO(miq::LogCategory::NET, "invtx: gettx sent for " + key.substr(0, 16) + "...");
+                                } else {
+                                    MIQ_LOG_WARN(miq::LogCategory::NET, "invtx: request_tx FAILED for " + key.substr(0, 16) + "...");
                                 }
                                 // If request failed, don't add to recent_inv_keys so we can retry
                             }
@@ -5507,13 +5528,16 @@ void P2P::loop(){
                     } else if (cmd == "gettx") {
                         if (m.payload.size() == 32) {
                             auto key = hexkey(m.payload);
+                            MIQ_LOG_INFO(miq::LogCategory::NET, "gettx: peer " + ps.ip + " requesting tx " + key.substr(0, 16) + "...");
                             // V1.0 FIX: Thread-safe access to tx_store_
                             std::vector<uint8_t> tx_data;
+                            bool found_in_store = false;
                             {
                                 std::lock_guard<std::mutex> tx_lk(tx_store_mu_);
                                 auto itx = tx_store_.find(key);
                                 if (itx != tx_store_.end()) {
                                     tx_data = itx->second; // Copy under lock
+                                    found_in_store = true;
                                 }
                             }
                             // V1.0 FIX: Fallback to mempool if not in tx_store_
@@ -5522,6 +5546,7 @@ void P2P::loop(){
                                 Transaction tx;
                                 if (mempool_->get_transaction(m.payload, tx)) {
                                     tx_data = ser_tx(tx);
+                                    MIQ_LOG_INFO(miq::LogCategory::NET, "gettx: found tx " + key.substr(0, 16) + "... in mempool");
                                     // Cache for future requests
                                     std::lock_guard<std::mutex> tx_lk(tx_store_mu_);
                                     if (tx_store_.find(key) == tx_store_.end()) {
@@ -5539,7 +5564,11 @@ void P2P::loop(){
                             if (!tx_data.empty()) {
                                 if (rate_consume_tx(ps, tx_data.size())) {
                                     send_tx(s, tx_data);
+                                    MIQ_LOG_INFO(miq::LogCategory::NET, "gettx: sent tx " + key.substr(0, 16) + "... to " + ps.ip +
+                                        " (source=" + (found_in_store ? "tx_store" : "mempool") + ", size=" + std::to_string(tx_data.size()) + ")");
                                 }
+                            } else {
+                                MIQ_LOG_WARN(miq::LogCategory::NET, "gettx: tx " + key.substr(0, 16) + "... NOT FOUND (requested by " + ps.ip + ")");
                             }
                         }
 
@@ -5549,8 +5578,12 @@ void P2P::loop(){
                         (void)rate_consume_tx(ps, m.payload.size());  // Update rate tracking but don't reject
 
                         Transaction tx;
-                        if (!deser_tx(m.payload, tx)) continue;
+                        if (!deser_tx(m.payload, tx)) {
+                            MIQ_LOG_WARN(miq::LogCategory::NET, "tx: failed to deserialize from " + ps.ip);
+                            continue;
+                        }
                         auto key = hexkey(tx.txid());
+                        MIQ_LOG_INFO(miq::LogCategory::NET, "tx: received " + key.substr(0, 16) + "... from " + ps.ip + " (size=" + std::to_string(m.payload.size()) + ")");
 
                         ps.inflight_tx.erase(key);
                         // CRITICAL FIX: Clear timestamp when tx is received
@@ -5562,6 +5595,7 @@ void P2P::loop(){
                         }
                         if (unsolicited_drop(ps, "tx", key)) {
                             // Polite ignore: remote may proactively relay deps.
+                            MIQ_LOG_DEBUG(miq::LogCategory::NET, "tx: dropped unsolicited " + key.substr(0, 16) + "...");
                             continue;
                         }
 
@@ -5579,6 +5613,9 @@ void P2P::loop(){
                                 accepted = mempool_->accept(tx, chain_.utxo(), static_cast<uint32_t>(chain_.height()), err);
                             }
                             bool in_mempool = mempool_ && mempool_->exists(tx.txid());
+                            MIQ_LOG_INFO(miq::LogCategory::NET, "tx: " + key.substr(0, 16) + "... mempool accept=" +
+                                (accepted ? "true" : "false") + " in_mempool=" + (in_mempool ? "true" : "false") +
+                                (err.empty() ? "" : " err=" + err));
 
                             // CRITICAL FIX: Detect orphan transactions
                             // Orphans return accepted=false with err starting with "orphan:"
@@ -6368,15 +6405,26 @@ void P2P::loop(){
                 }
             }
 
-            // Rebroadcast to all peers
+            // Rebroadcast to all connected peers with completed handshake
             if (!rebroadcast_txids.empty()) {
                 std::vector<Sock> sockets;
                 { std::lock_guard<std::recursive_mutex> lk2(g_peers_mu);
-                  for (auto& kv : peers_) sockets.push_back(kv.first); }
-                MIQ_LOG_DEBUG(miq::LogCategory::NET, "rebroadcast: sending " + std::to_string(rebroadcast_txids.size()) +
-                    " txs to " + std::to_string(sockets.size()) + " peers");
-                for (const auto& txid : rebroadcast_txids) {
-                    for (auto sock : sockets) trickle_enqueue(sock, txid);
+                  for (auto& kv : peers_) {
+                      // CRITICAL FIX: Only rebroadcast to peers with completed handshake
+                      if (kv.second.verack_ok) {
+                          sockets.push_back(kv.first);
+                      }
+                  }
+                }
+                if (!sockets.empty()) {
+                    MIQ_LOG_DEBUG(miq::LogCategory::NET, "rebroadcast: sending " + std::to_string(rebroadcast_txids.size()) +
+                        " txs to " + std::to_string(sockets.size()) + " peers");
+                    for (const auto& txid : rebroadcast_txids) {
+                        for (auto sock : sockets) trickle_enqueue(sock, txid);
+                    }
+                } else {
+                    MIQ_LOG_DEBUG(miq::LogCategory::NET, "rebroadcast: no peers with completed handshake, skipping " +
+                        std::to_string(rebroadcast_txids.size()) + " txs");
                 }
             }
             if (!expired_keys.empty()) {
