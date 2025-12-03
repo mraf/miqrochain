@@ -2907,6 +2907,10 @@ static void trickle_flush(){
         Sock s = kv.first;
         auto& q = kv.second;
 
+        // CRITICAL FIX: Skip empty queues entirely - don't update timestamp
+        // This prevents delays when new items are added after an empty flush
+        if (q.empty()) continue;
+
         int64_t last = 0;
         auto it_last = g_trickle_last_ms.find(s);
         if (it_last != g_trickle_last_ms.end()) last = it_last->second;
@@ -2919,12 +2923,15 @@ static void trickle_flush(){
             auto m = miq::encode_msg("invtx", txid);
             if (send_or_close(s, m)) {
                 q.pop_back();
+                ++n_send;
             } else {
                 break; // scheduled for close; stop emitting
             }
-            ++n_send;
         }
-        g_trickle_last_ms[s] = tnow;
+        // CRITICAL FIX: Only update timestamp if we actually sent something
+        if (n_send > 0) {
+            g_trickle_last_ms[s] = tnow;
+        }
     }
 }
 
@@ -5540,6 +5547,8 @@ void P2P::loop(){
                                 if (rate_consume_tx(ps, tx_data.size())) {
                                     send_tx(s, tx_data);
                                 }
+                            } else {
+                                MIQ_LOG_DEBUG(miq::LogCategory::NET, "gettx: tx " + key.substr(0, 16) + "... not found (requested by " + ps.ip + ")");
                             }
                         }
 
@@ -6368,15 +6377,26 @@ void P2P::loop(){
                 }
             }
 
-            // Rebroadcast to all peers
+            // Rebroadcast to all connected peers with completed handshake
             if (!rebroadcast_txids.empty()) {
                 std::vector<Sock> sockets;
                 { std::lock_guard<std::recursive_mutex> lk2(g_peers_mu);
-                  for (auto& kv : peers_) sockets.push_back(kv.first); }
-                MIQ_LOG_DEBUG(miq::LogCategory::NET, "rebroadcast: sending " + std::to_string(rebroadcast_txids.size()) +
-                    " txs to " + std::to_string(sockets.size()) + " peers");
-                for (const auto& txid : rebroadcast_txids) {
-                    for (auto sock : sockets) trickle_enqueue(sock, txid);
+                  for (auto& kv : peers_) {
+                      // CRITICAL FIX: Only rebroadcast to peers with completed handshake
+                      if (kv.second.verack_ok) {
+                          sockets.push_back(kv.first);
+                      }
+                  }
+                }
+                if (!sockets.empty()) {
+                    MIQ_LOG_DEBUG(miq::LogCategory::NET, "rebroadcast: sending " + std::to_string(rebroadcast_txids.size()) +
+                        " txs to " + std::to_string(sockets.size()) + " peers");
+                    for (const auto& txid : rebroadcast_txids) {
+                        for (auto sock : sockets) trickle_enqueue(sock, txid);
+                    }
+                } else {
+                    MIQ_LOG_DEBUG(miq::LogCategory::NET, "rebroadcast: no peers with completed handshake, skipping " +
+                        std::to_string(rebroadcast_txids.size()) + " txs");
                 }
             }
             if (!expired_keys.empty()) {
@@ -6421,9 +6441,14 @@ void P2P::loop(){
             for (const auto& h : todo) {
                 auto m = encode_msg("invb", h);
                 std::vector<Sock> sockets;
-                // NOTE: g_peers_mu is already locked by the outer scope at line 4108
+                // NOTE: g_peers_mu is already locked by the outer scope
                 // Do NOT lock it again here to avoid deadlock!
-                for (auto& kv : peers_) sockets.push_back(kv.first);
+                // CRITICAL FIX: Only broadcast to peers with completed handshake
+                for (auto& kv : peers_) {
+                    if (kv.second.verack_ok) {
+                        sockets.push_back(kv.first);
+                    }
+                }
                 for (auto s : sockets) {
                     (void)send_or_close(s, m);
                 }
