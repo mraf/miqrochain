@@ -3579,12 +3579,21 @@ void P2P::loop(){
                      bool is_v4 = parse_ipv4(cand->host, be_ip);
                      if (is_v4 && !ipv4_is_public(be_ip)) { g_addrman.mark_attempt(*cand); continue; }
                      if (is_v4 && is_self_be(be_ip)) { g_addrman.mark_attempt(*cand); continue; }
-                     if (is_v4 && outbound_count() >= (size_t)MIQ_OUTBOUND_TARGET && violates_group_diversity(peers_, be_ip)) {
-                         g_addrman.mark_attempt(*cand); continue;
+                     // CRITICAL FIX: Hold g_peers_mu while accessing peers_ to prevent segfault
+                     {
+                         std::lock_guard<std::recursive_mutex> lk_check(g_peers_mu);
+                         if (is_v4 && outbound_count() >= (size_t)MIQ_OUTBOUND_TARGET && violates_group_diversity(peers_, be_ip)) {
+                             g_addrman.mark_attempt(*cand); continue;
+                         }
                      }
                      std::string dotted = is_v4 ? be_ip_to_string(be_ip) : cand->host;
                      if (banned_.count(dotted)) { g_addrman.mark_attempt(*cand); continue; }
-                     bool connected = false; for (auto& kv : peers_) if (kv.second.ip == dotted) { connected = true; break; }
+                     // CRITICAL FIX: Hold g_peers_mu while accessing peers_
+                     bool connected = false;
+                     {
+                         std::lock_guard<std::recursive_mutex> lk_check(g_peers_mu);
+                         for (auto& kv : peers_) if (kv.second.ip == dotted) { connected = true; break; }
+                     }
                      if (connected) { g_addrman.mark_attempt(*cand); continue; }
  
                      Sock s = MIQ_INVALID_SOCK;
@@ -3638,6 +3647,8 @@ void P2P::loop(){
  #endif
                     std::vector<uint32_t> candidates;
                     candidates.reserve(addrv4_.size());
+                    // CRITICAL FIX: Hold g_peers_mu while accessing peers_
+                    std::lock_guard<std::recursive_mutex> lk_cand(g_peers_mu);
                     for (uint32_t ip : addrv4_) {
                         if (is_self_be(ip)) continue;
                         if (is_loopback_be(ip)) continue;
@@ -3702,35 +3713,46 @@ void P2P::loop(){
                 auto cand = g_addrman.select_feeler(g_am_rng);
                 if (cand) {
                     uint32_t be_ip;
-                    if (parse_ipv4(cand->host, be_ip) && ipv4_is_public(be_ip) && !is_self_be(be_ip) && !violates_group_diversity(peers_, be_ip)) {
-                        std::string dotted = be_ip_to_string(be_ip);
-                        if (!banned_.count(dotted)) {
-                            bool connected=false; for (auto& kv:peers_) if (kv.second.ip==dotted) { connected=true; break; }
-                            if (!connected) {
-                                Sock s = dial_be_ipv4(be_ip, g_listen_port);
-                                if (s != MIQ_INVALID_SOCK) {
-                                    PeerState ps; ps.sock=s; ps.ip=dotted; ps.mis=0; ps.last_ms=now_ms();
-                                    ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
-                                    ps.inflight_hdr_batches = 0; ps.last_hdr_batch_done_ms = 0; ps.sent_getheaders = false;
-                                    ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
-                                    ps.total_blocks_received = 0;
-                                    ps.total_block_delivery_time_ms = 0;
-                                    ps.avg_block_delivery_ms = 30000;
-                                    ps.blocks_delivered_successfully = 0;
-                                    ps.blocks_failed_delivery = 0;
-                                    ps.health_score = 1.0;
-                                    ps.last_block_received_ms = 0;
-                                    { std::lock_guard<std::recursive_mutex> lk(g_peers_mu); peers_[s]=ps; g_outbounds.insert(s); }
-                                    g_peer_index_capable[s] = false;
-                                    g_trickle_last_ms[s] = 0;
-                                    log_info("P2P: feeler " + dotted);
-                                    gate_on_connect(s);
-                                    miq_set_keepalive(s);
-                                    gate_set_loopback(s, is_loopback_be(be_ip));
-                                    auto msg = encode_msg("version", miq_build_version_payload((uint32_t)chain_.height()));
-                                    (void)send_or_close(s, msg);
-                                }
+                    // CRITICAL FIX: Hold g_peers_mu while accessing peers_
+                    bool skip_cand = false;
+                    bool connected = false;
+                    std::string dotted;
+                    {
+                        std::lock_guard<std::recursive_mutex> lk_feeler(g_peers_mu);
+                        if (parse_ipv4(cand->host, be_ip) && ipv4_is_public(be_ip) && !is_self_be(be_ip) && !violates_group_diversity(peers_, be_ip)) {
+                            dotted = be_ip_to_string(be_ip);
+                            if (!banned_.count(dotted)) {
+                                for (auto& kv:peers_) if (kv.second.ip==dotted) { connected=true; break; }
+                            } else {
+                                skip_cand = true;
                             }
+                        } else {
+                            skip_cand = true;
+                        }
+                    }
+                    if (!skip_cand && !connected) {
+                        Sock s = dial_be_ipv4(be_ip, g_listen_port);
+                        if (s != MIQ_INVALID_SOCK) {
+                            PeerState ps; ps.sock=s; ps.ip=dotted; ps.mis=0; ps.last_ms=now_ms();
+                            ps.blk_tokens = MIQ_RATE_BLOCK_BURST; ps.tx_tokens=MIQ_RATE_TX_BURST; ps.last_refill_ms=ps.last_ms;
+                            ps.inflight_hdr_batches = 0; ps.last_hdr_batch_done_ms = 0; ps.sent_getheaders = false;
+                            ps.rate.last_ms=ps.last_ms; ps.banscore=0; ps.version=0; ps.features=0; ps.whitelisted=false;
+                            ps.total_blocks_received = 0;
+                            ps.total_block_delivery_time_ms = 0;
+                            ps.avg_block_delivery_ms = 30000;
+                            ps.blocks_delivered_successfully = 0;
+                            ps.blocks_failed_delivery = 0;
+                            ps.health_score = 1.0;
+                            ps.last_block_received_ms = 0;
+                            { std::lock_guard<std::recursive_mutex> lk(g_peers_mu); peers_[s]=ps; g_outbounds.insert(s); }
+                            g_peer_index_capable[s] = false;
+                            g_trickle_last_ms[s] = 0;
+                            log_info("P2P: feeler " + dotted);
+                            gate_on_connect(s);
+                            miq_set_keepalive(s);
+                            gate_set_loopback(s, is_loopback_be(be_ip));
+                            auto msg = encode_msg("version", miq_build_version_payload((uint32_t)chain_.height()));
+                            (void)send_or_close(s, msg);
                         }
                     }
                 }
