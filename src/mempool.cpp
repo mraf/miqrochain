@@ -18,6 +18,25 @@
 
 namespace miq {
 
+// --- Low-S helper (RAW-64 r||s) ---
+// CRITICAL FIX: Validate low-S signatures in mempool to match chain validation.
+// This prevents transactions with high-S signatures from being accepted into the
+// mempool and propagated, only to fail at block validation time.
+// secp256k1 group order n/2 (big-endian) - signatures with S > n/2 are non-canonical.
+static inline bool is_low_s64(const std::vector<uint8_t>& sig64) {
+    if (sig64.size() != 64) return false;
+    static const uint8_t N_HALF[32] = {
+        0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0
+    };
+    const uint8_t* s = sig64.data() + 32;
+    for (int i = 0; i < 32; i++) {
+        if (s[i] < N_HALF[i]) return true;
+        if (s[i] > N_HALF[i]) return false;
+    }
+    return true;  // equal is allowed
+}
+
 static inline std::string key_from_vec(const std::vector<uint8_t>& v){
     return std::string(reinterpret_cast<const char*>(v.data()), v.size());
 }
@@ -173,6 +192,17 @@ bool Mempool::validate_inputs_and_calc_fee(const Transaction& tx, const UTXOView
         if (!crypto::ECDSA::verify(in.pubkey, sighash, in.sig)) {
             err = "bad signature"; return false;
         }
+
+        // CRITICAL FIX: Enforce low-S signatures in mempool, matching chain validation.
+        // Without this check, transactions with high-S signatures would be accepted
+        // into the mempool and propagated, but blocks containing them would be rejected.
+        // This wastes miner work and network bandwidth.
+#if MIQ_RULE_ENFORCE_LOW_S
+        if (!is_low_s64(in.sig)) {
+            err = "high-S signature";
+            return false;
+        }
+#endif
 
         // input sum + overflow guard
         uint64_t tmp = in_sum + prev_value;

@@ -1157,6 +1157,11 @@ static std::unordered_map<Sock, std::unordered_map<uint64_t,int64_t>> g_inflight
 static std::unordered_map<Sock, std::deque<uint64_t>> g_inflight_index_order;
 static int64_t g_stall_retry_ms = MIQ_P2P_STALL_RETRY_MS;
 
+// CRITICAL FIX: Track inflight tx request timestamps for timeout cleanup
+// Without this, inflight_tx can grow forever, eventually blocking all new tx requests
+static std::unordered_map<Sock, std::unordered_map<std::string,int64_t>> g_inflight_tx_ts;
+static constexpr int64_t INFLIGHT_TX_TIMEOUT_MS = 30000;  // 30 second timeout for tx requests
+
 // RAII lock guard for inflight data
 class InflightLock {
     SpinLock& lock_;
@@ -1202,6 +1207,8 @@ static inline void clear_all_inflight_for_sock(Sock sock) {
     }
     g_inflight_index_ts.erase(sock);
     g_inflight_index_order.erase(sock);
+    // CRITICAL FIX: Also clear inflight tx tracking
+    g_inflight_tx_ts.erase(sock);
 }
 
 } // namespace
@@ -2928,7 +2935,10 @@ void P2P::request_tx(PeerState& ps, const std::vector<uint8_t>& txid){
     if (ps.inflight_tx.size() >= max_inflight_tx) return;
     auto m = encode_msg("gettx", txid);
     if (send_or_close(ps.sock, m)) {
-        ps.inflight_tx.insert(hexkey(txid));
+        std::string key = hexkey(txid);
+        ps.inflight_tx.insert(key);
+        // CRITICAL FIX: Track request timestamp for timeout cleanup
+        g_inflight_tx_ts[(Sock)ps.sock][key] = now_ms();
     }
 }
 
@@ -4059,6 +4069,32 @@ void P2P::loop(){
           }
         }
 
+        // CRITICAL FIX: Inflight transaction request timeout cleanup
+        // Without this, inflight_tx can grow forever and block new transaction requests
+        {
+            const int64_t tnow = now_ms();
+            std::vector<std::pair<Sock, std::string>> expired_tx;
+            for (auto& kv : g_inflight_tx_ts) {
+                Sock sock = kv.first;
+                for (auto& txkv : kv.second) {
+                    if (tnow - txkv.second > INFLIGHT_TX_TIMEOUT_MS) {
+                        expired_tx.emplace_back(sock, txkv.first);
+                    }
+                }
+            }
+            for (const auto& e : expired_tx) {
+                g_inflight_tx_ts[e.first].erase(e.second);
+                auto pit = peers_.find(e.first);
+                if (pit != peers_.end()) {
+                    pit->second.inflight_tx.erase(e.second);
+                }
+            }
+            if (!expired_tx.empty()) {
+                MIQ_LOG_DEBUG(miq::LogCategory::NET, "inflight_tx cleanup: timed out " +
+                    std::to_string(expired_tx.size()) + " stale tx requests");
+            }
+        }
+
             {
             const int64_t tnow = now_ms();
             std::vector<Sock> to_close;
@@ -4761,6 +4797,7 @@ void P2P::loop(){
                 }
                 // Drop per-socket inflight timestamps for the dead peer.
                 g_inflight_block_ts.erase(s_dead);
+                g_inflight_tx_ts.erase(s_dead);  // CRITICAL FIX: Also clear tx inflight tracking
 
                 // Re-issue any pending by-index requests from this peer.
                 auto itIdx = g_inflight_index_ts.find(s_dead);
@@ -5461,6 +5498,13 @@ void P2P::loop(){
                         auto key = hexkey(tx.txid());
 
                         ps.inflight_tx.erase(key);
+                        // CRITICAL FIX: Clear timestamp when tx is received
+                        {
+                            auto it = g_inflight_tx_ts.find(s);
+                            if (it != g_inflight_tx_ts.end()) {
+                                it->second.erase(key);
+                            }
+                        }
                         if (unsolicited_drop(ps, "tx", key)) {
                             // Polite ignore: remote may proactively relay deps.
                             continue;
@@ -5496,18 +5540,29 @@ void P2P::loop(){
                                     seen_txids_.erase(key);
                                 }
 
-                                // CRITICAL FIX: Aggressive ban scoring for bad signatures
-                                // Bad signatures are likely malicious, not accidental
+                                // CRITICAL FIX: Ban scoring based on rejection type
+                                // Different rejection reasons get different scores:
+                                // - Cryptographic failures (bad signature) = severe (malicious)
+                                // - Policy violations (high-S, fees) = low (not malicious, just non-standard)
+                                // - Double-spend = medium (could be race condition or malicious)
                                 int ban_increment = 1;
-                                if (err.find("bad signature") != std::string::npos ||
-                                    err.find("sig") != std::string::npos) {
-                                    ban_increment = 20; // Severe penalty for invalid signatures
+                                if (err.find("bad signature") != std::string::npos) {
+                                    // Invalid ECDSA signature - likely malicious or corrupted
+                                    ban_increment = 20;
                                     MIQ_LOG_WARN(miq::LogCategory::NET, "bad signature from peer " + ps.ip + " - high ban score");
+                                } else if (err.find("bad sig size") != std::string::npos ||
+                                           err.find("bad pubkey size") != std::string::npos) {
+                                    // Malformed transaction structure
+                                    ban_increment = 10;
                                 } else if (err.find("double-spend") != std::string::npos) {
                                     ban_increment = 10; // Medium penalty for double-spend attempts
-                                } else if (err.find("insufficient fee") != std::string::npos ||
-                                           err.find("too many ancestors") != std::string::npos) {
-                                    ban_increment = 1; // Low penalty for policy violations
+                                } else if (err.find("high-S signature") != std::string::npos ||
+                                           err.find("insufficient fee") != std::string::npos ||
+                                           err.find("too many ancestors") != std::string::npos ||
+                                           err.find("too many descendants") != std::string::npos) {
+                                    // Policy violations - valid but non-standard transactions
+                                    // These are NOT malicious, just need to be normalized/fixed by sender
+                                    ban_increment = 1;
                                 }
 
                                 if (!ibd_or_fetch_active(ps, now_ms())) {
@@ -6158,6 +6213,8 @@ void P2P::loop(){
                     }
                     g_inflight_block_ts.erase(it_ts);
                 }
+                // CRITICAL FIX: Also clear tx inflight tracking on disconnect
+                g_inflight_tx_ts.erase(s);
             }
         }
 
