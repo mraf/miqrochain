@@ -969,7 +969,10 @@ static inline void maybe_send_feefilter(miq::PeerState& ps){
     for (int i=0;i<8;i++) pl[i] = (uint8_t)((mrf >> (8*i)) & 0xFF);
     auto msg = miq::encode_msg("feefilter", pl);
     if (send_or_close(ps.sock, msg)) {
-        set_peer_feefilter((Sock)ps.sock, mrf);
+        // CRITICAL FIX: Only update the timestamp, NOT the peer's feefilter value!
+        // The peer's feefilter should only be set when we RECEIVE their feefilter message.
+        // Previously this was setting our own value as the peer's, which was incorrect.
+        g_peer_last_ff_ms[(Sock)ps.sock] = now;
     }
 }
 
