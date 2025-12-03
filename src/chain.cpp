@@ -1558,6 +1558,10 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     struct KE { bool operator()(Key const& a, Key const& b) const noexcept { return a.vout==b.vout && a.txid==b.txid; } };
     std::unordered_set<Key, KH, KE> spent_in_block;
 
+    // CRITICAL FIX: Track outputs created by earlier transactions in this block
+    // This enables spending of outputs created earlier in the same block (chained transactions)
+    std::unordered_map<Key, UTXOEntry, KH, KE> created_in_block;
+
     // SECURITY FIX: Clear BOTH sig AND pubkey for sighash computation
     // This prevents signature malleability attacks where different pubkeys
     // could produce different sighashes for the same transaction
@@ -1592,7 +1596,15 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
             spent_in_block.insert(k);
 
             UTXOEntry e;
-            if(!utxo_.get(inx.prev.txid, inx.prev.vout, e)){ err="missing utxo"; return false; }
+            // CRITICAL FIX: First check if this output was created earlier in this block
+            // This enables chained transactions where Tx B spends output from Tx A in same block
+            auto cib_it = created_in_block.find(k);
+            if (cib_it != created_in_block.end()) {
+                e = cib_it->second;
+            } else if(!utxo_.get(inx.prev.txid, inx.prev.vout, e)){
+                err="missing utxo";
+                return false;
+            }
             // SECURITY FIX: Use <= instead of < for coinbase maturity check
             // Bitcoin requires 100 confirmations, meaning coinbase at height H
             // is spendable at height H + COINBASE_MATURITY + 1
@@ -1615,6 +1627,15 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         if (!leq_max_money(fee)) { err="fee>MAX_MONEY"; return false; }
         if (!add_u64_safe(fees, fee, tmp)) { err="fees overflow"; return false; }
         fees = tmp;
+
+        // CRITICAL FIX: Add this transaction's outputs to created_in_block
+        // This allows later transactions in this block to spend these outputs
+        auto txid = tx.txid();
+        for (uint32_t vi = 0; vi < tx.vout.size(); ++vi) {
+            Key outk{txid, vi};
+            UTXOEntry out_entry{tx.vout[vi].value, tx.vout[vi].pkh, tip_.height + 1, false};
+            created_in_block.emplace(outk, out_entry);
+        }
     }
 
     // Coinbase payout checks
