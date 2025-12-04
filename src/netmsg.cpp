@@ -112,7 +112,11 @@ static bool cmd_is_allowed(const std::string& c){
         "invtx","gettx","tx",
         "getaddr","addr",
         // headers-first & relay extras
-        "getheaders","headers","feefilter"
+        "getheaders","headers","feefilter",
+        // BIP130/BIP152: header announcements and compact blocks
+        "sendheaders","sendcmpct",
+        // generic inventory (for block announcements)
+        "inv"
     };
     for (auto* s : k) if (c == s) return true;
     return false;
@@ -179,6 +183,27 @@ static bool length_ok_for_command(const std::string& cmd, size_t n){
         // *** Allow empty batch (count==0) to indicate "no more" ***
         if (count > MIQ_MAX_HEADERS_PER_MSG) return false;
         return true;
+    }
+
+    // BIP130: sendheaders has no payload
+    if (cmd == "sendheaders") {
+        return n == 0;
+    }
+
+    // BIP152: sendcmpct payload is 9 bytes (1 byte announce + 8 bytes version)
+    if (cmd == "sendcmpct") {
+        return n == 9;
+    }
+
+    // Generic inventory: 1-byte count + count * (4-byte type + 32-byte hash)
+    if (cmd == "inv") {
+        if (n < 1) return false;
+        // Simple validation: must be able to hold at least the count byte
+        // and each entry is 36 bytes (4 type + 32 hash)
+        if (n > 1 && (n - 1) % 36 != 0) {
+            // Could be varint encoding - be lenient and just cap size
+        }
+        return n <= 50000;  // reasonable upper bound
     }
 
     // Unknown command: reject

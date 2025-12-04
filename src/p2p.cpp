@@ -884,12 +884,17 @@ static inline bool send_or_close(Sock s, const std::vector<uint8_t>& v){
   return false;
 }
 
+// Return values:
+//   >0 = bytes read
+//   0  = EOF (peer closed connection gracefully)
+//  -1  = error
+//  -2  = would block (EAGAIN/EWOULDBLOCK) - no data available yet
 static inline int miq_recv(Sock s, uint8_t* buf, size_t bufsz) {
 #ifdef _WIN32
     int n = recv(s, reinterpret_cast<char*>(buf), (int)bufsz, 0);
     if (n == SOCKET_ERROR) {
         int e = WSAGetLastError();
-        if (e == WSAEWOULDBLOCK) return 0;
+        if (e == WSAEWOULDBLOCK) return -2;  // would block, not an error
         // CRITICAL FIX: Rate-limit recv error logging to prevent log flooding
         // Connection errors are common and expected - don't spam logs
         static std::atomic<int64_t> last_recv_log_ms{0};
@@ -909,16 +914,16 @@ static inline int miq_recv(Sock s, uint8_t* buf, size_t bufsz) {
         }
         return -1;
     }
-    return n;
+    return n;  // 0 = EOF, >0 = data
 #else
     for (;;) {
         ssize_t n = ::recv(s, buf, bufsz, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-            return -1;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;  // would block, not an error
+            return -1;  // actual error
         }
-        return (int)n;
+        return (int)n;  // 0 = EOF (peer closed), >0 = data
     }
 #endif
 }
@@ -1516,7 +1521,10 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
     close_code = 0;
 
     auto it = g_gate.find(fd);
-    if (it == g_gate.end()) return false;
+    if (it == g_gate.end()) {
+        miq::log_warn("P2P: gate_on_command - no gate entry for fd=" + std::to_string((uintptr_t)fd) + " cmd=" + cmd);
+        return false;
+    }
     auto& g = it->second;
 
     if (!g.got_verack) {
@@ -1526,7 +1534,11 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
                 g.hs_last_ms = now_ms();          // be lenient with localhost tools
             } else {
                 close_code = 408;
-                P2P_TRACE("close fd=" + std::to_string((uintptr_t)fd) + " reason=handshake-timeout");
+                miq::log_warn("P2P: handshake timeout fd=" + std::to_string((uintptr_t)fd) +
+                         " idle=" + std::to_string(idle) + "ms got_version=" +
+                         (g.got_version ? "true" : "false") + " got_verack=" +
+                         (g.got_verack ? "true" : "false") + " sent_verack=" +
+                         (g.sent_verack ? "true" : "false"));
                 return true;
             }
         }
@@ -1535,6 +1547,7 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
     if (!cmd.empty()){
         if (cmd == "version"){
             if (!g.got_version){
+                miq::log_info("P2P: received version from peer fd=" + std::to_string((uintptr_t)fd));
                 g.got_version = true;
                 g.hs_last_ms = now_ms();
                 should_send_verack = true;
@@ -1543,6 +1556,7 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
                     Clock::now().time_since_epoch()).count();
             }
         } else if (cmd == "verack"){
+            miq::log_info("P2P: received verack from peer fd=" + std::to_string((uintptr_t)fd));
             g.got_verack = true;
             g_preverack_counts.erase(fd);
             g.hs_last_ms = now_ms();
@@ -2550,16 +2564,19 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     }
 
     // Check if we already have connections to any of the resolved IPs
-    for (const auto& ne : eps) {
-        if (ne.ss.ss_family == AF_INET) {
-            const sockaddr_in* a4 = reinterpret_cast<const sockaddr_in*>(&ne.ss);
-            std::string resolved_ip = be_ip_to_string(a4->sin_addr.s_addr);
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+        for (const auto& ne : eps) {
+            if (ne.ss.ss_family == AF_INET) {
+                const sockaddr_in* a4 = reinterpret_cast<const sockaddr_in*>(&ne.ss);
+                std::string resolved_ip = be_ip_to_string(a4->sin_addr.s_addr);
 
-            // Check existing connections to this IP
-            for (const auto& kv : peers_) {
-                if (kv.second.ip == resolved_ip) {
-                    // Already connected to this IP, skip
-                    return false;
+                // Check existing connections to this IP
+                for (const auto& kv : peers_) {
+                    if (kv.second.ip == resolved_ip) {
+                        // Already connected to this IP, skip
+                        return false;
+                    }
                 }
             }
         }
@@ -2637,10 +2654,16 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     ps.blocks_failed_delivery = 0;
     ps.health_score = 1.0;
     ps.last_block_received_ms = 0;
-    peers_[s] = ps;
-    g_peer_index_capable[s] = false;
 
-    g_trickle_last_ms[s] = 0;
+    // CRITICAL: Hold g_peers_mu while modifying peers_ to prevent data race with loop thread
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+        peers_[s] = ps;
+        g_peer_index_capable[s] = false;
+        g_trickle_last_ms[s] = 0;
+        // mark as outbound for gating/diversity
+        g_outbounds.insert(s);
+    }
 
     uint32_t be_ip;
     if (parse_ipv4(ps.ip, be_ip) && ipv4_is_public(be_ip) && !is_self_be(be_ip)) {
@@ -2652,15 +2675,10 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 #endif
     }
 
-    log_info("Peer: connected → " + peers_[s].ip);
+    log_info("Peer: connected → " + ps.ip);
 
     // Gate first, then mark loopback (so flag actually sticks)
     gate_on_connect(s);
-    {
-        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
-        // mark as outbound for gating/diversity
-        g_outbounds.insert(s);
-    }
     if (parse_ipv4(ps.ip, be_ip)) {
         gate_set_loopback(s, is_loopback_be(be_ip));
     }
@@ -2752,10 +2770,14 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     ps.blocks_failed_delivery = 0;
     ps.health_score = 1.0;
     ps.last_block_received_ms = 0;
-    peers_[c] = ps;
-    g_peer_index_capable[c] = false;
 
-    g_trickle_last_ms[c] = 0;
+    // CRITICAL: Hold g_peers_mu while modifying peers_ to prevent data race with loop thread
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+        peers_[c] = ps;
+        g_peer_index_capable[c] = false;
+        g_trickle_last_ms[c] = 0;
+    }
 
     uint32_t be_ip;
     if (parse_ipv4(ip, be_ip) && ipv4_is_public(be_ip)) {
@@ -4997,6 +5019,20 @@ void P2P::loop(){
                 uint8_t buf[65536];
                 int n = miq_recv(s, buf, sizeof(buf));
                 if (n <= 0) {
+                    if (n == 0) {
+                        // EOF: peer closed connection gracefully
+                        log_info("P2P: peer " + ps.ip + " closed connection (EOF)");
+                        dead.push_back(s);
+                        continue;
+                    } else if (n == -2) {
+                        // EAGAIN/EWOULDBLOCK: no data yet, but connection still open
+                        enforce_rx_parse_deadline(ps, s);
+                        continue;
+                    } else {
+                        // n < 0: actual error
+                        log_warn("P2P: recv error from " + ps.ip + " code=" + std::to_string(n));
+                        dead.push_back(s);
+                        continue;
                     if (n < 0) {
                         log_info("P2P: recv error from " + ps.ip + " (errno=" + std::to_string(errno) + ")");
                         P2P_TRACE("close read<0");
@@ -5005,8 +5041,11 @@ void P2P::loop(){
                         // n == 0: peer closed connection gracefully
                         log_info("P2P: peer " + ps.ip + " closed connection (recv returned 0)");
                     }
-                    enforce_rx_parse_deadline(ps, s);
-                    continue;
+                }
+
+                // Log received bytes during handshake phase for diagnostics
+                if (!ps.verack_ok) {
+                    log_info("P2P: received " + std::to_string(n) + " bytes from " + ps.ip + " (handshake in progress)");
                 }
 
                 // Log first data received from peer (handshake)
@@ -5043,6 +5082,16 @@ void P2P::loop(){
                     size_t off_before = off;
                     bool ok = decode_msg(ps.rx, off, m);
                     if (!ok) {
+                        // Log decode failure during handshake
+                        if (!ps.verack_ok && ps.rx.size() > 0) {
+                            static int64_t last_decode_fail_log_ms = 0;
+                            int64_t now_log = now_ms();
+                            if (now_log - last_decode_fail_log_ms > 5000) {
+                                last_decode_fail_log_ms = now_log;
+                                log_info("P2P: decode_msg waiting for more data from " + ps.ip +
+                                         " rx_buf=" + std::to_string(ps.rx.size()) + " bytes");
+                            }
+                        }
                         break;
                     }
                     if (m.payload.size() > MIQ_MSG_HARD_MAX) {
@@ -5094,16 +5143,22 @@ void P2P::loop(){
                         dead.push_back(s);
                         break;
                     }
-                    P2P_TRACE("DEBUG: cmd=" + cmd + " send_verack=" + (send_verack ? "true" : "false"));
+                    // Log all received commands during handshake for debugging
+                    if (!ps.verack_ok) {
+                        log_info("P2P: RX from " + ps.ip + " cmd=" + cmd + " len=" + std::to_string(m.payload.size()));
+                    }
+
                     if (send_verack) {
                         // Send verack to acknowledge the received version
                         auto verack = encode_msg("verack", {});
                         bool verack_sent = send_or_close(s, verack);
+                        log_info("P2P: TX to " + ps.ip + " cmd=verack sent=" + (verack_sent ? "OK" : "FAILED"));
                         log_info("P2P: sending verack to " + ps.ip + " (result=" + (verack_sent ? "OK" : "FAILED") + ")");
                         P2P_TRACE("TX " + ps.ip + " cmd=verack len=0 result=" + (verack_sent ? "OK" : "FAILED"));
 
                         if (verack_sent) {
                             gate_mark_sent_verack(s);
+                            log_info("P2P: marked sent_verack=true for " + ps.ip);
                         }
                     }
 
