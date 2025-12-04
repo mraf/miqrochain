@@ -41,7 +41,7 @@ struct StratumJob {
     std::vector<std::string> merkle_branches;
     uint32_t version;
     uint32_t bits;
-    uint32_t time;
+    uint64_t time;  // MIQ uses 64-bit timestamps
     uint64_t height;
     bool clean_jobs;                      // True if new block, clear old jobs
 
