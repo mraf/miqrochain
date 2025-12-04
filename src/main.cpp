@@ -1392,11 +1392,18 @@ static inline std::string spark_ascii(const std::vector<double>& v){
 
 // Sync gate helper (used both in TUI texts and IBD logic)
 static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
-    size_t peers = p2p ? p2p->snapshot_peers().size() : 0;
-    const bool we_are_seed = compute_seed_role().we_are_seed;
-    const bool seed_solo = we_are_seed && peers == 0;
+    // CRITICAL FIX: Only count peers that have completed handshake (verack_ok)
+    // Otherwise we might think we're synced when peer hasn't told us their height yet
+    size_t verack_peers = 0;
+    auto all_peers = p2p ? p2p->snapshot_peers() : std::vector<PeerSnapshot>{};
+    for (const auto& pr : all_peers) {
+        if (pr.verack_ok) verack_peers++;
+    }
 
-    if (!seed_solo && peers == 0) {
+    const bool we_are_seed = compute_seed_role().we_are_seed;
+    const bool seed_solo = we_are_seed && verack_peers == 0;
+
+    if (!seed_solo && verack_peers == 0) {
         why_out = "no peers";
         return false;
     }
@@ -1421,14 +1428,24 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
 
     // For peer nodes that have successfully synced blocks from a seed, also allow stale tips
     // This handles the case where we've synced historical blocks that are legitimately old
-    if (peers > 0) {
+    if (verack_peers > 0) {
         // Only finish sync once we've reached all known blocks from peers
+        // CRITICAL: Only consider peers with verack_ok AND valid peer_tip
         uint64_t max_peer_tip = 0;
-        // Gather each peer's advertised tip height
-        auto peer_list = p2p->snapshot_peers();
-        for (const auto& pr : peer_list) {
-            max_peer_tip = std::max(max_peer_tip, pr.peer_tip);
+        size_t peers_with_tip = 0;
+        for (const auto& pr : all_peers) {
+            if (pr.verack_ok && pr.peer_tip > 0) {
+                max_peer_tip = std::max(max_peer_tip, pr.peer_tip);
+                peers_with_tip++;
+            }
         }
+
+        // If no peers have reported their tip yet, keep syncing
+        if (peers_with_tip == 0) {
+            why_out = "waiting for peer tip heights";
+            return false;
+        }
+
         if (h >= max_peer_tip) {
             why_out.clear();
             return true;
