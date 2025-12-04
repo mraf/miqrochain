@@ -978,17 +978,20 @@ std::string RpcService::handle(const std::string& body){
             }
             std::vector<JNode> arr;
 
-            // Build a quick index from txid -> (fee, vsize, hex, depends[])
-            std::map<std::string, std::tuple<uint64_t, uint32_t, std::string, std::vector<std::string>>> mapTx;
-            std::map<std::string, std::vector<std::string>> mapDeps;
+            // CRITICAL FIX: Preserve topological order from collect_for_block!
+            // collect_for_block returns transactions in parent-first order (parents before children)
+            // This order MUST be preserved so chained transactions can be validated in the same block.
+            // Previously we used std::map which sorted by txid, destroying the correct order.
 
+            // Build JSON array directly in correct order from txs_vec
             for (const auto& tx : txs_vec) {
                 auto raw = ser_tx(tx);
                 uint32_t vsize = (uint32_t)raw.size();
                 uint64_t in_sum = 0, out_sum = 0;
+                std::string txid_hex = to_hex(tx.txid());
+                std::vector<std::string> depends;
 
-                // V1 FIX: Check mempool for parent transactions first (for chained tx fee calculation)
-                // This ensures accurate fee calculation for transactions spending unconfirmed outputs
+                // Calculate fee and track dependencies
                 for (const auto& in : tx.vin) {
                     bool found = false;
                     // First check if parent is in mempool (for chained transactions)
@@ -997,7 +1000,7 @@ std::string RpcService::handle(const std::string& body){
                         if (in.prev.vout < parent_tx.vout.size()) {
                             in_sum += parent_tx.vout[in.prev.vout].value;
                             // dependency edge (in-mempool parent)
-                            mapDeps[to_hex(tx.txid())].push_back(to_hex(in.prev.txid));
+                            depends.push_back(to_hex(in.prev.txid));
                             found = true;
                         }
                     }
@@ -1012,27 +1015,19 @@ std::string RpcService::handle(const std::string& body){
                 for (const auto& o : tx.vout) out_sum += o.value;
                 uint64_t fee = (in_sum > out_sum) ? (in_sum - out_sum) : 0;
 
-                // Store
-                mapTx[to_hex(tx.txid())] = std::make_tuple(fee, vsize, to_hex(raw), std::vector<std::string>{});
-            }
-
-            // Transfer to JSON (use "hex" so external miner picks it up)
-            for (auto& kv : mapTx) {
-                const std::string& txid = kv.first;
-                auto& tup = kv.second;
-                auto itd = mapDeps.find(txid);
-                if (itd != mapDeps.end()) {
-                    std::get<3>(tup) = itd->second;
-                }
+                // Build JSON object for this transaction
                 std::map<std::string, JNode> o;
-                o["txid"]   = jstr(txid);
-                o["fee"]    = jnum((double)std::get<0>(tup));
-                o["vsize"]  = jnum((double)std::get<1>(tup));
-                o["hex"]    = jstr(std::get<2>(tup)); // "hex" (not "raw")
-                // depends[]
-                std::vector<JNode> d; for (auto& dep : std::get<3>(tup)) d.push_back(jstr(dep));
-                JNode dd; dd.v = d; o["depends"] = dd;
-                JNode x; x.v = o; arr.push_back(x);
+                o["txid"]   = jstr(txid_hex);
+                o["fee"]    = jnum((double)fee);
+                o["vsize"]  = jnum((double)vsize);
+                o["hex"]    = jstr(to_hex(raw));
+                // depends[] array
+                std::vector<JNode> d;
+                for (const auto& dep : depends) d.push_back(jstr(dep));
+                JNode dd; dd.v = d;
+                o["depends"] = dd;
+                JNode x; x.v = o;
+                arr.push_back(x);  // Preserves order from txs_vec!
             }
 
             // Compute the *next block's* bits (retarget-aware).
