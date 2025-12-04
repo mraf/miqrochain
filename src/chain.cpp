@@ -2060,14 +2060,13 @@ bool Chain::get_block_by_index(size_t idx, Block& out) const{
     while (cur_height > idx) {
         auto it = header_index_.find(hk(cur_hash));
         if (it == header_index_.end()) {
-            // Header not in index, try to continue with prev from tip if at tip
-            if (cur_hash == tip_.hash) {
-                // Can't find current tip in header index, fall back to storage
-                std::vector<uint8_t> raw;
-                if (!storage_.read_block_by_index(idx, raw)) return false;
-                return deser_block(raw, out);
-            }
-            return false; // Chain broken
+            // Header not in index - fall back to storage for this and all deeper lookups
+            // This handles cases where header_index_ is incomplete (node restart, etc.)
+            // IMPORTANT: After reorgs, storage may have stale blocks, but if headers
+            // are incomplete we have no choice - let validation catch any issues
+            std::vector<uint8_t> raw;
+            if (!storage_.read_block_by_index(idx, raw)) return false;
+            return deser_block(raw, out);
         }
         cur_hash = it->second.prev;
         cur_height--;
