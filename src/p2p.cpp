@@ -2670,7 +2670,11 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     P2P_TRACE("TX " + ps.ip + " cmd=version len=" + std::to_string(version_payload.size()));
     auto msg = encode_msg("version", version_payload);
     bool sent = send_or_close(s, msg);
-    (void)sent; // Used by P2P_TRACE when enabled
+    if (sent) {
+        log_info("P2P: sent version to " + ps.ip + " (payload=" + std::to_string(version_payload.size()) + " bytes)");
+    } else {
+        log_warn("P2P: FAILED to send version to " + ps.ip);
+    }
     P2P_TRACE("TX " + ps.ip + " version send result=" + (sent ? "OK" : "FAILED"));
 
     return true;
@@ -4994,11 +4998,20 @@ void P2P::loop(){
                 int n = miq_recv(s, buf, sizeof(buf));
                 if (n <= 0) {
                     if (n < 0) {
+                        log_info("P2P: recv error from " + ps.ip + " (errno=" + std::to_string(errno) + ")");
                         P2P_TRACE("close read<0");
                         dead.push_back(s);
+                    } else {
+                        // n == 0: peer closed connection gracefully
+                        log_info("P2P: peer " + ps.ip + " closed connection (recv returned 0)");
                     }
                     enforce_rx_parse_deadline(ps, s);
                     continue;
+                }
+
+                // Log first data received from peer (handshake)
+                if (!ps.verack_ok) {
+                    log_info("P2P: received " + std::to_string(n) + " bytes from " + ps.ip + " (handshake pending)");
                 }
 
                 ps.last_ms = now_ms();
@@ -5070,6 +5083,11 @@ void P2P::loop(){
 
                     P2P_TRACE("RX " + ps.ip + " cmd=" + cmd + " len=" + std::to_string(m.payload.size()));
 
+                    // Log handshake commands
+                    if (cmd == "version" || cmd == "verack" || !ps.verack_ok) {
+                        log_info("P2P: decoded cmd=" + cmd + " from " + ps.ip + " (len=" + std::to_string(m.payload.size()) + ")");
+                    }
+
                     bool send_verack = false; int close_code = 0;
                     if (gate_on_command(s, cmd, send_verack, close_code)) {
                         if (close_code) { /* traced in gate_on_command */ }
@@ -5081,6 +5099,7 @@ void P2P::loop(){
                         // Send verack to acknowledge the received version
                         auto verack = encode_msg("verack", {});
                         bool verack_sent = send_or_close(s, verack);
+                        log_info("P2P: sending verack to " + ps.ip + " (result=" + (verack_sent ? "OK" : "FAILED") + ")");
                         P2P_TRACE("TX " + ps.ip + " cmd=verack len=0 result=" + (verack_sent ? "OK" : "FAILED"));
 
                         if (verack_sent) {
@@ -5219,6 +5238,7 @@ void P2P::loop(){
                     };
   
                     if (cmd == "version") {
+                        log_info("P2P: received version from " + ps.ip + " (payload=" + std::to_string(m.payload.size()) + " bytes)");
                         int32_t peer_ver = 0; uint64_t peer_services = 0;
                         if (m.payload.size() >= 4) {
                             peer_ver = (int32_t)((uint32_t)m.payload[0] | ((uint32_t)m.payload[1]<<8) | ((uint32_t)m.payload[2]<<16) | ((uint32_t)m.payload[3]<<24));
@@ -5226,6 +5246,7 @@ void P2P::loop(){
                         if (m.payload.size() >= 12) {
                             for(int j=0;j<8;j++) peer_services |= ((uint64_t)m.payload[4+j]) << (8*j);
                         }
+                        log_info("P2P: peer " + ps.ip + " version=" + std::to_string(peer_ver) + " services=0x" + std::to_string(peer_services));
                         ps.version  = peer_ver;
                         ps.features = peer_services;
                         if ((peer_services & MIQ_FEAT_INDEX_BY_HEIGHT) != 0) {
@@ -5281,6 +5302,7 @@ void P2P::loop(){
                     try_finish_handshake();
                       
                     } else if (cmd == "verack") {
+                        log_info("P2P: received verack from " + ps.ip + " - handshake completing");
                         P2P_TRACE("RX " + ps.ip + " cmd=verack - handshake completing");
                         auto itg = g_gate.find(s);
                         if (itg != g_gate.end()) {
