@@ -4135,8 +4135,19 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             uint64_t cur = chain.height();
             uint64_t discovered = (cur >= height_at_seed_connect) ? (cur - height_at_seed_connect) : 0;
             const char* stage = (cur == 0 ? "headers" : "blocks");
+
+            // CRITICAL FIX: Get actual network height from peers for proper progress display
+            // Previously this passed (cur, cur) which made the splash screen think sync was complete
+            uint64_t network_height = cur;  // Default to current if no peers
+            auto peer_snapshot = p2p->snapshot_peers();
+            for (const auto& pr : peer_snapshot) {
+                if (pr.peer_tip > network_height) {
+                    network_height = pr.peer_tip;
+                }
+            }
+
             if (tui && can_tui) {
-                tui->set_ibd_progress(cur, cur, discovered, stage, seed_host_cstr(), false);
+                tui->set_ibd_progress(cur, network_height, discovered, stage, seed_host_cstr(), false);
             } else {
                 static uint64_t last_note_ms = 0;
                 if (now_ms() - last_note_ms > 2500) {
