@@ -1030,17 +1030,17 @@ static inline void maybe_mark_headers_done(bool at_tip) {
         return;
     }
 
-    if (g_chain_ptr && g_chain_ptr->height() < 100) {
-        g_headers_tip_confirmed = 0;
-        return;
-    }
-    
+    // When we're at tip (receiving empty headers), always allow the confirmation logic to run
+    // This is essential for chains of any size - we need to confirm we're truly at the tip
     if (at_tip) {
         if (++g_headers_tip_confirmed >= 3) {
             g_logged_headers_done = true;
-            miq::log_info(std::string("[IBD] headers phase done"));
+            uint64_t hdr_height = g_chain_ptr ? g_chain_ptr->best_header_height() : 0;
+            miq::log_info("[IBD] headers phase done (height=" + std::to_string(hdr_height) +
+                         ") — starting block download");
         }
     } else {
+        // Not at tip - reset confirmation counter
         g_headers_tip_confirmed = 0;
     }
 }
