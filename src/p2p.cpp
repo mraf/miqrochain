@@ -2757,10 +2757,14 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     ps.blocks_failed_delivery = 0;
     ps.health_score = 1.0;
     ps.last_block_received_ms = 0;
-    peers_[c] = ps;
-    g_peer_index_capable[c] = false;
 
-    g_trickle_last_ms[c] = 0;
+    // CRITICAL: Hold g_peers_mu while modifying peers_ to prevent data race with loop thread
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+        peers_[c] = ps;
+        g_peer_index_capable[c] = false;
+        g_trickle_last_ms[c] = 0;
+    }
 
     uint32_t be_ip;
     if (parse_ipv4(ip, be_ip) && ipv4_is_public(be_ip)) {
