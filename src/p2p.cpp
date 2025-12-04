@@ -1527,11 +1527,39 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
     }
     auto& g = it->second;
 
+    // CRITICAL FIX: Process handshake commands (version/verack) FIRST before timeout check
+    // This ensures that receiving a valid handshake message extends the deadline
+    if (!cmd.empty()) {
+        if (cmd == "version") {
+            // Receiving version message - update timestamp immediately to prevent timeout
+            g.hs_last_ms = now_ms();
+            if (!g.got_version) {
+                miq::log_info("P2P: received version from peer fd=" + std::to_string((uintptr_t)fd));
+                g.got_version = true;
+                should_send_verack = true;
+                g_preverack_counts.erase(fd);
+            }
+            // Don't apply timeout logic - we just got a valid handshake message
+            if (g.banscore >= MAX_BANSCORE) { close_code = 400; return true; }
+            return false;
+        } else if (cmd == "verack") {
+            // Receiving verack message - update timestamp immediately to prevent timeout
+            g.hs_last_ms = now_ms();
+            miq::log_info("P2P: received verack from peer fd=" + std::to_string((uintptr_t)fd));
+            g.got_verack = true;
+            g_preverack_counts.erase(fd);
+            // Don't apply timeout logic - we just got a valid handshake message
+            if (g.banscore >= MAX_BANSCORE) { close_code = 400; return true; }
+            return false;
+        }
+    }
+
+    // For non-handshake commands, check timeout
     if (!g.got_verack) {
-        int64_t idle = now_ms() - g.hs_last_ms;   // will be small if traffic is flowing
+        int64_t idle = now_ms() - g.hs_last_ms;
         if (idle > HANDSHAKE_MS) {
             if (g.is_loopback) {
-                g.hs_last_ms = now_ms();          // be lenient with localhost tools
+                g.hs_last_ms = now_ms();
             } else {
                 close_code = 408;
                 miq::log_warn("P2P: handshake timeout fd=" + std::to_string((uintptr_t)fd) +
@@ -1544,47 +1572,25 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
         }
     }
 
-    if (!cmd.empty()){
-        if (cmd == "version"){
-            if (!g.got_version){
-                miq::log_info("P2P: received version from peer fd=" + std::to_string((uintptr_t)fd));
-                g.got_version = true;
+    // Handle other pre-handshake commands
+    if (!cmd.empty()) {
+        if (!g.got_version) {
+            if (miq_safe_preverack_cmd(cmd)) {
                 g.hs_last_ms = now_ms();
-                should_send_verack = true;
-                g_preverack_counts.erase(fd);
-                g.hs_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    Clock::now().time_since_epoch()).count();
+                return false;
+            } else {
+                g.banscore += 10;
+                if (g.banscore >= MAX_BANSCORE) { close_code = 400; P2P_TRACE("close fd="+std::to_string((uintptr_t)fd)+" reason=pre-version-bad"); return true; }
+                return false;
             }
-        } else if (cmd == "verack"){
-            miq::log_info("P2P: received verack from peer fd=" + std::to_string((uintptr_t)fd));
-            g.got_verack = true;
-            g_preverack_counts.erase(fd);
+        }
+        if (!g.got_verack) {
+            if (!miq_safe_preverack_cmd(cmd)) { return false; }
             g.hs_last_ms = now_ms();
-            g.hs_last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                Clock::now().time_since_epoch()).count();
-        } else {
-            if (!g.got_version) {
-                if (miq_safe_preverack_cmd(cmd)) {
-                    // Safe pre-version traffic → count as liveness so we don't trip verack timeout.
-                    g.hs_last_ms = now_ms();
+            if (!g.is_loopback && cmd != "getheaders" && cmd != "headers") {
+                int &cnt = g_preverack_counts[fd];
+                if (++cnt > MIQ_PREVERACK_QUEUE_MAX) {
                     return false;
-                } else {
-                    g.banscore += 10;
-                    if (g.banscore >= MAX_BANSCORE) { close_code = 400; P2P_TRACE("close fd="+std::to_string((uintptr_t)fd)+" reason=pre-version-bad"); return true; }
-                    return false;
-                }
-            }
-            if (!g.got_verack){
-                if (!miq_safe_preverack_cmd(cmd)) { return false; /* ignore silently */ }
-                // Safe pre-verack traffic also counts as liveness.
-                g.hs_last_ms = now_ms();
-                // Never penalize safe pre-verack getheaders/headers; drop-count only other safe cmds.
-                if (!g.is_loopback && cmd != "getheaders" && cmd != "headers") {
-                    int &cnt = g_preverack_counts[fd];
-                    if (++cnt > MIQ_PREVERACK_QUEUE_MAX) {
-                        // soft-drop extra safe messages during handshake; no banscore/close
-                        return false;
-                    }
                 }
             }
         }
