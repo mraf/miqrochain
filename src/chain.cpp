@@ -1574,6 +1574,16 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         return dsha256(ser_tx(tmp));
     };
 
+    // CRITICAL DEBUG: Log the exact order of transactions in submitted block
+    if (b.txs.size() > 2) {  // More than just coinbase + 1 tx
+        std::string order_log = "verify_block TX ORDER in block: ";
+        for (size_t i = 1; i < b.txs.size(); ++i) {
+            std::string txid_short = to_hex(b.txs[i].txid()).substr(0, 8);
+            order_log += "[" + std::to_string(i-1) + "]=" + txid_short + " ";
+        }
+        MIQ_LOG_INFO(miq::LogCategory::VALIDATION, order_log);
+    }
+
     uint64_t fees = 0, tmp = 0;
     for(size_t ti=1; ti<b.txs.size(); ++ti){
         const auto& tx=b.txs[ti];
@@ -1601,7 +1611,14 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
             auto cib_it = created_in_block.find(k);
             if (cib_it != created_in_block.end()) {
                 e = cib_it->second;
+                MIQ_LOG_DEBUG(miq::LogCategory::VALIDATION, "verify_block: tx[" + std::to_string(ti) +
+                              "] input found in created_in_block (chained tx OK)");
             } else if(!utxo_.get(inx.prev.txid, inx.prev.vout, e)){
+                // DEBUG: Log detailed info about missing UTXO
+                MIQ_LOG_WARN(miq::LogCategory::VALIDATION, "verify_block: tx[" + std::to_string(ti) +
+                             "] MISSING UTXO - prev_txid=" + to_hex(inx.prev.txid).substr(0,16) +
+                             "... vout=" + std::to_string(inx.prev.vout) +
+                             ", created_in_block has " + std::to_string(created_in_block.size()) + " entries");
                 err="missing utxo";
                 return false;
             }

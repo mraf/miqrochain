@@ -1030,6 +1030,16 @@ std::string RpcService::handle(const std::string& body){
                 arr.push_back(x);  // Preserves order from txs_vec!
             }
 
+            // CRITICAL DEBUG: Log the exact order being sent to miner
+            if (txs_vec.size() > 1) {
+                std::string order_log = "getminertemplate TX ORDER sent to miner: ";
+                for (size_t i = 0; i < txs_vec.size(); ++i) {
+                    std::string txid_short = to_hex(txs_vec[i].txid()).substr(0, 8);
+                    order_log += "[" + std::to_string(i) + "]=" + txid_short + " ";
+                }
+                log_info(order_log);
+            }
+
             // Compute the *next block's* bits (retarget-aware).
             uint32_t next_bits = tip.bits;
             try {
