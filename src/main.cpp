@@ -1682,6 +1682,12 @@ public:
         ibd_cur_ = cur; ibd_target_ = std::max(target, cur); ibd_discovered_ = discovered_from_seed;
         ibd_stage_ = stage; ibd_seed_host_ = seed_host; ibd_done_ = finished; ibd_visible_ = !finished;
         ibd_last_update_ms_ = now_ms();
+        // FIX: Also update sync_network_height_ for immediate splash screen display
+        // This ensures the progress bar shows correct target immediately instead of waiting
+        // for the background TUI loop to update it
+        if (target > sync_network_height_) {
+            sync_network_height_ = target;
+        }
     }
 
     // Bitcoin Core-like sync stats update
@@ -3117,7 +3123,9 @@ private:
         // FIXED: Also transition when blocks are 100% synced even if ibd_done_ isn't set
         // This handles the case where peers disconnect after all blocks are downloaded,
         // which prevents compute_sync_gate() from returning true and leaves us stuck
-        if (!sync_complete && ibd_target_ > 0 && ibd_cur_ >= ibd_target_) {
+        // CRITICAL: Require ibd_target_ > 10 to avoid false completion when network height unknown
+        // A target of 0 or very low means we haven't discovered peers' heights yet
+        if (!sync_complete && ibd_target_ > 10 && ibd_cur_ >= ibd_target_ && ibd_cur_ > 0) {
             // We've downloaded all known blocks - treat as successful sync
             // Set the internal state to match so the main screen shows correct info
             if (!ibd_done_) {
@@ -4038,8 +4046,17 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                 if (tui && can_tui) {
                     tui->mark_step_ok("Peer handshake (verack)");
                     tui->set_banner(std::string("Connected to seed: ") + seed_host_cstr());
+                    // FIX: Get network height from connected peers instead of using local height
+                    // This ensures the progress bar shows meaningful progress from the start
+                    uint64_t initial_network_height = chain.height();
+                    auto peer_list = p2p->snapshot_peers();
+                    for (const auto& pr : peer_list) {
+                        if (pr.peer_tip > initial_network_height) {
+                            initial_network_height = pr.peer_tip;
+                        }
+                    }
                     tui->set_ibd_progress(chain.height(),
-                                          chain.height(),
+                                          initial_network_height,
                                           0, "headers", seed_host_cstr(), false);
                 }
                 break; // proceed to IBD

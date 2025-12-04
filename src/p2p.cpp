@@ -1030,15 +1030,20 @@ static inline void maybe_mark_headers_done(bool at_tip) {
         return;
     }
 
-    if (g_chain_ptr && g_chain_ptr->height() < 100) {
+    // FIX: Use best_header_height() instead of height() to determine if we have enough headers
+    // The previous check using height() < 100 would never pass during initial sync because
+    // block height stays at 0 until blocks are downloaded (after headers phase completes)
+    if (g_chain_ptr && g_chain_ptr->best_header_height() < 100) {
+        // Don't mark headers done until we have at least 100 headers (very short chain)
+        // This prevents premature transition on chains that are still bootstrapping
         g_headers_tip_confirmed = 0;
         return;
     }
-    
+
     if (at_tip) {
         if (++g_headers_tip_confirmed >= 3) {
             g_logged_headers_done = true;
-            miq::log_info(std::string("[IBD] headers phase done"));
+            miq::log_info(std::string("[IBD] headers phase done — starting block download"));
         }
     } else {
         g_headers_tip_confirmed = 0;
