@@ -3957,11 +3957,35 @@ void P2P::loop(){
                 }
                 g_next_stall_probe_ms = tnow + g_stall_retry_ms;
             } else if (tnow >= g_next_stall_probe_ms && peers_.empty()) {
-                // No peers connected during stall - rate limit logging to once per 60s
+                // No peers connected - CRITICAL: actually retry DNS seeds!
                 static int64_t s_last_no_peers_log_ms = 0;
+                static int64_t s_last_seed_retry_ms = 0;
+
                 if (tnow - s_last_no_peers_log_ms > 60000) {
                     s_last_no_peers_log_ms = tnow;
-                    log_info("P2P: no peers connected (height=" + std::to_string(h) + ") - attempting to reconnect");
+                    log_info("P2P: no peers connected (height=" + std::to_string(h) + ") - retrying DNS seeds");
+                }
+
+                // Retry DNS seeds every 30 seconds when we have no peers
+                if (tnow - s_last_seed_retry_ms > 30000) {
+                    s_last_seed_retry_ms = tnow;
+
+                    // Clear backoff for all seeds when we're desperate for connections
+                    g_seed_backoff.clear();
+
+                    // Re-resolve and connect to DNS seeds
+                    std::vector<miq::SeedEndpoint> seeds;
+                    if (miq::resolve_dns_seeds(seeds, P2P_PORT, /*include_single_dns_seed=*/true)) {
+                        log_info("P2P: resolved " + std::to_string(seeds.size()) + " seed(s), attempting connections...");
+                        size_t boots = std::min<size_t>(seeds.size(), 3);
+                        for (size_t i = 0; i < boots; ++i) {
+                            if (connect_seed(seeds[i].ip, P2P_PORT)) {
+                                log_info("P2P: seed connection initiated to " + seeds[i].ip);
+                            }
+                        }
+                    } else {
+                        log_warn("P2P: DNS seed resolution failed - check network connectivity");
+                    }
                 }
                 g_next_stall_probe_ms = tnow + g_stall_retry_ms;
             }

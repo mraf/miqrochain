@@ -3123,9 +3123,8 @@ private:
         // FIXED: Also transition when blocks are 100% synced even if ibd_done_ isn't set
         // This handles the case where peers disconnect after all blocks are downloaded,
         // which prevents compute_sync_gate() from returning true and leaves us stuck
-        // CRITICAL: Require ibd_target_ > 10 to avoid false completion when network height unknown
-        // A target of 0 or very low means we haven't discovered peers' heights yet
-        if (!sync_complete && ibd_target_ > 10 && ibd_cur_ >= ibd_target_ && ibd_cur_ > 0) {
+        // NOTE: ibd_target_ > 0 ensures we have a known network height before transitioning
+        if (!sync_complete && ibd_target_ > 0 && ibd_cur_ >= ibd_target_) {
             // We've downloaded all known blocks - treat as successful sync
             // Set the internal state to match so the main screen shows correct info
             if (!ibd_done_) {
