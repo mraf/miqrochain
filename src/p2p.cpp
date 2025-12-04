@@ -884,12 +884,17 @@ static inline bool send_or_close(Sock s, const std::vector<uint8_t>& v){
   return false;
 }
 
+// Return values:
+//   >0 = bytes read
+//   0  = EOF (peer closed connection gracefully)
+//  -1  = error
+//  -2  = would block (EAGAIN/EWOULDBLOCK) - no data available yet
 static inline int miq_recv(Sock s, uint8_t* buf, size_t bufsz) {
 #ifdef _WIN32
     int n = recv(s, reinterpret_cast<char*>(buf), (int)bufsz, 0);
     if (n == SOCKET_ERROR) {
         int e = WSAGetLastError();
-        if (e == WSAEWOULDBLOCK) return 0;
+        if (e == WSAEWOULDBLOCK) return -2;  // would block, not an error
         // CRITICAL FIX: Rate-limit recv error logging to prevent log flooding
         // Connection errors are common and expected - don't spam logs
         static std::atomic<int64_t> last_recv_log_ms{0};
@@ -909,16 +914,16 @@ static inline int miq_recv(Sock s, uint8_t* buf, size_t bufsz) {
         }
         return -1;
     }
-    return n;
+    return n;  // 0 = EOF, >0 = data
 #else
     for (;;) {
         ssize_t n = ::recv(s, buf, bufsz, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-            return -1;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;  // would block, not an error
+            return -1;  // actual error
         }
-        return (int)n;
+        return (int)n;  // 0 = EOF (peer closed), >0 = data
     }
 #endif
 }
@@ -2550,16 +2555,19 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     }
 
     // Check if we already have connections to any of the resolved IPs
-    for (const auto& ne : eps) {
-        if (ne.ss.ss_family == AF_INET) {
-            const sockaddr_in* a4 = reinterpret_cast<const sockaddr_in*>(&ne.ss);
-            std::string resolved_ip = be_ip_to_string(a4->sin_addr.s_addr);
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+        for (const auto& ne : eps) {
+            if (ne.ss.ss_family == AF_INET) {
+                const sockaddr_in* a4 = reinterpret_cast<const sockaddr_in*>(&ne.ss);
+                std::string resolved_ip = be_ip_to_string(a4->sin_addr.s_addr);
 
-            // Check existing connections to this IP
-            for (const auto& kv : peers_) {
-                if (kv.second.ip == resolved_ip) {
-                    // Already connected to this IP, skip
-                    return false;
+                // Check existing connections to this IP
+                for (const auto& kv : peers_) {
+                    if (kv.second.ip == resolved_ip) {
+                        // Already connected to this IP, skip
+                        return false;
+                    }
                 }
             }
         }
@@ -2637,10 +2645,16 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     ps.blocks_failed_delivery = 0;
     ps.health_score = 1.0;
     ps.last_block_received_ms = 0;
-    peers_[s] = ps;
-    g_peer_index_capable[s] = false;
 
-    g_trickle_last_ms[s] = 0;
+    // CRITICAL: Hold g_peers_mu while modifying peers_ to prevent data race with loop thread
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+        peers_[s] = ps;
+        g_peer_index_capable[s] = false;
+        g_trickle_last_ms[s] = 0;
+        // mark as outbound for gating/diversity
+        g_outbounds.insert(s);
+    }
 
     uint32_t be_ip;
     if (parse_ipv4(ps.ip, be_ip) && ipv4_is_public(be_ip) && !is_self_be(be_ip)) {
@@ -2652,15 +2666,10 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 #endif
     }
 
-    log_info("Peer: connected → " + peers_[s].ip);
+    log_info("Peer: connected → " + ps.ip);
 
     // Gate first, then mark loopback (so flag actually sticks)
     gate_on_connect(s);
-    {
-        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
-        // mark as outbound for gating/diversity
-        g_outbounds.insert(s);
-    }
     if (parse_ipv4(ps.ip, be_ip)) {
         gate_set_loopback(s, is_loopback_be(be_ip));
     }
@@ -4993,12 +5002,21 @@ void P2P::loop(){
                 uint8_t buf[65536];
                 int n = miq_recv(s, buf, sizeof(buf));
                 if (n <= 0) {
-                    if (n < 0) {
-                        P2P_TRACE("close read<0");
+                    if (n == 0) {
+                        // EOF: peer closed connection gracefully
+                        P2P_TRACE("close EOF (peer closed)");
                         dead.push_back(s);
+                        continue;
+                    } else if (n == -2) {
+                        // EAGAIN/EWOULDBLOCK: no data yet, but connection still open
+                        enforce_rx_parse_deadline(ps, s);
+                        continue;
+                    } else {
+                        // n < 0: actual error
+                        P2P_TRACE("close read error");
+                        dead.push_back(s);
+                        continue;
                     }
-                    enforce_rx_parse_deadline(ps, s);
-                    continue;
                 }
 
                 ps.last_ms = now_ms();
