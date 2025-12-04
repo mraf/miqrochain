@@ -5033,24 +5033,12 @@ void P2P::loop(){
                         log_warn("P2P: recv error from " + ps.ip + " code=" + std::to_string(n));
                         dead.push_back(s);
                         continue;
-                    if (n < 0) {
-                        log_info("P2P: recv error from " + ps.ip + " (errno=" + std::to_string(errno) + ")");
-                        P2P_TRACE("close read<0");
-                        dead.push_back(s);
-                    } else {
-                        // n == 0: peer closed connection gracefully
-                        log_info("P2P: peer " + ps.ip + " closed connection (recv returned 0)");
                     }
                 }
 
                 // Log received bytes during handshake phase for diagnostics
                 if (!ps.verack_ok) {
                     log_info("P2P: received " + std::to_string(n) + " bytes from " + ps.ip + " (handshake in progress)");
-                }
-
-                // Log first data received from peer (handshake)
-                if (!ps.verack_ok) {
-                    log_info("P2P: received " + std::to_string(n) + " bytes from " + ps.ip + " (handshake pending)");
                 }
 
                 ps.last_ms = now_ms();
@@ -5132,9 +5120,9 @@ void P2P::loop(){
 
                     P2P_TRACE("RX " + ps.ip + " cmd=" + cmd + " len=" + std::to_string(m.payload.size()));
 
-                    // Log handshake commands
-                    if (cmd == "version" || cmd == "verack" || !ps.verack_ok) {
-                        log_info("P2P: decoded cmd=" + cmd + " from " + ps.ip + " (len=" + std::to_string(m.payload.size()) + ")");
+                    // Log commands during handshake for debugging
+                    if (!ps.verack_ok) {
+                        log_info("P2P: RX from " + ps.ip + " cmd=" + cmd + " len=" + std::to_string(m.payload.size()));
                     }
 
                     bool send_verack = false; int close_code = 0;
@@ -5143,18 +5131,12 @@ void P2P::loop(){
                         dead.push_back(s);
                         break;
                     }
-                    // Log all received commands during handshake for debugging
-                    if (!ps.verack_ok) {
-                        log_info("P2P: RX from " + ps.ip + " cmd=" + cmd + " len=" + std::to_string(m.payload.size()));
-                    }
 
                     if (send_verack) {
                         // Send verack to acknowledge the received version
                         auto verack = encode_msg("verack", {});
                         bool verack_sent = send_or_close(s, verack);
                         log_info("P2P: TX to " + ps.ip + " cmd=verack sent=" + (verack_sent ? "OK" : "FAILED"));
-                        log_info("P2P: sending verack to " + ps.ip + " (result=" + (verack_sent ? "OK" : "FAILED") + ")");
-                        P2P_TRACE("TX " + ps.ip + " cmd=verack len=0 result=" + (verack_sent ? "OK" : "FAILED"));
 
                         if (verack_sent) {
                             gate_mark_sent_verack(s);
