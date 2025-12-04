@@ -645,13 +645,17 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     m.bits   = h.bits;
     m.time   = h.time;
     m.have_block = have_block(m.hash);
-    // Height & cumulative work
+
+    // Height & cumulative work - MUST find parent to compute correctly
     uint64_t parent_height = 0;
     long double parent_work = 0.0L;
+    bool found_parent = false;
+
     auto itp = header_index_.find(hk(h.prev_hash));
     if (itp != header_index_.end()) {
         parent_height = itp->second.height;
         parent_work   = itp->second.work_sum;
+        found_parent = true;
     } else if (h.prev_hash == tip_.hash) {
         parent_height = tip_.height;
         // Calculate cumulative work up to current tip
@@ -671,7 +675,22 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
         if (cur_height == 0) {
             parent_work += work_from_bits(GENESIS_BITS);
         }
+        found_parent = true;
+    } else if (h.prev_hash == std::vector<uint8_t>(32, 0)) {
+        // Genesis block (prev_hash is all zeros)
+        parent_height = 0;
+        parent_work = 0.0L;
+        found_parent = true;
     }
+
+    // CRITICAL FIX: If we can't find the parent, reject the header
+    // This prevents headers from being assigned wrong heights (e.g., height=1)
+    // which would corrupt the chain state
+    if (!found_parent) {
+        err = "cannot compute height - parent not in header index";
+        return false;
+    }
+
     m.height   = parent_height + 1;
     m.work_sum = parent_work + work_from_bits(h.bits);
 
