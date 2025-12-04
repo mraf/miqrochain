@@ -3395,13 +3395,24 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
     Block b;
     if (!deser_block(raw, b)) return;
 
+    // CRITICAL FIX: Apply same byte-reversal to block headers as was done for headers
+    // This fixes "bad merkle" errors when headers were accepted with reversed byte order
+    if (g_hdr_flip[(Sock)sock]) {
+        std::reverse(b.header.prev_hash.begin(), b.header.prev_hash.end());
+        std::reverse(b.header.merkle_root.begin(), b.header.merkle_root.end());
+    }
+
     const auto bh = b.block_hash();
     if (chain_.have_block(bh)) return;
 
     bool have_parent = chain_.have_block(b.header.prev_hash);
 
     if (!have_parent) {
-        OrphanRec rec{ bh, b.header.prev_hash, raw };
+        // CRITICAL FIX: Serialize the modified block (with byte-reversal applied) instead of
+        // using raw bytes. This ensures orphans have consistent byte ordering when later processed.
+        std::vector<uint8_t> block_bytes = ser_block(b);
+        size_t block_size = block_bytes.size();
+        OrphanRec rec{ bh, b.header.prev_hash, std::move(block_bytes) };
         const std::string child_hex  = hexkey(bh);
         const std::string parent_hex = hexkey(b.header.prev_hash);
 
@@ -3409,7 +3420,7 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             orphans_.emplace(child_hex, std::move(rec));
             orphan_children_[parent_hex].push_back(child_hex);
             orphan_order_.push_back(child_hex);
-            orphan_bytes_ += raw.size();
+            orphan_bytes_ += block_size;
             evict_orphans_if_needed();
             // PERFORMANCE: Throttle orphan logging to avoid spam during sync
             static int64_t last_orphan_log_ms = 0;
@@ -5531,6 +5542,14 @@ void P2P::loop(){
                         if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
                             Block hb;
                             if (!deser_block(m.payload, hb)) { if (++ps.mis > 10) { dead.push_back(s); } continue; }
+
+                            // CRITICAL FIX: Apply same byte-reversal to block headers as was done for headers
+                            // This fixes "bad merkle" errors when headers were accepted with reversed byte order
+                            if (g_hdr_flip[(Sock)s]) {
+                                std::reverse(hb.header.prev_hash.begin(), hb.header.prev_hash.end());
+                                std::reverse(hb.header.merkle_root.begin(), hb.header.merkle_root.end());
+                            }
+
                             const std::string bh = hexkey(hb.block_hash());
                             bool drop_unsolicited = false;
                             if (!ps.syncing) {
