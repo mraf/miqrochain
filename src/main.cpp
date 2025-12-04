@@ -1219,17 +1219,6 @@ static std::vector<std::string> local_ip_strings(){
     return false;
 }
 
-static inline bool is_private_v4(const std::string& ip){
-    return ip.rfind("10.",0)==0
-        || ip.rfind("192.168.",0)==0
-        || (ip.rfind("172.",0)==0 && [] (const std::string& s){
-              // 172.16.0.0/12
-              int a=0; char dot=0;
-              if (std::sscanf(s.c_str(),"172.%d%c",&a,&dot)==2 && dot=='.') return (a>=16 && a<=31);
-              return false;
-           }(ip));
-}
-
 struct SeedRole {
     bool we_are_seed{false};
     std::string detail;
