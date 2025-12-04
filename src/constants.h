@@ -451,12 +451,15 @@ static constexpr uint32_t MIN_PEER_PROTO_VERSION = 70015;  // Minimum supported
 #define MIQ_COMPACT_BLOCK_HIGH_BANDWIDTH 3  // High-bandwidth compact block peers
 #endif
 
-// === TRANSACTION RELAY OPTIMIZATION ===
+// === TRANSACTION RELAY OPTIMIZATION (V1 HIGH-THROUGHPUT) ===
 #ifndef MIQ_TX_FLOOD_PROTECTION
 #define MIQ_TX_FLOOD_PROTECTION 1  // Enable transaction flood protection
 #endif
 #ifndef MIQ_TX_RELAY_RATE_LIMIT_PER_PEER
-#define MIQ_TX_RELAY_RATE_LIMIT_PER_PEER 7  // Txs per second per peer
+#define MIQ_TX_RELAY_RATE_LIMIT_PER_PEER 100  // V1: Increased from 7 to 100 txs per second per peer
+#endif
+#ifndef MIQ_TX_RELAY_BURST_LIMIT
+#define MIQ_TX_RELAY_BURST_LIMIT 500  // V1: Allow burst of up to 500 txs before rate limiting kicks in
 #endif
 
 }

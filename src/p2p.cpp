@@ -2799,15 +2799,19 @@ void P2P::announce_block_async(const std::vector<uint8_t>& h) {
 
 // =================== helpers for sync / serving ===================
 
+// V1: Increased trickle queue from 4096 to 32768 for high-throughput tx relay
+static constexpr size_t MIQ_TRICKLE_QUEUE_MAX = 32768;
+
 static inline void trickle_enqueue(Sock sock, const std::vector<uint8_t>& txid){
     if (txid.size()!=32) return;
     auto& q = g_trickle_q[sock];
-    if (q.size() < 4096) {
+    if (q.size() < MIQ_TRICKLE_QUEUE_MAX) {
         q.push_back(txid);
     } else {
-        // CRITICAL FIX: Log when trickle queue is full - this can cause transactions
-        // to not propagate to specific peers, potentially preventing mining
-        MIQ_LOG_WARN(miq::LogCategory::NET, "trickle_enqueue: peer queue full (4096), dropping tx announcement for sock=" + std::to_string(sock));
+        // Log when trickle queue is full - this can cause transactions
+        // to not propagate to specific peers
+        MIQ_LOG_WARN(miq::LogCategory::NET, "trickle_enqueue: peer queue full (" +
+                     std::to_string(MIQ_TRICKLE_QUEUE_MAX) + "), dropping tx announcement for sock=" + std::to_string(sock));
     }
 }
 

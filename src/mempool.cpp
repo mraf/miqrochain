@@ -756,6 +756,15 @@ void Mempool::collect_for_block(std::vector<Transaction>& out, size_t max_bytes)
     std::lock_guard<std::recursive_mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
     out.clear();
 
+    // V1 FIX: Log mempool state for debugging
+    MIQ_LOG_DEBUG(LogCategory::MEMPOOL, "collect_for_block: mempool has " +
+                  std::to_string(map_.size()) + " txs, max_bytes=" + std::to_string(max_bytes));
+
+    if (map_.empty()) {
+        MIQ_LOG_DEBUG(LogCategory::MEMPOOL, "collect_for_block: mempool empty, nothing to collect");
+        return;
+    }
+
     // Build sorted node view by feerate desc (tie-break: smaller size first)
     struct NodeRef { const MempoolEntry* e; };
     std::vector<NodeRef> nodes;
@@ -770,9 +779,11 @@ void Mempool::collect_for_block(std::vector<Transaction>& out, size_t max_bytes)
     std::unordered_set<std::string> selected_keys;
     size_t used = 0;
     bool progress = true;
+    int passes = 0;
 
     while (progress) {
         progress = false;
+        passes++;
         for (const auto& n : nodes) {
             const auto& e = *n.e;
             const std::string myk = key_from_vec(e.tx.txid());
@@ -780,26 +791,53 @@ void Mempool::collect_for_block(std::vector<Transaction>& out, size_t max_bytes)
 
             // parents must be either not in mempool or already selected
             bool parents_ok = true;
+            size_t unselected_parents = 0;
             for (const auto& pk : e.parents) {
                 if (map_.find(pk) != map_.end() && !selected_keys.count(pk)) {
-                    parents_ok = false; break;
+                    parents_ok = false;
+                    unselected_parents++;
                 }
             }
-            if (!parents_ok) continue;
+            if (!parents_ok) {
+                // V1 DEBUG: Log why tx was skipped
+                MIQ_LOG_DEBUG(LogCategory::MEMPOOL, "collect_for_block: skipping tx (pass " +
+                              std::to_string(passes) + ") - has " + std::to_string(unselected_parents) +
+                              " unselected parent(s) in mempool");
+                continue;
+            }
 
             const size_t sz = e.size_bytes;
-            if (sz > max_bytes) continue; // single tx larger than cap remainder; skip
-            if (used > max_bytes - sz) continue; // avoid overflow and respect cap
+            if (sz > max_bytes) {
+                MIQ_LOG_DEBUG(LogCategory::MEMPOOL, "collect_for_block: skipping tx - size " +
+                              std::to_string(sz) + " > max " + std::to_string(max_bytes));
+                continue;
+            }
+            if (used + sz > max_bytes) {
+                MIQ_LOG_DEBUG(LogCategory::MEMPOOL, "collect_for_block: skipping tx - would exceed limit: used=" +
+                              std::to_string(used) + " + sz=" + std::to_string(sz) + " > " + std::to_string(max_bytes));
+                continue;
+            }
 
             out.push_back(e.tx);
             selected_keys.insert(myk);
             used += sz;
             progress = true;
 
-            if (used >= max_bytes) return; // filled
+            MIQ_LOG_DEBUG(LogCategory::MEMPOOL, "collect_for_block: selected tx #" +
+                          std::to_string(out.size()) + ", size=" + std::to_string(sz) +
+                          ", total_used=" + std::to_string(used));
+
+            if (used >= max_bytes) {
+                MIQ_LOG_INFO(LogCategory::MEMPOOL, "collect_for_block: block full, collected " +
+                             std::to_string(out.size()) + " txs in " + std::to_string(passes) + " passes");
+                return;
+            }
         }
-        // If no progress and still have space, we're done.
     }
+
+    MIQ_LOG_INFO(LogCategory::MEMPOOL, "collect_for_block: collected " + std::to_string(out.size()) +
+                 " of " + std::to_string(map_.size()) + " txs in " + std::to_string(passes) + " passes, used=" +
+                 std::to_string(used) + " bytes");
 }
 
 // ============================================================================
