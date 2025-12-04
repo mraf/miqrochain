@@ -1521,7 +1521,10 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
     close_code = 0;
 
     auto it = g_gate.find(fd);
-    if (it == g_gate.end()) return false;
+    if (it == g_gate.end()) {
+        miq::log_warn("P2P: gate_on_command - no gate entry for fd=" + std::to_string((uintptr_t)fd) + " cmd=" + cmd);
+        return false;
+    }
     auto& g = it->second;
 
     if (!g.got_verack) {
@@ -1531,7 +1534,11 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
                 g.hs_last_ms = now_ms();          // be lenient with localhost tools
             } else {
                 close_code = 408;
-                P2P_TRACE("close fd=" + std::to_string((uintptr_t)fd) + " reason=handshake-timeout");
+                miq::log_warn("P2P: handshake timeout fd=" + std::to_string((uintptr_t)fd) +
+                         " idle=" + std::to_string(idle) + "ms got_version=" +
+                         (g.got_version ? "true" : "false") + " got_verack=" +
+                         (g.got_verack ? "true" : "false") + " sent_verack=" +
+                         (g.sent_verack ? "true" : "false"));
                 return true;
             }
         }
@@ -1540,6 +1547,7 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
     if (!cmd.empty()){
         if (cmd == "version"){
             if (!g.got_version){
+                miq::log_info("P2P: received version from peer fd=" + std::to_string((uintptr_t)fd));
                 g.got_version = true;
                 g.hs_last_ms = now_ms();
                 should_send_verack = true;
@@ -1548,6 +1556,7 @@ static inline bool gate_on_command(Sock fd, const std::string& cmd,
                     Clock::now().time_since_epoch()).count();
             }
         } else if (cmd == "verack"){
+            miq::log_info("P2P: received verack from peer fd=" + std::to_string((uintptr_t)fd));
             g.got_verack = true;
             g_preverack_counts.erase(fd);
             g.hs_last_ms = now_ms();
@@ -5008,7 +5017,7 @@ void P2P::loop(){
                 if (n <= 0) {
                     if (n == 0) {
                         // EOF: peer closed connection gracefully
-                        P2P_TRACE("close EOF (peer closed)");
+                        log_info("P2P: peer " + ps.ip + " closed connection (EOF)");
                         dead.push_back(s);
                         continue;
                     } else if (n == -2) {
@@ -5017,10 +5026,15 @@ void P2P::loop(){
                         continue;
                     } else {
                         // n < 0: actual error
-                        P2P_TRACE("close read error");
+                        log_warn("P2P: recv error from " + ps.ip + " code=" + std::to_string(n));
                         dead.push_back(s);
                         continue;
                     }
+                }
+
+                // Log received bytes during handshake phase for diagnostics
+                if (!ps.verack_ok) {
+                    log_info("P2P: received " + std::to_string(n) + " bytes from " + ps.ip + " (handshake in progress)");
                 }
 
                 ps.last_ms = now_ms();
@@ -5052,6 +5066,16 @@ void P2P::loop(){
                     size_t off_before = off;
                     bool ok = decode_msg(ps.rx, off, m);
                     if (!ok) {
+                        // Log decode failure during handshake
+                        if (!ps.verack_ok && ps.rx.size() > 0) {
+                            static int64_t last_decode_fail_log_ms = 0;
+                            int64_t now_log = now_ms();
+                            if (now_log - last_decode_fail_log_ms > 5000) {
+                                last_decode_fail_log_ms = now_log;
+                                log_info("P2P: decode_msg waiting for more data from " + ps.ip +
+                                         " rx_buf=" + std::to_string(ps.rx.size()) + " bytes");
+                            }
+                        }
                         break;
                     }
                     if (m.payload.size() > MIQ_MSG_HARD_MAX) {
@@ -5098,15 +5122,20 @@ void P2P::loop(){
                         dead.push_back(s);
                         break;
                     }
-                    P2P_TRACE("DEBUG: cmd=" + cmd + " send_verack=" + (send_verack ? "true" : "false"));
+                    // Log all received commands during handshake for debugging
+                    if (!ps.verack_ok) {
+                        log_info("P2P: RX from " + ps.ip + " cmd=" + cmd + " len=" + std::to_string(m.payload.size()));
+                    }
+
                     if (send_verack) {
                         // Send verack to acknowledge the received version
                         auto verack = encode_msg("verack", {});
                         bool verack_sent = send_or_close(s, verack);
-                        P2P_TRACE("TX " + ps.ip + " cmd=verack len=0 result=" + (verack_sent ? "OK" : "FAILED"));
+                        log_info("P2P: TX to " + ps.ip + " cmd=verack sent=" + (verack_sent ? "OK" : "FAILED"));
 
                         if (verack_sent) {
                             gate_mark_sent_verack(s);
+                            log_info("P2P: marked sent_verack=true for " + ps.ip);
                         }
                     }
 
