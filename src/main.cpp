@@ -4018,13 +4018,11 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
     uint64_t       lastProgressMs        = now_ms();
     uint64_t       lastHeight            = chain.height();
     uint64_t       height_at_seed_connect= lastHeight;
-    uint32_t       seed_dials            = 0;
 
-    // Make sure we’ve nudged the seed right away.
+    // Make sure we've nudged the seed right away.
     if (!we_are_seed) {
         p2p->connect_seed(seed_host_cstr(), P2P_PORT);
         lastSeedDialMs = now_ms();
-        ++seed_dials;
     } else {
         log_info(std::string("Seed self-detect: skipping outbound connect to ")
                  + seed_host_cstr() + " (waiting for inbound peers).");
@@ -4069,18 +4067,6 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             if (!we_are_seed && verack_peers == 0 && (now_ms() - lastSeedDialMs > kSeedNudgeMs)) {
                 p2p->connect_seed(seed_host_cstr(), P2P_PORT);
                 lastSeedDialMs = now_ms();
-                ++seed_dials;
-                if (seed_dials >= 5) {
-                    auto ips = resolve_host_ip_strings(seed_host_cstr());
-                    bool any_public = false;
-                    for (auto& ip : ips) { if (!is_private_v4(ip) && !is_loopback_or_linklocal(ip)) { any_public = true; break; } }
-                    if (any_public && p2p && p2p->snapshot_peers().empty()){
-                        g_assume_seed_hairpin.store(true);
-                        we_are_seed = true;
-                        log_warn("IBD: assuming SEED mode due to probable NAT hairpin (repeated seed dial fails with 0 peers).");
-                        if (tui && can_tui) tui->set_banner("Seed solo mode (hairpin) — waiting for inbound peers…");
-                    }
-                }
             }
 
             if (now_ms() > handshake_deadline_ms) {
@@ -4094,15 +4080,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                     }
                     return true; // treat IBD as trivially complete to unlock mining
                 } else {
-                    if (g_assume_seed_hairpin.load()){
-                        log_warn("IBD: hairpin seed assumption during handshake — proceeding in SOLO-SEED mode.");
-                        if (tui && can_tui) {
-                            tui->mark_step_ok("Peer handshake (verack)");
-                            tui->set_banner("Seed solo mode (hairpin) — mining unlocked.");
-                            tui->set_ibd_progress(chain.height(), chain.height(), 0, "complete", seed_host_cstr(), true);
-                        }
-                        return true;
-                    }
+                    // Regular node: handshake failed - report error
                     out_err = "no peers completed handshake (verack)";
                     if (tui && can_tui) tui->mark_step_fail("Peer handshake (verack)");
                     return false;
@@ -4132,7 +4110,6 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
         if (!we_are_seed && verack_peers == 0 && now_ms() - lastSeedDialMs > kSeedNudgeMs) {
             p2p->connect_seed(seed_host_cstr(), P2P_PORT);
             lastSeedDialMs = now_ms();
-            ++seed_dials;
         }
 
         // Early no-peer failure
