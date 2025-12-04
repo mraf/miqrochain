@@ -1362,12 +1362,22 @@ uint64_t Chain::subsidy_for_height(uint64_t h) const {
 bool Chain::init_genesis(const Block& g){
     MIQ_CHAIN_GUARD();
     if(tip_.hash != std::vector<uint8_t>(32,0)) return true;
-    g_reorg.init_genesis(tip_.hash, tip_.bits, tip_.time);
 
+    // Compute merkle root from transactions
     std::vector<std::vector<uint8_t>> txids;
     for(const auto& tx : g.txs) txids.push_back(tx.txid());
     auto mr = merkle_root(txids);
-    if(mr != g.header.merkle_root) return false;
+
+    // CRITICAL FIX: Add detailed logging for genesis init failures
+    if(mr != g.header.merkle_root) {
+        log_error("init_genesis: merkle mismatch - computed=" + to_hex(mr) +
+                  " header=" + to_hex(g.header.merkle_root) +
+                  " txcount=" + std::to_string(g.txs.size()));
+        return false;
+    }
+
+    // CRITICAL FIX: Initialize reorg manager with GENESIS hash, not tip (which is all zeros)
+    g_reorg.init_genesis(g.block_hash(), g.header.bits, g.header.time);
 
     storage_.append_block(ser_block(g), g.block_hash());
 

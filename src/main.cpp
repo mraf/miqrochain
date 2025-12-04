@@ -4576,6 +4576,8 @@ int main(int argc, char** argv){
                 if (can_tui) {
                     tui.mark_step_ok("IBD sync phase");
                     tui.set_banner("Seed solo mode — no peers yet. Mining enabled.");
+                    // CRITICAL FIX: Must set ibd_done_ to true for splash screen transition!
+                    tui.set_ibd_progress(chain.height(), chain.height(), 0, "complete", seed_host_cstr(), true);
                     tui.set_node_state(TUI::NodeState::Running);
                     tui.set_mining_gate(true, "");
                 }
