@@ -851,15 +851,27 @@ StratumJob StratumServer::create_job() {
     job.height = tip.height + 1;
     job.clean_jobs = true;
 
-    // PRODUCTION FIX: Collect mempool transactions and calculate fees
-    job.mempool_txs = mempool_.collect(5000); // Up to 5000 transactions
+    // V1 FIX: Use collect_for_block with proper size limit instead of count limit
+    // This ensures we collect transactions up to block size limit, not arbitrary count
+    static constexpr size_t COINBASE_RESERVED_SIZE = 1024;
+    static constexpr size_t BLOCK_TX_SIZE_LIMIT = MAX_BLOCK_SIZE - COINBASE_RESERVED_SIZE;
+    mempool_.collect_for_block(job.mempool_txs, BLOCK_TX_SIZE_LIMIT);
     job.total_fees = 0;
 
     for (const auto& tx : job.mempool_txs) {
         uint64_t in_sum = 0, out_sum = 0;
 
-        // Calculate input sum (query UTXO set for input values)
+        // V1 FIX: Check mempool for parent transactions first (for chained tx fee calculation)
         for (const auto& in : tx.vin) {
+            // First check if parent is in mempool (for chained transactions)
+            Transaction parent_tx;
+            if (mempool_.get_transaction(in.prev.txid, parent_tx)) {
+                if (in.prev.vout < parent_tx.vout.size()) {
+                    in_sum += parent_tx.vout[in.prev.vout].value;
+                    continue;
+                }
+            }
+            // Fallback to UTXO set
             UTXOEntry e;
             if (chain_.utxo().get(in.prev.txid, in.prev.vout, e)) {
                 in_sum += e.value;

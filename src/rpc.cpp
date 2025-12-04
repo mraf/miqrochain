@@ -987,13 +987,26 @@ std::string RpcService::handle(const std::string& body){
                 uint32_t vsize = (uint32_t)raw.size();
                 uint64_t in_sum = 0, out_sum = 0;
 
-                // Sum in/out (best-effort using UTXO view; if missing, fee=0)
+                // V1 FIX: Check mempool for parent transactions first (for chained tx fee calculation)
+                // This ensures accurate fee calculation for transactions spending unconfirmed outputs
                 for (const auto& in : tx.vin) {
-                    UTXOEntry e;
-                    if (chain_.utxo().get(in.prev.txid, in.prev.vout, e)) {
-                        in_sum += e.value;
-                        // dependency edge
-                        mapDeps[to_hex(tx.txid())].push_back(to_hex(in.prev.txid));
+                    bool found = false;
+                    // First check if parent is in mempool (for chained transactions)
+                    Transaction parent_tx;
+                    if (mempool_.get_transaction(in.prev.txid, parent_tx)) {
+                        if (in.prev.vout < parent_tx.vout.size()) {
+                            in_sum += parent_tx.vout[in.prev.vout].value;
+                            // dependency edge (in-mempool parent)
+                            mapDeps[to_hex(tx.txid())].push_back(to_hex(in.prev.txid));
+                            found = true;
+                        }
+                    }
+                    // Fallback to UTXO set
+                    if (!found) {
+                        UTXOEntry e;
+                        if (chain_.utxo().get(in.prev.txid, in.prev.vout, e)) {
+                            in_sum += e.value;
+                        }
                     }
                 }
                 for (const auto& o : tx.vout) out_sum += o.value;
