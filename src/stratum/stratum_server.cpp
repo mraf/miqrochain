@@ -10,6 +10,7 @@
 #include "../log.h"
 #include "../tx.h"
 #include "../block.h"
+#include "../difficulty.h"  // epoch_next_bits for proper difficulty calculation
 
 #include <algorithm>
 #include <chrono>
@@ -852,8 +853,28 @@ StratumJob StratumServer::create_job() {
     job.job_id = generate_job_id();
     job.prev_hash = tip.hash;
     job.version = 1;
-    job.bits = tip.bits;
-    job.time = (uint32_t)std::time(nullptr);
+
+    // CRITICAL FIX: Calculate proper next block difficulty (retarget-aware)
+    // Using tip.bits directly is wrong at difficulty adjustment boundaries
+    uint32_t next_bits = tip.bits;
+    try {
+        auto last = chain_.last_headers(MIQ_RETARGET_INTERVAL);
+        next_bits = miq::epoch_next_bits(
+            last,
+            BLOCK_TIME_SECS,
+            GENESIS_BITS,
+            tip.height + 1,
+            MIQ_RETARGET_INTERVAL
+        );
+    } catch (const std::exception& e) {
+        log_error(std::string("Stratum: epoch_next_bits failed: ") + e.what());
+        // Fall back to tip.bits on error
+    } catch (...) {
+        log_error("Stratum: epoch_next_bits failed with unknown error");
+    }
+    job.bits = next_bits;
+
+    job.time = (uint64_t)std::time(nullptr);  // MIQ uses 64-bit timestamps
     job.height = tip.height + 1;
     job.clean_jobs = true;
 
@@ -1045,7 +1066,7 @@ void StratumServer::send_job_to_miner(StratumMiner& miner, const StratumJob& job
     ss << "],";
     ss << "\"" << std::hex << std::setw(8) << std::setfill('0') << job.version << "\",";
     ss << "\"" << std::hex << std::setw(8) << std::setfill('0') << job.bits << "\",";
-    ss << "\"" << std::hex << std::setw(8) << std::setfill('0') << job.time << "\",";
+    ss << "\"" << std::hex << std::setw(16) << std::setfill('0') << job.time << "\",";  // MIQ: 64-bit time
     ss << (job.clean_jobs ? "true" : "false");
     ss << "]}\n";
 

@@ -570,7 +570,7 @@ static inline void put_u32_le(std::vector<uint8_t>& v, uint32_t x){
     p[6]=uint8_t((x>>48)&0xff); p[7]=uint8_t((x>>56)&0xff);
 }
 
-static inline void store_u32_le(uint8_t* p, uint32_t x){
+[[maybe_unused]] static inline void store_u32_le(uint8_t* p, uint32_t x){
     p[0]=uint8_t((x>>0 )&0xff);
     p[1]=uint8_t((x>>8 )&0xff);
     p[2]=uint8_t((x>>16)&0xff);
@@ -2486,7 +2486,7 @@ struct StratumJob {
     std::vector<std::string> merkle_branch;
     uint32_t version;
     uint32_t bits;
-    uint32_t time;
+    uint64_t time;  // MIQ uses 64-bit timestamps
     bool clean;
 };
 
@@ -2933,7 +2933,7 @@ public:
             }
             current_job.version = (uint32_t)std::stoul(version_hex, nullptr, 16);
             current_job.bits = (uint32_t)std::stoul(bits_hex, nullptr, 16);
-            current_job.time = (uint32_t)std::stoul(time_hex, nullptr, 16);
+            current_job.time = std::stoull(time_hex, nullptr, 16);  // MIQ: 64-bit time
         } catch (...) {
             return false;
         }
@@ -4202,31 +4202,24 @@ int main(int argc, char** argv){
                     if (found_share.load() && stratum.connected.load()) {
                         uint64_t nonce = found_nonce.load();
 
-                        // CRITICAL FIX: Format nonce as little-endian hex for Stratum
-                        // Stratum expects the nonce bytes in little-endian order as hex
-                        // For standard Stratum (4-byte nonce), use lower 32 bits
-                        // For Miqrochain pools (8-byte nonce), use full 64 bits
+                        // CRITICAL FIX: Format nonce as hex NUMBER (not LE bytes)
+                        // Server parses hex string as number with std::stoull, then LE-encodes
+                        // So we must send the numeric value as hex, not LE-encoded bytes as hex
+                        // Miqrochain uses 64-bit nonce
                         std::string nonce_hex;
                         {
-                            // Format as 8-byte little-endian hex (Miqrochain uses 64-bit nonce)
-                            uint8_t nonce_bytes[8];
-                            store_u64_le(nonce_bytes, nonce);
                             std::ostringstream ss;
-                            for (int i = 0; i < 8; i++) {
-                                ss << std::hex << std::setw(2) << std::setfill('0') << (unsigned)nonce_bytes[i];
-                            }
+                            ss << std::hex << std::setw(16) << std::setfill('0') << nonce;
                             nonce_hex = ss.str();
                         }
 
-                        // Format time as little-endian hex (4 bytes for Stratum compatibility)
+                        // CRITICAL FIX: Format time as hex NUMBER (not LE bytes)
+                        // Server parses hex as number then LE-encodes, so we send the number directly
+                        // For MIQ 64-bit time, send full 64-bit value
                         std::string time_hex;
                         {
-                            uint8_t time_bytes[4];
-                            store_u32_le(time_bytes, job.time);
                             std::ostringstream ss;
-                            for (int i = 0; i < 4; i++) {
-                                ss << std::hex << std::setw(2) << std::setfill('0') << (unsigned)time_bytes[i];
-                            }
+                            ss << std::hex << std::setw(16) << std::setfill('0') << (uint64_t)job.time;
                             time_hex = ss.str();
                         }
 
