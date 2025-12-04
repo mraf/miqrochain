@@ -4269,10 +4269,28 @@ void P2P::loop(){
             
             // Request genesis block if we're completely empty
             if (want.empty() && chain_.height() == 0 && chain_.best_header_height() == 0) {
-                // Request genesis from peers
-                std::vector<uint8_t> genesis_hash(32, 0);
-                if (!chain_.have_block(genesis_hash)) {
-                    want.push_back(genesis_hash);
+                // Request genesis from peers using the actual genesis hash from constants
+                // Helper to parse GENESIS_HASH_HEX (64 hex chars -> 32 bytes)
+                static std::vector<uint8_t> s_genesis_hash;
+                static bool s_genesis_parsed = false;
+                if (!s_genesis_parsed) {
+                    s_genesis_parsed = true;
+                    const char* hex = GENESIS_HASH_HEX;
+                    if (hex && std::strlen(hex) == 64) {
+                        s_genesis_hash.resize(32);
+                        auto hv = [](char c)->int {
+                            if (c >= '0' && c <= '9') return c - '0';
+                            if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+                            if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+                            return 0;
+                        };
+                        for (size_t i = 0; i < 32; i++) {
+                            s_genesis_hash[i] = (uint8_t)((hv(hex[2*i]) << 4) | hv(hex[2*i + 1]));
+                        }
+                    }
+                }
+                if (!s_genesis_hash.empty() && !chain_.have_block(s_genesis_hash)) {
+                    want.push_back(s_genesis_hash);
                     log_info("[SYNC] Requesting genesis block for initial sync");
                 }
             }
