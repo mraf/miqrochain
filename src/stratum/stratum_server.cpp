@@ -763,18 +763,24 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
                 block.txs.push_back(tx);
             }
 
+            // CRITICAL DEBUG: Log exactly how many transactions are being submitted
+            log_info("Stratum: Submitting block " + std::to_string(job.height) +
+                     " with " + std::to_string(block.txs.size()) + " txs (1 coinbase + " +
+                     std::to_string(job.mempool_txs.size()) + " mempool)");
+
             // Submit to chain
             std::string submit_err;
             if (chain_.submit_block(block, submit_err)) {
                 // CRITICAL FIX: Notify mempool to remove confirmed transactions
                 mempool_.on_block_connect(block);
-                log_info("Stratum: Block " + std::to_string(job.height) + " accepted!");
+                log_info("Stratum: Block " + std::to_string(job.height) + " accepted with " +
+                         std::to_string(block.txs.size() - 1) + " transactions!");
                 {
                     std::lock_guard<std::mutex> stats_lock(stats_mutex_);
                     stats_.blocks_found++;
                 }
             } else {
-                log_error("Stratum: Block rejected: " + submit_err);
+                log_error("Stratum: Block " + std::to_string(job.height) + " rejected: " + submit_err);
             }
         } catch (const std::exception& e) {
             log_error("Stratum: Failed to build/submit block: " + std::string(e.what()));
@@ -960,52 +966,52 @@ StratumJob StratumServer::create_job() {
     job.coinb2 = hex_encode(coinb2_bytes);
 
     // PRODUCTION FIX: Compute merkle branches from mempool transactions
+    // CRITICAL FIX: Correct merkle branch algorithm for stratum protocol
+    // Each branch[i] is the sibling hash needed at level i to compute merkle root
     job.merkle_branches.clear();
     if (!job.mempool_txs.empty()) {
-        // Compute tx hashes
+        // Compute tx hashes (these are siblings of coinbase path at level 0)
         std::vector<std::vector<uint8_t>> tx_hashes;
         for (const auto& tx : job.mempool_txs) {
             tx_hashes.push_back(tx.txid());
         }
 
-        // Build merkle branches for stratum (coinbase is index 0)
-        // The branches are the sibling hashes needed to compute merkle root
-        while (tx_hashes.size() > 0) {
+        log_info("Stratum: Job created with " + std::to_string(job.mempool_txs.size()) +
+                 " mempool txs for height " + std::to_string(job.height));
+
+        // Build merkle branches for stratum (coinbase is at index 0)
+        // Algorithm: At each level, first hash is the sibling, then remove it
+        // and pair up remaining hashes for the next level
+        while (!tx_hashes.empty()) {
+            // First hash is always the sibling at this level
+            job.merkle_branches.push_back(hex_encode(tx_hashes[0]));
+
             if (tx_hashes.size() == 1) {
-                // Only one tx left, it's a branch
-                job.merkle_branches.push_back(hex_encode(tx_hashes[0]));
+                // Only one element left, we're done
                 break;
             }
 
-            // Take the first tx hash as the branch (sibling of coinbase path)
-            job.merkle_branches.push_back(hex_encode(tx_hashes[0]));
+            // CRITICAL FIX: Remove the first element BEFORE computing next level
+            // The first element was the sibling of our path, now we need to compute
+            // what the sibling subtree hashes to at the next level
+            tx_hashes.erase(tx_hashes.begin());
 
-            // Combine pairs for next level
+            // Pair up remaining elements for next level
             std::vector<std::vector<uint8_t>> next_level;
             for (size_t i = 0; i < tx_hashes.size(); i += 2) {
+                std::vector<uint8_t> combined;
+                combined.reserve(64);
+                combined.insert(combined.end(), tx_hashes[i].begin(), tx_hashes[i].end());
                 if (i + 1 < tx_hashes.size()) {
-                    // Combine two hashes
-                    std::vector<uint8_t> combined;
-                    combined.reserve(64);
-                    if (!tx_hashes[i].empty()) {
-                        combined.insert(combined.end(), tx_hashes[i].begin(), tx_hashes[i].end());
-                    }
-                    if (!tx_hashes[i+1].empty()) {
-                        combined.insert(combined.end(), tx_hashes[i+1].begin(), tx_hashes[i+1].end());
-                    }
-                    next_level.push_back(dsha256(combined));
+                    // Two elements to combine
+                    combined.insert(combined.end(), tx_hashes[i+1].begin(), tx_hashes[i+1].end());
                 } else {
-                    // Odd element, duplicate
-                    std::vector<uint8_t> combined;
-                    combined.reserve(64);
-                    if (!tx_hashes[i].empty()) {
-                        combined.insert(combined.end(), tx_hashes[i].begin(), tx_hashes[i].end());
-                        combined.insert(combined.end(), tx_hashes[i].begin(), tx_hashes[i].end());
-                    }
-                    next_level.push_back(dsha256(combined));
+                    // Odd element - duplicate for merkle tree
+                    combined.insert(combined.end(), tx_hashes[i].begin(), tx_hashes[i].end());
                 }
+                next_level.push_back(dsha256(combined));
             }
-            tx_hashes = next_level;
+            tx_hashes = std::move(next_level);
         }
     }
 

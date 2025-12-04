@@ -838,6 +838,16 @@ void Mempool::collect_for_block(std::vector<Transaction>& out, size_t max_bytes)
     MIQ_LOG_INFO(LogCategory::MEMPOOL, "collect_for_block: collected " + std::to_string(out.size()) +
                  " of " + std::to_string(map_.size()) + " txs in " + std::to_string(passes) + " passes, used=" +
                  std::to_string(used) + " bytes");
+
+    // CRITICAL DEBUG: Log the exact order of transactions for chained tx debugging
+    if (out.size() > 1) {
+        std::string order_log = "collect_for_block ORDER: ";
+        for (size_t i = 0; i < out.size(); ++i) {
+            std::string txid_short = to_hex(out[i].txid()).substr(0, 8);
+            order_log += "[" + std::to_string(i) + "]=" + txid_short + " ";
+        }
+        MIQ_LOG_INFO(LogCategory::MEMPOOL, order_log);
+    }
 }
 
 // ============================================================================
