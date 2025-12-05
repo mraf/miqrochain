@@ -3550,6 +3550,9 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
         // During IBD, always request the next block from peers
         // The peer will respond with the block if they have it, or ignore if they don't
+        // CRITICAL FIX: Allow speculative requests beyond announced tip during IBD
+        // Peer's version message tip might be stale if peer continued syncing after we connected
+        constexpr uint64_t IBD_SPECULATIVE_MARGIN = 16; // Probe this many blocks beyond announced tip
         for (auto& kvp : peers_) {
             auto& pps = kvp.second;
             if (!pps.verack_ok) continue;
@@ -3558,14 +3561,16 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             uint64_t peer_or_hdr_tip = (pps.peer_tip_height > 0)
                 ? std::max<uint64_t>(pps.peer_tip_height, best_hdr_height)
                 : (uint64_t)best_hdr_height;
-            if (peer_or_hdr_tip > 0 && next_height > peer_or_hdr_tip) {
+            // Allow speculative requests during IBD - peer might have more blocks than announced
+            // Only skip if we're way beyond the tip AND have no inflight requests returning
+            uint64_t probe_limit = peer_or_hdr_tip + IBD_SPECULATIVE_MARGIN;
+            if (peer_or_hdr_tip > 0 && next_height > probe_limit && pps.inflight_index == 0) {
                 P2P_TRACE("DEBUG: Not requesting block " + std::to_string(next_height) +
-                          " from " + pps.ip + " (beyond peer/header tip)");
+                          " from " + pps.ip + " (beyond peer/header tip + margin)");
                 continue;
             }
-            if (pps.peer_tip_height == 0 || next_height <= pps.peer_tip_height) {
+            // Always fill pipeline during IBD - speculative requests will timeout if peer doesn't have blocks
             fill_index_pipeline(pps);
-          }
         }
 
 #if MIQ_ENABLE_HEADERS_FIRST
