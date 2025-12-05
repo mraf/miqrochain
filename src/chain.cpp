@@ -590,11 +590,7 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
 
 bool Chain::header_exists(const std::vector<uint8_t>& h) const {
     MIQ_CHAIN_GUARD();
-    if (header_index_.find(hk(h)) != header_index_.end()) return true;
-    // COMPAT FIX: Try reversed hash for headers stored with wrong byte-order
-    std::vector<uint8_t> h_reversed = h;
-    std::reverse(h_reversed.begin(), h_reversed.end());
-    return header_index_.find(hk(h_reversed)) != header_index_.end();
+    return header_index_.find(hk(h)) != header_index_.end();
 }
 
 std::vector<uint8_t> Chain::best_header_hash() const {
@@ -655,52 +651,36 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     long double parent_work = 0.0L;
     bool found_parent = false;
 
-    // COMPAT FIX: Try both byte-orders for parent lookup
     auto itp = header_index_.find(hk(h.prev_hash));
-    if (itp == header_index_.end()) {
-        // Try reversed hash
-        std::vector<uint8_t> prev_reversed = h.prev_hash;
-        std::reverse(prev_reversed.begin(), prev_reversed.end());
-        itp = header_index_.find(hk(prev_reversed));
-    }
     if (itp != header_index_.end()) {
         parent_height = itp->second.height;
         parent_work   = itp->second.work_sum;
         found_parent = true;
-    } else {
-        // COMPAT FIX: Check tip_.hash match with both byte-orders
-        bool matches_tip = (h.prev_hash == tip_.hash);
-        if (!matches_tip) {
-            std::vector<uint8_t> prev_reversed = h.prev_hash;
-            std::reverse(prev_reversed.begin(), prev_reversed.end());
-            matches_tip = (prev_reversed == tip_.hash);
+    } else if (h.prev_hash == tip_.hash) {
+        parent_height = tip_.height;
+        // Calculate cumulative work up to current tip
+        parent_work = 0.0L;
+        // Walk back from tip to genesis to calculate total work
+        std::vector<uint8_t> cur_hash = tip_.hash;
+        uint64_t cur_height = tip_.height;
+        while (cur_height > 0) {
+            Block b;
+            if (get_block_by_hash(cur_hash, b)) {
+                parent_work += work_from_bits(b.header.bits);
+                cur_hash = b.header.prev_hash;
+                cur_height--;
+            } else break;
         }
-        if (matches_tip) {
-            parent_height = tip_.height;
-            // Calculate cumulative work up to current tip
-            parent_work = 0.0L;
-            // Walk back from tip to genesis to calculate total work
-            std::vector<uint8_t> cur_hash = tip_.hash;
-            uint64_t cur_height = tip_.height;
-            while (cur_height > 0) {
-                Block b;
-                if (get_block_by_hash(cur_hash, b)) {
-                    parent_work += work_from_bits(b.header.bits);
-                    cur_hash = b.header.prev_hash;
-                    cur_height--;
-                } else break;
-            }
-            // Add work for genesis if at height 0
-            if (cur_height == 0) {
-                parent_work += work_from_bits(GENESIS_BITS);
-            }
-            found_parent = true;
-        } else if (h.prev_hash == std::vector<uint8_t>(32, 0)) {
-            // Genesis block (prev_hash is all zeros)
-            parent_height = 0;
-            parent_work = 0.0L;
-            found_parent = true;
+        // Add work for genesis if at height 0
+        if (cur_height == 0) {
+            parent_work += work_from_bits(GENESIS_BITS);
         }
+        found_parent = true;
+    } else if (h.prev_hash == std::vector<uint8_t>(32, 0)) {
+        // Genesis block (prev_hash is all zeros)
+        parent_height = 0;
+        parent_work = 0.0L;
+        found_parent = true;
     }
 
     // CRITICAL FIX: If we can't find the parent, reject the header
@@ -1086,11 +1066,6 @@ bool Chain::read_block_any(const std::vector<uint8_t>& h, Block& out) const{
     std::vector<uint8_t> raw;
     if (storage_.read_block_by_hash(h, raw)) return deser_block(raw, out);
     if (orphan_get(h, raw)) return deser_block(raw, out);
-    // COMPAT FIX: Try reversed hash for blocks stored with wrong byte-order
-    std::vector<uint8_t> h_reversed = h;
-    std::reverse(h_reversed.begin(), h_reversed.end());
-    if (storage_.read_block_by_hash(h_reversed, raw)) return deser_block(raw, out);
-    if (orphan_get(h_reversed, raw)) return deser_block(raw, out);
     return false;
 }
 
@@ -1910,11 +1885,6 @@ bool Chain::submit_block(const Block& b, std::string& err){
 
     if (!verify_block(b, err)) return false;
 
-    // Store block exactly as received - DO NOT normalize!
-    // Normalization would change block_hash() and break POW validation.
-    // The verify_block function already accepts both byte-orders for validation.
-    // Fallback lookups handle finding blocks stored in either format.
-
     if (have_block(b.block_hash())) return true;
 
     // --- Collect undo BEFORE mutating UTXO ---
@@ -1933,7 +1903,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
         }
     }
 
-    // Persist the block body - store exactly as received
+    // Persist the block body
     storage_.append_block(ser_block(b), b.block_hash());
 
     // --- Crash-safety: write undo BEFORE UTXO mutation ---
@@ -2117,26 +2087,14 @@ bool Chain::get_block_by_index(size_t idx, Block& out) const{
 bool Chain::get_block_by_hash(const std::vector<uint8_t>& h, Block& out) const{
     MIQ_CHAIN_GUARD();
     std::vector<uint8_t> raw;
-    if (storage_.read_block_by_hash(h, raw)) {
-        return deser_block(raw, out);
-    }
-    // COMPAT FIX: Try reversed hash for blocks stored with wrong byte-order
-    std::vector<uint8_t> h_reversed = h;
-    std::reverse(h_reversed.begin(), h_reversed.end());
-    if (storage_.read_block_by_hash(h_reversed, raw)) {
-        return deser_block(raw, out);
-    }
-    return false;
+    if(!storage_.read_block_by_hash(h, raw)) return false;
+    return deser_block(raw, out);
 }
 
 bool Chain::have_block(const std::vector<uint8_t>& h) const{
     MIQ_CHAIN_GUARD();
     std::vector<uint8_t> raw;
-    if (storage_.read_block_by_hash(h, raw)) return true;
-    // COMPAT FIX: Try reversed hash for blocks stored with wrong byte-order
-    std::vector<uint8_t> h_reversed = h;
-    std::reverse(h_reversed.begin(), h_reversed.end());
-    return storage_.read_block_by_hash(h_reversed, raw);
+    return storage_.read_block_by_hash(h, raw);
 }
 
 long double Chain::work_from_bits_public(uint32_t bits) {
@@ -2167,12 +2125,6 @@ bool Chain::get_block_by_hash_fast(const std::vector<uint8_t>& hash, Block& out)
     // Use hash index for O(1) lookup
     int64_t height = hashindex_.get(hash);
     if (height < 0) {
-        // COMPAT FIX: Try reversed hash for blocks stored with wrong byte-order
-        std::vector<uint8_t> hash_reversed = hash;
-        std::reverse(hash_reversed.begin(), hash_reversed.end());
-        height = hashindex_.get(hash_reversed);
-    }
-    if (height < 0) {
         // Fallback to storage lookup (slower, O(n))
         return get_block_by_hash(hash, out);
     }
@@ -2182,14 +2134,7 @@ bool Chain::get_block_by_hash_fast(const std::vector<uint8_t>& hash, Block& out)
 
 int64_t Chain::get_height_by_hash(const std::vector<uint8_t>& hash) const {
     MIQ_CHAIN_GUARD();
-    int64_t height = hashindex_.get(hash);
-    if (height < 0) {
-        // COMPAT FIX: Try reversed hash for blocks stored with wrong byte-order
-        std::vector<uint8_t> hash_reversed = hash;
-        std::reverse(hash_reversed.begin(), hash_reversed.end());
-        height = hashindex_.get(hash_reversed);
-    }
-    return height;
+    return hashindex_.get(hash);
 }
 
 bool Chain::reindex_addresses(std::function<bool(uint64_t, uint64_t)> progress) {

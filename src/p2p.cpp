@@ -3627,31 +3627,7 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
         }
 
         std::string err;
-        bool orphan_accepted = chain_.submit_block(ob, err);
-
-        // CRITICAL FIX: Retry orphan with opposite byte-order if validation failed
-        // Orphans may have been stored before we knew the correct byte-order for the peer
-        // Retry on ANY error (not just bad merkle) because byte-order issues can cause
-        // various errors like "bad prev hash", "parent header not found", etc.
-        if (!orphan_accepted) {
-            Block ob_retry;
-            if (deser_block(oit->second.raw, ob_retry)) {
-                // Try with reversed byte-order
-                std::reverse(ob_retry.header.prev_hash.begin(), ob_retry.header.prev_hash.end());
-                std::reverse(ob_retry.header.merkle_root.begin(), ob_retry.header.merkle_root.end());
-
-                std::string err2;
-                if (chain_.submit_block(ob_retry, err2)) {
-                    orphan_accepted = true;
-                    ob = std::move(ob_retry);
-                    log_info("P2P: orphan accepted after byte-order correction");
-                } else {
-                    err = err + " / retry: " + err2;
-                }
-            }
-        }
-
-        if (orphan_accepted) {
+        if (chain_.submit_block(ob, err)) {
             // CRITICAL FIX: Notify mempool to remove confirmed transactions
             if (mempool_) {
                 mempool_->on_block_connect(ob);
