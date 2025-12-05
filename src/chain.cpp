@@ -2033,10 +2033,54 @@ std::vector<std::pair<int64_t,uint32_t>> Chain::last_headers(size_t n) const{
     return v;
 }
 
+// CRITICAL FIX: get_block_by_index must follow the CURRENT chain, not storage order
+// After reorgs, storage indices don't match chain heights - old blocks remain at
+// their original storage positions. We must walk back from tip to find the correct
+// block hash at the requested height.
 bool Chain::get_block_by_index(size_t idx, Block& out) const{
     MIQ_CHAIN_GUARD();
+
+    // Quick bounds check
+    if (idx > tip_.height) return false;
+
+    // Special case: if no headers exist, fall back to storage index (pre-IBD)
+    // This maintains backwards compatibility for genesis initialization
+    if (header_index_.empty()) {
+        std::vector<uint8_t> raw;
+        if (!storage_.read_block_by_index(idx, raw)) return false;
+        return deser_block(raw, out);
+    }
+
+    // Walk back from tip to find the block hash at height idx
+    // Start from current tip
+    std::vector<uint8_t> cur_hash = tip_.hash;
+    uint64_t cur_height = tip_.height;
+
+    // Walk back using header_index_ until we reach the target height
+    while (cur_height > idx) {
+        auto it = header_index_.find(hk(cur_hash));
+        if (it == header_index_.end()) {
+            // Header not in index - fall back to storage for this and all deeper lookups
+            // This handles cases where header_index_ is incomplete (node restart, etc.)
+            // IMPORTANT: After reorgs, storage may have stale blocks, but if headers
+            // are incomplete we have no choice - let validation catch any issues
+            std::vector<uint8_t> raw;
+            if (!storage_.read_block_by_index(idx, raw)) return false;
+            return deser_block(raw, out);
+        }
+        cur_hash = it->second.prev;
+        cur_height--;
+    }
+
+    // Now cur_hash is the hash of block at height idx
+    // Verify height matches (sanity check)
+    if (cur_height != idx) {
+        return false;
+    }
+
+    // Get block by hash
     std::vector<uint8_t> raw;
-    if(!storage_.read_block_by_index(idx, raw)) return false;
+    if (!storage_.read_block_by_hash(cur_hash, raw)) return false;
     return deser_block(raw, out);
 }
 
