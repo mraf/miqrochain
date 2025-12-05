@@ -3445,7 +3445,34 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
     }
 
     std::string err;
-    if (chain_.submit_block(b, err)) {
+    bool accepted = chain_.submit_block(b, err);
+
+    // CRITICAL FIX: Retry with opposite byte-order if merkle validation failed
+    // This handles new/inbound peers that haven't had their flip state determined yet,
+    // similar to the header acceptance retry logic at lines 5402-5410.
+    if (!accepted && err == "bad merkle") {
+        Block b_retry;
+        if (deser_block(raw, b_retry)) {
+            bool current_flip = g_hdr_flip[(Sock)sock];
+            if (!current_flip) {
+                // Originally no flip was applied, try WITH flip
+                std::reverse(b_retry.header.prev_hash.begin(), b_retry.header.prev_hash.end());
+                std::reverse(b_retry.header.merkle_root.begin(), b_retry.header.merkle_root.end());
+            }
+            // If current_flip was true, b_retry has no flip applied (original wire format)
+
+            std::string err2;
+            if (chain_.submit_block(b_retry, err2)) {
+                accepted = true;
+                b = std::move(b_retry);
+                g_hdr_flip[(Sock)sock] = !current_flip;
+                log_info("P2P: block accepted after byte-order correction (flip=" +
+                         std::string(!current_flip ? "enabled" : "disabled") + " for peer)");
+            }
+        }
+    }
+
+    if (accepted) {
         // CRITICAL FIX: Notify mempool to remove confirmed transactions
         // Without this, confirmed transactions stay in mempool forever!
         if (mempool_) {
@@ -3636,7 +3663,27 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
         }
 
         std::string err;
-        if (chain_.submit_block(ob, err)) {
+        bool orphan_accepted = chain_.submit_block(ob, err);
+
+        // CRITICAL FIX: Retry orphan with opposite byte-order if merkle validation failed
+        // Orphans may have been stored before we knew the correct byte-order for the peer
+        if (!orphan_accepted && err == "bad merkle") {
+            Block ob_retry;
+            if (deser_block(oit->second.raw, ob_retry)) {
+                // Try with reversed byte-order
+                std::reverse(ob_retry.header.prev_hash.begin(), ob_retry.header.prev_hash.end());
+                std::reverse(ob_retry.header.merkle_root.begin(), ob_retry.header.merkle_root.end());
+
+                std::string err2;
+                if (chain_.submit_block(ob_retry, err2)) {
+                    orphan_accepted = true;
+                    ob = std::move(ob_retry);
+                    log_info("P2P: orphan accepted after byte-order correction");
+                }
+            }
+        }
+
+        if (orphan_accepted) {
             // CRITICAL FIX: Notify mempool to remove confirmed transactions
             if (mempool_) {
                 mempool_->on_block_connect(ob);
