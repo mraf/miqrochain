@@ -715,10 +715,10 @@ static int64_t g_ibd_headers_started_ms = 0;
 // Global listen port for outbound dials (set in start())
 static uint16_t g_listen_port = 0;
 
-// Stall/progress trackers
-static int64_t g_last_progress_ms = 0;
-static size_t  g_last_progress_height = 0;
-static int64_t g_next_stall_probe_ms = 0;
+// Stall/progress trackers (atomic for thread safety)
+static std::atomic<int64_t> g_last_progress_ms{0};
+static std::atomic<size_t>  g_last_progress_height{0};
+static std::atomic<int64_t> g_next_stall_probe_ms{0};
 
 // Simple trickle queues per-peer (sock -> txid queue and last flush ms)
 static std::unordered_map<Sock, std::vector<std::vector<uint8_t>>> g_trickle_q;
@@ -1011,7 +1011,7 @@ static inline bool ibd_or_fetch_active(const miq::PeerState& ps, int64_t nowms) 
 }
 
 static bool g_seed_mode = false;
-static bool g_sequential_sync = (MIQ_SYNC_SEQUENTIAL_DEFAULT != 0);
+static std::atomic<bool> g_sequential_sync{(MIQ_SYNC_SEQUENTIAL_DEFAULT != 0)};
 static inline int miq_outbound_target(){
     return g_seed_mode ? MIQ_SEED_MODE_OUTBOUND_TARGET : MIQ_OUTBOUND_TARGET;
 }
@@ -3123,8 +3123,23 @@ void P2P::fill_index_pipeline(PeerState& ps){
                   " (chain height=" + std::to_string(current_height) + ")");
     }
 
+    // CRITICAL FIX: Backpressure - don't request too far ahead of current tip
+    // This prevents orphan pool overflow when blocks arrive out of order.
+    // Limit: Don't request more than (orphan_count_limit / 2) blocks ahead.
+    // This leaves room for other sources of orphans and prevents sync stalls.
+    const uint64_t max_ahead = orphan_count_limit_ / 2;
+    const uint64_t max_index = current_height + max_ahead;
+
     while (ps.inflight_index < pipe) {
-        uint64_t idx = ps.next_index++;
+        uint64_t idx = ps.next_index;
+
+        // Backpressure: Stop if we're too far ahead of the tip
+        if (idx > max_index) {
+            // Don't request more - wait for chain to catch up
+            break;
+        }
+
+        ps.next_index++;
         request_block_index(ps, idx);
         ps.inflight_index++;
     }
@@ -3315,11 +3330,65 @@ void P2P::handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload){
 // =================== Orphan manager =========================================
 
 void P2P::evict_orphans_if_needed(){
+    // CRITICAL FIX: Protect orphans that are part of the active sync chain
+    // An orphan is "protected" if its parent is:
+    //   1. The current chain tip (next block to be accepted)
+    //   2. Another orphan in the pool (forms a chain)
+    // Evicting protected orphans would cause permanent sync stalls.
+
+    const std::string tip_hex = hexkey(chain_.tip_hash());
+
     while ( (orphan_bytes_ > orphan_bytes_limit_) ||
             (orphans_.size() > orphan_count_limit_) ) {
         if (orphan_order_.empty()) break;
-        const std::string victim = orphan_order_.front();
-        orphan_order_.pop_front();
+
+        // Find a victim that is NOT protected
+        std::string victim;
+        bool found_victim = false;
+
+        // Try to find an evictable orphan (not part of active chain)
+        for (auto order_it = orphan_order_.begin(); order_it != orphan_order_.end(); ++order_it) {
+            const std::string& candidate = *order_it;
+            auto it = orphans_.find(candidate);
+            if (it == orphans_.end()) {
+                // Already removed, clean up order list
+                order_it = orphan_order_.erase(order_it);
+                --order_it;
+                continue;
+            }
+
+            const std::string parent_hex = hexkey(it->second.prev);
+
+            // PROTECTION: Don't evict if parent is chain tip
+            if (parent_hex == tip_hex) {
+                continue;  // This orphan is next in line - protect it
+            }
+
+            // PROTECTION: Don't evict if parent is also an orphan (chain of orphans)
+            if (orphans_.find(parent_hex) != orphans_.end()) {
+                continue;  // Part of orphan chain - protect it
+            }
+
+            // This orphan is safe to evict (its parent is neither tip nor orphan)
+            victim = candidate;
+            orphan_order_.erase(order_it);
+            found_victim = true;
+            break;
+        }
+
+        if (!found_victim) {
+            // All orphans are protected - we're at capacity with active sync chain
+            // This is okay - it means we're making progress on a large reorg or IBD
+            // Log once and stop trying to evict
+            static int64_t last_protection_log_ms = 0;
+            int64_t now = now_ms();
+            if (now - last_protection_log_ms > 30000) {  // Log every 30s max
+                last_protection_log_ms = now;
+                log_info("P2P: orphan pool at capacity with protected blocks (size=" +
+                         std::to_string(orphans_.size()) + ") - sync chain intact");
+            }
+            break;
+        }
 
         auto it = orphans_.find(victim);
         if (it == orphans_.end()) continue;
@@ -3405,9 +3474,21 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
     const auto bh = b.block_hash();
     if (chain_.have_block(bh)) return;
 
+    // CRITICAL FIX: Enforce sequential block processing to prevent UTXO errors
+    // With parallel block requests (pipeline=128), blocks can arrive out of order.
+    // Simply checking have_block(prev_hash) is NOT sufficient because:
+    //   - Parent block may exist on disk but its UTXOs haven't been applied yet
+    //   - This causes "missing utxo" errors when processing child blocks
+    //
+    // Solution: Only process blocks that extend the CURRENT TIP (prev_hash == tip_hash).
+    // Out-of-order blocks are stored as orphans and processed sequentially via
+    // try_connect_orphans() when their parent becomes the tip.
+    const auto& current_tip = chain_.tip_hash();
+    bool extends_tip = (b.header.prev_hash == current_tip);
     bool have_parent = chain_.have_block(b.header.prev_hash);
 
-    if (!have_parent) {
+    // Block doesn't extend tip - store as orphan for later sequential processing
+    if (!extends_tip) {
         OrphanRec rec{ bh, b.header.prev_hash, raw };
         const std::string child_hex  = hexkey(bh);
         const std::string parent_hex = hexkey(b.header.prev_hash);
@@ -3427,9 +3508,12 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             }
         }
 
-        auto pit = peers_.find(sock);
-        if (pit != peers_.end()) {
-            request_block_hash(pit->second, b.header.prev_hash);
+        // Only request parent if we don't have it on disk at all
+        if (!have_parent) {
+            auto pit = peers_.find(sock);
+            if (pit != peers_.end()) {
+                request_block_hash(pit->second, b.header.prev_hash);
+            }
         }
         return;
     }
@@ -5627,13 +5711,17 @@ void P2P::loop(){
                             // If we requested index N from this peer, they must have at least N blocks
                             // This prevents early sync completion when version message had stale height
                             uint64_t new_height = chain_.height();
-                            if (new_height > old_height) {
-                                // Block was accepted, update peer tip estimate
-                                // Use the higher of: current estimate, new chain height, or next requested index
-                                uint64_t min_peer_tip = std::max(new_height, ps.next_index > 0 ? ps.next_index - 1 : 0);
-                                if (min_peer_tip > ps.peer_tip_height) {
-                                    ps.peer_tip_height = min_peer_tip;
-                                }
+
+                            // CRITICAL: Update peer_tip_height REGARDLESS of whether block was accepted
+                            // With sequential ordering (extends_tip check), blocks may be orphaned first
+                            // but we still know the peer has those blocks. If we only update when
+                            // new_height > old_height, we might declare sync complete prematurely.
+                            // Use next_index-1 as minimum peer tip since we requested that index from them.
+                            uint64_t min_peer_tip = std::max(new_height, ps.next_index > 0 ? ps.next_index - 1 : 0);
+                            if (min_peer_tip > ps.peer_tip_height) {
+                                ps.peer_tip_height = min_peer_tip;
+                                P2P_TRACE("DEBUG: Updated peer " + ps.ip + " tip_height to " +
+                                          std::to_string(min_peer_tip) + " (from index request)");
                             }
 
                             // Update reputation: track successful delivery
@@ -5676,6 +5764,16 @@ void P2P::loop(){
                                     }
                                 }
                                 ps.inflight_index--;
+                                // CRITICAL FIX: Always refill index pipeline after receiving a block
+                                // Without this, duplicate/rejected/orphaned blocks don't trigger new requests
+                                // and the pipeline depletes over time causing sync slowdown or stall.
+                                // This is essential for maintaining consistent sync progress regardless
+                                // of whether blocks are accepted, orphaned, or rejected.
+                                fill_index_pipeline(ps);
+                            } else {
+                                // SAFETY NET: Even if inflight_index was 0, try to refill pipeline
+                                // This handles edge cases where tracking got out of sync
+                                fill_index_pipeline(ps);
                             }
 
                             std::vector<std::vector<uint8_t>> want2;
