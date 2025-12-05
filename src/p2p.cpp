@@ -3123,8 +3123,23 @@ void P2P::fill_index_pipeline(PeerState& ps){
                   " (chain height=" + std::to_string(current_height) + ")");
     }
 
+    // CRITICAL FIX: Backpressure - don't request too far ahead of current tip
+    // This prevents orphan pool overflow when blocks arrive out of order.
+    // Limit: Don't request more than (orphan_count_limit / 2) blocks ahead.
+    // This leaves room for other sources of orphans and prevents sync stalls.
+    const uint64_t max_ahead = orphan_count_limit_ / 2;
+    const uint64_t max_index = current_height + max_ahead;
+
     while (ps.inflight_index < pipe) {
-        uint64_t idx = ps.next_index++;
+        uint64_t idx = ps.next_index;
+
+        // Backpressure: Stop if we're too far ahead of the tip
+        if (idx > max_index) {
+            // Don't request more - wait for chain to catch up
+            break;
+        }
+
+        ps.next_index++;
         request_block_index(ps, idx);
         ps.inflight_index++;
     }
@@ -3315,11 +3330,65 @@ void P2P::handle_addr_msg(PeerState& ps, const std::vector<uint8_t>& payload){
 // =================== Orphan manager =========================================
 
 void P2P::evict_orphans_if_needed(){
+    // CRITICAL FIX: Protect orphans that are part of the active sync chain
+    // An orphan is "protected" if its parent is:
+    //   1. The current chain tip (next block to be accepted)
+    //   2. Another orphan in the pool (forms a chain)
+    // Evicting protected orphans would cause permanent sync stalls.
+
+    const std::string tip_hex = hexkey(chain_.tip_hash());
+
     while ( (orphan_bytes_ > orphan_bytes_limit_) ||
             (orphans_.size() > orphan_count_limit_) ) {
         if (orphan_order_.empty()) break;
-        const std::string victim = orphan_order_.front();
-        orphan_order_.pop_front();
+
+        // Find a victim that is NOT protected
+        std::string victim;
+        bool found_victim = false;
+
+        // Try to find an evictable orphan (not part of active chain)
+        for (auto order_it = orphan_order_.begin(); order_it != orphan_order_.end(); ++order_it) {
+            const std::string& candidate = *order_it;
+            auto it = orphans_.find(candidate);
+            if (it == orphans_.end()) {
+                // Already removed, clean up order list
+                order_it = orphan_order_.erase(order_it);
+                --order_it;
+                continue;
+            }
+
+            const std::string parent_hex = hexkey(it->second.prev);
+
+            // PROTECTION: Don't evict if parent is chain tip
+            if (parent_hex == tip_hex) {
+                continue;  // This orphan is next in line - protect it
+            }
+
+            // PROTECTION: Don't evict if parent is also an orphan (chain of orphans)
+            if (orphans_.find(parent_hex) != orphans_.end()) {
+                continue;  // Part of orphan chain - protect it
+            }
+
+            // This orphan is safe to evict (its parent is neither tip nor orphan)
+            victim = candidate;
+            orphan_order_.erase(order_it);
+            found_victim = true;
+            break;
+        }
+
+        if (!found_victim) {
+            // All orphans are protected - we're at capacity with active sync chain
+            // This is okay - it means we're making progress on a large reorg or IBD
+            // Log once and stop trying to evict
+            static int64_t last_protection_log_ms = 0;
+            int64_t now = now_ms();
+            if (now - last_protection_log_ms > 30000) {  // Log every 30s max
+                last_protection_log_ms = now;
+                log_info("P2P: orphan pool at capacity with protected blocks (size=" +
+                         std::to_string(orphans_.size()) + ") - sync chain intact");
+            }
+            break;
+        }
 
         auto it = orphans_.find(victim);
         if (it == orphans_.end()) continue;
@@ -5700,6 +5769,10 @@ void P2P::loop(){
                                 // and the pipeline depletes over time causing sync slowdown or stall.
                                 // This is essential for maintaining consistent sync progress regardless
                                 // of whether blocks are accepted, orphaned, or rejected.
+                                fill_index_pipeline(ps);
+                            } else {
+                                // SAFETY NET: Even if inflight_index was 0, try to refill pipeline
+                                // This handles edge cases where tracking got out of sync
                                 fill_index_pipeline(ps);
                             }
 
