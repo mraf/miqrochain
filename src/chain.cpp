@@ -1792,8 +1792,18 @@ bool Chain::disconnect_tip_once(std::string& err){
     }
 
     // Restore previous inputs from undo (reverse order)
+    // CRITICAL FIX: Skip in-block spends that may exist in old undo data
+    // Before the chained transaction fix, undo data incorrectly included entries
+    // for outputs created and spent within the same block. These should NOT be
+    // restored because they never existed in UTXO before this block.
+    // Detection: if prev_entry.height == tip_.height, it was created in this block.
     for (size_t i = undo.size(); i-- > 0; ){
         const auto& u = undo[i];
+        // Skip in-block spends: outputs created at this block's height were
+        // created within this block and should not be restored to UTXO
+        if (u.prev_entry.height == tip_.height) {
+            continue;  // In-block spend, do not restore
+        }
         ops.push_back(UtxoOp{true, u.prev_txid, u.prev_vout, u.prev_entry});
     }
 
