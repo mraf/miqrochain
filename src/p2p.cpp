@@ -5243,10 +5243,16 @@ void P2P::loop(){
                         auto& gg = itg2->second;
                         if (ps.verack_ok) return;
                         if (!(gg.got_version && gg.got_verack && gg.sent_verack)) return;
-                        
+
                         // The handshake is complete at this point
 
                         ps.verack_ok = true;
+                        // CRITICAL: Mark peer as index-capable so block sync can start
+                        g_peer_index_capable[(Sock)s] = true;
+                        g_index_timeouts[(Sock)s] = 0;
+                        ps.syncing = true;
+                        ps.next_index = chain_.height() + 1;
+
                         const int64_t hs_ms = now_ms() - gg.t_conn_ms;
                         log_info(std::string("P2P: handshake complete with ")+ps.ip+" in "+std::to_string(hs_ms)+" ms");
 
