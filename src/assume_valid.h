@@ -6,8 +6,31 @@
 #include <cstdint>
 #include <string>
 #include <cstring>
+#include <atomic>
 
 namespace miq {
+
+// =============================================================================
+// IBD (Initial Block Download) STATE
+// Global flag to track if we're still in initial sync. Used to:
+// - Skip fsync for faster block processing during IBD
+// - Enable other IBD-specific optimizations
+// =============================================================================
+
+inline std::atomic<bool>& ibd_mode_active() {
+    static std::atomic<bool> g_ibd_active{true};  // Start in IBD mode
+    return g_ibd_active;
+}
+
+// Call this when sync is complete to enable full durability
+inline void mark_ibd_complete() {
+    ibd_mode_active().store(false, std::memory_order_release);
+}
+
+// Check if we're in IBD mode (for skipping fsync, etc.)
+inline bool is_ibd_mode() {
+    return ibd_mode_active().load(std::memory_order_acquire);
+}
 
 // =============================================================================
 // ASSUME-VALID OPTIMIZATION
