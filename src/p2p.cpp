@@ -3447,10 +3447,12 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
     std::string err;
     bool accepted = chain_.submit_block(b, err);
 
-    // CRITICAL FIX: Retry with opposite byte-order if merkle validation failed
+    // CRITICAL FIX: Retry with opposite byte-order if block validation failed
     // This handles new/inbound peers that haven't had their flip state determined yet,
     // similar to the header acceptance retry logic at lines 5402-5410.
-    if (!accepted && err == "bad merkle") {
+    // Retry on ANY validation failure (bad merkle, bad prev hash, parent not found, etc.)
+    // because byte-order mismatch can cause various different error messages.
+    if (!accepted) {
         Block b_retry;
         if (deser_block(raw, b_retry)) {
             bool current_flip = g_hdr_flip[(Sock)sock];
@@ -3468,6 +3470,9 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
                 g_hdr_flip[(Sock)sock] = !current_flip;
                 log_info("P2P: block accepted after byte-order correction (flip=" +
                          std::string(!current_flip ? "enabled" : "disabled") + " for peer)");
+            } else {
+                // Both orientations failed - log for debugging
+                err = err + " / retry: " + err2;
             }
         }
     }
@@ -3665,9 +3670,11 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
         std::string err;
         bool orphan_accepted = chain_.submit_block(ob, err);
 
-        // CRITICAL FIX: Retry orphan with opposite byte-order if merkle validation failed
+        // CRITICAL FIX: Retry orphan with opposite byte-order if validation failed
         // Orphans may have been stored before we knew the correct byte-order for the peer
-        if (!orphan_accepted && err == "bad merkle") {
+        // Retry on ANY error (not just bad merkle) because byte-order issues can cause
+        // various errors like "bad prev hash", "parent header not found", etc.
+        if (!orphan_accepted) {
             Block ob_retry;
             if (deser_block(oit->second.raw, ob_retry)) {
                 // Try with reversed byte-order
@@ -3679,6 +3686,8 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
                     orphan_accepted = true;
                     ob = std::move(ob_retry);
                     log_info("P2P: orphan accepted after byte-order correction");
+                } else {
+                    err = err + " / retry: " + err2;
                 }
             }
         }
