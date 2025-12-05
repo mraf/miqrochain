@@ -1477,15 +1477,7 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         return false;
     }
 
-    // NETWORK COMPAT FIX: Try both byte-orders for prev_hash comparison
-    if (b.header.prev_hash != tip_.hash) {
-        std::vector<uint8_t> prev_reversed = b.header.prev_hash;
-        std::reverse(prev_reversed.begin(), prev_reversed.end());
-        if (prev_reversed != tip_.hash) {
-            err = "bad prev hash";
-            return false;
-        }
-    }
+    if(b.header.prev_hash != tip_.hash){ err="bad prev hash"; return false; }
 
     // MTP
     auto hdrs = last_headers(11);
@@ -1518,15 +1510,7 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
             txids.push_back(std::move(id));
         }
         auto mr = merkle_root(txids);
-        // NETWORK COMPAT FIX: Try both byte-orders for merkle root comparison
-        if (mr != b.header.merkle_root) {
-            std::vector<uint8_t> mr_reversed = mr;
-            std::reverse(mr_reversed.begin(), mr_reversed.end());
-            if (mr_reversed != b.header.merkle_root) {
-                err = "bad merkle";
-                return false;
-            }
-        }
+        if(mr != b.header.merkle_root){ err="bad merkle"; return false; }
     }
 
     // Coinbase shape (allow tagged sig; pubkey must be empty)
