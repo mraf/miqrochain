@@ -1485,7 +1485,20 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
             txids.push_back(std::move(id));
         }
         auto mr = merkle_root(txids);
-        if(mr != b.header.merkle_root){ err="bad merkle"; return false; }
+        if(mr != b.header.merkle_root){
+            // DIAGNOSTIC: Log full details about merkle mismatch
+            MIQ_LOG_WARN(miq::LogCategory::VALIDATION, "bad merkle: computed=" + to_hex(mr) +
+                         " header=" + to_hex(b.header.merkle_root) +
+                         " txs=" + std::to_string(b.txs.size()) +
+                         " header_mr_size=" + std::to_string(b.header.merkle_root.size()) +
+                         " prev_hash_size=" + std::to_string(b.header.prev_hash.size()));
+            // Log first txid for debugging
+            if (!txids.empty()) {
+                MIQ_LOG_WARN(miq::LogCategory::VALIDATION, "first txid=" + to_hex(txids[0]));
+            }
+            err="bad merkle";
+            return false;
+        }
     }
 
     // Coinbase shape (allow tagged sig; pubkey must be empty)
