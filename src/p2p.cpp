@@ -5676,6 +5676,10 @@ void P2P::loop(){
                                     }
                                 }
                                 ps.inflight_index--;
+                                // CRITICAL FIX: Always refill index pipeline after receiving a block
+                                // Without this, duplicate/rejected blocks don't trigger new requests
+                                // and the pipeline depletes over time causing sync slowdown
+                                fill_index_pipeline(ps);
                             }
 
                             std::vector<std::vector<uint8_t>> want2;
