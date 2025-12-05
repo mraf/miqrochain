@@ -220,7 +220,7 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
 #endif
 
 #ifndef MIQ_INDEX_PIPELINE
-#define MIQ_INDEX_PIPELINE 64
+#define MIQ_INDEX_PIPELINE 128  // PERFORMANCE: Increased from 64 for faster block download
 #endif
 
 #ifndef MIQ_HDR_PIPELINE
@@ -1278,27 +1278,28 @@ static inline void update_peer_reputation(miq::PeerState& ps) {
 
 // Calculate adaptive batch size based on peer reputation and network conditions
 static inline uint32_t calculate_adaptive_batch_size(const miq::PeerState& ps) {
-    // Adjust based on reputation score
-    // Excellent peers (0.9+): 32 blocks
-    // Good peers (0.7-0.9): 24 blocks
-    // Average peers (0.5-0.7): 16 blocks
-    // Poor peers (<0.5): 8 blocks
+    // PERFORMANCE FIX: Increased batch sizes for faster block download
+    // Excellent peers (0.9+): 64 blocks
+    // Good peers (0.7-0.9): 48 blocks
+    // Average peers (0.5-0.7): 32 blocks
+    // Poor peers (<0.5): 16 blocks
 
     double rep = ps.reputation_score;
     uint32_t batch_size;
 
     if (rep >= 0.9) {
-        batch_size = 32;
+        batch_size = 64;
     } else if (rep >= 0.7) {
-        batch_size = 24;
+        batch_size = 48;
     } else if (rep >= 0.5) {
-        batch_size = 16;
+        batch_size = 32;
     } else {
-        batch_size = 8;
+        batch_size = 16;
     }
 
-   if (!g_logged_headers_done && rep >= 0.8) {
-        batch_size = std::min(256u, batch_size * 2);
+    // During IBD (before headers done), allow even larger batches for faster sync
+    if (!g_logged_headers_done && rep >= 0.8) {
+        batch_size = std::min(128u, batch_size * 2);
     }
 
     return batch_size;

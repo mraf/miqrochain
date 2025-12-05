@@ -251,7 +251,7 @@ struct PeerState {
     double health_score{1.0};                   // 0.0 (bad) to 1.0 (good) - legacy field
 
     // Adaptive batching
-    uint32_t adaptive_batch_size{16};           // Current batch size (adapts based on performance)
+    uint32_t adaptive_batch_size{64};           // Current batch size (adapts based on performance) - PERF: increased from 16
     int64_t last_batch_completion_ms{0};        // When last batch completed
     int64_t last_batch_duration_ms{0};          // How long last batch took
 
