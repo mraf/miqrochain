@@ -1923,11 +1923,16 @@ bool Chain::submit_block(const Block& b, std::string& err){
             // This enables chained transactions where Tx B spends output from Tx A in same block
             auto cib_it = created_in_block.find(k);
             if (cib_it != created_in_block.end()) {
-                e = cib_it->second;
+                // In-block spend: output was created and spent within same block.
+                // Do NOT record in undo - these have no net effect on UTXO set.
+                // On disconnect, we should NOT restore these outputs because they
+                // never existed in UTXO before this block.
+                continue;
             } else if (!utxo_.get(in.prev.txid, in.prev.vout, e)){
                 err = "missing utxo during undo-capture";
                 return false;
             }
+            // Only record undo for outputs that existed BEFORE this block
             undo.push_back(UndoIn{in.prev.txid, in.prev.vout, e});
         }
 
