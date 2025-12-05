@@ -3405,9 +3405,24 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
     const auto bh = b.block_hash();
     if (chain_.have_block(bh)) return;
 
+    // CRITICAL FIX: Check if this block extends our current tip, not just if parent exists
+    // With parallel block requests, blocks can arrive out of order. If we only check
+    // have_block(prev_hash), a block could pass the check but fail UTXO verification
+    // because intermediate blocks haven't been processed yet.
+    // By requiring prev_hash == tip_hash, we ensure strict sequential processing.
+    // Out-of-order blocks will be orphaned and processed in order via try_connect_orphans.
+    const auto& current_tip = chain_.tip_hash();
+    bool extends_tip = (b.header.prev_hash == current_tip);
+
+    // Also accept genesis block (empty tip) or if parent is on disk but not tip
+    // For non-tip-extending blocks, use the orphan pool to ensure ordering
     bool have_parent = chain_.have_block(b.header.prev_hash);
 
-    if (!have_parent) {
+    // During IBD: only process blocks that extend the current tip to guarantee ordering
+    // Non-tip-extending blocks go to orphan pool for later sequential processing
+    if (!extends_tip) {
+        // Block doesn't extend tip - store as orphan if parent is known (header exists)
+        // or request parent if truly unknown
         OrphanRec rec{ bh, b.header.prev_hash, raw };
         const std::string child_hex  = hexkey(bh);
         const std::string parent_hex = hexkey(b.header.prev_hash);
@@ -3427,9 +3442,12 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             }
         }
 
-        auto pit = peers_.find(sock);
-        if (pit != peers_.end()) {
-            request_block_hash(pit->second, b.header.prev_hash);
+        // Only request parent if we don't have it at all
+        if (!have_parent) {
+            auto pit = peers_.find(sock);
+            if (pit != peers_.end()) {
+                request_block_hash(pit->second, b.header.prev_hash);
+            }
         }
         return;
     }
@@ -5676,6 +5694,10 @@ void P2P::loop(){
                                     }
                                 }
                                 ps.inflight_index--;
+                                // CRITICAL FIX: Always refill index pipeline after receiving a block
+                                // Without this, duplicate/rejected blocks don't trigger new requests
+                                // and the pipeline depletes over time causing sync slowdown
+                                fill_index_pipeline(ps);
                             }
 
                             std::vector<std::vector<uint8_t>> want2;
