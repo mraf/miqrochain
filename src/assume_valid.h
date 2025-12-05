@@ -24,14 +24,12 @@ struct AssumeValidConfig {
     // Block hash to assume valid (blocks at or before this are not sig-checked)
     std::vector<uint8_t> hash;  // 32 bytes, little-endian
 
-    // Height of the assume-valid block (for display purposes)
-    // CRITICAL FIX: Default to UINT64_MAX to skip merkle verification during IBD
-    // This is needed because some blocks were created with different tooling.
-    // A proper checkpoint should be configured for production deployments.
-    uint64_t height{UINT64_MAX};
+    // Height of the assume-valid block (for signature skip optimization)
+    // Set to 0 to disable signature skipping (verify all signatures)
+    uint64_t height{0};
 
-    // Whether assume-valid is enabled
-    bool enabled{true};
+    // Whether assume-valid is enabled (for signature optimization)
+    bool enabled{false};  // Disabled by default - verify all signatures
 
     // Whether we've passed the assume-valid point
     bool passed{false};
@@ -108,25 +106,25 @@ inline bool is_assume_valid_active() {
 }
 
 // CRITICAL FIX: Check if merkle verification should be skipped for this block
-// This is needed because some historical blocks (including genesis) were created
-// with different tooling that computed merkle roots differently than tx.txid().
-// PoW is still verified, so the chain is still secure against reorgs.
+// ONLY the genesis block (height 0) needs to skip merkle verification because
+// it was created with different tooling. All other blocks mined by stratum
+// have correct merkle roots computed using tx.txid().
 inline bool should_skip_merkle_verification(uint64_t height) {
-    auto& cfg = assume_valid_config();
-
-    // If assume-valid is disabled or already passed, verify merkles
-    if (!cfg.enabled || cfg.passed) {
-        return false;
-    }
-
-    // Skip merkle verification for blocks before the assume-valid height
-    return height < cfg.height;
+    // Skip merkle verification ONLY for genesis block (height 0)
+    // The genesis block was created with unknown tooling that computed
+    // the merkle root differently than tx.txid(). This is a known issue
+    // that cannot be fixed without changing the genesis block hash.
+    // All blocks at height > 0 are mined by stratum and have correct merkles.
+    return height == 0;
 }
 
 // Overload for when height is unknown (e.g., orphan blocks during reorg)
-// Returns true if assume-valid is active (haven't passed checkpoint yet)
+// During IBD before assume-valid checkpoint, we may encounter orphan blocks
+// For safety, only skip merkle for blocks that we can confirm are genesis
 inline bool should_skip_merkle_verification_during_ibd() {
-    return is_assume_valid_active();
+    // Don't skip merkle verification for orphan blocks during IBD
+    // They should all have correct merkles (mined by stratum)
+    return false;
 }
 
 // Get progress toward assume-valid point (for display)
