@@ -5559,10 +5559,10 @@ void P2P::loop(){
                             clear_block_inflight(bh, (Sock)s);
                             P2P_TRACE_IF(true, "Received block " + bh.substr(0, 16) + "... from peer");
 
-                            // NOTE: Don't update peer_tip_height here - it should only be set from
-                            // the version message or headers, not from individual blocks.
-                            // Setting it here causes false "syncing blocks" status when the peer
-                            // sends us a block that hasn't been accepted yet.
+                            // FIX: Update peer_tip_height when we receive blocks via index fetch.
+                            // This is critical for correct sync completion detection.
+                            // When we request block at index N and receive it, peer has at least N blocks.
+                            // Without this, sync can complete early if version message had stale height.
 
                             // Track block delivery time for reputation scoring
                             int64_t now_ms_val = now_ms();
@@ -5571,6 +5571,19 @@ void P2P::loop(){
                             // accept/process
                             uint64_t old_height = chain_.height();
                             handle_incoming_block(s, m.payload);
+
+                            // FIX: Update peer_tip_height based on what we've requested from this peer
+                            // If we requested index N from this peer, they must have at least N blocks
+                            // This prevents early sync completion when version message had stale height
+                            uint64_t new_height = chain_.height();
+                            if (new_height > old_height) {
+                                // Block was accepted, update peer tip estimate
+                                // Use the higher of: current estimate, new chain height, or next requested index
+                                uint64_t min_peer_tip = std::max(new_height, ps.next_index > 0 ? ps.next_index - 1 : 0);
+                                if (min_peer_tip > ps.peer_tip_height) {
+                                    ps.peer_tip_height = min_peer_tip;
+                                }
+                            }
 
                             // Update reputation: track successful delivery
                             int64_t after_ms = now_ms();
