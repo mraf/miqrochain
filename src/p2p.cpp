@@ -2403,7 +2403,13 @@ bool P2P::start(uint16_t port){
 
     // NOTE: srv_ is Sock; Windows-safe
     srv_ = create_server(port);
-    if (srv_ == MIQ_INVALID_SOCK) { log_error("P2P: failed to create IPv4 server"); return false; }
+    if (srv_ == MIQ_INVALID_SOCK) {
+        // CRITICAL FIX: Don't return early - continue so the loop thread starts.
+        // This allows outbound connections even when we can't accept inbound connections.
+        // Common when another instance is already running or port is in use.
+        log_error("P2P: failed to create IPv4 server (port " + std::to_string(port) + " may be in use)");
+        log_warn("P2P: continuing without inbound - outbound connections will still work");
+    }
     // New: IPv6 server as well
     g_srv6_ = create_server_v6(port);
     if (g_srv6_ == MIQ_INVALID_SOCK) {
