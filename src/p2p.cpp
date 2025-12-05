@@ -220,7 +220,7 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
 #endif
 
 #ifndef MIQ_INDEX_PIPELINE
-#define MIQ_INDEX_PIPELINE 64
+#define MIQ_INDEX_PIPELINE 128  // PERFORMANCE: Increased from 64 for faster block download
 #endif
 
 #ifndef MIQ_HDR_PIPELINE
@@ -1278,27 +1278,28 @@ static inline void update_peer_reputation(miq::PeerState& ps) {
 
 // Calculate adaptive batch size based on peer reputation and network conditions
 static inline uint32_t calculate_adaptive_batch_size(const miq::PeerState& ps) {
-    // Adjust based on reputation score
-    // Excellent peers (0.9+): 32 blocks
-    // Good peers (0.7-0.9): 24 blocks
-    // Average peers (0.5-0.7): 16 blocks
-    // Poor peers (<0.5): 8 blocks
+    // PERFORMANCE FIX: Increased batch sizes for faster block download
+    // Excellent peers (0.9+): 64 blocks
+    // Good peers (0.7-0.9): 48 blocks
+    // Average peers (0.5-0.7): 32 blocks
+    // Poor peers (<0.5): 16 blocks
 
     double rep = ps.reputation_score;
     uint32_t batch_size;
 
     if (rep >= 0.9) {
-        batch_size = 32;
+        batch_size = 64;
     } else if (rep >= 0.7) {
-        batch_size = 24;
+        batch_size = 48;
     } else if (rep >= 0.5) {
-        batch_size = 16;
+        batch_size = 32;
     } else {
-        batch_size = 8;
+        batch_size = 16;
     }
 
-   if (!g_logged_headers_done && rep >= 0.8) {
-        batch_size = std::min(256u, batch_size * 2);
+    // During IBD (before headers done), allow even larger batches for faster sync
+    if (!g_logged_headers_done && rep >= 0.8) {
+        batch_size = std::min(128u, batch_size * 2);
     }
 
     return batch_size;
@@ -3549,6 +3550,9 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
         // During IBD, always request the next block from peers
         // The peer will respond with the block if they have it, or ignore if they don't
+        // CRITICAL FIX: Allow speculative requests beyond announced tip during IBD
+        // Peer's version message tip might be stale if peer continued syncing after we connected
+        constexpr uint64_t IBD_SPECULATIVE_MARGIN = 16; // Probe this many blocks beyond announced tip
         for (auto& kvp : peers_) {
             auto& pps = kvp.second;
             if (!pps.verack_ok) continue;
@@ -3557,14 +3561,16 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             uint64_t peer_or_hdr_tip = (pps.peer_tip_height > 0)
                 ? std::max<uint64_t>(pps.peer_tip_height, best_hdr_height)
                 : (uint64_t)best_hdr_height;
-            if (peer_or_hdr_tip > 0 && next_height > peer_or_hdr_tip) {
+            // Allow speculative requests during IBD - peer might have more blocks than announced
+            // Only skip if we're way beyond the tip AND have no inflight requests returning
+            uint64_t probe_limit = peer_or_hdr_tip + IBD_SPECULATIVE_MARGIN;
+            if (peer_or_hdr_tip > 0 && next_height > probe_limit && pps.inflight_index == 0) {
                 P2P_TRACE("DEBUG: Not requesting block " + std::to_string(next_height) +
-                          " from " + pps.ip + " (beyond peer/header tip)");
+                          " from " + pps.ip + " (beyond peer/header tip + margin)");
                 continue;
             }
-            if (pps.peer_tip_height == 0 || next_height <= pps.peer_tip_height) {
+            // Always fill pipeline during IBD - speculative requests will timeout if peer doesn't have blocks
             fill_index_pipeline(pps);
-          }
         }
 
 #if MIQ_ENABLE_HEADERS_FIRST
@@ -5559,10 +5565,10 @@ void P2P::loop(){
                             clear_block_inflight(bh, (Sock)s);
                             P2P_TRACE_IF(true, "Received block " + bh.substr(0, 16) + "... from peer");
 
-                            // NOTE: Don't update peer_tip_height here - it should only be set from
-                            // the version message or headers, not from individual blocks.
-                            // Setting it here causes false "syncing blocks" status when the peer
-                            // sends us a block that hasn't been accepted yet.
+                            // FIX: Update peer_tip_height when we receive blocks via index fetch.
+                            // This is critical for correct sync completion detection.
+                            // When we request block at index N and receive it, peer has at least N blocks.
+                            // Without this, sync can complete early if version message had stale height.
 
                             // Track block delivery time for reputation scoring
                             int64_t now_ms_val = now_ms();
@@ -5571,6 +5577,19 @@ void P2P::loop(){
                             // accept/process
                             uint64_t old_height = chain_.height();
                             handle_incoming_block(s, m.payload);
+
+                            // FIX: Update peer_tip_height based on what we've requested from this peer
+                            // If we requested index N from this peer, they must have at least N blocks
+                            // This prevents early sync completion when version message had stale height
+                            uint64_t new_height = chain_.height();
+                            if (new_height > old_height) {
+                                // Block was accepted, update peer tip estimate
+                                // Use the higher of: current estimate, new chain height, or next requested index
+                                uint64_t min_peer_tip = std::max(new_height, ps.next_index > 0 ? ps.next_index - 1 : 0);
+                                if (min_peer_tip > ps.peer_tip_height) {
+                                    ps.peer_tip_height = min_peer_tip;
+                                }
+                            }
 
                             // Update reputation: track successful delivery
                             int64_t after_ms = now_ms();

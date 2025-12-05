@@ -18,6 +18,7 @@
 #include "constants.h"
 #include "config.h"
 #include "log.h"
+#include "assume_valid.h"  // For mark_ibd_complete()
 #include "chain.h"
 #include "mempool.h"
 #include "rpc.h"
@@ -3135,6 +3136,8 @@ private:
             // Set the internal state to match so the main screen shows correct info
             if (!ibd_done_) {
                 ibd_done_ = true;
+                // PERFORMANCE: Mark IBD complete to enable full durability (fsync on every block)
+                miq::mark_ibd_complete();
             }
             if (nstate_ != NodeState::Running) {
                 nstate_ = NodeState::Running;
@@ -4079,6 +4082,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                 if (we_are_seed) {
                     // SOLO-SEED: allow the node to proceed without peers so it can mine the first blocks.
                     log_warn("IBD: seed mode handshake timed out — entering SOLO-SEED mode (no peers yet).");
+                    miq::mark_ibd_complete();  // Enable full durability
                     if (tui && can_tui) {
                         tui->mark_step_ok("Peer handshake (verack)");
                         tui->set_banner("Seed solo mode: no peers yet — mining unlocked.");
@@ -4188,6 +4192,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                                           (chain.height() >= height_at_seed_connect ? (chain.height() - height_at_seed_connect) : 0),
                                           "complete", seed_host_cstr(), true);
                 }
+                mark_ibd_complete();  // Enable full durability now that sync is complete
                 return true;
             }
         }
@@ -4573,6 +4578,7 @@ int main(int argc, char** argv){
         std::string ibd_err;
         bool ibd_ok = perform_ibd_sync(chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, &tui, ibd_err);
         if (ibd_ok) {
+            miq::mark_ibd_complete();  // Enable full durability (fsync on every block)
             if (can_tui) {
                 tui.mark_step_ok("IBD sync phase");
                 tui.set_banner("Synced");
@@ -4586,6 +4592,7 @@ int main(int argc, char** argv){
         } else {
             if (solo_seed_mode(cfg.no_p2p ? nullptr : &p2p)) {
                 // Bootstrap solo: treat as OK so local mining can proceed.
+                miq::mark_ibd_complete();  // Enable full durability
                 if (can_tui) {
                     tui.mark_step_ok("IBD sync phase");
                     tui.set_banner("Seed solo mode — no peers yet. Mining enabled.");
