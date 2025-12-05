@@ -4240,6 +4240,36 @@ void P2P::loop(){
 #endif
             }
           }
+
+          // CRITICAL FIX: Recovery mechanism when all peers are demoted
+          // If no peers are index-capable, re-enable them to prevent sync from getting stuck
+          // This handles the case where temporary network issues caused all peers to be demoted
+          {
+              size_t index_capable_count = 0;
+              size_t verack_peers = 0;
+              for (const auto& kvp : peers_) {
+                  if (kvp.second.verack_ok) {
+                      verack_peers++;
+                      if (g_peer_index_capable[(Sock)kvp.first]) {
+                          index_capable_count++;
+                      }
+                  }
+              }
+              // If we have verified peers but none are index-capable, re-enable them
+              if (verack_peers > 0 && index_capable_count == 0) {
+                  log_warn("P2P: All peers demoted from index sync - re-enabling for recovery");
+                  for (auto& kvp : peers_) {
+                      if (kvp.second.verack_ok) {
+                          Sock s = kvp.first;
+                          g_peer_index_capable[s] = true;
+                          g_index_timeouts[s] = 0;  // Reset timeout counter
+                          kvp.second.syncing = true;
+                          kvp.second.inflight_index = 0;
+                          kvp.second.next_index = chain_.height() + 1;
+                      }
+                  }
+              }
+          }
         }
 
         // CRITICAL FIX: Inflight transaction request timeout cleanup
