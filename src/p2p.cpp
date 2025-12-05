@@ -5252,6 +5252,8 @@ void P2P::loop(){
                         g_index_timeouts[(Sock)s] = 0;
                         ps.syncing = true;
                         ps.next_index = chain_.height() + 1;
+                        // Start requesting blocks immediately
+                        fill_index_pipeline(ps);
 
                         const int64_t hs_ms = now_ms() - gg.t_conn_ms;
                         log_info(std::string("P2P: handshake complete with ")+ps.ip+" in "+std::to_string(hs_ms)+" ms");
