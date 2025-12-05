@@ -3456,24 +3456,22 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
     // similar to the header acceptance retry logic at lines 5402-5410.
     // Retry on ANY validation failure (bad merkle, bad prev hash, parent not found, etc.)
     // because byte-order mismatch can cause various different error messages.
+    // CRITICAL FIX: If first attempt failed, ALWAYS try with reversed byte-order
+    // First attempt used original block, so retry with flipped prev_hash and merkle_root
     if (!accepted) {
         Block b_retry;
         if (deser_block(raw, b_retry)) {
-            bool current_flip = g_hdr_flip[(Sock)sock];
-            if (!current_flip) {
-                // Originally no flip was applied, try WITH flip
-                std::reverse(b_retry.header.prev_hash.begin(), b_retry.header.prev_hash.end());
-                std::reverse(b_retry.header.merkle_root.begin(), b_retry.header.merkle_root.end());
-            }
-            // If current_flip was true, b_retry has no flip applied (original wire format)
+            // Always flip for retry - first attempt used original orientation
+            std::reverse(b_retry.header.prev_hash.begin(), b_retry.header.prev_hash.end());
+            std::reverse(b_retry.header.merkle_root.begin(), b_retry.header.merkle_root.end());
 
             std::string err2;
             if (chain_.submit_block(b_retry, err2)) {
                 accepted = true;
                 b = std::move(b_retry);
-                g_hdr_flip[(Sock)sock] = !current_flip;
-                log_info("P2P: block accepted after byte-order correction (flip=" +
-                         std::string(!current_flip ? "enabled" : "disabled") + " for peer)");
+                // Update flip state: if we needed to flip, set to true; otherwise toggle
+                g_hdr_flip[(Sock)sock] = true;
+                log_info("P2P: block accepted after byte-order correction");
             } else {
                 // Both orientations failed - log for debugging
                 err = err + " / retry: " + err2;

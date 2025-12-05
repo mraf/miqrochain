@@ -1923,40 +1923,22 @@ bool Chain::submit_block(const Block& b, std::string& err){
             log_warn("Failed to accept header during block submission: " + header_err);
         }
     }
-    
+
     if (!verify_block(b, err)) return false;
 
-    // NETWORK COMPAT FIX: Create normalized copy for consistent storage
-    // This ensures block_hash() is computed correctly regardless of incoming byte-order
-    Block normalized_block = b;
+    // Store block exactly as received - DO NOT normalize!
+    // Normalization would change block_hash() and break POW validation.
+    // The verify_block function already accepts both byte-orders for validation.
+    // Fallback lookups handle finding blocks stored in either format.
 
-    // Normalize prev_hash to match tip_.hash format
-    if (normalized_block.header.prev_hash != tip_.hash) {
-        std::reverse(normalized_block.header.prev_hash.begin(),
-                     normalized_block.header.prev_hash.end());
-    }
-
-    // Normalize merkle_root to match computed merkle root
-    {
-        std::vector<std::vector<uint8_t>> txids;
-        txids.reserve(normalized_block.txs.size());
-        for (const auto& tx : normalized_block.txs) {
-            txids.push_back(tx.txid());
-        }
-        auto mr = merkle_root(txids);
-        if (mr != normalized_block.header.merkle_root) {
-            normalized_block.header.merkle_root = mr;
-        }
-    }
-
-    if (have_block(normalized_block.block_hash())) return true;
+    if (have_block(b.block_hash())) return true;
 
     // --- Collect undo BEFORE mutating UTXO ---
     std::vector<UndoIn> undo;
-    undo.reserve(normalized_block.txs.size() * 2);
+    undo.reserve(b.txs.size() * 2);
 
-    for (size_t ti = 1; ti < normalized_block.txs.size(); ++ti){
-        const auto& tx = normalized_block.txs[ti];
+    for (size_t ti = 1; ti < b.txs.size(); ++ti){
+        const auto& tx = b.txs[ti];
         for (const auto& in : tx.vin){
             UTXOEntry e;
             if (!utxo_.get(in.prev.txid, in.prev.vout, e)){
@@ -1967,12 +1949,12 @@ bool Chain::submit_block(const Block& b, std::string& err){
         }
     }
 
-    // Persist the block body
-    storage_.append_block(ser_block(normalized_block), normalized_block.block_hash());
+    // Persist the block body - store exactly as received
+    storage_.append_block(ser_block(b), b.block_hash());
 
     // --- Crash-safety: write undo BEFORE UTXO mutation ---
     const uint64_t new_height = tip_.height + 1;
-    const auto     new_hash   = normalized_block.block_hash();
+    const auto     new_hash   = b.block_hash();
     if (!write_undo_file(datadir_, new_height, new_hash, undo)) {
         err = "failed to write undo";
         return false;
@@ -2022,7 +2004,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
     }
 
     // Also cache the full header for serving to peers
-    set_header_full(hk(new_hash), normalized_block.header);  // THREAD-SAFE
+    set_header_full(hk(new_hash), b.header);  // THREAD-SAFE
 
     // CRITICAL FIX: Add all transactions to the transaction index for fast lookups
     // This enables O(1) transaction lookup by txid instead of scanning blocks
