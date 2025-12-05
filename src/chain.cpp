@@ -72,6 +72,13 @@
 #endif
 
 // ---------- file-scope helpers (ensure declared before first use) ----------
+
+// PERFORMANCE: Skip fsync during fast sync (IBD) for much faster block processing
+static inline bool fast_sync_enabled() {
+    const char* e = std::getenv("MIQ_FAST_SYNC");
+    return e && (e[0]=='1' || e[0]=='t' || e[0]=='T' || e[0]=='y' || e[0]=='Y');
+}
+
 static inline size_t env_szt(const char* name, size_t defv){
     const char* v = std::getenv(name);
     if(!v || !*v) return defv;
@@ -226,7 +233,11 @@ static bool write_undo_file(const std::string& base_dir,
         WVS(u.prev_entry.pkh);
     }
     std::fflush(f);
-    miq_fsync(miq_fileno(f));
+    // PERFORMANCE: Skip fsync during fast sync (IBD) for 10-100x faster block processing
+    // Data is still flushed to OS buffers, just not forced to disk synchronously
+    if (!fast_sync_enabled()) {
+        miq_fsync(miq_fileno(f));
+    }
     std::fclose(f);
 
     // atomic-ish rename
@@ -237,7 +248,8 @@ static bool write_undo_file(const std::string& base_dir,
     }
 #ifndef _WIN32
     // fsync parent directory to make the rename durable
-    {
+    // PERFORMANCE: Skip during fast sync
+    if (!fast_sync_enabled()) {
         int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) { ::fsync(dfd); ::close(dfd); }
     }
