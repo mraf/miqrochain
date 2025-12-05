@@ -333,6 +333,17 @@ void StratumServer::work_loop() {
                 job_order_.push_back(job.job_id);
                 current_job_id_ = job.job_id;
             }
+            // Count subscribed miners for logging
+            size_t subscribed_count = 0;
+            {
+                std::lock_guard<std::mutex> lock(miners_mutex_);
+                for (const auto& kv : miners_) {
+                    if (kv.second.subscribed) subscribed_count++;
+                }
+            }
+            log_info("Stratum: Created job " + job.job_id + " height=" + std::to_string(job.height) +
+                     " fees=" + std::to_string(job.total_fees) + " broadcasting to " +
+                     std::to_string(subscribed_count) + " miners");
             broadcast_job(job);
             last_job_time = now;
         }
@@ -537,16 +548,23 @@ void StratumServer::handle_subscribe(StratumMiner& miner, uint64_t id, const std
     ss << "[\"mining.notify\",\"" << miner.extranonce1 << "\"]";
     ss << "],\"" << miner.extranonce1 << "\"," << (int)extranonce2_size_ << "],\"error\":null}\n";
 
-    send_json(miner, ss.str());
+    if (!send_json(miner, ss.str())) {
+        log_warn("Stratum: Failed to send subscribe response to " + miner.ip);
+        return;
+    }
     miner.subscribed = true;
+    log_info("Stratum: Miner subscribed from " + miner.ip + " extranonce1=" + miner.extranonce1);
 
     // Send current difficulty
     send_set_difficulty(miner, miner.difficulty);
 
-    // Send current job
+    // Send current job immediately after subscription
     std::lock_guard<std::mutex> lock(jobs_mutex_);
     if (!current_job_id_.empty() && jobs_.count(current_job_id_)) {
         send_job_to_miner(miner, jobs_[current_job_id_]);
+        log_info("Stratum: Sent job " + current_job_id_ + " to " + miner.ip);
+    } else {
+        log_warn("Stratum: No current job available for " + miner.ip + " (will send on next job creation)");
     }
 }
 
@@ -561,6 +579,13 @@ void StratumServer::handle_authorize(StratumMiner& miner, uint64_t id, const std
 
     send_result(miner, id, "true");
     log_info("Stratum: Worker authorized: " + miner.worker_name + " from " + miner.ip);
+
+    // If subscribed but no job was sent yet (race condition), send job now
+    std::lock_guard<std::mutex> lock(jobs_mutex_);
+    if (miner.subscribed && !current_job_id_.empty() && jobs_.count(current_job_id_)) {
+        // Check if we need to resend job (in case it wasn't sent during subscribe)
+        send_job_to_miner(miner, jobs_[current_job_id_]);
+    }
 }
 
 void StratumServer::handle_submit(StratumMiner& miner, uint64_t id, const std::vector<std::string>& params) {
@@ -676,9 +701,18 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
     }
 
     // Time (8 bytes, little-endian) - MIQ uses 8-byte timestamps
+    // STRATUM COMPAT FIX: Accept both 8-char (32-bit) and 16-char (64-bit) ntime
+    // For 8-char ntime, use the job's original 64-bit time (we sent truncated value)
     uint64_t time_val;
     try {
-        time_val = std::stoull(ntime, nullptr, 16);
+        if (ntime.length() <= 8) {
+            // Standard miner sent 32-bit ntime back - use job's original 64-bit time
+            // The miner can only modify lower 32 bits anyway
+            time_val = job.time;
+        } else {
+            // Custom miner sent full 64-bit ntime
+            time_val = std::stoull(ntime, nullptr, 16);
+        }
     } catch (...) {
         error = "Invalid ntime format";
         return false;
@@ -695,9 +729,12 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
     header.push_back((bits >> 24) & 0xff);
 
     // Nonce (8 bytes, little-endian) - MIQ uses 8-byte nonces
+    // STRATUM COMPAT FIX: Accept both 8-char (32-bit) and 16-char (64-bit) nonces
+    // For 8-char nonce, pad upper 32 bits with zeros
     uint64_t nonce_val;
     try {
         nonce_val = std::stoull(nonce, nullptr, 16);
+        // If nonce is 8 chars or less, it's a 32-bit value - upper bits are zero (already handled by stoull)
     } catch (...) {
         error = "Invalid nonce format";
         return false;
@@ -1066,7 +1103,10 @@ void StratumServer::send_job_to_miner(StratumMiner& miner, const StratumJob& job
     ss << "],";
     ss << "\"" << std::hex << std::setw(8) << std::setfill('0') << job.version << "\",";
     ss << "\"" << std::hex << std::setw(8) << std::setfill('0') << job.bits << "\",";
-    ss << "\"" << std::hex << std::setw(16) << std::setfill('0') << job.time << "\",";  // MIQ: 64-bit time
+    // STRATUM COMPAT FIX: Send ntime as 8 hex chars (32-bit) for standard miner compatibility
+    // MIQ internally uses 64-bit time but standard stratum protocol expects 32-bit
+    // The miner will send back 8 chars which we'll handle in validate_share
+    ss << "\"" << std::hex << std::setw(8) << std::setfill('0') << (uint32_t)(job.time & 0xFFFFFFFF) << "\",";
     ss << (job.clean_jobs ? "true" : "false");
     ss << "]}\n";
 
