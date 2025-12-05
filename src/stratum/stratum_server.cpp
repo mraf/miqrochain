@@ -759,32 +759,17 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
 
         // Build the full block and submit to chain
         try {
-            // Build coinbase transaction
+            // CRITICAL FIX: Deserialize the actual coinbase bytes that were used
+            // to compute the merkle root, instead of creating a new empty coinbase.
+            // The merkle_root was computed from dsha256(coinbase) where coinbase
+            // includes the extranonce as the "sig" field. If we create a new coinbase
+            // with empty sig, the txid won't match and merkle verification will fail.
             Transaction coinbase_tx;
-            coinbase_tx.version = 1;
-
-            // Coinbase input
-            TxIn cb_in;
-            cb_in.prev.txid = std::vector<uint8_t>(32, 0); // Null txid for coinbase
-            cb_in.prev.vout = 0;  // MIQ uses 0, not 0xffffffff
-            // Script sig contains extranonce (empty sig/pubkey for coinbase)
-            cb_in.sig.clear();
-            cb_in.pubkey.clear();
-            coinbase_tx.vin.push_back(cb_in);
-
-            // Calculate subsidy
-            uint64_t subsidy = INITIAL_SUBSIDY;
-            uint64_t halvings = job.height / HALVING_INTERVAL;
-            if (halvings < 64) subsidy = INITIAL_SUBSIDY >> halvings;
-            else subsidy = 0;
-
-            // PRODUCTION FIX: Coinbase output with subsidy + fees
-            TxOut cb_out;
-            cb_out.value = subsidy + job.total_fees;  // Include mempool tx fees
-            cb_out.pkh = reward_pkh_.size() == 20 ? reward_pkh_ : std::vector<uint8_t>(20, 0);
-            coinbase_tx.vout.push_back(cb_out);
-
-            coinbase_tx.lock_time = 0;
+            if (!deser_tx(coinbase, coinbase_tx)) {
+                log_error("Stratum: Failed to deserialize coinbase for block submission");
+                error = "coinbase deser failed";
+                return false;
+            }
 
             // Build block
             Block block;
