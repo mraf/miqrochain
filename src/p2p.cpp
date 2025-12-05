@@ -3347,25 +3347,28 @@ void P2P::evict_orphans_if_needed(){
         bool found_victim = false;
 
         // Try to find an evictable orphan (not part of active chain)
-        for (auto order_it = orphan_order_.begin(); order_it != orphan_order_.end(); ++order_it) {
+        // Use while loop with manual iterator management to safely handle erasure
+        auto order_it = orphan_order_.begin();
+        while (order_it != orphan_order_.end()) {
             const std::string& candidate = *order_it;
             auto it = orphans_.find(candidate);
             if (it == orphans_.end()) {
                 // Already removed, clean up order list
-                order_it = orphan_order_.erase(order_it);
-                --order_it;
-                continue;
+                order_it = orphan_order_.erase(order_it);  // Returns next valid iterator
+                continue;  // Don't increment - erase already moved us forward
             }
 
             const std::string parent_hex = hexkey(it->second.prev);
 
             // PROTECTION: Don't evict if parent is chain tip
             if (parent_hex == tip_hex) {
+                ++order_it;
                 continue;  // This orphan is next in line - protect it
             }
 
             // PROTECTION: Don't evict if parent is also an orphan (chain of orphans)
             if (orphans_.find(parent_hex) != orphans_.end()) {
+                ++order_it;
                 continue;  // Part of orphan chain - protect it
             }
 
