@@ -4217,6 +4217,13 @@ void P2P::loop(){
               auto &ps = kvp.second;
               ps.syncing = false;
               ps.inflight_index = 0;
+              // CRITICAL FIX: Reset peer_tip_height when peer is demoted due to timeouts
+              // This prevents peer_tip_height from being stuck above actual chain tip
+              // after speculative requests timeout (peer doesn't have those blocks)
+              uint64_t current_height = chain_.height();
+              if (ps.peer_tip_height > current_height) {
+                  ps.peer_tip_height = current_height;
+              }
               // Send getheaders immediately to re-bootstrap
 #if MIQ_ENABLE_HEADERS_FIRST
               std::vector<std::vector<uint8_t>> locator;
