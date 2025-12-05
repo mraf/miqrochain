@@ -1891,15 +1891,53 @@ bool Chain::submit_block(const Block& b, std::string& err){
     std::vector<UndoIn> undo;
     undo.reserve(b.txs.size() * 2);
 
+    // CRITICAL FIX: Track outputs created by earlier transactions in this block
+    // This mirrors the same logic in verify_block() and is needed for chained transactions
+    // where Tx B spends an output from Tx A, both in the same block.
+    // Without this, syncing nodes fail with "missing utxo during undo-capture" on blocks
+    // containing chained transactions, because the parent output isn't in UTXO set yet.
+    struct UndoKey { std::vector<uint8_t> txid; uint32_t vout; };
+    struct UndoKeyHash {
+        size_t operator()(const UndoKey& k) const noexcept {
+            size_t h = k.vout * 1315423911u;
+            if(!k.txid.empty()){ h ^= (size_t)k.txid.front() * 2654435761u; h ^= (size_t)k.txid.back() * 2246822519u; }
+            return h;
+        }
+    };
+    struct UndoKeyEq {
+        bool operator()(const UndoKey& a, const UndoKey& b) const noexcept {
+            return a.vout == b.vout && a.txid == b.txid;
+        }
+    };
+    std::unordered_map<UndoKey, UTXOEntry, UndoKeyHash, UndoKeyEq> created_in_block;
+
+    const uint64_t pending_height = tip_.height + 1;
+
     for (size_t ti = 1; ti < b.txs.size(); ++ti){
         const auto& tx = b.txs[ti];
         for (const auto& in : tx.vin){
             UTXOEntry e;
-            if (!utxo_.get(in.prev.txid, in.prev.vout, e)){
+            UndoKey k{in.prev.txid, in.prev.vout};
+
+            // CRITICAL FIX: First check if this output was created earlier in this block
+            // This enables chained transactions where Tx B spends output from Tx A in same block
+            auto cib_it = created_in_block.find(k);
+            if (cib_it != created_in_block.end()) {
+                e = cib_it->second;
+            } else if (!utxo_.get(in.prev.txid, in.prev.vout, e)){
                 err = "missing utxo during undo-capture";
                 return false;
             }
             undo.push_back(UndoIn{in.prev.txid, in.prev.vout, e});
+        }
+
+        // CRITICAL FIX: Add this transaction's outputs to created_in_block
+        // This allows later transactions in this block to find these outputs
+        auto txid = tx.txid();
+        for (uint32_t vi = 0; vi < tx.vout.size(); ++vi) {
+            UndoKey outk{txid, vi};
+            UTXOEntry out_entry{tx.vout[vi].value, tx.vout[vi].pkh, pending_height, false};
+            created_in_block.emplace(outk, out_entry);
         }
     }
 
