@@ -3401,22 +3401,26 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
     Block b;
     if (!deser_block(raw, b)) return;
 
-    // CRITICAL FIX: Apply same byte-reversal to block headers as was done for headers
-    // This fixes "bad merkle" errors when headers were accepted with reversed byte order
-    if (g_hdr_flip[(Sock)sock]) {
-        std::reverse(b.header.prev_hash.begin(), b.header.prev_hash.end());
-        std::reverse(b.header.merkle_root.begin(), b.header.merkle_root.end());
-    }
+    // NOTE: We no longer flip blocks here. The validation layer (verify_block) now
+    // handles both byte-orders internally. This ensures blocks are stored in their
+    // original wire format, which is essential for network compatibility.
 
     const auto bh = b.block_hash();
     if (chain_.have_block(bh)) return;
 
+    // Check for parent with both byte-orders
     bool have_parent = chain_.have_block(b.header.prev_hash);
+    if (!have_parent) {
+        // Try reversed byte-order for parent lookup
+        std::vector<uint8_t> prev_reversed = b.header.prev_hash;
+        std::reverse(prev_reversed.begin(), prev_reversed.end());
+        have_parent = chain_.have_block(prev_reversed);
+    }
 
     if (!have_parent) {
-        // CRITICAL FIX: Serialize the modified block (with byte-reversal applied) instead of
-        // using raw bytes. This ensures orphans have consistent byte ordering when later processed.
-        std::vector<uint8_t> block_bytes = ser_block(b);
+        // NETWORK COMPAT FIX: Store original raw bytes (not ser_block) to preserve wire format
+        // This ensures when we send orphans to other nodes, they're in the correct format
+        std::vector<uint8_t> block_bytes(raw.begin(), raw.end());
         size_t block_size = block_bytes.size();
         OrphanRec rec{ bh, b.header.prev_hash, std::move(block_bytes) };
         const std::string child_hex  = hexkey(bh);
