@@ -683,24 +683,10 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
         parent_work   = itp->second.work_sum;
         found_parent = true;
     } else if (h.prev_hash == tip_.hash) {
+        // PERF FIX: Use cached cumulative work instead of O(n) backward walk
+        // This was causing UI freezes on every new header (walked 4000+ blocks!)
         parent_height = tip_.height;
-        // Calculate cumulative work up to current tip
-        parent_work = 0.0L;
-        // Walk back from tip to genesis to calculate total work
-        std::vector<uint8_t> cur_hash = tip_.hash;
-        uint64_t cur_height = tip_.height;
-        while (cur_height > 0) {
-            Block b;
-            if (get_block_by_hash(cur_hash, b)) {
-                parent_work += work_from_bits(b.header.bits);
-                cur_hash = b.header.prev_hash;
-                cur_height--;
-            } else break;
-        }
-        // Add work for genesis if at height 0
-        if (cur_height == 0) {
-            parent_work += work_from_bits(GENESIS_BITS);
-        }
+        parent_work = tip_.work_sum;
         found_parent = true;
     } else if (h.prev_hash == std::vector<uint8_t>(32, 0)) {
         // Genesis block (prev_hash is all zeros)
@@ -1253,6 +1239,7 @@ bool Chain::load_state(){
         tip_.time = 0;
         tip_.bits = 0;
         tip_.issued = 0;
+        tip_.work_sum = 0.0L;
         return true;
     }
 
@@ -1262,6 +1249,7 @@ bool Chain::load_state(){
         tip_.time = 0;
         tip_.bits = 0;
         tip_.issued = 0;
+        tip_.work_sum = 0.0L;
         return true;
     }
 
@@ -1288,6 +1276,25 @@ bool Chain::load_state(){
         tip_.issued |= (uint64_t)b[i + k] << (k * 8);
     }
     i += 8;
+
+    // PERF: Calculate cumulative work once on startup
+    // This is O(n) but only runs once, not on every header like before
+    tip_.work_sum = 0.0L;
+    if (tip_.height > 0) {
+        std::vector<uint8_t> cur_hash = tip_.hash;
+        uint64_t cur_height = tip_.height;
+        while (cur_height > 0) {
+            std::vector<uint8_t> raw;
+            Block blk;
+            if (storage_.read_block_by_hash(cur_hash, raw) && deser_block(raw, blk)) {
+                tip_.work_sum += work_from_bits(blk.header.bits);
+                cur_hash = blk.header.prev_hash;
+                cur_height--;
+            } else break;
+        }
+        // Add genesis work
+        tip_.work_sum += work_from_bits(GENESIS_BITS);
+    }
 
     return true;
 }
@@ -1360,10 +1367,15 @@ void Chain::rebuild_header_index_from_blocks(){
             parent_work   = itp->second.work_sum;
         } else if (blk.header.prev_hash == tip_.hash) {
             parent_height = tip_.height;
-            parent_work   = work_from_bits(tip_.bits);
+            parent_work   = tip_.work_sum;  // PERF: Use cached work
         }
         m.height   = parent_height + 1;
         m.work_sum = parent_work + work_from_bits(blk.header.bits);
+
+        // PERF: Keep tip_.work_sum updated as we rebuild
+        if (m.height == tip_.height && m.hash == tip_.hash) {
+            tip_.work_sum = m.work_sum;
+        }
 
         header_index_.emplace(key, std::move(m));
         set_header_full(key, blk.header);  // THREAD-SAFE
@@ -1431,7 +1443,7 @@ bool Chain::init_genesis(const Block& g){
         cb_sum += cb.vout[i].value;
     }
 
-    tip_ = Tip{0, g.block_hash(), g.header.bits, g.header.time, cb_sum};
+    tip_ = Tip{0, g.block_hash(), g.header.bits, g.header.time, cb_sum, work_from_bits(g.header.bits)};
     index_.reset(tip_.hash, tip_.time, tip_.bits);
     save_state();
 
@@ -1905,6 +1917,7 @@ bool Chain::disconnect_tip_once(std::string& err){
     tip_.bits   = prev.header.bits;
     tip_.time   = prev.header.time;
     tip_.issued -= cb_sum;
+    tip_.work_sum -= work_from_bits(cur.header.bits);  // PERF: Update cached work
 
     {
         std::lock_guard<std::mutex> lk(g_undo_mtx);
@@ -2052,6 +2065,7 @@ bool Chain::submit_block(const Block& b, std::string& err){
     tip_.bits   = b.header.bits;
     tip_.time   = b.header.time;
     tip_.issued += cb_sum;
+    tip_.work_sum += work_from_bits(b.header.bits);  // PERF: Update cached work
 
     // Cache undo in RAM map (thread-safe)
     {

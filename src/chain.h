@@ -49,6 +49,7 @@ struct Tip {
     uint32_t             bits;
     int64_t              time;
     uint64_t             issued;
+    long double          work_sum;  // PERF: Cached cumulative work to avoid O(n) recalculation
 };
 
 class Chain {
