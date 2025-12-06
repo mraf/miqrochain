@@ -152,6 +152,7 @@ private:
 
     bool save_state();
     bool load_state();
+    bool rebuild_state_from_blocks();  // AUTO-RECOVERY: Rebuild state when corrupted
     void rebuild_header_index_from_blocks();  // Rebuild header index from stored blocks
 
     // key = hk(hash)

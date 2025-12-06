@@ -292,6 +292,17 @@ static bool read_undo_file(const std::string& base_dir,
 
     uint32_t cnt=0; if(!read_exact(f, &cnt, sizeof(cnt))) { std::fclose(f); return false; }
 
+    // CRITICAL FIX: Validate undo count to prevent segfault on corrupted undo files
+    // A corrupted file could have cnt = 0xFFFFFFFF, causing reserve() to allocate
+    // gigabytes of memory, leading to std::bad_alloc or OOM crash
+    static constexpr uint32_t MAX_UNDO_ENTRIES = 1000000; // 1M entries max (way more than any block needs)
+    if (cnt > MAX_UNDO_ENTRIES) {
+        log_warn("Undo file corrupted at height " + std::to_string(height) +
+                 " (invalid count " + std::to_string(cnt) + "), cannot reorg past this point");
+        std::fclose(f);
+        return false;
+    }
+
     out.clear(); out.reserve(cnt);
 
     for(uint32_t i=0;i<cnt;i++){
@@ -1236,11 +1247,13 @@ bool Chain::save_state(){
     return storage_.write_state(b);
 }
 
-bool Chain::load_state(){
-    MIQ_CHAIN_GUARD();
-    std::vector<uint8_t> b;
-
-    if(!storage_.read_state(b)){
+// AUTO-RECOVERY: Rebuild state from blocks when state.dat is missing or corrupted
+// This allows nodes to recover without manual data directory deletion
+bool Chain::rebuild_state_from_blocks() {
+    // Note: Caller must hold MIQ_CHAIN_GUARD()
+    size_t block_count = storage_.count();
+    if (block_count == 0) {
+        // No blocks - start fresh
         tip_.hash = std::vector<uint8_t>(32, 0);
         tip_.height = 0;
         tip_.time = 0;
@@ -1250,7 +1263,25 @@ bool Chain::load_state(){
         return true;
     }
 
-    if(b.size() < 32 + 8 + 8 + 4 + 8){
+    log_warn("State corrupted or missing - rebuilding from " + std::to_string(block_count) + " blocks...");
+
+    // Find the highest valid block by scanning from the end
+    uint64_t highest_valid = 0;
+    Block highest_block;
+    bool found = false;
+
+    for (size_t idx = 0; idx < block_count; ++idx) {
+        std::vector<uint8_t> raw;
+        Block blk;
+        if (storage_.read_block_by_index(idx, raw) && deser_block(raw, blk)) {
+            highest_valid = idx;
+            highest_block = blk;
+            found = true;
+        }
+    }
+
+    if (!found) {
+        log_warn("No valid blocks found during recovery - starting fresh");
         tip_.hash = std::vector<uint8_t>(32, 0);
         tip_.height = 0;
         tip_.time = 0;
@@ -1258,6 +1289,61 @@ bool Chain::load_state(){
         tip_.issued = 0;
         tip_.work_sum = 0.0L;
         return true;
+    }
+
+    // Set tip to highest valid block
+    tip_.hash = highest_block.block_hash();
+    tip_.height = highest_valid;
+    tip_.time = highest_block.header.time;
+    tip_.bits = highest_block.header.bits;
+
+    // Recalculate issued coins (sum of all coinbase outputs)
+    tip_.issued = 0;
+    for (uint64_t h = 0; h <= highest_valid; ++h) {
+        std::vector<uint8_t> raw;
+        Block blk;
+        if (storage_.read_block_by_index(h, raw) && deser_block(raw, blk)) {
+            if (!blk.txs.empty()) {
+                for (const auto& out : blk.txs[0].vout) {
+                    tip_.issued += out.value;
+                }
+            }
+        }
+    }
+
+    // Calculate cumulative work
+    tip_.work_sum = 0.0L;
+    for (uint64_t h = 0; h <= highest_valid; ++h) {
+        std::vector<uint8_t> raw;
+        Block blk;
+        if (storage_.read_block_by_index(h, raw) && deser_block(raw, blk)) {
+            tip_.work_sum += work_from_bits(blk.header.bits);
+        }
+    }
+
+    log_info("State rebuilt: height=" + std::to_string(tip_.height) +
+             " issued=" + std::to_string(tip_.issued) +
+             " work=" + std::to_string((double)tip_.work_sum));
+
+    // Save the recovered state
+    save_state();
+
+    return true;
+}
+
+bool Chain::load_state(){
+    MIQ_CHAIN_GUARD();
+    std::vector<uint8_t> b;
+
+    if(!storage_.read_state(b)){
+        // State file missing or corrupted - try to rebuild from blocks
+        return rebuild_state_from_blocks();
+    }
+
+    if(b.size() < 32 + 8 + 8 + 4 + 8){
+        // State file truncated/corrupted - try to rebuild from blocks
+        log_warn("State file truncated, attempting recovery...");
+        return rebuild_state_from_blocks();
     }
 
     size_t i = 0;
