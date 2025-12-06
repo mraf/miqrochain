@@ -4065,6 +4065,9 @@ void P2P::loop(){
                     std::vector<std::vector<uint8_t>> want3;
                     chain_.next_block_fetch_targets(want3, (size_t)128);
                     if (!want3.empty()) {
+                        // CRITICAL FIX: Hold g_peers_mu while iterating peers_ to prevent
+                        // race condition with connect_seed() called from main thread during IBD
+                        std::lock_guard<std::recursive_mutex> lk_fetch(g_peers_mu);
                         std::vector<std::pair<Sock,double>> scored;
                         for (auto& kvp : peers_) if (kvp.second.verack_ok)
                             scored.emplace_back(kvp.first, kvp.second.health_score);
@@ -4142,6 +4145,8 @@ void P2P::loop(){
         
         // === NEW: Adaptive timeout & retry for inflight blocks =======================
         {
+          // CRITICAL FIX: Hold g_peers_mu to prevent race with connect_seed() from main thread
+          std::lock_guard<std::recursive_mutex> lk_timeout(g_peers_mu);
           const int64_t tnow = now_ms();
           std::vector<std::pair<Sock,std::string>> expired;
 
@@ -4245,6 +4250,8 @@ void P2P::loop(){
         }
 
           {
+          // CRITICAL FIX: Hold g_peers_mu to prevent race with connect_seed() from main thread
+          std::lock_guard<std::recursive_mutex> lk_idx_timeout(g_peers_mu);
           const int64_t tnow = now_ms();
           // Oldest-first per-peer: check deque front(s) only each tick, bounded effort
           struct Exp { Sock s; uint64_t idx; int64_t ts; };
@@ -4378,6 +4385,8 @@ void P2P::loop(){
         // CRITICAL FIX: Inflight transaction request timeout cleanup
         // Without this, inflight_tx can grow forever and block new transaction requests
         {
+            // CRITICAL FIX: Hold g_peers_mu to prevent race with connect_seed() from main thread
+            std::lock_guard<std::recursive_mutex> lk_tx_timeout(g_peers_mu);
             const int64_t tnow = now_ms();
             std::vector<std::pair<Sock, std::string>> expired_tx;
             for (auto& kv : g_inflight_tx_ts) {
@@ -4406,6 +4415,8 @@ void P2P::loop(){
         }
 
             {
+            // CRITICAL FIX: Hold g_peers_mu to prevent race with connect_seed() from main thread
+            std::lock_guard<std::recursive_mutex> lk_ping(g_peers_mu);
             const int64_t tnow = now_ms();
             std::vector<Sock> to_close;
             for (auto &kv : peers_) {
