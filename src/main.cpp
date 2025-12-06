@@ -1875,6 +1875,10 @@ private:
                 dark_theme_ = !dark_theme_;
             }
 
+            // PERFORMANCE: Update chain cache BEFORE drawing to minimize lock time
+            // This moves the chain mutex acquisition outside the TUI mutex hold
+            update_chain_cache_nonblocking();
+
             // IMPROVED: Time-based drawing for consistent animation speed
             if ((now - last_draw_time) >= draw_interval) {
                 draw_once(false);
@@ -1910,9 +1914,10 @@ private:
                     uint64_t network_height = 0;
 
                     // Get max peer tip for network height
+                    // Only count peers with verack_ok && peer_tip > 0 to match compute_sync_gate()
                     auto peers = p2p_->snapshot_peers();
                     for (const auto& peer : peers) {
-                        if (peer.peer_tip > network_height) {
+                        if (peer.verack_ok && peer.peer_tip > 0 && peer.peer_tip > network_height) {
                             network_height = peer.peer_tip;
                         }
                     }
@@ -1922,7 +1927,10 @@ private:
                     uint64_t last_block_time = hdr_time(tip);
 
                     // Store values (already have lock)
-                    sync_network_height_ = network_height;
+                    // Only update if we got a valid network height from peers
+                    if (network_height > 0) {
+                        sync_network_height_ = network_height;
+                    }
                     sync_last_block_time_ = last_block_time;
                 }
             }
@@ -1934,11 +1942,17 @@ private:
                 uint64_t current_height = chain_->height();
                 uint64_t network_height = 0;
                 auto peers = p2p_->snapshot_peers();
+                // Only count peers with verack_ok && peer_tip > 0
                 for (const auto& peer : peers) {
-                    if (peer.peer_tip > network_height) network_height = peer.peer_tip;
+                    if (peer.verack_ok && peer.peer_tip > 0 && peer.peer_tip > network_height) {
+                        network_height = peer.peer_tip;
+                    }
                 }
                 uint64_t last_block_time = hdr_time(chain_->tip());
-                update_sync_stats(current_height, network_height, last_block_time);
+                // Only update if we have valid peer data
+                if (network_height > 0) {
+                    update_sync_stats(current_height, network_height, last_block_time);
+                }
             }
         }
     }
@@ -2687,10 +2701,10 @@ private:
                     break;
             }
 
-            // Network activity indicator
-            size_t peer_count = p2p_ ? p2p_->snapshot_peers().size() : 0;
-            status << "   " << network_activity(tick_, peer_count, peer_count > 0);
-            status << " " << C_dim() << peer_count << " peers" << C_reset();
+            // Network activity indicator - use cached value (populated at start of draw)
+            auto cached_for_status = get_cached_chain();
+            status << "   " << network_activity(tick_, cached_for_status.peer_count, cached_for_status.peer_count > 0);
+            status << " " << C_dim() << cached_for_status.peer_count << " peers" << C_reset();
 
             // Mining indicator
             if (miner_running_badge()) {
@@ -2726,21 +2740,17 @@ private:
         {
             left_panel.push_back(box_header("Blockchain", half_width, "\x1b[38;5;51m"));
 
-            uint64_t height = chain_ ? chain_->height() : 0;
-            std::string tip_hex;
-            long double tip_diff = 0.0L;
+            // PERFORMANCE: Use cached chain state to avoid mutex contention
+            // This prevents UI freeze when P2P is holding chain mutex during block processing
+            auto cached = get_cached_chain();
+            uint64_t height = cached.height;
+            std::string tip_hex = to_hex(cached.tip_hash);
+            long double tip_diff = difficulty_from_bits(cached.bits);
+            uint64_t tip_ts = static_cast<uint64_t>(cached.time);
             uint64_t tip_age_s = 0;
-            uint64_t tip_ts = 0;
-
-            if (chain_) {
-                auto t = chain_->tip();
-                tip_hex = to_hex(t.hash);
-                tip_diff = difficulty_from_bits(hdr_bits(t));
-                tip_ts = hdr_time(t);
-                if (tip_ts) {
-                    uint64_t now = (uint64_t)std::time(nullptr);
-                    tip_age_s = (now > tip_ts) ? (now - tip_ts) : 0;
-                }
+            if (tip_ts) {
+                uint64_t now = (uint64_t)std::time(nullptr);
+                tip_age_s = (now > tip_ts) ? (now - tip_ts) : 0;
             }
 
             // Height with chain visualization
@@ -2789,15 +2799,11 @@ private:
         {
             right_panel.push_back(box_header("Network", half_width, "\x1b[38;5;47m"));
 
-            size_t peers_n = 0, verack_ok = 0, inflight_tx = 0;
-            if (p2p_) {
-                auto peers = p2p_->snapshot_peers();
-                peers_n = peers.size();
-                for (auto& s : peers) {
-                    if (s.verack_ok) ++verack_ok;
-                    inflight_tx += (size_t)s.inflight;
-                }
-            }
+            // PERFORMANCE: Use cached peer stats to avoid mutex contention
+            auto cached_net = get_cached_chain();
+            size_t peers_n = cached_net.peer_count;
+            size_t verack_ok = cached_net.verack_ok;
+            size_t inflight_tx = cached_net.inflight_tx;
 
             // Peer count with mini bar
             std::ostringstream n1;
@@ -3852,6 +3858,75 @@ private:
     // View mode: Splash during sync, Main after sync complete
     ViewMode    view_mode_{ViewMode::Splash};
     int         splash_transition_counter_{0};  // Count frames at 100% before transitioning
+
+    // PERFORMANCE: Cached chain state to avoid mutex contention during rendering
+    // These are updated asynchronously and used for display - prevents UI freeze
+    // when chain mutex is held by P2P during block processing
+    struct CachedChainState {
+        uint64_t height{0};
+        std::vector<uint8_t> tip_hash;
+        uint32_t bits{0};
+        int64_t time{0};
+        uint64_t issued{0};
+        size_t peer_count{0};
+        size_t verack_ok{0};
+        size_t inflight_tx{0};
+        uint64_t last_update_ms{0};
+    };
+    CachedChainState cached_chain_;
+    std::mutex cached_chain_mu_;  // Separate mutex for cache (never blocks on chain)
+
+    // Non-blocking cache update - call from render loop
+    void update_chain_cache_nonblocking() {
+        // Only update every 100ms to reduce overhead
+        uint64_t now = now_ms();
+        if (now - cached_chain_.last_update_ms < 100) return;
+
+        // Update peer stats (uses g_peers_mu, usually fast)
+        size_t peer_count = 0, verack_ok = 0, inflight_tx = 0;
+        if (p2p_) {
+            // Snapshot peers is usually fast, but wrap in try for safety
+            try {
+                auto peers = p2p_->snapshot_peers();
+                peer_count = peers.size();
+                for (const auto& s : peers) {
+                    if (s.verack_ok) ++verack_ok;
+                    inflight_tx += static_cast<size_t>(s.inflight);
+                }
+            } catch (...) {}
+        }
+
+        // Update chain state if available
+        if (chain_) {
+            // Get tip - this acquires chain mutex but is usually fast
+            // If chain is busy, this will block briefly but that's acceptable
+            // since we throttle to 100ms
+            auto t = chain_->tip();
+
+            std::lock_guard<std::mutex> lk(cached_chain_mu_);
+            cached_chain_.height = t.height;
+            cached_chain_.tip_hash = t.hash;
+            cached_chain_.bits = t.bits;
+            cached_chain_.time = t.time;
+            cached_chain_.issued = t.issued;
+            cached_chain_.peer_count = peer_count;
+            cached_chain_.verack_ok = verack_ok;
+            cached_chain_.inflight_tx = inflight_tx;
+            cached_chain_.last_update_ms = now;
+        } else {
+            std::lock_guard<std::mutex> lk(cached_chain_mu_);
+            cached_chain_.peer_count = peer_count;
+            cached_chain_.verack_ok = verack_ok;
+            cached_chain_.inflight_tx = inflight_tx;
+            cached_chain_.last_update_ms = now;
+        }
+    }
+
+    // Get cached state without blocking (for rendering)
+    CachedChainState get_cached_chain() {
+        std::lock_guard<std::mutex> lk(cached_chain_mu_);
+        return cached_chain_;
+    }
 };
 
 // ==================================================================
@@ -4058,12 +4133,22 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                     tui->set_banner(std::string("Connected to seed: ") + seed_host_cstr());
                     // FIX: Get network height from connected peers instead of using local height
                     // This ensures the progress bar shows meaningful progress from the start
-                    uint64_t initial_network_height = chain.height();
+                    // Only count peers with verack_ok && peer_tip > 0 to prevent premature sync completion
+                    uint64_t initial_network_height = 0;
+                    bool found_valid_peer = false;
                     auto peer_list = p2p->snapshot_peers();
                     for (const auto& pr : peer_list) {
-                        if (pr.peer_tip > initial_network_height) {
-                            initial_network_height = pr.peer_tip;
+                        if (pr.verack_ok && pr.peer_tip > 0) {
+                            if (pr.peer_tip > initial_network_height) {
+                                initial_network_height = pr.peer_tip;
+                            }
+                            found_valid_peer = true;
                         }
+                    }
+                    // If no valid peer tips yet, use checkpoint height as minimum target
+                    if (!found_valid_peer) {
+                        static constexpr uint64_t CHECKPOINT_HEIGHT = 4255;
+                        initial_network_height = std::max(chain.height() + 1, CHECKPOINT_HEIGHT);
                     }
                     tui->set_ibd_progress(chain.height(),
                                           initial_network_height,
@@ -4177,12 +4262,31 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
 
             // CRITICAL FIX: Get actual network height from peers for proper progress display
             // Previously this passed (cur, cur) which made the splash screen think sync was complete
-            uint64_t network_height = cur;  // Default to current if no peers
+            //
+            // IMPORTANT: Only count peers that have:
+            // 1. Completed handshake (verack_ok) - otherwise they haven't told us their height
+            // 2. Reported a valid tip (peer_tip > 0) - 0 means they haven't sent version yet
+            // This matches the logic in compute_sync_gate() to prevent premature sync completion
+            uint64_t network_height = 0;  // Start at 0, will be updated by valid peers
+            bool found_valid_peer = false;
             auto peer_snapshot = p2p->snapshot_peers();
             for (const auto& pr : peer_snapshot) {
-                if (pr.peer_tip > network_height) {
-                    network_height = pr.peer_tip;
+                // Only consider peers that have completed handshake AND reported their tip
+                if (pr.verack_ok && pr.peer_tip > 0) {
+                    if (pr.peer_tip > network_height) {
+                        network_height = pr.peer_tip;
+                    }
+                    found_valid_peer = true;
                 }
+            }
+
+            // If no valid peers found, use checkpoint height as minimum target to prevent
+            // premature sync completion when peers disconnect or haven't reported tips yet
+            if (!found_valid_peer) {
+                // Use the known checkpoint height (4255) as minimum network height
+                // This ensures sync won't complete prematurely before reaching this point
+                static constexpr uint64_t CHECKPOINT_HEIGHT = 4255;
+                network_height = std::max(cur + 1, CHECKPOINT_HEIGHT);
             }
 
             if (tui && can_tui) {
