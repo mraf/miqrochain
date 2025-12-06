@@ -4039,9 +4039,13 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
     if (can_tui) tui->set_node_state(TUI::NodeState::Syncing);
     if (tui && can_tui) tui->mark_step_started("Peer handshake (verack)");
     {
-        const uint64_t hs_t0 = now_ms();
-        const uint64_t handshake_deadline_ms =
-            we_are_seed ? (hs_t0 + 5 * 60 * 1000) : (hs_t0 + kHandshakeTimeoutMs);
+        uint64_t hs_t0 = now_ms();
+        // CRITICAL FIX: Track last activity time separately from start time
+        // Reset deadline when peers connect/disconnect to allow for reconnection
+        uint64_t last_activity_ms = hs_t0;
+        size_t last_peer_count = 0;
+
+        const uint64_t handshake_timeout = we_are_seed ? (5 * 60 * 1000) : kHandshakeTimeoutMs;
         if (we_are_seed) {
             log_info("IBD: acting as seed host — waiting for inbound verack (up to ~5 min).");
             if (tui && can_tui) tui->set_banner("Seed mode: waiting for inbound peers…");
@@ -4069,8 +4073,21 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             }
             // keep nudging the seed if needed (only if no working connections)
             size_t verack_peers = 0;
-            for (const auto& peer : p2p->snapshot_peers()) {
+            auto current_peers = p2p->snapshot_peers();
+            size_t peer_count = current_peers.size();
+            for (const auto& peer : current_peers) {
                 if (peer.verack_ok) verack_peers++;
+            }
+
+            // CRITICAL FIX: Reset activity timer when peer count changes (connect/disconnect)
+            // This allows peers to reconnect without hitting the timeout
+            if (peer_count != last_peer_count) {
+                last_activity_ms = now_ms();
+                last_peer_count = peer_count;
+                if (peer_count > 0) {
+                    log_info("IBD: peer activity detected (" + std::to_string(peer_count) +
+                             " peers) - resetting handshake timeout");
+                }
             }
 
             if (!we_are_seed && verack_peers == 0 && (now_ms() - lastSeedDialMs > kSeedNudgeMs)) {
@@ -4078,7 +4095,9 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                 lastSeedDialMs = now_ms();
             }
 
-            if (now_ms() > handshake_deadline_ms) {
+            // CRITICAL FIX: Use activity-based timeout instead of fixed deadline
+            // Timeout only if no peer activity for the timeout period
+            if (now_ms() - last_activity_ms > handshake_timeout) {
                 if (we_are_seed) {
                     // SOLO-SEED: allow the node to proceed without peers so it can mine the first blocks.
                     log_warn("IBD: seed mode handshake timed out — entering SOLO-SEED mode (no peers yet).");
@@ -4105,15 +4124,31 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
         }
     }
 
+    // CRITICAL FIX: Track when we last had peers for activity-based timeout
+    uint64_t last_had_peers_ms = now_ms();
+    size_t prev_peer_count = 0;
+
     while (!global::shutdown_requested.load()) {
         // Hard wall clock timeout
         if (now_ms() - t0 > kMaxWallMs) { out_err = "IBD timeout (no completion within time budget)"; break; }
 
         // Ensure we periodically re-nudge the seed if peer count is low.
-        size_t peers = p2p->snapshot_peers().size();
+        auto peer_snap = p2p->snapshot_peers();
+        size_t peers = peer_snap.size();
         size_t verack_peers = 0;
-        for (const auto& peer : p2p->snapshot_peers()) {
+        for (const auto& peer : peer_snap) {
             if (peer.verack_ok) verack_peers++;
+        }
+
+        // CRITICAL FIX: Reset peer activity timer when we have peers
+        if (peers > 0) {
+            last_had_peers_ms = now_ms();
+        }
+        // Log peer count changes for debugging
+        if (peers != prev_peer_count) {
+            log_info("IBD: peer count changed: " + std::to_string(prev_peer_count) +
+                     " -> " + std::to_string(peers) + " (verack=" + std::to_string(verack_peers) + ")");
+            prev_peer_count = peers;
         }
 
         // Only nudge if we have no working connections (verack_ok peers)
@@ -4122,10 +4157,11 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             lastSeedDialMs = now_ms();
         }
 
-        // Early no-peer failure
+        // CRITICAL FIX: Use activity-based timeout for "no peers" check
+        // Only fail if we haven't had any peers for the timeout period
         const uint64_t no_peer_budget =
             we_are_seed ? (5 * 60 * 1000) : kNoPeerTimeoutMs;
-        if (peers == 0 && now_ms() - t0 > no_peer_budget) {
+        if (peers == 0 && now_ms() - last_had_peers_ms > no_peer_budget) {
             if (we_are_seed) {
                 out_err = "no peers reachable while acting as seed (check DNS A/AAAA and firewall/NAT)";
             } else {
@@ -4245,7 +4281,15 @@ private:
                 } else {
                     log_info("IBDGuard: node resynced.");
                     backoff_ms = 2'000;
-                    if (tui && can_tui) tui->set_node_state(TUI::NodeState::Running);
+                    miq::mark_ibd_complete();  // Enable full durability (fsync on every block)
+                    if (tui && can_tui) {
+                        // CRITICAL FIX: Must set ibd_done_ to true for splash screen transition!
+                        // Without this, the splash screen stays stuck even though IBDGuard succeeded
+                        // because the condition ibd_done_ && nstate_ == Running is never satisfied
+                        tui->set_ibd_progress(chain->height(), chain->height(), 0, "complete", "", true);
+                        tui->set_node_state(TUI::NodeState::Running);
+                        tui->set_mining_gate(true, "");
+                    }
                 }
             }
             std::this_thread::sleep_for(3s);
