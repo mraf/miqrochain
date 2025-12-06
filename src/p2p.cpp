@@ -3723,6 +3723,18 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
             continue;
         }
 
+        // CRITICAL FIX: Enforce sequential processing in orphan handling
+        // If this orphan doesn't extend the current tip (e.g., competing chain),
+        // keep it in the orphan pool instead of processing and dropping it.
+        // This prevents losing valid blocks from alternate chains during reorgs.
+        const auto current_tip = chain_.tip_hash();
+        if (ob.header.prev_hash != current_tip) {
+            // Re-register this orphan under its actual parent for later processing
+            const std::string actual_parent_hex = hexkey(ob.header.prev_hash);
+            orphan_children_[actual_parent_hex].push_back(child_hex);
+            continue;  // Don't remove from orphans_, try again when parent becomes tip
+        }
+
         std::string err;
         if (chain_.submit_block(ob, err)) {
             // CRITICAL FIX: Notify mempool to remove confirmed transactions
