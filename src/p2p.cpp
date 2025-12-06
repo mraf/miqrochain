@@ -726,6 +726,11 @@ static std::unordered_map<Sock, int64_t> g_trickle_last_ms;
 
 static std::unordered_map<Sock,int64_t> g_last_hdr_req_ms;
 
+// CRITICAL FIX: Periodic header polling after IBD completes
+// This ensures nodes discover new blocks mined by peers during/after sync
+static std::atomic<int64_t> g_last_header_poll_ms{0};
+static constexpr int64_t MIQ_HEADER_POLL_INTERVAL_MS = 30000; // Poll every 30 seconds
+
 // Per-peer sliding-window message counters
 static std::unordered_map<Sock,
     std::unordered_map<std::string, std::pair<int64_t,uint32_t>>> g_cmd_rl;
@@ -4061,10 +4066,51 @@ void P2P::loop(){
                     }
                 }
 #endif
+                // CRITICAL FIX: Periodic header polling AFTER IBD completes
+                // Without this, nodes cannot discover new blocks mined during/after their sync.
+                // The seed announces its height at connection time, but may mine more blocks
+                // while the node is syncing. Once IBD completes, header requests stop completely,
+                // leaving the node stuck at the announced height (e.g., 3668 instead of actual tip).
+                // This fix polls for new headers every 30 seconds to discover any new blocks.
+                if (g_logged_headers_done) {
+                    int64_t poll_now = now_ms();
+                    int64_t last_poll = g_last_header_poll_ms.load();
+                    if (poll_now - last_poll >= MIQ_HEADER_POLL_INTERVAL_MS) {
+                        g_last_header_poll_ms.store(poll_now);
+
+                        std::vector<std::vector<uint8_t>> locator;
+                        chain_.build_locator(locator);
+                        std::vector<uint8_t> stop(32, 0);
+                        auto pl = build_getheaders_payload(locator, stop);
+                        auto msg = encode_msg("getheaders", pl);
+
+                        // Send to one or two peers to discover new blocks
+                        int sent = 0;
+                        std::lock_guard<std::recursive_mutex> lk_poll(g_peers_mu);
+                        for (auto& kvp : peers_) {
+                            if (!kvp.second.verack_ok) continue;
+                            if (sent >= 2) break;
+                            Sock s = kvp.first;
+                            if (can_accept_hdr_batch(kvp.second, poll_now) &&
+                                check_rate(kvp.second, "hdr", 1.0, poll_now)) {
+                                kvp.second.sent_getheaders = true;
+                                kvp.second.inflight_hdr_batches++;
+                                g_last_hdr_req_ms[s] = poll_now;
+                                (void)send_or_close(s, msg);
+                                sent++;
+                                P2P_TRACE("POST-IBD header poll sent to " + kvp.second.ip);
+                            }
+                        }
+                    }
+                }
+
                     {
                     std::vector<std::vector<uint8_t>> want3;
                     chain_.next_block_fetch_targets(want3, (size_t)128);
                     if (!want3.empty()) {
+                        // CRITICAL FIX: Hold g_peers_mu while iterating peers_ to prevent
+                        // race condition with connect_seed() called from main thread during IBD
+                        std::lock_guard<std::recursive_mutex> lk_fetch(g_peers_mu);
                         std::vector<std::pair<Sock,double>> scored;
                         for (auto& kvp : peers_) if (kvp.second.verack_ok)
                             scored.emplace_back(kvp.first, kvp.second.health_score);
@@ -4142,6 +4188,8 @@ void P2P::loop(){
         
         // === NEW: Adaptive timeout & retry for inflight blocks =======================
         {
+          // CRITICAL FIX: Hold g_peers_mu to prevent race with connect_seed() from main thread
+          std::lock_guard<std::recursive_mutex> lk_timeout(g_peers_mu);
           const int64_t tnow = now_ms();
           std::vector<std::pair<Sock,std::string>> expired;
 
@@ -4245,6 +4293,8 @@ void P2P::loop(){
         }
 
           {
+          // CRITICAL FIX: Hold g_peers_mu to prevent race with connect_seed() from main thread
+          std::lock_guard<std::recursive_mutex> lk_idx_timeout(g_peers_mu);
           const int64_t tnow = now_ms();
           // Oldest-first per-peer: check deque front(s) only each tick, bounded effort
           struct Exp { Sock s; uint64_t idx; int64_t ts; };
@@ -4378,6 +4428,8 @@ void P2P::loop(){
         // CRITICAL FIX: Inflight transaction request timeout cleanup
         // Without this, inflight_tx can grow forever and block new transaction requests
         {
+            // CRITICAL FIX: Hold g_peers_mu to prevent race with connect_seed() from main thread
+            std::lock_guard<std::recursive_mutex> lk_tx_timeout(g_peers_mu);
             const int64_t tnow = now_ms();
             std::vector<std::pair<Sock, std::string>> expired_tx;
             for (auto& kv : g_inflight_tx_ts) {
@@ -4406,6 +4458,8 @@ void P2P::loop(){
         }
 
             {
+            // CRITICAL FIX: Hold g_peers_mu to prevent race with connect_seed() from main thread
+            std::lock_guard<std::recursive_mutex> lk_ping(g_peers_mu);
             const int64_t tnow = now_ms();
             std::vector<Sock> to_close;
             for (auto &kv : peers_) {
@@ -5731,16 +5785,18 @@ void P2P::loop(){
                             // This prevents early sync completion when version message had stale height
                             uint64_t new_height = chain_.height();
 
-                            // CRITICAL: Update peer_tip_height REGARDLESS of whether block was accepted
-                            // With sequential ordering (extends_tip check), blocks may be orphaned first
-                            // but we still know the peer has those blocks. If we only update when
-                            // new_height > old_height, we might declare sync complete prematurely.
-                            // Use next_index-1 as minimum peer tip since we requested that index from them.
-                            uint64_t min_peer_tip = std::max(new_height, ps.next_index > 0 ? ps.next_index - 1 : 0);
-                            if (min_peer_tip > ps.peer_tip_height) {
-                                ps.peer_tip_height = min_peer_tip;
+                            // CRITICAL FIX: Only update peer_tip_height based on ACTUAL received blocks
+                            // NOT based on speculative next_index requests. The previous code was
+                            // using next_index-1 which caused peer_tip_height to inflate beyond
+                            // the actual network height (e.g., showing 5716 when network only has 4500)
+                            //
+                            // We should only trust:
+                            // 1. The height announced in the peer's version message (set at handshake)
+                            // 2. Heights from blocks we actually receive and validate
+                            if (new_height > ps.peer_tip_height) {
+                                ps.peer_tip_height = new_height;
                                 P2P_TRACE("DEBUG: Updated peer " + ps.ip + " tip_height to " +
-                                          std::to_string(min_peer_tip) + " (from index request)");
+                                          std::to_string(new_height) + " (from received block)");
                             }
 
                             // Update reputation: track successful delivery
