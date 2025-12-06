@@ -196,4 +196,71 @@ inline uint32_t get_script_flags(uint64_t height, const std::vector<uint8_t>& bl
     }
 }
 
+// =============================================================================
+// CHAIN CHECKPOINTS - Prevent following forked chains
+// Nodes MUST have these exact blocks at these heights to be considered valid.
+// This prevents attackers from creating a fake chain that nodes might follow.
+// =============================================================================
+
+struct Checkpoint {
+    uint64_t height;
+    const char* hash_hex;  // Block hash in hex (64 chars)
+};
+
+// IMPORTANT: Add your official chain's checkpoints here!
+// Get the block hash at each height from your seed node using RPC:
+//   miqrochaind getblockhash <height>
+// Add checkpoints at regular intervals (e.g., every 1000 blocks)
+inline const std::vector<Checkpoint>& get_checkpoints() {
+    static const std::vector<Checkpoint> checkpoints = {
+        // === MIQROCHAIN OFFICIAL CHECKPOINTS ===
+        // These block hashes are from the official chain (seed.miqrochain.org)
+        // Any chain not containing these exact blocks will be rejected
+        {4255, "00000000050bb0750f9276a0e7bc03a3facdcc5f81d2bf15fce4d894ade27e22"},
+    };
+    return checkpoints;
+}
+
+// Convert hex string to bytes for comparison
+inline std::vector<uint8_t> checkpoint_hash_to_bytes(const char* hex) {
+    std::vector<uint8_t> result(32);
+    for (size_t i = 0; i < 32; ++i) {
+        char buf[3] = {hex[i*2], hex[i*2+1], 0};
+        result[i] = (uint8_t)std::strtoul(buf, nullptr, 16);
+    }
+    return result;
+}
+
+// Check if a block at given height matches checkpoint (if one exists)
+// Returns: true if OK (no checkpoint at this height, or hash matches)
+//          false if checkpoint exists and hash does NOT match (reject block!)
+inline bool check_checkpoint(uint64_t height, const std::vector<uint8_t>& block_hash) {
+    for (const auto& cp : get_checkpoints()) {
+        if (cp.height == height) {
+            auto expected = checkpoint_hash_to_bytes(cp.hash_hex);
+            if (block_hash != expected) {
+                return false;  // REJECT! Block hash doesn't match checkpoint
+            }
+            return true;  // Matches checkpoint
+        }
+    }
+    return true;  // No checkpoint at this height
+}
+
+// Check if we're accepting a chain that would conflict with checkpoints
+// Call this when evaluating a new header/block chain
+inline bool chain_conflicts_with_checkpoints(uint64_t height, const std::vector<uint8_t>& block_hash) {
+    // If this block is AT a checkpoint height, it must match
+    return !check_checkpoint(height, block_hash);
+}
+
+// Get the highest checkpoint height (for sync progress display)
+inline uint64_t get_highest_checkpoint_height() {
+    uint64_t max_h = 0;
+    for (const auto& cp : get_checkpoints()) {
+        if (cp.height > max_h) max_h = cp.height;
+    }
+    return max_h;
+}
+
 } // namespace miq

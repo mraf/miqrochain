@@ -3490,7 +3490,7 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
     // Solution: Only process blocks that extend the CURRENT TIP (prev_hash == tip_hash).
     // Out-of-order blocks are stored as orphans and processed sequentially via
     // try_connect_orphans() when their parent becomes the tip.
-    const auto& current_tip = chain_.tip_hash();
+    const auto current_tip = chain_.tip_hash();  // CRITICAL: Must be copy, not reference (tip_hash returns by value)
     bool extends_tip = (b.header.prev_hash == current_tip);
     bool have_parent = chain_.have_block(b.header.prev_hash);
 
