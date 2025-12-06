@@ -726,6 +726,11 @@ static std::unordered_map<Sock, int64_t> g_trickle_last_ms;
 
 static std::unordered_map<Sock,int64_t> g_last_hdr_req_ms;
 
+// CRITICAL FIX: Periodic header polling after IBD completes
+// This ensures nodes discover new blocks mined by peers during/after sync
+static std::atomic<int64_t> g_last_header_poll_ms{0};
+static constexpr int64_t MIQ_HEADER_POLL_INTERVAL_MS = 30000; // Poll every 30 seconds
+
 // Per-peer sliding-window message counters
 static std::unordered_map<Sock,
     std::unordered_map<std::string, std::pair<int64_t,uint32_t>>> g_cmd_rl;
@@ -4061,6 +4066,44 @@ void P2P::loop(){
                     }
                 }
 #endif
+                // CRITICAL FIX: Periodic header polling AFTER IBD completes
+                // Without this, nodes cannot discover new blocks mined during/after their sync.
+                // The seed announces its height at connection time, but may mine more blocks
+                // while the node is syncing. Once IBD completes, header requests stop completely,
+                // leaving the node stuck at the announced height (e.g., 3668 instead of actual tip).
+                // This fix polls for new headers every 30 seconds to discover any new blocks.
+                if (g_logged_headers_done) {
+                    int64_t poll_now = now_ms();
+                    int64_t last_poll = g_last_header_poll_ms.load();
+                    if (poll_now - last_poll >= MIQ_HEADER_POLL_INTERVAL_MS) {
+                        g_last_header_poll_ms.store(poll_now);
+
+                        std::vector<std::vector<uint8_t>> locator;
+                        chain_.build_locator(locator);
+                        std::vector<uint8_t> stop(32, 0);
+                        auto pl = build_getheaders_payload(locator, stop);
+                        auto msg = encode_msg("getheaders", pl);
+
+                        // Send to one or two peers to discover new blocks
+                        int sent = 0;
+                        std::lock_guard<std::recursive_mutex> lk_poll(g_peers_mu);
+                        for (auto& kvp : peers_) {
+                            if (!kvp.second.verack_ok) continue;
+                            if (sent >= 2) break;
+                            Sock s = kvp.first;
+                            if (can_accept_hdr_batch(kvp.second, poll_now) &&
+                                check_rate(kvp.second, "hdr", 1.0, poll_now)) {
+                                kvp.second.sent_getheaders = true;
+                                kvp.second.inflight_hdr_batches++;
+                                g_last_hdr_req_ms[s] = poll_now;
+                                (void)send_or_close(s, msg);
+                                sent++;
+                                P2P_TRACE("POST-IBD header poll sent to " + kvp.second.ip);
+                            }
+                        }
+                    }
+                }
+
                     {
                     std::vector<std::vector<uint8_t>> want3;
                     chain_.next_block_fetch_targets(want3, (size_t)128);
