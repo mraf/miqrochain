@@ -482,6 +482,8 @@ AddressBalance AddressIndex::get_address_balance(
     uint64_t current_height,
     uint64_t coinbase_maturity
 ) const {
+    (void)current_height;     // Reserved for coinbase maturity filtering
+    (void)coinbase_maturity;  // Reserved for coinbase maturity filtering
     std::lock_guard<std::recursive_mutex> lk(mtx_);
 
     AddressBalance bal;

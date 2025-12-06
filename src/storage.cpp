@@ -24,13 +24,13 @@
           if (!FlushFileBuffers(h)) {
               // Log flush failure - data may not be persisted to disk
               DWORD err = GetLastError();
-              log_warn("Storage: FlushFileBuffers failed for " + p +
+              miq::log_warn("Storage: FlushFileBuffers failed for " + p +
                       " error=" + std::to_string(err));
           }
           CloseHandle(h);
       } else {
           DWORD err = GetLastError();
-          log_warn("Storage: CreateFileA failed for flush " + p +
+          miq::log_warn("Storage: CreateFileA failed for flush " + p +
                   " error=" + std::to_string(err));
       }
   }

@@ -4141,10 +4141,10 @@ void P2P::loop(){
                     if (poll_now - last_poll >= MIQ_HEADER_POLL_INTERVAL_MS) {
                         g_last_header_poll_ms.store(poll_now);
 
-                        std::vector<std::vector<uint8_t>> locator;
-                        chain_.build_locator(locator);
-                        std::vector<uint8_t> stop(32, 0);
-                        auto pl = build_getheaders_payload(locator, stop);
+                        std::vector<std::vector<uint8_t>> poll_locator;
+                        chain_.build_locator(poll_locator);
+                        std::vector<uint8_t> poll_stop(32, 0);
+                        auto pl = build_getheaders_payload(poll_locator, poll_stop);
                         auto msg = encode_msg("getheaders", pl);
 
                         // Send to one or two peers to discover new blocks
@@ -6039,9 +6039,9 @@ void P2P::loop(){
                         ps.inflight_tx.erase(key);
                         // CRITICAL FIX: Clear timestamp when tx is received
                         {
-                            auto it = g_inflight_tx_ts.find(s);
-                            if (it != g_inflight_tx_ts.end()) {
-                                it->second.erase(key);
+                            auto it_tx = g_inflight_tx_ts.find(s);
+                            if (it_tx != g_inflight_tx_ts.end()) {
+                                it_tx->second.erase(key);
                             }
                         }
                         if (unsolicited_drop(ps, "tx", key)) {

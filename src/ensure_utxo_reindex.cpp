@@ -16,6 +16,7 @@ namespace miq {
 // CRITICAL FIX: Check if chainstate is consistent with blockchain tip
 // Returns true if reindex is needed
 static bool detect_chainstate_mismatch(Chain& chain, UTXOKV& kv) {
+    (void)kv;  // Reserved for future chainstate validation
     // Read stored chainstate tip from marker file
     std::string marker_path = chain.datadir() + "/chainstate/tip.dat";
     std::ifstream marker(marker_path, std::ios::binary);
