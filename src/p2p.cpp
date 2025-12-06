@@ -1,5 +1,12 @@
 // src/p2p.cpp  (strict-filter profile, Windows SOCKET-safe)
 #include "p2p.h"
+
+// Define global network statistics
+namespace p2p_stats {
+    std::atomic<uint64_t> bytes_sent{0};
+    std::atomic<uint64_t> bytes_recv{0};
+}
+
 #include <cmath>
 #include "nat.h"
 #include "seeds.h"
@@ -729,7 +736,7 @@ static std::unordered_map<Sock,int64_t> g_last_hdr_req_ms;
 // CRITICAL FIX: Periodic header polling after IBD completes
 // This ensures nodes discover new blocks mined by peers during/after sync
 static std::atomic<int64_t> g_last_header_poll_ms{0};
-static constexpr int64_t MIQ_HEADER_POLL_INTERVAL_MS = 30000; // Poll every 30 seconds
+static constexpr int64_t MIQ_HEADER_POLL_INTERVAL_MS = 10000; // Poll every 10 seconds for faster block discovery
 
 // Per-peer sliding-window message counters
 static std::unordered_map<Sock,
@@ -873,7 +880,8 @@ static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
 #endif
     }
 
-
+    // Track total bytes sent for network stats
+    p2p_stats::bytes_sent.fetch_add(len, std::memory_order_relaxed);
     return true;
 }
 static inline bool miq_send(Sock s, const std::vector<uint8_t>& v){
@@ -4133,10 +4141,10 @@ void P2P::loop(){
                     if (poll_now - last_poll >= MIQ_HEADER_POLL_INTERVAL_MS) {
                         g_last_header_poll_ms.store(poll_now);
 
-                        std::vector<std::vector<uint8_t>> locator;
-                        chain_.build_locator(locator);
-                        std::vector<uint8_t> stop(32, 0);
-                        auto pl = build_getheaders_payload(locator, stop);
+                        std::vector<std::vector<uint8_t>> poll_locator;
+                        chain_.build_locator(poll_locator);
+                        std::vector<uint8_t> poll_stop(32, 0);
+                        auto pl = build_getheaders_payload(poll_locator, poll_stop);
                         auto msg = encode_msg("getheaders", pl);
 
                         // Send to one or two peers to discover new blocks
@@ -4426,12 +4434,13 @@ void P2P::loop(){
               ps.syncing = false;
               ps.inflight_index = 0;
               // CRITICAL FIX: Reset peer_tip_height when peer is demoted due to timeouts
-              // This prevents peer_tip_height from being stuck above actual chain tip
+              // This prevents peer_tip_height from being stuck at incorrect values
               // after speculative requests timeout (peer doesn't have those blocks)
-              uint64_t current_height = chain_.height();
-              if (ps.peer_tip_height > current_height) {
-                  ps.peer_tip_height = current_height;
-              }
+              // Reset to 0 to force re-discovery from next version message
+              // This handles both:
+              // 1. Values above current height (speculative inflation)
+              // 2. Stale values below current height (outdated peer info)
+              ps.peer_tip_height = 0;
               // Send getheaders immediately to re-bootstrap
 #if MIQ_ENABLE_HEADERS_FIRST
               std::vector<std::vector<uint8_t>> locator;
@@ -5305,6 +5314,9 @@ void P2P::loop(){
                     }
                 }
 
+                // Track total bytes received for network stats
+                p2p_stats::bytes_recv.fetch_add((uint64_t)n, std::memory_order_relaxed);
+
                 // Log received bytes during handshake phase for diagnostics
                 if (!ps.verack_ok) {
                     log_info("P2P: received " + std::to_string(n) + " bytes from " + ps.ip + " (handshake in progress)");
@@ -5678,11 +5690,13 @@ void P2P::loop(){
                             }
                             g_last_progress_ms = now_ms();
                             g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
-                            // Use received headers to raise our estimate of this peer's tip.
-                            {
-                                uint64_t bhh = chain_.best_header_height();
-                                if (bhh > ps.peer_tip_height) ps.peer_tip_height = bhh;
-                            }
+                            // CRITICAL FIX: Do NOT update peer_tip_height from header height!
+                            // Headers can be far ahead of actual blocks, causing premature sync.
+                            // peer_tip_height should only come from:
+                            // 1. Version message announced_height (what peer claims to have)
+                            // 2. Actual blocks received from this peer
+                            // The old code here caused nodes to think they were synced when
+                            // headers caught up but blocks hadn't been downloaded yet.
                         } else if (hs.size() > 0) {
                             log_warn("P2P: Headers REJECTED from " + ps.ip + " n=" + std::to_string(hs.size()) +
                                     " accepted=0 error=" + herr);
@@ -6025,9 +6039,9 @@ void P2P::loop(){
                         ps.inflight_tx.erase(key);
                         // CRITICAL FIX: Clear timestamp when tx is received
                         {
-                            auto it = g_inflight_tx_ts.find(s);
-                            if (it != g_inflight_tx_ts.end()) {
-                                it->second.erase(key);
+                            auto it_tx = g_inflight_tx_ts.find(s);
+                            if (it_tx != g_inflight_tx_ts.end()) {
+                                it_tx->second.erase(key);
                             }
                         }
                         if (unsolicited_drop(ps, "tx", key)) {

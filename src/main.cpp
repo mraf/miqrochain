@@ -1447,6 +1447,19 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
             return false;
         }
 
+        // CRITICAL FIX: Verify that blocks are actually validated, not just headers
+        // best_header_height can be far ahead of height() during header-first sync
+        uint64_t block_height = h;
+        uint64_t header_height = chain.best_header_height();
+
+        // If headers are significantly ahead of blocks, we're still downloading blocks
+        // Allow up to 10 block difference for normal operation
+        if (header_height > block_height + 10) {
+            why_out = "blocks behind headers (blocks=" + std::to_string(block_height) +
+                     " headers=" + std::to_string(header_height) + ")";
+            return false;
+        }
+
         if (h >= max_peer_tip) {
             why_out.clear();
             return true;
@@ -2859,11 +2872,11 @@ private:
 
             // Network stats
             std::ostringstream n4;
-            n4 << C_dim() << "Sent:" << C_reset() << "       " << fmt_net_bytes(g_net_stats.bytes_sent.load());
+            n4 << C_dim() << "Sent:" << C_reset() << "       " << fmt_net_bytes(p2p_stats::bytes_sent.load());
             right_panel.push_back(box_row(n4.str(), half_width));
 
             std::ostringstream n5;
-            n5 << C_dim() << "Received:" << C_reset() << "   " << fmt_net_bytes(g_net_stats.bytes_recv.load());
+            n5 << C_dim() << "Received:" << C_reset() << "   " << fmt_net_bytes(p2p_stats::bytes_recv.load());
             right_panel.push_back(box_row(n5.str(), half_width));
 
             // Connection status
@@ -4205,8 +4218,10 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                     }
                     // If no valid peer tips yet, use checkpoint height as minimum target
                     if (!found_valid_peer) {
-                        static constexpr uint64_t CHECKPOINT_HEIGHT = 4255;
-                        initial_network_height = std::max(chain.height() + 1, CHECKPOINT_HEIGHT);
+                        // CRITICAL FIX: Use dynamic checkpoint height instead of hardcoded value
+                        // This ensures we don't declare sync complete before reaching the latest checkpoint
+                        uint64_t checkpoint_height = miq::get_highest_checkpoint_height();
+                        initial_network_height = std::max(chain.height() + 1, checkpoint_height);
                     }
                     tui->set_ibd_progress(chain.height(),
                                           initial_network_height,
@@ -4341,10 +4356,10 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             // If no valid peers found, use checkpoint height as minimum target to prevent
             // premature sync completion when peers disconnect or haven't reported tips yet
             if (!found_valid_peer) {
-                // Use the known checkpoint height (4255) as minimum network height
-                // This ensures sync won't complete prematurely before reaching this point
-                static constexpr uint64_t CHECKPOINT_HEIGHT = 4255;
-                network_height = std::max(cur + 1, CHECKPOINT_HEIGHT);
+                // CRITICAL FIX: Use dynamic checkpoint height instead of hardcoded value
+                // This ensures sync won't complete prematurely before reaching the latest checkpoint
+                uint64_t checkpoint_height = miq::get_highest_checkpoint_height();
+                network_height = std::max(cur + 1, checkpoint_height);
             }
 
             if (tui && can_tui) {
@@ -4384,7 +4399,18 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                 if (!compute_sync_gate(chain, p2p, why)) { stable = false; break; }
             }
             if (stable) {
-            if (tui && can_tui) {
+                // CRITICAL FIX: Verify we've passed all checkpoints before declaring sync complete
+                // This prevents syncing to a short fork chain
+                uint64_t checkpoint_height = miq::get_highest_checkpoint_height();
+                if (chain.height() < checkpoint_height) {
+                    log_warn("IBD: Refusing to complete sync - height " + std::to_string(chain.height()) +
+                            " is below checkpoint " + std::to_string(checkpoint_height));
+                    // Not at checkpoint yet, keep syncing
+                    std::this_thread::sleep_for(250ms);
+                    continue;
+                }
+
+                if (tui && can_tui) {
                     tui->set_ibd_progress(chain.height(),
                                           chain.height(),
                                           (chain.height() >= height_at_seed_connect ? (chain.height() - height_at_seed_connect) : 0),

@@ -9,10 +9,30 @@
 #if defined(_WIN32)
   #include <windows.h>
   static inline void flush_path(const std::string& p){
-      HANDLE h = CreateFileA(p.c_str(), GENERIC_WRITE,
-                             FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
-                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-      if (h != INVALID_HANDLE_VALUE) { FlushFileBuffers(h); CloseHandle(h); }
+      // CRITICAL FIX: Retry file open on Windows as files may be temporarily locked
+      // by antivirus, indexing, or other processes - common on Windows 11
+      HANDLE h = INVALID_HANDLE_VALUE;
+      for (int retry = 0; retry < 3 && h == INVALID_HANDLE_VALUE; ++retry) {
+          h = CreateFileA(p.c_str(), GENERIC_WRITE,
+                          FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+          if (h == INVALID_HANDLE_VALUE && retry < 2) {
+              Sleep(50);  // Wait 50ms before retry
+          }
+      }
+      if (h != INVALID_HANDLE_VALUE) {
+          if (!FlushFileBuffers(h)) {
+              // Log flush failure - data may not be persisted to disk
+              DWORD err = GetLastError();
+              miq::log_warn("Storage: FlushFileBuffers failed for " + p +
+                      " error=" + std::to_string(err));
+          }
+          CloseHandle(h);
+      } else {
+          DWORD err = GetLastError();
+          miq::log_warn("Storage: CreateFileA failed for flush " + p +
+                  " error=" + std::to_string(err));
+      }
   }
 #else
   #include <unistd.h>

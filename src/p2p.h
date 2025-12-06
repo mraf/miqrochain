@@ -42,6 +42,14 @@ namespace miq {
 }
 
 // =============================================================================
+// GLOBAL NETWORK STATISTICS (accessible from both p2p.cpp and main.cpp)
+// =============================================================================
+namespace p2p_stats {
+    extern std::atomic<uint64_t> bytes_sent;
+    extern std::atomic<uint64_t> bytes_recv;
+}
+
+// =============================================================================
 // PRODUCTION-GRADE P2P NETWORK CONFIGURATION
 // Optimized for millions of users and high reliability
 // =============================================================================
