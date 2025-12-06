@@ -2680,6 +2680,18 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     // CRITICAL: Hold g_peers_mu while modifying peers_ to prevent data race with loop thread
     {
         std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+
+        // CRITICAL FIX: Check for duplicate IP AGAIN before adding
+        // This prevents TOCTOU race where multiple threads pass the initial check,
+        // connect in parallel, and both try to add the same IP
+        for (const auto& kv : peers_) {
+            if (kv.second.ip == peer_ip) {
+                log_info("P2P: rejecting duplicate outbound connection to " + peer_ip);
+                CLOSESOCK(s);
+                return false;
+            }
+        }
+
         peers_[s] = ps;
         g_peer_index_capable[s] = false;
         g_trickle_last_ms[s] = 0;
@@ -3842,7 +3854,22 @@ void P2P::loop(){
                          ps.blocks_failed_delivery = 0;
                          ps.health_score = 1.0;
                          ps.last_block_received_ms = 0;
-                         { std::lock_guard<std::recursive_mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
+                         {
+                             std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+                             // CRITICAL FIX: Check for duplicate IP before adding (TOCTOU prevention)
+                             bool is_dup = false;
+                             for (const auto& kv : peers_) {
+                                 if (kv.second.ip == ip_txt) { is_dup = true; break; }
+                             }
+                             if (is_dup) {
+                                 log_info("P2P: rejecting duplicate addrman outbound to " + ip_txt);
+                                 CLOSESOCK(s);
+                                 g_addrman.mark_attempt(*cand);
+                                 continue;
+                             }
+                             peers_[s] = ps;
+                             g_outbounds.insert(s);
+                         }
                          g_peer_index_capable[s] = false;
                          g_trickle_last_ms[s] = 0;
                          log_info("P2P: outbound (addrman) " + ps.ip);
@@ -3900,7 +3927,21 @@ void P2P::loop(){
                                 ps.blocks_failed_delivery = 0;
                                 ps.health_score = 1.0;
                                 ps.last_block_received_ms = 0;
-                                { std::lock_guard<std::recursive_mutex> lk(g_peers_mu); peers_[s] = ps; g_outbounds.insert(s); }
+                                {
+                                    std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+                                    // CRITICAL FIX: Check for duplicate IP before adding (TOCTOU prevention)
+                                    bool is_dup = false;
+                                    for (const auto& kv : peers_) {
+                                        if (kv.second.ip == ps.ip) { is_dup = true; break; }
+                                    }
+                                    if (is_dup) {
+                                        log_info("P2P: rejecting duplicate outbound to " + ps.ip);
+                                        CLOSESOCK(s);
+                                        continue;
+                                    }
+                                    peers_[s] = ps;
+                                    g_outbounds.insert(s);
+                                }
                                 g_peer_index_capable[s] = false;
                                 g_trickle_last_ms[s] = 0;
 
@@ -3958,7 +3999,21 @@ void P2P::loop(){
                             ps.blocks_failed_delivery = 0;
                             ps.health_score = 1.0;
                             ps.last_block_received_ms = 0;
-                            { std::lock_guard<std::recursive_mutex> lk(g_peers_mu); peers_[s]=ps; g_outbounds.insert(s); }
+                            {
+                                std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+                                // CRITICAL FIX: Check for duplicate IP before adding (TOCTOU prevention)
+                                bool is_dup = false;
+                                for (const auto& kv : peers_) {
+                                    if (kv.second.ip == dotted) { is_dup = true; break; }
+                                }
+                                if (is_dup) {
+                                    log_info("P2P: rejecting duplicate feeler to " + dotted);
+                                    CLOSESOCK(s);
+                                    continue;
+                                }
+                                peers_[s] = ps;
+                                g_outbounds.insert(s);
+                            }
                             g_peer_index_capable[s] = false;
                             g_trickle_last_ms[s] = 0;
                             log_info("P2P: feeler " + dotted);
