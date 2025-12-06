@@ -213,14 +213,10 @@ struct Checkpoint {
 // Add checkpoints at regular intervals (e.g., every 1000 blocks)
 inline const std::vector<Checkpoint>& get_checkpoints() {
     static const std::vector<Checkpoint> checkpoints = {
-        // === ADD YOUR CHECKPOINTS HERE ===
-        // Format: {height, "blockhash"}
-        // Example:
-        // {0,    "0000000000000000000000000000000000000000000000000000000000000000"},  // Genesis
-        // {1000, "your_block_hash_at_height_1000"},
-        // {2000, "your_block_hash_at_height_2000"},
-        // {3000, "your_block_hash_at_height_3000"},
-        // {4000, "your_block_hash_at_height_4000"},
+        // === MIQROCHAIN OFFICIAL CHECKPOINTS ===
+        // These block hashes are from the official chain (seed.miqrochain.org)
+        // Any chain not containing these exact blocks will be rejected
+        {4255, "00000000050bb0750f9276a0e7bc03a3facdcc5f81d2bf15fce4d894ade27e22"},
     };
     return checkpoints;
 }
