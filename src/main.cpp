@@ -1611,16 +1611,24 @@ public:
     void start() {
         if (!enabled_) return;
         if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H\x1b[?25l");
+        // CRITICAL: Set ALL running flags BEFORE starting threads
+        // Otherwise threads would exit immediately or never stop
+        running_ = true;
+        cache_running_ = true;
+        key_running_ = true;  // Must be set before key_thr_ starts
         draw_once(true);
-        key_thr_ = std::thread([this]{ key_loop(); });
-        thr_     = std::thread([this]{ loop(); });
+        key_thr_   = std::thread([this]{ key_loop(); });
+        cache_thr_ = std::thread([this]{ cache_update_loop(); });  // Background cache updates
+        thr_       = std::thread([this]{ loop(); });
     }
     void stop() {
         if (!enabled_) return;
         running_ = false;
         key_running_ = false;
+        cache_running_ = false;
         if (thr_.joinable()) thr_.join();
         if (key_thr_.joinable()) key_thr_.join();
+        if (cache_thr_.joinable()) cache_thr_.join();
         if (vt_ok_) cw_.write_raw("\x1b[?25h\x1b[0m\n");
     }
     ~TUI(){ stop(); }
@@ -1823,7 +1831,7 @@ private:
     }
 
     void key_loop(){
-        key_running_ = true;
+        // Note: key_running_ is set by start() before this thread launches
 #ifdef _WIN32
         while (key_running_){
             if (_kbhit()){
@@ -1863,13 +1871,79 @@ private:
         }
     }
 
+    // PERFORMANCE: Background thread for cache updates
+    // This runs ALL blocking chain/p2p operations in a separate thread
+    // so the main render loop NEVER blocks on mutexes
+    void cache_update_loop() {
+        using namespace std::chrono_literals;
+        // Note: cache_running_ and running_ are set by start() before this thread launches
+        uint64_t last_net_ms = 0;
+        uint64_t last_sync_update_ms = 0;
+
+        while (cache_running_ && running_) {
+            // Update cache (this can block on chain/p2p mutexes - that's OK in this thread)
+            update_chain_cache_nonblocking();
+
+            // Update network hashrate every second
+            if (now_ms() - last_net_ms > 1000) {
+                last_net_ms = now_ms();
+                double nh = estimate_network_hashrate(chain_);
+
+                std::lock_guard<std::mutex> lk(mu_);
+                net_hashrate_ = nh;
+                net_spark_.push_back(nh);
+                if (net_spark_.size() > 90) net_spark_.erase(net_spark_.begin());
+
+                // Update sync stats from cached data
+                auto cached = get_cached_chain();
+                if (cached.peer_count > 0) {
+                    // Find max peer tip from cached peers
+                    uint64_t network_height = 0;
+                    for (const auto& peer : cached.peers) {
+                        if (peer.verack_ok && peer.peer_tip > 0 && peer.peer_tip > network_height) {
+                            network_height = peer.peer_tip;
+                        }
+                    }
+                    if (network_height > 0) {
+                        sync_network_height_ = network_height;
+                    }
+                    sync_last_block_time_ = static_cast<uint64_t>(cached.time);
+
+                    // Keep ibd_cur_ in sync with chain height
+                    if (cached.height > ibd_cur_) {
+                        ibd_cur_ = cached.height;
+                    }
+                }
+            }
+
+            // Update sync speed tracking (every 2 seconds for accuracy)
+            if (now_ms() - last_sync_update_ms > 2000) {
+                last_sync_update_ms = now_ms();
+                auto cached = get_cached_chain();
+                uint64_t network_height = 0;
+                for (const auto& peer : cached.peers) {
+                    if (peer.verack_ok && peer.peer_tip > 0 && peer.peer_tip > network_height) {
+                        network_height = peer.peer_tip;
+                    }
+                }
+                if (network_height > 0) {
+                    update_sync_stats(cached.height, network_height, static_cast<uint64_t>(cached.time));
+                }
+            }
+
+            // Sleep 100ms between updates
+            std::this_thread::sleep_for(100ms);
+        }
+    }
+
+    // Main render loop - NO BLOCKING OPERATIONS
+    // All chain/p2p data comes from cache updated by background thread
     void loop(){
         using clock = std::chrono::steady_clock;
         using namespace std::chrono_literals;
-        running_ = true;
+        // Note: running_ is already set by start() before this thread launches
         auto last_hs_time = clock::now();
         auto last_draw_time = clock::now();
-        uint64_t last_net_ms   = now_ms();
 
         // IMPROVED: Adaptive refresh rate for smoother animations
         // - VT terminals: 250ms for smooth spinner animation
@@ -1886,9 +1960,8 @@ private:
                 dark_theme_ = !dark_theme_;
             }
 
-            // PERFORMANCE: Update chain cache BEFORE drawing to minimize lock time
-            // This moves the chain mutex acquisition outside the TUI mutex hold
-            update_chain_cache_nonblocking();
+            // PERFORMANCE: NO BLOCKING CALLS HERE
+            // Cache is updated by background thread (cache_update_loop)
 
             // IMPROVED: Time-based drawing for consistent animation speed
             if ((now - last_draw_time) >= draw_interval) {
@@ -1900,7 +1973,7 @@ private:
             // Sleep for short interval to maintain responsive input handling
             std::this_thread::sleep_for(idle_sleep);
 
-            // Update hashrate sparkline at 250ms intervals
+            // Update hashrate sparkline at 250ms intervals (non-blocking, uses atomic)
             if((clock::now()-last_hs_time) > 250ms){
                 last_hs_time = clock::now();
                 std::lock_guard<std::mutex> lk(mu_);
@@ -1908,70 +1981,8 @@ private:
                 if(spark_hs_.size() > 90) spark_hs_.erase(spark_hs_.begin());
             }
 
-            // Handle snapshot requests
+            // Handle snapshot requests (only on explicit user request)
             if (global::tui_snapshot_requested.exchange(false)) snapshot_to_disk();
-
-            // Update network hashrate every second
-            if (now_ms() - last_net_ms > 1000){
-                last_net_ms = now_ms();
-                double nh = estimate_network_hashrate(chain_);
-                std::lock_guard<std::mutex> lk(mu_);
-                net_hashrate_ = nh;
-                net_spark_.push_back(nh);
-                if (net_spark_.size() > 90) net_spark_.erase(net_spark_.begin());
-
-                // Update Bitcoin Core-like sync stats
-                if (chain_ && p2p_) {
-                    uint64_t network_height = 0;
-
-                    // Get max peer tip for network height
-                    // Only count peers with verack_ok && peer_tip > 0 to match compute_sync_gate()
-                    auto peers = p2p_->snapshot_peers();
-                    for (const auto& peer : peers) {
-                        if (peer.verack_ok && peer.peer_tip > 0 && peer.peer_tip > network_height) {
-                            network_height = peer.peer_tip;
-                        }
-                    }
-
-                    // Get last block timestamp
-                    auto tip = chain_->tip();
-                    uint64_t last_block_time = hdr_time(tip);
-
-                    // Store values (already have lock)
-                    // Only update if we got a valid network height from peers
-                    if (network_height > 0) {
-                        sync_network_height_ = network_height;
-                    }
-                    sync_last_block_time_ = last_block_time;
-
-                    // CRITICAL FIX: Keep ibd_cur_ in sync with chain height
-                    // This ensures correct block count display even during "Connecting" phase
-                    uint64_t chain_height = chain_->height();
-                    if (chain_height > ibd_cur_) {
-                        ibd_cur_ = chain_height;
-                    }
-                }
-            }
-
-            // Update sync speed tracking (every 2 seconds for accuracy)
-            static uint64_t last_sync_update_ms = 0;
-            if (chain_ && p2p_ && now_ms() - last_sync_update_ms > 2000) {
-                last_sync_update_ms = now_ms();
-                uint64_t current_height = chain_->height();
-                uint64_t network_height = 0;
-                auto peers = p2p_->snapshot_peers();
-                // Only count peers with verack_ok && peer_tip > 0
-                for (const auto& peer : peers) {
-                    if (peer.verack_ok && peer.peer_tip > 0 && peer.peer_tip > network_height) {
-                        network_height = peer.peer_tip;
-                    }
-                }
-                uint64_t last_block_time = hdr_time(chain_->tip());
-                // Only update if we have valid peer data
-                if (network_height > 0) {
-                    update_sync_stats(current_height, network_height, last_block_time);
-                }
-            }
         }
     }
 
@@ -2172,8 +2183,9 @@ private:
         }
         double frac = sync_progress / 100.0;
 
-        // Peer info
-        size_t peer_count = p2p_ ? p2p_->snapshot_peers().size() : 0;
+        // Peer info - use cached value to avoid blocking
+        auto cached_splash = get_cached_chain();
+        size_t peer_count = cached_splash.peer_count;
 
         std::vector<std::string> lines;
 
@@ -3815,7 +3827,8 @@ private:
     bool u8_ok_{false};
     std::atomic<bool> running_{false};
     std::atomic<bool> key_running_{false};
-    std::thread thr_, key_thr_;
+    std::atomic<bool> cache_running_{false};  // For background cache thread
+    std::thread thr_, key_thr_, cache_thr_;   // Added cache update thread
     std::mutex mu_;
 
     std::vector<std::pair<std::string,bool>> steps_;
@@ -3880,15 +3893,25 @@ private:
     // PERFORMANCE: Cached chain state to avoid mutex contention during rendering
     // These are updated asynchronously and used for display - prevents UI freeze
     // when chain mutex is held by P2P during block processing
+    struct CachedMempoolStats {
+        size_t count{0};
+        size_t bytes{0};
+        size_t recent_adds{0};
+    };
     struct CachedChainState {
         uint64_t height{0};
         std::vector<uint8_t> tip_hash;
         uint32_t bits{0};
         int64_t time{0};
         uint64_t issued{0};
+        long double work_sum{0.0L};
+        // Full peer snapshot for draw_main
+        std::vector<PeerSnapshot> peers;
         size_t peer_count{0};
         size_t verack_ok{0};
         size_t inflight_tx{0};
+        // Mempool stats
+        CachedMempoolStats mempool;
         uint64_t last_update_ms{0};
     };
     CachedChainState cached_chain_;
@@ -3898,44 +3921,61 @@ private:
     void update_chain_cache_nonblocking() {
         // Only update every 100ms to reduce overhead
         uint64_t now = now_ms();
-        if (now - cached_chain_.last_update_ms < 100) return;
+        {
+            std::lock_guard<std::mutex> lk(cached_chain_mu_);
+            if (now - cached_chain_.last_update_ms < 100) return;
+        }
 
-        // Update peer stats (uses g_peers_mu, usually fast)
+        // Gather all data OUTSIDE the cache lock to minimize lock time
+        std::vector<PeerSnapshot> peers_snapshot;
         size_t peer_count = 0, verack_ok = 0, inflight_tx = 0;
         if (p2p_) {
-            // Snapshot peers is usually fast, but wrap in try for safety
             try {
-                auto peers = p2p_->snapshot_peers();
-                peer_count = peers.size();
-                for (const auto& s : peers) {
+                peers_snapshot = p2p_->snapshot_peers();
+                peer_count = peers_snapshot.size();
+                for (const auto& s : peers_snapshot) {
                     if (s.verack_ok) ++verack_ok;
                     inflight_tx += static_cast<size_t>(s.inflight);
                 }
             } catch (...) {}
         }
 
+        // Get mempool stats
+        CachedMempoolStats mempool_stats;
+        if (mempool_) {
+            try {
+                auto stat = mempool_view_fallback(mempool_);
+                mempool_stats.count = stat.count;
+                mempool_stats.bytes = stat.bytes;
+                mempool_stats.recent_adds = stat.recent_adds;
+            } catch (...) {}
+        }
+
         // Update chain state if available
         if (chain_) {
-            // Get tip - this acquires chain mutex but is usually fast
-            // If chain is busy, this will block briefly but that's acceptable
-            // since we throttle to 100ms
             auto t = chain_->tip();
 
+            // Now update cache with all gathered data
             std::lock_guard<std::mutex> lk(cached_chain_mu_);
             cached_chain_.height = t.height;
             cached_chain_.tip_hash = t.hash;
             cached_chain_.bits = t.bits;
             cached_chain_.time = t.time;
             cached_chain_.issued = t.issued;
+            cached_chain_.work_sum = t.work_sum;
+            cached_chain_.peers = std::move(peers_snapshot);
             cached_chain_.peer_count = peer_count;
             cached_chain_.verack_ok = verack_ok;
             cached_chain_.inflight_tx = inflight_tx;
+            cached_chain_.mempool = mempool_stats;
             cached_chain_.last_update_ms = now;
         } else {
             std::lock_guard<std::mutex> lk(cached_chain_mu_);
+            cached_chain_.peers = std::move(peers_snapshot);
             cached_chain_.peer_count = peer_count;
             cached_chain_.verack_ok = verack_ok;
             cached_chain_.inflight_tx = inflight_tx;
+            cached_chain_.mempool = mempool_stats;
             cached_chain_.last_update_ms = now;
         }
     }
