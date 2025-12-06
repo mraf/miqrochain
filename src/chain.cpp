@@ -485,6 +485,15 @@ Tip Chain::tip() const {
     return tip_;
 }
 
+// CRITICAL FIX: Thread-safe tip_hash accessor
+// Returns a COPY of the tip hash while holding the chain lock.
+// This prevents crashes when another thread modifies tip_ while
+// we're using the hash (e.g., during block submission).
+std::vector<uint8_t> Chain::tip_hash() const {
+    MIQ_CHAIN_GUARD();
+    return tip_.hash;
+}
+
 int64_t Chain::get_header_height(const std::vector<uint8_t>& h) const {
     MIQ_CHAIN_GUARD();
 

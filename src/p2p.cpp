@@ -1002,8 +1002,12 @@ static inline bool ibd_or_fetch_active(const miq::PeerState& ps, int64_t nowms) 
         ps.inflight_index > 0 ||
         ps.inflight_hdr_batches > 0 ||
         ps.sent_getheaders;
-    const int64_t f = (g_peer_last_fetch_ms.count(s)    ? g_peer_last_fetch_ms.at(s)    : 0);
-    const int64_t r = (g_peer_last_request_ms.count(s)  ? g_peer_last_request_ms.at(s)  : 0);
+    // CRITICAL FIX: Use find() instead of count()/at() pattern to avoid TOCTOU race
+    // The old pattern could crash if another thread erased the key between count() and at()
+    auto it_f = g_peer_last_fetch_ms.find(s);
+    auto it_r = g_peer_last_request_ms.find(s);
+    const int64_t f = (it_f != g_peer_last_fetch_ms.end()) ? it_f->second : 0;
+    const int64_t r = (it_r != g_peer_last_request_ms.end()) ? it_r->second : 0;
     const int64_t kWindow = 5 * 60 * 1000; // 5 minutes grace
     // Also grant grace while global headers IBD hasn't finished.
     return inflight || (f && (nowms - f) < kWindow) || (r && (nowms - r) < kWindow)
@@ -3717,6 +3721,18 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
             // Chain already has this block, remove from orphans
             remove_orphan_by_hex(child_hex);
             continue;
+        }
+
+        // CRITICAL FIX: Enforce sequential processing in orphan handling
+        // If this orphan doesn't extend the current tip (e.g., competing chain),
+        // keep it in the orphan pool instead of processing and dropping it.
+        // This prevents losing valid blocks from alternate chains during reorgs.
+        const auto current_tip = chain_.tip_hash();
+        if (ob.header.prev_hash != current_tip) {
+            // Re-register this orphan under its actual parent for later processing
+            const std::string actual_parent_hex = hexkey(ob.header.prev_hash);
+            orphan_children_[actual_parent_hex].push_back(child_hex);
+            continue;  // Don't remove from orphans_, try again when parent becomes tip
         }
 
         std::string err;
@@ -6623,6 +6639,10 @@ void P2P::loop(){
                 }
                 // CRITICAL FIX: Also clear tx inflight tracking on disconnect
                 g_inflight_tx_ts.erase(s);
+                // CRITICAL FIX: Also clear index inflight tracking on disconnect
+                // Missing this caused stale entries and potential use-after-free crashes
+                g_inflight_index_ts.erase(s);
+                g_inflight_index_order.erase(s);
             }
         }
 
