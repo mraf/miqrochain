@@ -3719,6 +3719,17 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
             continue;
         }
 
+        // CRITICAL FIX: Verify orphan extends current tip before processing
+        // This prevents out-of-order processing in edge cases like competing chains
+        const auto& current_tip = chain_.tip_hash();
+        if (ob.header.prev_hash != current_tip) {
+            // Orphan doesn't extend current tip - re-add as orphan for later
+            // This can happen with competing chains (forks)
+            const std::string parent_hex = hexkey(ob.header.prev_hash);
+            orphan_children_[parent_hex].push_back(child_hex);
+            continue;
+        }
+
         std::string err;
         if (chain_.submit_block(ob, err)) {
             // CRITICAL FIX: Notify mempool to remove confirmed transactions
