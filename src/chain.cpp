@@ -706,6 +706,13 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     m.height   = parent_height + 1;
     m.work_sum = parent_work + work_from_bits(h.bits);
 
+    // CHECKPOINT VALIDATION: Reject headers that don't match checkpoints
+    // This prevents nodes from following forked chains
+    if (!miq::check_checkpoint(m.height, hh)) {
+        err = "header hash does not match checkpoint at height " + std::to_string(m.height);
+        return false;
+    }
+
     header_index_.emplace(key, std::move(m));
     set_header_full(key, h);  // THREAD-SAFE
 
@@ -1516,6 +1523,13 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     {
         // Calculate block height for assume-valid check
         uint64_t block_height = tip_.height + 1;
+
+        // CHECKPOINT VALIDATION: Reject blocks that don't match checkpoints
+        // This prevents nodes from following forked chains
+        if (!miq::check_checkpoint(block_height, b.block_hash())) {
+            err = "block hash does not match checkpoint at height " + std::to_string(block_height);
+            return false;
+        }
 
         std::unordered_set<std::string> seen;
         std::vector<std::vector<uint8_t>> txids;
