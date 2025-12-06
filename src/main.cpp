@@ -4281,7 +4281,15 @@ private:
                 } else {
                     log_info("IBDGuard: node resynced.");
                     backoff_ms = 2'000;
-                    if (tui && can_tui) tui->set_node_state(TUI::NodeState::Running);
+                    miq::mark_ibd_complete();  // Enable full durability (fsync on every block)
+                    if (tui && can_tui) {
+                        // CRITICAL FIX: Must set ibd_done_ to true for splash screen transition!
+                        // Without this, the splash screen stays stuck even though IBDGuard succeeded
+                        // because the condition ibd_done_ && nstate_ == Running is never satisfied
+                        tui->set_ibd_progress(chain->height(), chain->height(), 0, "complete", "", true);
+                        tui->set_node_state(TUI::NodeState::Running);
+                        tui->set_mining_gate(true, "");
+                    }
                 }
             }
             std::this_thread::sleep_for(3s);
