@@ -5742,16 +5742,18 @@ void P2P::loop(){
                             // This prevents early sync completion when version message had stale height
                             uint64_t new_height = chain_.height();
 
-                            // CRITICAL: Update peer_tip_height REGARDLESS of whether block was accepted
-                            // With sequential ordering (extends_tip check), blocks may be orphaned first
-                            // but we still know the peer has those blocks. If we only update when
-                            // new_height > old_height, we might declare sync complete prematurely.
-                            // Use next_index-1 as minimum peer tip since we requested that index from them.
-                            uint64_t min_peer_tip = std::max(new_height, ps.next_index > 0 ? ps.next_index - 1 : 0);
-                            if (min_peer_tip > ps.peer_tip_height) {
-                                ps.peer_tip_height = min_peer_tip;
+                            // CRITICAL FIX: Only update peer_tip_height based on ACTUAL received blocks
+                            // NOT based on speculative next_index requests. The previous code was
+                            // using next_index-1 which caused peer_tip_height to inflate beyond
+                            // the actual network height (e.g., showing 5716 when network only has 4500)
+                            //
+                            // We should only trust:
+                            // 1. The height announced in the peer's version message (set at handshake)
+                            // 2. Heights from blocks we actually receive and validate
+                            if (new_height > ps.peer_tip_height) {
+                                ps.peer_tip_height = new_height;
                                 P2P_TRACE("DEBUG: Updated peer " + ps.ip + " tip_height to " +
-                                          std::to_string(min_peer_tip) + " (from index request)");
+                                          std::to_string(new_height) + " (from received block)");
                             }
 
                             // Update reputation: track successful delivery
