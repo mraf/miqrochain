@@ -1914,9 +1914,10 @@ private:
                     uint64_t network_height = 0;
 
                     // Get max peer tip for network height
+                    // Only count peers with verack_ok && peer_tip > 0 to match compute_sync_gate()
                     auto peers = p2p_->snapshot_peers();
                     for (const auto& peer : peers) {
-                        if (peer.peer_tip > network_height) {
+                        if (peer.verack_ok && peer.peer_tip > 0 && peer.peer_tip > network_height) {
                             network_height = peer.peer_tip;
                         }
                     }
@@ -1926,7 +1927,10 @@ private:
                     uint64_t last_block_time = hdr_time(tip);
 
                     // Store values (already have lock)
-                    sync_network_height_ = network_height;
+                    // Only update if we got a valid network height from peers
+                    if (network_height > 0) {
+                        sync_network_height_ = network_height;
+                    }
                     sync_last_block_time_ = last_block_time;
                 }
             }
@@ -1938,11 +1942,17 @@ private:
                 uint64_t current_height = chain_->height();
                 uint64_t network_height = 0;
                 auto peers = p2p_->snapshot_peers();
+                // Only count peers with verack_ok && peer_tip > 0
                 for (const auto& peer : peers) {
-                    if (peer.peer_tip > network_height) network_height = peer.peer_tip;
+                    if (peer.verack_ok && peer.peer_tip > 0 && peer.peer_tip > network_height) {
+                        network_height = peer.peer_tip;
+                    }
                 }
                 uint64_t last_block_time = hdr_time(chain_->tip());
-                update_sync_stats(current_height, network_height, last_block_time);
+                // Only update if we have valid peer data
+                if (network_height > 0) {
+                    update_sync_stats(current_height, network_height, last_block_time);
+                }
             }
         }
     }
@@ -4123,12 +4133,22 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                     tui->set_banner(std::string("Connected to seed: ") + seed_host_cstr());
                     // FIX: Get network height from connected peers instead of using local height
                     // This ensures the progress bar shows meaningful progress from the start
-                    uint64_t initial_network_height = chain.height();
+                    // Only count peers with verack_ok && peer_tip > 0 to prevent premature sync completion
+                    uint64_t initial_network_height = 0;
+                    bool found_valid_peer = false;
                     auto peer_list = p2p->snapshot_peers();
                     for (const auto& pr : peer_list) {
-                        if (pr.peer_tip > initial_network_height) {
-                            initial_network_height = pr.peer_tip;
+                        if (pr.verack_ok && pr.peer_tip > 0) {
+                            if (pr.peer_tip > initial_network_height) {
+                                initial_network_height = pr.peer_tip;
+                            }
+                            found_valid_peer = true;
                         }
+                    }
+                    // If no valid peer tips yet, use checkpoint height as minimum target
+                    if (!found_valid_peer) {
+                        static constexpr uint64_t CHECKPOINT_HEIGHT = 4255;
+                        initial_network_height = std::max(chain.height() + 1, CHECKPOINT_HEIGHT);
                     }
                     tui->set_ibd_progress(chain.height(),
                                           initial_network_height,
@@ -4242,12 +4262,31 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
 
             // CRITICAL FIX: Get actual network height from peers for proper progress display
             // Previously this passed (cur, cur) which made the splash screen think sync was complete
-            uint64_t network_height = cur;  // Default to current if no peers
+            //
+            // IMPORTANT: Only count peers that have:
+            // 1. Completed handshake (verack_ok) - otherwise they haven't told us their height
+            // 2. Reported a valid tip (peer_tip > 0) - 0 means they haven't sent version yet
+            // This matches the logic in compute_sync_gate() to prevent premature sync completion
+            uint64_t network_height = 0;  // Start at 0, will be updated by valid peers
+            bool found_valid_peer = false;
             auto peer_snapshot = p2p->snapshot_peers();
             for (const auto& pr : peer_snapshot) {
-                if (pr.peer_tip > network_height) {
-                    network_height = pr.peer_tip;
+                // Only consider peers that have completed handshake AND reported their tip
+                if (pr.verack_ok && pr.peer_tip > 0) {
+                    if (pr.peer_tip > network_height) {
+                        network_height = pr.peer_tip;
+                    }
+                    found_valid_peer = true;
                 }
+            }
+
+            // If no valid peers found, use checkpoint height as minimum target to prevent
+            // premature sync completion when peers disconnect or haven't reported tips yet
+            if (!found_valid_peer) {
+                // Use the known checkpoint height (4255) as minimum network height
+                // This ensures sync won't complete prematurely before reaching this point
+                static constexpr uint64_t CHECKPOINT_HEIGHT = 4255;
+                network_height = std::max(cur + 1, CHECKPOINT_HEIGHT);
             }
 
             if (tui && can_tui) {
