@@ -1631,7 +1631,18 @@ public:
     void mark_step_fail(const std::string& title){ std::lock_guard<std::mutex> lk(mu_); ensure_step(title); failures_.insert(title); }
 
     // runtime refs
-    void set_runtime_refs(P2P* p2p, Chain* chain, Mempool* mempool) { p2p_ = p2p; chain_ = chain; mempool_ = mempool; }
+    void set_runtime_refs(P2P* p2p, Chain* chain, Mempool* mempool) {
+        std::lock_guard<std::mutex> lk(mu_);
+        p2p_ = p2p;
+        chain_ = chain;
+        mempool_ = mempool;
+        // CRITICAL FIX: Initialize ibd_cur_ from chain height immediately
+        // This ensures the TUI shows the actual block count during the "Connecting" phase
+        // instead of showing "Blocks 0" while waiting for peers
+        if (chain_) {
+            ibd_cur_ = chain_->height();
+        }
+    }
     void set_ports(uint16_t p2pport, uint16_t rpcport) { p2p_port_ = p2pport; rpc_port_ = rpcport; }
     void set_node_state(NodeState st){ std::lock_guard<std::mutex> lk(mu_); nstate_ = st; }
     void set_datadir(const std::string& d){ std::lock_guard<std::mutex> lk(mu_); datadir_ = d; }
@@ -1932,6 +1943,13 @@ private:
                         sync_network_height_ = network_height;
                     }
                     sync_last_block_time_ = last_block_time;
+
+                    // CRITICAL FIX: Keep ibd_cur_ in sync with chain height
+                    // This ensures correct block count display even during "Connecting" phase
+                    uint64_t chain_height = chain_->height();
+                    if (chain_height > ibd_cur_) {
+                        ibd_cur_ = chain_height;
+                    }
                 }
             }
 
