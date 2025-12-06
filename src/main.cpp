@@ -1611,6 +1611,10 @@ public:
     void start() {
         if (!enabled_) return;
         if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H\x1b[?25l");
+        // CRITICAL: Set running flags BEFORE starting threads
+        // Otherwise cache_update_loop() would exit immediately
+        running_ = true;
+        cache_running_ = true;
         draw_once(true);
         key_thr_   = std::thread([this]{ key_loop(); });
         cache_thr_ = std::thread([this]{ cache_update_loop(); });  // Background cache updates
@@ -1871,7 +1875,7 @@ private:
     // so the main render loop NEVER blocks on mutexes
     void cache_update_loop() {
         using namespace std::chrono_literals;
-        cache_running_ = true;
+        // Note: cache_running_ and running_ are set by start() before this thread launches
         uint64_t last_net_ms = 0;
         uint64_t last_sync_update_ms = 0;
 
@@ -1936,7 +1940,7 @@ private:
     void loop(){
         using clock = std::chrono::steady_clock;
         using namespace std::chrono_literals;
-        running_ = true;
+        // Note: running_ is already set by start() before this thread launches
         auto last_hs_time = clock::now();
         auto last_draw_time = clock::now();
 
