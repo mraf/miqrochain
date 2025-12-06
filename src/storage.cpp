@@ -137,7 +137,9 @@ bool miq::Storage::read_block_by_index(size_t index, std::vector<uint8_t>& out) 
     // gigabytes of memory, leading to std::bad_alloc or OOM crash
     static constexpr uint32_t STORAGE_MAX_BLOCK_SIZE = 32 * 1024 * 1024; // 32 MB max
     if (sz == 0 || sz > STORAGE_MAX_BLOCK_SIZE) {
-        return false;  // Corrupted or invalid block size
+        log_warn("Storage: block at index " + std::to_string(index) +
+                 " has invalid size (" + std::to_string(sz) + " bytes), skipping");
+        return false;  // Corrupted or invalid block size - caller will handle recovery
     }
 
     out.resize(sz);
@@ -171,7 +173,11 @@ bool miq::Storage::read_state(std::vector<uint8_t>& out) const {
     // CRITICAL FIX: Validate state file size to prevent issues with corrupted files
     // State file should be small (~100 bytes), reject anything unreasonably large
     static constexpr size_t MAX_STATE_SIZE = 1024 * 1024; // 1 MB max (way more than needed)
-    if (sz > MAX_STATE_SIZE) return false;
+    if (sz > MAX_STATE_SIZE) {
+        log_warn("Storage: state.dat is corrupted (size " + std::to_string(sz) +
+                 " bytes), will rebuild from blocks");
+        return false;
+    }
 
     f.seekg(0, std::ios::beg);
     out.resize(sz);

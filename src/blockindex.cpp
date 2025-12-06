@@ -493,7 +493,9 @@ bool BlockIndex::load_from_disk(const std::string& path, std::string& err) {
         // exabytes of memory, leading to std::bad_alloc or OOM crash
         static constexpr uint64_t MAX_HEADER_COUNT = 100000000; // 100M headers max (centuries of blocks)
         if (count > MAX_HEADER_COUNT) {
-            err = "corrupt header count";
+            log_warn("Header index corrupted (invalid count " + std::to_string(count) +
+                     "), will rebuild from blocks");
+            err = "corrupt header count - will rebuild from blocks";
             return false;
         }
 
