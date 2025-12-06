@@ -131,6 +131,15 @@ bool miq::Storage::read_block_by_index(size_t index, std::vector<uint8_t>& out) 
     f.seekg((std::streamoff)offsets_[index], std::ios::beg);
     uint32_t sz = 0;
     if(!f.read((char*)&sz, sizeof(sz))) return false;
+
+    // CRITICAL FIX: Validate block size to prevent segfault on corrupted blocks.dat
+    // Without this check, a corrupted file could cause out.resize() to allocate
+    // gigabytes of memory, leading to std::bad_alloc or OOM crash
+    static constexpr uint32_t STORAGE_MAX_BLOCK_SIZE = 32 * 1024 * 1024; // 32 MB max
+    if (sz == 0 || sz > STORAGE_MAX_BLOCK_SIZE) {
+        return false;  // Corrupted or invalid block size
+    }
+
     out.resize(sz);
     return (bool)f.read((char*)out.data(), sz);
 }
