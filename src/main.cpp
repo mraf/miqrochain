@@ -1875,6 +1875,10 @@ private:
                 dark_theme_ = !dark_theme_;
             }
 
+            // PERFORMANCE: Update chain cache BEFORE drawing to minimize lock time
+            // This moves the chain mutex acquisition outside the TUI mutex hold
+            update_chain_cache_nonblocking();
+
             // IMPROVED: Time-based drawing for consistent animation speed
             if ((now - last_draw_time) >= draw_interval) {
                 draw_once(false);
@@ -2687,10 +2691,10 @@ private:
                     break;
             }
 
-            // Network activity indicator
-            size_t peer_count = p2p_ ? p2p_->snapshot_peers().size() : 0;
-            status << "   " << network_activity(tick_, peer_count, peer_count > 0);
-            status << " " << C_dim() << peer_count << " peers" << C_reset();
+            // Network activity indicator - use cached value (populated at start of draw)
+            auto cached_for_status = get_cached_chain();
+            status << "   " << network_activity(tick_, cached_for_status.peer_count, cached_for_status.peer_count > 0);
+            status << " " << C_dim() << cached_for_status.peer_count << " peers" << C_reset();
 
             // Mining indicator
             if (miner_running_badge()) {
@@ -2726,21 +2730,17 @@ private:
         {
             left_panel.push_back(box_header("Blockchain", half_width, "\x1b[38;5;51m"));
 
-            uint64_t height = chain_ ? chain_->height() : 0;
-            std::string tip_hex;
-            long double tip_diff = 0.0L;
+            // PERFORMANCE: Use cached chain state to avoid mutex contention
+            // This prevents UI freeze when P2P is holding chain mutex during block processing
+            auto cached = get_cached_chain();
+            uint64_t height = cached.height;
+            std::string tip_hex = to_hex(cached.tip_hash);
+            long double tip_diff = difficulty_from_bits(cached.bits);
+            uint64_t tip_ts = static_cast<uint64_t>(cached.time);
             uint64_t tip_age_s = 0;
-            uint64_t tip_ts = 0;
-
-            if (chain_) {
-                auto t = chain_->tip();
-                tip_hex = to_hex(t.hash);
-                tip_diff = difficulty_from_bits(hdr_bits(t));
-                tip_ts = hdr_time(t);
-                if (tip_ts) {
-                    uint64_t now = (uint64_t)std::time(nullptr);
-                    tip_age_s = (now > tip_ts) ? (now - tip_ts) : 0;
-                }
+            if (tip_ts) {
+                uint64_t now = (uint64_t)std::time(nullptr);
+                tip_age_s = (now > tip_ts) ? (now - tip_ts) : 0;
             }
 
             // Height with chain visualization
@@ -2789,15 +2789,11 @@ private:
         {
             right_panel.push_back(box_header("Network", half_width, "\x1b[38;5;47m"));
 
-            size_t peers_n = 0, verack_ok = 0, inflight_tx = 0;
-            if (p2p_) {
-                auto peers = p2p_->snapshot_peers();
-                peers_n = peers.size();
-                for (auto& s : peers) {
-                    if (s.verack_ok) ++verack_ok;
-                    inflight_tx += (size_t)s.inflight;
-                }
-            }
+            // PERFORMANCE: Use cached peer stats to avoid mutex contention
+            auto cached_net = get_cached_chain();
+            size_t peers_n = cached_net.peer_count;
+            size_t verack_ok = cached_net.verack_ok;
+            size_t inflight_tx = cached_net.inflight_tx;
 
             // Peer count with mini bar
             std::ostringstream n1;
@@ -3852,6 +3848,75 @@ private:
     // View mode: Splash during sync, Main after sync complete
     ViewMode    view_mode_{ViewMode::Splash};
     int         splash_transition_counter_{0};  // Count frames at 100% before transitioning
+
+    // PERFORMANCE: Cached chain state to avoid mutex contention during rendering
+    // These are updated asynchronously and used for display - prevents UI freeze
+    // when chain mutex is held by P2P during block processing
+    struct CachedChainState {
+        uint64_t height{0};
+        std::vector<uint8_t> tip_hash;
+        uint32_t bits{0};
+        int64_t time{0};
+        uint64_t issued{0};
+        size_t peer_count{0};
+        size_t verack_ok{0};
+        size_t inflight_tx{0};
+        uint64_t last_update_ms{0};
+    };
+    CachedChainState cached_chain_;
+    std::mutex cached_chain_mu_;  // Separate mutex for cache (never blocks on chain)
+
+    // Non-blocking cache update - call from render loop
+    void update_chain_cache_nonblocking() {
+        // Only update every 100ms to reduce overhead
+        uint64_t now = now_ms();
+        if (now - cached_chain_.last_update_ms < 100) return;
+
+        // Update peer stats (uses g_peers_mu, usually fast)
+        size_t peer_count = 0, verack_ok = 0, inflight_tx = 0;
+        if (p2p_) {
+            // Snapshot peers is usually fast, but wrap in try for safety
+            try {
+                auto peers = p2p_->snapshot_peers();
+                peer_count = peers.size();
+                for (const auto& s : peers) {
+                    if (s.verack_ok) ++verack_ok;
+                    inflight_tx += static_cast<size_t>(s.inflight);
+                }
+            } catch (...) {}
+        }
+
+        // Update chain state if available
+        if (chain_) {
+            // Get tip - this acquires chain mutex but is usually fast
+            // If chain is busy, this will block briefly but that's acceptable
+            // since we throttle to 100ms
+            auto t = chain_->tip();
+
+            std::lock_guard<std::mutex> lk(cached_chain_mu_);
+            cached_chain_.height = t.height;
+            cached_chain_.tip_hash = t.hash;
+            cached_chain_.bits = t.bits;
+            cached_chain_.time = t.time;
+            cached_chain_.issued = t.issued;
+            cached_chain_.peer_count = peer_count;
+            cached_chain_.verack_ok = verack_ok;
+            cached_chain_.inflight_tx = inflight_tx;
+            cached_chain_.last_update_ms = now;
+        } else {
+            std::lock_guard<std::mutex> lk(cached_chain_mu_);
+            cached_chain_.peer_count = peer_count;
+            cached_chain_.verack_ok = verack_ok;
+            cached_chain_.inflight_tx = inflight_tx;
+            cached_chain_.last_update_ms = now;
+        }
+    }
+
+    // Get cached state without blocking (for rendering)
+    CachedChainState get_cached_chain() {
+        std::lock_guard<std::mutex> lk(cached_chain_mu_);
+        return cached_chain_;
+    }
 };
 
 // ==================================================================
