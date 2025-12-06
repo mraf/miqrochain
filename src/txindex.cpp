@@ -123,8 +123,17 @@ bool TxIndex::load_from_disk() {
         uint64_t count = 0;
         f.read(reinterpret_cast<char*>(&count), sizeof(count));
 
+        // CRITICAL FIX: Validate count to prevent segfault on corrupted txindex
+        // A corrupted file could have count = 0xFFFFFFFFFFFFFFFF
+        static constexpr uint64_t MAX_TX_COUNT = 500000000; // 500M txs max
+        if (count > MAX_TX_COUNT) {
+            log_warn("TxIndex corrupted (invalid count " + std::to_string(count) +
+                     "), will rebuild");
+            return false;
+        }
+
         index_.clear();
-        index_.reserve(count);
+        index_.reserve(static_cast<size_t>(count));
 
         for (uint64_t i = 0; i < count; ++i) {
             // Read 32-byte txid key
