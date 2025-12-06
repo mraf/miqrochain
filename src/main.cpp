@@ -1611,10 +1611,11 @@ public:
     void start() {
         if (!enabled_) return;
         if (vt_ok_) cw_.write_raw("\x1b[2J\x1b[H\x1b[?25l");
-        // CRITICAL: Set running flags BEFORE starting threads
-        // Otherwise cache_update_loop() would exit immediately
+        // CRITICAL: Set ALL running flags BEFORE starting threads
+        // Otherwise threads would exit immediately or never stop
         running_ = true;
         cache_running_ = true;
+        key_running_ = true;  // Must be set before key_thr_ starts
         draw_once(true);
         key_thr_   = std::thread([this]{ key_loop(); });
         cache_thr_ = std::thread([this]{ cache_update_loop(); });  // Background cache updates
@@ -1830,7 +1831,7 @@ private:
     }
 
     void key_loop(){
-        key_running_ = true;
+        // Note: key_running_ is set by start() before this thread launches
 #ifdef _WIN32
         while (key_running_){
             if (_kbhit()){
