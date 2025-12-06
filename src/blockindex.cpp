@@ -488,6 +488,15 @@ bool BlockIndex::load_from_disk(const std::string& path, std::string& err) {
         uint64_t count;
         f.read(reinterpret_cast<char*>(&count), 8);
 
+        // CRITICAL FIX: Validate header count to prevent segfault on corrupted index files
+        // A corrupted file could have count = 0xFFFFFFFFFFFFFFFF, causing reserve() to allocate
+        // exabytes of memory, leading to std::bad_alloc or OOM crash
+        static constexpr uint64_t MAX_HEADER_COUNT = 100000000; // 100M headers max (centuries of blocks)
+        if (count > MAX_HEADER_COUNT) {
+            err = "corrupt header count";
+            return false;
+        }
+
         // Clear existing data
         map_.clear();
         children_.clear();
@@ -495,7 +504,7 @@ bool BlockIndex::load_from_disk(const std::string& path, std::string& err) {
 
         // First pass: create all records
         std::vector<std::shared_ptr<HeaderRec>> records;
-        records.reserve(count);
+        records.reserve(static_cast<size_t>(count));
 
         for (uint64_t i = 0; i < count; ++i) {
             auto rec = std::make_shared<HeaderRec>();

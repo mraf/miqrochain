@@ -292,6 +292,12 @@ static bool read_undo_file(const std::string& base_dir,
 
     uint32_t cnt=0; if(!read_exact(f, &cnt, sizeof(cnt))) { std::fclose(f); return false; }
 
+    // CRITICAL FIX: Validate undo count to prevent segfault on corrupted undo files
+    // A corrupted file could have cnt = 0xFFFFFFFF, causing reserve() to allocate
+    // gigabytes of memory, leading to std::bad_alloc or OOM crash
+    static constexpr uint32_t MAX_UNDO_ENTRIES = 1000000; // 1M entries max (way more than any block needs)
+    if (cnt > MAX_UNDO_ENTRIES) { std::fclose(f); return false; }
+
     out.clear(); out.reserve(cnt);
 
     for(uint32_t i=0;i<cnt;i++){

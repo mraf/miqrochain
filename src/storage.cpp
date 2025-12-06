@@ -167,6 +167,12 @@ bool miq::Storage::read_state(std::vector<uint8_t>& out) const {
     std::streamoff end = f.tellg();
     if (end < 0) return false;
     size_t sz = static_cast<size_t>(end);
+
+    // CRITICAL FIX: Validate state file size to prevent issues with corrupted files
+    // State file should be small (~100 bytes), reject anything unreasonably large
+    static constexpr size_t MAX_STATE_SIZE = 1024 * 1024; // 1 MB max (way more than needed)
+    if (sz > MAX_STATE_SIZE) return false;
+
     f.seekg(0, std::ios::beg);
     out.resize(sz);
     if (sz == 0) return true;             // empty state is valid
