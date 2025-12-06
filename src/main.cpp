@@ -2872,11 +2872,11 @@ private:
 
             // Network stats
             std::ostringstream n4;
-            n4 << C_dim() << "Sent:" << C_reset() << "       " << fmt_net_bytes(g_net_stats.bytes_sent.load());
+            n4 << C_dim() << "Sent:" << C_reset() << "       " << fmt_net_bytes(p2p_stats::bytes_sent.load());
             right_panel.push_back(box_row(n4.str(), half_width));
 
             std::ostringstream n5;
-            n5 << C_dim() << "Received:" << C_reset() << "   " << fmt_net_bytes(g_net_stats.bytes_recv.load());
+            n5 << C_dim() << "Received:" << C_reset() << "   " << fmt_net_bytes(p2p_stats::bytes_recv.load());
             right_panel.push_back(box_row(n5.str(), half_width));
 
             // Connection status

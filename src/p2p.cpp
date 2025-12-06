@@ -1,5 +1,12 @@
 // src/p2p.cpp  (strict-filter profile, Windows SOCKET-safe)
 #include "p2p.h"
+
+// Define global network statistics
+namespace p2p_stats {
+    std::atomic<uint64_t> bytes_sent{0};
+    std::atomic<uint64_t> bytes_recv{0};
+}
+
 #include <cmath>
 #include "nat.h"
 #include "seeds.h"
@@ -873,7 +880,8 @@ static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
 #endif
     }
 
-
+    // Track total bytes sent for network stats
+    p2p_stats::bytes_sent.fetch_add(len, std::memory_order_relaxed);
     return true;
 }
 static inline bool miq_send(Sock s, const std::vector<uint8_t>& v){
@@ -5305,6 +5313,9 @@ void P2P::loop(){
                         continue;
                     }
                 }
+
+                // Track total bytes received for network stats
+                p2p_stats::bytes_recv.fetch_add((uint64_t)n, std::memory_order_relaxed);
 
                 // Log received bytes during handshake phase for diagnostics
                 if (!ps.verack_ok) {
