@@ -704,6 +704,22 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
         parent_height = 0;
         parent_work = 0.0L;
         found_parent = true;
+    } else {
+        // CRITICAL FIX: Check if prev_hash is the genesis hash
+        // This allows headers at height 1+ to be accepted even when genesis
+        // isn't in header_index_ (e.g., fork recovery, fresh sync)
+        static std::vector<uint8_t> genesis_hash;
+        static bool genesis_parsed = false;
+        if (!genesis_parsed) {
+            genesis_parsed = true;
+            parse_hex32(GENESIS_HASH_HEX, genesis_hash);
+        }
+        if (!genesis_hash.empty() && h.prev_hash == genesis_hash) {
+            // Parent is genesis - treat as height 0 parent
+            parent_height = 0;
+            parent_work = work_from_bits(GENESIS_BITS);  // Genesis work
+            found_parent = true;
+        }
     }
 
     // CRITICAL FIX: If we can't find the parent, reject the header
