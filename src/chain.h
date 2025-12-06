@@ -56,7 +56,11 @@ public:
     // ---- Public API (unchanged signatures; internally synchronized) ----
     static long double work_from_bits_public(uint32_t bits);
 
-    const std::vector<uint8_t>& tip_hash() const { return tip_.hash; }
+    // CRITICAL FIX: Return by value to prevent race condition
+    // The old version returned a reference without locking, which could cause
+    // a crash if another thread modified tip_ while the reference was in use.
+    // Now callers get a safe copy. For performance-critical paths, use tip().hash.
+    std::vector<uint8_t> tip_hash() const;
 
     bool read_block_any(const std::vector<uint8_t>& h, Block& out) const;
     bool validate_header(const BlockHeader& h, std::string& err) const;
