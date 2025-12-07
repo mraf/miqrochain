@@ -2526,16 +2526,26 @@ bool P2P::start(uint16_t port){
 void P2P::stop(){
     if (!running_) return;
     running_ = false;
+
+    // Close server sockets first to wake up poll() if it's blocking
     if (srv_ != MIQ_INVALID_SOCK) { CLOSESOCK(srv_); srv_ = MIQ_INVALID_SOCK; }
     if (g_srv6_ != MIQ_INVALID_SOCK) { CLOSESOCK(g_srv6_); g_srv6_ = MIQ_INVALID_SOCK; }
-    for (auto& kv : peers_) {
-        if (kv.first != MIQ_INVALID_SOCK) {
-            gate_on_close(kv.first);
-            CLOSESOCK(kv.first);
-        }
-    }
-    peers_.clear();
+
+    // CRITICAL FIX: Join thread BEFORE modifying peers_ to prevent race condition
+    // The main loop may still be accessing peers_ until it exits
     if (th_.joinable()) th_.join();
+
+    // Now safe to modify peers_ since the thread has exited
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+        for (auto& kv : peers_) {
+            if (kv.first != MIQ_INVALID_SOCK) {
+                gate_on_close(kv.first);
+                CLOSESOCK(kv.first);
+            }
+        }
+        peers_.clear();
+    }
 #ifdef _WIN32
     WSACleanup();
 #endif
@@ -5653,7 +5663,7 @@ void P2P::loop(){
                         // Free a header slot and keep pipelining while within caps.
                         std::vector<BlockHeader> hs;
                         if (!parse_headers_payload(m.payload, hs)) {
-                            if (++ps.mis > 10) { dead.push_back(s); }
+                            if (++ps.mis > 10) { dead.push_back(s); break; }
                             continue;
                         }
 
@@ -6204,7 +6214,7 @@ void P2P::loop(){
                             for(int j=0;j<8;j++) kb |= (uint64_t)m.payload[j] << (8*j);
                             set_peer_feefilter(s, kb);
                         } else {
-                            if (++ps.mis > 10) { dead.push_back(s); }
+                            if (++ps.mis > 10) { dead.push_back(s); break; }
                         }
 
                     // ─────────────────────────────────────────────────────────
@@ -6227,7 +6237,7 @@ void P2P::loop(){
                                          std::to_string(version) + (high_bandwidth ? " (high-bandwidth)" : ""));
                             }
                         } else {
-                            if (++ps.mis > 10) { dead.push_back(s); }
+                            if (++ps.mis > 10) { dead.push_back(s); break; }
                         }
 
                     } else if (cmd == "cmpctblock") {
@@ -6307,7 +6317,7 @@ void P2P::loop(){
                         std::vector<std::vector<uint8_t>> locator;
                         std::vector<uint8_t> stop;
                         if (!parse_getheaders_payload(m.payload, locator, stop)) {
-                            if (++ps.mis > 10) { dead.push_back(s); }
+                            if (++ps.mis > 10) { dead.push_back(s); break; }
                             continue;
                         }
 
@@ -6330,7 +6340,7 @@ void P2P::loop(){
                         g_peer_last_fetch_ms[(Sock)ps.sock] = now_ms();
                         std::vector<BlockHeader> hs;
                         if (!parse_headers_payload(m.payload, hs)) {
-                            if (++ps.mis > 10) { dead.push_back(s); }
+                            if (++ps.mis > 10) { dead.push_back(s); break; }
                             continue;
                         }
                         const size_t kHdrBatchMax = 2000; // must match build_headers_payload()
@@ -6479,7 +6489,7 @@ void P2P::loop(){
 
 #endif
                     } else {
-                        if (++ps.mis > 10) { dead.push_back(s); }
+                        if (++ps.mis > 10) { dead.push_back(s); continue; }
                     }
                 }
 
@@ -6578,7 +6588,7 @@ void P2P::loop(){
                     if (last_ok && (tnow - last_ok) > (int64_t)(g_stall_retry_ms * 4) && !is_lb) {
                         log_warn("P2P: deprioritizing header-stalled peer " + ps.ip);
                         g_peer_stalls[s]++;
-                        if (g_peer_stalls[s] >= MIQ_P2P_BAD_PEER_MAX_STALLS) dead.push_back(s);
+                        if (g_peer_stalls[s] >= MIQ_P2P_BAD_PEER_MAX_STALLS) { dead.push_back(s); continue; }
                     }
                 }
             }
@@ -6959,8 +6969,9 @@ void P2P::loop(){
 }
 std::vector<PeerSnapshot> P2P::snapshot_peers() const {
     std::vector<PeerSnapshot> out;
-    out.reserve(peers_.size());
+    // CRITICAL FIX: Acquire lock BEFORE accessing peers_ to prevent race condition
     std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+    out.reserve(peers_.size());
     for (const auto& kv : peers_) {
         const auto& ps = kv.second;
         PeerSnapshot s;
