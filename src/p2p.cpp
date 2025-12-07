@@ -3215,13 +3215,14 @@ void P2P::fill_index_pipeline(PeerState& ps){
     const uint64_t max_ahead = orphan_count_limit_ / 2;
     uint64_t max_index = current_height + max_ahead;
 
-    // Use peer_tip_height if known, otherwise fall back to header height
-    // This allows sync to start even before version message is fully processed
+    // Determine the limit for block requests from this peer
+    // CRITICAL: Use peer_tip_height as primary source, fall back to header height
     const uint64_t best_hdr = chain_.best_header_height();
     uint64_t peer_limit;
     if (ps.peer_tip_height > 0) {
-        // Prefer peer's announced tip (with small margin for growth)
-        peer_limit = ps.peer_tip_height + 8;
+        // Use peer's announced tip - this is what they claim to have
+        // No speculative margin to avoid nfbi confusion
+        peer_limit = ps.peer_tip_height;
         // If peer is significantly behind us, don't request from them
         if (ps.peer_tip_height + 16 < current_height) {
             P2P_TRACE("DEBUG: Skipping block requests from " + ps.ip +
@@ -3231,10 +3232,10 @@ void P2P::fill_index_pipeline(PeerState& ps){
         }
     } else if (best_hdr > 0) {
         // Fallback to header height if peer_tip not yet known
-        peer_limit = best_hdr + 32;
+        peer_limit = best_hdr;
     } else {
-        // No info yet - allow speculative requests up to reasonable limit
-        peer_limit = current_height + 1000;
+        // No info yet - allow requests up to reasonable limit for initial sync
+        peer_limit = current_height + 2000;
     }
     max_index = std::min(max_index, peer_limit);
 
@@ -3822,7 +3823,6 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
         // The peer will respond with the block if they have it, or ignore if they don't
         // CRITICAL FIX: Allow speculative requests beyond announced tip during IBD
         // Peer's version message tip might be stale if peer continued syncing after we connected
-        constexpr uint64_t IBD_SPECULATIVE_MARGIN = 16; // Probe this many blocks beyond announced tip
         for (auto& kvp : peers_) {
             auto& pps = kvp.second;
             if (!pps.verack_ok) continue;
@@ -3830,8 +3830,8 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             // Use peer_tip_height if known, otherwise fall back to header height for initial sync
             uint64_t best_hdr_height = chain_.best_header_height();
             uint64_t peer_tip = (pps.peer_tip_height > 0) ? pps.peer_tip_height : best_hdr_height;
-            // Allow small speculative margin - peer might have gotten a few more blocks since version
-            uint64_t probe_limit = peer_tip + IBD_SPECULATIVE_MARGIN;
+            // Use exact peer tip - no speculative margin to avoid nfbi confusion
+            uint64_t probe_limit = peer_tip;
             if (peer_tip > 0 && next_height > probe_limit && pps.inflight_index == 0) {
                 P2P_TRACE("DEBUG: Not requesting block " + std::to_string(next_height) +
                           " from " + pps.ip + " (beyond peer tip + margin)");
@@ -5069,13 +5069,14 @@ void P2P::loop(){
 
                         // If no info at all, use a reasonable default
                         if (peer_tip == 0) {
-                            peer_tip = current_height + 1000;
+                            peer_tip = current_height + 2000;
                         }
 
-                        uint64_t max_height = std::min(peer_tip + 8, current_height + pps.adaptive_batch_size);
+                        // Use exact peer tip - no speculative margin
+                        uint64_t max_height = std::min(peer_tip, current_height + pps.adaptive_batch_size);
 
                         // Request blocks up to max_height (capped by peer's tip)
-                        uint64_t batch_end = std::min<uint64_t>(max_height, peer_tip + 8);
+                        uint64_t batch_end = std::min<uint64_t>(max_height, peer_tip);
 
                         for (uint64_t h = current_height + 1; h <= batch_end; h++) {
                             request_block_index(pps, (uint64_t)h);
