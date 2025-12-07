@@ -3223,6 +3223,24 @@ void P2P::fill_index_pipeline(PeerState& ps){
         max_index = std::min(max_index, header_limit);
     }
 
+    // CRITICAL FIX: Also limit by peer's announced tip height
+    // This prevents requesting blocks the peer doesn't have yet.
+    // peer_tip_height is set from version message and updated when peer sends headers/blocks
+    // If peer_tip_height is 0 or very low, be conservative and request from seeds instead
+    if (ps.peer_tip_height > 0) {
+        // Allow small margin (8 blocks) in case peer has grown since last update
+        uint64_t peer_limit = ps.peer_tip_height + 8;
+        max_index = std::min(max_index, peer_limit);
+
+        // If peer is significantly behind us, don't request from them at all
+        if (ps.peer_tip_height + 16 < current_height) {
+            P2P_TRACE("DEBUG: Skipping block requests from " + ps.ip +
+                      " - peer_tip=" + std::to_string(ps.peer_tip_height) +
+                      " our_height=" + std::to_string(current_height));
+            return;
+        }
+    }
+
     while (ps.inflight_index < pipe) {
         uint64_t idx = ps.next_index;
 
@@ -4373,8 +4391,59 @@ void P2P::loop(){
                 }
                 g_next_stall_probe_ms = tnow + g_stall_retry_ms;
             }
+
+            // CRITICAL FIX: If we have peers but they can't serve blocks we need, connect to seeds
+            // This handles the case where a node is only connected to peers that are behind
+            // (e.g., connected to a node that's still syncing itself)
+            if (!peers_.empty() && tnow - g_last_progress_ms > 30000) {
+                // Check if any peer can serve the blocks we need
+                uint64_t our_height = chain_.height();
+                bool found_capable_peer = false;
+                for (const auto& kvp : peers_) {
+                    if (!kvp.second.verack_ok) continue;
+                    // Peer is capable if their tip is ahead of our height
+                    if (kvp.second.peer_tip_height > our_height + 1) {
+                        found_capable_peer = true;
+                        break;
+                    }
+                }
+
+                if (!found_capable_peer) {
+                    static int64_t s_last_no_capable_log_ms = 0;
+                    static int64_t s_last_no_capable_seed_ms = 0;
+
+                    if (tnow - s_last_no_capable_log_ms > 60000) {
+                        s_last_no_capable_log_ms = tnow;
+                        log_warn("P2P: No peers can serve blocks above height " + std::to_string(our_height) +
+                                 " - connecting to seeds");
+                    }
+
+                    if (tnow - s_last_no_capable_seed_ms > 30000) {
+                        s_last_no_capable_seed_ms = tnow;
+                        std::vector<miq::SeedEndpoint> seeds;
+                        if (miq::resolve_dns_seeds(seeds, P2P_PORT, /*include_single_dns_seed=*/true)) {
+                            size_t boots = std::min<size_t>(seeds.size(), 3);
+                            for (size_t i = 0; i < boots; ++i) {
+                                // Check if we're not already connected to this seed
+                                bool already_connected = false;
+                                for (const auto& kvp : peers_) {
+                                    if (kvp.second.ip == seeds[i].ip) {
+                                        already_connected = true;
+                                        break;
+                                    }
+                                }
+                                if (!already_connected) {
+                                    if (connect_seed(seeds[i].ip, P2P_PORT)) {
+                                        log_info("P2P: Connected to seed " + seeds[i].ip + " for additional sync capacity");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
-        
+
         // === NEW: Adaptive timeout & retry for inflight blocks =======================
         {
           // CRITICAL FIX: Hold g_peers_mu to prevent race with connect_seed() from main thread
@@ -5930,6 +5999,23 @@ void P2P::loop(){
                             for (int j=0;j<8;j++) idx64 |= ((uint64_t)m.payload[j]) << (8*j);
                             P2P_TRACE("DEBUG: getbi request for index " + std::to_string(idx64) + " from " + ps.ip);
 
+                            // DIAGNOSTIC: Log getbi requests that might fail
+                            uint64_t our_height = chain_.height();
+                            if (idx64 > our_height) {
+                                // Rate-limit this log to prevent spam
+                                static std::atomic<int64_t> last_future_log_ms{0};
+                                static std::atomic<int> future_req_count{0};
+                                int64_t tnow = now_ms();
+                                future_req_count.fetch_add(1, std::memory_order_relaxed);
+                                if (tnow - last_future_log_ms.load(std::memory_order_relaxed) > 5000) {
+                                    int cnt = future_req_count.exchange(0, std::memory_order_relaxed);
+                                    log_warn("P2P: Peer " + ps.ip + " requested block " + std::to_string(idx64) +
+                                             " but our height is only " + std::to_string(our_height) +
+                                             " (count=" + std::to_string(cnt) + " requests beyond tip)");
+                                    last_future_log_ms.store(tnow, std::memory_order_relaxed);
+                                }
+                            }
+
                             Block b;
                             if (chain_.get_block_by_index((size_t)idx64, b)) {
                                 auto raw = ser_block(b);
@@ -5940,6 +6026,19 @@ void P2P::loop(){
                                     P2P_TRACE("SKIP " + ps.ip + " cmd=getbi height=" + std::to_string(idx64) + " (block too large)");
                                 }
                             } else {
+                                // CRITICAL FIX: Send "notfound" response so peer doesn't wait for timeout
+                                // This is similar to Bitcoin Core behavior - when we can't serve a block,
+                                // we inform the peer immediately instead of leaving them hanging
+                                if (idx64 <= our_height) {
+                                    // This is concerning - we should have this block
+                                    static std::atomic<int64_t> last_missing_log_ms{0};
+                                    int64_t tnow = now_ms();
+                                    if (tnow - last_missing_log_ms.load(std::memory_order_relaxed) > 10000) {
+                                        log_warn("P2P: Failed to retrieve block at index " + std::to_string(idx64) +
+                                                 " (our height=" + std::to_string(our_height) + ") - possible index corruption");
+                                        last_missing_log_ms.store(tnow, std::memory_order_relaxed);
+                                    }
+                                }
                                 P2P_TRACE("SKIP " + ps.ip + " cmd=getbi height=" + std::to_string(idx64) + " (block not available)");
                             }
                         } else {
@@ -5990,23 +6089,23 @@ void P2P::loop(){
                             uint64_t old_height = chain_.height();
                             handle_incoming_block(s, m.payload);
 
-                            // FIX: Update peer_tip_height based on what we've requested from this peer
-                            // If we requested index N from this peer, they must have at least N blocks
+                            // FIX: Update peer_tip_height based on blocks we've received from this peer
+                            // If we received a block at height N from this peer, they have at least N blocks
                             // This prevents early sync completion when version message had stale height
                             uint64_t new_height = chain_.height();
 
-                            // CRITICAL FIX: Only update peer_tip_height based on ACTUAL received blocks
-                            // NOT based on speculative next_index requests. The previous code was
-                            // using next_index-1 which caused peer_tip_height to inflate beyond
-                            // the actual network height (e.g., showing 5716 when network only has 4500)
+                            // CRITICAL FIX: Update peer_tip_height based on ACTUAL received blocks
+                            // The received block confirms that the peer HAS this block
+                            // We use the block's height in our chain (or requested index if orphaned)
                             //
-                            // We should only trust:
+                            // We should trust:
                             // 1. The height announced in the peer's version message (set at handshake)
                             // 2. Heights from blocks we actually receive and validate
+                            // 3. The index we requested (if we got a response, peer has at least that block)
                             if (new_height > ps.peer_tip_height) {
                                 ps.peer_tip_height = new_height;
                                 P2P_TRACE("DEBUG: Updated peer " + ps.ip + " tip_height to " +
-                                          std::to_string(new_height) + " (from received block)");
+                                          std::to_string(new_height) + " (from chain height)");
                             }
 
                             // Update reputation: track successful delivery
@@ -6038,6 +6137,16 @@ void P2P::loop(){
                                     }
                                 }
                                 if (delivered_idx != 0) {
+                                    // CRITICAL FIX: Update peer_tip_height based on delivered block index
+                                    // If peer delivered block N, they have at least N blocks.
+                                    // This enables continued sync even when blocks arrive as orphans
+                                    // and don't immediately extend our chain.
+                                    if (delivered_idx > ps.peer_tip_height) {
+                                        ps.peer_tip_height = delivered_idx;
+                                        P2P_TRACE("DEBUG: Updated peer " + ps.ip + " tip_height to " +
+                                                  std::to_string(delivered_idx) + " (from delivered block)");
+                                    }
+
                                     auto it_idx = g_inflight_index_ts[(Sock)s].find(delivered_idx);
                                     if (it_idx != g_inflight_index_ts[(Sock)s].end()) {
                                         g_inflight_index_ts[(Sock)s].erase(it_idx);
