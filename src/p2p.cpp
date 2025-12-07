@@ -4395,7 +4395,8 @@ void P2P::loop(){
             // CRITICAL FIX: If we have peers but they can't serve blocks we need, connect to seeds
             // This handles the case where a node is only connected to peers that are behind
             // (e.g., connected to a node that's still syncing itself)
-            if (!peers_.empty() && tnow - g_last_progress_ms > 30000) {
+            // Use 10 seconds instead of 30 - faster detection of incapable peers
+            if (!peers_.empty() && tnow - g_last_progress_ms > 10000) {
                 // Check if any peer can serve the blocks we need
                 uint64_t our_height = chain_.height();
                 bool found_capable_peer = false;
@@ -4412,13 +4413,14 @@ void P2P::loop(){
                     static int64_t s_last_no_capable_log_ms = 0;
                     static int64_t s_last_no_capable_seed_ms = 0;
 
-                    if (tnow - s_last_no_capable_log_ms > 60000) {
+                    if (tnow - s_last_no_capable_log_ms > 30000) {
                         s_last_no_capable_log_ms = tnow;
                         log_warn("P2P: No peers can serve blocks above height " + std::to_string(our_height) +
                                  " - connecting to seeds");
                     }
 
-                    if (tnow - s_last_no_capable_seed_ms > 30000) {
+                    // Try seeds every 10 seconds when stuck (faster than before)
+                    if (tnow - s_last_no_capable_seed_ms > 10000) {
                         s_last_no_capable_seed_ms = tnow;
                         std::vector<miq::SeedEndpoint> seeds;
                         if (miq::resolve_dns_seeds(seeds, P2P_PORT, /*include_single_dns_seed=*/true)) {
@@ -4693,6 +4695,9 @@ void P2P::loop(){
                           kvp.second.syncing = true;
                           kvp.second.inflight_index = 0;
                           kvp.second.next_index = chain_.height() + 1;
+                          // CRITICAL FIX: Actually start requesting blocks after re-enabling
+                          // Without this, the peer is marked as syncing but no requests are made
+                          fill_index_pipeline(kvp.second);
                       }
                   }
               }
@@ -5898,8 +5903,12 @@ void P2P::loop(){
                                 log_info("P2P: headers accepted=" + std::to_string(hdrs_since_log) + " best_height=" + std::to_string(chain_.best_header_height()));
                                 hdrs_since_log = 0;
                             }
-                            g_last_progress_ms = now_ms();
-                            g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
+                            // CRITICAL FIX: Do NOT update g_last_progress_ms for headers!
+                            // We only want to track BLOCK progress for stall detection.
+                            // Headers can arrive even when blocks are stuck, which would prevent
+                            // the seed connection logic from triggering.
+                            // Update the stall probe timer but NOT g_last_progress_ms
+                            g_next_stall_probe_ms = now_ms() + MIQ_P2P_STALL_RETRY_MS;
                             // CRITICAL FIX: Do NOT update peer_tip_height from header height!
                             // Headers can be far ahead of actual blocks, causing premature sync.
                             // peer_tip_height should only come from:
@@ -6632,11 +6641,11 @@ void P2P::loop(){
                         bool at_tip = (hs.empty()) || ((hs.size() < kHdrBatchMax) && (chain_.best_header_height() > chain_.height()) && want.empty());
 
                         if (accepted > 0) {
-                            // PERFORMANCE: Use the static throttle counter from above
-                            // (Headers logging is already throttled by the first branch)
-                            g_last_progress_ms = now_ms();
-                            g_next_stall_probe_ms = g_last_progress_ms + MIQ_P2P_STALL_RETRY_MS;
-                            g_last_hdr_ok_ms[(Sock)s] = g_last_progress_ms;
+                            // CRITICAL FIX: Do NOT update g_last_progress_ms for headers!
+                            // We only want to track BLOCK progress for stall detection.
+                            // Headers arriving shouldn't prevent seed connection when blocks are stuck.
+                            g_next_stall_probe_ms = now_ms() + MIQ_P2P_STALL_RETRY_MS;
+                            g_last_hdr_ok_ms[(Sock)s] = now_ms();
                         } else if (hs.size() > 0) {
                             log_warn("P2P: Headers REJECTED from " + ps.ip + " n=" + std::to_string(hs.size()) +
                                     " accepted=0 error=" + herr);
