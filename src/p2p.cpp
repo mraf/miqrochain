@@ -3210,36 +3210,35 @@ void P2P::fill_index_pipeline(PeerState& ps){
                   " (chain height=" + std::to_string(current_height) + ")");
     }
 
+    // CRITICAL FIX: Only use peer_tip_height to limit block requests!
+    // Headers can be AHEAD of actual blocks. A peer might have headers to height 4288
+    // but only blocks to 4256. Requesting blocks beyond the peer's actual tip causes
+    // sync stalls and the "requested block N but our height is only M" warnings.
+    //
+    // peer_tip_height comes from the version message and is updated when we receive blocks.
+    // If peer_tip_height == 0, we haven't received their version yet - don't request.
+    if (ps.peer_tip_height == 0) {
+        P2P_TRACE("DEBUG: Skipping fill_index_pipeline for " + ps.ip + " - peer_tip_height not yet known");
+        return;
+    }
+
+    // If peer is significantly behind us, don't request from them
+    if (ps.peer_tip_height + 16 < current_height) {
+        P2P_TRACE("DEBUG: Skipping block requests from " + ps.ip +
+                  " - peer_tip=" + std::to_string(ps.peer_tip_height) +
+                  " our_height=" + std::to_string(current_height));
+        return;
+    }
+
     // Backpressure - don't request too far ahead of current tip
     // This prevents orphan pool overflow when blocks arrive out of order.
     const uint64_t max_ahead = orphan_count_limit_ / 2;
     uint64_t max_index = current_height + max_ahead;
 
-    // Also limit by header height if available (for extra security)
-    const uint64_t best_hdr = chain_.best_header_height();
-    if (best_hdr > 0) {
-        constexpr uint64_t HEADER_MARGIN = 32;
-        uint64_t header_limit = best_hdr + HEADER_MARGIN;
-        max_index = std::min(max_index, header_limit);
-    }
-
-    // CRITICAL FIX: Also limit by peer's announced tip height
-    // This prevents requesting blocks the peer doesn't have yet.
-    // peer_tip_height is set from version message and updated when peer sends headers/blocks
-    // If peer_tip_height is 0 or very low, be conservative and request from seeds instead
-    if (ps.peer_tip_height > 0) {
-        // Allow small margin (8 blocks) in case peer has grown since last update
-        uint64_t peer_limit = ps.peer_tip_height + 8;
-        max_index = std::min(max_index, peer_limit);
-
-        // If peer is significantly behind us, don't request from them at all
-        if (ps.peer_tip_height + 16 < current_height) {
-            P2P_TRACE("DEBUG: Skipping block requests from " + ps.ip +
-                      " - peer_tip=" + std::to_string(ps.peer_tip_height) +
-                      " our_height=" + std::to_string(current_height));
-            return;
-        }
-    }
+    // PRIMARY LIMIT: Use peer's announced tip height (with small margin for growth)
+    // This is the authoritative source for what blocks the peer actually has
+    uint64_t peer_limit = ps.peer_tip_height + 8;
+    max_index = std::min(max_index, peer_limit);
 
     while (ps.inflight_index < pipe) {
         uint64_t idx = ps.next_index;
@@ -3315,6 +3314,19 @@ void P2P::send_block(Sock s, const std::vector<uint8_t>& raw){
     bool result = send_or_close(s, msg);
     (void)result; // Used by P2P_TRACE when enabled
     P2P_TRACE("DEBUG: send_block result=" + std::string(result ? "OK" : "FAILED"));
+}
+
+// Send "notfound by index" response when we cannot serve a requested block
+// This allows the requesting peer to immediately retry with another peer
+// instead of waiting for timeout.
+void P2P::send_notfound_index(Sock s, uint64_t idx) {
+    uint8_t p[8];
+    for (int i = 0; i < 8; i++) {
+        p[i] = (uint8_t)((idx >> (8 * i)) & 0xFF);
+    }
+    auto msg = encode_msg("nfbi", std::vector<uint8_t>(p, p + 8));
+    P2P_TRACE("DEBUG: Sending notfound for index " + std::to_string(idx));
+    (void)send_or_close(s, msg);
 }
 
 // === rate-limit helpers ======================================================
@@ -3817,16 +3829,23 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             auto& pps = kvp.second;
             if (!pps.verack_ok) continue;
             if (!peer_is_index_capable((Sock)pps.sock)) continue;
-            uint64_t best_hdr_height = chain_.best_header_height();
-            uint64_t peer_or_hdr_tip = (pps.peer_tip_height > 0)
-                ? std::max<uint64_t>(pps.peer_tip_height, best_hdr_height)
-                : (uint64_t)best_hdr_height;
-            // Allow speculative requests during IBD - peer might have more blocks than announced
-            // Only skip if we're way beyond the tip AND have no inflight requests returning
-            uint64_t probe_limit = peer_or_hdr_tip + IBD_SPECULATIVE_MARGIN;
-            if (peer_or_hdr_tip > 0 && next_height > probe_limit && pps.inflight_index == 0) {
+            // CRITICAL FIX: Only use peer_tip_height to determine how many blocks to request from this peer.
+            // Headers can be AHEAD of actual blocks (e.g., peer has headers to 4288 but blocks only to 4256).
+            // Previously this code used std::max(peer_tip_height, best_header_height) which caused
+            // requests for blocks that don't exist when headers are ahead of blocks.
+            //
+            // peer_tip_height comes from the peer's version message and is the authoritative source
+            // for what blocks they actually have. If it's 0, we skip this peer for block requests.
+            if (pps.peer_tip_height == 0) {
+                P2P_TRACE("DEBUG: Skipping peer " + pps.ip + " - peer_tip_height not yet known");
+                continue;
+            }
+            uint64_t peer_tip = pps.peer_tip_height;
+            // Allow small speculative margin - peer might have gotten a few more blocks since version
+            uint64_t probe_limit = peer_tip + IBD_SPECULATIVE_MARGIN;
+            if (peer_tip > 0 && next_height > probe_limit && pps.inflight_index == 0) {
                 P2P_TRACE("DEBUG: Not requesting block " + std::to_string(next_height) +
-                          " from " + pps.ip + " (beyond peer/header tip + margin)");
+                          " from " + pps.ip + " (beyond peer tip + margin)");
                 continue;
             }
             // Always fill pipeline during IBD - speculative requests will timeout if peer doesn't have blocks
@@ -5055,19 +5074,23 @@ void P2P::loop(){
                         update_peer_reputation(pps);
                         update_adaptive_batch_size(pps);
 
-                        // Determine how many blocks to request (adaptive based on peer reputation)
-                        uint64_t best_hdr_height = chain_.best_header_height();
-                        uint64_t max_height = (best_hdr_height > current_height)
-                            ? best_hdr_height
-                            : current_height + pps.adaptive_batch_size;  // Use adaptive batch size
-
-                        // Cap to peer's known tip height: don't request beyond what peer has sent us
-                        if (pps.peer_tip_height > 0 && pps.peer_tip_height > current_height) {
-                            max_height = std::min(max_height, (uint64_t)pps.peer_tip_height);
+                        // CRITICAL FIX: Only use peer_tip_height to limit block requests, NOT header height!
+                        // Headers can be ahead of actual blocks - a peer might have headers to 4288
+                        // but only blocks to 4256. Requesting blocks beyond peer's actual tip causes
+                        // sync stalls as the peer can't serve those blocks.
+                        //
+                        // Skip this peer if we don't know their tip yet (peer_tip_height == 0)
+                        if (pps.peer_tip_height == 0) {
+                            continue;  // Wait for version message to tell us their tip
                         }
 
-                        // Request blocks up to max_height (or current_height + adaptive_batch_size, whichever is smaller)
-                        uint64_t batch_end = std::min<uint64_t>(max_height, current_height + pps.adaptive_batch_size);
+                        // Determine how many blocks to request from this specific peer
+                        // Use peer's tip as the hard limit (with small margin for growth)
+                        uint64_t peer_tip = pps.peer_tip_height;
+                        uint64_t max_height = std::min(peer_tip + 8, current_height + pps.adaptive_batch_size);
+
+                        // Request blocks up to max_height (capped by peer's tip)
+                        uint64_t batch_end = std::min<uint64_t>(max_height, peer_tip + 8);
 
                         for (uint64_t h = current_height + 1; h <= batch_end; h++) {
                             request_block_index(pps, (uint64_t)h);
@@ -6049,9 +6072,81 @@ void P2P::loop(){
                                     }
                                 }
                                 P2P_TRACE("SKIP " + ps.ip + " cmd=getbi height=" + std::to_string(idx64) + " (block not available)");
+                                // CRITICAL FIX: Actually send notfound response so peer doesn't wait for timeout
+                                send_notfound_index(s, idx64);
                             }
                         } else {
                             P2P_TRACE("SKIP " + ps.ip + " cmd=getbi (invalid payload size=" + std::to_string(m.payload.size()) + ")");
+                        }
+
+                    } else if (cmd == "nfbi") {
+                        // Handle "not found block index" response from peer
+                        // This means the peer doesn't have the block we requested
+                        if (m.payload.size() == 8) {
+                            uint64_t idx64 = 0;
+                            for (int j = 0; j < 8; j++) idx64 |= ((uint64_t)m.payload[j]) << (8 * j);
+
+                            P2P_TRACE("DEBUG: Received notfound for index " + std::to_string(idx64) + " from " + ps.ip);
+
+                            // CRITICAL FIX: Update peer_tip_height - peer doesn't have this block
+                            // If peer says they don't have block N, set their tip to N-1 (or 0)
+                            if (idx64 > 0 && idx64 <= ps.peer_tip_height) {
+                                ps.peer_tip_height = idx64 - 1;
+                                log_info("P2P: Peer " + ps.ip + " doesn't have block " + std::to_string(idx64) +
+                                         ", updated peer_tip_height to " + std::to_string(ps.peer_tip_height));
+                            }
+
+                            // Clear this index from inflight tracking for this peer
+                            auto it_idx = g_inflight_index_ts[(Sock)s].find(idx64);
+                            if (it_idx != g_inflight_index_ts[(Sock)s].end()) {
+                                g_inflight_index_ts[(Sock)s].erase(it_idx);
+                            }
+                            auto& dq_idx = g_inflight_index_order[(Sock)s];
+                            auto dq_it = std::find(dq_idx.begin(), dq_idx.end(), idx64);
+                            if (dq_it != dq_idx.end()) {
+                                dq_idx.erase(dq_it);
+                            }
+
+                            // Clear from global tracking so another peer can try
+                            {
+                                InflightLock lk(g_inflight_lock);
+                                g_global_requested_indices.erase(idx64);
+                            }
+
+                            if (ps.inflight_index > 0) {
+                                ps.inflight_index--;
+                            }
+
+                            // Track as failed delivery for reputation scoring
+                            ps.blocks_failed_delivery++;
+
+                            // Try another peer for this block immediately
+                            // Find a peer that might have this block
+                            std::vector<Sock> alt_peers;
+                            for (auto& kvp : peers_) {
+                                if (kvp.first == s) continue;  // Skip current peer
+                                if (!kvp.second.verack_ok) continue;
+                                // Only try peers that claim to have this block
+                                if (kvp.second.peer_tip_height >= idx64) {
+                                    alt_peers.push_back(kvp.first);
+                                }
+                            }
+
+                            if (!alt_peers.empty()) {
+                                // Pick a random alternative peer
+                                Sock alt_s = alt_peers[std::rand() % alt_peers.size()];
+                                auto pit = peers_.find(alt_s);
+                                if (pit != peers_.end()) {
+                                    request_block_index(pit->second, idx64);
+                                    P2P_TRACE("DEBUG: Retrying index " + std::to_string(idx64) + " with peer " + pit->second.ip);
+                                }
+                            } else {
+                                // No alternative peer available - this block might not be available yet
+                                P2P_TRACE("DEBUG: No alternative peer for index " + std::to_string(idx64));
+                            }
+
+                            // Refill pipeline since we cleared an inflight slot
+                            fill_index_pipeline(ps);
                         }
 
                     } else if (cmd == "block") {
