@@ -3622,6 +3622,175 @@ void P2P::remove_orphan_by_hex(const std::string& child_hex){
     if (dit != orphan_order_.end()) orphan_order_.erase(dit);
 }
 
+// ============================================================================
+// HEIGHT-ORDERED BLOCK QUEUE
+// Blocks are downloaded in parallel for speed, but processed strictly by height.
+// This prevents "missing utxo" errors from out-of-order block processing.
+// ============================================================================
+
+void P2P::queue_block_by_height(uint64_t height, const std::vector<uint8_t>& hash,
+                                 const std::vector<uint8_t>& raw) {
+    // Don't queue if we already have it
+    if (pending_blocks_.count(height)) return;
+
+    PendingBlock pb;
+    pb.hash = hash;
+    pb.raw = raw;
+    pb.received_ms = now_ms();
+
+    pending_blocks_[height] = std::move(pb);
+    pending_blocks_bytes_ += raw.size();
+
+    // Evict old blocks if queue is too large
+    evict_pending_blocks_if_needed();
+}
+
+void P2P::evict_pending_blocks_if_needed() {
+    // Remove blocks that are already in chain or too far behind
+    uint64_t current_height = chain_.height();
+
+    // Remove blocks at or below current height (already processed)
+    auto it = pending_blocks_.begin();
+    while (it != pending_blocks_.end()) {
+        if (it->first <= current_height) {
+            pending_blocks_bytes_ -= it->second.raw.size();
+            it = pending_blocks_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // If still too large, remove the highest blocks first (furthest from being processable)
+    while (pending_blocks_bytes_ > MAX_PENDING_BLOCKS_BYTES && !pending_blocks_.empty()) {
+        auto last = std::prev(pending_blocks_.end());
+        pending_blocks_bytes_ -= last->second.raw.size();
+        pending_blocks_.erase(last);
+    }
+}
+
+void P2P::process_pending_blocks() {
+    uint64_t current_height = chain_.height();
+    uint64_t next_height = current_height + 1;
+    int blocks_processed = 0;
+    static int64_t last_pending_log_ms = 0;
+
+    // Process blocks in strict height order
+    while (true) {
+        auto it = pending_blocks_.find(next_height);
+        if (it == pending_blocks_.end()) {
+            // No block at next height yet - stop processing
+            break;
+        }
+
+        // Deserialize and validate the block
+        Block b;
+        if (!deser_block(it->second.raw, b)) {
+            log_warn("P2P: failed to deserialize pending block at height " + std::to_string(next_height));
+            pending_blocks_bytes_ -= it->second.raw.size();
+            pending_blocks_.erase(it);
+            continue;
+        }
+
+        // Verify this block extends current tip
+        const auto current_tip = chain_.tip_hash();
+        if (b.header.prev_hash != current_tip) {
+            // Block doesn't extend tip - might be on wrong chain or tip changed
+            // Log and skip for now
+            int64_t now_log = now_ms();
+            if (now_log - last_pending_log_ms > 5000) {
+                last_pending_log_ms = now_log;
+                log_warn("P2P: pending block at height " + std::to_string(next_height) +
+                         " doesn't extend current tip - skipping");
+            }
+            pending_blocks_bytes_ -= it->second.raw.size();
+            pending_blocks_.erase(it);
+            break;
+        }
+
+        // Submit the block
+        std::string err;
+        bool accepted = chain_.submit_block(b, err);
+
+        if (accepted) {
+            blocks_processed++;
+
+            // Notify mempool
+            if (mempool_) {
+                mempool_->on_block_connect(b);
+            }
+
+            // Broadcast to peers
+            broadcast_inv_block(it->second.hash);
+
+            // Update tracking
+            g_last_progress_ms = now_ms();
+            g_last_progress_height = chain_.height();
+
+            // TELEMETRY: Notify main.cpp about received blocks for UI display
+            if (block_callback_) {
+                P2PBlockInfo info;
+                info.height = chain_.height();
+                info.hash_hex = hexkey(it->second.hash);
+                info.tx_count = static_cast<uint32_t>(b.txs.size());
+                info.miner = miq_miner_from_block(b);
+                // Calculate fees from coinbase
+                if (!b.txs.empty()) {
+                    uint64_t coinbase_total = 0;
+                    for (const auto& out : b.txs[0].vout) coinbase_total += out.value;
+                    uint64_t subsidy = chain_.subsidy_for_height(info.height);
+                    if (coinbase_total >= subsidy) {
+                        info.fees = coinbase_total - subsidy;
+                        info.fees_known = true;
+                    }
+                }
+                block_callback_(info);
+
+                // Also notify about transactions in this block
+                if (txids_callback_ && b.txs.size() > 1) {
+                    std::vector<std::string> txids;
+                    txids.reserve(b.txs.size() - 1);
+                    for (size_t i = 1; i < b.txs.size(); ++i) {
+                        txids.push_back(hexkey(b.txs[i].txid()));
+                    }
+                    txids_callback_(txids);
+                }
+            }
+
+            // Also try to connect any orphans that were waiting for this block
+            try_connect_orphans(hexkey(it->second.hash));
+
+            // Remove from pending queue
+            pending_blocks_bytes_ -= it->second.raw.size();
+            pending_blocks_.erase(it);
+
+            // Update heights for next iteration
+            current_height = chain_.height();
+            next_height = current_height + 1;
+        } else {
+            // Block rejected - log and remove
+            log_warn("P2P: pending block at height " + std::to_string(next_height) +
+                     " rejected: " + err);
+            pending_blocks_bytes_ -= it->second.raw.size();
+            pending_blocks_.erase(it);
+            break;  // Stop processing on error
+        }
+    }
+
+    // Log progress periodically
+    if (blocks_processed > 0) {
+        static int64_t last_queue_log_ms = 0;
+        static uint64_t total_blocks_processed = 0;
+        total_blocks_processed += blocks_processed;
+        int64_t now_queue = now_ms();
+        if (now_queue - last_queue_log_ms > 5000) {
+            last_queue_log_ms = now_queue;
+            log_warn("Chain: +" + std::to_string(total_blocks_processed) + " blocks → height " +
+                     std::to_string(chain_.height()) + " (pending=" + std::to_string(pending_blocks_.size()) + ")");
+            total_blocks_processed = 0;
+        }
+    }
+}
+
 // Helper: Update peer performance metrics when a block is successfully received
 static void update_peer_performance(PeerState& ps, const std::string& block_hex,
                                      const std::unordered_map<Sock, std::unordered_map<std::string, int64_t>>& inflight_ts,
@@ -3667,51 +3836,49 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
     const auto bh = b.block_hash();
     if (chain_.have_block(bh)) return;
 
-    // BULLETPROOF SYNC: Validate block hash against header index
-    // If we have a header for this block's expected height, verify the hash matches.
-    // This catches malicious peers sending wrong blocks for a given height.
-    // Only applies when we have validated headers (headers-first mode).
-    {
-        int64_t parent_height = chain_.get_header_height(b.header.prev_hash);
-        if (parent_height >= 0) {
-            uint64_t expected_height = static_cast<uint64_t>(parent_height) + 1;
-            std::vector<uint8_t> expected_hash;
-            if (chain_.get_hash_by_index(expected_height, expected_hash)) {
-                // We have a validated header at this height - block hash must match
-                if (bh != expected_hash) {
-                    log_warn("P2P: block hash mismatch at height " + std::to_string(expected_height) +
-                             " - expected " + hexkey(expected_hash).substr(0, 16) +
-                             " got " + hexkey(bh).substr(0, 16) + " - rejecting");
-                    // Penalize the peer for sending wrong block
-                    auto pit = peers_.find(sock);
-                    if (pit != peers_.end()) {
-                        pit->second.mis++;
-                        if (pit->second.mis > 5) {
-                            log_warn("P2P: disconnecting peer " + pit->second.ip + " for repeated hash mismatches");
-                            // Will be cleaned up in dead peer handling
-                        }
+    // =========================================================================
+    // HEIGHT-ORDERED QUEUE: Parallel download, sequential processing
+    // Blocks are downloaded in parallel for speed, but processed strictly by height.
+    // This prevents "missing utxo" errors from out-of-order block processing.
+    // =========================================================================
+
+    // Determine block height from parent
+    int64_t parent_height = chain_.get_header_height(b.header.prev_hash);
+    uint64_t block_height = 0;
+
+    if (parent_height >= 0) {
+        block_height = static_cast<uint64_t>(parent_height) + 1;
+
+        // Validate block hash against header index (if we have headers)
+        std::vector<uint8_t> expected_hash;
+        if (chain_.get_hash_by_index(block_height, expected_hash)) {
+            if (bh != expected_hash) {
+                log_warn("P2P: block hash mismatch at height " + std::to_string(block_height) +
+                         " - expected " + hexkey(expected_hash).substr(0, 16) +
+                         " got " + hexkey(bh).substr(0, 16) + " - rejecting");
+                auto pit = peers_.find(sock);
+                if (pit != peers_.end()) {
+                    pit->second.mis++;
+                    if (pit->second.mis > 5) {
+                        log_warn("P2P: disconnecting peer " + pit->second.ip + " for repeated hash mismatches");
                     }
-                    return;
                 }
+                return;
             }
         }
-    }
 
-    // CRITICAL FIX: Enforce sequential block processing to prevent UTXO errors
-    // With parallel block requests (pipeline=128), blocks can arrive out of order.
-    // Simply checking have_block(prev_hash) is NOT sufficient because:
-    //   - Parent block may exist on disk but its UTXOs haven't been applied yet
-    //   - This causes "missing utxo" errors when processing child blocks
-    //
-    // Solution: Only process blocks that extend the CURRENT TIP (prev_hash == tip_hash).
-    // Out-of-order blocks are stored as orphans and processed sequentially via
-    // try_connect_orphans() when their parent becomes the tip.
-    const auto current_tip = chain_.tip_hash();  // CRITICAL: Must be copy, not reference (tip_hash returns by value)
-    bool extends_tip = (b.header.prev_hash == current_tip);
-    bool have_parent = chain_.have_block(b.header.prev_hash);
+        // Queue block by height for ordered processing
+        queue_block_by_height(block_height, bh, raw);
 
-    // Block doesn't extend tip - store as orphan for later sequential processing
-    if (!extends_tip) {
+        // Update peer performance metrics
+        auto pit = peers_.find(sock);
+        if (pit != peers_.end()) {
+            update_peer_performance(pit->second, hexkey(bh), g_inflight_block_ts, now_ms());
+        }
+        g_rr_next_idx.erase(hexkey(bh));
+
+    } else {
+        // Parent height unknown - store as orphan (will be rare with height queue)
         OrphanRec rec{ bh, b.header.prev_hash, raw };
         const std::string child_hex  = hexkey(bh);
         const std::string parent_hex = hexkey(b.header.prev_hash);
@@ -3722,16 +3889,10 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             orphan_order_.push_back(child_hex);
             orphan_bytes_ += raw.size();
             evict_orphans_if_needed();
-            // PERFORMANCE: Throttle orphan logging to avoid spam during sync
-            static int64_t last_orphan_log_ms = 0;
-            int64_t now_orphan_ms = now_ms();
-            if (now_orphan_ms - last_orphan_log_ms > 5000) {  // Log at most every 5 seconds
-                last_orphan_log_ms = now_orphan_ms;
-                log_info("P2P: stored orphan (total=" + std::to_string(orphans_.size()) + ")");
-            }
         }
 
-        // Only request parent if we don't have it on disk at all
+        // Request parent block
+        bool have_parent = chain_.have_block(b.header.prev_hash);
         if (!have_parent) {
             auto pit = peers_.find(sock);
             if (pit != peers_.end()) {
@@ -3741,198 +3902,49 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
         return;
     }
 
-    std::string err;
-    bool accepted = chain_.submit_block(b, err);
+    // Process pending blocks in height order
+    process_pending_blocks();
 
-    if (accepted) {
-        // CRITICAL FIX: Notify mempool to remove confirmed transactions
-        // Without this, confirmed transactions stay in mempool forever!
-        if (mempool_) {
-            mempool_->on_block_connect(b);
+    // Request more blocks from peers
+    for (auto& kvp : peers_) {
+        auto& pps = kvp.second;
+        if (!pps.verack_ok) continue;
+        if (!peer_is_index_capable((Sock)pps.sock)) continue;
+        fill_index_pipeline(pps);
+    }
+
+    // Update sync state
+    uint64_t new_height = chain_.height();
+    for (auto& kvp : peers_) {
+        PeerState& peer = kvp.second;
+        if (peer.next_index <= new_height) {
+            peer.next_index = new_height + 1;
         }
-        const std::string miner = miq_miner_from_block(b);
-        std::string src_ip = "?";
-        auto pit = peers_.find(sock);
-        if (pit != peers_.end()) {
-            src_ip = pit->second.ip;
-            // Update peer performance metrics for adaptive timeout
-            update_peer_performance(pit->second, hexkey(bh), g_inflight_block_ts, now_ms());
-        }
-        g_rr_next_idx.erase(hexkey(bh));
-
-        // PERFORMANCE: Throttle block acceptance logging during sync (1 per second max)
-        static int64_t last_block_log_ms = 0;
-        // PRODUCTION: Log block acceptance at WARN level so it shows with default settings
-        static uint64_t blocks_since_log = 0;
-        int64_t now_block_ms = now_ms();
-        blocks_since_log++;
-        if (now_block_ms - last_block_log_ms > 5000) {  // Log at most every 5 seconds to reduce spam
-            last_block_log_ms = now_block_ms;
-            if (blocks_since_log > 1) {
-                log_warn("Chain: +" + std::to_string(blocks_since_log) + " blocks → height " + std::to_string(chain_.height()));
-            } else {
-                log_warn("Chain: new block → height " + std::to_string(chain_.height()));
-            }
-            blocks_since_log = 0;
-        }
-
-        // TELEMETRY: Notify main.cpp about received blocks for UI display
-        if (block_callback_) {
-            P2PBlockInfo info;
-            info.height = chain_.height();
-            info.hash_hex = hexkey(bh);
-            info.tx_count = static_cast<uint32_t>(b.txs.size());
-            info.miner = miner;
-            // Calculate fees from coinbase
-            if (!b.txs.empty()) {
-                uint64_t coinbase_total = 0;
-                for (const auto& out : b.txs[0].vout) coinbase_total += out.value;
-                uint64_t subsidy = chain_.subsidy_for_height(info.height);
-                if (coinbase_total >= subsidy) {
-                    info.fees = coinbase_total - subsidy;
-                    info.fees_known = true;
-                }
-            }
-            block_callback_(info);
-
-            // Also notify about transactions in this block
-            if (txids_callback_ && b.txs.size() > 1) {
-                std::vector<std::string> txids;
-                txids.reserve(b.txs.size() - 1);
-                for (size_t i = 1; i < b.txs.size(); ++i) {
-                    txids.push_back(hexkey(b.txs[i].txid()));
-                }
-                txids_callback_(txids);
-            }
-        }
-
-        broadcast_inv_block(bh);
-        try_connect_orphans(hexkey(bh));
-        // Pass header height to also clean up any corrupted indices beyond it
-        clear_fulfilled_indices_up_to_height(chain_.height(), chain_.best_header_height());
-
-        // SYNC STATE FIX: Update sync state for all peers when chain height changes
-        uint64_t new_height = chain_.height();
-        for (auto& kvp : peers_) {
-            PeerState& peer = kvp.second;
-
-            if (peer.next_index <= new_height) {
-                uint64_t old_next = peer.next_index;
-                peer.next_index = new_height + 1;
-                if (old_next > 0 && old_next != peer.next_index) {
-                    P2P_TRACE("Corrected peer " + peer.ip + " next_index from " + 
-                              std::to_string(old_next) + " to " + std::to_string(peer.next_index));
-                }
-            }
-          
-            if (peer.syncing && peer.next_index <= new_height) {
-                peer.next_index = new_height + 1;
-                P2P_TRACE("DEBUG: Updated peer " + peer.ip + " next_index to " +
-                          std::to_string(peer.next_index) + " after block acceptance");
-            }
-
-            // Adjust inflight_index counter for cleared fulfilled requests
-            Sock s = (Sock)peer.sock;
-            auto it = g_inflight_index_ts.find(s);
-            if (it != g_inflight_index_ts.end()) {
-                uint32_t cleared = 0;
-                for (const auto& idx_ts : it->second) {
-                    if (idx_ts.first <= new_height) cleared++;
-                }
-                if (cleared > 0) {
-                    peer.inflight_index = (peer.inflight_index > cleared) ?
-                        (peer.inflight_index - cleared) : 0;
-                    P2P_TRACE("DEBUG: Adjusted peer " + peer.ip + " inflight_index by -" +
-                              std::to_string(cleared) + " (now " + std::to_string(peer.inflight_index) + ")");
-                }
-            }
-        }
-
-        g_last_progress_ms = now_ms();
-        g_last_progress_height = chain_.height();
-
-        // Request next block immediately after accepting one (Bitcoin-style sequential sync)
-        // This is more efficient than batch requests and prevents over-requesting
-        uint64_t current_height = chain_.height();
-        uint64_t next_height = current_height + 1;
-
-        // During IBD, always request the next block from peers
-        // The peer will respond with the block if they have it, or ignore if they don't
-        // CRITICAL FIX: Allow speculative requests beyond announced tip during IBD
-        // Peer's version message tip might be stale if peer continued syncing after we connected
-        for (auto& kvp : peers_) {
-            auto& pps = kvp.second;
-            if (!pps.verack_ok) continue;
-            if (!peer_is_index_capable((Sock)pps.sock)) continue;
-            // Use peer_tip_height if known, otherwise fall back to header height for initial sync
-            // CRITICAL FIX: Don't block requests when peer_tip_height is unknown (0)
-            // This was causing sync stalls when headers weren't received yet
-            uint64_t best_hdr_height = chain_.best_header_height();
-            uint64_t peer_tip = (pps.peer_tip_height > 0) ? pps.peer_tip_height : best_hdr_height;
-            // Cap at header height - can't have more blocks than headers
-            if (best_hdr_height > 0 && peer_tip > best_hdr_height) {
-                peer_tip = best_hdr_height;
-            }
-            uint64_t probe_limit = peer_tip;
-            // CRITICAL FIX: Only skip peer if peer_tip_height is KNOWN and we're beyond it
-            // When peer_tip_height is unknown (0), always try to request - let timeout handle it
-            if (pps.peer_tip_height > 0 && next_height > probe_limit && pps.inflight_index == 0) {
-                P2P_TRACE("DEBUG: Not requesting block " + std::to_string(next_height) +
-                          " from " + pps.ip + " (beyond peer tip + margin)");
-                continue;
-            }
-            // Always fill pipeline during IBD - speculative requests will timeout if peer doesn't have blocks
-            fill_index_pipeline(pps);
-        }
-
-#if MIQ_ENABLE_HEADERS_FIRST
-        {
-            std::vector<std::vector<uint8_t>> want_tmp;
-            chain_.next_block_fetch_targets(want_tmp, (size_t)32);
-            uint64_t max_peer_tip = chain_.height();
-            {
-                // g_peers_mu is held by the caller context in this path.
-                for (auto &kvp : peers_) {
-                    const auto &pps = kvp.second;
-                    if (!pps.verack_ok) continue;
-                    if (pps.peer_tip_height > max_peer_tip) max_peer_tip = pps.peer_tip_height;
-                }
-            }
-            bool at_tip = want_tmp.empty() && (chain_.height() >= max_peer_tip);
-
-            // DEBUG: Log why we think we're at tip
-
-
-            maybe_mark_headers_done(at_tip);
-        }
-#endif
-    } else {
-        // CRITICAL FIX: If block fails with "missing utxo", it means parent's UTXOs
-        // haven't been applied yet. Store as orphan for later retry instead of discarding.
-        // This happens when blocks arrive out of order during parallel sync.
-        if (err == "missing utxo" || err == "missing utxo during undo-capture") {
-            OrphanRec rec{ bh, b.header.prev_hash, raw };
-            const std::string child_hex  = hexkey(bh);
-            const std::string parent_hex = hexkey(b.header.prev_hash);
-
-            if (orphans_.find(child_hex) == orphans_.end()) {
-                orphans_.emplace(child_hex, std::move(rec));
-                orphan_children_[parent_hex].push_back(child_hex);
-                orphan_order_.push_back(child_hex);
-                orphan_bytes_ += raw.size();
-                evict_orphans_if_needed();
-                // Throttle logging
-                static int64_t last_utxo_orphan_log_ms = 0;
-                int64_t now_ms_local = now_ms();
-                if (now_ms_local - last_utxo_orphan_log_ms > 5000) {
-                    last_utxo_orphan_log_ms = now_ms_local;
-                    log_info("P2P: block queued as orphan (missing utxo, total=" + std::to_string(orphans_.size()) + ")");
-                }
-            }
-        } else {
-            log_warn("P2P: reject block (" + err + ")");
+        if (peer.syncing && peer.next_index <= new_height) {
+            peer.next_index = new_height + 1;
         }
     }
+
+    g_last_progress_ms = now_ms();
+    g_last_progress_height = chain_.height();
+
+    // Clear fulfilled indices
+    clear_fulfilled_indices_up_to_height(chain_.height(), chain_.best_header_height());
+
+#if MIQ_ENABLE_HEADERS_FIRST
+    {
+        std::vector<std::vector<uint8_t>> want_tmp;
+        chain_.next_block_fetch_targets(want_tmp, (size_t)32);
+        uint64_t max_peer_tip = chain_.height();
+        for (auto &kvp : peers_) {
+            const auto &pps = kvp.second;
+            if (!pps.verack_ok) continue;
+            if (pps.peer_tip_height > max_peer_tip) max_peer_tip = pps.peer_tip_height;
+        }
+        bool at_tip = want_tmp.empty() && (chain_.height() >= max_peer_tip);
+        maybe_mark_headers_done(at_tip);
+    }
+#endif
 }
 
 void P2P::try_connect_orphans(const std::string& parent_hex){
@@ -4003,6 +4015,9 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
             }
             g_last_progress_ms = now_ms();
             g_last_progress_height = chain_.height();
+
+            // After connecting orphan, try to process pending blocks that may now be ready
+            process_pending_blocks();
         } else {
             log_warn("P2P: orphan child rejected (" + err + "), dropping orphan " + child_hex);
             remove_orphan_by_hex(child_hex);
@@ -5089,6 +5104,10 @@ void P2P::loop(){
 
             if (should_refetch) {
                 last_refetch_time = now;
+
+                // CRITICAL: Process any pending blocks in the height-ordered queue
+                // This ensures blocks waiting in queue get processed even during stalls
+                process_pending_blocks();
 
                 if (g_logged_headers_done && current_height < chain_.best_header_height()) {
                     for (auto& kvp : peers_) {

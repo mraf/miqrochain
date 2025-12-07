@@ -3,6 +3,7 @@
 #include <atomic>
 #include <vector>
 #include <string>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <deque>
@@ -634,6 +635,18 @@ private:
     size_t orphan_bytes_limit_{0};
     size_t orphan_count_limit_{0};
 
+    // HEIGHT-ORDERED BLOCK QUEUE: Parallel download, sequential processing
+    // Blocks are downloaded in parallel for speed, but processed strictly by height
+    // This prevents "missing utxo" errors from out-of-order block processing
+    struct PendingBlock {
+        std::vector<uint8_t> hash;
+        std::vector<uint8_t> raw;
+        int64_t received_ms;
+    };
+    std::map<uint64_t, PendingBlock> pending_blocks_;  // keyed by height (ordered)
+    size_t pending_blocks_bytes_{0};
+    static constexpr size_t MAX_PENDING_BLOCKS_BYTES = 512 * 1024 * 1024;  // 512MB max
+
     // inbound rate gating
     int64_t  inbound_win_start_ms_{0};
     uint32_t inbound_accepts_in_window_{0};
@@ -693,6 +706,12 @@ private:
     void evict_orphans_if_needed();
     void remove_orphan_by_hex(const std::string& child_hex);
     void try_connect_orphans(const std::string& parent_hex);
+
+    // height-ordered block queue handlers
+    void queue_block_by_height(uint64_t height, const std::vector<uint8_t>& hash,
+                               const std::vector<uint8_t>& raw);
+    void process_pending_blocks();
+    void evict_pending_blocks_if_needed();
 
     size_t count_connections_by_type(ConnectionType type) const;
     size_t count_connections_from_ip(const std::string& ip) const;
