@@ -3131,34 +3131,22 @@ void P2P::send_tx(Sock sock, const std::vector<uint8_t>& raw){
 }
 
 void P2P::start_sync_with_peer(PeerState& ps){
-    // BULLETPROOF SYNC: Always prefer headers-first (Bitcoin Core style)
-    // Index-by-height is ONLY used as a fallback after:
-    //   1. Headers phase is complete (g_logged_headers_done), OR
-    //   2. Headers phase has timed out (MIQ_IBD_FALLBACK_AFTER_MS)
+    // BULLETPROOF SYNC: Headers-first for security, index-by-height for speed
     //
-    // This ensures we know block hashes BEFORE requesting blocks,
-    // preventing sync stalls and malicious block injection.
+    // Strategy:
+    // 1. Always request headers first (to know block hashes)
+    // 2. Once headers are ahead, use index-by-height for FAST parallel download
+    // 3. Validate each block against header hash on receive (security)
+    //
+    // This gives us both SPEED and SECURITY.
 
-    bool use_index_fallback = false;
+    const uint64_t best_hdr = chain_.best_header_height();
+    const uint64_t current_height = chain_.height();
+    const bool headers_ahead = (best_hdr > current_height + 10);
 
-    // Check if we should use index-by-height as fallback
-    if (peer_is_index_capable((Sock)ps.sock) && ps.peer_tip_height > 1) {
-        // Only use index if headers are done OR headers timed out
-        if (g_logged_headers_done) {
-            // Headers complete - can use index for faster parallel download
-            use_index_fallback = true;
-        } else if (g_ibd_headers_started_ms > 0) {
-            // Check if headers have timed out
-            int64_t elapsed = now_ms() - g_ibd_headers_started_ms;
-            if (elapsed > (int64_t)MIQ_IBD_FALLBACK_AFTER_MS) {
-                use_index_fallback = true;
-            }
-        }
-    }
-
-    if (!use_index_fallback) {
-        // PRIMARY PATH: Headers-first sync (like Bitcoin Core)
+    // Always send getheaders to get more headers
 #if MIQ_ENABLE_HEADERS_FIRST
+    if (!g_logged_headers_done) {
         std::vector<std::vector<uint8_t>> locator;
         chain_.build_locator(locator);
         if (g_hdr_flip[(Sock)ps.sock]) {
@@ -3180,54 +3168,47 @@ void P2P::start_sync_with_peer(PeerState& ps){
         }
         if (!g_logged_headers_started) {
             g_logged_headers_started = true;
-            log_info("[IBD] headers phase started (Bitcoin-style headers-first sync)");
+            log_info("[IBD] headers phase started");
             if (!g_ibd_headers_started_ms) g_ibd_headers_started_ms = now_ms();
         }
+    }
 #endif
-        return;
+
+    // Once headers are ahead OR headers done, use fast index-by-height
+    // Blocks are validated against header hashes on receive (security is maintained)
+    bool can_use_index = g_logged_headers_done || headers_ahead;
+
+    // Also allow after timeout (fallback for networks without header support)
+    if (!can_use_index && g_ibd_headers_started_ms > 0) {
+        int64_t elapsed = now_ms() - g_ibd_headers_started_ms;
+        if (elapsed > (int64_t)MIQ_IBD_FALLBACK_AFTER_MS) {
+            can_use_index = true;
+        }
     }
 
-    // FALLBACK PATH: Index-by-height (only after headers done or timeout)
-    ps.syncing = true;
-    ps.inflight_index = 0;
-    ps.next_index = chain_.height() + 1;
-    fill_index_pipeline(ps);
+    if (can_use_index && ps.peer_tip_height > 1) {
+        // Enable index-by-height for this peer (fast parallel download)
+        g_peer_index_capable[(Sock)ps.sock] = true;
+        ps.syncing = true;
+        ps.inflight_index = 0;
+        ps.next_index = current_height + 1;
+        fill_index_pipeline(ps);
+    }
 }
 
 void P2P::fill_index_pipeline(PeerState& ps){
-    // BULLETPROOF SYNC: Prefer block-by-hash when headers are available
-    // This is more reliable than index-by-height because we know the exact hash.
-    // Only fall back to index-by-height if:
-    //   1. Headers are not available (headers timed out), OR
-    //   2. We've exhausted block-by-hash targets
-    const uint64_t best_hdr = chain_.best_header_height();
-    const uint64_t current_height = chain_.height();
+    // BULLETPROOF SYNC: Use index-by-height for SPEED, validate against headers for SECURITY
+    //
+    // The previous approach (block-by-hash) was too slow because next_block_fetch_targets()
+    // only returns blocks whose parent we have, making downloads sequential (0.1 blocks/sec).
+    //
+    // The correct approach (like Bitcoin Core):
+    // 1. Download headers first (we have the hashes) - DONE in start_sync_with_peer
+    // 2. Download blocks in PARALLEL using index-by-height (fast)
+    // 3. Validate each block hash against header index on receive (security)
+    //
+    // This gives us both SPEED (parallel) and SECURITY (hash validation).
 
-    if (best_hdr > current_height) {
-        // We have headers ahead of our chain - prefer block-by-hash
-        std::vector<std::vector<uint8_t>> want;
-        chain_.next_block_fetch_targets(want, (size_t)32);
-
-        for (const auto& h : want) {
-            const std::string key = hexkey(h);
-            // Skip if already inflight or orphaned
-            {
-                InflightLock lk(g_inflight_lock);
-                if (g_global_inflight_blocks.count(key)) continue;
-            }
-            if (orphans_.count(key)) continue;
-
-            // Request by hash (preferred method)
-            request_block_hash(ps, h);
-        }
-
-        // If we have pending block-by-hash requests, don't use index pipeline
-        if (!want.empty()) {
-            return;
-        }
-    }
-
-    // FALLBACK: Index-by-height pipeline (only if block-by-hash is exhausted)
     // Use adaptive pipeline size based on peer reputation
     uint32_t pipe;
     if (g_sequential_sync) {
@@ -3239,6 +3220,16 @@ void P2P::fill_index_pipeline(PeerState& ps){
 
         // Use adaptive batch size, but cap at MIQ_INDEX_PIPELINE
         pipe = std::min(ps.adaptive_batch_size, (uint32_t)MIQ_INDEX_PIPELINE);
+    }
+
+    // BULLETPROOF SYNC: After headers are done, enable index-by-height for this peer
+    // This is safe because we validate block hashes against the header index on receive
+    const uint64_t best_hdr = chain_.best_header_height();
+    const uint64_t current_height = chain_.height();
+
+    if (g_logged_headers_done || (best_hdr > current_height + 10)) {
+        // Headers are done or significantly ahead - enable fast parallel sync
+        g_peer_index_capable[(Sock)ps.sock] = true;
     }
 
     if (!peer_is_index_capable((Sock)ps.sock)) return;
