@@ -1350,15 +1350,21 @@ static inline void update_adaptive_batch_size(miq::PeerState& ps) {
     }
 }
 
-static inline void clear_fulfilled_indices_up_to_height(size_t new_h){
+static inline void clear_fulfilled_indices_up_to_height(size_t new_h, uint64_t header_height = 0){
     // BULLETPROOF SYNC: Clear completed indices from global tracking
     // This ensures indices below the current chain height are removed,
     // allowing the sync to progress without getting stuck on old indices.
+    // Also clear any corrupted indices beyond header height.
     {
         InflightLock lk(g_inflight_lock);
         std::vector<uint64_t> to_remove;
         for (uint64_t idx : g_global_requested_indices) {
+            // Clear fulfilled indices
             if (idx <= (uint64_t)new_h) {
+                to_remove.push_back(idx);
+            }
+            // CRITICAL: Also clear corrupted indices beyond header height
+            else if (header_height > 0 && idx > header_height) {
                 to_remove.push_back(idx);
             }
         }
@@ -1373,8 +1379,12 @@ static inline void clear_fulfilled_indices_up_to_height(size_t new_h){
         auto &dq = g_inflight_index_order[s];
 
         // Remove from timestamp map any indices we must already have received
+        // OR any corrupted indices beyond header height
         for (auto it = byidx.begin(); it != byidx.end(); ){
             if (it->first <= (uint64_t)new_h) {
+                it = byidx.erase(it);
+            } else if (header_height > 0 && it->first > header_height) {
+                // CRITICAL: Clear corrupted indices beyond header height
                 it = byidx.erase(it);
             } else {
                 ++it;
@@ -1382,7 +1392,11 @@ static inline void clear_fulfilled_indices_up_to_height(size_t new_h){
         }
 
         // Trim the front of the oldest-first deque
-        while (!dq.empty() && dq.front() <= (uint64_t)new_h) dq.pop_front();
+        // Also remove any corrupted indices beyond header height
+        while (!dq.empty() && (dq.front() <= (uint64_t)new_h ||
+               (header_height > 0 && dq.front() > header_height))) {
+            dq.pop_front();
+        }
     }
 }
 
@@ -3271,6 +3285,22 @@ void P2P::fill_index_pipeline(PeerState& ps){
 }
 
 bool P2P::request_block_index(PeerState& ps, uint64_t index){
+    // ULTIMATE SAFETY NET: Never request blocks beyond header height
+    // This is the last line of defense against corrupted state
+    const uint64_t hdr_height = chain_.best_header_height();
+    if (hdr_height > 0 && index > hdr_height) {
+        P2P_TRACE("BLOCKED: request_block_index(" + std::to_string(index) +
+                  ") exceeds header height " + std::to_string(hdr_height));
+        return false;
+    }
+
+    // Also don't request blocks we already have
+    if (index <= chain_.height()) {
+        P2P_TRACE("SKIP: request_block_index(" + std::to_string(index) +
+                  ") - already have this block");
+        return false;
+    }
+
     uint8_t p[8];
     for (int i = 0; i < 8; i++) {
         p[i] = (uint8_t)((index >> (8 * i)) & 0xFF);
@@ -3776,7 +3806,8 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
         broadcast_inv_block(bh);
         try_connect_orphans(hexkey(bh));
-        clear_fulfilled_indices_up_to_height(chain_.height());
+        // Pass header height to also clean up any corrupted indices beyond it
+        clear_fulfilled_indices_up_to_height(chain_.height(), chain_.best_header_height());
 
         // SYNC STATE FIX: Update sync state for all peers when chain height changes
         uint64_t new_height = chain_.height();
