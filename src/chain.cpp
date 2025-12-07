@@ -1405,44 +1405,53 @@ bool Chain::load_state(){
         tip_.work_sum += work_from_bits(GENESIS_BITS);
     }
 
-    // CRITICAL FIX: Verify that blocks actually exist up to tip_.height
-    // This detects corruption where state.dat claims a higher height than actual blocks
-    // Common causes: partial data loss, incomplete sync, disk corruption
+    // CRITICAL FIX: Verify chain connectivity from genesis to tip
+    // Just checking if tip block exists isn't enough - the chain must be CONNECTED
+    // This detects corruption where state.dat claims higher height but intermediate blocks are missing
     if (tip_.height > 0) {
+        // First check: does the tip block exist?
         Block tip_block;
         if (!get_block_by_index(tip_.height, tip_block)) {
             log_warn("CORRUPTION DETECTED: state.dat claims height=" + std::to_string(tip_.height) +
-                     " but block doesn't exist! Scanning for actual tip...");
-
-            // Find actual highest block that exists
-            uint64_t actual_height = 0;
-            for (uint64_t h = tip_.height; h > 0; --h) {
-                Block test_block;
-                if (get_block_by_index(h, test_block)) {
-                    actual_height = h;
-                    log_info("Found actual tip at height " + std::to_string(actual_height));
-                    break;
-                }
-            }
-
-            if (actual_height == 0) {
-                // Check if genesis exists
-                Block genesis;
-                if (get_block_by_index(0, genesis)) {
-                    actual_height = 0;
-                    log_info("Only genesis block found");
-                }
-            }
-
-            log_warn("Rebuilding state from actual blocks (0 to " + std::to_string(actual_height) + ")...");
+                     " but tip block doesn't exist! Rebuilding...");
             return rebuild_state_from_blocks();
         }
 
-        // Also verify the tip block hash matches what we expect
+        // Second check: does tip hash match?
         if (tip_block.block_hash() != tip_.hash) {
-            log_warn("CORRUPTION DETECTED: tip block hash mismatch! Rebuilding state...");
+            log_warn("CORRUPTION DETECTED: tip block hash mismatch! Rebuilding...");
             return rebuild_state_from_blocks();
         }
+
+        // Third check: verify chain connectivity by walking back from tip
+        // We don't need to check every block, just spot-check the last N blocks
+        std::vector<uint8_t> expected_hash = tip_.hash;
+        uint64_t check_height = tip_.height;
+        uint64_t checks_done = 0;
+        const uint64_t max_checks = 50;  // Check last 50 blocks for connectivity
+
+        while (check_height > 0 && checks_done < max_checks) {
+            std::vector<uint8_t> raw;
+            if (!storage_.read_block_by_hash(expected_hash, raw)) {
+                log_warn("CORRUPTION DETECTED: block at height " + std::to_string(check_height) +
+                         " not found by hash! Chain is disconnected. Rebuilding...");
+                return rebuild_state_from_blocks();
+            }
+
+            Block blk;
+            if (!deser_block(raw, blk)) {
+                log_warn("CORRUPTION DETECTED: failed to deserialize block at height " +
+                         std::to_string(check_height) + "! Rebuilding...");
+                return rebuild_state_from_blocks();
+            }
+
+            // Move to parent block
+            expected_hash = blk.header.prev_hash;
+            check_height--;
+            checks_done++;
+        }
+
+        log_info("Chain connectivity verified (checked " + std::to_string(checks_done) + " blocks)");
     }
 
     return true;

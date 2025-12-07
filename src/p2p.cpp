@@ -1350,15 +1350,21 @@ static inline void update_adaptive_batch_size(miq::PeerState& ps) {
     }
 }
 
-static inline void clear_fulfilled_indices_up_to_height(size_t new_h){
+static inline void clear_fulfilled_indices_up_to_height(size_t new_h, uint64_t header_height = 0){
     // BULLETPROOF SYNC: Clear completed indices from global tracking
     // This ensures indices below the current chain height are removed,
     // allowing the sync to progress without getting stuck on old indices.
+    // Also clear any corrupted indices beyond header height.
     {
         InflightLock lk(g_inflight_lock);
         std::vector<uint64_t> to_remove;
         for (uint64_t idx : g_global_requested_indices) {
+            // Clear fulfilled indices
             if (idx <= (uint64_t)new_h) {
+                to_remove.push_back(idx);
+            }
+            // CRITICAL: Also clear corrupted indices beyond header height
+            else if (header_height > 0 && idx > header_height) {
                 to_remove.push_back(idx);
             }
         }
@@ -1373,8 +1379,12 @@ static inline void clear_fulfilled_indices_up_to_height(size_t new_h){
         auto &dq = g_inflight_index_order[s];
 
         // Remove from timestamp map any indices we must already have received
+        // OR any corrupted indices beyond header height
         for (auto it = byidx.begin(); it != byidx.end(); ){
             if (it->first <= (uint64_t)new_h) {
+                it = byidx.erase(it);
+            } else if (header_height > 0 && it->first > header_height) {
+                // CRITICAL: Clear corrupted indices beyond header height
                 it = byidx.erase(it);
             } else {
                 ++it;
@@ -1382,7 +1392,11 @@ static inline void clear_fulfilled_indices_up_to_height(size_t new_h){
         }
 
         // Trim the front of the oldest-first deque
-        while (!dq.empty() && dq.front() <= (uint64_t)new_h) dq.pop_front();
+        // Also remove any corrupted indices beyond header height
+        while (!dq.empty() && (dq.front() <= (uint64_t)new_h ||
+               (header_height > 0 && dq.front() > header_height))) {
+            dq.pop_front();
+        }
     }
 }
 
@@ -3210,34 +3224,37 @@ void P2P::fill_index_pipeline(PeerState& ps){
                   " (chain height=" + std::to_string(current_height) + ")");
     }
 
-    // CRITICAL FIX: Only use peer_tip_height to limit block requests!
-    // Headers can be AHEAD of actual blocks. A peer might have headers to height 4288
-    // but only blocks to 4256. Requesting blocks beyond the peer's actual tip causes
-    // sync stalls and the "requested block N but our height is only M" warnings.
-    //
-    // peer_tip_height comes from the version message and is updated when we receive blocks.
-    // If peer_tip_height == 0, we haven't received their version yet - don't request.
-    if (ps.peer_tip_height == 0) {
-        P2P_TRACE("DEBUG: Skipping fill_index_pipeline for " + ps.ip + " - peer_tip_height not yet known");
-        return;
-    }
-
-    // If peer is significantly behind us, don't request from them
-    if (ps.peer_tip_height + 16 < current_height) {
-        P2P_TRACE("DEBUG: Skipping block requests from " + ps.ip +
-                  " - peer_tip=" + std::to_string(ps.peer_tip_height) +
-                  " our_height=" + std::to_string(current_height));
-        return;
-    }
-
     // Backpressure - don't request too far ahead of current tip
     // This prevents orphan pool overflow when blocks arrive out of order.
     const uint64_t max_ahead = orphan_count_limit_ / 2;
     uint64_t max_index = current_height + max_ahead;
 
-    // PRIMARY LIMIT: Use peer's announced tip height (with small margin for growth)
-    // This is the authoritative source for what blocks the peer actually has
-    uint64_t peer_limit = ps.peer_tip_height + 8;
+    // Determine the limit for block requests from this peer
+    // CRITICAL: Use peer_tip_height as primary source, fall back to header height
+    // NEVER request blocks beyond header height - it's impossible to have more blocks than headers
+    const uint64_t best_hdr = chain_.best_header_height();
+    uint64_t peer_limit;
+    if (ps.peer_tip_height > 0) {
+        // Use peer's announced tip - this is what they claim to have
+        peer_limit = ps.peer_tip_height;
+        // Cap at header height - can't have more blocks than headers
+        if (best_hdr > 0 && peer_limit > best_hdr) {
+            peer_limit = best_hdr;
+        }
+        // If peer is significantly behind us, don't request from them
+        if (peer_limit + 16 < current_height) {
+            P2P_TRACE("DEBUG: Skipping block requests from " + ps.ip +
+                      " - peer_limit=" + std::to_string(peer_limit) +
+                      " our_height=" + std::to_string(current_height));
+            return;
+        }
+    } else if (best_hdr > 0) {
+        // Fallback to header height if peer_tip not yet known
+        peer_limit = best_hdr;
+    } else {
+        // No headers yet - allow initial requests but be conservative
+        peer_limit = current_height + 100;
+    }
     max_index = std::min(max_index, peer_limit);
 
     while (ps.inflight_index < pipe) {
@@ -3268,6 +3285,22 @@ void P2P::fill_index_pipeline(PeerState& ps){
 }
 
 bool P2P::request_block_index(PeerState& ps, uint64_t index){
+    // ULTIMATE SAFETY NET: Never request blocks beyond header height
+    // This is the last line of defense against corrupted state
+    const uint64_t hdr_height = chain_.best_header_height();
+    if (hdr_height > 0 && index > hdr_height) {
+        P2P_TRACE("BLOCKED: request_block_index(" + std::to_string(index) +
+                  ") exceeds header height " + std::to_string(hdr_height));
+        return false;
+    }
+
+    // Also don't request blocks we already have
+    if (index <= chain_.height()) {
+        P2P_TRACE("SKIP: request_block_index(" + std::to_string(index) +
+                  ") - already have this block");
+        return false;
+    }
+
     uint8_t p[8];
     for (int i = 0; i < 8; i++) {
         p[i] = (uint8_t)((index >> (8 * i)) & 0xFF);
@@ -3773,7 +3806,8 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
         broadcast_inv_block(bh);
         try_connect_orphans(hexkey(bh));
-        clear_fulfilled_indices_up_to_height(chain_.height());
+        // Pass header height to also clean up any corrupted indices beyond it
+        clear_fulfilled_indices_up_to_height(chain_.height(), chain_.best_header_height());
 
         // SYNC STATE FIX: Update sync state for all peers when chain height changes
         uint64_t new_height = chain_.height();
@@ -3824,25 +3858,19 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
         // The peer will respond with the block if they have it, or ignore if they don't
         // CRITICAL FIX: Allow speculative requests beyond announced tip during IBD
         // Peer's version message tip might be stale if peer continued syncing after we connected
-        constexpr uint64_t IBD_SPECULATIVE_MARGIN = 16; // Probe this many blocks beyond announced tip
         for (auto& kvp : peers_) {
             auto& pps = kvp.second;
             if (!pps.verack_ok) continue;
             if (!peer_is_index_capable((Sock)pps.sock)) continue;
-            // CRITICAL FIX: Only use peer_tip_height to determine how many blocks to request from this peer.
-            // Headers can be AHEAD of actual blocks (e.g., peer has headers to 4288 but blocks only to 4256).
-            // Previously this code used std::max(peer_tip_height, best_header_height) which caused
-            // requests for blocks that don't exist when headers are ahead of blocks.
-            //
-            // peer_tip_height comes from the peer's version message and is the authoritative source
-            // for what blocks they actually have. If it's 0, we skip this peer for block requests.
-            if (pps.peer_tip_height == 0) {
-                P2P_TRACE("DEBUG: Skipping peer " + pps.ip + " - peer_tip_height not yet known");
-                continue;
+            // Use peer_tip_height if known, otherwise fall back to header height for initial sync
+            // CRITICAL: Never request beyond header height
+            uint64_t best_hdr_height = chain_.best_header_height();
+            uint64_t peer_tip = (pps.peer_tip_height > 0) ? pps.peer_tip_height : best_hdr_height;
+            // Cap at header height - can't have more blocks than headers
+            if (best_hdr_height > 0 && peer_tip > best_hdr_height) {
+                peer_tip = best_hdr_height;
             }
-            uint64_t peer_tip = pps.peer_tip_height;
-            // Allow small speculative margin - peer might have gotten a few more blocks since version
-            uint64_t probe_limit = peer_tip + IBD_SPECULATIVE_MARGIN;
+            uint64_t probe_limit = peer_tip;
             if (peer_tip > 0 && next_height > probe_limit && pps.inflight_index == 0) {
                 P2P_TRACE("DEBUG: Not requesting block " + std::to_string(next_height) +
                           " from " + pps.ip + " (beyond peer tip + margin)");
@@ -5074,23 +5102,24 @@ void P2P::loop(){
                         update_peer_reputation(pps);
                         update_adaptive_batch_size(pps);
 
-                        // CRITICAL FIX: Only use peer_tip_height to limit block requests, NOT header height!
-                        // Headers can be ahead of actual blocks - a peer might have headers to 4288
-                        // but only blocks to 4256. Requesting blocks beyond peer's actual tip causes
-                        // sync stalls as the peer can't serve those blocks.
-                        //
-                        // Skip this peer if we don't know their tip yet (peer_tip_height == 0)
-                        if (pps.peer_tip_height == 0) {
-                            continue;  // Wait for version message to tell us their tip
+                        // Use peer_tip_height if known, otherwise fall back to header height
+                        // CRITICAL: Never request beyond header height
+                        uint64_t best_hdr = chain_.best_header_height();
+                        uint64_t peer_tip = (pps.peer_tip_height > 0) ? pps.peer_tip_height : best_hdr;
+
+                        // Cap at header height - can't have more blocks than headers
+                        if (best_hdr > 0 && peer_tip > best_hdr) {
+                            peer_tip = best_hdr;
                         }
 
-                        // Determine how many blocks to request from this specific peer
-                        // Use peer's tip as the hard limit (with small margin for growth)
-                        uint64_t peer_tip = pps.peer_tip_height;
-                        uint64_t max_height = std::min(peer_tip + 8, current_height + pps.adaptive_batch_size);
+                        // If no info at all, use a conservative default
+                        if (peer_tip == 0) {
+                            peer_tip = current_height + 100;
+                        }
 
-                        // Request blocks up to max_height (capped by peer's tip)
-                        uint64_t batch_end = std::min<uint64_t>(max_height, peer_tip + 8);
+                        // Request blocks up to peer_tip (capped by batch size)
+                        uint64_t max_height = std::min(peer_tip, current_height + pps.adaptive_batch_size);
+                        uint64_t batch_end = std::min<uint64_t>(max_height, peer_tip);
 
                         for (uint64_t h = current_height + 1; h <= batch_end; h++) {
                             request_block_index(pps, (uint64_t)h);
@@ -6120,29 +6149,37 @@ void P2P::loop(){
                             // Track as failed delivery for reputation scoring
                             ps.blocks_failed_delivery++;
 
-                            // Try another peer for this block immediately
-                            // Find a peer that might have this block
-                            std::vector<Sock> alt_peers;
-                            for (auto& kvp : peers_) {
-                                if (kvp.first == s) continue;  // Skip current peer
-                                if (!kvp.second.verack_ok) continue;
-                                // Only try peers that claim to have this block
-                                if (kvp.second.peer_tip_height >= idx64) {
-                                    alt_peers.push_back(kvp.first);
-                                }
-                            }
-
-                            if (!alt_peers.empty()) {
-                                // Pick a random alternative peer
-                                Sock alt_s = alt_peers[std::rand() % alt_peers.size()];
-                                auto pit = peers_.find(alt_s);
-                                if (pit != peers_.end()) {
-                                    request_block_index(pit->second, idx64);
-                                    P2P_TRACE("DEBUG: Retrying index " + std::to_string(idx64) + " with peer " + pit->second.ip);
-                                }
+                            // CRITICAL FIX: Don't retry if index exceeds header height
+                            // This prevents endless retry loops for non-existent blocks
+                            const uint64_t best_hdr_h = chain_.best_header_height();
+                            if (best_hdr_h > 0 && idx64 > best_hdr_h) {
+                                P2P_TRACE("DEBUG: Not retrying index " + std::to_string(idx64) +
+                                          " - exceeds header height " + std::to_string(best_hdr_h));
                             } else {
-                                // No alternative peer available - this block might not be available yet
-                                P2P_TRACE("DEBUG: No alternative peer for index " + std::to_string(idx64));
+                                // Try another peer for this block immediately
+                                // Find a peer that might have this block
+                                std::vector<Sock> alt_peers;
+                                for (auto& kvp : peers_) {
+                                    if (kvp.first == s) continue;  // Skip current peer
+                                    if (!kvp.second.verack_ok) continue;
+                                    // Only try peers that claim to have this block
+                                    if (kvp.second.peer_tip_height >= idx64) {
+                                        alt_peers.push_back(kvp.first);
+                                    }
+                                }
+
+                                if (!alt_peers.empty()) {
+                                    // Pick a random alternative peer
+                                    Sock alt_s = alt_peers[std::rand() % alt_peers.size()];
+                                    auto pit = peers_.find(alt_s);
+                                    if (pit != peers_.end()) {
+                                        request_block_index(pit->second, idx64);
+                                        P2P_TRACE("DEBUG: Retrying index " + std::to_string(idx64) + " with peer " + pit->second.ip);
+                                    }
+                                } else {
+                                    // No alternative peer available - this block might not be available yet
+                                    P2P_TRACE("DEBUG: No alternative peer for index " + std::to_string(idx64));
+                                }
                             }
 
                             // Refill pipeline since we cleared an inflight slot
@@ -6193,23 +6230,20 @@ void P2P::loop(){
                             uint64_t old_height = chain_.height();
                             handle_incoming_block(s, m.payload);
 
-                            // FIX: Update peer_tip_height based on blocks we've received from this peer
-                            // If we received a block at height N from this peer, they have at least N blocks
-                            // This prevents early sync completion when version message had stale height
+                            // Update peer_tip_height based on blocks we've received from this peer
+                            // If we received a block that extends our chain, peer has at least that many blocks
                             uint64_t new_height = chain_.height();
 
-                            // CRITICAL FIX: Update peer_tip_height based on ACTUAL received blocks
-                            // The received block confirms that the peer HAS this block
-                            // We use the block's height in our chain (or requested index if orphaned)
-                            //
-                            // We should trust:
-                            // 1. The height announced in the peer's version message (set at handshake)
-                            // 2. Heights from blocks we actually receive and validate
-                            // 3. The index we requested (if we got a response, peer has at least that block)
-                            if (new_height > ps.peer_tip_height) {
-                                ps.peer_tip_height = new_height;
-                                P2P_TRACE("DEBUG: Updated peer " + ps.ip + " tip_height to " +
-                                          std::to_string(new_height) + " (from chain height)");
+                            // Only update peer_tip_height if chain actually grew AND within header bounds
+                            uint64_t header_tip = chain_.best_header_height();
+                            if (new_height > old_height && new_height > ps.peer_tip_height) {
+                                // Chain extended - peer has at least this many blocks
+                                // But never set above header tip (can't have more blocks than headers)
+                                if (header_tip == 0 || new_height <= header_tip) {
+                                    ps.peer_tip_height = new_height;
+                                    P2P_TRACE("DEBUG: Updated peer " + ps.ip + " tip_height to " +
+                                              std::to_string(new_height) + " (from chain height)");
+                                }
                             }
 
                             // Update reputation: track successful delivery
@@ -6231,21 +6265,24 @@ void P2P::loop(){
                                         break;
                                     }
                                 }
-                                if (delivered_idx == 0) {
+                                    if (delivered_idx == 0) {
                                     uint64_t newHeight = chain_.height();
                                     if (newHeight > old_height) {
                                         delivered_idx = old_height + 1;
-                                    } else {
-                                        // Fallback: assume the last requested index
-                                        delivered_idx = (ps.next_index > 0 ? ps.next_index - 1 : 0);
                                     }
+                                    // NOTE: Don't use next_index as fallback - it can be arbitrarily high
+                                    // If we can't identify the block, just don't update peer_tip_height
                                 }
                                 if (delivered_idx != 0) {
                                     // CRITICAL FIX: Update peer_tip_height based on delivered block index
                                     // If peer delivered block N, they have at least N blocks.
-                                    // This enables continued sync even when blocks arrive as orphans
-                                    // and don't immediately extend our chain.
-                                    if (delivered_idx > ps.peer_tip_height) {
+                                    // BUT: Never set peer_tip_height above header height - that's impossible
+                                    uint64_t header_tip = chain_.best_header_height();
+                                    if (header_tip > 0 && delivered_idx > header_tip) {
+                                        // Can't have more blocks than headers - don't update
+                                        P2P_TRACE("DEBUG: Ignoring delivered_idx " + std::to_string(delivered_idx) +
+                                                  " from " + ps.ip + " (exceeds header height " + std::to_string(header_tip) + ")");
+                                    } else if (delivered_idx > ps.peer_tip_height) {
                                         ps.peer_tip_height = delivered_idx;
                                         P2P_TRACE("DEBUG: Updated peer " + ps.ip + " tip_height to " +
                                                   std::to_string(delivered_idx) + " (from delivered block)");
@@ -6966,10 +7003,32 @@ void P2P::loop(){
             }
             if (ps.syncing) {
                 if ((tnow - g_last_progress_ms) > (int64_t)MIQ_P2P_STALL_RETRY_MS) {
-                    uint64_t oldest_inflight =
-                        (ps.next_index > ps.inflight_index)
-                            ? (ps.next_index - ps.inflight_index)
-                            : (uint64_t)chain_.height() + 1; // safe floor
+                    // CRITICAL FIX: Use the actual inflight queue instead of formula
+                    // The old calculation (next_index - inflight_index) was wrong and could
+                    // produce arbitrarily high values when counters got out of sync
+                    uint64_t oldest_inflight = 0;
+                    auto& order_q = g_inflight_index_order[(Sock)s];
+                    if (!order_q.empty()) {
+                        oldest_inflight = order_q.front();
+                    } else {
+                        // No actual inflight requests - use chain height + 1 as next target
+                        oldest_inflight = (uint64_t)chain_.height() + 1;
+                    }
+
+                    // CRITICAL FIX: Never request beyond best header height
+                    // If oldest_inflight exceeds header height, it means our tracking is corrupted
+                    const uint64_t best_hdr = chain_.best_header_height();
+                    if (best_hdr > 0 && oldest_inflight > best_hdr) {
+                        P2P_TRACE("DEBUG: Clearing corrupted inflight - idx " + std::to_string(oldest_inflight) +
+                                  " exceeds header height " + std::to_string(best_hdr));
+                        // Clear this peer's inflight tracking and restart
+                        g_inflight_index_ts.erase((Sock)s);
+                        g_inflight_index_order.erase((Sock)s);
+                        ps.inflight_index = 0;
+                        ps.next_index = chain_.height() + 1;
+                        fill_index_pipeline(ps);
+                        continue;  // Skip to next peer
+                    }
 
                     const int64_t last_probe =
                         (g_last_idx_probe_ms.count(oldest_inflight) ? g_last_idx_probe_ms[oldest_inflight] : 0);
