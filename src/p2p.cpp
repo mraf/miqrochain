@@ -3230,14 +3230,14 @@ void P2P::fill_index_pipeline(PeerState& ps){
     uint64_t max_index = current_height + max_ahead;
 
     // Determine the limit for block requests from this peer
-    // CRITICAL: Use peer_tip_height as primary source, fall back to header height
-    // NEVER request blocks beyond header height - it's impossible to have more blocks than headers
+    // CRITICAL FIX: When peer_tip_height is unknown, don't block requests
+    // This was causing sync stalls when peer didn't announce height in version message
     const uint64_t best_hdr = chain_.best_header_height();
     uint64_t peer_limit;
     if (ps.peer_tip_height > 0) {
         // Use peer's announced tip - this is what they claim to have
         peer_limit = ps.peer_tip_height;
-        // Cap at header height - can't have more blocks than headers
+        // Cap at header height if we have headers
         if (best_hdr > 0 && peer_limit > best_hdr) {
             peer_limit = best_hdr;
         }
@@ -3252,8 +3252,10 @@ void P2P::fill_index_pipeline(PeerState& ps){
         // Fallback to header height if peer_tip not yet known
         peer_limit = best_hdr;
     } else {
-        // No headers yet - allow initial requests but be conservative
-        peer_limit = current_height + 100;
+        // CRITICAL FIX: No peer_tip and no headers - allow aggressive sync
+        // Let requests go through and timeout naturally if peer doesn't have blocks
+        // This enables sync to start even when peer height is unknown
+        peer_limit = current_height + max_ahead;  // Use full window, not just 100
     }
     max_index = std::min(max_index, peer_limit);
 
@@ -3863,7 +3865,8 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             if (!pps.verack_ok) continue;
             if (!peer_is_index_capable((Sock)pps.sock)) continue;
             // Use peer_tip_height if known, otherwise fall back to header height for initial sync
-            // CRITICAL: Never request beyond header height
+            // CRITICAL FIX: Don't block requests when peer_tip_height is unknown (0)
+            // This was causing sync stalls when headers weren't received yet
             uint64_t best_hdr_height = chain_.best_header_height();
             uint64_t peer_tip = (pps.peer_tip_height > 0) ? pps.peer_tip_height : best_hdr_height;
             // Cap at header height - can't have more blocks than headers
@@ -3871,7 +3874,9 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
                 peer_tip = best_hdr_height;
             }
             uint64_t probe_limit = peer_tip;
-            if (peer_tip > 0 && next_height > probe_limit && pps.inflight_index == 0) {
+            // CRITICAL FIX: Only skip peer if peer_tip_height is KNOWN and we're beyond it
+            // When peer_tip_height is unknown (0), always try to request - let timeout handle it
+            if (pps.peer_tip_height > 0 && next_height > probe_limit && pps.inflight_index == 0) {
                 P2P_TRACE("DEBUG: Not requesting block " + std::to_string(next_height) +
                           " from " + pps.ip + " (beyond peer tip + margin)");
                 continue;
