@@ -4015,6 +4015,9 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
             }
             g_last_progress_ms = now_ms();
             g_last_progress_height = chain_.height();
+
+            // After connecting orphan, try to process pending blocks that may now be ready
+            process_pending_blocks();
         } else {
             log_warn("P2P: orphan child rejected (" + err + "), dropping orphan " + child_hex);
             remove_orphan_by_hex(child_hex);
@@ -5101,6 +5104,10 @@ void P2P::loop(){
 
             if (should_refetch) {
                 last_refetch_time = now;
+
+                // CRITICAL: Process any pending blocks in the height-ordered queue
+                // This ensures blocks waiting in queue get processed even during stalls
+                process_pending_blocks();
 
                 if (g_logged_headers_done && current_height < chain_.best_header_height()) {
                     for (auto& kvp : peers_) {
