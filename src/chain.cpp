@@ -1405,6 +1405,46 @@ bool Chain::load_state(){
         tip_.work_sum += work_from_bits(GENESIS_BITS);
     }
 
+    // CRITICAL FIX: Verify that blocks actually exist up to tip_.height
+    // This detects corruption where state.dat claims a higher height than actual blocks
+    // Common causes: partial data loss, incomplete sync, disk corruption
+    if (tip_.height > 0) {
+        Block tip_block;
+        if (!get_block_by_index(tip_.height, tip_block)) {
+            log_warn("CORRUPTION DETECTED: state.dat claims height=" + std::to_string(tip_.height) +
+                     " but block doesn't exist! Scanning for actual tip...");
+
+            // Find actual highest block that exists
+            uint64_t actual_height = 0;
+            for (uint64_t h = tip_.height; h > 0; --h) {
+                Block test_block;
+                if (get_block_by_index(h, test_block)) {
+                    actual_height = h;
+                    log_info("Found actual tip at height " + std::to_string(actual_height));
+                    break;
+                }
+            }
+
+            if (actual_height == 0) {
+                // Check if genesis exists
+                Block genesis;
+                if (get_block_by_index(0, genesis)) {
+                    actual_height = 0;
+                    log_info("Only genesis block found");
+                }
+            }
+
+            log_warn("Rebuilding state from actual blocks (0 to " + std::to_string(actual_height) + ")...");
+            return rebuild_state_from_blocks();
+        }
+
+        // Also verify the tip block hash matches what we expect
+        if (tip_block.block_hash() != tip_.hash) {
+            log_warn("CORRUPTION DETECTED: tip block hash mismatch! Rebuilding state...");
+            return rebuild_state_from_blocks();
+        }
+    }
+
     return true;
 }
 
