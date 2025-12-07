@@ -3317,6 +3317,19 @@ void P2P::send_block(Sock s, const std::vector<uint8_t>& raw){
     P2P_TRACE("DEBUG: send_block result=" + std::string(result ? "OK" : "FAILED"));
 }
 
+// Send "notfound by index" response when we cannot serve a requested block
+// This allows the requesting peer to immediately retry with another peer
+// instead of waiting for timeout.
+void P2P::send_notfound_index(Sock s, uint64_t idx) {
+    uint8_t p[8];
+    for (int i = 0; i < 8; i++) {
+        p[i] = (uint8_t)((idx >> (8 * i)) & 0xFF);
+    }
+    auto msg = encode_msg("nfbi", std::vector<uint8_t>(p, p + 8));
+    P2P_TRACE("DEBUG: Sending notfound for index " + std::to_string(idx));
+    (void)send_or_close(s, msg);
+}
+
 // === rate-limit helpers ======================================================
 
 void P2P::rate_refill(PeerState& ps, int64_t now){
@@ -6049,9 +6062,81 @@ void P2P::loop(){
                                     }
                                 }
                                 P2P_TRACE("SKIP " + ps.ip + " cmd=getbi height=" + std::to_string(idx64) + " (block not available)");
+                                // CRITICAL FIX: Actually send notfound response so peer doesn't wait for timeout
+                                send_notfound_index(s, idx64);
                             }
                         } else {
                             P2P_TRACE("SKIP " + ps.ip + " cmd=getbi (invalid payload size=" + std::to_string(m.payload.size()) + ")");
+                        }
+
+                    } else if (cmd == "nfbi") {
+                        // Handle "not found block index" response from peer
+                        // This means the peer doesn't have the block we requested
+                        if (m.payload.size() == 8) {
+                            uint64_t idx64 = 0;
+                            for (int j = 0; j < 8; j++) idx64 |= ((uint64_t)m.payload[j]) << (8 * j);
+
+                            P2P_TRACE("DEBUG: Received notfound for index " + std::to_string(idx64) + " from " + ps.ip);
+
+                            // CRITICAL FIX: Update peer_tip_height - peer doesn't have this block
+                            // If peer says they don't have block N, set their tip to N-1 (or 0)
+                            if (idx64 > 0 && idx64 <= ps.peer_tip_height) {
+                                ps.peer_tip_height = idx64 - 1;
+                                log_info("P2P: Peer " + ps.ip + " doesn't have block " + std::to_string(idx64) +
+                                         ", updated peer_tip_height to " + std::to_string(ps.peer_tip_height));
+                            }
+
+                            // Clear this index from inflight tracking for this peer
+                            auto it_idx = g_inflight_index_ts[(Sock)s].find(idx64);
+                            if (it_idx != g_inflight_index_ts[(Sock)s].end()) {
+                                g_inflight_index_ts[(Sock)s].erase(it_idx);
+                            }
+                            auto& dq_idx = g_inflight_index_order[(Sock)s];
+                            auto dq_it = std::find(dq_idx.begin(), dq_idx.end(), idx64);
+                            if (dq_it != dq_idx.end()) {
+                                dq_idx.erase(dq_it);
+                            }
+
+                            // Clear from global tracking so another peer can try
+                            {
+                                InflightLock lk(g_inflight_lock);
+                                g_global_requested_indices.erase(idx64);
+                            }
+
+                            if (ps.inflight_index > 0) {
+                                ps.inflight_index--;
+                            }
+
+                            // Track as failed delivery for reputation scoring
+                            ps.blocks_failed_delivery++;
+
+                            // Try another peer for this block immediately
+                            // Find a peer that might have this block
+                            std::vector<Sock> alt_peers;
+                            for (auto& kvp : peers_) {
+                                if (kvp.first == s) continue;  // Skip current peer
+                                if (!kvp.second.verack_ok) continue;
+                                // Only try peers that claim to have this block
+                                if (kvp.second.peer_tip_height >= idx64) {
+                                    alt_peers.push_back(kvp.first);
+                                }
+                            }
+
+                            if (!alt_peers.empty()) {
+                                // Pick a random alternative peer
+                                Sock alt_s = alt_peers[std::rand() % alt_peers.size()];
+                                auto pit = peers_.find(alt_s);
+                                if (pit != peers_.end()) {
+                                    request_block_index(pit->second, idx64);
+                                    P2P_TRACE("DEBUG: Retrying index " + std::to_string(idx64) + " with peer " + pit->second.ip);
+                                }
+                            } else {
+                                // No alternative peer available - this block might not be available yet
+                                P2P_TRACE("DEBUG: No alternative peer for index " + std::to_string(idx64));
+                            }
+
+                            // Refill pipeline since we cleared an inflight slot
+                            fill_index_pipeline(ps);
                         }
 
                     } else if (cmd == "block") {

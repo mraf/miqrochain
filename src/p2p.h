@@ -555,6 +555,7 @@ private:
     bool request_tx(PeerState& ps, const std::vector<uint8_t>& txid);
     void send_tx(Sock sock, const std::vector<uint8_t>& raw);
     void send_block(Sock s, const std::vector<uint8_t>& raw);
+    void send_notfound_index(Sock s, uint64_t idx);
 
     // Small caches
     mutable std::mutex announce_mu_;
