@@ -3215,12 +3215,21 @@ void P2P::fill_index_pipeline(PeerState& ps){
     const uint64_t max_ahead = orphan_count_limit_ / 2;
     uint64_t max_index = current_height + max_ahead;
 
+    // CRITICAL: Don't request beyond what the peer has!
+    // If peer_tip_height is 176, don't request block 177 - it doesn't exist!
+    if (ps.peer_tip_height > 0) {
+        max_index = std::min(max_index, ps.peer_tip_height);
+    }
+
     // Also limit by header height if available (for extra security)
     const uint64_t best_hdr = chain_.best_header_height();
     if (best_hdr > 0) {
-        constexpr uint64_t HEADER_MARGIN = 32;
-        uint64_t header_limit = best_hdr + HEADER_MARGIN;
-        max_index = std::min(max_index, header_limit);
+        max_index = std::min(max_index, best_hdr);
+    }
+
+    // If we're already at or beyond max_index, nothing to request
+    if (current_height >= max_index) {
+        return;  // At tip - nothing more to sync from this peer
     }
 
     while (ps.inflight_index < pipe) {
