@@ -6762,10 +6762,22 @@ void P2P::loop(){
                                     fill_index_pipeline(ps);
                                     zero_count = 0;
                                     g_peer_stalls[(Sock)s]++;
-                                    if (g_peer_stalls[(Sock)s] >= MIQ_P2P_BAD_PEER_MAX_STALLS && !is_loopback(ps.ip)) {
+                                    // CRITICAL FIX: Don't disconnect our only peer!
+                                    // If we only have one peer (the seed), disconnecting it would stop sync entirely.
+                                    // Only disconnect stalling peers if we have alternatives.
+                                    size_t active_peers = 0;
+                                    for (const auto& kvp : peers_) {
+                                        if (kvp.second.verack_ok) active_peers++;
+                                    }
+                                    bool is_only_peer = (active_peers <= 1);
+                                    if (g_peer_stalls[(Sock)s] >= MIQ_P2P_BAD_PEER_MAX_STALLS && !is_loopback(ps.ip) && !is_only_peer) {
                                         // disconnect persistently stalling peer (keeps the network moving)
                                         log_warn("P2P: disconnecting persistently stalling peer " + ps.ip);
                                         dead.push_back(s);
+                                    } else if (is_only_peer && g_peer_stalls[(Sock)s] >= MIQ_P2P_BAD_PEER_MAX_STALLS) {
+                                        // Only peer - don't disconnect, just log and reset stall count
+                                        log_warn("P2P: peer " + ps.ip + " is stalling but is our only peer - keeping connection");
+                                        g_peer_stalls[(Sock)s] = 0;  // Reset to give peer another chance
                                     }
                                 }
                             } else {
@@ -6937,7 +6949,18 @@ void P2P::loop(){
                     if (last_ok && (tnow - last_ok) > (int64_t)(g_stall_retry_ms * 4) && !is_lb) {
                         log_warn("P2P: deprioritizing header-stalled peer " + ps.ip);
                         g_peer_stalls[s]++;
-                        if (g_peer_stalls[s] >= MIQ_P2P_BAD_PEER_MAX_STALLS) { dead.push_back(s); continue; }
+                        // CRITICAL FIX: Don't disconnect our only peer!
+                        size_t active_peers = 0;
+                        for (const auto& kvp : peers_) {
+                            if (kvp.second.verack_ok) active_peers++;
+                        }
+                        if (g_peer_stalls[s] >= MIQ_P2P_BAD_PEER_MAX_STALLS && active_peers > 1) {
+                            dead.push_back(s);
+                            continue;
+                        } else if (active_peers <= 1 && g_peer_stalls[s] >= MIQ_P2P_BAD_PEER_MAX_STALLS) {
+                            log_warn("P2P: peer " + ps.ip + " is header-stalled but is our only peer - keeping connection");
+                            g_peer_stalls[s] = 0;  // Reset stall count
+                        }
                     }
                 }
             }
