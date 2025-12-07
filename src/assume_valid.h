@@ -75,7 +75,6 @@ inline void init_assume_valid(const std::vector<uint8_t>& hash, uint64_t height)
 }
 
 // Initialize from hex string
-// NOTE: Block hashes are displayed in big-endian, stored in little-endian
 inline bool init_assume_valid_hex(const std::string& hash_hex, uint64_t height) {
     if (hash_hex.size() != 64) return false;
 
@@ -83,8 +82,7 @@ inline bool init_assume_valid_hex(const std::string& hash_hex, uint64_t height) 
     for (size_t i = 0; i < 32; ++i) {
         char buf[3] = {hash_hex[i*2], hash_hex[i*2+1], 0};
         char* end = nullptr;
-        // Store in reverse order for little-endian comparison
-        hash[31 - i] = (uint8_t)std::strtoul(buf, &end, 16);
+        hash[i] = (uint8_t)std::strtoul(buf, &end, 16);
         if (end != buf + 2) return false;
     }
 
@@ -311,14 +309,11 @@ inline const std::vector<Checkpoint>& get_checkpoints() {
 }
 
 // Convert hex string to bytes for comparison
-// NOTE: Block hashes are displayed in big-endian (like Bitcoin), but
-// block_hash() returns little-endian. We must reverse the bytes.
 inline std::vector<uint8_t> checkpoint_hash_to_bytes(const char* hex) {
     std::vector<uint8_t> result(32);
     for (size_t i = 0; i < 32; ++i) {
         char buf[3] = {hex[i*2], hex[i*2+1], 0};
-        // Store in reverse order: hex[0:2] -> result[31], hex[62:64] -> result[0]
-        result[31 - i] = (uint8_t)std::strtoul(buf, nullptr, 16);
+        result[i] = (uint8_t)std::strtoul(buf, nullptr, 16);
     }
     return result;
 }
