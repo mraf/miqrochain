@@ -3907,7 +3907,31 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
         }
 #endif
     } else {
-        log_warn("P2P: reject block (" + err + ")");
+        // CRITICAL FIX: If block fails with "missing utxo", it means parent's UTXOs
+        // haven't been applied yet. Store as orphan for later retry instead of discarding.
+        // This happens when blocks arrive out of order during parallel sync.
+        if (err == "missing utxo" || err == "missing utxo during undo-capture") {
+            OrphanRec rec{ bh, b.header.prev_hash, raw };
+            const std::string child_hex  = hexkey(bh);
+            const std::string parent_hex = hexkey(b.header.prev_hash);
+
+            if (orphans_.find(child_hex) == orphans_.end()) {
+                orphans_.emplace(child_hex, std::move(rec));
+                orphan_children_[parent_hex].push_back(child_hex);
+                orphan_order_.push_back(child_hex);
+                orphan_bytes_ += raw.size();
+                evict_orphans_if_needed();
+                // Throttle logging
+                static int64_t last_utxo_orphan_log_ms = 0;
+                int64_t now_ms_local = now_ms();
+                if (now_ms_local - last_utxo_orphan_log_ms > 5000) {
+                    last_utxo_orphan_log_ms = now_ms_local;
+                    log_info("P2P: block queued as orphan (missing utxo, total=" + std::to_string(orphans_.size()) + ")");
+                }
+            }
+        } else {
+            log_warn("P2P: reject block (" + err + ")");
+        }
     }
 }
 
