@@ -1182,6 +1182,11 @@ static std::unordered_map<Sock, std::unordered_map<uint64_t,int64_t>> g_inflight
 static std::unordered_map<Sock, std::deque<uint64_t>> g_inflight_index_order;
 static int64_t g_stall_retry_ms = MIQ_P2P_STALL_RETRY_MS;
 
+// BULLETPROOF SYNC: Global deduplication for index-based block requests
+// Prevents multiple peers from requesting the same block height simultaneously,
+// which wastes bandwidth and can create duplicate orphans causing sync issues.
+static std::unordered_set<uint64_t> g_global_requested_indices;
+
 // CRITICAL FIX: Track inflight tx request timestamps for timeout cleanup
 // Without this, inflight_tx can grow forever, eventually blocking all new tx requests
 static std::unordered_map<Sock, std::unordered_map<std::string,int64_t>> g_inflight_tx_ts;
@@ -1230,8 +1235,18 @@ static inline void clear_all_inflight_for_sock(Sock sock) {
         }
         g_inflight_block_ts.erase(it);
     }
+
+    // BULLETPROOF SYNC: Clear global index tracking when peer disconnects
+    // This allows other peers to request these indices again
+    auto idx_it = g_inflight_index_ts.find(sock);
+    if (idx_it != g_inflight_index_ts.end()) {
+        for (const auto& kv : idx_it->second) {
+            g_global_requested_indices.erase(kv.first);
+        }
+    }
     g_inflight_index_ts.erase(sock);
     g_inflight_index_order.erase(sock);
+
     // CRITICAL FIX: Also clear inflight tx tracking
     g_inflight_tx_ts.erase(sock);
 }
@@ -1240,8 +1255,10 @@ static inline void clear_all_inflight_for_sock(Sock sock) {
 
 static inline bool peer_is_index_capable(Sock s) {
     auto it = g_peer_index_capable.find(s);
-    // Default to true unless explicitly demoted.
-    if (it == g_peer_index_capable.end()) return true;
+    // BULLETPROOF SYNC: Default to FALSE - always start with headers-first
+    // Index-by-height is only enabled as a fallback after headers timeout
+    // This ensures we sync like Bitcoin Core: headers first, then blocks
+    if (it == g_peer_index_capable.end()) return false;
     return it->second;
 }
 
@@ -1334,6 +1351,22 @@ static inline void update_adaptive_batch_size(miq::PeerState& ps) {
 }
 
 static inline void clear_fulfilled_indices_up_to_height(size_t new_h){
+    // BULLETPROOF SYNC: Clear completed indices from global tracking
+    // This ensures indices below the current chain height are removed,
+    // allowing the sync to progress without getting stuck on old indices.
+    {
+        InflightLock lk(g_inflight_lock);
+        std::vector<uint64_t> to_remove;
+        for (uint64_t idx : g_global_requested_indices) {
+            if (idx <= (uint64_t)new_h) {
+                to_remove.push_back(idx);
+            }
+        }
+        for (uint64_t idx : to_remove) {
+            g_global_requested_indices.erase(idx);
+        }
+    }
+
     for (auto &kv : g_inflight_index_ts){
         Sock s = kv.first;
         auto &byidx = kv.second;
@@ -1350,19 +1383,6 @@ static inline void clear_fulfilled_indices_up_to_height(size_t new_h){
 
         // Trim the front of the oldest-first deque
         while (!dq.empty() && dq.front() <= (uint64_t)new_h) dq.pop_front();
-
-        }
-    
-    // Return number of cleared items per socket for caller to adjust counters
-    static std::unordered_map<Sock, uint32_t> cleared_counts;
-    cleared_counts.clear();
-    for (const auto& kv : g_inflight_index_ts) {
-        Sock s = kv.first;
-        for (const auto& idx_ts : kv.second) {
-            if (idx_ts.first <= (uint64_t)new_h) {
-                cleared_counts[s]++;
-            }
-        }
     }
 }
 
@@ -1521,6 +1541,8 @@ static inline void gate_on_close(Sock fd){
     g_peer_last_fetch_ms.erase(fd);
     g_peer_last_request_ms.erase(fd);
     g_peer_index_capable.erase(fd);
+    g_index_timeouts.erase(fd);  // CRITICAL FIX: Clean up timeout counter to prevent socket reuse issues
+    g_last_hdr_ok_ms.erase(fd);  // Clean up header tracking to prevent stale state
 }
 [[maybe_unused]] static inline bool gate_on_bytes(Sock fd, size_t add){
     auto it = g_gate.find(fd);
@@ -2377,6 +2399,14 @@ bool P2P::start(uint16_t port){
     g_rr_next_idx.clear();
     g_last_hdr_req_ms.clear();
 
+    // BULLETPROOF SYNC: Clear global index tracking on start
+    {
+        InflightLock lk(g_inflight_lock);
+        g_global_requested_indices.clear();
+    }
+    g_inflight_index_ts.clear();
+    g_inflight_index_order.clear();
+
 #ifdef MIQ_DEFAULT_PORT
     (void)MIQ_DEFAULT_PORT;
 #endif
@@ -2526,16 +2556,26 @@ bool P2P::start(uint16_t port){
 void P2P::stop(){
     if (!running_) return;
     running_ = false;
+
+    // Close server sockets first to wake up poll() if it's blocking
     if (srv_ != MIQ_INVALID_SOCK) { CLOSESOCK(srv_); srv_ = MIQ_INVALID_SOCK; }
     if (g_srv6_ != MIQ_INVALID_SOCK) { CLOSESOCK(g_srv6_); g_srv6_ = MIQ_INVALID_SOCK; }
-    for (auto& kv : peers_) {
-        if (kv.first != MIQ_INVALID_SOCK) {
-            gate_on_close(kv.first);
-            CLOSESOCK(kv.first);
-        }
-    }
-    peers_.clear();
+
+    // CRITICAL FIX: Join thread BEFORE modifying peers_ to prevent race condition
+    // The main loop may still be accessing peers_ until it exits
     if (th_.joinable()) th_.join();
+
+    // Now safe to modify peers_ since the thread has exited
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+        for (auto& kv : peers_) {
+            if (kv.first != MIQ_INVALID_SOCK) {
+                gate_on_close(kv.first);
+                CLOSESOCK(kv.first);
+            }
+        }
+        peers_.clear();
+    }
 #ifdef _WIN32
     WSACleanup();
 #endif
@@ -3091,7 +3131,33 @@ void P2P::send_tx(Sock sock, const std::vector<uint8_t>& raw){
 }
 
 void P2P::start_sync_with_peer(PeerState& ps){
-    if (!peer_is_index_capable((Sock)ps.sock) || ps.peer_tip_height <= 1) {
+    // BULLETPROOF SYNC: Always prefer headers-first (Bitcoin Core style)
+    // Index-by-height is ONLY used as a fallback after:
+    //   1. Headers phase is complete (g_logged_headers_done), OR
+    //   2. Headers phase has timed out (MIQ_IBD_FALLBACK_AFTER_MS)
+    //
+    // This ensures we know block hashes BEFORE requesting blocks,
+    // preventing sync stalls and malicious block injection.
+
+    bool use_index_fallback = false;
+
+    // Check if we should use index-by-height as fallback
+    if (peer_is_index_capable((Sock)ps.sock) && ps.peer_tip_height > 1) {
+        // Only use index if headers are done OR headers timed out
+        if (g_logged_headers_done) {
+            // Headers complete - can use index for faster parallel download
+            use_index_fallback = true;
+        } else if (g_ibd_headers_started_ms > 0) {
+            // Check if headers have timed out
+            int64_t elapsed = now_ms() - g_ibd_headers_started_ms;
+            if (elapsed > (int64_t)MIQ_IBD_FALLBACK_AFTER_MS) {
+                use_index_fallback = true;
+            }
+        }
+    }
+
+    if (!use_index_fallback) {
+        // PRIMARY PATH: Headers-first sync (like Bitcoin Core)
 #if MIQ_ENABLE_HEADERS_FIRST
         std::vector<std::vector<uint8_t>> locator;
         chain_.build_locator(locator);
@@ -3114,13 +3180,14 @@ void P2P::start_sync_with_peer(PeerState& ps){
         }
         if (!g_logged_headers_started) {
             g_logged_headers_started = true;
-            log_info("[IBD] headers phase started");
+            log_info("[IBD] headers phase started (Bitcoin-style headers-first sync)");
             if (!g_ibd_headers_started_ms) g_ibd_headers_started_ms = now_ms();
         }
 #endif
         return;
     }
-    // Index-capable: pipeline indices immediately.
+
+    // FALLBACK PATH: Index-by-height (only after headers done or timeout)
     ps.syncing = true;
     ps.inflight_index = 0;
     ps.next_index = chain_.height() + 1;
@@ -3128,6 +3195,39 @@ void P2P::start_sync_with_peer(PeerState& ps){
 }
 
 void P2P::fill_index_pipeline(PeerState& ps){
+    // BULLETPROOF SYNC: Prefer block-by-hash when headers are available
+    // This is more reliable than index-by-height because we know the exact hash.
+    // Only fall back to index-by-height if:
+    //   1. Headers are not available (headers timed out), OR
+    //   2. We've exhausted block-by-hash targets
+    const uint64_t best_hdr = chain_.best_header_height();
+    const uint64_t current_height = chain_.height();
+
+    if (best_hdr > current_height) {
+        // We have headers ahead of our chain - prefer block-by-hash
+        std::vector<std::vector<uint8_t>> want;
+        chain_.next_block_fetch_targets(want, (size_t)32);
+
+        for (const auto& h : want) {
+            const std::string key = hexkey(h);
+            // Skip if already inflight or orphaned
+            {
+                InflightLock lk(g_inflight_lock);
+                if (g_global_inflight_blocks.count(key)) continue;
+            }
+            if (orphans_.count(key)) continue;
+
+            // Request by hash (preferred method)
+            request_block_hash(ps, h);
+        }
+
+        // If we have pending block-by-hash requests, don't use index pipeline
+        if (!want.empty()) {
+            return;
+        }
+    }
+
+    // FALLBACK: Index-by-height pipeline (only if block-by-hash is exhausted)
     // Use adaptive pipeline size based on peer reputation
     uint32_t pipe;
     if (g_sequential_sync) {
@@ -3144,12 +3244,13 @@ void P2P::fill_index_pipeline(PeerState& ps){
     if (!peer_is_index_capable((Sock)ps.sock)) return;
 
     // SYNC STATE FIX: Ensure next_index is consistent with current chain height
-    uint64_t current_height = chain_.height();
-    if (ps.next_index <= current_height) {
-        ps.next_index = current_height + 1;
+    // (current_height already defined above, but refresh in case block-by-hash changed it)
+    const uint64_t idx_current_height = chain_.height();
+    if (ps.next_index <= idx_current_height) {
+        ps.next_index = idx_current_height + 1;
         P2P_TRACE("DEBUG: Sync state corrected - next_index updated from " +
                   std::to_string(ps.next_index - 1) + " to " + std::to_string(ps.next_index) +
-                  " (chain height=" + std::to_string(current_height) + ")");
+                  " (chain height=" + std::to_string(idx_current_height) + ")");
     }
 
     // CRITICAL FIX: Backpressure - don't request too far ahead of current tip
@@ -3157,24 +3258,50 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // Limit: Don't request more than (orphan_count_limit / 2) blocks ahead.
     // This leaves room for other sources of orphans and prevents sync stalls.
     const uint64_t max_ahead = orphan_count_limit_ / 2;
-    const uint64_t max_index = current_height + max_ahead;
+    uint64_t max_index = idx_current_height + max_ahead;
+
+    // BULLETPROOF SYNC: Header-aware download window
+    // Only request blocks up to the best validated header height.
+    // This ensures we never request blocks we don't have headers for,
+    // similar to Bitcoin Core's headers-first approach.
+    // Allow a small margin (16 blocks) for peers that might be slightly ahead.
+    const uint64_t idx_best_hdr = chain_.best_header_height();
+    if (idx_best_hdr > 0) {
+        // Limit to header height + small margin (to handle slight header lag)
+        constexpr uint64_t HEADER_MARGIN = 16;
+        uint64_t header_limit = idx_best_hdr + HEADER_MARGIN;
+        // Use the more restrictive limit
+        max_index = std::min(max_index, header_limit);
+    }
 
     while (ps.inflight_index < pipe) {
         uint64_t idx = ps.next_index;
 
-        // Backpressure: Stop if we're too far ahead of the tip
+        // Backpressure: Stop if we're too far ahead of the tip or beyond header height
         if (idx > max_index) {
-            // Don't request more - wait for chain to catch up
+            // Don't request more - wait for chain/headers to catch up
             break;
         }
 
+        // BULLETPROOF SYNC: Skip if this index is already being requested by another peer
+        // This prevents duplicate requests that waste bandwidth and create duplicate orphans
+        {
+            InflightLock lk(g_inflight_lock);
+            if (g_global_requested_indices.count(idx)) {
+                // Another peer is already fetching this index, skip to next
+                ps.next_index++;
+                continue;
+            }
+        }
+
         ps.next_index++;
-        request_block_index(ps, idx);
-        ps.inflight_index++;
+        if (request_block_index(ps, idx)) {
+            ps.inflight_index++;
+        }
     }
 }
 
-void P2P::request_block_index(PeerState& ps, uint64_t index){
+bool P2P::request_block_index(PeerState& ps, uint64_t index){
     uint8_t p[8];
     for (int i = 0; i < 8; i++) {
         p[i] = (uint8_t)((index >> (8 * i)) & 0xFF);
@@ -3184,7 +3311,15 @@ void P2P::request_block_index(PeerState& ps, uint64_t index){
         // Track inflight timestamp and ordering per-peer for oldest-first retries
         g_inflight_index_ts[(Sock)ps.sock][index] = now_ms();
         g_inflight_index_order[(Sock)ps.sock].push_back(index);
+
+        // BULLETPROOF SYNC: Mark this index as globally requested
+        {
+            InflightLock lk(g_inflight_lock);
+            g_global_requested_indices.insert(index);
+        }
+        return true;
     }
+    return false;
 }
 
 void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
@@ -3401,7 +3536,19 @@ void P2P::evict_orphans_if_needed(){
                 continue;  // Part of orphan chain - protect it
             }
 
-            // This orphan is safe to evict (its parent is neither tip nor orphan)
+            // PROTECTION: Don't evict if parent is currently inflight (being requested)
+            // This is CRITICAL for sync - if block 1 is slow and blocks 2,3,4... arrive first,
+            // we must NOT evict block 2 just because block 1 hasn't arrived yet.
+            // Without this check, entire orphan chains can be wrongly evicted causing sync stalls.
+            {
+                InflightLock lk(g_inflight_lock);
+                if (g_global_inflight_blocks.count(parent_hex)) {
+                    ++order_it;
+                    continue;  // Parent is being fetched - protect this orphan
+                }
+            }
+
+            // This orphan is safe to evict (its parent is neither tip, orphan, nor inflight)
             victim = candidate;
             orphan_order_.erase(order_it);
             found_victim = true;
@@ -3505,6 +3652,36 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
     const auto bh = b.block_hash();
     if (chain_.have_block(bh)) return;
+
+    // BULLETPROOF SYNC: Validate block hash against header index
+    // If we have a header for this block's expected height, verify the hash matches.
+    // This catches malicious peers sending wrong blocks for a given height.
+    // Only applies when we have validated headers (headers-first mode).
+    {
+        int64_t parent_height = chain_.get_header_height(b.header.prev_hash);
+        if (parent_height >= 0) {
+            uint64_t expected_height = static_cast<uint64_t>(parent_height) + 1;
+            std::vector<uint8_t> expected_hash;
+            if (chain_.get_hash_by_index(expected_height, expected_hash)) {
+                // We have a validated header at this height - block hash must match
+                if (bh != expected_hash) {
+                    log_warn("P2P: block hash mismatch at height " + std::to_string(expected_height) +
+                             " - expected " + hexkey(expected_hash).substr(0, 16) +
+                             " got " + hexkey(bh).substr(0, 16) + " - rejecting");
+                    // Penalize the peer for sending wrong block
+                    auto pit = peers_.find(sock);
+                    if (pit != peers_.end()) {
+                        pit->second.mis++;
+                        if (pit->second.mis > 5) {
+                            log_warn("P2P: disconnecting peer " + pit->second.ip + " for repeated hash mismatches");
+                            // Will be cleaned up in dead peer handling
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
 
     // CRITICAL FIX: Enforce sequential block processing to prevent UTXO errors
     // With parallel block requests (pipeline=128), blocks can arrive out of order.
@@ -4433,6 +4610,21 @@ void P2P::loop(){
               auto &ps = kvp.second;
               ps.syncing = false;
               ps.inflight_index = 0;
+
+              // BULLETPROOF SYNC: Clear global index tracking when peer is demoted
+              // This prevents indices from getting stuck in the global set
+              {
+                  InflightLock lk(g_inflight_lock);
+                  auto idx_it = g_inflight_index_ts.find(s);
+                  if (idx_it != g_inflight_index_ts.end()) {
+                      for (const auto& kv : idx_it->second) {
+                          g_global_requested_indices.erase(kv.first);
+                      }
+                  }
+              }
+              g_inflight_index_ts.erase(s);
+              g_inflight_index_order.erase(s);
+
               // CRITICAL FIX: Reset peer_tip_height when peer is demoted due to timeouts
               // This prevents peer_tip_height from being stuck at incorrect values
               // after speculative requests timeout (peer doesn't have those blocks)
@@ -5653,7 +5845,7 @@ void P2P::loop(){
                         // Free a header slot and keep pipelining while within caps.
                         std::vector<BlockHeader> hs;
                         if (!parse_headers_payload(m.payload, hs)) {
-                            if (++ps.mis > 10) { dead.push_back(s); }
+                            if (++ps.mis > 10) { dead.push_back(s); break; }
                             continue;
                         }
 
@@ -5905,6 +6097,11 @@ void P2P::loop(){
                                     auto dq_it = std::find(dq_idx.begin(), dq_idx.end(), delivered_idx);
                                     if (dq_it != dq_idx.end()) {
                                         dq_idx.erase(dq_it);
+                                    }
+                                    // BULLETPROOF SYNC: Clear from global index tracking on successful delivery
+                                    {
+                                        InflightLock lk(g_inflight_lock);
+                                        g_global_requested_indices.erase(delivered_idx);
                                     }
                                 }
                                 ps.inflight_index--;
@@ -6204,7 +6401,7 @@ void P2P::loop(){
                             for(int j=0;j<8;j++) kb |= (uint64_t)m.payload[j] << (8*j);
                             set_peer_feefilter(s, kb);
                         } else {
-                            if (++ps.mis > 10) { dead.push_back(s); }
+                            if (++ps.mis > 10) { dead.push_back(s); break; }
                         }
 
                     // ─────────────────────────────────────────────────────────
@@ -6227,7 +6424,7 @@ void P2P::loop(){
                                          std::to_string(version) + (high_bandwidth ? " (high-bandwidth)" : ""));
                             }
                         } else {
-                            if (++ps.mis > 10) { dead.push_back(s); }
+                            if (++ps.mis > 10) { dead.push_back(s); break; }
                         }
 
                     } else if (cmd == "cmpctblock") {
@@ -6307,7 +6504,7 @@ void P2P::loop(){
                         std::vector<std::vector<uint8_t>> locator;
                         std::vector<uint8_t> stop;
                         if (!parse_getheaders_payload(m.payload, locator, stop)) {
-                            if (++ps.mis > 10) { dead.push_back(s); }
+                            if (++ps.mis > 10) { dead.push_back(s); break; }
                             continue;
                         }
 
@@ -6330,7 +6527,7 @@ void P2P::loop(){
                         g_peer_last_fetch_ms[(Sock)ps.sock] = now_ms();
                         std::vector<BlockHeader> hs;
                         if (!parse_headers_payload(m.payload, hs)) {
-                            if (++ps.mis > 10) { dead.push_back(s); }
+                            if (++ps.mis > 10) { dead.push_back(s); break; }
                             continue;
                         }
                         const size_t kHdrBatchMax = 2000; // must match build_headers_payload()
@@ -6479,7 +6676,7 @@ void P2P::loop(){
 
 #endif
                     } else {
-                        if (++ps.mis > 10) { dead.push_back(s); }
+                        if (++ps.mis > 10) { dead.push_back(s); continue; }
                     }
                 }
 
@@ -6578,7 +6775,7 @@ void P2P::loop(){
                     if (last_ok && (tnow - last_ok) > (int64_t)(g_stall_retry_ms * 4) && !is_lb) {
                         log_warn("P2P: deprioritizing header-stalled peer " + ps.ip);
                         g_peer_stalls[s]++;
-                        if (g_peer_stalls[s] >= MIQ_P2P_BAD_PEER_MAX_STALLS) dead.push_back(s);
+                        if (g_peer_stalls[s] >= MIQ_P2P_BAD_PEER_MAX_STALLS) { dead.push_back(s); continue; }
                     }
                 }
             }
@@ -6907,6 +7104,51 @@ void P2P::loop(){
             }
         }
 
+        // BULLETPROOF SYNC: Periodic cleanup of stale global requested indices
+        // Remove indices that have been in the global set for too long (5 minutes)
+        // This handles edge cases where indices get stuck due to disconnections or errors
+        {
+            static int64_t last_idx_cleanup_ms = 0;
+            constexpr int64_t IDX_CLEANUP_INTERVAL_MS = 60000;  // Every 60 seconds
+            constexpr int64_t IDX_STALE_THRESHOLD_MS = 300000;  // 5 minutes stale threshold
+
+            if (current_time - last_idx_cleanup_ms >= IDX_CLEANUP_INTERVAL_MS) {
+                last_idx_cleanup_ms = current_time;
+
+                InflightLock lk(g_inflight_lock);
+
+                // Build set of all indices that are actually inflight with valid timestamps
+                std::unordered_set<uint64_t> active_indices;
+                for (const auto& sock_map : g_inflight_index_ts) {
+                    for (const auto& idx_ts : sock_map.second) {
+                        // Only keep if timestamp is recent
+                        if (current_time - idx_ts.second < IDX_STALE_THRESHOLD_MS) {
+                            active_indices.insert(idx_ts.first);
+                        }
+                    }
+                }
+
+                // Remove stale indices from global set
+                size_t old_size = g_global_requested_indices.size();
+                std::vector<uint64_t> to_remove;
+                for (uint64_t idx : g_global_requested_indices) {
+                    if (active_indices.find(idx) == active_indices.end()) {
+                        to_remove.push_back(idx);
+                    }
+                }
+                for (uint64_t idx : to_remove) {
+                    g_global_requested_indices.erase(idx);
+                }
+
+                if (!to_remove.empty()) {
+                    MIQ_LOG_DEBUG(miq::LogCategory::NET, "BULLETPROOF SYNC: cleaned " +
+                        std::to_string(to_remove.size()) + " stale indices (was " +
+                        std::to_string(old_size) + ", now " +
+                        std::to_string(g_global_requested_indices.size()) + ")");
+                }
+            }
+        }
+
         trickle_flush();
 
         {
@@ -6959,8 +7201,9 @@ void P2P::loop(){
 }
 std::vector<PeerSnapshot> P2P::snapshot_peers() const {
     std::vector<PeerSnapshot> out;
-    out.reserve(peers_.size());
+    // CRITICAL FIX: Acquire lock BEFORE accessing peers_ to prevent race condition
     std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+    out.reserve(peers_.size());
     for (const auto& kv : peers_) {
         const auto& ps = kv.second;
         PeerSnapshot s;

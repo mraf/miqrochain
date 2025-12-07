@@ -669,7 +669,7 @@ private:
 
     // sync & block serving
     void start_sync_with_peer(PeerState& ps);
-    void request_block_index(PeerState& ps, uint64_t index);
+    bool request_block_index(PeerState& ps, uint64_t index);
     void fill_index_pipeline(PeerState& ps);
     void request_block_hash(PeerState& ps, const std::vector<uint8_t>& h);
     void handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw);
