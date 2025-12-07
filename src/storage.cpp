@@ -2,9 +2,12 @@
 #include "hex.h"
 #include "log.h"  // For log_warn
 #include "assume_valid.h"  // For is_ibd_mode()
+#include "serialize.h"  // For deser_block
+#include "block.h"      // For Block::block_hash()
 #include <cstdint>
 #include <fstream>
 #include <filesystem>
+#include <unordered_set>
 
 #if defined(_WIN32)
   #include <windows.h>
@@ -98,6 +101,70 @@ bool Storage::open(const std::string& dir){
         }
         std::string k(ksz,'\0'); hm.read(&k[0], ksz); uint32_t vi=0; hm.read((char*)&vi,sizeof(vi)); hash_to_index_[k]=vi;
     }
+
+    // CRITICAL FIX: Rebuild hash.map if it has fewer entries than blocks.dat
+    // This can happen after a crash during IBD when hash.map wasn't fsynced.
+    // Without this fix, blocks exist in storage but can't be looked up by hash,
+    // causing "possible index corruption" errors and sync failures.
+    if (hash_to_index_.size() < offsets_.size()) {
+        size_t missing_count = offsets_.size() - hash_to_index_.size();
+        log_warn("Storage: hash.map has " + std::to_string(hash_to_index_.size()) +
+                 " entries but blocks.dat has " + std::to_string(offsets_.size()) +
+                 " blocks - rebuilding " + std::to_string(missing_count) + " missing entries...");
+
+        // Build a set of indices we already have in hash_to_index_
+        std::unordered_set<uint32_t> known_indices;
+        for (const auto& kv : hash_to_index_) {
+            known_indices.insert(kv.second);
+        }
+
+        // Scan all blocks and add missing ones to hash_to_index_
+        size_t rebuilt = 0;
+        std::ofstream hm_append(path_hashmap_, std::ios::app|std::ios::binary);
+
+        for (size_t i = 0; i < offsets_.size(); ++i) {
+            if (known_indices.count((uint32_t)i)) {
+                continue;  // Already have this index
+            }
+
+            // Read the block and compute its hash
+            std::vector<uint8_t> raw;
+            if (!read_block_by_index(i, raw)) {
+                log_warn("Storage: failed to read block at index " + std::to_string(i) + " during hash.map rebuild");
+                continue;
+            }
+
+            Block blk;
+            if (!deser_block(raw, blk)) {
+                log_warn("Storage: failed to deserialize block at index " + std::to_string(i) + " during hash.map rebuild");
+                continue;
+            }
+
+            // Compute hash and add to index
+            std::vector<uint8_t> hash = blk.block_hash();
+            std::string hexh = to_hex(hash);
+            hash_to_index_[hexh] = (uint32_t)i;
+
+            // Persist to hash.map file
+            if (hm_append) {
+                uint32_t ksz = (uint32_t)hexh.size();
+                uint32_t idx_val = (uint32_t)i;
+                hm_append.write((const char*)&ksz, sizeof(ksz));
+                hm_append.write(hexh.c_str(), ksz);
+                hm_append.write((const char*)&idx_val, sizeof(idx_val));
+            }
+
+            rebuilt++;
+        }
+
+        if (hm_append) {
+            hm_append.flush();
+            flush_path(path_hashmap_);
+        }
+
+        log_info("Storage: rebuilt " + std::to_string(rebuilt) + " missing hash.map entries");
+    }
+
     return true;
 }
 // Append a block, update offsets and hash->index, then fsync all files.
