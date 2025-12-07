@@ -1521,6 +1521,8 @@ static inline void gate_on_close(Sock fd){
     g_peer_last_fetch_ms.erase(fd);
     g_peer_last_request_ms.erase(fd);
     g_peer_index_capable.erase(fd);
+    g_index_timeouts.erase(fd);  // CRITICAL FIX: Clean up timeout counter to prevent socket reuse issues
+    g_last_hdr_ok_ms.erase(fd);  // Clean up header tracking to prevent stale state
 }
 [[maybe_unused]] static inline bool gate_on_bytes(Sock fd, size_t add){
     auto it = g_gate.find(fd);
