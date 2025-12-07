@@ -1255,8 +1255,10 @@ static inline void clear_all_inflight_for_sock(Sock sock) {
 
 static inline bool peer_is_index_capable(Sock s) {
     auto it = g_peer_index_capable.find(s);
-    // Default to true unless explicitly demoted.
-    if (it == g_peer_index_capable.end()) return true;
+    // BULLETPROOF SYNC: Default to FALSE - always start with headers-first
+    // Index-by-height is only enabled as a fallback after headers timeout
+    // This ensures we sync like Bitcoin Core: headers first, then blocks
+    if (it == g_peer_index_capable.end()) return false;
     return it->second;
 }
 
@@ -3129,7 +3131,33 @@ void P2P::send_tx(Sock sock, const std::vector<uint8_t>& raw){
 }
 
 void P2P::start_sync_with_peer(PeerState& ps){
-    if (!peer_is_index_capable((Sock)ps.sock) || ps.peer_tip_height <= 1) {
+    // BULLETPROOF SYNC: Always prefer headers-first (Bitcoin Core style)
+    // Index-by-height is ONLY used as a fallback after:
+    //   1. Headers phase is complete (g_logged_headers_done), OR
+    //   2. Headers phase has timed out (MIQ_IBD_FALLBACK_AFTER_MS)
+    //
+    // This ensures we know block hashes BEFORE requesting blocks,
+    // preventing sync stalls and malicious block injection.
+
+    bool use_index_fallback = false;
+
+    // Check if we should use index-by-height as fallback
+    if (peer_is_index_capable((Sock)ps.sock) && ps.peer_tip_height > 1) {
+        // Only use index if headers are done OR headers timed out
+        if (g_logged_headers_done) {
+            // Headers complete - can use index for faster parallel download
+            use_index_fallback = true;
+        } else if (g_ibd_headers_started_ms > 0) {
+            // Check if headers have timed out
+            int64_t elapsed = now_ms() - g_ibd_headers_started_ms;
+            if (elapsed > (int64_t)MIQ_IBD_FALLBACK_AFTER_MS) {
+                use_index_fallback = true;
+            }
+        }
+    }
+
+    if (!use_index_fallback) {
+        // PRIMARY PATH: Headers-first sync (like Bitcoin Core)
 #if MIQ_ENABLE_HEADERS_FIRST
         std::vector<std::vector<uint8_t>> locator;
         chain_.build_locator(locator);
@@ -3152,13 +3180,14 @@ void P2P::start_sync_with_peer(PeerState& ps){
         }
         if (!g_logged_headers_started) {
             g_logged_headers_started = true;
-            log_info("[IBD] headers phase started");
+            log_info("[IBD] headers phase started (Bitcoin-style headers-first sync)");
             if (!g_ibd_headers_started_ms) g_ibd_headers_started_ms = now_ms();
         }
 #endif
         return;
     }
-    // Index-capable: pipeline indices immediately.
+
+    // FALLBACK PATH: Index-by-height (only after headers done or timeout)
     ps.syncing = true;
     ps.inflight_index = 0;
     ps.next_index = chain_.height() + 1;
@@ -3166,6 +3195,39 @@ void P2P::start_sync_with_peer(PeerState& ps){
 }
 
 void P2P::fill_index_pipeline(PeerState& ps){
+    // BULLETPROOF SYNC: Prefer block-by-hash when headers are available
+    // This is more reliable than index-by-height because we know the exact hash.
+    // Only fall back to index-by-height if:
+    //   1. Headers are not available (headers timed out), OR
+    //   2. We've exhausted block-by-hash targets
+    const uint64_t best_hdr = chain_.best_header_height();
+    const uint64_t current_height = chain_.height();
+
+    if (best_hdr > current_height) {
+        // We have headers ahead of our chain - prefer block-by-hash
+        std::vector<std::vector<uint8_t>> want;
+        chain_.next_block_fetch_targets(want, (size_t)32);
+
+        for (const auto& h : want) {
+            const std::string key = hexkey(h);
+            // Skip if already inflight or orphaned
+            {
+                InflightLock lk(g_inflight_lock);
+                if (g_global_inflight_blocks.count(key)) continue;
+            }
+            if (orphans_.count(key)) continue;
+
+            // Request by hash (preferred method)
+            request_block_hash(ps, h);
+        }
+
+        // If we have pending block-by-hash requests, don't use index pipeline
+        if (!want.empty()) {
+            return;
+        }
+    }
+
+    // FALLBACK: Index-by-height pipeline (only if block-by-hash is exhausted)
     // Use adaptive pipeline size based on peer reputation
     uint32_t pipe;
     if (g_sequential_sync) {
@@ -3182,12 +3244,13 @@ void P2P::fill_index_pipeline(PeerState& ps){
     if (!peer_is_index_capable((Sock)ps.sock)) return;
 
     // SYNC STATE FIX: Ensure next_index is consistent with current chain height
-    uint64_t current_height = chain_.height();
-    if (ps.next_index <= current_height) {
-        ps.next_index = current_height + 1;
+    // (current_height already defined above, but refresh in case block-by-hash changed it)
+    const uint64_t idx_current_height = chain_.height();
+    if (ps.next_index <= idx_current_height) {
+        ps.next_index = idx_current_height + 1;
         P2P_TRACE("DEBUG: Sync state corrected - next_index updated from " +
                   std::to_string(ps.next_index - 1) + " to " + std::to_string(ps.next_index) +
-                  " (chain height=" + std::to_string(current_height) + ")");
+                  " (chain height=" + std::to_string(idx_current_height) + ")");
     }
 
     // CRITICAL FIX: Backpressure - don't request too far ahead of current tip
@@ -3195,18 +3258,18 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // Limit: Don't request more than (orphan_count_limit / 2) blocks ahead.
     // This leaves room for other sources of orphans and prevents sync stalls.
     const uint64_t max_ahead = orphan_count_limit_ / 2;
-    uint64_t max_index = current_height + max_ahead;
+    uint64_t max_index = idx_current_height + max_ahead;
 
     // BULLETPROOF SYNC: Header-aware download window
     // Only request blocks up to the best validated header height.
     // This ensures we never request blocks we don't have headers for,
     // similar to Bitcoin Core's headers-first approach.
     // Allow a small margin (16 blocks) for peers that might be slightly ahead.
-    const uint64_t best_hdr = chain_.best_header_height();
-    if (best_hdr > 0) {
+    const uint64_t idx_best_hdr = chain_.best_header_height();
+    if (idx_best_hdr > 0) {
         // Limit to header height + small margin (to handle slight header lag)
         constexpr uint64_t HEADER_MARGIN = 16;
-        uint64_t header_limit = best_hdr + HEADER_MARGIN;
+        uint64_t header_limit = idx_best_hdr + HEADER_MARGIN;
         // Use the more restrictive limit
         max_index = std::min(max_index, header_limit);
     }
