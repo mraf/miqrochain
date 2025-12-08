@@ -1195,6 +1195,64 @@ bool Chain::open(const std::string& dir){
         });
     }
 
+    // CRITICAL FIX: Auto-detect and rebuild corrupted UTXO set
+    // This fixes "missing utxo" errors that occur when blocks are stored but UTXOs weren't applied
+    if (tip_.height > 0) {
+        bool needs_utxo_rebuild = false;
+
+        // Check 1: If UTXO set is completely empty but we have blocks, definitely corrupted
+        if (utxo_.size() == 0) {
+            log_warn("UTXO set is empty but chain has " + std::to_string(tip_.height + 1) +
+                     " blocks - triggering automatic rebuild");
+            needs_utxo_rebuild = true;
+        }
+
+        // Check 2: UTXO count is suspiciously low (should have at least 1 UTXO per block on average)
+        // A healthy chain should have many more UTXOs than blocks due to transaction outputs
+        // If we have way fewer, something is wrong
+        if (!needs_utxo_rebuild && utxo_.size() < tip_.height / 10 && tip_.height > 100) {
+            log_warn("UTXO count (" + std::to_string(utxo_.size()) + ") is suspiciously low for " +
+                     std::to_string(tip_.height + 1) + " blocks - triggering automatic rebuild");
+            needs_utxo_rebuild = true;
+        }
+
+        // Check 3: Verify early coinbase UTXOs exist (most reliable corruption detection)
+        // Block 1's coinbase should always exist unless spent - try to verify chain integrity
+        if (!needs_utxo_rebuild && tip_.height >= 1) {
+            Block blk1;
+            if (get_block_by_index(1, blk1) && !blk1.txs.empty()) {
+                auto cb_txid = blk1.txs[0].txid();
+                UTXOEntry dummy;
+                // Check if block 1's coinbase output 0 exists (or was spent)
+                // For a simple check, we verify the UTXO lookup doesn't crash
+                // A more thorough check would trace spending history
+                bool found = utxo_.get(cb_txid, 0, dummy);
+                // If not found, it might have been spent - that's OK
+                // But if UTXO count is very low AND this is missing, likely corruption
+                if (!found && utxo_.size() < tip_.height) {
+                    // Double-check by verifying block 0's coinbase
+                    Block blk0;
+                    if (get_block_by_index(0, blk0) && !blk0.txs.empty()) {
+                        auto cb0_txid = blk0.txs[0].txid();
+                        if (!utxo_.get(cb0_txid, 0, dummy) && utxo_.size() < 100) {
+                            log_warn("Critical UTXOs appear missing - triggering automatic rebuild");
+                            needs_utxo_rebuild = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (needs_utxo_rebuild) {
+            log_info("=== AUTOMATIC UTXO REBUILD TRIGGERED ===");
+            if (rebuild_utxo_from_blocks()) {
+                log_info("=== UTXO REBUILD COMPLETE ===");
+            } else {
+                log_error("UTXO rebuild failed! Chain may be in inconsistent state.");
+            }
+        }
+    }
+
     return true;
 }
 
