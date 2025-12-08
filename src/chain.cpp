@@ -2097,19 +2097,31 @@ bool Chain::disconnect_tip_once(std::string& err){
 
 bool Chain::submit_block(const Block& b, std::string& err){
     MIQ_CHAIN_GUARD();
-    
+
     // Ensure header is in index before block validation
     const auto hh = b.block_hash();
     const auto key = hk(hh);
-    
+
     // Check if we already have this block
     if (have_block(hh)) {
-        // Already have it, ensure header is in index
-        if (header_index_.find(key) == header_index_.end()) {
-            std::string header_err;
-            accept_header(b.header, header_err);
+        // CRITICAL FIX: Detect incomplete block processing
+        // If this block's prev_hash matches our current tip but our tip hasn't advanced,
+        // it means the block was stored but UTXO operations failed (e.g., due to crash).
+        // In this case, we need to re-process the UTXOs rather than returning early.
+        bool incomplete_processing = (b.header.prev_hash == tip_.hash);
+
+        if (incomplete_processing) {
+            log_warn("Detected incomplete block processing at height " +
+                     std::to_string(tip_.height + 1) + " - re-applying UTXOs");
+            // Fall through to continue processing UTXOs
+        } else {
+            // Block doesn't extend tip - truly a duplicate or already processed
+            if (header_index_.find(key) == header_index_.end()) {
+                std::string header_err;
+                accept_header(b.header, header_err);
+            }
+            return true;
         }
-        return true;
     }
     
     // Add header to index if not present
@@ -2122,7 +2134,11 @@ bool Chain::submit_block(const Block& b, std::string& err){
 
     if (!verify_block(b, err)) return false;
 
-    if (have_block(b.block_hash())) return true;
+    // CRITICAL FIX: Don't early-return here if block extends tip
+    // This handles the case where block was stored but UTXO wasn't applied
+    if (have_block(b.block_hash()) && b.header.prev_hash != tip_.hash) {
+        return true;
+    }
 
     // --- Collect undo BEFORE mutating UTXO ---
     std::vector<UndoIn> undo;
@@ -2183,8 +2199,11 @@ bool Chain::submit_block(const Block& b, std::string& err){
         }
     }
 
-    // Persist the block body
-    storage_.append_block(ser_block(b), b.block_hash());
+    // Persist the block body (only if not already stored)
+    // CRITICAL FIX: Check have_block to avoid duplicating storage on re-processing
+    if (!have_block(b.block_hash())) {
+        storage_.append_block(ser_block(b), b.block_hash());
+    }
 
     // --- Crash-safety: write undo BEFORE UTXO mutation ---
     const uint64_t new_height = tip_.height + 1;
