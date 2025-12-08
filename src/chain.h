@@ -126,6 +126,10 @@ public:
     // Reindex address index from genesis
     bool reindex_addresses(std::function<bool(uint64_t, uint64_t)> progress = nullptr);
 
+    // CRITICAL FIX: Rebuild UTXO set from stored blocks
+    // Recovers from corrupted/incomplete UTXO sets that cause "missing utxo" errors
+    bool rebuild_utxo_from_blocks();
+
 #if MIQ_HAVE_GCS_FILTERS
     // === Compact filter RPC helpers for the P2P server ===
     // Returns rolling filter headers (BIP158-style) for [start, start+count).

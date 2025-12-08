@@ -1347,6 +1347,64 @@ bool Chain::rebuild_state_from_blocks() {
     return true;
 }
 
+// CRITICAL FIX: Rebuild UTXO set from stored blocks
+// This recovers from corrupted/incomplete UTXO sets that cause "missing utxo" errors
+bool Chain::rebuild_utxo_from_blocks() {
+    MIQ_CHAIN_GUARD();
+
+    size_t block_count = storage_.count();
+    if (block_count == 0) {
+        return true;  // Nothing to rebuild
+    }
+
+    log_warn("Rebuilding UTXO set from " + std::to_string(block_count) + " blocks...");
+
+    // Clear existing UTXO set
+    utxo_.clear();
+
+    // Process each block to rebuild UTXO set
+    for (size_t h = 0; h < block_count; ++h) {
+        std::vector<uint8_t> raw;
+        Block blk;
+        if (!storage_.read_block_by_index(h, raw) || !deser_block(raw, blk)) {
+            log_warn("Failed to read block " + std::to_string(h) + " during UTXO rebuild");
+            continue;
+        }
+
+        // Add coinbase outputs
+        const auto& cb = blk.txs[0];
+        auto cb_txid = cb.txid();
+        for (size_t i = 0; i < cb.vout.size(); ++i) {
+            UTXOEntry e{cb.vout[i].value, cb.vout[i].pkh, h, true};
+            utxo_.add(cb_txid, (uint32_t)i, e);
+        }
+
+        // Process non-coinbase transactions
+        for (size_t ti = 1; ti < blk.txs.size(); ++ti) {
+            const auto& tx = blk.txs[ti];
+
+            // Spend inputs
+            for (const auto& in : tx.vin) {
+                utxo_.spend(in.prev.txid, in.prev.vout);
+            }
+
+            // Add outputs
+            auto txid = tx.txid();
+            for (size_t i = 0; i < tx.vout.size(); ++i) {
+                UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, h, false};
+                utxo_.add(txid, (uint32_t)i, e);
+            }
+        }
+
+        if (h % 1000 == 0 && h > 0) {
+            log_info("UTXO rebuild progress: " + std::to_string(h) + "/" + std::to_string(block_count) + " blocks");
+        }
+    }
+
+    log_info("UTXO rebuild complete: processed " + std::to_string(block_count) + " blocks");
+    return true;
+}
+
 bool Chain::load_state(){
     MIQ_CHAIN_GUARD();
     std::vector<uint8_t> b;

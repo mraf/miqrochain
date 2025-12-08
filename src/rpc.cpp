@@ -549,7 +549,7 @@ std::string RpcService::handle(const std::string& body){
                 "submitblock","submitrawblock","sendrawblock",
                 // Blockchain Explorer API
                 "getaddresstxids","getaddresshistory","getaddressbalance","getaddressdeltas",
-                "getaddressindexinfo","reindexaddresses"
+                "getaddressindexinfo","reindexaddresses","reindexutxo"
                 // (getibdinfo exists but not listed here to keep help stable)
             };
             std::vector<JNode> v;
@@ -3412,6 +3412,19 @@ std::string RpcService::handle(const std::string& body){
             result["success"] = jbool(success);
             result["address_count"] = jnum((double)chain_.addressindex().address_count());
             result["indexed_height"] = jnum((double)chain_.addressindex().best_indexed_height());
+
+            JNode out; out.v = result; return json_dump(out);
+        }
+
+        // reindexutxo -> rebuild UTXO set from blocks (fixes "missing utxo" errors)
+        if(method=="reindexutxo"){
+            log_info("Starting UTXO rebuild from RPC...");
+            bool success = chain_.rebuild_utxo_from_blocks();
+
+            std::map<std::string, JNode> result;
+            result["success"] = jbool(success);
+            result["utxo_count"] = jnum((double)chain_.utxo().size());
+            result["tip_height"] = jnum((double)chain_.tip().height);
 
             JNode out; out.v = result; return json_dump(out);
         }

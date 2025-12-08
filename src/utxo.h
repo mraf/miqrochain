@@ -22,6 +22,7 @@ public:
     bool spend(const std::vector<uint8_t>& txid, uint32_t vout);
     bool get(const std::vector<uint8_t>& txid, uint32_t vout, UTXOEntry& out) const;
     size_t size() const { return map_.size(); }
+    void clear();  // Clear UTXO set and log for rebuild
 
     // Enumerate live UTXOs for a given PKH. Returns (txid, vout, entry).
     std::vector<std::tuple<std::vector<uint8_t>, uint32_t, UTXOEntry>>
