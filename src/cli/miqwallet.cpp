@@ -11456,16 +11456,19 @@ static bool wallet_session(const std::string& cli_host,
             }
 
             // Get spendable UTXOs
-            // CRITICAL FIX: Filter out unconfirmed UTXOs (height=0) to prevent orphan transactions
-            // Only spend UTXOs that are confirmed in the blockchain and known to the node
+            // CRITICAL FIX v2.0: Allow spending unconfirmed (mempool) UTXOs
+            // The node now returns mempool outputs in getaddressutxos (height=0)
+            // The mempool validates child transactions by checking parent outputs,
+            // enabling CPFP (Child Pays For Parent) transaction chains
             std::vector<miq::UtxoLite> spendables;
             for(const auto& u: utxos){
-                // Skip unconfirmed UTXOs - they may not be in the node's UTXO set yet
-                // which would cause the transaction to become an orphan
-                if(u.height == 0) continue;
+                // Note: height=0 UTXOs are now spendable (from mempool)
+                // The node validates these against mempool parents
 
                 bool immature = false;
                 if(u.coinbase){
+                    // Coinbase UTXOs must be confirmed and mature
+                    if(u.height == 0) continue;  // Coinbase can't be in mempool
                     uint64_t mh = (uint64_t)u.height + (uint64_t)miq::COINBASE_MATURITY;
                     // CRITICAL FIX: Must use <= to match mempool maturity check
                     if(tip_h + 1 <= mh) immature = true;
@@ -11481,10 +11484,17 @@ static bool wallet_session(const std::string& cli_host,
                 continue;
             }
 
-            // Sort: oldest first, then by value
+            // Sort: confirmed first (height > 0), then oldest first, then by value
+            // This prefers spending confirmed UTXOs before unconfirmed mempool ones
             std::stable_sort(spendables.begin(), spendables.end(),
                 [](const miq::UtxoLite& a, const miq::UtxoLite& b){
+                    // Prefer confirmed (height > 0) over unconfirmed (height = 0)
+                    bool a_confirmed = (a.height > 0);
+                    bool b_confirmed = (b.height > 0);
+                    if(a_confirmed != b_confirmed) return a_confirmed;
+                    // Among confirmed, prefer oldest first
                     if(a.height != b.height) return a.height < b.height;
+                    // Then prefer larger value
                     return a.value > b.value;
                 });
 

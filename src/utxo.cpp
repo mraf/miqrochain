@@ -255,5 +255,13 @@ UTXOSet::list_for_pkh(const std::vector<uint8_t>& pkh) const {
     return out;
 }
 
+void UTXOSet::clear() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    map_.clear();
+    // Truncate the log file to allow fresh rebuild
+    std::ofstream f(log_path_, std::ios::trunc | std::ios::binary);
+    f.close();
+}
+
 }
 

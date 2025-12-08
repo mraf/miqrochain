@@ -1195,6 +1195,64 @@ bool Chain::open(const std::string& dir){
         });
     }
 
+    // CRITICAL FIX: Auto-detect and rebuild corrupted UTXO set
+    // This fixes "missing utxo" errors that occur when blocks are stored but UTXOs weren't applied
+    if (tip_.height > 0) {
+        bool needs_utxo_rebuild = false;
+
+        // Check 1: If UTXO set is completely empty but we have blocks, definitely corrupted
+        if (utxo_.size() == 0) {
+            log_warn("UTXO set is empty but chain has " + std::to_string(tip_.height + 1) +
+                     " blocks - triggering automatic rebuild");
+            needs_utxo_rebuild = true;
+        }
+
+        // Check 2: UTXO count is suspiciously low (should have at least 1 UTXO per block on average)
+        // A healthy chain should have many more UTXOs than blocks due to transaction outputs
+        // If we have way fewer, something is wrong
+        if (!needs_utxo_rebuild && utxo_.size() < tip_.height / 10 && tip_.height > 100) {
+            log_warn("UTXO count (" + std::to_string(utxo_.size()) + ") is suspiciously low for " +
+                     std::to_string(tip_.height + 1) + " blocks - triggering automatic rebuild");
+            needs_utxo_rebuild = true;
+        }
+
+        // Check 3: Verify early coinbase UTXOs exist (most reliable corruption detection)
+        // Block 1's coinbase should always exist unless spent - try to verify chain integrity
+        if (!needs_utxo_rebuild && tip_.height >= 1) {
+            Block blk1;
+            if (get_block_by_index(1, blk1) && !blk1.txs.empty()) {
+                auto cb_txid = blk1.txs[0].txid();
+                UTXOEntry dummy;
+                // Check if block 1's coinbase output 0 exists (or was spent)
+                // For a simple check, we verify the UTXO lookup doesn't crash
+                // A more thorough check would trace spending history
+                bool found = utxo_.get(cb_txid, 0, dummy);
+                // If not found, it might have been spent - that's OK
+                // But if UTXO count is very low AND this is missing, likely corruption
+                if (!found && utxo_.size() < tip_.height) {
+                    // Double-check by verifying block 0's coinbase
+                    Block blk0;
+                    if (get_block_by_index(0, blk0) && !blk0.txs.empty()) {
+                        auto cb0_txid = blk0.txs[0].txid();
+                        if (!utxo_.get(cb0_txid, 0, dummy) && utxo_.size() < 100) {
+                            log_warn("Critical UTXOs appear missing - triggering automatic rebuild");
+                            needs_utxo_rebuild = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (needs_utxo_rebuild) {
+            log_info("=== AUTOMATIC UTXO REBUILD TRIGGERED ===");
+            if (rebuild_utxo_from_blocks()) {
+                log_info("=== UTXO REBUILD COMPLETE ===");
+            } else {
+                log_error("UTXO rebuild failed! Chain may be in inconsistent state.");
+            }
+        }
+    }
+
     return true;
 }
 
@@ -1344,6 +1402,64 @@ bool Chain::rebuild_state_from_blocks() {
     // Save the recovered state
     save_state();
 
+    return true;
+}
+
+// CRITICAL FIX: Rebuild UTXO set from stored blocks
+// This recovers from corrupted/incomplete UTXO sets that cause "missing utxo" errors
+bool Chain::rebuild_utxo_from_blocks() {
+    MIQ_CHAIN_GUARD();
+
+    size_t block_count = storage_.count();
+    if (block_count == 0) {
+        return true;  // Nothing to rebuild
+    }
+
+    log_warn("Rebuilding UTXO set from " + std::to_string(block_count) + " blocks...");
+
+    // Clear existing UTXO set
+    utxo_.clear();
+
+    // Process each block to rebuild UTXO set
+    for (size_t h = 0; h < block_count; ++h) {
+        std::vector<uint8_t> raw;
+        Block blk;
+        if (!storage_.read_block_by_index(h, raw) || !deser_block(raw, blk)) {
+            log_warn("Failed to read block " + std::to_string(h) + " during UTXO rebuild");
+            continue;
+        }
+
+        // Add coinbase outputs
+        const auto& cb = blk.txs[0];
+        auto cb_txid = cb.txid();
+        for (size_t i = 0; i < cb.vout.size(); ++i) {
+            UTXOEntry e{cb.vout[i].value, cb.vout[i].pkh, h, true};
+            utxo_.add(cb_txid, (uint32_t)i, e);
+        }
+
+        // Process non-coinbase transactions
+        for (size_t ti = 1; ti < blk.txs.size(); ++ti) {
+            const auto& tx = blk.txs[ti];
+
+            // Spend inputs
+            for (const auto& in : tx.vin) {
+                utxo_.spend(in.prev.txid, in.prev.vout);
+            }
+
+            // Add outputs
+            auto txid = tx.txid();
+            for (size_t i = 0; i < tx.vout.size(); ++i) {
+                UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, h, false};
+                utxo_.add(txid, (uint32_t)i, e);
+            }
+        }
+
+        if (h % 1000 == 0 && h > 0) {
+            log_info("UTXO rebuild progress: " + std::to_string(h) + "/" + std::to_string(block_count) + " blocks");
+        }
+    }
+
+    log_info("UTXO rebuild complete: processed " + std::to_string(block_count) + " blocks");
     return true;
 }
 
@@ -2097,19 +2213,31 @@ bool Chain::disconnect_tip_once(std::string& err){
 
 bool Chain::submit_block(const Block& b, std::string& err){
     MIQ_CHAIN_GUARD();
-    
+
     // Ensure header is in index before block validation
     const auto hh = b.block_hash();
     const auto key = hk(hh);
-    
+
     // Check if we already have this block
     if (have_block(hh)) {
-        // Already have it, ensure header is in index
-        if (header_index_.find(key) == header_index_.end()) {
-            std::string header_err;
-            accept_header(b.header, header_err);
+        // CRITICAL FIX: Detect incomplete block processing
+        // If this block's prev_hash matches our current tip but our tip hasn't advanced,
+        // it means the block was stored but UTXO operations failed (e.g., due to crash).
+        // In this case, we need to re-process the UTXOs rather than returning early.
+        bool incomplete_processing = (b.header.prev_hash == tip_.hash);
+
+        if (incomplete_processing) {
+            log_warn("Detected incomplete block processing at height " +
+                     std::to_string(tip_.height + 1) + " - re-applying UTXOs");
+            // Fall through to continue processing UTXOs
+        } else {
+            // Block doesn't extend tip - truly a duplicate or already processed
+            if (header_index_.find(key) == header_index_.end()) {
+                std::string header_err;
+                accept_header(b.header, header_err);
+            }
+            return true;
         }
-        return true;
     }
     
     // Add header to index if not present
@@ -2122,7 +2250,11 @@ bool Chain::submit_block(const Block& b, std::string& err){
 
     if (!verify_block(b, err)) return false;
 
-    if (have_block(b.block_hash())) return true;
+    // CRITICAL FIX: Don't early-return here if block extends tip
+    // This handles the case where block was stored but UTXO wasn't applied
+    if (have_block(b.block_hash()) && b.header.prev_hash != tip_.hash) {
+        return true;
+    }
 
     // --- Collect undo BEFORE mutating UTXO ---
     std::vector<UndoIn> undo;
@@ -2183,8 +2315,11 @@ bool Chain::submit_block(const Block& b, std::string& err){
         }
     }
 
-    // Persist the block body
-    storage_.append_block(ser_block(b), b.block_hash());
+    // Persist the block body (only if not already stored)
+    // CRITICAL FIX: Check have_block to avoid duplicating storage on re-processing
+    if (!have_block(b.block_hash())) {
+        storage_.append_block(ser_block(b), b.block_hash());
+    }
 
     // --- Crash-safety: write undo BEFORE UTXO mutation ---
     const uint64_t new_height = tip_.height + 1;

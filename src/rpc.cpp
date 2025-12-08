@@ -549,7 +549,7 @@ std::string RpcService::handle(const std::string& body){
                 "submitblock","submitrawblock","sendrawblock",
                 // Blockchain Explorer API
                 "getaddresstxids","getaddresshistory","getaddressbalance","getaddressdeltas",
-                "getaddressindexinfo","reindexaddresses"
+                "getaddressindexinfo","reindexaddresses","reindexutxo"
                 // (getibdinfo exists but not listed here to keep help stable)
             };
             std::vector<JNode> v;
@@ -1798,19 +1798,48 @@ std::string RpcService::handle(const std::string& body){
             std::vector<JNode> arr;
             arr.reserve(addresses.size() * 10);  // Pre-allocate for efficiency
 
+            // CRITICAL FIX: Get mempool transactions to include unconfirmed UTXOs
+            // This enables CPFP (Child Pays For Parent) - spending unconfirmed change
+            std::vector<Transaction> mempool_txs;
+            mempool_.snapshot(mempool_txs);
+
+            // Build PKH lookup set for efficient matching
+            std::unordered_set<std::string> target_pkhs;
+            std::unordered_map<std::string, std::string> pkh_to_addr;  // pkh_hex -> address
+            for (const auto& addr : addresses) {
+                uint8_t ver = 0; std::vector<uint8_t> payload;
+                if (!base58check_decode(addr, ver, payload)) continue;
+                if (ver != VERSION_P2PKH || payload.size() != 20) continue;
+                std::string pkh_hex = to_hex(payload);
+                target_pkhs.insert(pkh_hex);
+                pkh_to_addr[pkh_hex] = addr;
+            }
+
+            // Track UTXOs we've seen (to avoid duplicates between confirmed and mempool)
+            std::unordered_set<std::string> seen_utxos;  // "txid:vout"
+
             for (const auto& addr : addresses) {
                 // Decode address
                 uint8_t ver = 0; std::vector<uint8_t> payload;
                 if (!base58check_decode(addr, ver, payload)) continue;  // Skip invalid
                 if (ver != VERSION_P2PKH || payload.size() != 20) continue;
 
-                // Query UTXO set
+                // Query confirmed UTXO set
                 auto entries = chain_.utxo().list_for_pkh(payload);
 
                 for (const auto& t : entries) {
                     const auto& txid = std::get<0>(t);
                     uint32_t vout    = std::get<1>(t);
                     const auto& e    = std::get<2>(t);
+
+                    // CRITICAL FIX: Skip UTXOs that are being spent by mempool transactions
+                    // This prevents double-spending attempts
+                    if (mempool_.has_spent_input(txid, vout)) {
+                        continue;
+                    }
+
+                    std::string utxo_key = to_hex(txid) + ":" + std::to_string(vout);
+                    seen_utxos.insert(utxo_key);
 
                     std::map<std::string,JNode> o;
                     o["coinbase"] = jbool(e.coinbase);
@@ -1819,10 +1848,47 @@ std::string RpcService::handle(const std::string& body){
                     o["vout"]  = jnum((double)vout);
                     o["value"] = jnum((double)e.value);
                     o["pkh"]   = jstr(to_hex(e.pkh));
-                    o["address"] = jstr(addr);  // Include source address for client convenience
+                    o["address"] = jstr(addr);
+                    o["confirmations"] = jnum((double)(chain_.tip().height - e.height + 1));
                     JNode n; n.v = o; arr.push_back(n);
                 }
             }
+
+            // CRITICAL FIX: Add unconfirmed outputs from mempool transactions
+            // This enables the wallet to spend change from its own pending transactions
+            for (const auto& mtx : mempool_txs) {
+                auto mtxid = mtx.txid();
+                std::string mtxid_hex = to_hex(mtxid);
+
+                for (uint32_t vout = 0; vout < mtx.vout.size(); ++vout) {
+                    const auto& out = mtx.vout[vout];
+                    std::string pkh_hex = to_hex(out.pkh);
+
+                    // Check if this output is to one of our target addresses
+                    if (target_pkhs.find(pkh_hex) == target_pkhs.end()) continue;
+
+                    // Skip if already spent by another mempool tx
+                    if (mempool_.has_spent_input(mtxid, vout)) continue;
+
+                    // Skip if we've already seen this (shouldn't happen but be safe)
+                    std::string utxo_key = mtxid_hex + ":" + std::to_string(vout);
+                    if (seen_utxos.find(utxo_key) != seen_utxos.end()) continue;
+                    seen_utxos.insert(utxo_key);
+
+                    std::map<std::string,JNode> o;
+                    o["coinbase"] = jbool(false);
+                    o["height"]   = jnum(0.0);  // 0 = unconfirmed
+                    o["txid"]  = jstr(mtxid_hex);
+                    o["vout"]  = jnum((double)vout);
+                    o["value"] = jnum((double)out.value);
+                    o["pkh"]   = jstr(pkh_hex);
+                    o["address"] = jstr(pkh_to_addr[pkh_hex]);
+                    o["confirmations"] = jnum(0.0);  // Unconfirmed
+                    o["mempool"] = jbool(true);  // Flag as mempool UTXO
+                    JNode n; n.v = o; arr.push_back(n);
+                }
+            }
+
             // CRITICAL FIX: Wrap in {"result":...} format
             return ok_arr(arr);
         }
@@ -3412,6 +3478,19 @@ std::string RpcService::handle(const std::string& body){
             result["success"] = jbool(success);
             result["address_count"] = jnum((double)chain_.addressindex().address_count());
             result["indexed_height"] = jnum((double)chain_.addressindex().best_indexed_height());
+
+            JNode out; out.v = result; return json_dump(out);
+        }
+
+        // reindexutxo -> rebuild UTXO set from blocks (fixes "missing utxo" errors)
+        if(method=="reindexutxo"){
+            log_info("Starting UTXO rebuild from RPC...");
+            bool success = chain_.rebuild_utxo_from_blocks();
+
+            std::map<std::string, JNode> result;
+            result["success"] = jbool(success);
+            result["utxo_count"] = jnum((double)chain_.utxo().size());
+            result["tip_height"] = jnum((double)chain_.tip().height);
 
             JNode out; out.v = result; return json_dump(out);
         }
