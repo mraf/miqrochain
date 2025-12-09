@@ -5083,24 +5083,26 @@ int main(int argc, char** argv){
             }
 
             // Sync gate for TUI display (external miner checks sync state via RPC)
-            // CRITICAL FIX: Also recover from Degraded state if node is actually synced
+            // CRITICAL FIX: Force transition to running state when truly synced
             {
                 std::string why;
                 bool synced = compute_sync_gate(chain, &p2p, why);
                 if (can_tui) {
                     tui.set_mining_gate(synced, synced ? "" : why);
 
-                    // RECOVERY FIX: If node is synced but was in Degraded state (from IBD failure),
-                    // recover to Running state. This handles transient IBD failures where the node
-                    // is actually synced (e.g., stability check glitch, brief peer disconnect).
-                    static bool was_degraded = !ibd_ok;
-                    if (was_degraded && synced) {
-                        log_info("Sync recovery: Node synced after initial IBD failure - enabling mining");
+                    // CRITICAL FIX: Force immediate transition to main screen when truly synced
+                    // This ensures the "core running" screen appears without stalling, even if
+                    // splash screen state is incorrect due to IBD flags not being set properly.
+                    static bool forced_transition = false;
+                    if (synced && !forced_transition) {
+                        log_info("Sync verified: Forcing transition to running state");
+                        // Force all the flags needed for splash -> main screen transition
+                        tui.set_ibd_progress(chain.height(), chain.height(), 0, "complete", "", true);
                         tui.set_node_state(TUI::NodeState::Running);
-                        tui.set_hot_warning("");  // Clear the "blocks mined will not be valid" warning
-                        tui.set_banner("Synced (recovered)");
+                        tui.set_hot_warning("");  // Clear any warnings
+                        tui.set_banner("Running");
                         miq::mark_ibd_complete();  // Enable full durability
-                        was_degraded = false;
+                        forced_transition = true;
                     }
                 }
             }
