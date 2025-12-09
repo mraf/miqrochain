@@ -630,31 +630,38 @@ void Mempool::evict_lowest_feerate_until(size_t target_bytes){
     if (total_bytes_ <= target_bytes) return;
 
     // Build a min-heap by fee rate
-    struct Item { double fr; Key k; size_t sz; };
+    struct Item { double fr; Key k; size_t sz; int retries; };
     auto cmp = [](const Item& a, const Item& b){ return a.fr > b.fr; };
     std::priority_queue<Item, std::vector<Item>, decltype(cmp)> pq(cmp);
 
     for (const auto& kv : map_) {
-        pq.push(Item{kv.second.fee_rate, kv.first, kv.second.size_bytes});
+        pq.push(Item{kv.second.fee_rate, kv.first, kv.second.size_bytes, 0});
     }
 
     // Evict until under target
     while (total_bytes_ > target_bytes && !pq.empty()){
-        auto it = map_.find(pq.top().k);
+        Item top = pq.top();
         pq.pop();
+        auto it = map_.find(top.k);
         if (it == map_.end()) continue; // already evicted by linkage cascade
 
         // Prefer evicting leaf descendants first to reduce churn
-        if (!it->second.children.empty()) {
+        // But after 3 retries, force eviction with descendants to prevent infinite loop
+        if (!it->second.children.empty() && top.retries < 3) {
             // Requeue with slight penalty to try others first
-            pq.push(Item{it->second.fee_rate * 1.01, it->first, it->second.size_bytes});
+            pq.push(Item{top.fr * 1.01, top.k, top.sz, top.retries + 1});
             continue;
         }
 
-        // Unlink and erase
-        unlink_entry(it->first);
-        total_bytes_ -= it->second.size_bytes;
-        map_.erase(it);
+        // CRITICAL FIX: If this tx has children, remove them too to prevent orphans
+        if (!it->second.children.empty()) {
+            remove_with_descendants(top.k);
+        } else {
+            // Leaf node - simple removal
+            unlink_entry(it->first);
+            total_bytes_ -= it->second.size_bytes;
+            map_.erase(it);
+        }
     }
 }
 
