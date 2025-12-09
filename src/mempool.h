@@ -226,6 +226,10 @@ private:
     // Eviction helpers
     void evict_lowest_feerate_until(size_t target_bytes);
 
+    // CRITICAL FIX: Remove a transaction AND all its descendants
+    // Prevents orphaned transactions from remaining when parent is evicted/expired
+    void remove_with_descendants(const Key& root);
+
 private:
     // CRITICAL FIX: Thread safety - protect all mutable state
     mutable std::recursive_mutex mtx_;

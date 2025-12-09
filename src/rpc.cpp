@@ -1234,6 +1234,144 @@ std::string RpcService::handle(const std::string& body){
             }
         }
 
+        // DIAGNOSTIC: Debug UTXO lookup - helps diagnose "missing utxo" errors
+        // Usage: debugutxo <txid> <vout>
+        // Returns detailed info about whether UTXO exists, where parent tx is, etc.
+        if(method=="debugutxo"){
+            if(params.size()<2) return err("need txid & vout");
+            if(!std::holds_alternative<std::string>(params[0].v)) return err("need txid");
+            if(!std::holds_alternative<double>(params[1].v))      return err("need vout");
+
+            const std::string txidhex = std::get<std::string>(params[0].v);
+            uint32_t vout = (uint32_t)std::get<double>(params[1].v);
+
+            std::vector<uint8_t> txid;
+            try { txid = from_hex(txidhex); }
+            catch(...) { return err("bad txid hex"); }
+
+            std::map<std::string,JNode> o;
+            o["txid"] = jstr(txidhex);
+            o["vout"] = jnum((double)vout);
+            o["txid_size"] = jnum((double)txid.size());
+
+            // Check if UTXO exists
+            UTXOEntry e;
+            bool utxo_exists = chain_.utxo().get(txid, vout, e);
+            o["utxo_exists"] = jbool(utxo_exists);
+            if (utxo_exists) {
+                o["utxo_value"] = jnum((double)e.value);
+                o["utxo_height"] = jnum((double)e.height);
+                o["utxo_coinbase"] = jbool(e.coinbase);
+                o["utxo_pkh"] = jstr(to_hex(e.pkh));
+            }
+
+            // Check txindex for parent transaction
+            TxLocation loc;
+            bool tx_indexed = chain_.txindex().get(txid, loc);
+            o["tx_in_index"] = jbool(tx_indexed);
+            if (tx_indexed) {
+                o["tx_block_height"] = jnum((double)loc.block_height);
+                o["tx_position"] = jnum((double)loc.tx_position);
+
+                // Try to get the actual transaction from the block
+                Block blk;
+                if (chain_.get_block_by_index((size_t)loc.block_height, blk)) {
+                    if (loc.tx_position < blk.txs.size()) {
+                        const auto& tx = blk.txs[loc.tx_position];
+                        auto computed_txid = tx.txid();
+                        o["computed_txid"] = jstr(to_hex(computed_txid));
+                        o["txid_matches"] = jbool(computed_txid == txid);
+                        o["tx_vout_count"] = jnum((double)tx.vout.size());
+                        if (vout < tx.vout.size()) {
+                            o["output_exists"] = jbool(true);
+                            o["output_value"] = jnum((double)tx.vout[vout].value);
+                            o["output_pkh"] = jstr(to_hex(tx.vout[vout].pkh));
+                        } else {
+                            o["output_exists"] = jbool(false);
+                            o["error"] = jstr("vout " + std::to_string(vout) + " >= tx.vout.size " + std::to_string(tx.vout.size()));
+                        }
+                    } else {
+                        o["error"] = jstr("tx_position out of range");
+                    }
+                } else {
+                    o["error"] = jstr("could not read block at height " + std::to_string(loc.block_height));
+                }
+            }
+
+            // Provide diagnosis
+            if (!utxo_exists && tx_indexed) {
+                o["diagnosis"] = jstr("UTXO was likely SPENT - tx exists in index but UTXO not in set");
+            } else if (!utxo_exists && !tx_indexed) {
+                o["diagnosis"] = jstr("Transaction NOT FOUND in this chain - invalid reference");
+            } else if (utxo_exists) {
+                o["diagnosis"] = jstr("UTXO exists and is spendable");
+            }
+
+            return ok_obj(o);
+        }
+
+        // DIAGNOSTIC: Find where a UTXO was spent (scan blocks to find spending tx)
+        // Usage: findspend <txid> <vout> [start_height] [end_height]
+        // WARNING: This is slow - scans blocks sequentially
+        if(method=="findspend"){
+            if(params.size()<2) return err("need txid & vout");
+            if(!std::holds_alternative<std::string>(params[0].v)) return err("need txid");
+            if(!std::holds_alternative<double>(params[1].v))      return err("need vout");
+
+            const std::string txidhex = std::get<std::string>(params[0].v);
+            uint32_t vout = (uint32_t)std::get<double>(params[1].v);
+
+            std::vector<uint8_t> txid;
+            try { txid = from_hex(txidhex); }
+            catch(...) { return err("bad txid hex"); }
+
+            uint64_t start_h = 0;
+            uint64_t end_h = chain_.tip().height;
+
+            if (params.size() >= 3 && std::holds_alternative<double>(params[2].v)) {
+                start_h = (uint64_t)std::get<double>(params[2].v);
+            }
+            if (params.size() >= 4 && std::holds_alternative<double>(params[3].v)) {
+                end_h = (uint64_t)std::get<double>(params[3].v);
+            }
+
+            std::map<std::string,JNode> o;
+            o["searching_for_txid"] = jstr(txidhex);
+            o["searching_for_vout"] = jnum((double)vout);
+            o["search_start"] = jnum((double)start_h);
+            o["search_end"] = jnum((double)end_h);
+
+            bool found = false;
+            for (uint64_t h = start_h; h <= end_h && !found; ++h) {
+                Block blk;
+                if (!chain_.get_block_by_index((size_t)h, blk)) continue;
+
+                for (size_t ti = 1; ti < blk.txs.size() && !found; ++ti) {
+                    const auto& tx = blk.txs[ti];
+                    for (size_t ii = 0; ii < tx.vin.size(); ++ii) {
+                        const auto& in = tx.vin[ii];
+                        if (in.prev.txid == txid && in.prev.vout == vout) {
+                            o["found"] = jbool(true);
+                            o["spent_in_block"] = jnum((double)h);
+                            o["spent_by_tx_index"] = jnum((double)ti);
+                            o["spent_by_input_index"] = jnum((double)ii);
+                            o["spending_txid"] = jstr(to_hex(tx.txid()));
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!found) {
+                o["found"] = jbool(false);
+                o["message"] = jstr("UTXO not found as spent in range [" +
+                    std::to_string(start_h) + ", " + std::to_string(end_h) + "]");
+            }
+
+            return ok_obj(o);
+        }
+
         // getrawtransaction - look up transaction by txid
         // CRITICAL FIX: Now uses TxIndex for O(1) lookup of confirmed transactions
         if(method=="getrawtransaction"){
