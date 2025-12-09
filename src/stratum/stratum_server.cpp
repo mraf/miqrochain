@@ -98,7 +98,11 @@ static bool parse_json_string(const std::string& json, size_t& pos, std::string&
         }
         pos++;
     }
-    if (pos < json.size()) pos++; // skip closing quote
+    // CRITICAL FIX: Validate string was properly terminated with closing quote
+    if (pos >= json.size() || json[pos] != '"') {
+        return false;  // Unterminated string
+    }
+    pos++; // skip closing quote
     return true;
 }
 
@@ -374,6 +378,12 @@ void StratumServer::work_loop() {
             it = miners_.find(sock);
             if (it == miners_.end()) continue;
 
+            // CRITICAL FIX: Check for pending disconnect after message processing
+            if (it->second.pending_disconnect) {
+                disconnect_miner(sock, "send failed");
+                continue; // Iterator invalidated
+            }
+
             // Check for timeout (2 minutes of inactivity)
             if (now - it->second.last_activity_ms > 120000) {
                 disconnect_miner(sock, "timeout");
@@ -391,7 +401,9 @@ void StratumServer::work_loop() {
 }
 
 void StratumServer::handle_miner_data(StratumMiner& miner) {
-    char buf[4096];
+    // CRITICAL FIX: Increased buffer from 4KB to 16KB for large job messages
+    // Jobs with many merkle branches can exceed 4KB
+    char buf[16384];
 #ifdef _WIN32
     int n = recv(miner.sock, buf, sizeof(buf) - 1, 0);
     if (n == SOCKET_ERROR) {
@@ -623,14 +635,20 @@ void StratumServer::handle_submit(StratumMiner& miner, uint64_t id, const std::v
             std::lock_guard<std::mutex> lock(stats_mutex_);
             stats_.accepted_shares++;
         }
-        send_result(miner, id, "true");
+        // CRITICAL FIX: Check send status and mark miner for disconnect on failure
+        if (!send_result(miner, id, "true")) {
+            miner.pending_disconnect = true;
+        }
     } else {
         miner.shares_rejected++;
         {
             std::lock_guard<std::mutex> lock(stats_mutex_);
             stats_.rejected_shares++;
         }
-        send_error(miner, id, 21, error);
+        // CRITICAL FIX: Check send status and mark miner for disconnect on failure
+        if (!send_error(miner, id, 21, error)) {
+            miner.pending_disconnect = true;
+        }
     }
 }
 
@@ -657,25 +675,53 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
         return false;
     }
 
+    // CRITICAL FIX: Validate extranonce2 is valid hex
+    for (char c : extranonce2) {
+        if (!std::isxdigit(static_cast<unsigned char>(c))) {
+            error = "Invalid extranonce2 format (not hex)";
+            return false;
+        }
+    }
+
     // Build coinbase
     std::string coinbase_hex = job.coinb1 + miner.extranonce1 + extranonce2 + job.coinb2;
     std::vector<uint8_t> coinbase = hex_decode(coinbase_hex);
 
+    // CRITICAL FIX: Validate hex decode succeeded
+    if (coinbase.empty() && !coinbase_hex.empty()) {
+        error = "Invalid coinbase hex";
+        return false;
+    }
+
     // Calculate coinbase hash
     auto coinbase_hash = dsha256(coinbase);
+
+    // CRITICAL FIX: Validate coinbase hash is 32 bytes
+    if (coinbase_hash.size() != 32) {
+        error = "Invalid coinbase hash size";
+        return false;
+    }
 
     // Build merkle root
     std::vector<uint8_t> merkle_root = coinbase_hash;
     for (const auto& branch : job.merkle_branches) {
+        // CRITICAL FIX: Validate merkle root is exactly 32 bytes
+        if (merkle_root.size() != 32) {
+            error = "Invalid merkle root size";
+            return false;
+        }
+
+        auto branch_bytes = hex_decode(branch);
+        // CRITICAL FIX: Validate branch is exactly 32 bytes
+        if (branch_bytes.size() != 32) {
+            error = "Invalid merkle branch size";
+            return false;
+        }
+
         std::vector<uint8_t> combined;
         combined.reserve(64); // Reserve space for two 32-byte hashes
-        if (!merkle_root.empty()) {
-            combined.insert(combined.end(), merkle_root.begin(), merkle_root.end());
-        }
-        auto branch_bytes = hex_decode(branch);
-        if (!branch_bytes.empty()) {
-            combined.insert(combined.end(), branch_bytes.begin(), branch_bytes.end());
-        }
+        combined.insert(combined.end(), merkle_root.begin(), merkle_root.end());
+        combined.insert(combined.end(), branch_bytes.begin(), branch_bytes.end());
         merkle_root = dsha256(combined);
     }
 
@@ -834,28 +880,32 @@ bool StratumServer::check_pow(const std::vector<uint8_t>& header_hash, uint32_t 
         }
     }
 
-    // Scale target by difficulty factor (share_target = network_target * difficulty)
+    // Scale target by difficulty factor (share_target = network_target / difficulty)
     // For share validation, we allow hashes up to target/difficulty
     // So we compare: hash < target / difficulty
-    // Which is equivalent to: hash * difficulty < target
 
-    // For simplicity, scale the target down by difficulty
-    // We'll use a 256-bit division approximation
+    // CRITICAL FIX: Proper 256-bit division by difficulty using long division
+    // The previous log2 truncation lost precision for difficulties like 1.5
     if (difficulty > 1.0) {
-        // Divide target by difficulty (shift right by log2(difficulty) bits approximately)
-        int shift_bits = (int)(std::log2(difficulty));
-        if (shift_bits > 0 && shift_bits < 256) {
-            int byte_shift = shift_bits / 8;
-            int bit_shift = shift_bits % 8;
-            std::vector<uint8_t> scaled_target(32, 0);
-            for (int i = byte_shift; i < 32; i++) {
-                scaled_target[i - byte_shift] = target[i] >> bit_shift;
-                if (bit_shift > 0 && i + 1 < 32) {
-                    scaled_target[i - byte_shift] |= target[i + 1] << (8 - bit_shift);
-                }
-            }
-            target = scaled_target;
+        // Convert target to 256-bit integer, divide by difficulty, convert back
+        // Use double precision for reasonable accuracy up to difficulty ~2^52
+        std::vector<uint8_t> scaled_target(32, 0);
+
+        // Process in 64-bit chunks from most significant to least significant
+        // We accumulate a remainder as we go (standard long division)
+        double remainder = 0.0;
+        for (int i = 31; i >= 0; i--) {
+            // Bring down the next byte
+            double value = remainder * 256.0 + target[i];
+            // Divide by difficulty
+            double quotient = std::floor(value / difficulty);
+            remainder = value - quotient * difficulty;
+            // Clamp to byte range (should always be 0-255 but be safe)
+            if (quotient > 255.0) quotient = 255.0;
+            if (quotient < 0.0) quotient = 0.0;
+            scaled_target[i] = (uint8_t)quotient;
         }
+        target = scaled_target;
     }
 
     // Compare hash < target (both in little-endian)
@@ -1062,15 +1112,28 @@ StratumJob StratumServer::create_job() {
 }
 
 void StratumServer::broadcast_job(const StratumJob& job) {
-    std::lock_guard<std::mutex> lock(miners_mutex_);
-    for (auto& kv : miners_) {
-        if (kv.second.subscribed) {
-            send_job_to_miner(kv.second, job);
+    // CRITICAL FIX: Track miners with failed sends to disconnect them after iteration
+    // This prevents a single broken miner from blocking broadcasts to others
+    std::vector<StratumSock> failed_miners;
+
+    {
+        std::lock_guard<std::mutex> lock(miners_mutex_);
+        for (auto& kv : miners_) {
+            if (kv.second.subscribed) {
+                if (!send_job_to_miner(kv.second, job)) {
+                    failed_miners.push_back(kv.first);
+                }
+            }
         }
+    }
+
+    // Disconnect failed miners outside of the loop to avoid iterator invalidation
+    for (StratumSock sock : failed_miners) {
+        disconnect_miner(sock, "broadcast send failed");
     }
 }
 
-void StratumServer::send_job_to_miner(StratumMiner& miner, const StratumJob& job) {
+bool StratumServer::send_job_to_miner(StratumMiner& miner, const StratumJob& job) {
     // mining.notify params:
     // [job_id, prev_hash, coinb1, coinb2, merkle_branches[], version, nbits, ntime, clean_jobs]
 
@@ -1095,7 +1158,8 @@ void StratumServer::send_job_to_miner(StratumMiner& miner, const StratumJob& job
     ss << (job.clean_jobs ? "true" : "false");
     ss << "]}\n";
 
-    send_json(miner, ss.str());
+    // CRITICAL FIX: Return send status so broadcast_job can track failures
+    return send_json(miner, ss.str());
 }
 
 void StratumServer::cleanup_old_jobs() {
@@ -1159,13 +1223,22 @@ bool StratumServer::send_json(StratumMiner& miner, const std::string& json) {
     size_t remaining = json.size();
     const char* data = json.c_str();
 
+    // CRITICAL FIX: Add retry limit to prevent infinite loop DoS
+    // If a miner doesn't read data, we can't block forever
+    static constexpr int MAX_SEND_RETRIES = 100;  // ~100ms max wait
+    int retry_count = 0;
+
     while (remaining > 0) {
 #ifdef _WIN32
         int sent = send(miner.sock, data + total_sent, (int)remaining, 0);
         if (sent == SOCKET_ERROR) {
             int err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK) {
-                // Non-blocking socket, retry after brief pause
+                // Non-blocking socket, retry with limit
+                if (++retry_count > MAX_SEND_RETRIES) {
+                    log_warn("Stratum: send_json timeout after " + std::to_string(MAX_SEND_RETRIES) + " retries");
+                    return false;  // Disconnect slow/malicious miner
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
@@ -1175,7 +1248,11 @@ bool StratumServer::send_json(StratumMiner& miner, const std::string& json) {
         ssize_t sent = send(miner.sock, data + total_sent, remaining, 0);
         if (sent < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Non-blocking socket, retry after brief pause
+                // Non-blocking socket, retry with limit
+                if (++retry_count > MAX_SEND_RETRIES) {
+                    log_warn("Stratum: send_json timeout after " + std::to_string(MAX_SEND_RETRIES) + " retries");
+                    return false;  // Disconnect slow/malicious miner
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
@@ -1187,20 +1264,23 @@ bool StratumServer::send_json(StratumMiner& miner, const std::string& json) {
         }
         total_sent += sent;
         remaining -= sent;
+        retry_count = 0;  // Reset on successful send
     }
     return true;
 }
 
-void StratumServer::send_result(StratumMiner& miner, uint64_t id, const std::string& result) {
+bool StratumServer::send_result(StratumMiner& miner, uint64_t id, const std::string& result) {
     std::ostringstream ss;
     ss << "{\"id\":" << id << ",\"result\":" << result << ",\"error\":null}\n";
-    send_json(miner, ss.str());
+    // CRITICAL FIX: Return send status so caller can disconnect on failure
+    return send_json(miner, ss.str());
 }
 
-void StratumServer::send_error(StratumMiner& miner, uint64_t id, int code, const std::string& message) {
+bool StratumServer::send_error(StratumMiner& miner, uint64_t id, int code, const std::string& message) {
     std::ostringstream ss;
     ss << "{\"id\":" << id << ",\"result\":null,\"error\":[" << code << ",\"" << json_escape(message) << "\",null]}\n";
-    send_json(miner, ss.str());
+    // CRITICAL FIX: Return send status so caller can disconnect on failure
+    return send_json(miner, ss.str());
 }
 
 std::string StratumServer::generate_extranonce1() {
