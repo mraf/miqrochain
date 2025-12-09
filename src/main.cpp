@@ -1441,10 +1441,19 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
             }
         }
 
-        // If no peers have reported their tip yet, we must wait
-        // CRITICAL: Don't declare synced until at least one peer reports their tip
-        // Otherwise we may transition to main screen then discover we're blocks behind
+        // If no peers have reported their tip yet, check if our tip is fresh enough
+        // If tip is fresh (< 2 block times), we're likely synced - don't wait for peer tips
         if (peers_with_tip == 0) {
+            auto tip = chain.tip();
+            uint64_t tsec = hdr_time(tip);
+            uint64_t now_time = (uint64_t)std::time(nullptr);
+            uint64_t tip_age = (now_time > tsec) ? (now_time - tsec) : 0;
+            // If tip is fresh (< 2 block times = ~16 min for MIQ), consider synced
+            const uint64_t fresh_threshold = BLOCK_TIME_SECS * 2;
+            if (tip_age < fresh_threshold) {
+                why_out.clear();
+                return true;  // Fresh tip + connected peers = synced
+            }
             why_out = "waiting for peer tip heights";
             return false;
         }
