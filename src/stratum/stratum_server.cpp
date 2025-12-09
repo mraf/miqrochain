@@ -1335,12 +1335,13 @@ bool StratumServer::send_json(StratumMiner& miner, const std::string& json) {
             if (err == WSAEWOULDBLOCK) {
                 // Non-blocking socket, retry with limit
                 if (++retry_count > MAX_SEND_RETRIES) {
-                    log_warn("Stratum: send_json timeout after " + std::to_string(MAX_SEND_RETRIES) + " retries");
+                    log_warn("Stratum: send_json timeout after " + std::to_string(MAX_SEND_RETRIES) + " retries to " + miner.ip);
                     return false;  // Disconnect slow/malicious miner
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
+            log_warn("Stratum: send_json failed to " + miner.ip + " WSA error=" + std::to_string(err));
             return false;
         }
 #else
@@ -1349,16 +1350,20 @@ bool StratumServer::send_json(StratumMiner& miner, const std::string& json) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 // Non-blocking socket, retry with limit
                 if (++retry_count > MAX_SEND_RETRIES) {
-                    log_warn("Stratum: send_json timeout after " + std::to_string(MAX_SEND_RETRIES) + " retries");
+                    log_warn("Stratum: send_json timeout after " + std::to_string(MAX_SEND_RETRIES) + " retries to " + miner.ip);
                     return false;  // Disconnect slow/malicious miner
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
+            // Log the specific error
+            log_warn("Stratum: send_json failed to " + miner.ip + " errno=" + std::to_string(errno) +
+                     " (" + std::string(strerror(errno)) + ")");
             return false;
         }
 #endif
         if (sent == 0) {
+            log_warn("Stratum: send_json connection closed by " + miner.ip);
             return false; // Connection closed
         }
         total_sent += sent;

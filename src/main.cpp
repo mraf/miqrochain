@@ -5083,10 +5083,26 @@ int main(int argc, char** argv){
             }
 
             // Sync gate for TUI display (external miner checks sync state via RPC)
+            // CRITICAL FIX: Also recover from Degraded state if node is actually synced
             {
                 std::string why;
                 bool synced = compute_sync_gate(chain, &p2p, why);
-                if (can_tui) tui.set_mining_gate(synced, synced ? "" : why);
+                if (can_tui) {
+                    tui.set_mining_gate(synced, synced ? "" : why);
+
+                    // RECOVERY FIX: If node is synced but was in Degraded state (from IBD failure),
+                    // recover to Running state. This handles transient IBD failures where the node
+                    // is actually synced (e.g., stability check glitch, brief peer disconnect).
+                    static bool was_degraded = !ibd_ok;
+                    if (was_degraded && synced) {
+                        log_info("Sync recovery: Node synced after initial IBD failure - enabling mining");
+                        tui.set_node_state(TUI::NodeState::Running);
+                        tui.set_hot_warning("");  // Clear the "blocks mined will not be valid" warning
+                        tui.set_banner("Synced (recovered)");
+                        miq::mark_ibd_complete();  // Enable full durability
+                        was_degraded = false;
+                    }
+                }
             }
 
             // Periodic mempool maintenance (every ~30 seconds)
