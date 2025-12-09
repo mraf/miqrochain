@@ -1441,7 +1441,9 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
             }
         }
 
-        // If no peers have reported their tip yet, keep syncing
+        // If no peers have reported their tip yet, we must wait
+        // CRITICAL: Don't declare synced until at least one peer reports their tip
+        // Otherwise we may transition to main screen then discover we're blocks behind
         if (peers_with_tip == 0) {
             why_out = "waiting for peer tip heights";
             return false;
@@ -2809,9 +2811,16 @@ private:
             }
 
             // Height with chain visualization
+            // Show network height if we're behind (syncing)
+            // Use the best of: peer tips (sync_network_height_) or header height from cache
+            uint64_t net_height = std::max(sync_network_height_, cached.best_header_height);
             std::ostringstream h1;
             h1 << C_dim() << "Height:" << C_reset() << "     " << chain_blocks_viz(tick_, height) << " "
                << C_info() << C_bold() << fmt_num(height) << C_reset();
+            if (net_height > height + 1) {
+                // Show target network height when syncing
+                h1 << C_dim() << " / " << C_warn() << fmt_num(net_height) << C_reset();
+            }
             left_panel.push_back(box_row(h1.str(), half_width));
 
             // Tip hash
@@ -3925,6 +3934,7 @@ private:
     };
     struct CachedChainState {
         uint64_t height{0};
+        uint64_t best_header_height{0};  // Best header height (network sync target)
         std::vector<uint8_t> tip_hash;
         uint32_t bits{0};
         int64_t time{0};
@@ -3979,10 +3989,12 @@ private:
         // Update chain state if available
         if (chain_) {
             auto t = chain_->tip();
+            uint64_t hdr_height = chain_->best_header_height();
 
             // Now update cache with all gathered data
             std::lock_guard<std::mutex> lk(cached_chain_mu_);
             cached_chain_.height = t.height;
+            cached_chain_.best_header_height = hdr_height;
             cached_chain_.tip_hash = t.hash;
             cached_chain_.bits = t.bits;
             cached_chain_.time = t.time;
@@ -4176,7 +4188,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
 
     const uint64_t kNoPeerTimeoutMs      = 90 * 1000;
     const uint64_t kNoProgressTimeoutMs  = 180 * 1000;
-    const uint64_t kStableOkMs           = 20 * 1000;  // INCREASED from 8s to 20s for better sync verification
+    const uint64_t kStableOkMs           = 5 * 1000;   // REDUCED to 5s for faster startup (was 20s)
     const uint64_t kHandshakeTimeoutMs   = 60 * 1000;
     const uint64_t kSeedNudgeMs          = 10 * 1000;
     const uint64_t kMaxWallMs            = 30 * 60 * 1000;
