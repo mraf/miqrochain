@@ -670,8 +670,12 @@ void Mempool::on_block_connect(const Block& b){
                 }
             }
             for (const auto& r : victims){
+                // CRITICAL FIX: Get size BEFORE unlink_entry which may modify map_
+                auto vit = map_.find(r);
+                if (vit == map_.end()) continue;  // Already removed
+                size_t victim_size = vit->second.size_bytes;
                 unlink_entry(r);
-                total_bytes_ -= map_[r].size_bytes;
+                total_bytes_ -= victim_size;
                 map_.erase(r);
             }
         }
