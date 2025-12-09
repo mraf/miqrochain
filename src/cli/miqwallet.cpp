@@ -310,7 +310,7 @@ namespace wallet_config {
     static constexpr size_t MAX_UTXO_COUNT = 100000;
     static constexpr size_t MAX_TX_INPUTS = 500;
     static constexpr size_t MAX_TX_OUTPUTS = 50;
-    // No transfer limit - like Bitcoin, allow any amount up to total supply
+    // No transfer limit - allow any amount up to total supply
     static constexpr uint64_t MAX_SINGLE_TX_VALUE = 26280000ULL * 100000000ULL;  // MAX_MONEY
     static constexpr uint64_t DUST_THRESHOLD = 546;
     static constexpr uint64_t MIN_RELAY_FEE = 1000;  // Minimum fee for relay
@@ -6337,7 +6337,7 @@ static void add_tx_history(const std::string& wdir, const TxHistoryEntry& entry)
 // =============================================================================
 // ENHANCED TRANSACTION TRACKING v9.0 - Multi-source confirmation system
 // CRITICAL FIXES:
-// 1. Use MIQ 8-minute blocks (480s) not Bitcoin 10-minute blocks (600s)
+// 1. Use MIQ 8-minute blocks (480s) for confirmation estimates
 // 2. Track sent tx confirmations via change outputs
 // 3. Better handling of spent outputs
 // =============================================================================
@@ -13283,7 +13283,7 @@ static bool wallet_session(const std::string& cli_host,
             uint64_t current_difficulty = 0;
             std::string best_hash;
             std::string rpc_host = "127.0.0.1";
-            // V1.1 FIX: Use correct RPC port (default 9834, not Bitcoin's 8332)
+            // V1.1 FIX: Use correct RPC port (default 9834)
             uint16_t rpc_port = (uint16_t)miq::RPC_PORT;
 
             // Try to parse from last_connected_node (this is P2P port, convert to RPC)

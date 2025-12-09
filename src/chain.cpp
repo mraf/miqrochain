@@ -2033,7 +2033,7 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
                 return false;
             }
             // SECURITY FIX: Use <= instead of < for coinbase maturity check
-            // Bitcoin requires 100 confirmations, meaning coinbase at height H
+            // MIQ requires 100 confirmations, meaning coinbase at height H
             // is spendable at height H + COINBASE_MATURITY + 1
             // Example: coinbase at 100, maturity 100 -> spendable at 201
             if(e.coinbase && tip_.height+1 <= e.height + COINBASE_MATURITY){ err="immature coinbase"; return false; }

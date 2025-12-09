@@ -15,7 +15,7 @@ std::string ReorgManager::hexkey(const HashBytes& h){
 
 // Approx chainwork from compact 'bits' (adequate for ordering).
 long double ReorgManager::work_from_bits(uint32_t bits){
-    // bits: exponent in high byte, mantissa in low 23 bits (Bitcoin-style "compact")
+    // bits: exponent in high byte, mantissa in low 23 bits (compact format)
     uint32_t exp  = bits >> 24;
     uint32_t mant = bits & 0x007fffff;
     if(mant == 0 || exp < 3) return 0.0L;

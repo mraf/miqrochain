@@ -1259,7 +1259,7 @@ static inline bool peer_is_index_capable(Sock s) {
     auto it = g_peer_index_capable.find(s);
     // BULLETPROOF SYNC: Default to FALSE - always start with headers-first
     // Index-by-height is only enabled as a fallback after headers timeout
-    // This ensures we sync like Bitcoin Core: headers first, then blocks
+    // This ensures proper sync order: headers first, then blocks
     if (it == g_peer_index_capable.end()) return false;
     return it->second;
 }
@@ -1933,7 +1933,7 @@ static inline void miq_put_u64le(std::vector<uint8_t>& v, uint64_t x){
 static inline std::vector<uint8_t> miq_build_version_payload(uint32_t start_height) {
     std::vector<uint8_t> v; v.reserve(128);
 
-    // Use a more compatible protocol version (similar to Bitcoin Core)
+    // Use a compatible protocol version for P2P communication
     const uint32_t version = 70015;
     miq_put_u32le(v, version);
 
@@ -6159,8 +6159,8 @@ void P2P::loop(){
                                 }
                             } else {
                                 // CRITICAL FIX: Send "notfound" response so peer doesn't wait for timeout
-                                // This is similar to Bitcoin Core behavior - when we can't serve a block,
-                                // we inform the peer immediately instead of leaving them hanging
+                                // When we can't serve a block, inform the peer immediately
+                                // instead of leaving them hanging
                                 if (idx64 <= our_height) {
                                     // This is concerning - we should have this block
                                     static std::atomic<int64_t> last_missing_log_ms{0};

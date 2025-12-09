@@ -51,7 +51,7 @@
 #define MIQ_MAX_LOCATOR_HASHES 32        // locator cap used by p2p.cpp
 #endif
 
-// Accept non-empty Bitcoin-style "version" payloads for interoperability.
+// Accept non-empty "version" payloads for interoperability.
 // Generous cap so extra fields/extensions don't break handshake.
 #ifndef MIQ_VERSION_MAX_BYTES
 #define MIQ_VERSION_MAX_BYTES 1024
@@ -91,7 +91,7 @@ static inline uint32_t dsha256_4(const uint8_t* data, size_t n) {
         b.update(h, 32);
         b.final(h);
     }
-    // First 4 bytes as LE integer on the wire (same as Bitcoin)
+    // First 4 bytes as LE integer on the wire
     return (uint32_t(h[0])      )
          | (uint32_t(h[1]) <<  8)
          | (uint32_t(h[2]) << 16)
@@ -131,7 +131,7 @@ static bool length_ok_for_command(const std::string& cmd, size_t n){
         return n == 0;
     }
 
-    // version: accept legacy zero-payload and standard Bitcoin-style payloads
+    // version: accept legacy zero-payload and standard payloads
     // (version, services, ts, addr_recv, addr_from, nonce, UA, start_height, relay)
     // Typical size ~85–110 bytes; allow generous headroom.
     if (cmd == "version") {

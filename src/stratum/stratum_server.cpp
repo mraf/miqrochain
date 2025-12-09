@@ -860,7 +860,7 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
 }
 
 bool StratumServer::check_pow(const std::vector<uint8_t>& header_hash, uint32_t bits, double difficulty) {
-    // Calculate target from bits (Bitcoin compact format)
+    // Calculate target from bits (compact format)
     uint32_t exp = bits >> 24;
     uint32_t mant = bits & 0x007fffff;
 

@@ -11,8 +11,8 @@ namespace miq {
 // =============================================================================
 // PRODUCTION MTP (MEDIAN TIME PAST) IMPLEMENTATION v2.0
 // =============================================================================
-// RFC: Bitcoin-style MTP uses the median of the last 11 block **times**.
-// We mirror that: parent -> walk back up to 11 headers (including parent).
+// MTP uses the median of the last 11 block timestamps.
+// Parent -> walk back up to 11 headers (including parent).
 // =============================================================================
 
 static constexpr int MIQ_MTP_WINDOW = 11;
@@ -41,7 +41,7 @@ int64_t compute_mtp_from_times(const std::vector<int64_t>& times);
 // TIME RULE VALIDATION
 // =============================================================================
 
-// Strict header timestamp rules (Bitcoin-like):
+// Strict header timestamp rules:
 //   1) h.time > MTP(parent)  [strictly greater than]
 //   2) h.time <= now + MAX_FUTURE_DRIFT
 //   3) h.time >= parent.time (monotonic check, soft enforcement)

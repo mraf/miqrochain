@@ -122,7 +122,7 @@ inline NetworkParams testnet_params() {
     p.default_rpc_port = 19834;
     p.magic = 0xB4FC9F32;  // Different magic for testnet
 
-    p.version_p2pkh = 0x6F;  // 'n' or 'm' prefix (like Bitcoin testnet)
+    p.version_p2pkh = 0x6F;  // 'n' or 'm' prefix (testnet)
     p.version_p2sh = 0xC4;   // Reserved
     p.version_wif = 0xEF;    // Testnet WIF
 

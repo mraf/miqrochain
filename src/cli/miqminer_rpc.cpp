@@ -502,7 +502,7 @@ static double difficulty_from_bits(uint32_t bits){
 }
 
 // Convert pool difficulty to compact bits format for share validation
-// Pool difficulty 1 = 0xFFFF * 2^208 (same as Bitcoin pdiff=1)
+// Pool difficulty 1 = 0xFFFF * 2^208 (standard pdiff=1)
 static uint32_t bits_from_pool_difficulty(double pool_diff) {
     if (pool_diff <= 0.0) return miq::GENESIS_BITS;
 
@@ -1501,7 +1501,7 @@ static bool rpc_getminertemplate(const std::string& host, uint16_t port, const s
 // ===== coinbase/merkle =======================================================
 static Transaction make_coinbase(uint64_t height, uint64_t fees, const std::vector<uint8_t>& pkh){
     Transaction cbt;
-    // MIQ coinbase convention: prev.vout = 0 (differs from Bitcoin's 0xffffffff)
+    // MIQ coinbase convention: prev.vout = 0
     TxIn in; in.prev.txid = std::vector<uint8_t>(32,0); in.prev.vout = 0;
 
     uint64_t rnd = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
