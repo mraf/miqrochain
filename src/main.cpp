@@ -1441,10 +1441,17 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
             }
         }
 
-        // If no peers have reported their tip yet, we must wait
-        // CRITICAL: Don't declare synced until at least one peer reports their tip
-        // Otherwise we may transition to main screen then discover we're blocks behind
+        // If no peers have reported their tip yet, check if our tip is fresh enough
+        // If tip is fresh (< 1 min), we're synced - don't wait for peer tips
         if (peers_with_tip == 0) {
+            auto tip = chain.tip();
+            uint64_t tsec = hdr_time(tip);
+            uint64_t now_time = (uint64_t)std::time(nullptr);
+            uint64_t tip_age = (now_time > tsec) ? (now_time - tsec) : 0;
+            if (tip_age < 60) {
+                why_out.clear();
+                return true;  // Fresh tip + connected peers = synced
+            }
             why_out = "waiting for peer tip heights";
             return false;
         }
@@ -2811,16 +2818,9 @@ private:
             }
 
             // Height with chain visualization
-            // Show network height if we're behind (syncing)
-            // Use the best of: peer tips (sync_network_height_) or header height from cache
-            uint64_t net_height = std::max(sync_network_height_, cached.best_header_height);
             std::ostringstream h1;
             h1 << C_dim() << "Height:" << C_reset() << "     " << chain_blocks_viz(tick_, height) << " "
                << C_info() << C_bold() << fmt_num(height) << C_reset();
-            if (net_height > height + 1) {
-                // Show target network height when syncing
-                h1 << C_dim() << " / " << C_warn() << fmt_num(net_height) << C_reset();
-            }
             left_panel.push_back(box_row(h1.str(), half_width));
 
             // Tip hash
@@ -4166,10 +4166,14 @@ static bool should_enter_ibd(Chain& chain, const std::string& datadir){
 // Surfaces a concrete error if it can't finish.
 static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                              bool can_tui, TUI* tui, std::string& out_err){
+    // CRITICAL FIX: Always check if we need IBD, but don't skip peer connection!
+    // Even if tip is fresh, we must connect to peers to verify we're truly synced
     {
         std::string reason;
         if (!should_enter_ibd_reason(chain, datadir, &reason)) {
-            return true;
+            // Tip is fresh - we may skip block downloading, but MUST still connect to peers
+            log_info("IBD: local tip is fresh, will verify sync state with peers");
+            if (tui && can_tui) tui->set_banner("Verifying sync state with peers...");
         } else {
             log_info(std::string("IBD: starting (reason: ") + reason + ")");
             if (tui && can_tui) tui->set_banner(std::string("Initial block download — ") + reason);
