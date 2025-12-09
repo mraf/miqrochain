@@ -303,6 +303,44 @@ void Mempool::unlink_entry(const Key& kk){
     }
 }
 
+// CRITICAL FIX: Remove a transaction AND all its descendants
+// This prevents orphaned transactions from remaining in mempool when parent is removed
+void Mempool::remove_with_descendants(const Key& root) {
+    // Collect all descendants using BFS
+    std::vector<Key> to_remove;
+    std::unordered_set<std::string> seen;
+    std::deque<Key> queue;
+    queue.push_back(root);
+
+    while (!queue.empty()) {
+        Key current = queue.front();
+        queue.pop_front();
+
+        if (!seen.insert(current).second) continue;  // Already processed
+
+        auto it = map_.find(current);
+        if (it == map_.end()) continue;
+
+        to_remove.push_back(current);
+
+        // Add all children to queue
+        for (const auto& child : it->second.children) {
+            queue.push_back(child);
+        }
+    }
+
+    // Remove in reverse order (children before parents) to maintain consistency
+    for (auto rit = to_remove.rbegin(); rit != to_remove.rend(); ++rit) {
+        auto it = map_.find(*rit);
+        if (it == map_.end()) continue;
+
+        size_t sz = it->second.size_bytes;
+        unlink_entry(*rit);
+        total_bytes_ -= sz;
+        map_.erase(it);
+    }
+}
+
 bool Mempool::enforce_limits_and_insert(const Transaction& tx, uint64_t fee, std::string& err){
     Key kk = k(tx.txid());
     if (map_.find(kk) != map_.end()) return true; // already in
@@ -634,10 +672,12 @@ void Mempool::maintenance(){
     for (const auto& kv : map_) {
         if (kv.second.added_ms < cutoff) expired.push_back(kv.first);
     }
+    // CRITICAL FIX: Remove expired transactions AND their descendants
+    // This prevents orphaned children from remaining in mempool
     for (const auto& kx : expired) {
-        unlink_entry(kx);
-        total_bytes_ -= map_[kx].size_bytes;
-        map_.erase(kx);
+        if (map_.find(kx) != map_.end()) {  // May have been removed as descendant
+            remove_with_descendants(kx);
+        }
     }
     // Trim to size (in case)
     evict_lowest_feerate_until(MIQ_MEMPOOL_MAX_BYTES);
@@ -793,11 +833,16 @@ void Mempool::collect_for_block(std::vector<Transaction>& out, size_t max_bytes)
             const std::string myk = key_from_vec(e.tx.txid());
             if (selected_keys.count(myk)) continue;
 
-            // parents must be either not in mempool or already selected
+            // CRITICAL FIX: Validate ALL inputs exist either in already-selected txs OR not in mempool
+            // This catches orphaned transactions whose parent was removed but child remained
+            // (e.g., due to bugs in eviction/expiry). The e.parents set can become stale
+            // if unlink_entry removed links without removing the child.
             bool parents_ok = true;
             size_t unselected_parents = 0;
-            for (const auto& pk : e.parents) {
-                if (map_.find(pk) != map_.end() && !selected_keys.count(pk)) {
+            for (const auto& in : e.tx.vin) {
+                std::string input_key = key_from_vec(in.prev.txid);
+                // If this input's parent is in mempool, it must be already selected
+                if (map_.find(input_key) != map_.end() && !selected_keys.count(input_key)) {
                     parents_ok = false;
                     unselected_parents++;
                 }
