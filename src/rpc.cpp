@@ -636,12 +636,18 @@ std::string RpcService::handle(const std::string& body){
 
         if(method=="getblockchaininfo"){
             auto tip = chain_.tip();
+            auto ibd_snap = miq::get_ibd_info_snapshot();
             std::map<std::string,JNode> o;
             JNode a; a.v = std::string(CHAIN_NAME);              o["chain"] = a;
             JNode h; h.v = (double)tip.height;                   o["height"] = h;
             JNode b; b.v = (double)tip.height;                   o["blocks"] = b;  // alias for height
             JNode hh; hh.v = to_hex(tip.hash);                   o["bestblockhash"] = hh;
             JNode d; d.v = (double)Chain::work_from_bits_public(tip.bits); o["difficulty"] = d;
+            // Add IBD status for Bitcoin-compatible clients
+            o["initialblockdownload"] = jbool(ibd_snap.ibd_active);
+            o["verificationprogress"] = jnum(ibd_snap.est_best_header_height > 0
+                ? (double)tip.height / (double)ibd_snap.est_best_header_height
+                : 1.0);
             return ok_obj(o);
         }
 

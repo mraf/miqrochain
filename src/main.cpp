@@ -4795,60 +4795,11 @@ int main(int argc, char** argv){
         }
         SeedSentinel seed_sentinel;
         seed_sentinel.start(&p2p, can_tui ? &tui : nullptr);
-        if (can_tui) tui.mark_step_started("Start IBD monitor");
-        start_ibd_monitor(&chain, &p2p);
-        if (can_tui) tui.mark_step_ok("Start IBD monitor");
 
         // =====================================================================
-        // NEW STEP: IBD sync phase (smart start/finish, surfaces real error)
+        // START RPC EARLY: Allow clients to connect while IBD is in progress
+        // This makes startup feel faster and allows sync status queries
         // =====================================================================
-        if (can_tui) {
-            // Only show what is known at start; no estimated future height.
-            tui.set_ibd_progress(chain.height(), chain.height(), 0, "headers", seed_host_cstr(), false);
-        }
-        if (can_tui) tui.mark_step_started("IBD sync phase");
-        std::string ibd_err;
-        bool ibd_ok = perform_ibd_sync(chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, &tui, ibd_err);
-        if (ibd_ok) {
-            miq::mark_ibd_complete();  // Enable full durability (fsync on every block)
-            if (can_tui) {
-                tui.mark_step_ok("IBD sync phase");
-                tui.set_banner("Synced");
-                // CRITICAL FIX: Must set ibd_done_ to true for splash screen transition!
-                // Without this, the splash screen stays stuck even though sync is complete
-                tui.set_ibd_progress(chain.height(), chain.height(), 0, "complete", seed_host_cstr(), true);
-                tui.set_node_state(TUI::NodeState::Running);
-                tui.set_mining_gate(true, "");
-            }
-            log_info("IBD sync completed successfully.");
-        } else {
-            if (solo_seed_mode(cfg.no_p2p ? nullptr : &p2p)) {
-                // Bootstrap solo: treat as OK so local mining can proceed.
-                miq::mark_ibd_complete();  // Enable full durability
-                if (can_tui) {
-                    tui.mark_step_ok("IBD sync phase");
-                    tui.set_banner("Seed solo mode — no peers yet. Mining enabled.");
-                    // CRITICAL FIX: Must set ibd_done_ to true for splash screen transition!
-                    tui.set_ibd_progress(chain.height(), chain.height(), 0, "complete", seed_host_cstr(), true);
-                    tui.set_node_state(TUI::NodeState::Running);
-                    tui.set_mining_gate(true, "");
-                }
-                log_info("IBD sync skipped (seed solo mode).");
-            } else {
-                if (can_tui) {
-                    tui.mark_step_fail("IBD sync phase");
-                    tui.set_node_state(TUI::NodeState::Degraded);
-                    tui.set_hot_warning(std::string("BLOCKS MINED LOCALLY WILL NOT BE VALID — ") + ibd_err);
-                    tui.set_mining_gate(false, ibd_err + " — blocks mined locally will not be valid");
-                }
-                log_error(std::string("IBD sync failed: ") + ibd_err);
-                log_error("BLOCKS MINED LOCALLY WILL NOT BE VALID");
-            }
-        }
-        
-        IBDGuard ibd_guard;
-        ibd_guard.start(&chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, can_tui ? &tui : nullptr);
-        
         [[maybe_unused]] bool rpc_ok = false;
         if (can_tui) tui.mark_step_started("Start RPC server");
         if(!cfg.no_rpc){
@@ -4940,6 +4891,61 @@ int main(int argc, char** argv){
             tui.mark_step_ok("RPC ready");
             rpc_ok = true;
         }
+
+        // =====================================================================
+        // IBD SYNC PHASE: Now starts AFTER RPC is available
+        // This allows clients to connect and query sync status immediately
+        // =====================================================================
+        if (can_tui) tui.mark_step_started("Start IBD monitor");
+        start_ibd_monitor(&chain, &p2p);
+        if (can_tui) tui.mark_step_ok("Start IBD monitor");
+
+        if (can_tui) {
+            // Only show what is known at start; no estimated future height.
+            tui.set_ibd_progress(chain.height(), chain.height(), 0, "headers", seed_host_cstr(), false);
+        }
+        if (can_tui) tui.mark_step_started("IBD sync phase");
+        std::string ibd_err;
+        bool ibd_ok = perform_ibd_sync(chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, &tui, ibd_err);
+        if (ibd_ok) {
+            miq::mark_ibd_complete();  // Enable full durability (fsync on every block)
+            if (can_tui) {
+                tui.mark_step_ok("IBD sync phase");
+                tui.set_banner("Synced");
+                // CRITICAL FIX: Must set ibd_done_ to true for splash screen transition!
+                // Without this, the splash screen stays stuck even though sync is complete
+                tui.set_ibd_progress(chain.height(), chain.height(), 0, "complete", seed_host_cstr(), true);
+                tui.set_node_state(TUI::NodeState::Running);
+                tui.set_mining_gate(true, "");
+            }
+            log_info("IBD sync completed successfully.");
+        } else {
+            if (solo_seed_mode(cfg.no_p2p ? nullptr : &p2p)) {
+                // Bootstrap solo: treat as OK so local mining can proceed.
+                miq::mark_ibd_complete();  // Enable full durability
+                if (can_tui) {
+                    tui.mark_step_ok("IBD sync phase");
+                    tui.set_banner("Seed solo mode — no peers yet. Mining enabled.");
+                    // CRITICAL FIX: Must set ibd_done_ to true for splash screen transition!
+                    tui.set_ibd_progress(chain.height(), chain.height(), 0, "complete", seed_host_cstr(), true);
+                    tui.set_node_state(TUI::NodeState::Running);
+                    tui.set_mining_gate(true, "");
+                }
+                log_info("IBD sync skipped (seed solo mode).");
+            } else {
+                if (can_tui) {
+                    tui.mark_step_fail("IBD sync phase");
+                    tui.set_node_state(TUI::NodeState::Degraded);
+                    tui.set_hot_warning(std::string("BLOCKS MINED LOCALLY WILL NOT BE VALID — ") + ibd_err);
+                    tui.set_mining_gate(false, ibd_err + " — blocks mined locally will not be valid");
+                }
+                log_error(std::string("IBD sync failed: ") + ibd_err);
+                log_error("BLOCKS MINED LOCALLY WILL NOT BE VALID");
+            }
+        }
+
+        IBDGuard ibd_guard;
+        ibd_guard.start(&chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, can_tui ? &tui : nullptr);
 
         // =====================================================================
         // Stratum mining pool server (optional)
