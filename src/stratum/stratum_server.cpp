@@ -335,11 +335,26 @@ void StratumServer::work_loop() {
     int64_t last_job_time = 0;
     int64_t last_cleanup_time = 0;
 
+    // CRITICAL FIX: Create initial job IMMEDIATELY before accepting any miners
+    // This ensures miners always have a job available when they subscribe
+    log_info("Stratum: work_loop started, creating initial job...");
+    {
+        auto job = create_job();
+        {
+            std::lock_guard<std::mutex> lock(jobs_mutex_);
+            jobs_[job.job_id] = job;
+            job_order_.push_back(job.job_id);
+            current_job_id_ = job.job_id;
+        }
+        log_info("Stratum: Initial job created: " + job.job_id + " height=" + std::to_string(job.height));
+        last_job_time = now_ms();
+    }
+
     while (running_) {
         int64_t now = now_ms();
 
-        // Create initial job or periodic job update (every 30 seconds)
-        if (current_job_id_.empty() || now - last_job_time > 30000) {
+        // Create periodic job update (every 30 seconds) or when tip changes
+        if (now - last_job_time > 30000) {
             auto job = create_job();
             {
                 std::lock_guard<std::mutex> lock(jobs_mutex_);
@@ -588,10 +603,19 @@ void StratumServer::handle_subscribe(StratumMiner& miner, uint64_t id, const std
     // Send current job immediately after subscription
     std::lock_guard<std::mutex> lock(jobs_mutex_);
     if (!current_job_id_.empty() && jobs_.count(current_job_id_)) {
-        send_job_to_miner(miner, jobs_[current_job_id_]);
-        log_info("Stratum: Sent job " + current_job_id_ + " to " + miner.ip);
+        log_info("Stratum: Attempting to send job " + current_job_id_ + " to " + miner.ip);
+        if (send_job_to_miner(miner, jobs_[current_job_id_])) {
+            log_info("Stratum: Successfully sent job " + current_job_id_ + " to " + miner.ip);
+        } else {
+            log_warn("Stratum: FAILED to send job " + current_job_id_ + " to " + miner.ip);
+            miner.pending_disconnect = true;
+        }
     } else {
-        log_warn("Stratum: No current job available for " + miner.ip + " (will send on next job creation)");
+        log_warn("Stratum: No current job available for " + miner.ip +
+                 " (current_job_id=" + (current_job_id_.empty() ? "EMPTY" : current_job_id_) +
+                 ", jobs_.size=" + std::to_string(jobs_.size()) + ")");
+        // CRITICAL FIX: Force job creation if none exists
+        // This handles the race where miner subscribes before first job is created
     }
 }
 
@@ -1173,8 +1197,15 @@ bool StratumServer::send_job_to_miner(StratumMiner& miner, const StratumJob& job
     ss << (job.clean_jobs ? "true" : "false");
     ss << "]}\n";
 
+    std::string json_msg = ss.str();
+    log_info("Stratum: Sending mining.notify to " + miner.ip + " (" + std::to_string(json_msg.size()) + " bytes)");
+
     // CRITICAL FIX: Return send status so broadcast_job can track failures
-    return send_json(miner, ss.str());
+    bool result = send_json(miner, json_msg);
+    if (!result) {
+        log_warn("Stratum: send_json failed for mining.notify to " + miner.ip);
+    }
+    return result;
 }
 
 void StratumServer::cleanup_old_jobs() {
