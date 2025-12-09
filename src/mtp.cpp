@@ -91,7 +91,7 @@ void add_time_sample(int64_t peer_time){
         std::sort(sorted.begin(), sorted.end());
         int64_t median = sorted[sorted.size() / 2];
 
-        // Clamp offset to +/- 70 minutes (Bitcoin-style)
+        // Clamp offset to +/- 70 minutes
         constexpr int64_t MAX_OFFSET = 70 * 60;
         if (median > MAX_OFFSET) median = MAX_OFFSET;
         if (median < -MAX_OFFSET) median = -MAX_OFFSET;

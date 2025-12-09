@@ -915,7 +915,7 @@ static inline std::string fmt_diff(long double d){
 }
 
 // =============================================================================
-// Bitcoin Core-like sync display helpers
+// Sync display helpers
 // =============================================================================
 
 // Format "X years and Y weeks behind" for sync status
@@ -975,7 +975,7 @@ static inline std::string fmt_datetime(uint64_t timestamp){
     return std::string(buf);
 }
 
-// Animated progress bar with gradient effect (Bitcoin Core style)
+// Animated progress bar with gradient effect
 static inline std::string progress_bar_animated(int width, double frac, int tick, bool vt_ok, bool u8_ok){
     if (width < 10) width = 10;
     if (frac < 0.0) frac = 0.0;
@@ -1729,7 +1729,7 @@ public:
         }
     }
 
-    // Bitcoin Core-like sync stats update
+    // Sync stats update
     void update_sync_stats(uint64_t current_height, uint64_t network_height, uint64_t last_block_timestamp) {
         std::lock_guard<std::mutex> lk(mu_);
         uint64_t now = now_ms();
@@ -3351,7 +3351,7 @@ private:
         }
 
         // =============================================================
-        // Bitcoin Core-style Sync Progress Panel
+        // Sync Progress Panel
         // =============================================================
         {
             bool show_sync_panel = (nstate_ == NodeState::Syncing || ibd_visible_ || (!ibd_done_ && ibd_target_ > 0));
@@ -3362,7 +3362,7 @@ private:
                 left.push_back(std::string(C_bold()) + C_warn() + warn_icon + "Synchronizing with Network" + C_reset());
                 left.push_back("");
 
-                // Warning message like Bitcoin Core
+                // Warning message during sync
                 left.push_back(std::string("  ") + C_warn() + "Recent transactions may not yet be visible, and therefore" + C_reset());
                 left.push_back(std::string("  ") + C_warn() + "your wallet's balance might be incorrect. This information" + C_reset());
                 left.push_back(std::string("  ") + C_warn() + "will be correct once your node has finished synchronizing." + C_reset());
@@ -3383,7 +3383,7 @@ private:
                     header_status = fmt_num(blocks_remaining);
                 }
 
-                // Bitcoin Core-style metrics display
+                // Metrics display
                 std::ostringstream l1;
                 l1 << "  " << C_dim() << "Number of blocks left" << C_reset() << "    " << C_info() << header_status << C_reset();
                 left.push_back(l1.str());
@@ -3885,7 +3885,7 @@ private:
     std::string ibd_seed_host_;
     uint64_t    ibd_last_update_ms_{0};
 
-    // Bitcoin Core-like sync tracking
+    // Sync tracking
     uint64_t    sync_network_height_{0};         // Max peer tip height
     uint64_t    sync_last_block_time_{0};        // Timestamp of last synced block
     double      sync_blocks_per_sec_{0.0};       // Current sync speed

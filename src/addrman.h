@@ -30,7 +30,7 @@ struct FastRand {
     }
 };
 
-// Simple bucketed Address Manager inspired by Bitcoin’s tried/new tables.
+// Simple bucketed Address Manager with tried/new tables.
 // Serialization is stable and includes a header+checksum.
 class AddrMan {
 public:

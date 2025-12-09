@@ -2831,7 +2831,7 @@ std::string RpcService::handle(const std::string& body){
             catch(...) { return err("bad amount"); }
             if (amount == 0) return err("amount must be >0");
 
-            // No transfer limit - like Bitcoin, allow any amount up to user's balance
+            // No transfer limit - allow any amount up to user's balance
             // The only limit is MAX_MONEY (total supply) which is checked elsewhere
 
             // Load wallet data

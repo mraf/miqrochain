@@ -58,6 +58,7 @@ struct StratumMiner {
     std::string extranonce1;              // Unique per connection
     bool authorized{false};
     bool subscribed{false};
+    bool pending_disconnect{false};       // CRITICAL FIX: Mark miner for disconnect after send failure
 
     // Difficulty tracking
     double difficulty{1.0};
@@ -181,7 +182,7 @@ private:
     // Job management
     StratumJob create_job();
     void broadcast_job(const StratumJob& job);
-    void send_job_to_miner(StratumMiner& miner, const StratumJob& job);
+    bool send_job_to_miner(StratumMiner& miner, const StratumJob& job);
     void cleanup_old_jobs();
 
     // Share validation
@@ -196,8 +197,8 @@ private:
 
     // Communication
     bool send_json(StratumMiner& miner, const std::string& json);
-    void send_result(StratumMiner& miner, uint64_t id, const std::string& result);
-    void send_error(StratumMiner& miner, uint64_t id, int code, const std::string& message);
+    bool send_result(StratumMiner& miner, uint64_t id, const std::string& result);
+    bool send_error(StratumMiner& miner, uint64_t id, int code, const std::string& message);
 
     // Helpers
     std::string generate_extranonce1();

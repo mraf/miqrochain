@@ -12,7 +12,7 @@
 #endif
 
 #ifndef COIN
-// Smallest unit per coin (default 1e8 like Bitcoin). Override in constants.h if different.
+// Smallest unit per coin (1e8 miqron). Override in constants.h if different.
 #define COIN 100000000ULL
 #endif
 
