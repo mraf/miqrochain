@@ -2811,16 +2811,9 @@ private:
             }
 
             // Height with chain visualization
-            // Show network height if we're behind (syncing)
-            // Use the best of: peer tips (sync_network_height_) or header height from cache
-            uint64_t net_height = std::max(sync_network_height_, cached.best_header_height);
             std::ostringstream h1;
             h1 << C_dim() << "Height:" << C_reset() << "     " << chain_blocks_viz(tick_, height) << " "
                << C_info() << C_bold() << fmt_num(height) << C_reset();
-            if (net_height > height + 1) {
-                // Show target network height when syncing
-                h1 << C_dim() << " / " << C_warn() << fmt_num(net_height) << C_reset();
-            }
             left_panel.push_back(box_row(h1.str(), half_width));
 
             // Tip hash
@@ -4166,10 +4159,16 @@ static bool should_enter_ibd(Chain& chain, const std::string& datadir){
 // Surfaces a concrete error if it can't finish.
 static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                              bool can_tui, TUI* tui, std::string& out_err){
+    // CRITICAL FIX: Always check if we need IBD, but don't skip peer connection!
+    // Even if tip is fresh, we must connect to peers to verify we're truly synced
+    bool skip_block_sync = false;
     {
         std::string reason;
         if (!should_enter_ibd_reason(chain, datadir, &reason)) {
-            return true;
+            // Tip is fresh - we may skip block downloading, but MUST still connect to peers
+            log_info("IBD: local tip is fresh, will verify sync state with peers");
+            if (tui && can_tui) tui->set_banner("Verifying sync state with peers...");
+            skip_block_sync = true;
         } else {
             log_info(std::string("IBD: starting (reason: ") + reason + ")");
             if (tui && can_tui) tui->set_banner(std::string("Initial block download — ") + reason);
