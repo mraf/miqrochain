@@ -1410,23 +1410,35 @@ bool Chain::rebuild_state_from_blocks() {
 bool Chain::rebuild_utxo_from_blocks() {
     MIQ_CHAIN_GUARD();
 
-    size_t block_count = storage_.count();
-    if (block_count == 0) {
-        return true;  // Nothing to rebuild
+    // CRITICAL FIX: Use chain height, not storage count
+    // After reorgs, storage may contain orphaned blocks at different indices.
+    // We must walk the ACTUAL CHAIN from genesis to tip.
+    uint64_t chain_height = tip_.height;
+    if (chain_height == 0 && tip_.hash.empty()) {
+        return true;  // Nothing to rebuild (no chain yet)
     }
 
-    log_warn("Rebuilding UTXO set from " + std::to_string(block_count) + " blocks...");
+    log_warn("Rebuilding UTXO set from " + std::to_string(chain_height + 1) + " blocks (height 0 to " + std::to_string(chain_height) + ")...");
 
     // Clear existing UTXO set
     utxo_.clear();
 
-    // Process each block to rebuild UTXO set
-    for (size_t h = 0; h < block_count; ++h) {
-        std::vector<uint8_t> raw;
+    // CRITICAL FIX: Process blocks by CHAIN HEIGHT using get_block_by_index()
+    // This follows the actual chain, not storage order which may include orphans
+    for (uint64_t h = 0; h <= chain_height; ++h) {
         Block blk;
-        if (!storage_.read_block_by_index(h, raw) || !deser_block(raw, blk)) {
-            log_warn("Failed to read block " + std::to_string(h) + " during UTXO rebuild");
-            continue;
+        // CRITICAL FIX: Use get_block_by_index which walks the chain, not storage
+        if (!get_block_by_index((size_t)h, blk)) {
+            // CRITICAL FIX: FAIL on missing blocks, don't continue!
+            // A missing block means UTXO set would be incomplete/incorrect
+            log_error("UTXO rebuild FAILED: cannot read block at height " + std::to_string(h) +
+                      " - chain may be corrupted");
+            return false;
+        }
+
+        if (blk.txs.empty()) {
+            log_error("UTXO rebuild FAILED: block at height " + std::to_string(h) + " has no transactions");
+            return false;
         }
 
         // Add coinbase outputs
@@ -1434,7 +1446,10 @@ bool Chain::rebuild_utxo_from_blocks() {
         auto cb_txid = cb.txid();
         for (size_t i = 0; i < cb.vout.size(); ++i) {
             UTXOEntry e{cb.vout[i].value, cb.vout[i].pkh, h, true};
-            utxo_.add(cb_txid, (uint32_t)i, e);
+            if (!utxo_.add(cb_txid, (uint32_t)i, e)) {
+                log_error("UTXO rebuild FAILED: cannot add coinbase output at height " + std::to_string(h));
+                return false;
+            }
         }
 
         // Process non-coinbase transactions
@@ -1443,6 +1458,8 @@ bool Chain::rebuild_utxo_from_blocks() {
 
             // Spend inputs
             for (const auto& in : tx.vin) {
+                // Note: spend() may fail if UTXO doesn't exist (indicates prior corruption)
+                // We continue anyway since we're rebuilding from scratch
                 utxo_.spend(in.prev.txid, in.prev.vout);
             }
 
@@ -1450,16 +1467,19 @@ bool Chain::rebuild_utxo_from_blocks() {
             auto txid = tx.txid();
             for (size_t i = 0; i < tx.vout.size(); ++i) {
                 UTXOEntry e{tx.vout[i].value, tx.vout[i].pkh, h, false};
-                utxo_.add(txid, (uint32_t)i, e);
+                if (!utxo_.add(txid, (uint32_t)i, e)) {
+                    log_error("UTXO rebuild FAILED: cannot add output at height " + std::to_string(h));
+                    return false;
+                }
             }
         }
 
         if (h % 1000 == 0 && h > 0) {
-            log_info("UTXO rebuild progress: " + std::to_string(h) + "/" + std::to_string(block_count) + " blocks");
+            log_info("UTXO rebuild progress: " + std::to_string(h) + "/" + std::to_string(chain_height + 1) + " blocks");
         }
     }
 
-    log_info("UTXO rebuild complete: processed " + std::to_string(block_count) + " blocks");
+    log_info("UTXO rebuild complete: processed " + std::to_string(chain_height + 1) + " blocks");
     return true;
 }
 
@@ -1968,6 +1988,14 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         for(const auto& inx: tx.vin){
             if (inx.pubkey.size() != 33 && inx.pubkey.size() != 65) { err="bad pubkey size"; return false; }
 
+            // CRITICAL FIX: Validate prev.txid is exactly 32 bytes
+            // Malformed txids cause UTXO lookup key mismatches, leading to "missing utxo" errors
+            // Coinbase has this check at line 1856, but non-coinbase was missing it
+            if (inx.prev.txid.size() != 32) {
+                err = "bad prev_txid size: " + std::to_string(inx.prev.txid.size()) + " (expected 32)";
+                return false;
+            }
+
             Key k{inx.prev.txid, inx.prev.vout};
             if (spent_in_block.find(k) != spent_in_block.end()){ err="in-block double-spend"; return false; }
             spent_in_block.insert(k);
@@ -1981,11 +2009,26 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
                 MIQ_LOG_DEBUG(miq::LogCategory::VALIDATION, "verify_block: tx[" + std::to_string(ti) +
                               "] input found in created_in_block (chained tx OK)");
             } else if(!utxo_.get(inx.prev.txid, inx.prev.vout, e)){
-                // DEBUG: Log detailed info about missing UTXO
+                // DEBUG: Log detailed info about missing UTXO to help diagnose the issue
+                std::string full_txid = to_hex(inx.prev.txid);
                 MIQ_LOG_WARN(miq::LogCategory::VALIDATION, "verify_block: tx[" + std::to_string(ti) +
-                             "] MISSING UTXO - prev_txid=" + to_hex(inx.prev.txid).substr(0,16) +
+                             "] MISSING UTXO - prev_txid=" + full_txid.substr(0, 16) +
                              "... vout=" + std::to_string(inx.prev.vout) +
-                             ", created_in_block has " + std::to_string(created_in_block.size()) + " entries");
+                             ", created_in_block has " + std::to_string(created_in_block.size()) + " entries" +
+                             ", current_tip_height=" + std::to_string(tip_.height) +
+                             ", block_being_verified=" + std::to_string(tip_.height + 1));
+
+                // Additional diagnostic: check if we have the parent transaction in txindex
+                TxLocation parent_loc;
+                if (txindex_.get(inx.prev.txid, parent_loc)) {
+                    MIQ_LOG_WARN(miq::LogCategory::VALIDATION, std::string("  -> Parent tx found in txindex at height ") +
+                                 std::to_string(parent_loc.block_height) + " pos " + std::to_string(parent_loc.tx_position) +
+                                 " - UTXO should exist but doesn't! Possible incomplete block processing.");
+                } else {
+                    MIQ_LOG_WARN(miq::LogCategory::VALIDATION, std::string("  -> Parent tx NOT in txindex - ") +
+                                 "transaction may not exist on this chain");
+                }
+
                 err="missing utxo";
                 return false;
             }
