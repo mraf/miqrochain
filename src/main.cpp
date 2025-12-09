@@ -1441,8 +1441,20 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
             }
         }
 
-        // If no peers have reported their tip yet, keep syncing
+        // If no peers have reported their tip yet, check if our local tip is fresh
+        // FAST-START FIX: If we already have a fresh tip (< 10 min old), we're likely synced
+        // Don't wait for peer tips in this case - allow node to start running immediately
         if (peers_with_tip == 0) {
+            auto tip = chain.tip();
+            uint64_t tsec = hdr_time(tip);
+            uint64_t now_time = (uint64_t)std::time(nullptr);
+            uint64_t tip_age = (now_time > tsec) ? (now_time - tsec) : 0;
+            // If our tip is fresh (< 10 min), consider ourselves synced
+            // This allows already-synced nodes to start immediately
+            if (tip_age < 10 * 60) {
+                why_out.clear();
+                return true;
+            }
             why_out = "waiting for peer tip heights";
             return false;
         }
@@ -4176,7 +4188,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
 
     const uint64_t kNoPeerTimeoutMs      = 90 * 1000;
     const uint64_t kNoProgressTimeoutMs  = 180 * 1000;
-    const uint64_t kStableOkMs           = 20 * 1000;  // INCREASED from 8s to 20s for better sync verification
+    const uint64_t kStableOkMs           = 5 * 1000;   // REDUCED to 5s for faster startup (was 20s)
     const uint64_t kHandshakeTimeoutMs   = 60 * 1000;
     const uint64_t kSeedNudgeMs          = 10 * 1000;
     const uint64_t kMaxWallMs            = 30 * 60 * 1000;
@@ -5083,28 +5095,10 @@ int main(int argc, char** argv){
             }
 
             // Sync gate for TUI display (external miner checks sync state via RPC)
-            // CRITICAL FIX: Force transition to running state when truly synced
             {
                 std::string why;
                 bool synced = compute_sync_gate(chain, &p2p, why);
-                if (can_tui) {
-                    tui.set_mining_gate(synced, synced ? "" : why);
-
-                    // CRITICAL FIX: Force immediate transition to main screen when truly synced
-                    // This ensures the "core running" screen appears without stalling, even if
-                    // splash screen state is incorrect due to IBD flags not being set properly.
-                    static bool forced_transition = false;
-                    if (synced && !forced_transition) {
-                        log_info("Sync verified: Forcing transition to running state");
-                        // Force all the flags needed for splash -> main screen transition
-                        tui.set_ibd_progress(chain.height(), chain.height(), 0, "complete", "", true);
-                        tui.set_node_state(TUI::NodeState::Running);
-                        tui.set_hot_warning("");  // Clear any warnings
-                        tui.set_banner("Running");
-                        miq::mark_ibd_complete();  // Enable full durability
-                        forced_transition = true;
-                    }
-                }
+                if (can_tui) tui.set_mining_gate(synced, synced ? "" : why);
             }
 
             // Periodic mempool maintenance (every ~30 seconds)
