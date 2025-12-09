@@ -1442,16 +1442,16 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
         }
 
         // If no peers have reported their tip yet, check if our local tip is fresh
-        // FAST-START FIX: If we already have a fresh tip (< 10 min old), we're likely synced
+        // FAST-START FIX: If we already have a fresh tip (< 40 sec old), we're synced
         // Don't wait for peer tips in this case - allow node to start running immediately
         if (peers_with_tip == 0) {
             auto tip = chain.tip();
             uint64_t tsec = hdr_time(tip);
             uint64_t now_time = (uint64_t)std::time(nullptr);
             uint64_t tip_age = (now_time > tsec) ? (now_time - tsec) : 0;
-            // If our tip is fresh (< 10 min), consider ourselves synced
+            // If our tip is fresh (< 40 sec), consider ourselves synced
             // This allows already-synced nodes to start immediately
-            if (tip_age < 10 * 60) {
+            if (tip_age < 40) {
                 why_out.clear();
                 return true;
             }
