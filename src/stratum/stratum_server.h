@@ -193,7 +193,7 @@ private:
 
     // Vardiff
     void update_vardiff(StratumMiner& miner);
-    void send_set_difficulty(StratumMiner& miner, double difficulty);
+    bool send_set_difficulty(StratumMiner& miner, double difficulty);
 
     // Communication
     bool send_json(StratumMiner& miner, const std::string& json);

@@ -573,7 +573,10 @@ void StratumServer::process_message(StratumMiner& miner, const std::string& line
     } else if (method == "mining.extranonce.subscribe") {
         handle_extranonce_subscribe(miner, id);
     } else {
-        send_error(miner, id, 20, "Unknown method");
+        // CRITICAL FIX: Check send_error return value
+        if (!send_error(miner, id, 20, "Unknown method")) {
+            miner.pending_disconnect = true;
+        }
     }
 }
 
@@ -592,62 +595,104 @@ void StratumServer::handle_subscribe(StratumMiner& miner, uint64_t id, const std
 
     if (!send_json(miner, response)) {
         log_warn("Stratum: Failed to send subscribe response to " + miner.ip);
+        miner.pending_disconnect = true;
         return;
     }
     miner.subscribed = true;
     log_info("Stratum: Miner subscribed from " + miner.ip + " extranonce1=" + miner.extranonce1);
 
-    // Send current difficulty
-    send_set_difficulty(miner, miner.difficulty);
+    // CRITICAL FIX: Check send_set_difficulty return value
+    if (!send_set_difficulty(miner, miner.difficulty)) {
+        log_warn("Stratum: Failed to send set_difficulty to " + miner.ip);
+        miner.pending_disconnect = true;
+        return;
+    }
 
-    // Send current job immediately after subscription
-    std::lock_guard<std::mutex> lock(jobs_mutex_);
-    if (!current_job_id_.empty() && jobs_.count(current_job_id_)) {
-        log_info("Stratum: Attempting to send job " + current_job_id_ + " to " + miner.ip);
-        if (send_job_to_miner(miner, jobs_[current_job_id_])) {
-            log_info("Stratum: Successfully sent job " + current_job_id_ + " to " + miner.ip);
+    // CRITICAL FIX: Copy job data while holding mutex, then send OUTSIDE mutex
+    // This avoids holding jobs_mutex_ during blocking I/O which can cause deadlock
+    StratumJob job_copy;
+    bool has_job = false;
+    std::string job_id_copy;
+    {
+        std::lock_guard<std::mutex> lock(jobs_mutex_);
+        if (!current_job_id_.empty() && jobs_.count(current_job_id_)) {
+            job_copy = jobs_[current_job_id_];
+            job_id_copy = current_job_id_;
+            has_job = true;
+        }
+    }
+
+    // Now send outside the mutex - no deadlock risk
+    if (has_job) {
+        log_info("Stratum: Attempting to send job " + job_id_copy + " to " + miner.ip);
+        if (send_job_to_miner(miner, job_copy)) {
+            log_info("Stratum: Successfully sent job " + job_id_copy + " to " + miner.ip);
         } else {
-            log_warn("Stratum: FAILED to send job " + current_job_id_ + " to " + miner.ip);
+            log_warn("Stratum: FAILED to send job " + job_id_copy + " to " + miner.ip);
             miner.pending_disconnect = true;
         }
     } else {
         log_warn("Stratum: No current job available for " + miner.ip +
-                 " (current_job_id=" + (current_job_id_.empty() ? "EMPTY" : current_job_id_) +
-                 ", jobs_.size=" + std::to_string(jobs_.size()) + ")");
-        // CRITICAL FIX: Force job creation if none exists
-        // This handles the race where miner subscribes before first job is created
+                 " (current_job_id=" + (current_job_id_.empty() ? "EMPTY" : current_job_id_) + ")");
+        // Job will be sent when next job is created/broadcast
     }
 }
 
 void StratumServer::handle_authorize(StratumMiner& miner, uint64_t id, const std::vector<std::string>& params) {
     if (params.empty()) {
-        send_error(miner, id, 20, "Missing worker name");
+        // CRITICAL FIX: Check send_error return value
+        if (!send_error(miner, id, 20, "Missing worker name")) {
+            miner.pending_disconnect = true;
+        }
         return;
     }
 
     miner.worker_name = params[0];
     miner.authorized = true;
 
-    send_result(miner, id, "true");
+    // CRITICAL FIX: Check send_result return value
+    if (!send_result(miner, id, "true")) {
+        log_warn("Stratum: Failed to send authorize response to " + miner.ip);
+        miner.pending_disconnect = true;
+        return;
+    }
     log_info("Stratum: Worker authorized: " + miner.worker_name + " from " + miner.ip);
 
-    // If subscribed but no job was sent yet (race condition), send job now
-    std::lock_guard<std::mutex> lock(jobs_mutex_);
-    if (miner.subscribed && !current_job_id_.empty() && jobs_.count(current_job_id_)) {
-        // Check if we need to resend job (in case it wasn't sent during subscribe)
-        send_job_to_miner(miner, jobs_[current_job_id_]);
+    // CRITICAL FIX: Copy job data while holding mutex, then send OUTSIDE mutex
+    // This avoids holding jobs_mutex_ during blocking I/O
+    StratumJob job_copy;
+    bool should_send_job = false;
+    {
+        std::lock_guard<std::mutex> lock(jobs_mutex_);
+        if (miner.subscribed && !current_job_id_.empty() && jobs_.count(current_job_id_)) {
+            job_copy = jobs_[current_job_id_];
+            should_send_job = true;
+        }
+    }
+
+    // Send outside the mutex
+    if (should_send_job) {
+        if (!send_job_to_miner(miner, job_copy)) {
+            miner.pending_disconnect = true;
+        }
     }
 }
 
 void StratumServer::handle_submit(StratumMiner& miner, uint64_t id, const std::vector<std::string>& params) {
     if (!miner.authorized) {
-        send_error(miner, id, 24, "Not authorized");
+        // CRITICAL FIX: Check send_error return value
+        if (!send_error(miner, id, 24, "Not authorized")) {
+            miner.pending_disconnect = true;
+        }
         return;
     }
 
     // params: [worker_name, job_id, extranonce2, ntime, nonce]
     if (params.size() < 5) {
-        send_error(miner, id, 20, "Invalid params");
+        // CRITICAL FIX: Check send_error return value
+        if (!send_error(miner, id, 20, "Invalid params")) {
+            miner.pending_disconnect = true;
+        }
         return;
     }
 
@@ -692,7 +737,10 @@ void StratumServer::handle_submit(StratumMiner& miner, uint64_t id, const std::v
 }
 
 void StratumServer::handle_extranonce_subscribe(StratumMiner& miner, uint64_t id) {
-    send_result(miner, id, "true");
+    // CRITICAL FIX: Check send_result return value
+    if (!send_result(miner, id, "true")) {
+        miner.pending_disconnect = true;
+    }
 }
 
 bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_id,
@@ -1238,17 +1286,21 @@ void StratumServer::update_vardiff(StratumMiner& miner) {
     // Only change if significant (>10% change)
     if (std::abs(new_diff - miner.difficulty) / miner.difficulty > 0.1) {
         miner.difficulty = new_diff;
-        send_set_difficulty(miner, new_diff);
+        // CRITICAL FIX: Check send_set_difficulty return value
+        if (!send_set_difficulty(miner, new_diff)) {
+            miner.pending_disconnect = true;
+            return;
+        }
     }
 
     miner.vardiff_last_adjust_ms = now;
     miner.vardiff_shares_since_adjust = 0;
 }
 
-void StratumServer::send_set_difficulty(StratumMiner& miner, double difficulty) {
+bool StratumServer::send_set_difficulty(StratumMiner& miner, double difficulty) {
     std::ostringstream ss;
     ss << "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[" << difficulty << "]}\n";
-    send_json(miner, ss.str());
+    return send_json(miner, ss.str());
 }
 
 void StratumServer::disconnect_miner(StratumSock sock, const std::string& reason) {
@@ -1271,7 +1323,8 @@ bool StratumServer::send_json(StratumMiner& miner, const std::string& json) {
 
     // CRITICAL FIX: Add retry limit to prevent infinite loop DoS
     // If a miner doesn't read data, we can't block forever
-    static constexpr int MAX_SEND_RETRIES = 100;  // ~100ms max wait
+    // Increased from 100 to 500 for slow network connections (~500ms max wait)
+    static constexpr int MAX_SEND_RETRIES = 500;
     int retry_count = 0;
 
     while (remaining > 0) {
