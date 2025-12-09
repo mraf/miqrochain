@@ -601,41 +601,9 @@ void StratumServer::handle_subscribe(StratumMiner& miner, uint64_t id, const std
     miner.subscribed = true;
     log_info("Stratum: Miner subscribed from " + miner.ip + " extranonce1=" + miner.extranonce1);
 
-    // CRITICAL FIX: Check send_set_difficulty return value
-    if (!send_set_difficulty(miner, miner.difficulty)) {
-        log_warn("Stratum: Failed to send set_difficulty to " + miner.ip);
-        miner.pending_disconnect = true;
-        return;
-    }
-
-    // CRITICAL FIX: Copy job data while holding mutex, then send OUTSIDE mutex
-    // This avoids holding jobs_mutex_ during blocking I/O which can cause deadlock
-    StratumJob job_copy;
-    bool has_job = false;
-    std::string job_id_copy;
-    {
-        std::lock_guard<std::mutex> lock(jobs_mutex_);
-        if (!current_job_id_.empty() && jobs_.count(current_job_id_)) {
-            job_copy = jobs_[current_job_id_];
-            job_id_copy = current_job_id_;
-            has_job = true;
-        }
-    }
-
-    // Now send outside the mutex - no deadlock risk
-    if (has_job) {
-        log_info("Stratum: Attempting to send job " + job_id_copy + " to " + miner.ip);
-        if (send_job_to_miner(miner, job_copy)) {
-            log_info("Stratum: Successfully sent job " + job_id_copy + " to " + miner.ip);
-        } else {
-            log_warn("Stratum: FAILED to send job " + job_id_copy + " to " + miner.ip);
-            miner.pending_disconnect = true;
-        }
-    } else {
-        log_warn("Stratum: No current job available for " + miner.ip +
-                 " (current_job_id=" + (current_job_id_.empty() ? "EMPTY" : current_job_id_) + ")");
-        // Job will be sent when next job is created/broadcast
-    }
+    // NOTE: Do NOT send set_difficulty or job here!
+    // Standard stratum protocol: wait for mining.authorize before sending difficulty and job
+    // The job will be sent in handle_authorize after successful authorization
 }
 
 void StratumServer::handle_authorize(StratumMiner& miner, uint64_t id, const std::vector<std::string>& params) {
@@ -658,7 +626,14 @@ void StratumServer::handle_authorize(StratumMiner& miner, uint64_t id, const std
     }
     log_info("Stratum: Worker authorized: " + miner.worker_name + " from " + miner.ip);
 
-    // CRITICAL FIX: Copy job data while holding mutex, then send OUTSIDE mutex
+    // Send set_difficulty AFTER authorize (standard stratum protocol)
+    if (!send_set_difficulty(miner, miner.difficulty)) {
+        log_warn("Stratum: Failed to send set_difficulty to " + miner.ip);
+        miner.pending_disconnect = true;
+        return;
+    }
+
+    // Copy job data while holding mutex, then send OUTSIDE mutex
     // This avoids holding jobs_mutex_ during blocking I/O
     StratumJob job_copy;
     bool should_send_job = false;
@@ -670,7 +645,7 @@ void StratumServer::handle_authorize(StratumMiner& miner, uint64_t id, const std
         }
     }
 
-    // Send outside the mutex
+    // Send job outside the mutex
     if (should_send_job) {
         if (!send_job_to_miner(miner, job_copy)) {
             miner.pending_disconnect = true;
