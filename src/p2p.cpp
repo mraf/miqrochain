@@ -728,6 +728,8 @@ static std::atomic<size_t>  g_last_progress_height{0};
 static std::atomic<int64_t> g_next_stall_probe_ms{0};
 
 // Simple trickle queues per-peer (sock -> txid queue and last flush ms)
+// CRITICAL FIX: Added mutex to protect trickle queue from concurrent access
+static std::mutex g_trickle_mu;
 static std::unordered_map<Sock, std::vector<std::vector<uint8_t>>> g_trickle_q;
 static std::unordered_map<Sock, int64_t> g_trickle_last_ms;
 
@@ -2926,6 +2928,8 @@ static constexpr size_t MIQ_TRICKLE_QUEUE_MAX = 32768;
 
 static inline void trickle_enqueue(Sock sock, const std::vector<uint8_t>& txid){
     if (txid.size()!=32) return;
+    // CRITICAL FIX: Acquire mutex to protect g_trickle_q from concurrent access
+    std::lock_guard<std::mutex> lk(g_trickle_mu);
     auto& q = g_trickle_q[sock];
     if (q.size() < MIQ_TRICKLE_QUEUE_MAX) {
         q.push_back(txid);
@@ -3078,6 +3082,8 @@ void P2P::store_tx_for_relay(const std::vector<uint8_t>& txid, const std::vector
 
 static void trickle_flush(){
     int64_t tnow = now_ms();
+    // CRITICAL FIX: Acquire mutex to protect g_trickle_q from concurrent access
+    std::lock_guard<std::mutex> lk(g_trickle_mu);
     for (auto& kv : g_trickle_q) {
         Sock s = kv.first;
         auto& q = kv.second;
@@ -6519,9 +6525,13 @@ void P2P::loop(){
 
                         if (is_new_tx) {
                             std::string err;
-                            bool accepted = true;
+                            bool accepted = false;
+                            // CRITICAL FIX: Don't accept/relay transactions if mempool is not initialized
+                            // Without this check, unvalidated transactions would be relayed to peers
                             if (mempool_) {
                                 accepted = mempool_->accept(tx, chain_.utxo(), static_cast<uint32_t>(chain_.height()), err);
+                            } else {
+                                err = "mempool not initialized";
                             }
                             bool in_mempool = mempool_ && mempool_->exists(tx.txid());
 
@@ -7177,12 +7187,8 @@ void P2P::loop(){
             }
 #endif
         }
-        // ---- Guarded removals (single, consistent path) --------------------
-        for (Sock s : dead) {
-            // auto it_peers_count = peers_.size();  // Currently unused
-            // auto it_preview = peers_.find(s);  // Currently unused
-
-            trickle_flush();
+        // Flush trickle queues once before processing dead peers
+        trickle_flush();
 
         // Periodically persist address sets (legacy + addrman)
         {
@@ -7202,7 +7208,9 @@ void P2P::loop(){
                 last_addr_save_ms = tnow;
             }
         }
-  
+
+        // ---- Guarded removals (single, consistent path) --------------------
+        for (Sock s : dead) {
             gate_on_close(s);
             auto it = peers_.find(s);
             if (it != peers_.end()) {
@@ -7258,7 +7266,12 @@ void P2P::loop(){
             g_peer_stalls.erase(s);
             g_last_hdr_ok_ms.erase(s);
             g_preverack_counts.erase(s);
-            g_trickle_last_ms.erase(s);
+            // CRITICAL FIX: Clean up trickle queue for disconnected peer
+            {
+                std::lock_guard<std::mutex> lk_trickle(g_trickle_mu);
+                g_trickle_q.erase(s);
+                g_trickle_last_ms.erase(s);
+            }
             g_cmd_rl.erase(s); // mirror cleanup in case gate_on_close wasn't hit
             {
                 auto it_ts = g_inflight_block_ts.find(s);
