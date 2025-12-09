@@ -3834,7 +3834,24 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
     if (!deser_block(raw, b)) return;
 
     const auto bh = b.block_hash();
-    if (chain_.have_block(bh)) return;
+
+    // CRITICAL FIX: Don't skip blocks that might have incomplete processing
+    // If block body is stored but UTXO operations failed (crash/disk error),
+    // we need to let submit_block() handle re-processing via its incomplete
+    // processing detection logic (checks if block extends current tip).
+    // Only skip if we truly have a fully processed block that doesn't extend tip.
+    if (chain_.have_block(bh)) {
+        // Check if this block extends the current tip - if so, might be incomplete
+        const auto tip_hash = chain_.tip_hash();
+        if (b.header.prev_hash == tip_hash) {
+            // Block extends tip but we already have it - possible incomplete processing!
+            // Let it through to submit_block() which will detect and recover
+            log_warn("P2P: have block that extends tip - checking for incomplete processing");
+        } else {
+            // Block doesn't extend tip - truly already processed or on different chain
+            return;
+        }
+    }
 
     // =========================================================================
     // HEIGHT-ORDERED QUEUE: Parallel download, sequential processing
