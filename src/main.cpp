@@ -4161,14 +4161,12 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                              bool can_tui, TUI* tui, std::string& out_err){
     // CRITICAL FIX: Always check if we need IBD, but don't skip peer connection!
     // Even if tip is fresh, we must connect to peers to verify we're truly synced
-    bool skip_block_sync = false;
     {
         std::string reason;
         if (!should_enter_ibd_reason(chain, datadir, &reason)) {
             // Tip is fresh - we may skip block downloading, but MUST still connect to peers
             log_info("IBD: local tip is fresh, will verify sync state with peers");
             if (tui && can_tui) tui->set_banner("Verifying sync state with peers...");
-            skip_block_sync = true;
         } else {
             log_info(std::string("IBD: starting (reason: ") + reason + ")");
             if (tui && can_tui) tui->set_banner(std::string("Initial block download — ") + reason);
