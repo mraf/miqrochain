@@ -1461,10 +1461,22 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
         }
 
         if (h >= max_peer_tip) {
+            // CRITICAL FIX: Also verify the tip is reasonably fresh
+            // This prevents declaring sync complete on a stale chain
+            auto tip = chain.tip();
+            uint64_t tsec = hdr_time(tip);
+            uint64_t now = (uint64_t)std::time(nullptr);
+            uint64_t age = (now > tsec) ? (now - tsec) : 0;
+            // Allow up to 10 minutes for slow block times or slight clock drift
+            const uint64_t max_age = 10 * 60;
+            if (age > max_age) {
+                why_out = "tip timestamp too old (" + std::to_string(age) + "s)";
+                return false;
+            }
             why_out.clear();
             return true;
         } else {
-            why_out = "syncing blocks";
+            why_out = "syncing blocks (" + std::to_string(h) + "/" + std::to_string(max_peer_tip) + ")";
             return false;
         }
     }
@@ -4164,7 +4176,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
 
     const uint64_t kNoPeerTimeoutMs      = 90 * 1000;
     const uint64_t kNoProgressTimeoutMs  = 180 * 1000;
-    const uint64_t kStableOkMs           = 8 * 1000;
+    const uint64_t kStableOkMs           = 20 * 1000;  // INCREASED from 8s to 20s for better sync verification
     const uint64_t kHandshakeTimeoutMs   = 60 * 1000;
     const uint64_t kSeedNudgeMs          = 10 * 1000;
     const uint64_t kMaxWallMs            = 30 * 60 * 1000;
@@ -4389,15 +4401,25 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             }
         }
 
-        // Check "synced" state and require short stability window
+        // Check "synced" state and require stability window with re-verification
         std::string why;
         if (compute_sync_gate(chain, p2p, why)) {
             const uint64_t okStart = now_ms();
+            const uint64_t heightAtStart = chain.height();
             bool stable = true;
+
+            log_info("IBD: sync gate passed, starting " + std::to_string(kStableOkMs/1000) +
+                     "s stability check at height " + std::to_string(heightAtStart));
+
             while (now_ms() - okStart < kStableOkMs) {
                 std::this_thread::sleep_for(200ms);
-                if (!compute_sync_gate(chain, p2p, why)) { stable = false; break; }
+                if (!compute_sync_gate(chain, p2p, why)) {
+                    log_info("IBD: stability check failed - " + why);
+                    stable = false;
+                    break;
+                }
             }
+
             if (stable) {
                 // CRITICAL FIX: Verify we've passed all checkpoints before declaring sync complete
                 // This prevents syncing to a short fork chain
@@ -4409,6 +4431,40 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                     std::this_thread::sleep_for(250ms);
                     continue;
                 }
+
+                // CRITICAL FIX: Re-verify peer tips AFTER stability window
+                // Peers may have received new blocks during our stability check
+                uint64_t final_max_peer_tip = 0;
+                size_t final_peers_with_tip = 0;
+                auto final_peers = p2p->snapshot_peers();
+                for (const auto& pr : final_peers) {
+                    if (pr.verack_ok && pr.peer_tip > 0) {
+                        final_max_peer_tip = std::max(final_max_peer_tip, pr.peer_tip);
+                        final_peers_with_tip++;
+                    }
+                }
+
+                // If peers now report a higher tip, we're not synced yet
+                if (final_peers_with_tip > 0 && chain.height() < final_max_peer_tip) {
+                    log_info("IBD: peer tips advanced during stability check (our=" +
+                             std::to_string(chain.height()) + " peer=" +
+                             std::to_string(final_max_peer_tip) + "), continuing sync");
+                    std::this_thread::sleep_for(250ms);
+                    continue;
+                }
+
+                // CRITICAL FIX: Check if blocks are still coming in
+                // If height increased during stability window, wait for things to settle
+                uint64_t heightNow = chain.height();
+                if (heightNow > heightAtStart) {
+                    log_info("IBD: blocks received during stability check (" +
+                             std::to_string(heightAtStart) + " -> " + std::to_string(heightNow) +
+                             "), restarting stability check");
+                    std::this_thread::sleep_for(250ms);
+                    continue;
+                }
+
+                log_info("IBD: sync complete after stability check, height=" + std::to_string(chain.height()));
 
                 if (tui && can_tui) {
                     tui->set_ibd_progress(chain.height(),
@@ -4795,60 +4851,11 @@ int main(int argc, char** argv){
         }
         SeedSentinel seed_sentinel;
         seed_sentinel.start(&p2p, can_tui ? &tui : nullptr);
-        if (can_tui) tui.mark_step_started("Start IBD monitor");
-        start_ibd_monitor(&chain, &p2p);
-        if (can_tui) tui.mark_step_ok("Start IBD monitor");
 
         // =====================================================================
-        // NEW STEP: IBD sync phase (smart start/finish, surfaces real error)
+        // START RPC EARLY: Allow clients to connect while IBD is in progress
+        // This makes startup feel faster and allows sync status queries
         // =====================================================================
-        if (can_tui) {
-            // Only show what is known at start; no estimated future height.
-            tui.set_ibd_progress(chain.height(), chain.height(), 0, "headers", seed_host_cstr(), false);
-        }
-        if (can_tui) tui.mark_step_started("IBD sync phase");
-        std::string ibd_err;
-        bool ibd_ok = perform_ibd_sync(chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, &tui, ibd_err);
-        if (ibd_ok) {
-            miq::mark_ibd_complete();  // Enable full durability (fsync on every block)
-            if (can_tui) {
-                tui.mark_step_ok("IBD sync phase");
-                tui.set_banner("Synced");
-                // CRITICAL FIX: Must set ibd_done_ to true for splash screen transition!
-                // Without this, the splash screen stays stuck even though sync is complete
-                tui.set_ibd_progress(chain.height(), chain.height(), 0, "complete", seed_host_cstr(), true);
-                tui.set_node_state(TUI::NodeState::Running);
-                tui.set_mining_gate(true, "");
-            }
-            log_info("IBD sync completed successfully.");
-        } else {
-            if (solo_seed_mode(cfg.no_p2p ? nullptr : &p2p)) {
-                // Bootstrap solo: treat as OK so local mining can proceed.
-                miq::mark_ibd_complete();  // Enable full durability
-                if (can_tui) {
-                    tui.mark_step_ok("IBD sync phase");
-                    tui.set_banner("Seed solo mode — no peers yet. Mining enabled.");
-                    // CRITICAL FIX: Must set ibd_done_ to true for splash screen transition!
-                    tui.set_ibd_progress(chain.height(), chain.height(), 0, "complete", seed_host_cstr(), true);
-                    tui.set_node_state(TUI::NodeState::Running);
-                    tui.set_mining_gate(true, "");
-                }
-                log_info("IBD sync skipped (seed solo mode).");
-            } else {
-                if (can_tui) {
-                    tui.mark_step_fail("IBD sync phase");
-                    tui.set_node_state(TUI::NodeState::Degraded);
-                    tui.set_hot_warning(std::string("BLOCKS MINED LOCALLY WILL NOT BE VALID — ") + ibd_err);
-                    tui.set_mining_gate(false, ibd_err + " — blocks mined locally will not be valid");
-                }
-                log_error(std::string("IBD sync failed: ") + ibd_err);
-                log_error("BLOCKS MINED LOCALLY WILL NOT BE VALID");
-            }
-        }
-        
-        IBDGuard ibd_guard;
-        ibd_guard.start(&chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, can_tui ? &tui : nullptr);
-        
         [[maybe_unused]] bool rpc_ok = false;
         if (can_tui) tui.mark_step_started("Start RPC server");
         if(!cfg.no_rpc){
@@ -4940,6 +4947,61 @@ int main(int argc, char** argv){
             tui.mark_step_ok("RPC ready");
             rpc_ok = true;
         }
+
+        // =====================================================================
+        // IBD SYNC PHASE: Now starts AFTER RPC is available
+        // This allows clients to connect and query sync status immediately
+        // =====================================================================
+        if (can_tui) tui.mark_step_started("Start IBD monitor");
+        start_ibd_monitor(&chain, &p2p);
+        if (can_tui) tui.mark_step_ok("Start IBD monitor");
+
+        if (can_tui) {
+            // Only show what is known at start; no estimated future height.
+            tui.set_ibd_progress(chain.height(), chain.height(), 0, "headers", seed_host_cstr(), false);
+        }
+        if (can_tui) tui.mark_step_started("IBD sync phase");
+        std::string ibd_err;
+        bool ibd_ok = perform_ibd_sync(chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, &tui, ibd_err);
+        if (ibd_ok) {
+            miq::mark_ibd_complete();  // Enable full durability (fsync on every block)
+            if (can_tui) {
+                tui.mark_step_ok("IBD sync phase");
+                tui.set_banner("Synced");
+                // CRITICAL FIX: Must set ibd_done_ to true for splash screen transition!
+                // Without this, the splash screen stays stuck even though sync is complete
+                tui.set_ibd_progress(chain.height(), chain.height(), 0, "complete", seed_host_cstr(), true);
+                tui.set_node_state(TUI::NodeState::Running);
+                tui.set_mining_gate(true, "");
+            }
+            log_info("IBD sync completed successfully.");
+        } else {
+            if (solo_seed_mode(cfg.no_p2p ? nullptr : &p2p)) {
+                // Bootstrap solo: treat as OK so local mining can proceed.
+                miq::mark_ibd_complete();  // Enable full durability
+                if (can_tui) {
+                    tui.mark_step_ok("IBD sync phase");
+                    tui.set_banner("Seed solo mode — no peers yet. Mining enabled.");
+                    // CRITICAL FIX: Must set ibd_done_ to true for splash screen transition!
+                    tui.set_ibd_progress(chain.height(), chain.height(), 0, "complete", seed_host_cstr(), true);
+                    tui.set_node_state(TUI::NodeState::Running);
+                    tui.set_mining_gate(true, "");
+                }
+                log_info("IBD sync skipped (seed solo mode).");
+            } else {
+                if (can_tui) {
+                    tui.mark_step_fail("IBD sync phase");
+                    tui.set_node_state(TUI::NodeState::Degraded);
+                    tui.set_hot_warning(std::string("BLOCKS MINED LOCALLY WILL NOT BE VALID — ") + ibd_err);
+                    tui.set_mining_gate(false, ibd_err + " — blocks mined locally will not be valid");
+                }
+                log_error(std::string("IBD sync failed: ") + ibd_err);
+                log_error("BLOCKS MINED LOCALLY WILL NOT BE VALID");
+            }
+        }
+
+        IBDGuard ibd_guard;
+        ibd_guard.start(&chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, can_tui ? &tui : nullptr);
 
         // =====================================================================
         // Stratum mining pool server (optional)

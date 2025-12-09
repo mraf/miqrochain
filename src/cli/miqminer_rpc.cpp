@@ -2533,6 +2533,13 @@ public:
             if (sock < 0) continue;
 #endif
             set_socket_timeouts(sock, 15000, 30000);  // 15s send, 30s recv
+            // CRITICAL FIX: Set TCP_NODELAY to disable Nagle's algorithm for faster stratum responses
+            int nodelay = 1;
+#if defined(_WIN32)
+            setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+#else
+            setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+#endif
             if (::connect(sock, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0) {
                 freeaddrinfo(res);
                 connected.store(true);
@@ -2704,12 +2711,17 @@ public:
     bool subscribe() {
         std::ostringstream ss;
         ss << "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"chronen-miner/1.0\"]}";
-        if (!send_json(ss.str())) return false;
+        std::fprintf(stderr, "[stratum] Sending subscribe request...\n");
+        if (!send_json(ss.str())) {
+            std::fprintf(stderr, "[stratum] ERROR: Failed to send subscribe request\n");
+            return false;
+        }
 
         // CRITICAL FIX: Read ALL pending messages after subscribe
         // Server sends: subscribe_response, set_difficulty, mining.notify
         bool got_subscribe_response = false;
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
+        // CRITICAL FIX: Increased timeout from 5s to 15s for slower networks
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(15000);
 
         while (std::chrono::steady_clock::now() < deadline) {
             std::string resp = recv_line(1000);
@@ -2776,6 +2788,13 @@ public:
             if (got_subscribe_response && has_job.load()) break;
         }
 
+        if (extranonce1.empty()) {
+            std::fprintf(stderr, "[stratum] ERROR: Subscribe failed - no extranonce1 received\n");
+            std::fprintf(stderr, "[stratum] This may indicate:\n");
+            std::fprintf(stderr, "[stratum]   - Server not responding to subscribe request\n");
+            std::fprintf(stderr, "[stratum]   - Firewall blocking connection\n");
+            std::fprintf(stderr, "[stratum]   - Server stratum port misconfigured\n");
+        }
         return !extranonce1.empty();
     }
 

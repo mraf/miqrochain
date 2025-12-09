@@ -25,6 +25,7 @@
   #pragma comment(lib, "ws2_32.lib")
 #else
   #include <netinet/in.h>
+  #include <netinet/tcp.h>  // TCP_NODELAY
   #include <arpa/inet.h>
   #include <sys/socket.h>
   #include <unistd.h>
@@ -292,6 +293,15 @@ void StratumServer::accept_loop() {
             }
         }
 
+        // CRITICAL FIX: Set TCP_NODELAY to disable Nagle's algorithm
+        // This ensures subscribe responses are sent immediately without buffering
+        int nodelay = 1;
+#ifdef _WIN32
+        setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+#else
+        setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+#endif
+
         // Set non-blocking
 #ifdef _WIN32
         u_long mode = 1;
@@ -553,6 +563,8 @@ void StratumServer::process_message(StratumMiner& miner, const std::string& line
 }
 
 void StratumServer::handle_subscribe(StratumMiner& miner, uint64_t id, const std::vector<std::string>& /*params*/) {
+    log_info("Stratum: Received subscribe request from " + miner.ip + " id=" + std::to_string(id));
+
     // Response: [[["mining.notify", "subscription_id"]], extranonce1, extranonce2_size]
     std::ostringstream ss;
     ss << "{\"id\":" << id << ",\"result\":[[";
@@ -560,7 +572,10 @@ void StratumServer::handle_subscribe(StratumMiner& miner, uint64_t id, const std
     ss << "[\"mining.notify\",\"" << miner.extranonce1 << "\"]";
     ss << "],\"" << miner.extranonce1 << "\"," << (int)extranonce2_size_ << "],\"error\":null}\n";
 
-    if (!send_json(miner, ss.str())) {
+    std::string response = ss.str();
+    log_info("Stratum: Sending subscribe response to " + miner.ip + " (" + std::to_string(response.size()) + " bytes)");
+
+    if (!send_json(miner, response)) {
         log_warn("Stratum: Failed to send subscribe response to " + miner.ip);
         return;
     }
