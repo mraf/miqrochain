@@ -32,10 +32,10 @@
 
 // === SYNCHRONIZATION TUNING ===
 #ifndef MIQ_P2P_STALL_RETRY_MS
-#define MIQ_P2P_STALL_RETRY_MS 3000  // Faster retry for better sync speed
+#define MIQ_P2P_STALL_RETRY_MS 2000  // CRITICAL FIX: Ultra-fast 2s retry to prevent forks
 #endif
 #ifndef MIQ_IBD_FALLBACK_AFTER_MS
-#define MIQ_IBD_FALLBACK_AFTER_MS (8 * 1000)  // 8s fallback for IBD
+#define MIQ_IBD_FALLBACK_AFTER_MS (3 * 1000)  // CRITICAL: 3s fallback for near-instant sync
 #endif
 #ifndef MIQ_OUTBOUND_TARGET
 #define MIQ_OUTBOUND_TARGET 12  // More outbound for better connectivity
@@ -101,7 +101,7 @@
 #endif
 
 #ifndef MIQ_INDEX_PIPELINE
-#define MIQ_INDEX_PIPELINE 32  // Doubled for faster sync
+#define MIQ_INDEX_PIPELINE 128  // CRITICAL FIX: High pipeline for near-instant sync
 #endif
 
 // Outbound dialing cadence (ms) - faster for quicker network formation
@@ -164,9 +164,7 @@ static constexpr uint64_t BLOCK_TIME_SECS = 480; // 8 minutes
 static constexpr uint16_t P2P_PORT = 9883;      // (kept as-is per your current config)
 static constexpr uint16_t RPC_PORT = 9834;
 
-#ifndef MIQ_INDEX_PIPELINE
-#define MIQ_INDEX_PIPELINE 8
-#endif
+// MIQ_INDEX_PIPELINE already defined earlier in this file (line ~104) at 128
 
 // Historical 32-bit network tag you already had; we continue to honor it.
 static constexpr uint32_t MAGIC = 0xA3FB9E21;
