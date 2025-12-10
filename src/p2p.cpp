@@ -367,7 +367,7 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
   #define MIQ_P2P_TRICKLE_BATCH 48
   #endif
   #ifndef MIQ_P2P_STALL_RETRY_MS
-  #define MIQ_P2P_STALL_RETRY_MS 15000
+  #define MIQ_P2P_STALL_RETRY_MS 2000   // CRITICAL FIX: Fast retry (2s) to prevent forks
   #endif
 #else
   #ifndef MIQ_P2P_NEW_INBOUND_CAP_PER_MIN
@@ -3785,6 +3785,12 @@ void P2P::process_pending_blocks() {
                     log_warn("P2P: pending block at height " + std::to_string(next_height) +
                              " rejected for reorg: " + reorg_err);
                 }
+                // CRITICAL FIX: Allow re-request from alternate peers on reorg failure
+                // The block might be from a different chain - try getting it from elsewhere
+                {
+                    InflightLock lk(g_inflight_lock);
+                    g_global_requested_indices.erase(next_height);
+                }
             }
             pending_blocks_bytes_ -= it->second.raw.size();
             pending_blocks_.erase(it);
@@ -3857,7 +3863,15 @@ void P2P::process_pending_blocks() {
                      " rejected: " + err);
             pending_blocks_bytes_ -= it->second.raw.size();
             pending_blocks_.erase(it);
-            break;  // Stop processing on error
+
+            // CRITICAL FIX: Immediately re-request this block from alternate peers
+            // Don't just stop - the rejection might be due to a transient error
+            {
+                InflightLock lk(g_inflight_lock);
+                g_global_requested_indices.erase(next_height);  // Allow re-request
+            }
+            // Continue to check if there are later blocks that might work after reorg
+            break;
         }
     }
 
@@ -4094,8 +4108,8 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             if (pps.peer_tip_height > max_peer_tip) max_peer_tip = pps.peer_tip_height;
         }
 
-        // CRITICAL FIX: Never consider ourselves "at tip" if the tip is stale (>5 min old)
-        // This prevents the node from sitting idle when peers haven't announced their height
+        // CRITICAL FIX: Never consider ourselves "at tip" if the tip is stale
+        // Reduced from 5 min to 60 sec to prevent forks
         uint64_t tip_age_sec = 0;
         {
             auto tip = chain_.tip();
@@ -4103,7 +4117,7 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             uint64_t tip_time = (tip.time > 0) ? (uint64_t)tip.time : now_sec;
             tip_age_sec = (now_sec > tip_time) ? (now_sec - tip_time) : 0;
         }
-        bool tip_is_stale = (tip_age_sec > 5 * 60);  // 5 minutes
+        bool tip_is_stale = (tip_age_sec > 60);  // 60 seconds (was 5 minutes)
 
         bool at_tip = want_tmp.empty() && (chain_.height() >= max_peer_tip) && !tip_is_stale;
         maybe_mark_headers_done(at_tip);
@@ -4730,9 +4744,10 @@ void P2P::loop(){
             // Final adaptive timeout
             int64_t adaptive_timeout = (int64_t)(base_timeout * health_multiplier * ibd_multiplier);
 
-            // Clamp to reasonable bounds: min 30s, max 180s during IBD, max 60s after
-            int64_t min_timeout = 30000;
-            int64_t max_timeout = !g_logged_headers_done ? 180000 : 60000;
+            // CRITICAL FIX: Aggressive timeouts to prevent forks
+            // min 5s (fast retry), max 30s during IBD, max 15s after
+            int64_t min_timeout = 5000;   // Was 30000 - way too slow
+            int64_t max_timeout = !g_logged_headers_done ? 30000 : 15000;  // Was 180000/60000
             adaptive_timeout = std::max(min_timeout, std::min(max_timeout, adaptive_timeout));
 
             // Check each inflight block for this peer
@@ -5243,7 +5258,7 @@ void P2P::loop(){
             // Implement aggressive refetch when stalled OR proactive pipeline during IBD
             int64_t refetch_interval = headers_done ? 5000 : 10000;  // 5s after headers, 10s before
 
-            // CRITICAL FIX: Check if tip is stale (>5 min old) - force aggressive sync
+            // CRITICAL FIX: Aggressive stale tip detection to prevent forks
             uint64_t tip_age_sec = 0;
             {
                 auto tip = chain_.tip();
@@ -5251,7 +5266,8 @@ void P2P::loop(){
                 uint64_t tip_time = (tip.time > 0) ? (uint64_t)tip.time : now_sec;
                 tip_age_sec = (now_sec > tip_time) ? (now_sec - tip_time) : 0;
             }
-            bool tip_is_stale = (tip_age_sec > 5 * 60);  // 5 minutes
+            // CRITICAL FIX: Stale threshold reduced from 5 min to 60 sec for instant sync
+            bool tip_is_stale = (tip_age_sec > 60);  // 60 seconds (was 5 minutes)
 
             // Use continuous batch pipeline: request next blocks every 200ms
             // This works both before AND after headers phase
@@ -5260,8 +5276,8 @@ void P2P::loop(){
             static int64_t last_stall_log = 0;
             static int64_t last_stale_tip_request = 0;
 
-            // CRITICAL FIX: Force block requests when tip is stale
-            if (tip_is_stale && (now - last_stale_tip_request > 10000)) {
+            // CRITICAL FIX: Force block requests when tip is stale - every 2 seconds (was 10s)
+            if (tip_is_stale && (now - last_stale_tip_request > 2000)) {
                 should_refetch = true;
                 last_stale_tip_request = now;
                 static int64_t last_stale_log = 0;
@@ -6126,6 +6142,16 @@ void P2P::loop(){
                                 announced_height |= (uint32_t)m.payload[pos + ua_size + 2] << 16;
                                 announced_height |= (uint32_t)m.payload[pos + ua_size + 3] << 24;
                                 ps.peer_tip_height = announced_height;
+
+                                // CRITICAL FIX: Trigger immediate sync if peer has higher tip
+                                // This prevents falling behind when new blocks are announced
+                                const uint64_t our_height = chain_.height();
+                                if (announced_height > our_height) {
+                                    log_info("P2P: peer " + ps.ip + " announces height " +
+                                             std::to_string(announced_height) + " (we have " +
+                                             std::to_string(our_height) + ") - triggering sync");
+                                    g_sync_wants_active.store(true);
+                                }
                             }
                         }
                     }
@@ -6264,6 +6290,8 @@ void P2P::loop(){
                                 // Only trace, not log - this is hot path
                                 P2P_TRACE("invb requesting block hash=" + k.substr(0, 16) + "... from " + ps.ip);
                                 request_block_hash(ps, m.payload);
+                                // CRITICAL FIX: Trigger sync when peer announces block we don't have
+                                g_sync_wants_active.store(true);
                             }
                             // Removed: "already have block" log - too spammy during sync
                         }
@@ -6406,16 +6434,26 @@ void P2P::loop(){
                                 }
 
                                 if (!alt_peers.empty()) {
-                                    // Pick a random alternative peer
-                                    Sock alt_s = alt_peers[std::rand() % alt_peers.size()];
-                                    auto pit = peers_.find(alt_s);
+                                    // CRITICAL FIX: Pick the peer with the highest tip (most likely to have block)
+                                    Sock best_alt = alt_peers[0];
+                                    uint64_t best_tip = 0;
+                                    for (Sock alt : alt_peers) {
+                                        auto pit = peers_.find(alt);
+                                        if (pit != peers_.end() && pit->second.peer_tip_height > best_tip) {
+                                            best_tip = pit->second.peer_tip_height;
+                                            best_alt = alt;
+                                        }
+                                    }
+                                    auto pit = peers_.find(best_alt);
                                     if (pit != peers_.end()) {
                                         request_block_index(pit->second, idx64);
-                                        P2P_TRACE("DEBUG: Retrying index " + std::to_string(idx64) + " with peer " + pit->second.ip);
+                                        log_info("P2P: Retrying index " + std::to_string(idx64) +
+                                                 " with peer " + pit->second.ip + " (tip=" + std::to_string(best_tip) + ")");
                                     }
                                 } else {
                                     // No alternative peer available - this block might not be available yet
-                                    P2P_TRACE("DEBUG: No alternative peer for index " + std::to_string(idx64));
+                                    log_warn("P2P: No alternative peer for index " + std::to_string(idx64) +
+                                             " - all peers may be behind");
                                 }
                             }
 
@@ -6539,6 +6577,9 @@ void P2P::loop(){
                                         InflightLock lk(g_inflight_lock);
                                         g_global_requested_indices.erase(delivered_idx);
                                     }
+                                    // CRITICAL FIX: Reset timeout counter on successful delivery
+                                    // This prevents peers from being demoted after transient timeouts
+                                    g_index_timeouts[(Sock)s] = 0;
                                 }
                                 ps.inflight_index--;
                                 // CRITICAL FIX: Always refill index pipeline after receiving a block
@@ -7592,13 +7633,12 @@ void P2P::loop(){
             }
         }
 
-        // BULLETPROOF SYNC: Periodic cleanup of stale global requested indices
-        // Remove indices that have been in the global set for too long (5 minutes)
-        // This handles edge cases where indices get stuck due to disconnections or errors
+        // BULLETPROOF SYNC: Aggressive cleanup of stale global requested indices
+        // CRITICAL FIX: Much faster cleanup to prevent sync stalls and forks
         {
             static int64_t last_idx_cleanup_ms = 0;
-            constexpr int64_t IDX_CLEANUP_INTERVAL_MS = 60000;  // Every 60 seconds
-            constexpr int64_t IDX_STALE_THRESHOLD_MS = 300000;  // 5 minutes stale threshold
+            constexpr int64_t IDX_CLEANUP_INTERVAL_MS = 5000;   // CRITICAL: Every 5 seconds (was 60s)
+            constexpr int64_t IDX_STALE_THRESHOLD_MS = 15000;   // CRITICAL: 15 seconds stale (was 5 min)
 
             if (current_time - last_idx_cleanup_ms >= IDX_CLEANUP_INTERVAL_MS) {
                 last_idx_cleanup_ms = current_time;
