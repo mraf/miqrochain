@@ -601,14 +601,33 @@ void StratumServer::handle_subscribe(StratumMiner& miner, uint64_t id, const std
     miner.subscribed = true;
     log_info("Stratum: Miner subscribed from " + miner.ip + " extranonce1=" + miner.extranonce1);
 
-    // Send set_difficulty immediately after subscribe (miners expect this)
+    // Send set_difficulty immediately after subscribe
     if (!send_set_difficulty(miner, miner.difficulty)) {
         log_warn("Stratum: Failed to send set_difficulty to " + miner.ip);
         miner.pending_disconnect = true;
         return;
     }
 
-    // NOTE: Job is sent after mining.authorize, not here
+    // Send job immediately after subscribe (miqminer expects this!)
+    // Copy job data while holding mutex, then send OUTSIDE mutex
+    StratumJob job_copy;
+    bool has_job = false;
+    std::string job_id_copy;
+    {
+        std::lock_guard<std::mutex> lock(jobs_mutex_);
+        if (!current_job_id_.empty() && jobs_.count(current_job_id_)) {
+            job_copy = jobs_[current_job_id_];
+            job_id_copy = current_job_id_;
+            has_job = true;
+        }
+    }
+
+    if (has_job) {
+        if (!send_job_to_miner(miner, job_copy)) {
+            log_warn("Stratum: Failed to send initial job to " + miner.ip);
+            miner.pending_disconnect = true;
+        }
+    }
 }
 
 void StratumServer::handle_authorize(StratumMiner& miner, uint64_t id, const std::vector<std::string>& params) {
