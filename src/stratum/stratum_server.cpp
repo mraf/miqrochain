@@ -601,9 +601,14 @@ void StratumServer::handle_subscribe(StratumMiner& miner, uint64_t id, const std
     miner.subscribed = true;
     log_info("Stratum: Miner subscribed from " + miner.ip + " extranonce1=" + miner.extranonce1);
 
-    // NOTE: Do NOT send set_difficulty or job here!
-    // Standard stratum protocol: wait for mining.authorize before sending difficulty and job
-    // The job will be sent in handle_authorize after successful authorization
+    // Send set_difficulty immediately after subscribe (miners expect this)
+    if (!send_set_difficulty(miner, miner.difficulty)) {
+        log_warn("Stratum: Failed to send set_difficulty to " + miner.ip);
+        miner.pending_disconnect = true;
+        return;
+    }
+
+    // NOTE: Job is sent after mining.authorize, not here
 }
 
 void StratumServer::handle_authorize(StratumMiner& miner, uint64_t id, const std::vector<std::string>& params) {
@@ -625,13 +630,6 @@ void StratumServer::handle_authorize(StratumMiner& miner, uint64_t id, const std
         return;
     }
     log_info("Stratum: Worker authorized: " + miner.worker_name + " from " + miner.ip);
-
-    // Send set_difficulty AFTER authorize (standard stratum protocol)
-    if (!send_set_difficulty(miner, miner.difficulty)) {
-        log_warn("Stratum: Failed to send set_difficulty to " + miner.ip);
-        miner.pending_disconnect = true;
-        return;
-    }
 
     // Copy job data while holding mutex, then send OUTSIDE mutex
     // This avoids holding jobs_mutex_ during blocking I/O
