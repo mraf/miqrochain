@@ -4093,7 +4093,19 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             if (!pps.verack_ok) continue;
             if (pps.peer_tip_height > max_peer_tip) max_peer_tip = pps.peer_tip_height;
         }
-        bool at_tip = want_tmp.empty() && (chain_.height() >= max_peer_tip);
+
+        // CRITICAL FIX: Never consider ourselves "at tip" if the tip is stale (>5 min old)
+        // This prevents the node from sitting idle when peers haven't announced their height
+        uint64_t tip_age_sec = 0;
+        {
+            auto tip = chain_.tip();
+            uint64_t now_sec = (uint64_t)std::time(nullptr);
+            uint64_t tip_time = (tip.time > 0) ? (uint64_t)tip.time : now_sec;
+            tip_age_sec = (now_sec > tip_time) ? (now_sec - tip_time) : 0;
+        }
+        bool tip_is_stale = (tip_age_sec > 5 * 60);  // 5 minutes
+
+        bool at_tip = want_tmp.empty() && (chain_.height() >= max_peer_tip) && !tip_is_stale;
         maybe_mark_headers_done(at_tip);
     }
 #endif
@@ -5231,12 +5243,33 @@ void P2P::loop(){
             // Implement aggressive refetch when stalled OR proactive pipeline during IBD
             int64_t refetch_interval = headers_done ? 5000 : 10000;  // 5s after headers, 10s before
 
+            // CRITICAL FIX: Check if tip is stale (>5 min old) - force aggressive sync
+            uint64_t tip_age_sec = 0;
+            {
+                auto tip = chain_.tip();
+                uint64_t now_sec = (uint64_t)std::time(nullptr);
+                uint64_t tip_time = (tip.time > 0) ? (uint64_t)tip.time : now_sec;
+                tip_age_sec = (now_sec > tip_time) ? (now_sec - tip_time) : 0;
+            }
+            bool tip_is_stale = (tip_age_sec > 5 * 60);  // 5 minutes
+
             // Use continuous batch pipeline: request next blocks every 200ms
             // This works both before AND after headers phase
             bool should_refetch = false;
             static int64_t last_proactive_log = 0;
             static int64_t last_stall_log = 0;
-            if (g_sequential_sync && (now - last_refetch_time > 200)) {
+            static int64_t last_stale_tip_request = 0;
+
+            // CRITICAL FIX: Force block requests when tip is stale
+            if (tip_is_stale && (now - last_stale_tip_request > 10000)) {
+                should_refetch = true;
+                last_stale_tip_request = now;
+                static int64_t last_stale_log = 0;
+                if (now - last_stale_log > 30000) {
+                    last_stale_log = now;
+                    log_warn("[SYNC] Tip is stale (" + std::to_string(tip_age_sec/60) + "m old) - forcing block requests from all peers");
+                }
+            } else if (g_sequential_sync && (now - last_refetch_time > 200)) {
                 // Proactive pipeline - keep requesting the next batch of blocks
                 should_refetch = true;
                 // Rate-limit log to once per 30 seconds
@@ -5313,9 +5346,12 @@ void P2P::loop(){
                         // If peer claims to have height X, we should try to get blocks up to X
                         // The blocks will be validated and trigger reorg if valid
 
-                        // If no info at all, use a conservative default
-                        if (peer_tip == 0) {
-                            peer_tip = current_height + 100;
+                        // If no info at all, or tip is stale, try requesting blocks speculatively
+                        // This helps discover blocks from peers that didn't announce their height
+                        if (peer_tip == 0 || peer_tip <= current_height) {
+                            // CRITICAL FIX: When tip is stale and peer_tip unknown, be more aggressive
+                            // Request up to 50 blocks ahead to discover if peer has more
+                            peer_tip = current_height + (tip_is_stale ? 50 : 10);
                         }
 
                         // Request blocks up to peer_tip (capped by batch size)
