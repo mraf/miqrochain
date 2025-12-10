@@ -17,9 +17,15 @@
 #include "utxo.h"          // UTXOEntry & list_for_pkh
 #include "difficulty.h"    // MIQ_RETARGET_INTERVAL & epoch_next_bits
 #include "txindex.h"       // Fast transaction lookup by txid
+#include "stratum/stratum_server.h"  // For stratum block notifications
 
 // External mining address for wallet balance inclusion
 extern std::string g_miner_address_b58;
+
+// External stratum server pointer (defined in main.cpp)
+namespace miq {
+    extern std::atomic<StratumServer*> g_stratum_server;
+}
 
 #include <sstream>
 #include <array>
@@ -1826,6 +1832,11 @@ std::string RpcService::handle(const std::string& body){
 
             // CRITICAL FIX: Notify mempool and promote orphan TXs
             mempool_.on_block_connect(b, chain_.utxo(), (uint32_t)chain_.height());
+
+            // CRITICAL FIX: Notify stratum server immediately on new block
+            if (auto* ss = miq::g_stratum_server.load()) {
+                ss->notify_new_block();
+            }
 
             // CRITICAL FIX: Notify TUI about the new locally-mined block
             // This ensures Recent Blocks and Recent TXIDs update for local mining

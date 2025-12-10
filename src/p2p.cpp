@@ -18,6 +18,7 @@ namespace p2p_stats {
 #include "utxo.h"           // fee calc (UTXOEntry)
 #include "base58check.h"    // Base58Check address display (miner logs)
 #include "sha256.h"         // dsha256 for compact block hash calculation
+#include "stratum/stratum_server.h"  // For stratum block notifications
 
 #include <chrono>
 #include <deque>
@@ -57,6 +58,11 @@ namespace p2p_stats {
 #ifndef MIQ_DEBUG_TRACE_NAMES
 #define MIQ_DEBUG_TRACE_NAMES 0
 #endif
+
+// Extern declaration for stratum server (defined in main.cpp)
+namespace miq {
+    extern std::atomic<StratumServer*> g_stratum_server;
+}
 
 #ifndef MIQ_SEED_MODE_ENV
 #define MIQ_SEED_MODE_ENV "MIQ_IS_SEED"
@@ -3771,6 +3777,10 @@ void P2P::process_pending_blocks() {
                         // CRITICAL FIX: Use overload that promotes orphan TXs
                         mempool_->on_block_connect(b, chain_.utxo(), (uint32_t)chain_.height());
                     }
+                    // CRITICAL FIX: Notify stratum server immediately on new block
+                    if (auto* ss = miq::g_stratum_server.load()) {
+                        ss->notify_new_block();
+                    }
                     broadcast_inv_block(it->second.hash);
                     g_last_progress_ms = now_ms();
                     g_last_progress_height = chain_.height();
@@ -3810,6 +3820,11 @@ void P2P::process_pending_blocks() {
             if (mempool_) {
                 // CRITICAL FIX: Use overload that promotes orphan TXs
                 mempool_->on_block_connect(b, chain_.utxo(), (uint32_t)chain_.height());
+            }
+
+            // CRITICAL FIX: Notify stratum server immediately on new block
+            if (auto* ss = miq::g_stratum_server.load()) {
+                ss->notify_new_block();
             }
 
             // Broadcast to peers
@@ -4177,6 +4192,10 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
             // CRITICAL FIX: Notify mempool and promote orphan TXs
             if (mempool_) {
                 mempool_->on_block_connect(ob, chain_.utxo(), (uint32_t)chain_.height());
+            }
+            // CRITICAL FIX: Notify stratum server immediately on new block
+            if (auto* ss = miq::g_stratum_server.load()) {
+                ss->notify_new_block();
             }
             const std::string miner = miq_miner_from_block(ob);
             log_info("P2P: accepted orphan as block height=" + std::to_string(chain_.height())
