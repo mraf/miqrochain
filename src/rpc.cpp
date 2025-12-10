@@ -17,9 +17,15 @@
 #include "utxo.h"          // UTXOEntry & list_for_pkh
 #include "difficulty.h"    // MIQ_RETARGET_INTERVAL & epoch_next_bits
 #include "txindex.h"       // Fast transaction lookup by txid
+#include "stratum/stratum_server.h"  // For stratum block notifications
 
 // External mining address for wallet balance inclusion
 extern std::string g_miner_address_b58;
+
+// External stratum server pointer (defined in main.cpp)
+namespace miq {
+    extern std::atomic<StratumServer*> g_stratum_server;
+}
 
 #include <sstream>
 #include <array>
@@ -542,7 +548,8 @@ std::string RpcService::handle(const std::string& body){
                 "getblock","getblockhash","getcoinbaserecipient",
                 "getrawmempool","getmempoolinfo","gettxout","getrawtransaction",
                 "validateaddress","decodeaddress","decoderawtx",
-                "getminerstats","sendrawtransaction","sendtoaddress","canceltx",
+                "getminerstats","setminerstats","getminingaddress","setminingaddress", // Mining
+                "sendrawtransaction","sendtoaddress","canceltx",
                 "estimatemediantime","getdifficulty","getchaintips",
                 "getpeerinfo","getconnectioncount","getnetworkinfo","listbanned","setban","disconnectnode",
                 "createhdwallet","restorehdwallet","walletinfo","getnewaddress","deriveaddressat",
@@ -1824,8 +1831,13 @@ std::string RpcService::handle(const std::string& body){
                 return err(std::string("submitblock: rejected: ")+e);
             }
 
-            // CRITICAL FIX: Notify mempool to remove confirmed transactions
-            mempool_.on_block_connect(b);
+            // CRITICAL FIX: Notify mempool and promote orphan TXs
+            mempool_.on_block_connect(b, chain_.utxo(), (uint32_t)chain_.height());
+
+            // CRITICAL FIX: Notify stratum server immediately on new block
+            if (auto* ss = miq::g_stratum_server.load()) {
+                ss->notify_new_block();
+            }
 
             // CRITICAL FIX: Notify TUI about the new locally-mined block
             // This ensures Recent Blocks and Recent TXIDs update for local mining
@@ -1942,6 +1954,56 @@ std::string RpcService::handle(const std::string& body){
             g_miner_stats.active.store(true);
 
             return "{\"result\":\"ok\"}";
+        }
+
+        // Set mining reward address at runtime (for UI/RPC configuration)
+        if (method == "setminingaddress") {
+            if (params.empty() || !std::holds_alternative<std::string>(params[0].v)) {
+                return err("usage: setminingaddress <address>");
+            }
+            const std::string& addr = std::get<std::string>(params[0].v);
+
+            // Validate address
+            uint8_t ver = 0;
+            std::vector<uint8_t> payload;
+            if (!base58check_decode(addr, ver, payload)) {
+                return err("Invalid address format");
+            }
+            if (ver != VERSION_P2PKH || payload.size() != 20) {
+                return err("Invalid P2PKH address");
+            }
+
+            // Update global mining address
+            g_miner_address_b58 = addr;
+
+            // Update stratum server reward address if running
+            if (auto* ss = miq::g_stratum_server.load()) {
+                ss->set_reward_address(payload);
+                log_info("RPC: Updated stratum reward address to " + addr);
+            }
+
+            log_info("RPC: Mining address set to " + addr);
+
+            std::map<std::string,JNode> result;
+            result["success"] = jbool(true);
+            result["address"] = jstr(addr);
+            JNode out; out.v = result;
+            return json_dump(out);
+        }
+
+        // Get current mining address
+        if (method == "getminingaddress") {
+            std::map<std::string,JNode> result;
+            if (g_miner_address_b58.empty()) {
+                result["configured"] = jbool(false);
+                result["address"] = jstr("");
+                result["warning"] = jstr("No mining address configured - mined coins will be lost!");
+            } else {
+                result["configured"] = jbool(true);
+                result["address"] = jstr(g_miner_address_b58);
+            }
+            JNode out; out.v = result;
+            return json_dump(out);
         }
 
         // ---------------- address UTXO lookup (for mobile/GUI) ----------------

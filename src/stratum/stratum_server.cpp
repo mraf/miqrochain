@@ -2,6 +2,7 @@
 #include "stratum_server.h"
 #include "../chain.h"
 #include "../mempool.h"
+#include "../base58check.h"  // For address validation from worker name
 #include "../sha256.h"
 #include "../merkle.h"
 #include "../hex.h"
@@ -148,6 +149,16 @@ int64_t StratumServer::now_ms() {
 
 bool StratumServer::start() {
     if (running_) return false;
+
+    // Check reward address - warn if not set but allow startup
+    // User can configure via RPC (setminingaddress) or UI
+    if (reward_pkh_.size() != 20) {
+        log_warn("Stratum: WARNING - No reward address configured!");
+        log_warn("Stratum: Set mining address via 'setminingaddress' RPC or UI before mining.");
+        log_warn("Stratum: Mined blocks will go to BURN ADDRESS until configured!");
+    } else {
+        log_info("Stratum: Reward address configured (PKH: " + hex_encode(reward_pkh_).substr(0, 8) + "...)");
+    }
 
     // Create listening socket
     listen_sock_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -604,14 +615,22 @@ void StratumServer::handle_subscribe(StratumMiner& miner, uint64_t id, const std
     // We combine: subscribe_response + set_difficulty + job_notify into one buffer
 
     // 1. Build subscribe response
+    // STRATUM COMPAT FIX: Use standard format for subscriptions
+    // Format: {"result": [[["method1","id1"],["method2","id2"]], extranonce1, extranonce2_size], "error": null}
     std::ostringstream batch;
-    batch << "{\"id\":" << id << ",\"result\":[[";
+    batch << "{\"id\":" << id << ",\"result\":[";
+    // Subscriptions array: [["mining.set_difficulty","subid"],["mining.notify","subid"]]
+    batch << "[";
     batch << "[\"mining.set_difficulty\",\"" << miner.extranonce1 << "\"],";
     batch << "[\"mining.notify\",\"" << miner.extranonce1 << "\"]";
-    batch << "],\"" << miner.extranonce1 << "\"," << (int)extranonce2_size_ << "],\"error\":null}\n";
+    batch << "],";
+    // extranonce1 and extranonce2_size
+    batch << "\"" << miner.extranonce1 << "\"," << (int)extranonce2_size_ << "],\"error\":null}\n";
 
     // 2. Add set_difficulty message
-    batch << "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[" << miner.difficulty << "]}\n";
+    // STRATUM COMPAT FIX: Use fixed precision to ensure decimal point is present
+    batch << "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":["
+          << std::fixed << std::setprecision(6) << miner.difficulty << "]}\n";
 
     // 3. Add job notify if available
     StratumJob job_copy;
@@ -647,6 +666,20 @@ void StratumServer::handle_subscribe(StratumMiner& miner, uint64_t id, const std
     std::string batch_str = batch.str();
     log_info("Stratum: Sending batched subscribe+difficulty+job to " + miner.ip + " (" + std::to_string(batch_str.size()) + " bytes)");
 
+    // DEBUG: Log the actual content being sent for troubleshooting
+    // Split by newlines and log each message
+    std::string debug_msg = batch_str;
+    size_t nl_pos;
+    int msg_num = 1;
+    while ((nl_pos = debug_msg.find('\n')) != std::string::npos) {
+        std::string line = debug_msg.substr(0, nl_pos);
+        if (!line.empty()) {
+            log_info("Stratum: MSG[" + std::to_string(msg_num++) + "]: " +
+                     (line.size() > 200 ? line.substr(0, 200) + "..." : line));
+        }
+        debug_msg = debug_msg.substr(nl_pos + 1);
+    }
+
     if (!send_json(miner, batch_str)) {
         log_warn("Stratum: Failed to send batched response to " + miner.ip);
         miner.pending_disconnect = true;
@@ -668,6 +701,26 @@ void StratumServer::handle_authorize(StratumMiner& miner, uint64_t id, const std
 
     miner.worker_name = params[0];
     miner.authorized = true;
+
+    // AUTO-CONFIG: Try to extract mining address from worker name
+    // Format: "address" or "address.workername"
+    // If no pool reward address is set, use the miner's address
+    std::string potential_addr = miner.worker_name;
+    size_t dot_pos = potential_addr.find('.');
+    if (dot_pos != std::string::npos) {
+        potential_addr = potential_addr.substr(0, dot_pos);
+    }
+
+    // Check if it's a valid address and we don't have one set
+    if (reward_pkh_.size() != 20 && !potential_addr.empty()) {
+        uint8_t ver = 0;
+        std::vector<uint8_t> payload;
+        if (base58check_decode(potential_addr, ver, payload) &&
+            ver == VERSION_P2PKH && payload.size() == 20) {
+            reward_pkh_ = payload;
+            log_info("Stratum: Auto-configured reward address from miner: " + potential_addr);
+        }
+    }
 
     // CRITICAL FIX: Check send_result return value
     if (!send_result(miner, id, "true")) {
@@ -946,8 +999,8 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
             // Submit to chain
             std::string submit_err;
             if (chain_.submit_block(block, submit_err)) {
-                // CRITICAL FIX: Notify mempool to remove confirmed transactions
-                mempool_.on_block_connect(block);
+                // CRITICAL FIX: Notify mempool and promote orphan TXs
+                mempool_.on_block_connect(block, chain_.utxo(), (uint32_t)chain_.height());
                 log_info("Stratum: Block " + std::to_string(job.height) + " accepted with " +
                          std::to_string(block.txs.size() - 1) + " transactions!");
                 {
@@ -1318,7 +1371,9 @@ void StratumServer::update_vardiff(StratumMiner& miner) {
 
 bool StratumServer::send_set_difficulty(StratumMiner& miner, double difficulty) {
     std::ostringstream ss;
-    ss << "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[" << difficulty << "]}\n";
+    // STRATUM COMPAT FIX: Use fixed precision to ensure decimal point is present
+    ss << "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":["
+       << std::fixed << std::setprecision(6) << difficulty << "]}\n";
     return send_json(miner, ss.str());
 }
 
@@ -1430,8 +1485,9 @@ std::string StratumServer::generate_extranonce1() {
 }
 
 std::string StratumServer::generate_job_id() {
+    // STRATUM COMPAT FIX: Use 8-char padded hex job IDs for better miner compatibility
     std::ostringstream ss;
-    ss << std::hex << job_counter_++;
+    ss << std::hex << std::setw(8) << std::setfill('0') << job_counter_++;
     return ss.str();
 }
 

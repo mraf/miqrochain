@@ -263,7 +263,10 @@ struct MinerStats {
 std::string g_miner_address_b58; // display mined-to address (non-static for RPC access)
 
 // Global Stratum server pointer for block notifications
-static std::atomic<StratumServer*> g_stratum_server{nullptr};
+// Non-static so p2p.cpp can notify stratum server on block connect
+namespace miq {
+    std::atomic<StratumServer*> g_stratum_server{nullptr};
+}
 
 // ==================================================================
 // |                           Telemetry buffers                                |
@@ -5092,6 +5095,11 @@ int main(int argc, char** argv){
                 g_miner_stats.last_height_rx.store(h);
                 last_tip_height_seen = h;
                 last_tip_change_ms = now_ms();
+                // CRITICAL FIX: Notify stratum server when tip changes
+                // This ensures miners get new jobs immediately instead of mining stale blocks
+                if (auto* ss = g_stratum_server.load()) {
+                    ss->notify_new_block();
+                }
             }
 
             // Sync gate for TUI display (external miner checks sync state via RPC)
