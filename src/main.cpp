@@ -260,7 +260,7 @@ struct MinerStats {
     std::atomic<double>   hps{0.0}; // stays 0 unless miner API exposes tries
 } g_miner_stats;
 
-static std::string g_miner_address_b58; // display mined-to address
+std::string g_miner_address_b58; // display mined-to address (non-static for RPC access)
 
 // Global Stratum server pointer for block notifications
 static std::atomic<StratumServer*> g_stratum_server{nullptr};
@@ -2961,6 +2961,12 @@ private:
                 }
             } else {
                 m1 << C_warn() << "Unavailable" << C_reset();
+                // Show reason if provided (helps users understand why mining is blocked)
+                if (!mining_gate_reason_.empty()) {
+                    std::string reason = mining_gate_reason_;
+                    if (reason.size() > 25) reason = reason.substr(0, 22) + "...";
+                    m1 << " - " << reason;
+                }
             }
             left_panel2.push_back(box_row(m1.str(), half_width));
 
@@ -4989,6 +4995,16 @@ int main(int argc, char** argv){
         IBDGuard ibd_guard;
         ibd_guard.start(&chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, can_tui ? &tui : nullptr);
 
+        // Set global mining address for TUI display (even if stratum is disabled)
+        if (!cfg.mining_address.empty()) {
+            uint8_t ver = 0;
+            std::vector<uint8_t> payload;
+            if (base58check_decode(cfg.mining_address, ver, payload) &&
+                ver == VERSION_P2PKH && payload.size() == 20) {
+                g_miner_address_b58 = cfg.mining_address;
+            }
+        }
+
         // =====================================================================
         // Stratum mining pool server (optional)
         // =====================================================================
@@ -5000,15 +5016,12 @@ int main(int argc, char** argv){
             stratum_server->set_default_difficulty(cfg.stratum_difficulty);
             stratum_server->set_vardiff_enabled(cfg.stratum_vardiff);
 
-            // Set reward address from mining_address config
-            if (!cfg.mining_address.empty()) {
+            // Set reward address from mining_address config (already validated above)
+            if (!g_miner_address_b58.empty()) {
                 uint8_t ver = 0;
                 std::vector<uint8_t> payload;
-                if (base58check_decode(cfg.mining_address, ver, payload) &&
-                    ver == VERSION_P2PKH && payload.size() == 20) {
+                if (base58check_decode(g_miner_address_b58, ver, payload)) {
                     stratum_server->set_reward_address(payload);
-                } else {
-                    log_warn("Invalid mining_address for Stratum; pool coinbase will use empty PKH");
                 }
             }
 
@@ -5052,6 +5065,19 @@ int main(int argc, char** argv){
         // Initial "at height 0" nudge
         if (chain.height() == 0) {
             log_info("Waiting for headers from seed (" + std::string(DNS_SEED) + ":" + std::to_string(P2P_PORT) + ")...");
+        }
+
+        // CRITICAL FIX: Set initial mining gate status before entering main loop
+        // This ensures mining shows as "Available" immediately after IBD completes
+        // without waiting for the first loop iteration (which sleeps first)
+        if (can_tui) {
+            auto tip = chain.tip();
+            uint64_t tsec = hdr_time(tip);
+            uint64_t now_time = (uint64_t)std::time(nullptr);
+            uint64_t tip_age = (now_time > tsec) ? (now_time - tsec) : 0;
+            bool mining_ok = (tip_age < 8 * 60);
+            std::string why = mining_ok ? "" : "tip too old (" + std::to_string(tip_age/60) + "m)";
+            tui.set_mining_gate(mining_ok, why);
         }
 
         while(!global::shutdown_requested.load()){
