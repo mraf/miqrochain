@@ -6736,8 +6736,9 @@ static bool fetch_block_by_height(const std::string& host, uint16_t port, uint64
 static bool fetch_tx_details_from_node(const std::string& host, uint16_t port,
                                         const std::string& txid,
                                         BlockchainTxDetails& details) {
-    // Use getrawtransaction with verbose=true to get decoded tx
-    std::string rpc_body = R"({"method":"getrawtransaction","params":[")" + txid + R"(", true]})";
+    // CRITICAL FIX: Use gettransactioninfo instead of getrawtransaction
+    // getrawtransaction only returns basic data, gettransactioninfo returns vin/vout arrays
+    std::string rpc_body = R"({"method":"gettransactioninfo","params":[")" + txid + R"("]})";
     miq::HttpResponse resp;
     std::vector<std::pair<std::string, std::string>> headers;
 
@@ -6773,11 +6774,11 @@ static bool fetch_tx_details_from_node(const std::string& host, uint16_t port,
         }
     }
 
-    // Parse blockhash (if confirmed)
+    // Parse block_hash (if confirmed) - CRITICAL FIX: gettransactioninfo uses "block_hash" not "blockhash"
     {
-        size_t pos = resp.body.find("\"blockhash\"");
+        size_t pos = resp.body.find("\"block_hash\"");
         if (pos != std::string::npos) {
-            pos = resp.body.find("\"", pos + 11);
+            pos = resp.body.find("\"", pos + 12);
             if (pos != std::string::npos) {
                 pos++;
                 size_t end = resp.body.find("\"", pos);
@@ -6788,9 +6789,9 @@ static bool fetch_tx_details_from_node(const std::string& host, uint16_t port,
         }
     }
 
-    // Parse blocktime
+    // Parse block_time - CRITICAL FIX: gettransactioninfo uses "block_time" not "blocktime"
     {
-        size_t pos = resp.body.find("\"blocktime\"");
+        size_t pos = resp.body.find("\"block_time\"");
         if (pos != std::string::npos) {
             pos = resp.body.find(":", pos);
             if (pos != std::string::npos) {
@@ -6802,6 +6803,24 @@ static bool fetch_tx_details_from_node(const std::string& host, uint16_t port,
                     pos++;
                 }
                 details.block_time = val;
+            }
+        }
+    }
+
+    // Parse block_height for the details
+    {
+        size_t pos = resp.body.find("\"block_height\"");
+        if (pos != std::string::npos) {
+            pos = resp.body.find(":", pos);
+            if (pos != std::string::npos) {
+                pos++;
+                while (pos < resp.body.size() && (resp.body[pos] == ' ' || resp.body[pos] == '\t')) pos++;
+                uint64_t val = 0;
+                while (pos < resp.body.size() && std::isdigit(resp.body[pos])) {
+                    val = val * 10 + (resp.body[pos] - '0');
+                    pos++;
+                }
+                details.block_height = val;
             }
         }
     }
@@ -6824,41 +6843,62 @@ static bool fetch_tx_details_from_node(const std::string& host, uint16_t port,
         }
     }
 
-    // Parse vout (outputs)
+    // Parse vout (outputs) - CRITICAL FIX: gettransactioninfo returns value in base units, not MIQ
     {
         size_t vout_start = resp.body.find("\"vout\"");
         if (vout_start != std::string::npos) {
-            size_t vout_end = resp.body.find("]", vout_start);
-            if (vout_end != std::string::npos) {
-                std::string vout_str = resp.body.substr(vout_start, vout_end - vout_start);
+            // Find the end of the vout array (accounting for nested objects)
+            size_t vout_end = vout_start;
+            int depth = 0;
+            bool found_start = false;
+            for (size_t i = vout_start; i < resp.body.size(); i++) {
+                if (resp.body[i] == '[') { depth++; found_start = true; }
+                else if (resp.body[i] == ']') {
+                    depth--;
+                    if (found_start && depth == 0) { vout_end = i; break; }
+                }
+            }
+            if (vout_end > vout_start) {
+                std::string vout_str = resp.body.substr(vout_start, vout_end - vout_start + 1);
 
-                // Find each output entry
+                // Parse each output using index-based approach for gettransactioninfo format
+                // Format: {"index":0,"value":50000000000,"address":"M..."}
                 size_t pos = 0;
-                uint32_t vout_idx = 0;
-                while ((pos = vout_str.find("\"value\"", pos)) != std::string::npos) {
+                while ((pos = vout_str.find("\"index\"", pos)) != std::string::npos) {
                     BlockchainTxDetails::TxOutput out;
-                    out.vout_index = vout_idx++;
 
-                    // Parse value (in MIQ)
+                    // Parse index
                     pos = vout_str.find(":", pos);
                     if (pos != std::string::npos) {
                         pos++;
                         while (pos < vout_str.size() && (vout_str[pos] == ' ' || vout_str[pos] == '\t')) pos++;
-                        double val = 0;
-                        std::string num_str;
-                        while (pos < vout_str.size() && (std::isdigit(vout_str[pos]) || vout_str[pos] == '.')) {
-                            num_str += vout_str[pos];
+                        out.vout_index = 0;
+                        while (pos < vout_str.size() && std::isdigit(vout_str[pos])) {
+                            out.vout_index = out.vout_index * 10 + (vout_str[pos] - '0');
                             pos++;
-                        }
-                        if (!num_str.empty()) {
-                            val = std::stod(num_str);
-                            out.value = (uint64_t)(val * (double)COIN);
                         }
                     }
 
-                    // Parse address from scriptPubKey
+                    // Parse value (in base units - no conversion needed)
+                    size_t value_pos = vout_str.find("\"value\"", pos);
+                    if (value_pos != std::string::npos && value_pos < vout_str.find("\"index\"", pos + 1)) {
+                        value_pos = vout_str.find(":", value_pos);
+                        if (value_pos != std::string::npos) {
+                            value_pos++;
+                            while (value_pos < vout_str.size() && (vout_str[value_pos] == ' ' || vout_str[value_pos] == '\t')) value_pos++;
+                            uint64_t val = 0;
+                            while (value_pos < vout_str.size() && std::isdigit(vout_str[value_pos])) {
+                                val = val * 10 + (vout_str[value_pos] - '0');
+                                value_pos++;
+                            }
+                            out.value = val;  // Already in base units
+                        }
+                    }
+
+                    // Parse address
                     size_t addr_pos = vout_str.find("\"address\"", pos);
-                    if (addr_pos != std::string::npos && addr_pos < vout_str.find("\"value\"", pos + 1)) {
+                    size_t next_idx = vout_str.find("\"index\"", pos + 1);
+                    if (addr_pos != std::string::npos && (next_idx == std::string::npos || addr_pos < next_idx)) {
                         addr_pos = vout_str.find("\"", addr_pos + 9);
                         if (addr_pos != std::string::npos) {
                             addr_pos++;
@@ -6869,7 +6909,7 @@ static bool fetch_tx_details_from_node(const std::string& host, uint16_t port,
                         }
                     }
 
-                    if (out.value > 0) {
+                    if (out.value > 0 || !out.address.empty()) {
                         details.outputs.push_back(out);
                     }
                 }
@@ -6877,13 +6917,23 @@ static bool fetch_tx_details_from_node(const std::string& host, uint16_t port,
         }
     }
 
-    // Parse vin (inputs)
+    // Parse vin (inputs) - CRITICAL FIX: gettransactioninfo uses "prev_txid" not "txid"
     {
         size_t vin_start = resp.body.find("\"vin\"");
         if (vin_start != std::string::npos) {
-            size_t vin_end = resp.body.find("]", vin_start);
-            if (vin_end != std::string::npos) {
-                std::string vin_str = resp.body.substr(vin_start, vin_end - vin_start);
+            // Find the end of the vin array (accounting for nested objects)
+            size_t vin_end = vin_start;
+            int depth = 0;
+            bool found_start = false;
+            for (size_t i = vin_start; i < resp.body.size(); i++) {
+                if (resp.body[i] == '[') { depth++; found_start = true; }
+                else if (resp.body[i] == ']') {
+                    depth--;
+                    if (found_start && depth == 0) { vin_end = i; break; }
+                }
+            }
+            if (vin_end > vin_start) {
+                std::string vin_str = resp.body.substr(vin_start, vin_end - vin_start + 1);
 
                 // Check for coinbase (mining reward)
                 if (vin_str.find("\"coinbase\"") != std::string::npos) {
@@ -6894,25 +6944,29 @@ static bool fetch_tx_details_from_node(const std::string& host, uint16_t port,
                     in.address = "Block Reward";
                     details.inputs.push_back(in);
                 } else {
-                    // Find each input entry
+                    // Find each input entry using "index" field (gettransactioninfo format)
+                    // Format: {"index":0,"prev_txid":"...","prev_vout":0,"value":123,"address":"M..."}
                     size_t pos = 0;
-                    while ((pos = vin_str.find("\"txid\"", pos)) != std::string::npos) {
+                    while ((pos = vin_str.find("\"index\"", pos)) != std::string::npos) {
                         BlockchainTxDetails::TxInput in;
+                        size_t next_idx = vin_str.find("\"index\"", pos + 1);
 
-                        // Parse txid
-                        pos = vin_str.find("\"", pos + 6);
-                        if (pos != std::string::npos) {
-                            pos++;
-                            size_t end = vin_str.find("\"", pos);
-                            if (end != std::string::npos) {
-                                in.prev_txid = vin_str.substr(pos, end - pos);
-                                pos = end;
+                        // Parse prev_txid
+                        size_t txid_pos = vin_str.find("\"prev_txid\"", pos);
+                        if (txid_pos != std::string::npos && (next_idx == std::string::npos || txid_pos < next_idx)) {
+                            txid_pos = vin_str.find("\"", txid_pos + 11);
+                            if (txid_pos != std::string::npos) {
+                                txid_pos++;
+                                size_t end = vin_str.find("\"", txid_pos);
+                                if (end != std::string::npos) {
+                                    in.prev_txid = vin_str.substr(txid_pos, end - txid_pos);
+                                }
                             }
                         }
 
-                        // Parse vout
-                        size_t vout_pos = vin_str.find("\"vout\"", pos);
-                        if (vout_pos != std::string::npos) {
+                        // Parse prev_vout
+                        size_t vout_pos = vin_str.find("\"prev_vout\"", pos);
+                        if (vout_pos != std::string::npos && (next_idx == std::string::npos || vout_pos < next_idx)) {
                             vout_pos = vin_str.find(":", vout_pos);
                             if (vout_pos != std::string::npos) {
                                 vout_pos++;
@@ -6926,9 +6980,39 @@ static bool fetch_tx_details_from_node(const std::string& host, uint16_t port,
                             }
                         }
 
+                        // Parse value (if available - from parent transaction lookup)
+                        size_t value_pos = vin_str.find("\"value\"", pos);
+                        if (value_pos != std::string::npos && (next_idx == std::string::npos || value_pos < next_idx)) {
+                            value_pos = vin_str.find(":", value_pos);
+                            if (value_pos != std::string::npos) {
+                                value_pos++;
+                                while (value_pos < vin_str.size() && (vin_str[value_pos] == ' ' || vin_str[value_pos] == '\t')) value_pos++;
+                                uint64_t val = 0;
+                                while (value_pos < vin_str.size() && std::isdigit(vin_str[value_pos])) {
+                                    val = val * 10 + (vin_str[value_pos] - '0');
+                                    value_pos++;
+                                }
+                                in.value = val;
+                            }
+                        }
+
+                        // Parse address (if available - from parent transaction lookup)
+                        size_t addr_pos = vin_str.find("\"address\"", pos);
+                        if (addr_pos != std::string::npos && (next_idx == std::string::npos || addr_pos < next_idx)) {
+                            addr_pos = vin_str.find("\"", addr_pos + 9);
+                            if (addr_pos != std::string::npos) {
+                                addr_pos++;
+                                size_t addr_end = vin_str.find("\"", addr_pos);
+                                if (addr_end != std::string::npos) {
+                                    in.address = vin_str.substr(addr_pos, addr_end - addr_pos);
+                                }
+                            }
+                        }
+
                         if (!in.prev_txid.empty()) {
                             details.inputs.push_back(in);
                         }
+                        pos++;
                     }
                 }
             }
@@ -7120,9 +7204,23 @@ static void draw_tx_details_window(const BlockchainTxDetails& tx, int width = 72
                 if (in.prev_txid == "COINBASE") {
                     line << "\033[38;5;220m" << (g_use_utf8 ? "⛏ " : "* ") << "COINBASE (Mining Reward)" << reset();
                 } else {
-                    std::string short_txid = in.prev_txid.size() > 16 ?
-                        in.prev_txid.substr(0, 12) + "..." : in.prev_txid;
-                    line << dim() << short_txid << ":" << in.prev_vout << reset();
+                    // Show value in MIQ format (if available from parent tx lookup)
+                    if (in.value > 0) {
+                        line << std::fixed << std::setprecision(8) << ((double)in.value / (double)COIN) << " MIQ";
+                        if (!in.address.empty()) {
+                            std::string short_addr = in.address.size() > 20 ?
+                                in.address.substr(0, 12) + "..." + in.address.substr(in.address.size() - 6) :
+                                in.address;
+                            line << " <- " << short_addr;
+                        }
+                    } else {
+                        std::string short_txid = in.prev_txid.size() > 16 ?
+                            in.prev_txid.substr(0, 12) + "..." : in.prev_txid;
+                        line << dim() << short_txid << ":" << in.prev_vout << reset();
+                        if (!in.address.empty()) {
+                            line << " " << in.address;
+                        }
+                    }
                 }
                 draw_line("[" + std::to_string(i) + "]", line.str());
             }
@@ -7907,7 +8005,7 @@ static std::string confirmation_bar_extended(uint32_t confirmations, int bar_wid
     return result;
 }
 
-// Print single transaction row
+// Print single transaction row - Enhanced with block height and time
 static void print_tx_row(const TxDetailedEntry& tx, int index, bool selected,
                          const std::vector<AddressBookEntry>& address_book) {
     if (selected) {
@@ -7920,16 +8018,27 @@ static void print_tx_row(const TxDetailedEntry& tx, int index, bool selected,
         std::cout << ui::red() << "[-]" << ui::reset();
     } else if (tx.direction == "received") {
         std::cout << ui::green() << "[+]" << ui::reset();
-    } else if (tx.direction == "mined") {
+    } else if (tx.direction == "mined" || tx.direction == "coinbase") {
         std::cout << "\033[38;5;220m[⛏]\033[0m";  // Gold mining icon
     } else {
         std::cout << ui::yellow() << "[=]" << ui::reset();
     }
-    std::cout << " " << ui::dim() << ui::format_time_short(tx.timestamp) << ui::reset();
+
+    // ENHANCED: Show block height + time or "pending" + time ago
+    if (tx.block_height > 0) {
+        // Confirmed: show block height and short time
+        std::cout << " " << ui::cyan() << "#" << tx.block_height << ui::reset();
+        std::cout << " " << ui::dim() << ui::format_time_short(tx.timestamp) << ui::reset();
+    } else {
+        // Pending: show "Pending" and time ago
+        std::cout << " " << ui::yellow() << "Pending" << ui::reset();
+        std::cout << " " << ui::dim() << ui::format_time_ago(tx.timestamp) << ui::reset();
+    }
+
     std::string amt_str;
     if (tx.amount >= 0) {
         amt_str = "+" + ui_pro::format_miq_professional((uint64_t)tx.amount);
-        if (tx.direction == "mined") {
+        if (tx.direction == "mined" || tx.direction == "coinbase") {
             std::cout << " \033[38;5;220m" << std::setw(16) << std::right << amt_str << "\033[0m";  // Gold for mining
         } else {
             std::cout << " " << ui::green() << std::setw(16) << std::right << amt_str << ui::reset();
@@ -7938,7 +8047,17 @@ static void print_tx_row(const TxDetailedEntry& tx, int index, bool selected,
         amt_str = "-" + ui_pro::format_miq_professional((uint64_t)(-tx.amount));
         std::cout << " " << ui::red() << std::setw(16) << std::right << amt_str << ui::reset();
     }
-    std::cout << " " << confirmation_bar(tx.confirmations);
+
+    // ENHANCED: Show confirmation count more prominently
+    std::cout << " ";
+    if (tx.confirmations >= 6) {
+        std::cout << ui::green() << "[" << tx.confirmations << "]" << ui::reset();
+    } else if (tx.confirmations > 0) {
+        std::cout << ui::yellow() << "[" << tx.confirmations << "]" << ui::reset();
+    } else {
+        std::cout << ui::red() << "[0]" << ui::reset();
+    }
+
     std::string addr = tx.direction == "sent" ? tx.to_address : tx.from_address;
     std::string label;
     for (const auto& entry : address_book) {
@@ -7949,8 +8068,8 @@ static void print_tx_row(const TxDetailedEntry& tx, int index, bool selected,
     }
     if (!label.empty()) {
         std::cout << " " << ui::cyan() << label << ui::reset();
-    } else if (!addr.empty()) {
-        std::cout << " " << ui::dim() << addr.substr(0, 12) << "..." << ui::reset();
+    } else if (!addr.empty() && addr.size() > 12) {
+        std::cout << " " << ui::dim() << addr.substr(0, 10) << ".." << ui::reset();
     }
     if (!tx.memo.empty()) {
         std::cout << " " << ui::yellow() << "[M]" << ui::reset();
@@ -8326,7 +8445,11 @@ static void show_interactive_tx_details(
 
         } else if(current_tab == 1){
             // BLOCK INFO TAB - v1.0 STABLE: Zero-flicker with eol() on all lines
-            if(!has_full_info || !full_info.confirmed){
+            if(!has_full_info){
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::yellow() << "Could not fetch block information" << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "Make sure miqrod is running on localhost" << ui::reset(); eol(); std::cout << "\n";
+            } else if(!full_info.confirmed){
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::yellow() << "Transaction not yet confirmed in a block" << ui::reset(); eol(); std::cout << "\n";
                 if(full_info.in_mempool){
@@ -8373,7 +8496,11 @@ static void show_interactive_tx_details(
 
         } else if(current_tab == 2){
             // INPUTS TAB - v1.0 STABLE: Zero-flicker with eol() on all lines
-            if(!has_full_info || full_info.inputs.empty()){
+            if(!has_full_info){
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::yellow() << "Could not fetch transaction details" << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "Make sure miqrod is running on localhost" << ui::reset(); eol(); std::cout << "\n";
+            } else if(full_info.inputs.empty()){
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "No input information available" << ui::reset(); eol(); std::cout << "\n";
             } else {
@@ -8410,7 +8537,11 @@ static void show_interactive_tx_details(
 
         } else if(current_tab == 3){
             // OUTPUTS TAB - v1.0 STABLE: Zero-flicker with eol() on all lines
-            if(!has_full_info || full_info.outputs.empty()){
+            if(!has_full_info){
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::yellow() << "Could not fetch transaction details" << ui::reset(); eol(); std::cout << "\n";
+                std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "Make sure miqrod is running on localhost" << ui::reset(); eol(); std::cout << "\n";
+            } else if(full_info.outputs.empty()){
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset(); eol(); std::cout << "\n";
                 std::cout << "  " << ui::cyan() << bc_v << ui::reset() << "  " << ui::dim() << "No output information available" << ui::reset(); eol(); std::cout << "\n";
             } else {
