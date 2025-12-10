@@ -2,6 +2,7 @@
 #include "stratum_server.h"
 #include "../chain.h"
 #include "../mempool.h"
+#include "../base58check.h"  // For address validation from worker name
 #include "../sha256.h"
 #include "../merkle.h"
 #include "../hex.h"
@@ -149,13 +150,15 @@ int64_t StratumServer::now_ms() {
 bool StratumServer::start() {
     if (running_) return false;
 
-    // CRITICAL FIX: Validate reward address is set before starting
-    // Without a valid reward address, mined coins would be lost to burn address
+    // Check reward address - warn if not set but allow startup
+    // User can configure via RPC (setminingaddress) or UI
     if (reward_pkh_.size() != 20) {
-        log_error("Stratum: Cannot start - no reward address configured! Set mining_address in config.");
-        return false;
+        log_warn("Stratum: WARNING - No reward address configured!");
+        log_warn("Stratum: Set mining address via 'setminingaddress' RPC or UI before mining.");
+        log_warn("Stratum: Mined blocks will go to BURN ADDRESS until configured!");
+    } else {
+        log_info("Stratum: Reward address configured (PKH: " + hex_encode(reward_pkh_).substr(0, 8) + "...)");
     }
-    log_info("Stratum: Reward address configured (PKH: " + hex_encode(reward_pkh_).substr(0, 8) + "...)");
 
     // Create listening socket
     listen_sock_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -698,6 +701,26 @@ void StratumServer::handle_authorize(StratumMiner& miner, uint64_t id, const std
 
     miner.worker_name = params[0];
     miner.authorized = true;
+
+    // AUTO-CONFIG: Try to extract mining address from worker name
+    // Format: "address" or "address.workername"
+    // If no pool reward address is set, use the miner's address
+    std::string potential_addr = miner.worker_name;
+    size_t dot_pos = potential_addr.find('.');
+    if (dot_pos != std::string::npos) {
+        potential_addr = potential_addr.substr(0, dot_pos);
+    }
+
+    // Check if it's a valid address and we don't have one set
+    if (reward_pkh_.size() != 20 && !potential_addr.empty()) {
+        uint8_t ver = 0;
+        std::vector<uint8_t> payload;
+        if (base58check_decode(potential_addr, ver, payload) &&
+            ver == VERSION_P2PKH && payload.size() == 20) {
+            reward_pkh_ = payload;
+            log_info("Stratum: Auto-configured reward address from miner: " + potential_addr);
+        }
+    }
 
     // CRITICAL FIX: Check send_result return value
     if (!send_result(miner, id, "true")) {
