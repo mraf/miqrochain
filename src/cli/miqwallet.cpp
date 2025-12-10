@@ -9843,10 +9843,17 @@ static inline bool safe_add(uint64_t& sum, uint64_t val) {
 // - This ensures balance immediately reflects sent transactions
 // =============================================================================
 static WalletBalance compute_balance(const std::vector<miq::UtxoLite>& utxos,
-                                     const std::set<OutpointKey>& pending)
+                                     const std::set<OutpointKey>& pending,
+                                     uint64_t actual_tip_height = 0)
 {
     WalletBalance wb{};
-    for(const auto& u : utxos) wb.approx_tip_h = std::max<uint64_t>(wb.approx_tip_h, u.height);
+    // CRITICAL FIX: Use actual blockchain tip height for maturity calculations
+    // If not provided, fall back to max UTXO height (less accurate but better than 0)
+    if (actual_tip_height > 0) {
+        wb.approx_tip_h = actual_tip_height;
+    } else {
+        for(const auto& u : utxos) wb.approx_tip_h = std::max<uint64_t>(wb.approx_tip_h, u.height);
+    }
 
     for(const auto& u: utxos){
         bool is_immature = false;
@@ -10070,16 +10077,28 @@ static bool wallet_session(const std::string& cli_host,
             }
         }
 
-        // Display balance
-        WalletBalance wb = compute_balance(utxos, pending);
+        // CRITICAL FIX: Get actual blockchain tip height for accurate maturity calculations
+        // Without this, old coinbase UTXOs may show as immature when they're actually mature
+        uint32_t actual_tip_height = 0;
+        {
+            auto rpc_endpoints = build_endpoints_from_seeds(seeds, true);
+            std::string best_hash, rpc_node, rpc_err;
+            if (rpc_wallet::rpc_get_blockchain_info(rpc_endpoints, actual_tip_height, best_hash, rpc_node, rpc_err)) {
+                // Successfully got tip height from node
+            } else {
+                // Fallback to max UTXO height if RPC fails
+                for(const auto& u : utxos){
+                    if(u.height > actual_tip_height) actual_tip_height = u.height;
+                }
+            }
+        }
+
+        // Display balance - now with accurate tip height
+        WalletBalance wb = compute_balance(utxos, pending, actual_tip_height);
 
         // CRITICAL v7.0: Enhanced transaction tracking with auto-detection
         {
-            // Get current tip height from highest UTXO height
-            uint32_t tip_height = 0;
-            for(const auto& u : utxos){
-                if(u.height > tip_height) tip_height = u.height;
-            }
+            uint32_t tip_height = actual_tip_height;  // Use the tip we already fetched
 
             if(tip_height > 0){
                 // STEP 1: Auto-detect any new received transactions we haven't seen
@@ -10199,8 +10218,19 @@ static bool wallet_session(const std::string& cli_host,
             }
         }
 
-        // Compute balance and UTXO stats
-        WalletBalance menu_wb = compute_balance(utxos, pending);
+        // Compute balance and UTXO stats - use actual tip height for accurate maturity
+        uint32_t menu_tip_height = 0;
+        {
+            auto rpc_endpoints = build_endpoints_from_seeds(seeds, true);
+            std::string best_hash, rpc_node, rpc_err;
+            if (!rpc_wallet::rpc_get_blockchain_info(rpc_endpoints, menu_tip_height, best_hash, rpc_node, rpc_err)) {
+                // Fallback to max UTXO height
+                for(const auto& u : utxos) {
+                    if(u.height > menu_tip_height) menu_tip_height = u.height;
+                }
+            }
+        }
+        WalletBalance menu_wb = compute_balance(utxos, pending, menu_tip_height);
         uint64_t min_u = UINT64_MAX, max_u = 0;
         for(const auto& u : utxos){
             min_u = std::min(min_u, u.value);
