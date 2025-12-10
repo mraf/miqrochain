@@ -2952,10 +2952,11 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
                 // This bypasses the invb→getb→block round-trip entirely
                 // Only send to peers that support high-bandwidth relay or have good health
                 if (!block_msg.empty()) {
-                    // Send to: 1) compact block high-bandwidth peers, 2) fast peers, 3) first 4 peers
+                    // Send to: 1) compact block high-bandwidth peers, 2) fast peers, 3) first 8 peers
+                    // Increased from 4 to 8 for faster network-wide propagation
                     bool should_send_direct = kv.second.compact_high_bandwidth ||
-                                              kv.second.health_score > 0.7 ||
-                                              block_sent < 4;  // Always send to at least 4 peers
+                                              kv.second.health_score > 0.5 ||  // Lowered threshold from 0.7
+                                              block_sent < 8;  // Always send to at least 8 peers (was 4)
                     if (should_send_direct) {
                         if (send_or_close(kv.first, block_msg)) {
                             block_sent++;
@@ -3954,9 +3955,10 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
     // CRITICAL OPTIMIZATION: Optimistic relay after PoW check
     // Verify PoW immediately (fast) and relay to peers before full validation
     // This dramatically reduces block propagation time and fork opportunities
-    static std::unordered_set<std::string> recently_relayed;
+    static std::unordered_map<std::string, int64_t> recently_relayed;  // block hash -> timestamp
     static std::mutex relay_mu;
     std::string bh_key = hexkey(bh);
+    const int64_t tnow = now_ms();
 
     {
         std::lock_guard<std::mutex> lk(relay_mu);
@@ -3973,7 +3975,8 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
                 for (auto& kv : peers_) {
                     if (kv.first != sock && kv.second.verack_ok) {
                         // Send to fast/high-bandwidth peers directly
-                        if (kv.second.compact_high_bandwidth || kv.second.health_score > 0.7 || relayed < 3) {
+                        // Increased from 3 to 6 for faster propagation
+                        if (kv.second.compact_high_bandwidth || kv.second.health_score > 0.5 || relayed < 6) {
                             if (send_or_close(kv.first, block_msg)) {
                                 relayed++;
                             }
@@ -3983,11 +3986,18 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
                         }
                     }
                 }
-                recently_relayed.insert(bh_key);
+                recently_relayed[bh_key] = tnow;
 
-                // Cleanup old entries (keep last 100)
-                if (recently_relayed.size() > 100) {
-                    recently_relayed.clear();
+                // Time-based cleanup: remove entries older than 60 seconds
+                // This prevents memory growth while preserving recent dedup tracking
+                if (recently_relayed.size() > 50) {
+                    for (auto it = recently_relayed.begin(); it != recently_relayed.end(); ) {
+                        if (tnow - it->second > 60000) {  // 60 second TTL
+                            it = recently_relayed.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
                 }
 
                 MIQ_LOG_DEBUG(miq::LogCategory::NET, "Optimistic relay: block " + bh_key.substr(0, 16) +
