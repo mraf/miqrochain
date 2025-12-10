@@ -19,6 +19,8 @@ namespace p2p_stats {
 #include "base58check.h"    // Base58Check address display (miner logs)
 #include "sha256.h"         // dsha256 for compact block hash calculation
 #include "stratum/stratum_server.h"  // For stratum block notifications
+#include "compact_blocks.h" // BIP152 compact block relay
+#include "mempool.h"        // For compact block reconstruction
 
 #include <chrono>
 #include <deque>
@@ -37,6 +39,8 @@ namespace p2p_stats {
 #include <mutex>
 #include <type_traits>
 #include <thread>
+#include <future>
+#include <memory>
 #include <cerrno>
 #include <cstdint>
 #include <climits>
@@ -280,11 +284,14 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
 #define MIQ_HEADERS_EMPTY_LIMIT 8
 #endif
 
+// ULTRA-FAST PROPAGATION: Increased rate limits for sub-second block relay
+// Block rate: 10MB/s (was 1MB/s) - allows instant block push to all peers
+// Burst: 20MB (was 2MB) - handles block storms without throttling
 #ifndef MIQ_RATE_BLOCK_BPS
-#define MIQ_RATE_BLOCK_BPS (1024u * 1024u)
+#define MIQ_RATE_BLOCK_BPS (10u * 1024u * 1024u)
 #endif
 #ifndef MIQ_RATE_TX_BPS
-#define MIQ_RATE_TX_BPS    (256u * 1024u)
+#define MIQ_RATE_TX_BPS    (1024u * 1024u)
 #endif
 #ifndef MIQ_RATE_BLOCK_BURST
 #define MIQ_RATE_BLOCK_BURST (MIQ_RATE_BLOCK_BPS * 2u)
@@ -832,7 +839,9 @@ static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
     }
 #endif
     size_t sent = 0;
-    const int kMaxSpinMs = 2000; // upper bound total wait per call
+    // ULTRA-FAST: Reduced from 2000ms to 200ms for sub-second block propagation
+    // If a peer can't accept data in 200ms, skip them - don't block other peers
+    const int kMaxSpinMs = 200;
     int waited_ms = 0;
 
 
@@ -903,6 +912,115 @@ static inline bool send_or_close(Sock s, const std::vector<uint8_t>& v){
   }
   schedule_close(s);
   return false;
+}
+
+// =============================================================================
+// PARALLEL BLOCK BROADCAST - TRUE CONCURRENT SENDS TO ALL PEERS
+// This is critical for sub-1-second propagation: sends happen simultaneously
+// instead of sequentially. With 20 peers, this reduces latency from 20*100ms
+// to just ~100ms (the slowest single peer).
+//
+// THREAD SAFETY:
+// - Message is copied via shared_ptr to ensure lifetime extends beyond async tasks
+// - schedule_close() is protected by g_force_close_mu mutex
+// - All futures are waited on before return to prevent dangling references
+// =============================================================================
+static inline int parallel_send_to_peers(
+    const std::vector<Sock>& sockets,
+    const std::vector<uint8_t>& message,
+    int max_parallel = 32)  // Limit concurrent threads to avoid resource exhaustion
+{
+    if (sockets.empty() || message.empty()) return 0;
+
+    // CRITICAL: Copy message to shared_ptr to extend lifetime beyond this function
+    // This prevents use-after-free when async tasks outlive the caller's local variable
+    auto msg_ptr = std::make_shared<std::vector<uint8_t>>(message);
+
+    // For small peer counts, use std::async for true parallelism
+    // For large peer counts, batch to avoid thread explosion
+    const size_t batch_size = std::min<size_t>(sockets.size(), (size_t)max_parallel);
+
+    std::vector<std::future<bool>> futures;
+    futures.reserve(batch_size);
+
+    int total_sent = 0;
+    size_t idx = 0;
+
+    // Track start time for cumulative timeout
+    const auto batch_start = std::chrono::steady_clock::now();
+    const auto max_total_time = std::chrono::milliseconds(800);  // 800ms total max
+
+    while (idx < sockets.size()) {
+        futures.clear();
+
+        // Check if we've exceeded total time budget
+        auto elapsed = std::chrono::steady_clock::now() - batch_start;
+        if (elapsed > max_total_time) {
+            // Time's up - close remaining peers and exit
+            for (size_t i = idx; i < sockets.size(); ++i) {
+                schedule_close(sockets[i]);
+            }
+            break;
+        }
+
+        // Launch parallel sends for this batch
+        size_t batch_end = std::min(idx + batch_size, sockets.size());
+        for (size_t i = idx; i < batch_end; ++i) {
+            Sock s = sockets[i];
+            // CRITICAL: Capture msg_ptr BY VALUE (shared_ptr copy) - extends lifetime!
+            futures.push_back(std::async(std::launch::async, [s, msg_ptr]() {
+                return miq_send(s, *msg_ptr);
+            }));
+        }
+
+        // Calculate remaining time for this batch
+        elapsed = std::chrono::steady_clock::now() - batch_start;
+        auto remaining = max_total_time - elapsed;
+        if (remaining < std::chrono::milliseconds(50)) {
+            remaining = std::chrono::milliseconds(50);  // Minimum 50ms per batch
+        }
+
+        // Wait for all sends in this batch with remaining time budget
+        auto per_future_timeout = remaining / futures.size();
+        if (per_future_timeout < std::chrono::milliseconds(50)) {
+            per_future_timeout = std::chrono::milliseconds(50);
+        }
+
+        for (size_t i = 0; i < futures.size(); ++i) {
+            try {
+                // Wait with timeout - don't let slow peers delay everything
+                auto status = futures[i].wait_for(per_future_timeout);
+                if (status == std::future_status::ready) {
+                    if (futures[i].get()) {
+                        total_sent++;
+                    } else {
+                        // Send failed - schedule close (thread-safe)
+                        schedule_close(sockets[idx + i]);
+                    }
+                } else {
+                    // Timeout - peer too slow
+                    // CRITICAL: We must still wait for the future to complete to prevent
+                    // dangling references. Use detached approach or wait in destructor.
+                    // For now, mark for close but the async task will complete eventually
+                    schedule_close(sockets[idx + i]);
+                    // Force-wait to prevent dangling reference to msg_ptr
+                    // Since msg_ptr is shared, the task will keep it alive
+                }
+            } catch (...) {
+                // Exception in async task - close socket
+                schedule_close(sockets[idx + i]);
+            }
+        }
+
+        idx = batch_end;
+    }
+
+    // CRITICAL: All futures MUST be waited on before we return
+    // The shared_ptr ensures message stays alive, but we want clean shutdown
+    // futures.clear() will call destructors which wait for completion
+    futures.clear();
+
+    return total_sent;
 }
 
 // Return values:
@@ -1136,7 +1254,13 @@ static inline int64_t now_ms() {
 
 namespace {
   static std::unordered_set<Sock> g_force_close;
-  static inline void schedule_close(Sock s){ if (s!=MIQ_INVALID_SOCK) g_force_close.insert(s); }
+  static std::mutex g_force_close_mu;  // CRITICAL: Thread-safe access for parallel broadcast
+  static inline void schedule_close(Sock s){
+    if (s!=MIQ_INVALID_SOCK) {
+      std::lock_guard<std::mutex> lk(g_force_close_mu);
+      g_force_close.insert(s);
+    }
+  }
   static std::unordered_set<Sock> g_outbounds;
   static inline size_t outbound_count(){ return g_outbounds.size(); }
 }
@@ -2615,7 +2739,10 @@ void P2P::stop(){
 
 static inline void reset_runtime_queues() {
     g_outbounds.clear();
-    g_force_close.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_force_close_mu);
+        g_force_close.clear();
+    }
     g_rr_next_idx.clear();
     g_inflight_block_ts.clear();
     g_global_inflight_blocks.clear();
@@ -2916,58 +3043,88 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
 }
 
 void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
-    // CRITICAL OPTIMIZATION: Send full block directly to peers for instant propagation
-    // This eliminates the invb→getb→block round-trip that causes fork opportunities
-    // Similar to how broadcast_inv_tx sends both inv and full tx
+    // ULTRA-FAST BLOCK PROPAGATION with BIP152 COMPACT BLOCKS
+    // Goal: Sub-1-second network-wide propagation
+    // Strategy:
+    //   - High-bandwidth compact block peers: Send compact block (~1-2KB)
+    //   - Other peers: Send full block for maximum compatibility
+    //   - All sends happen in parallel outside locks
 
     if (h.size() != 32) return;
 
-    // Read the block from chain
+    // Read the block from chain (outside lock)
+    Block blk;
     std::vector<uint8_t> raw_block;
+    bool have_block = false;
     {
-        Block b;
-        if (chain_.read_block_any(h, b)) {
-            raw_block = ser_block(b);
+        if (chain_.read_block_any(h, blk)) {
+            raw_block = ser_block(blk);
+            have_block = true;
         }
     }
 
-    // Send to all connected peers
+    if (!have_block) {
+        MIQ_LOG_WARN(miq::LogCategory::NET, "broadcast_inv_block: block not found");
+        return;
+    }
+
+    // Build compact block for BIP152 peers (dramatically smaller)
+    std::vector<uint8_t> compact_msg;
+    if (mempool_) {
+        miq::CompactBlock cb = miq::CompactBlockBuilder::create(blk, *mempool_);
+        auto compact_payload = miq::serialize_compact_block(cb);
+        compact_msg = encode_msg("cmpctblock", compact_payload);
+        MIQ_LOG_DEBUG(miq::LogCategory::NET, "broadcast_inv_block: compact block size=" +
+                     std::to_string(compact_payload.size()) + " bytes (" +
+                     std::to_string(cb.short_ids.size()) + " short_ids)");
+    }
+
+    // Prepare full block message for legacy peers
+    auto invb_msg = encode_msg("invb", h);
+    std::vector<uint8_t> block_msg;
+    if (!raw_block.empty() && raw_block.size() < 4 * 1024 * 1024) {
+        block_msg = encode_msg("block", raw_block);
+    }
+
+    // Collect peer sockets under lock, separated by compact block support
+    std::vector<Sock> compact_sockets;   // Peers supporting high-bandwidth compact blocks
+    std::vector<Sock> legacy_sockets;    // Peers needing full blocks
     {
         std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
-        auto invb_msg = encode_msg("invb", h);
-        std::vector<uint8_t> block_msg;
-        if (!raw_block.empty() && raw_block.size() < 2 * 1024 * 1024) {  // Only direct-send blocks under 2MB
-            block_msg = encode_msg("block", raw_block);
-        }
-
-        int inv_sent = 0;
-        int block_sent = 0;
+        compact_sockets.reserve(peers_.size());
+        legacy_sockets.reserve(peers_.size());
         for (auto& kv : peers_) {
             if (kv.second.verack_ok) {
-                // Always send invb first (lightweight notification)
-                if (send_or_close(kv.first, invb_msg)) {
-                    inv_sent++;
-                }
-                // CRITICAL: Also send full block directly to high-bandwidth/fast peers
-                // This bypasses the invb→getb→block round-trip entirely
-                // Only send to peers that support high-bandwidth relay or have good health
-                if (!block_msg.empty()) {
-                    // Send to: 1) compact block high-bandwidth peers, 2) fast peers, 3) first 4 peers
-                    bool should_send_direct = kv.second.compact_high_bandwidth ||
-                                              kv.second.health_score > 0.7 ||
-                                              block_sent < 4;  // Always send to at least 4 peers
-                    if (should_send_direct) {
-                        if (send_or_close(kv.first, block_msg)) {
-                            block_sent++;
-                        }
-                    }
+                if (kv.second.compact_blocks_enabled && kv.second.compact_high_bandwidth) {
+                    compact_sockets.push_back(kv.first);
+                } else {
+                    legacy_sockets.push_back(kv.first);
                 }
             }
         }
-        if (inv_sent > 0 || block_sent > 0) {
-            MIQ_LOG_DEBUG(miq::LogCategory::NET, "broadcast_inv_block: sent invb to " +
-                std::to_string(inv_sent) + " peers, block directly to " + std::to_string(block_sent) + " peers");
-        }
+    }
+
+    // PARALLEL BROADCAST to both groups simultaneously
+    int compact_sent = 0;
+    int legacy_sent = 0;
+
+    // Send compact blocks to BIP152 high-bandwidth peers (tiny payload, very fast)
+    if (!compact_msg.empty() && !compact_sockets.empty()) {
+        compact_sent = parallel_send_to_peers(compact_sockets, compact_msg);
+    }
+
+    // Send full blocks to legacy peers
+    if (!block_msg.empty() && !legacy_sockets.empty()) {
+        legacy_sent = parallel_send_to_peers(legacy_sockets, block_msg);
+    } else if (!legacy_sockets.empty()) {
+        // Fallback to invb only if block too large
+        legacy_sent = parallel_send_to_peers(legacy_sockets, invb_msg);
+    }
+
+    if (compact_sent > 0 || legacy_sent > 0) {
+        MIQ_LOG_INFO(miq::LogCategory::NET, "PARALLEL broadcast_inv_block: compact=" +
+            std::to_string(compact_sent) + " legacy=" + std::to_string(legacy_sent) +
+            " total=" + std::to_string(compact_sent + legacy_sent) + " peers");
     }
 
     // Also queue for async processing (handles late-connecting peers)
@@ -3951,49 +4108,60 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
     const auto bh = b.block_hash();
 
-    // CRITICAL OPTIMIZATION: Optimistic relay after PoW check
-    // Verify PoW immediately (fast) and relay to peers before full validation
-    // This dramatically reduces block propagation time and fork opportunities
-    static std::unordered_set<std::string> recently_relayed;
+    // ULTRA-FAST OPTIMISTIC RELAY: Push to ALL peers after PoW check only
+    // Goal: Sub-1-second network propagation before full validation
+    // Strategy: Collect sockets under lock, send outside lock for parallelism
+    static std::unordered_map<std::string, int64_t> recently_relayed;  // block hash -> timestamp
     static std::mutex relay_mu;
     std::string bh_key = hexkey(bh);
+    const int64_t tnow = now_ms();
 
+    bool should_relay = false;
     {
         std::lock_guard<std::mutex> lk(relay_mu);
-        // Only relay if we haven't recently relayed this block
         if (recently_relayed.find(bh_key) == recently_relayed.end()) {
             // Fast PoW check - only hash comparison, no full validation
             if (miq::verify_block_pow(b)) {
-                // Valid PoW - relay immediately to all peers (except sender)
-                auto block_msg = encode_msg("block", raw);
-                auto invb_msg = encode_msg("invb", bh);
+                recently_relayed[bh_key] = tnow;
+                should_relay = true;
 
-                std::lock_guard<std::recursive_mutex> peers_lk(g_peers_mu);
-                int relayed = 0;
-                for (auto& kv : peers_) {
-                    if (kv.first != sock && kv.second.verack_ok) {
-                        // Send to fast/high-bandwidth peers directly
-                        if (kv.second.compact_high_bandwidth || kv.second.health_score > 0.7 || relayed < 3) {
-                            if (send_or_close(kv.first, block_msg)) {
-                                relayed++;
-                            }
+                // Time-based cleanup: remove entries older than 60 seconds
+                if (recently_relayed.size() > 50) {
+                    for (auto it = recently_relayed.begin(); it != recently_relayed.end(); ) {
+                        if (tnow - it->second > 60000) {
+                            it = recently_relayed.erase(it);
                         } else {
-                            // Send just inv to other peers
-                            (void)send_or_close(kv.first, invb_msg);
+                            ++it;
                         }
                     }
                 }
-                recently_relayed.insert(bh_key);
-
-                // Cleanup old entries (keep last 100)
-                if (recently_relayed.size() > 100) {
-                    recently_relayed.clear();
-                }
-
-                MIQ_LOG_DEBUG(miq::LogCategory::NET, "Optimistic relay: block " + bh_key.substr(0, 16) +
-                              " relayed to " + std::to_string(relayed) + " peers before validation");
             }
         }
+    }
+
+    if (should_relay) {
+        // Prepare message once (outside all locks)
+        auto block_msg = encode_msg("block", raw);
+
+        // Collect peer sockets under lock (fast)
+        std::vector<Sock> relay_sockets;
+        {
+            std::lock_guard<std::recursive_mutex> peers_lk(g_peers_mu);
+            relay_sockets.reserve(peers_.size());
+            for (auto& kv : peers_) {
+                if (kv.first != sock && kv.second.verack_ok) {
+                    relay_sockets.push_back(kv.first);
+                }
+            }
+        }
+
+        // PARALLEL OPTIMISTIC RELAY: Send to ALL peers simultaneously
+        // This is the fastest possible path - PoW verified, now blast to everyone
+        int relayed = parallel_send_to_peers(relay_sockets, block_msg);
+
+        MIQ_LOG_INFO(miq::LogCategory::NET, "PARALLEL optimistic relay: block " + bh_key.substr(0, 16) +
+                     " pushed to " + std::to_string(relayed) + "/" +
+                     std::to_string(relay_sockets.size()) + " peers SIMULTANEOUSLY");
     }
 
     // CRITICAL FIX: Don't skip blocks that might have incomplete processing
@@ -4044,6 +4212,7 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
                     pit->second.mis++;
                     if (pit->second.mis > 5) {
                         log_warn("P2P: disconnecting peer " + pit->second.ip + " for repeated hash mismatches");
+                        schedule_close(sock);
                     }
                 }
                 return;
@@ -5532,13 +5701,13 @@ void P2P::loop(){
 #endif
         }
 
-        // OPTIMIZATION: Reduced poll timeout from 200ms to 50ms for faster response
-        // This significantly improves latency for localhost/same-machine wallet connections
-        // while still allowing efficient batching of network events
+        // OPTIMIZATION: Aggressive 10ms poll timeout for sub-second block propagation
+        // Critical for ensuring blocks propagate across network in <1 second
+        // Trade-off: Slightly higher CPU usage for dramatically lower latency
 #ifdef _WIN32
-        int rc = WSAPoll(fds.data(), (ULONG)fds.size(), 50);
+        int rc = WSAPoll(fds.data(), (ULONG)fds.size(), 10);
 #else
-        int rc = poll(fds.data(), (nfds_t)fds.size(), 50);
+        int rc = poll(fds.data(), (nfds_t)fds.size(), 10);
 #endif
 
         // Tight loop detection - less aggressive to avoid hurting localhost performance
@@ -5704,18 +5873,22 @@ void P2P::loop(){
 
         // Read/process peers
         std::vector<Sock> dead;
-          if (!g_force_close.empty()) {
-            // Don’t honor force-close for peers that are helping IBD; keep them alive.
-            std::vector<Sock> tmp(g_force_close.begin(), g_force_close.end());
-            g_force_close.clear();
-            const int64_t tnow = now_ms();
-            for (Sock s : tmp) {
-                auto itp = peers_.find(s);
-                if (itp != peers_.end() && ibd_or_fetch_active(itp->second, tnow)) {
-                    P2P_TRACE("skip scheduled close during IBD for " + itp->second.ip);
-                    continue;
+        {
+            // CRITICAL: Thread-safe access to g_force_close (parallel broadcast threads write to it)
+            std::lock_guard<std::mutex> lk(g_force_close_mu);
+            if (!g_force_close.empty()) {
+                // Don't honor force-close for peers that are helping IBD; keep them alive.
+                std::vector<Sock> tmp(g_force_close.begin(), g_force_close.end());
+                g_force_close.clear();
+                const int64_t tnow = now_ms();
+                for (Sock s : tmp) {
+                    auto itp = peers_.find(s);
+                    if (itp != peers_.end() && ibd_or_fetch_active(itp->second, tnow)) {
+                        P2P_TRACE("skip scheduled close during IBD for " + itp->second.ip);
+                        continue;
+                    }
+                    dead.push_back(s);
                 }
-                dead.push_back(s);
             }
         }
         for (size_t i = 0; i < peer_fd_order.size(); ++i) {
@@ -6031,16 +6204,22 @@ void P2P::loop(){
                             }
                         }
 
-                        // BIP152: Announce compact block support (version 1, low-bandwidth mode)
+                        // BIP152: Announce compact block support (version 1, HIGH-BANDWIDTH mode)
+                        // High-bandwidth mode = peers send us compact blocks immediately
+                        // This is critical for sub-1-second block propagation
                         {
                             std::vector<uint8_t> sendcmpct_payload;
-                            sendcmpct_payload.push_back(0);  // announce = 0 (low-bandwidth)
+                            sendcmpct_payload.push_back(1);  // announce = 1 (HIGH-BANDWIDTH)
                             // version = 1 (8 bytes little-endian)
                             for (int i = 0; i < 8; i++) {
                                 sendcmpct_payload.push_back(i == 0 ? 1 : 0);
                             }
                             auto sendcmpct_msg = encode_msg("sendcmpct", sendcmpct_payload);
-                            (void)send_or_close(s, sendcmpct_msg);
+                            if (send_or_close(s, sendcmpct_msg)) {
+                                ps.compact_blocks_enabled = true;
+                                ps.compact_high_bandwidth = true;  // We want high-bandwidth relay
+                                ps.compact_version = 1;
+                            }
                         }
 
 #if MIQ_ENABLE_HEADERS_FIRST
@@ -6930,41 +7109,79 @@ void P2P::loop(){
                         }
 
                     } else if (cmd == "cmpctblock") {
-                        // Compact block: header + nonce + short_ids + prefilled_txn
-                        // For now, we'll request the full block if we receive a compact block
-                        if (m.payload.size() >= 88) { // Minimum: 88-byte header
-                            // Extract block header hash from the compact block
-                            // Header is: version(4) + prev_hash(32) + merkle_root(32) + time(8) + bits(4) + nonce(8)
-                            std::vector<uint8_t> header_data(m.payload.begin(), m.payload.begin() + 88);
-
-                            // Hash the header to get block hash
-                            std::vector<uint8_t> block_hash(32);
-                            // Note: We'd need to compute the block hash here
-                            // For simplicity, just request by inverting the compact block
-                            // A full implementation would reconstruct the block from mempool
-
-                            log_info("P2P: received compact block from " + ps.ip + " (will request full block)");
-
-                            // Store that we prefer compact blocks but need full block for now
-                            // Real implementation would reconstruct from mempool and request missing txns
-                        }
+                        // BIP152: Full compact block implementation
+                        // Reconstruct block from mempool, request missing txs if needed
+                        handle_compact_block(ps, m.payload);
 
                     } else if (cmd == "getblocktxn") {
-                        // Request for specific transactions from a block
-                        // Format: <32 byte block_hash> <varint count> <varint indexes...>
+                        // BIP152: Peer requests specific transactions from a block
                         if (m.payload.size() >= 33) {
-                            std::vector<uint8_t> block_hash(m.payload.begin(), m.payload.begin() + 32);
-                            // A full implementation would send back the requested transactions
-                            // For now, log and skip
-                            log_info("P2P: received getblocktxn from " + ps.ip);
+                            miq::BlockTransactionsRequest req;
+                            if (miq::deserialize_getblocktxn(m.payload, req)) {
+                                // Find the block
+                                miq::Block block;
+                                if (chain_.read_block_any(req.block_hash, block)) {
+                                    // Build response with requested transactions
+                                    miq::BlockTransactions resp;
+                                    resp.block_hash = req.block_hash;
+                                    resp.txs.reserve(req.indexes.size());
+
+                                    bool valid = true;
+                                    for (uint16_t idx : req.indexes) {
+                                        if (idx < block.txs.size()) {
+                                            resp.txs.push_back(block.txs[idx]);
+                                        } else {
+                                            valid = false;
+                                            break;
+                                        }
+                                    }
+
+                                    if (valid && !resp.txs.empty()) {
+                                        auto payload = miq::serialize_blocktxn(resp);
+                                        auto msg = encode_msg("blocktxn", payload);
+                                        (void)send_or_close(ps.sock, msg);
+                                        MIQ_LOG_DEBUG(miq::LogCategory::NET, "getblocktxn: sent " +
+                                                     std::to_string(resp.txs.size()) + " txs to " + ps.ip);
+                                    }
+                                }
+                            }
                         }
 
                     } else if (cmd == "blocktxn") {
-                        // Response with requested transactions
-                        // Format: <32 byte block_hash> <varint count> <raw transactions...>
+                        // BIP152: Peer sends missing transactions to complete a compact block
                         if (m.payload.size() >= 33) {
-                            // A full implementation would use these to complete a compact block
-                            log_info("P2P: received blocktxn from " + ps.ip);
+                            miq::BlockTransactions bt;
+                            if (miq::deserialize_blocktxn(m.payload, bt)) {
+                                // Build hash hex for lookup
+                                std::string hash_hex;
+                                static const char hex[] = "0123456789abcdef";
+                                for (uint8_t byte : bt.block_hash) {
+                                    hash_hex.push_back(hex[byte >> 4]);
+                                    hash_hex.push_back(hex[byte & 0xf]);
+                                }
+
+                                // Find pending compact block
+                                miq::PendingCompactBlock pcb;
+                                if (pending_compact_blocks_.get(hash_hex, pcb)) {
+                                    // Fill in missing transactions
+                                    miq::CompactBlockReconstructor reconstructor(*mempool_);
+                                    if (reconstructor.fill_missing(pcb.partial_block, bt, pcb.missing_indexes)) {
+                                        // Block complete! Process it
+                                        pending_compact_blocks_.remove(hash_hex);
+
+                                        MIQ_LOG_INFO(miq::LogCategory::NET, "COMPACT BLOCK " + hash_hex.substr(0, 16) +
+                                                     " completed with " + std::to_string(bt.txs.size()) +
+                                                     " missing txs from " + ps.ip);
+
+                                        auto raw = ser_block(pcb.partial_block);
+                                        handle_incoming_block(ps.sock, raw);
+                                    } else {
+                                        // Fill failed - request full block
+                                        pending_compact_blocks_.remove(hash_hex);
+                                        request_block_hash(ps, bt.block_hash);
+                                    }
+                                }
+                            }
                         }
 
                     } else if (cmd == "sendheaders") {
@@ -7698,6 +7915,61 @@ void P2P::loop(){
             }
         }
 
+        // BIP152: COMPACT BLOCK TIMEOUT FALLBACK
+        // If we've been waiting too long for blocktxn, request full block instead
+        // This prevents stalls when peers don't respond with missing transactions
+        {
+            static int64_t last_compact_cleanup_ms = 0;
+            constexpr int64_t COMPACT_CLEANUP_INTERVAL_MS = 5000;   // Check every 5 seconds
+            constexpr int64_t COMPACT_TIMEOUT_MS = 10000;           // 10 second timeout
+
+            if (current_time - last_compact_cleanup_ms >= COMPACT_CLEANUP_INTERVAL_MS) {
+                last_compact_cleanup_ms = current_time;
+
+                // Get list of timed-out pending compact blocks
+                std::vector<std::pair<std::string, std::vector<uint8_t>>> timed_out;
+                {
+                    // Check all pending compact blocks
+                    std::lock_guard<std::mutex> pcb_lk(pending_compact_blocks_.mtx());
+                    auto& pending = pending_compact_blocks_.pending_map();
+                    for (auto it = pending.begin(); it != pending.end(); ) {
+                        if (current_time - it->second.received_ms > COMPACT_TIMEOUT_MS) {
+                            // Timed out - need to request full block
+                            timed_out.push_back({it->first, it->second.cb.block_hash});
+                            it = pending.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+
+                // Request full blocks for timed-out compact blocks
+                // NOTE: peers_ is accessed by the main loop thread which owns it
+                // No lock needed as we're already in the main loop context
+                for (const auto& timeout_pair : timed_out) {
+                    const std::string& hash_hex = timeout_pair.first;
+                    const std::vector<uint8_t>& block_hash = timeout_pair.second;
+
+                    MIQ_LOG_WARN(miq::LogCategory::NET, "COMPACT BLOCK " + hash_hex.substr(0, 16) +
+                                 " timed out waiting for blocktxn, requesting full block");
+
+                    // Request full block from any connected peer
+                    bool requested = false;
+                    for (auto& kv : peers_) {
+                        if (kv.second.verack_ok) {
+                            request_block_hash(kv.second, block_hash);
+                            requested = true;
+                            break;  // Only need to request from one peer
+                        }
+                    }
+                    if (!requested) {
+                        MIQ_LOG_WARN(miq::LogCategory::NET, "COMPACT BLOCK " + hash_hex.substr(0, 16) +
+                                     " timeout: no peers available to request full block");
+                    }
+                }
+            }
+        }
+
         trickle_flush();
 
         {
@@ -8130,12 +8402,9 @@ void P2P::send_sendcmpct(PeerState& ps, bool high_bandwidth, uint64_t version) {
 }
 
 void P2P::send_cmpctblock(PeerState& ps, const std::vector<uint8_t>& block_hash) {
-    // BIP152 compact block: header + nonce + short_ids + prefilled_txs
-    // This is a simplified implementation - full BIP152 would require:
-    // 1. Block header (80 bytes)
-    // 2. nonce for short_id calculation (8 bytes)
-    // 3. short_ids vector (compact tx identifiers)
-    // 4. prefilled_txns (coinbase at minimum)
+    // BIP152 FULL IMPLEMENTATION: Send compact block with short txids
+    // This dramatically reduces bandwidth: ~1-2KB instead of ~100KB+
+    // Receiver reconstructs from mempool, only requesting missing transactions
 
     if (block_hash.size() != 32) return;
 
@@ -8158,15 +8427,31 @@ void P2P::send_cmpctblock(PeerState& ps, const std::vector<uint8_t>& block_hash)
         return;
     }
 
-    // For now, send full block via regular "block" message as fallback
-    // Full BIP152 implementation would construct compact block format here
-    auto raw = ser_block(blk);
-    auto msg = encode_msg("block", raw);
-    if (ps.sock != MIQ_INVALID_SOCK) {
-        ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), static_cast<int>(msg.size()), 0);
-        if (w > 0) {
-            ps.last_compact_block_hash = block_hash;
-            MIQ_LOG_DEBUG(miq::LogCategory::NET, "send_cmpctblock: sent block to " + ps.ip);
+    // Build compact block using BIP152 format
+    if (mempool_) {
+        miq::CompactBlock cb = miq::CompactBlockBuilder::create(blk, *mempool_);
+        auto payload = miq::serialize_compact_block(cb);
+        auto msg = encode_msg("cmpctblock", payload);
+
+        if (ps.sock != MIQ_INVALID_SOCK) {
+            ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), static_cast<int>(msg.size()), 0);
+            if (w > 0) {
+                ps.last_compact_block_hash = block_hash;
+                MIQ_LOG_DEBUG(miq::LogCategory::NET, "send_cmpctblock: sent compact block (" +
+                             std::to_string(payload.size()) + " bytes, " +
+                             std::to_string(cb.short_ids.size()) + " short_ids) to " + ps.ip);
+            }
+        }
+    } else {
+        // Fallback: no mempool available, send full block
+        auto raw = ser_block(blk);
+        auto msg = encode_msg("block", raw);
+        if (ps.sock != MIQ_INVALID_SOCK) {
+            ssize_t w = send(ps.sock, reinterpret_cast<const char*>(msg.data()), static_cast<int>(msg.size()), 0);
+            if (w > 0) {
+                ps.last_compact_block_hash = block_hash;
+                MIQ_LOG_DEBUG(miq::LogCategory::NET, "send_cmpctblock: sent full block (no mempool) to " + ps.ip);
+            }
         }
     }
 }
@@ -8177,21 +8462,35 @@ void P2P::send_getblocktxn(PeerState& ps, const std::vector<uint8_t>& block_hash
     // Format: block_hash (32 bytes) + indexes_length (varint) + indexes (differentially encoded)
 
     if (block_hash.size() != 32) return;
+    if (indexes.empty()) return;
 
     std::vector<uint8_t> payload;
-    payload.reserve(32 + 1 + indexes.size() * 2);
+    payload.reserve(32 + 3 + indexes.size() * 3);
 
     // Block hash
     payload.insert(payload.end(), block_hash.begin(), block_hash.end());
 
-    // Indexes count (simplified - assuming < 253 txs)
-    payload.push_back(static_cast<uint8_t>(indexes.size() & 0xFF));
+    // Indexes count (proper varint encoding for any count)
+    uint64_t count = indexes.size();
+    if (count < 0xFD) {
+        payload.push_back(static_cast<uint8_t>(count));
+    } else if (count <= 0xFFFF) {
+        payload.push_back(0xFD);
+        payload.push_back(static_cast<uint8_t>(count & 0xFF));
+        payload.push_back(static_cast<uint8_t>((count >> 8) & 0xFF));
+    } else {
+        payload.push_back(0xFE);
+        payload.push_back(static_cast<uint8_t>(count & 0xFF));
+        payload.push_back(static_cast<uint8_t>((count >> 8) & 0xFF));
+        payload.push_back(static_cast<uint8_t>((count >> 16) & 0xFF));
+        payload.push_back(static_cast<uint8_t>((count >> 24) & 0xFF));
+    }
 
     // Differential encoding of indexes
     uint16_t prev = 0;
     for (uint16_t idx : indexes) {
         uint16_t diff = idx - prev;
-        // Simplified varint encoding for small values
+        // Proper varint encoding
         if (diff < 0xFD) {
             payload.push_back(static_cast<uint8_t>(diff));
         } else {
@@ -8213,31 +8512,80 @@ void P2P::send_getblocktxn(PeerState& ps, const std::vector<uint8_t>& block_hash
 }
 
 void P2P::handle_compact_block(PeerState& ps, const std::vector<uint8_t>& payload) {
-    // BIP152 compact block handler
-    // For now, log and request full block as fallback
+    // BIP152 FULL IMPLEMENTATION: Reconstruct block from mempool
+    // This dramatically reduces bandwidth - only ~1KB instead of ~500KB
 
-    if (payload.size() < 88) {  // Minimum: header(80) + nonce(8)
+    if (payload.size() < 96) {  // header(88) + nonce(8)
         MIQ_LOG_WARN(miq::LogCategory::NET, "handle_compact_block: payload too small from " + ps.ip);
         return;
     }
 
-    // Extract block header (first 80 bytes)
-    std::vector<uint8_t> header_data(payload.begin(), payload.begin() + 80);
+    // Deserialize compact block
+    miq::CompactBlock cb;
+    if (!miq::deserialize_compact_block(payload, cb)) {
+        MIQ_LOG_WARN(miq::LogCategory::NET, "handle_compact_block: deserialize failed from " + ps.ip);
+        request_block_hash(ps, miq::dsha256(std::vector<uint8_t>(payload.begin(), payload.begin() + 88)));
+        return;
+    }
 
-    // Compute block hash from header (double SHA256)
-    auto block_hash = miq::dsha256(header_data);
+    // Check if we already have this block
+    if (chain_.have_block(cb.block_hash)) {
+        MIQ_LOG_DEBUG(miq::LogCategory::NET, "handle_compact_block: already have block from " + ps.ip);
+        return;
+    }
 
-    // For now, request full block via getdata/getb as fallback
-    // Full implementation would:
-    // 1. Parse short_ids and prefilled_txns
-    // 2. Match short_ids to mempool transactions
-    // 3. Only request missing transactions via getblocktxn
+    // Try to reconstruct from mempool
+    if (!mempool_) {
+        MIQ_LOG_WARN(miq::LogCategory::NET, "handle_compact_block: no mempool, requesting full block");
+        request_block_hash(ps, cb.block_hash);
+        return;
+    }
 
-    MIQ_LOG_DEBUG(miq::LogCategory::NET, "handle_compact_block: received from " + ps.ip +
-        ", requesting full block as fallback");
+    miq::CompactBlockReconstructor reconstructor(*mempool_);
+    auto result = reconstructor.reconstruct(cb);
 
-    // Request full block
-    request_block_hash(ps, block_hash);
+    std::string hash_hex;
+    static const char hex[] = "0123456789abcdef";
+    for (uint8_t byte : cb.block_hash) {
+        hash_hex.push_back(hex[byte >> 4]);
+        hash_hex.push_back(hex[byte & 0xf]);
+    }
+
+    if (result.success) {
+        // Full reconstruction succeeded! Process the block immediately
+        MIQ_LOG_INFO(miq::LogCategory::NET, "COMPACT BLOCK " + hash_hex.substr(0, 16) +
+                     " reconstructed from mempool (" + std::to_string(cb.short_ids.size()) +
+                     " txs matched) from " + ps.ip);
+
+        // Serialize and process as normal block
+        auto raw = ser_block(result.block);
+        handle_incoming_block(ps.sock, raw);
+
+    } else if (!result.missing_indexes.empty()) {
+        // Partial reconstruction - need to request missing transactions
+        MIQ_LOG_DEBUG(miq::LogCategory::NET, "COMPACT BLOCK " + hash_hex.substr(0, 16) +
+                      " needs " + std::to_string(result.missing_indexes.size()) +
+                      " missing txs from " + ps.ip);
+
+        // Store pending compact block
+        miq::PendingCompactBlock pcb;
+        pcb.cb = cb;
+        pcb.partial_block = result.block;
+        pcb.missing_indexes = result.missing_indexes;
+        pcb.received_ms = now_ms();
+        pcb.from_peer = ps.ip;
+
+        pending_compact_blocks_.add(hash_hex, std::move(pcb));
+
+        // Request missing transactions
+        send_getblocktxn(ps, cb.block_hash, result.missing_indexes);
+
+    } else {
+        // Reconstruction failed for other reason - request full block
+        MIQ_LOG_WARN(miq::LogCategory::NET, "handle_compact_block: reconstruct failed (" +
+                     result.error + "), requesting full block from " + ps.ip);
+        request_block_hash(ps, cb.block_hash);
+    }
 }
 
 // =============================================================================
@@ -8288,22 +8636,55 @@ void P2P::handle_filterclear(PeerState& ps) {
 }
 
 // =============================================================================
-// CRITICAL FIX: Local block notification for TUI display
+// ULTRA-FAST LOCAL BLOCK PROPAGATION
+// For locally mined blocks - highest priority, immediate push to ALL peers
 // =============================================================================
 void P2P::notify_local_block(const Block& b, uint64_t height, uint64_t subsidy, const std::string& miner_addr) {
+    auto bh = b.block_hash();
+    std::string hash_hex;
+    hash_hex.reserve(64);
+    static const char hex[] = "0123456789abcdef";
+    for (uint8_t byte : bh) {
+        hash_hex.push_back(hex[byte >> 4]);
+        hash_hex.push_back(hex[byte & 0xf]);
+    }
+
+    // PRIORITY 1: INSTANT PARALLEL BROADCAST to ALL peers (before anything else!)
+    // For locally mined blocks, we serialize directly - no chain read needed
+    // This saves ~1-5ms of disk I/O latency
+    // CRITICAL: Uses parallel threads for simultaneous sends to all peers
+    {
+        auto raw_block = ser_block(b);
+        if (!raw_block.empty() && raw_block.size() < 4 * 1024 * 1024) {
+            auto block_msg = encode_msg("block", raw_block);
+
+            // Collect peer sockets under lock (fast)
+            std::vector<Sock> all_sockets;
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+                all_sockets.reserve(peers_.size());
+                for (auto& kv : peers_) {
+                    if (kv.second.verack_ok) {
+                        all_sockets.push_back(kv.first);
+                    }
+                }
+            }
+
+            // PARALLEL BROADCAST: Send to ALL peers SIMULTANEOUSLY
+            // This is the HIGHEST PRIORITY path - our own mined block!
+            int sent = parallel_send_to_peers(all_sockets, block_msg);
+
+            MIQ_LOG_INFO(miq::LogCategory::NET, "*** LOCAL BLOCK MINED *** " + hash_hex.substr(0, 16) +
+                         " at height " + std::to_string(height) +
+                         " PARALLEL pushed to " + std::to_string(sent) + "/" +
+                         std::to_string(all_sockets.size()) + " peers");
+        }
+    }
+
+    // PRIORITY 2: TUI callback (non-blocking)
     if (block_callback_) {
         P2PBlockInfo info;
         info.height = height;
-
-        // Build hash hex
-        auto bh = b.block_hash();
-        std::string hash_hex;
-        hash_hex.reserve(64);
-        static const char hex[] = "0123456789abcdef";
-        for (uint8_t byte : bh) {
-            hash_hex.push_back(hex[byte >> 4]);
-            hash_hex.push_back(hex[byte & 0xf]);
-        }
         info.hash_hex = hash_hex;
         info.tx_count = static_cast<uint32_t>(b.txs.size());
         info.miner = miner_addr;
@@ -8320,11 +8701,10 @@ void P2P::notify_local_block(const Block& b, uint64_t height, uint64_t subsidy, 
         block_callback_(info);
     }
 
-    // Also notify about transactions in this block
+    // PRIORITY 3: Notify about transactions in this block
     if (txids_callback_ && b.txs.size() > 1) {
         std::vector<std::string> txids;
         txids.reserve(b.txs.size() - 1);
-        static const char hex[] = "0123456789abcdef";
         for (size_t i = 1; i < b.txs.size(); ++i) {
             auto tid = b.txs[i].txid();
             std::string key;
@@ -8338,8 +8718,8 @@ void P2P::notify_local_block(const Block& b, uint64_t height, uint64_t subsidy, 
         txids_callback_(txids);
     }
 
-    // Broadcast the block to peers
-    broadcast_inv_block(b.block_hash());
+    // Queue for late-connecting peers (async)
+    announce_block_async(bh);
 }
 
 }
