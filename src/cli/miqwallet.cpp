@@ -7204,9 +7204,23 @@ static void draw_tx_details_window(const BlockchainTxDetails& tx, int width = 72
                 if (in.prev_txid == "COINBASE") {
                     line << "\033[38;5;220m" << (g_use_utf8 ? "⛏ " : "* ") << "COINBASE (Mining Reward)" << reset();
                 } else {
-                    std::string short_txid = in.prev_txid.size() > 16 ?
-                        in.prev_txid.substr(0, 12) + "..." : in.prev_txid;
-                    line << dim() << short_txid << ":" << in.prev_vout << reset();
+                    // Show value in MIQ format (if available from parent tx lookup)
+                    if (in.value > 0) {
+                        line << std::fixed << std::setprecision(8) << ((double)in.value / (double)COIN) << " MIQ";
+                        if (!in.address.empty()) {
+                            std::string short_addr = in.address.size() > 20 ?
+                                in.address.substr(0, 12) + "..." + in.address.substr(in.address.size() - 6) :
+                                in.address;
+                            line << " <- " << short_addr;
+                        }
+                    } else {
+                        std::string short_txid = in.prev_txid.size() > 16 ?
+                            in.prev_txid.substr(0, 12) + "..." : in.prev_txid;
+                        line << dim() << short_txid << ":" << in.prev_vout << reset();
+                        if (!in.address.empty()) {
+                            line << " " << in.address;
+                        }
+                    }
                 }
                 draw_line("[" + std::to_string(i) + "]", line.str());
             }

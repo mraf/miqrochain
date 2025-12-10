@@ -267,7 +267,6 @@ private:
     // Payout history
     mutable std::mutex payouts_mutex_;
     std::deque<PayoutRecord> payout_history_;
-    int64_t last_payout_check_ms_{0};
 
     // Persistence
     bool dirty_accounts_{false};            // Flag for save-on-change
