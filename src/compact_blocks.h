@@ -14,6 +14,7 @@
 #include "block.h"
 #include "tx.h"
 #include "sha256.h"
+#include "serialize.h"  // For ser_tx, deser_tx
 #include "mempool.h"
 
 namespace miq {
@@ -230,7 +231,7 @@ public:
             std::string key_str(short_id.begin(), short_id.end());
 
             Transaction tx;
-            if (mempool_.get_tx(txid, tx)) {
+            if (mempool_.get_transaction(txid, tx)) {
                 mempool_by_short[key_str] = tx;
             }
         }
@@ -396,6 +397,282 @@ inline std::vector<uint8_t> serialize_compact_block(const CompactBlock& cb) {
 
     return data;
 }
+
+// Helper: read varint from buffer
+inline bool read_varint(const std::vector<uint8_t>& data, size_t& offset, uint64_t& out) {
+    if (offset >= data.size()) return false;
+    uint8_t first = data[offset++];
+    if (first < 0xfd) {
+        out = first;
+    } else if (first == 0xfd) {
+        if (offset + 2 > data.size()) return false;
+        out = data[offset] | ((uint64_t)data[offset + 1] << 8);
+        offset += 2;
+    } else if (first == 0xfe) {
+        if (offset + 4 > data.size()) return false;
+        out = data[offset] | ((uint64_t)data[offset + 1] << 8) |
+              ((uint64_t)data[offset + 2] << 16) | ((uint64_t)data[offset + 3] << 24);
+        offset += 4;
+    } else {
+        if (offset + 8 > data.size()) return false;
+        out = 0;
+        for (int i = 0; i < 8; ++i) out |= ((uint64_t)data[offset + i] << (i * 8));
+        offset += 8;
+    }
+    return true;
+}
+
+// Deserialize compact block from network payload
+inline bool deserialize_compact_block(const std::vector<uint8_t>& data, CompactBlock& cb) {
+    if (data.size() < 96) return false;  // header(88) + nonce(8)
+
+    size_t off = 0;
+
+    // Header version (4 bytes LE)
+    cb.header.version = data[off] | (data[off+1] << 8) | (data[off+2] << 16) | (data[off+3] << 24);
+    off += 4;
+
+    // Prev hash (32 bytes)
+    cb.header.prev_hash.assign(data.begin() + off, data.begin() + off + 32);
+    off += 32;
+
+    // Merkle root (32 bytes)
+    cb.header.merkle_root.assign(data.begin() + off, data.begin() + off + 32);
+    off += 32;
+
+    // Time (8 bytes LE)
+    cb.header.time = 0;
+    for (int i = 0; i < 8; ++i) cb.header.time |= ((int64_t)data[off + i] << (i * 8));
+    off += 8;
+
+    // Bits (4 bytes LE)
+    cb.header.bits = data[off] | (data[off+1] << 8) | (data[off+2] << 16) | (data[off+3] << 24);
+    off += 4;
+
+    // Header nonce (8 bytes LE)
+    cb.header.nonce = 0;
+    for (int i = 0; i < 8; ++i) cb.header.nonce |= ((uint64_t)data[off + i] << (i * 8));
+    off += 8;
+
+    // Compact block nonce (8 bytes LE)
+    cb.nonce = 0;
+    for (int i = 0; i < 8; ++i) cb.nonce |= ((uint64_t)data[off + i] << (i * 8));
+    off += 8;
+
+    // Short IDs count
+    uint64_t short_count = 0;
+    if (!read_varint(data, off, short_count)) return false;
+    if (short_count > 100000) return false;  // Sanity limit
+
+    // Short IDs (6 bytes each)
+    cb.short_ids.clear();
+    cb.short_ids.reserve(short_count);
+    for (uint64_t i = 0; i < short_count; ++i) {
+        if (off + SHORT_TXID_SIZE > data.size()) return false;
+        std::array<uint8_t, SHORT_TXID_SIZE> sid;
+        std::copy(data.begin() + off, data.begin() + off + SHORT_TXID_SIZE, sid.begin());
+        cb.short_ids.push_back(sid);
+        off += SHORT_TXID_SIZE;
+    }
+
+    // Prefilled count
+    uint64_t prefilled_count = 0;
+    if (!read_varint(data, off, prefilled_count)) return false;
+    if (prefilled_count > 10000) return false;  // Sanity limit
+
+    // Prefilled transactions
+    cb.prefilled_txs.clear();
+    cb.prefilled_txs.reserve(prefilled_count);
+    for (uint64_t i = 0; i < prefilled_count; ++i) {
+        PrefilledTransaction pf;
+
+        // Index (varint)
+        uint64_t idx = 0;
+        if (!read_varint(data, off, idx)) return false;
+        pf.index = (uint16_t)idx;
+
+        // Transaction - find its length by parsing
+        if (off >= data.size()) return false;
+        std::vector<uint8_t> remaining(data.begin() + off, data.end());
+        if (!deser_tx(remaining, pf.tx)) return false;
+
+        // Advance offset by serialized tx size
+        auto tx_ser = ser_tx(pf.tx);
+        off += tx_ser.size();
+
+        cb.prefilled_txs.push_back(pf);
+    }
+
+    // Derive key for short ID matching
+    cb.block_hash = dsha256(std::vector<uint8_t>(data.begin(), data.begin() + 88));
+    cb.key = derive_compact_key(cb.block_hash, cb.nonce);
+
+    return true;
+}
+
+// Serialize blocktxn message (missing transactions response)
+inline std::vector<uint8_t> serialize_blocktxn(const BlockTransactions& bt) {
+    std::vector<uint8_t> data;
+    data.reserve(32 + 3 + bt.txs.size() * 256);
+
+    // Block hash (32 bytes)
+    data.insert(data.end(), bt.block_hash.begin(), bt.block_hash.end());
+
+    // Transaction count (varint)
+    uint64_t count = bt.txs.size();
+    if (count < 0xfd) {
+        data.push_back((uint8_t)count);
+    } else if (count <= 0xffff) {
+        data.push_back(0xfd);
+        data.push_back(count & 0xff);
+        data.push_back((count >> 8) & 0xff);
+    } else {
+        data.push_back(0xfe);
+        data.push_back(count & 0xff);
+        data.push_back((count >> 8) & 0xff);
+        data.push_back((count >> 16) & 0xff);
+        data.push_back((count >> 24) & 0xff);
+    }
+
+    // Transactions
+    for (const auto& tx : bt.txs) {
+        auto tx_data = ser_tx(tx);
+        data.insert(data.end(), tx_data.begin(), tx_data.end());
+    }
+
+    return data;
+}
+
+// Deserialize getblocktxn request
+inline bool deserialize_getblocktxn(const std::vector<uint8_t>& data, BlockTransactionsRequest& req) {
+    if (data.size() < 33) return false;  // 32 byte hash + at least 1 byte count
+
+    size_t off = 0;
+
+    // Block hash
+    req.block_hash.assign(data.begin(), data.begin() + 32);
+    off = 32;
+
+    // Indexes count
+    uint64_t count = 0;
+    if (!read_varint(data, off, count)) return false;
+    if (count > 50000) return false;  // Sanity limit
+
+    // Differentially encoded indexes
+    req.indexes.clear();
+    req.indexes.reserve(count);
+    uint16_t prev = 0;
+    for (uint64_t i = 0; i < count; ++i) {
+        uint64_t diff = 0;
+        if (!read_varint(data, off, diff)) return false;
+        uint16_t idx = prev + (uint16_t)diff;
+        req.indexes.push_back(idx);
+        prev = idx + 1;
+    }
+
+    return true;
+}
+
+// Deserialize blocktxn response
+inline bool deserialize_blocktxn(const std::vector<uint8_t>& data, BlockTransactions& bt) {
+    if (data.size() < 33) return false;
+
+    size_t off = 0;
+
+    // Block hash
+    bt.block_hash.assign(data.begin(), data.begin() + 32);
+    off = 32;
+
+    // Transaction count
+    uint64_t count = 0;
+    if (!read_varint(data, off, count)) return false;
+    if (count > 50000) return false;
+
+    // Transactions
+    bt.txs.clear();
+    bt.txs.reserve(count);
+    for (uint64_t i = 0; i < count; ++i) {
+        if (off >= data.size()) return false;
+        std::vector<uint8_t> remaining(data.begin() + off, data.end());
+        Transaction tx;
+        if (!deser_tx(remaining, tx)) return false;
+        auto tx_ser = ser_tx(tx);
+        off += tx_ser.size();
+        bt.txs.push_back(tx);
+    }
+
+    return true;
+}
+
+// =============================================================================
+// PENDING COMPACT BLOCK TRACKING
+// Track compact blocks waiting for missing transactions
+// =============================================================================
+
+struct PendingCompactBlock {
+    CompactBlock cb;
+    Block partial_block;
+    std::vector<uint16_t> missing_indexes;
+    int64_t received_ms{0};
+    std::string from_peer;
+};
+
+class PendingCompactBlockManager {
+public:
+    // Add a pending compact block
+    void add(const std::string& block_hash_hex, PendingCompactBlock&& pcb) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        // Limit to prevent memory exhaustion
+        if (pending_.size() >= 32) {
+            // Remove oldest
+            auto oldest = pending_.begin();
+            for (auto it = pending_.begin(); it != pending_.end(); ++it) {
+                if (it->second.received_ms < oldest->second.received_ms) {
+                    oldest = it;
+                }
+            }
+            pending_.erase(oldest);
+        }
+        pending_[block_hash_hex] = std::move(pcb);
+    }
+
+    // Get pending compact block
+    bool get(const std::string& block_hash_hex, PendingCompactBlock& out) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = pending_.find(block_hash_hex);
+        if (it == pending_.end()) return false;
+        out = it->second;
+        return true;
+    }
+
+    // Remove pending compact block
+    void remove(const std::string& block_hash_hex) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        pending_.erase(block_hash_hex);
+    }
+
+    // Check if block is pending
+    bool has(const std::string& block_hash_hex) const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return pending_.count(block_hash_hex) > 0;
+    }
+
+    // Clean up old pending blocks (older than 30 seconds)
+    void cleanup(int64_t now_ms) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        for (auto it = pending_.begin(); it != pending_.end(); ) {
+            if (now_ms - it->second.received_ms > 30000) {
+                it = pending_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+private:
+    mutable std::mutex mtx_;
+    std::unordered_map<std::string, PendingCompactBlock> pending_;
+};
 
 // =============================================================================
 // COMPACT BLOCK PEER SUPPORT

@@ -37,6 +37,7 @@
 
 #include "mempool.h"
 #include "block.h"      // For Block struct in notify_local_block
+#include "compact_blocks.h"  // BIP152 compact block relay
 
 namespace miq {
     class ThreadPool;
@@ -646,6 +647,10 @@ private:
     std::map<uint64_t, PendingBlock> pending_blocks_;  // keyed by height (ordered)
     size_t pending_blocks_bytes_{0};
     static constexpr size_t MAX_PENDING_BLOCKS_BYTES = 512 * 1024 * 1024;  // 512MB max
+
+    // BIP152 COMPACT BLOCK RELAY
+    // Track compact blocks waiting for missing transactions
+    PendingCompactBlockManager pending_compact_blocks_;
 
     // inbound rate gating
     int64_t  inbound_win_start_ms_{0};
