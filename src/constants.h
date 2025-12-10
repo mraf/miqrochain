@@ -95,10 +95,7 @@
 #define MIQ_ADDRMAN_FILE "peers2.dat"
 #endif
 
-// Outbound peer target (production: more connections for reliability)
-#ifndef MIQ_OUTBOUND_TARGET
-#define MIQ_OUTBOUND_TARGET 12
-#endif
+// MIQ_OUTBOUND_TARGET already defined earlier in this file (line ~41) at 12
 
 #ifndef MIQ_INDEX_PIPELINE
 #define MIQ_INDEX_PIPELINE 128  // CRITICAL FIX: High pipeline for near-instant sync
@@ -248,9 +245,8 @@ static constexpr size_t MAX_MSG_SIZE   = 8 * 1024 * 1024;  // 8 MiB (for large I
 // Optional: default RPC token (empty = no token unless MIQ_RPC_TOKEN env set)
 static constexpr const char* RPC_TOKEN_DEFAULT = "";
 
-#ifndef MIQ_DIAL_INTERVAL_MS
-#define MIQ_DIAL_INTERVAL_MS 3000
-#endif
+// MIQ_DIAL_INTERVAL_MS already defined earlier in this file (line ~105) at 10000ms
+
 #ifndef MIQ_HEADERS_EMPTY_LIMIT
 #define MIQ_HEADERS_EMPTY_LIMIT 3
 #endif
