@@ -5113,10 +5113,17 @@ int main(int argc, char** argv){
             }
 
             // Sync gate for TUI display (external miner checks sync state via RPC)
+            // CRITICAL FIX: After IBD completes, only check tip freshness for mining gate
+            // Don't disable mining just because peers disconnected or haven't reported tips
             {
-                std::string why;
-                bool synced = compute_sync_gate(chain, &p2p, why);
-                if (can_tui) tui.set_mining_gate(synced, synced ? "" : why);
+                auto tip = chain.tip();
+                uint64_t tsec = hdr_time(tip);
+                uint64_t now_time = (uint64_t)std::time(nullptr);
+                uint64_t tip_age = (now_time > tsec) ? (now_time - tsec) : 0;
+                // Mining available if tip is fresh (< 8 minutes = 1 block time)
+                bool mining_ok = (tip_age < 8 * 60);
+                std::string why = mining_ok ? "" : "tip too old (" + std::to_string(tip_age/60) + "m)";
+                if (can_tui) tui.set_mining_gate(mining_ok, why);
             }
 
             // Periodic mempool maintenance (every ~30 seconds)
