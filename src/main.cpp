@@ -1441,16 +1441,23 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
             }
         }
 
-        // If no peers have reported their tip yet, check if our tip is fresh enough
-        // If tip is fresh (< 1 min), we're synced - don't wait for peer tips
+        // If no peers have reported their tip yet, check if we can proceed anyway
+        // This handles the case where peers are connected but haven't sent their tip yet
         if (peers_with_tip == 0) {
             auto tip = chain.tip();
             uint64_t tsec = hdr_time(tip);
             uint64_t now_time = (uint64_t)std::time(nullptr);
             uint64_t tip_age = (now_time > tsec) ? (now_time - tsec) : 0;
-            if (tip_age < 60) {
-                why_out.clear();
-                return true;  // Fresh tip + connected peers = synced
+
+            // If tip is fresh (< 8 min) and we have blocks, consider synced
+            // Don't wait forever for peers to report tips
+            if (tip_age < 8 * 60 && h > 0) {
+                uint64_t header_height = chain.best_header_height();
+                // Either no headers yet (header_height==0) or we're caught up
+                if (header_height == 0 || h >= header_height) {
+                    why_out.clear();
+                    return true;
+                }
             }
             why_out = "waiting for peer tip heights";
             return false;
@@ -1476,8 +1483,8 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
             uint64_t tsec = hdr_time(tip);
             uint64_t now = (uint64_t)std::time(nullptr);
             uint64_t age = (now > tsec) ? (now - tsec) : 0;
-            // Allow up to 10 minutes for slow block times or slight clock drift
-            const uint64_t max_age = 10 * 60;
+            // Allow up to 8 minutes (1 block time)
+            const uint64_t max_age = 8 * 60;
             if (age > max_age) {
                 why_out = "tip timestamp too old (" + std::to_string(age) + "s)";
                 return false;
@@ -1490,6 +1497,13 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
         }
     }
 
+    // CRITICAL: Must have at least one connected peer before declaring synced
+    // (unless we're a seed node, which is handled above)
+    if (verack_peers == 0) {
+        why_out = "waiting for peer connection";
+        return false;
+    }
+
     auto tip = chain.tip();
     uint64_t tsec = hdr_time(tip);
     if (tsec == 0) {
@@ -1498,7 +1512,7 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
     }
     uint64_t now = (uint64_t)std::time(nullptr);
     uint64_t age = (now > tsec) ? (now - tsec) : 0;
-    const uint64_t fresh = std::max<uint64_t>(BLOCK_TIME_SECS * 3, 300);
+    const uint64_t fresh = 8 * 60;  // 8 minutes = 1 block time
 
     if (age > fresh) {
         why_out = "tip too old";
@@ -4437,49 +4451,17 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             }
 
             if (stable) {
-                // CRITICAL FIX: Verify we've passed all checkpoints before declaring sync complete
-                // This prevents syncing to a short fork chain
+                // Verify we've passed all checkpoints before declaring sync complete
                 uint64_t checkpoint_height = miq::get_highest_checkpoint_height();
                 if (chain.height() < checkpoint_height) {
                     log_warn("IBD: Refusing to complete sync - height " + std::to_string(chain.height()) +
                             " is below checkpoint " + std::to_string(checkpoint_height));
-                    // Not at checkpoint yet, keep syncing
                     std::this_thread::sleep_for(250ms);
                     continue;
                 }
 
-                // CRITICAL FIX: Re-verify peer tips AFTER stability window
-                // Peers may have received new blocks during our stability check
-                uint64_t final_max_peer_tip = 0;
-                size_t final_peers_with_tip = 0;
-                auto final_peers = p2p->snapshot_peers();
-                for (const auto& pr : final_peers) {
-                    if (pr.verack_ok && pr.peer_tip > 0) {
-                        final_max_peer_tip = std::max(final_max_peer_tip, pr.peer_tip);
-                        final_peers_with_tip++;
-                    }
-                }
-
-                // If peers now report a higher tip, we're not synced yet
-                if (final_peers_with_tip > 0 && chain.height() < final_max_peer_tip) {
-                    log_info("IBD: peer tips advanced during stability check (our=" +
-                             std::to_string(chain.height()) + " peer=" +
-                             std::to_string(final_max_peer_tip) + "), continuing sync");
-                    std::this_thread::sleep_for(250ms);
-                    continue;
-                }
-
-                // CRITICAL FIX: Check if blocks are still coming in
-                // If height increased during stability window, wait for things to settle
-                uint64_t heightNow = chain.height();
-                if (heightNow > heightAtStart) {
-                    log_info("IBD: blocks received during stability check (" +
-                             std::to_string(heightAtStart) + " -> " + std::to_string(heightNow) +
-                             "), restarting stability check");
-                    std::this_thread::sleep_for(250ms);
-                    continue;
-                }
-
+                // Sync gate passed + stability check passed = we're synced
+                // Don't re-verify peer tips - that can cause infinite loops if network keeps producing blocks
                 log_info("IBD: sync complete after stability check, height=" + std::to_string(chain.height()));
 
                 if (tui && can_tui) {
@@ -5099,10 +5081,17 @@ int main(int argc, char** argv){
             }
 
             // Sync gate for TUI display (external miner checks sync state via RPC)
+            // CRITICAL FIX: After IBD completes, only check tip freshness for mining gate
+            // Don't disable mining just because peers disconnected or haven't reported tips
             {
-                std::string why;
-                bool synced = compute_sync_gate(chain, &p2p, why);
-                if (can_tui) tui.set_mining_gate(synced, synced ? "" : why);
+                auto tip = chain.tip();
+                uint64_t tsec = hdr_time(tip);
+                uint64_t now_time = (uint64_t)std::time(nullptr);
+                uint64_t tip_age = (now_time > tsec) ? (now_time - tsec) : 0;
+                // Mining available if tip is fresh (< 8 minutes = 1 block time)
+                bool mining_ok = (tip_age < 8 * 60);
+                std::string why = mining_ok ? "" : "tip too old (" + std::to_string(tip_age/60) + "m)";
+                if (can_tui) tui.set_mining_gate(mining_ok, why);
             }
 
             // Periodic mempool maintenance (every ~30 seconds)
