@@ -4044,6 +4044,7 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
                     pit->second.mis++;
                     if (pit->second.mis > 5) {
                         log_warn("P2P: disconnecting peer " + pit->second.ip + " for repeated hash mismatches");
+                        schedule_close(sock);
                     }
                 }
                 return;
