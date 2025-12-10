@@ -194,7 +194,21 @@ bool StratumServer::start() {
 
     running_ = true;
 
-    // Start threads
+    // CRITICAL FIX: Create initial job BEFORE starting threads
+    // This eliminates the race condition where miners connect before a job exists
+    {
+        log_info("Stratum: Creating initial job before accepting miners...");
+        auto job = create_job();
+        {
+            std::lock_guard<std::mutex> lock(jobs_mutex_);
+            jobs_[job.job_id] = job;
+            job_order_.push_back(job.job_id);
+            current_job_id_ = job.job_id;
+        }
+        log_info("Stratum: Initial job ready: " + job.job_id + " height=" + std::to_string(job.height));
+    }
+
+    // Start threads - now miners will always have a job available
     accept_thread_ = std::thread(&StratumServer::accept_loop, this);
     work_thread_ = std::thread(&StratumServer::work_loop, this);
 
@@ -345,23 +359,12 @@ void StratumServer::accept_loop() {
 }
 
 void StratumServer::work_loop() {
-    int64_t last_job_time = 0;
+    // Initial job is now created in start() before threads are started
+    // This eliminates the race condition where miners connect before a job exists
+    int64_t last_job_time = now_ms();  // Start timer from now since job already exists
     int64_t last_cleanup_time = 0;
 
-    // CRITICAL FIX: Create initial job IMMEDIATELY before accepting any miners
-    // This ensures miners always have a job available when they subscribe
-    log_info("Stratum: work_loop started, creating initial job...");
-    {
-        auto job = create_job();
-        {
-            std::lock_guard<std::mutex> lock(jobs_mutex_);
-            jobs_[job.job_id] = job;
-            job_order_.push_back(job.job_id);
-            current_job_id_ = job.job_id;
-        }
-        log_info("Stratum: Initial job created: " + job.job_id + " height=" + std::to_string(job.height));
-        last_job_time = now_ms();
-    }
+    log_info("Stratum: work_loop started");
 
     while (running_) {
         int64_t now = now_ms();
