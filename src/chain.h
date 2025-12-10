@@ -181,4 +181,8 @@ private:
                           std::vector<std::vector<uint8_t>>& path_down_from_a) const;
 };
 
+// Fast PoW verification (no full block validation, just hash vs target)
+// Used for optimistic relay - relay blocks immediately after PoW check
+bool verify_block_pow(const Block& b);
+
 }

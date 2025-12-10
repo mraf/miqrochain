@@ -3920,6 +3920,51 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
     const auto bh = b.block_hash();
 
+    // CRITICAL OPTIMIZATION: Optimistic relay after PoW check
+    // Verify PoW immediately (fast) and relay to peers before full validation
+    // This dramatically reduces block propagation time and fork opportunities
+    static std::unordered_set<std::string> recently_relayed;
+    static std::mutex relay_mu;
+    std::string bh_key = hexkey(bh);
+
+    {
+        std::lock_guard<std::mutex> lk(relay_mu);
+        // Only relay if we haven't recently relayed this block
+        if (recently_relayed.find(bh_key) == recently_relayed.end()) {
+            // Fast PoW check - only hash comparison, no full validation
+            if (miq::verify_block_pow(b)) {
+                // Valid PoW - relay immediately to all peers (except sender)
+                auto block_msg = encode_msg("block", raw);
+                auto invb_msg = encode_msg("invb", bh);
+
+                std::lock_guard<std::recursive_mutex> peers_lk(g_peers_mu);
+                int relayed = 0;
+                for (auto& kv : peers_) {
+                    if (kv.first != sock && kv.second.verack_ok) {
+                        // Send to fast/high-bandwidth peers directly
+                        if (kv.second.compact_high_bandwidth || kv.second.health_score > 0.7 || relayed < 3) {
+                            if (send_or_close(kv.first, block_msg)) {
+                                relayed++;
+                            }
+                        } else {
+                            // Send just inv to other peers
+                            (void)send_or_close(kv.first, invb_msg);
+                        }
+                    }
+                }
+                recently_relayed.insert(bh_key);
+
+                // Cleanup old entries (keep last 100)
+                if (recently_relayed.size() > 100) {
+                    recently_relayed.clear();
+                }
+
+                MIQ_LOG_DEBUG(miq::LogCategory::NET, "Optimistic relay: block " + bh_key.substr(0, 16) +
+                              " relayed to " + std::to_string(relayed) + " peers before validation");
+            }
+        }
+    }
+
     // CRITICAL FIX: Don't skip blocks that might have incomplete processing
     // If block body is stored but UTXO operations failed (crash/disk error),
     // we need to let submit_block() handle re-processing via its incomplete
