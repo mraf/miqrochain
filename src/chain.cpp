@@ -2624,4 +2624,11 @@ bool Chain::reindex_addresses(std::function<bool(uint64_t, uint64_t)> progress) 
     return result;
 }
 
+// Fast PoW verification for optimistic relay
+// Only checks if hash meets target, no full block validation
+bool verify_block_pow(const Block& b) {
+    auto hash = b.block_hash();
+    return meets_target_be(hash, b.header.bits);
+}
+
 }
