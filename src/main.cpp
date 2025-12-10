@@ -1452,7 +1452,7 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
                 uint64_t tsec = hdr_time(tip);
                 uint64_t now_time = (uint64_t)std::time(nullptr);
                 uint64_t tip_age = (now_time > tsec) ? (now_time - tsec) : 0;
-                if (tip_age < 60) {
+                if (tip_age < 8 * 60) {  // 8 minutes = 1 block time
                     why_out.clear();
                     return true;
                 }
@@ -1481,8 +1481,8 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
             uint64_t tsec = hdr_time(tip);
             uint64_t now = (uint64_t)std::time(nullptr);
             uint64_t age = (now > tsec) ? (now - tsec) : 0;
-            // Allow up to 10 minutes for slow block times or slight clock drift
-            const uint64_t max_age = 10 * 60;
+            // Allow up to 8 minutes (1 block time)
+            const uint64_t max_age = 8 * 60;
             if (age > max_age) {
                 why_out = "tip timestamp too old (" + std::to_string(age) + "s)";
                 return false;
@@ -1510,7 +1510,7 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
     }
     uint64_t now = (uint64_t)std::time(nullptr);
     uint64_t age = (now > tsec) ? (now - tsec) : 0;
-    const uint64_t fresh = std::max<uint64_t>(BLOCK_TIME_SECS * 3, 300);
+    const uint64_t fresh = 8 * 60;  // 8 minutes = 1 block time
 
     if (age > fresh) {
         why_out = "tip too old";
