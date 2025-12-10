@@ -4451,49 +4451,17 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             }
 
             if (stable) {
-                // CRITICAL FIX: Verify we've passed all checkpoints before declaring sync complete
-                // This prevents syncing to a short fork chain
+                // Verify we've passed all checkpoints before declaring sync complete
                 uint64_t checkpoint_height = miq::get_highest_checkpoint_height();
                 if (chain.height() < checkpoint_height) {
                     log_warn("IBD: Refusing to complete sync - height " + std::to_string(chain.height()) +
                             " is below checkpoint " + std::to_string(checkpoint_height));
-                    // Not at checkpoint yet, keep syncing
                     std::this_thread::sleep_for(250ms);
                     continue;
                 }
 
-                // CRITICAL FIX: Re-verify peer tips AFTER stability window
-                // Peers may have received new blocks during our stability check
-                uint64_t final_max_peer_tip = 0;
-                size_t final_peers_with_tip = 0;
-                auto final_peers = p2p->snapshot_peers();
-                for (const auto& pr : final_peers) {
-                    if (pr.verack_ok && pr.peer_tip > 0) {
-                        final_max_peer_tip = std::max(final_max_peer_tip, pr.peer_tip);
-                        final_peers_with_tip++;
-                    }
-                }
-
-                // If peers now report a higher tip, we're not synced yet
-                if (final_peers_with_tip > 0 && chain.height() < final_max_peer_tip) {
-                    log_info("IBD: peer tips advanced during stability check (our=" +
-                             std::to_string(chain.height()) + " peer=" +
-                             std::to_string(final_max_peer_tip) + "), continuing sync");
-                    std::this_thread::sleep_for(250ms);
-                    continue;
-                }
-
-                // CRITICAL FIX: Check if blocks are still coming in
-                // If height increased during stability window, wait for things to settle
-                uint64_t heightNow = chain.height();
-                if (heightNow > heightAtStart) {
-                    log_info("IBD: blocks received during stability check (" +
-                             std::to_string(heightAtStart) + " -> " + std::to_string(heightNow) +
-                             "), restarting stability check");
-                    std::this_thread::sleep_for(250ms);
-                    continue;
-                }
-
+                // Sync gate passed + stability check passed = we're synced
+                // Don't re-verify peer tips - that can cause infinite loops if network keeps producing blocks
                 log_info("IBD: sync complete after stability check, height=" + std::to_string(chain.height()));
 
                 if (tui && can_tui) {
