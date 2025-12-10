@@ -7907,7 +7907,7 @@ static std::string confirmation_bar_extended(uint32_t confirmations, int bar_wid
     return result;
 }
 
-// Print single transaction row
+// Print single transaction row - Enhanced with block height and time
 static void print_tx_row(const TxDetailedEntry& tx, int index, bool selected,
                          const std::vector<AddressBookEntry>& address_book) {
     if (selected) {
@@ -7920,16 +7920,27 @@ static void print_tx_row(const TxDetailedEntry& tx, int index, bool selected,
         std::cout << ui::red() << "[-]" << ui::reset();
     } else if (tx.direction == "received") {
         std::cout << ui::green() << "[+]" << ui::reset();
-    } else if (tx.direction == "mined") {
+    } else if (tx.direction == "mined" || tx.direction == "coinbase") {
         std::cout << "\033[38;5;220m[⛏]\033[0m";  // Gold mining icon
     } else {
         std::cout << ui::yellow() << "[=]" << ui::reset();
     }
-    std::cout << " " << ui::dim() << ui::format_time_short(tx.timestamp) << ui::reset();
+
+    // ENHANCED: Show block height + time or "pending" + time ago
+    if (tx.block_height > 0) {
+        // Confirmed: show block height and short time
+        std::cout << " " << ui::cyan() << "#" << tx.block_height << ui::reset();
+        std::cout << " " << ui::dim() << ui::format_time_short(tx.timestamp) << ui::reset();
+    } else {
+        // Pending: show "Pending" and time ago
+        std::cout << " " << ui::yellow() << "Pending" << ui::reset();
+        std::cout << " " << ui::dim() << ui::format_time_ago(tx.timestamp) << ui::reset();
+    }
+
     std::string amt_str;
     if (tx.amount >= 0) {
         amt_str = "+" + ui_pro::format_miq_professional((uint64_t)tx.amount);
-        if (tx.direction == "mined") {
+        if (tx.direction == "mined" || tx.direction == "coinbase") {
             std::cout << " \033[38;5;220m" << std::setw(16) << std::right << amt_str << "\033[0m";  // Gold for mining
         } else {
             std::cout << " " << ui::green() << std::setw(16) << std::right << amt_str << ui::reset();
@@ -7938,7 +7949,17 @@ static void print_tx_row(const TxDetailedEntry& tx, int index, bool selected,
         amt_str = "-" + ui_pro::format_miq_professional((uint64_t)(-tx.amount));
         std::cout << " " << ui::red() << std::setw(16) << std::right << amt_str << ui::reset();
     }
-    std::cout << " " << confirmation_bar(tx.confirmations);
+
+    // ENHANCED: Show confirmation count more prominently
+    std::cout << " ";
+    if (tx.confirmations >= 6) {
+        std::cout << ui::green() << "[" << tx.confirmations << "]" << ui::reset();
+    } else if (tx.confirmations > 0) {
+        std::cout << ui::yellow() << "[" << tx.confirmations << "]" << ui::reset();
+    } else {
+        std::cout << ui::red() << "[0]" << ui::reset();
+    }
+
     std::string addr = tx.direction == "sent" ? tx.to_address : tx.from_address;
     std::string label;
     for (const auto& entry : address_book) {
@@ -7949,8 +7970,8 @@ static void print_tx_row(const TxDetailedEntry& tx, int index, bool selected,
     }
     if (!label.empty()) {
         std::cout << " " << ui::cyan() << label << ui::reset();
-    } else if (!addr.empty()) {
-        std::cout << " " << ui::dim() << addr.substr(0, 12) << "..." << ui::reset();
+    } else if (!addr.empty() && addr.size() > 12) {
+        std::cout << " " << ui::dim() << addr.substr(0, 10) << ".." << ui::reset();
     }
     if (!tx.memo.empty()) {
         std::cout << " " << ui::yellow() << "[M]" << ui::reset();

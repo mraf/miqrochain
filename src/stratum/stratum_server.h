@@ -76,6 +76,14 @@ struct PoolPayoutConfig {
     std::vector<uint8_t> fee_address_pkh; // Pool fee recipient (20 bytes)
 };
 
+// Coinbase payout output (for direct-to-miner payments)
+struct CoinbaseOutput {
+    std::string address;           // Base58check address (for stats tracking)
+    std::vector<uint8_t> pkh;      // 20-byte PKH for the output
+    uint64_t amount;               // Amount in base units
+    bool is_pool_fee{false};       // True if this is pool operator fee
+};
+
 // Stratum job template
 struct StratumJob {
     std::string job_id;
@@ -92,6 +100,11 @@ struct StratumJob {
     // PRODUCTION FIX: Store mempool transactions and total fees for proper block building
     std::vector<Transaction> mempool_txs; // Transactions to include in block
     uint64_t total_fees{0};              // Total fees from mempool transactions
+
+    // DIRECT COINBASE PAYOUTS: Output distribution calculated at job creation
+    // Each miner gets paid directly in the coinbase based on their PPLNS share
+    std::vector<CoinbaseOutput> coinbase_outputs;  // All outputs in coinbase
+    uint64_t total_reward{0};                      // Total block reward (subsidy + fees)
 };
 
 // Connected miner state

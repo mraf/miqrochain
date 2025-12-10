@@ -1053,19 +1053,40 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
                     stats_.blocks_found++;
                 }
 
-                // PAYOUT SYSTEM: Distribute block reward proportionally to miners
-                // Calculate total reward (subsidy + fees)
-                uint64_t subsidy = INITIAL_SUBSIDY;
-                uint64_t halvings = job.height / HALVING_INTERVAL;
-                if (halvings < 64) subsidy = INITIAL_SUBSIDY >> halvings;
-                else subsidy = 0;
-                uint64_t total_reward = subsidy + job.total_fees;
+                // DIRECT COINBASE PAYOUTS: Update stats for miners paid in this block
+                // Rewards were already included in coinbase outputs at job creation time
+                uint64_t miner_total = 0;
+                uint64_t pool_fee_total = 0;
+                int miners_paid = 0;
 
-                // Distribute to all miners who contributed shares
-                distribute_block_reward(total_reward, job.height);
+                for (const auto& out : job.coinbase_outputs) {
+                    if (out.is_pool_fee) {
+                        pool_fee_total += out.amount;
+                    } else if (out.address != "pool") {
+                        miner_total += out.amount;
+                        miners_paid++;
 
-                log_info("Stratum: Block " + std::to_string(job.height) + " reward (" +
-                         std::to_string(total_reward) + " base units) distributed to miners");
+                        // Update miner account stats (paid directly via coinbase)
+                        std::lock_guard<std::mutex> lock(accounts_mutex_);
+                        auto it = miner_accounts_.find(out.address);
+                        if (it != miner_accounts_.end()) {
+                            it->second.total_paid += out.amount;
+                            dirty_accounts_ = true;
+                        }
+                    }
+                }
+
+                // Update pool stats
+                {
+                    std::lock_guard<std::mutex> slock(stats_mutex_);
+                    stats_.total_rewards_distributed += miner_total;
+                    stats_.total_fees_collected += pool_fee_total;
+                    stats_.payouts_sent += miners_paid;
+                }
+
+                log_info("Stratum: Block " + std::to_string(job.height) + " - " +
+                         std::to_string(miners_paid) + " miners paid directly via coinbase (total=" +
+                         std::to_string(job.total_reward) + ", fee=" + std::to_string(pool_fee_total) + ")");
             } else {
                 log_error("Stratum: Block " + std::to_string(job.height) + " rejected: " + submit_err);
             }
@@ -1259,17 +1280,129 @@ StratumJob StratumServer::create_job() {
     std::vector<uint8_t> coinb2_bytes;
     put_u32_le(coinb2_bytes, 0);  // pubkey length (no pubkey for coinbase)
 
-    put_u32_le(coinb2_bytes, 1);  // output count
-    // PRODUCTION FIX: Include fees in coinbase value (subsidy + fees)
-    uint64_t coinbase_value = subsidy + job.total_fees;
-    put_u64_le(coinb2_bytes, coinbase_value);
-    put_u32_le(coinb2_bytes, 20); // pkh length
+    // ==========================================================================
+    // DIRECT COINBASE PAYOUTS - Calculate miner shares and build multi-output coinbase
+    // ==========================================================================
+    uint64_t total_reward = subsidy + job.total_fees;
+    job.total_reward = total_reward;
+    job.coinbase_outputs.clear();
 
-    // PKH
-    if (reward_pkh_.size() == 20) {
-        coinb2_bytes.insert(coinb2_bytes.end(), reward_pkh_.begin(), reward_pkh_.end());
+    // Calculate miner work proportions from PPLNS window
+    std::map<std::string, double> miner_work;
+    std::map<std::string, std::vector<uint8_t>> miner_pkh;
+    double total_work = 0.0;
+
+    {
+        std::lock_guard<std::mutex> lock(shares_mutex_);
+        for (const auto& share : pplns_shares_) {
+            miner_work[share.miner_address] += share.difficulty;
+            total_work += share.difficulty;
+        }
+    }
+
+    // Get PKHs from miner accounts
+    {
+        std::lock_guard<std::mutex> lock(accounts_mutex_);
+        for (const auto& kv : miner_work) {
+            auto it = miner_accounts_.find(kv.first);
+            if (it != miner_accounts_.end() && it->second.pkh.size() == 20) {
+                miner_pkh[kv.first] = it->second.pkh;
+            }
+        }
+    }
+
+    // Remove miners without valid PKH
+    for (auto it = miner_work.begin(); it != miner_work.end(); ) {
+        if (miner_pkh.find(it->first) == miner_pkh.end()) {
+            total_work -= it->second;
+            it = miner_work.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // If we have contributing miners, build multi-output coinbase
+    if (total_work > 0.0 && !miner_work.empty()) {
+        // Calculate pool fee
+        uint64_t pool_fee = 0;
+        if (payout_config_.pool_fee_percent > 0.0 && payout_config_.fee_address_pkh.size() == 20) {
+            pool_fee = (uint64_t)(total_reward * payout_config_.pool_fee_percent / 100.0);
+        }
+        uint64_t miner_reward_pool = total_reward - pool_fee;
+
+        // Calculate per-miner amounts
+        uint64_t distributed = 0;
+        std::string largest_miner;
+        double largest_work = 0;
+
+        for (const auto& kv : miner_work) {
+            double proportion = kv.second / total_work;
+            uint64_t amount = (uint64_t)(miner_reward_pool * proportion);
+
+            if (amount > 0) {
+                CoinbaseOutput out;
+                out.address = kv.first;
+                out.pkh = miner_pkh[kv.first];
+                out.amount = amount;
+                out.is_pool_fee = false;
+                job.coinbase_outputs.push_back(out);
+                distributed += amount;
+            }
+
+            if (kv.second > largest_work) {
+                largest_work = kv.second;
+                largest_miner = kv.first;
+            }
+        }
+
+        // Give rounding remainder to largest contributor
+        if (distributed < miner_reward_pool && !largest_miner.empty()) {
+            uint64_t remainder = miner_reward_pool - distributed;
+            for (auto& out : job.coinbase_outputs) {
+                if (out.address == largest_miner) {
+                    out.amount += remainder;
+                    break;
+                }
+            }
+        }
+
+        // Add pool fee output if configured
+        if (pool_fee > 0 && payout_config_.fee_address_pkh.size() == 20) {
+            CoinbaseOutput fee_out;
+            fee_out.address = "pool_fee";
+            fee_out.pkh = payout_config_.fee_address_pkh;
+            fee_out.amount = pool_fee;
+            fee_out.is_pool_fee = true;
+            job.coinbase_outputs.push_back(fee_out);
+        }
+
+        log_info("Stratum: Job " + job.job_id + " - Direct coinbase payouts to " +
+                 std::to_string(miner_work.size()) + " miners (reward=" +
+                 std::to_string(total_reward) + ", fee=" + std::to_string(pool_fee) + ")");
     } else {
-        for (int i = 0; i < 20; i++) coinb2_bytes.push_back(0);
+        // No PPLNS shares - fall back to single output to pool address
+        // This happens at pool startup or when no miners have submitted shares yet
+        CoinbaseOutput out;
+        out.address = "pool";
+        out.pkh = reward_pkh_.size() == 20 ? reward_pkh_ : std::vector<uint8_t>(20, 0);
+        out.amount = total_reward;
+        out.is_pool_fee = false;
+        job.coinbase_outputs.push_back(out);
+
+        log_info("Stratum: Job " + job.job_id + " - No PPLNS shares, reward to pool address");
+    }
+
+    // Build coinbase outputs
+    put_u32_le(coinb2_bytes, (uint32_t)job.coinbase_outputs.size());  // output count
+
+    for (const auto& out : job.coinbase_outputs) {
+        put_u64_le(coinb2_bytes, out.amount);
+        put_u32_le(coinb2_bytes, 20);  // pkh length
+        if (out.pkh.size() == 20) {
+            coinb2_bytes.insert(coinb2_bytes.end(), out.pkh.begin(), out.pkh.end());
+        } else {
+            for (int i = 0; i < 20; i++) coinb2_bytes.push_back(0);
+        }
     }
 
     put_u32_le(coinb2_bytes, 0);  // lock_time
@@ -1754,18 +1887,14 @@ void StratumServer::distribute_block_reward(uint64_t block_reward, uint64_t bloc
 }
 
 void StratumServer::payout_loop() {
-    log_info("Stratum: Payout processing thread started");
+    log_info("Stratum: Account maintenance thread started (direct coinbase payouts active)");
 
     while (running_) {
         int64_t now = now_ms();
 
-        // Check payouts periodically
-        if (now - last_payout_check_ms_ > (int64_t)payout_config_.payout_interval_ms) {
-            if (payout_config_.auto_payout) {
-                process_pending_payouts();
-            }
-            last_payout_check_ms_ = now;
-        }
+        // NOTE: With direct coinbase payouts, miners are paid directly in each block.
+        // There are no pending balances to pay out - balance is always 0.
+        // This loop now only handles account persistence for stats tracking.
 
         // Save accounts periodically (every 5 minutes) or when dirty
         if (dirty_accounts_ && (now - last_save_ms_ > 300000)) {
@@ -1781,7 +1910,7 @@ void StratumServer::payout_loop() {
         save_accounts();
     }
 
-    log_info("Stratum: Payout processing thread stopped");
+    log_info("Stratum: Account maintenance thread stopped");
 }
 
 void StratumServer::process_pending_payouts() {
