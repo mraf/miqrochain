@@ -4431,48 +4431,36 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             }
         }
 
-        // Check "synced" state and require stability window with re-verification
+        // Check "synced" state and require stability window
         std::string why;
         if (compute_sync_gate(chain, p2p, why)) {
-            const uint64_t okStart = now_ms();
-            const uint64_t heightAtStart = chain.height();
-            bool stable = true;
+            log_info("IBD: sync gate passed at height " + std::to_string(chain.height()) +
+                     ", waiting " + std::to_string(kStableOkMs/1000) + "s stability window");
 
-            log_info("IBD: sync gate passed, starting " + std::to_string(kStableOkMs/1000) +
-                     "s stability check at height " + std::to_string(heightAtStart));
+            // Just wait the stability window - don't re-check sync gate
+            // Re-checking can fail if peers report tips during the window
+            std::this_thread::sleep_for(std::chrono::milliseconds(kStableOkMs));
 
-            while (now_ms() - okStart < kStableOkMs) {
-                std::this_thread::sleep_for(200ms);
-                if (!compute_sync_gate(chain, p2p, why)) {
-                    log_info("IBD: stability check failed - " + why);
-                    stable = false;
-                    break;
-                }
+            // Verify we've passed all checkpoints before declaring sync complete
+            uint64_t checkpoint_height = miq::get_highest_checkpoint_height();
+            if (chain.height() < checkpoint_height) {
+                log_warn("IBD: Refusing to complete sync - height " + std::to_string(chain.height()) +
+                        " is below checkpoint " + std::to_string(checkpoint_height));
+                std::this_thread::sleep_for(250ms);
+                continue;
             }
 
-            if (stable) {
-                // Verify we've passed all checkpoints before declaring sync complete
-                uint64_t checkpoint_height = miq::get_highest_checkpoint_height();
-                if (chain.height() < checkpoint_height) {
-                    log_warn("IBD: Refusing to complete sync - height " + std::to_string(chain.height()) +
-                            " is below checkpoint " + std::to_string(checkpoint_height));
-                    std::this_thread::sleep_for(250ms);
-                    continue;
-                }
+            // Sync gate passed + stability window passed = we're synced
+            log_info("IBD: sync complete after stability check, height=" + std::to_string(chain.height()));
 
-                // Sync gate passed + stability check passed = we're synced
-                // Don't re-verify peer tips - that can cause infinite loops if network keeps producing blocks
-                log_info("IBD: sync complete after stability check, height=" + std::to_string(chain.height()));
-
-                if (tui && can_tui) {
-                    tui->set_ibd_progress(chain.height(),
-                                          chain.height(),
-                                          (chain.height() >= height_at_seed_connect ? (chain.height() - height_at_seed_connect) : 0),
-                                          "complete", seed_host_cstr(), true);
-                }
-                mark_ibd_complete();  // Enable full durability now that sync is complete
-                return true;
+            if (tui && can_tui) {
+                tui->set_ibd_progress(chain.height(),
+                                      chain.height(),
+                                      (chain.height() >= height_at_seed_connect ? (chain.height() - height_at_seed_connect) : 0),
+                                      "complete", seed_host_cstr(), true);
             }
+            mark_ibd_complete();  // Enable full durability now that sync is complete
+            return true;
         }
 
         std::this_thread::sleep_for(250ms);
