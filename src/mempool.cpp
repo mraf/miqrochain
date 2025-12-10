@@ -729,6 +729,28 @@ void Mempool::on_block_connect(const Block& b){
     }
 }
 
+// CRITICAL FIX: Overload that promotes orphans whose parent was in the connected block
+// Without this, orphan TXs can get stuck forever if their parent is mined directly
+void Mempool::on_block_connect(const Block& b, const UTXOView& utxo, uint32_t height){
+    // First do the standard block connect logic
+    on_block_connect(b);
+
+    // Now try to promote any orphans whose parent was in this block
+    // This is critical because orphans waiting for a parent that gets mined
+    // (rather than going through mempool) would otherwise be stuck forever
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    for (size_t i=1; i<b.txs.size(); ++i){
+        const auto& tx = b.txs[i];
+        Key parent_key = k(tx.txid());
+        try_promote_orphans_depending_on(parent_key, utxo, height);
+    }
+}
+
+void Mempool::on_block_connect(const Block& b, const UTXOSet& utxo, uint32_t height){
+    UTXOAdapter a(utxo);
+    on_block_connect(b, static_cast<const UTXOView&>(a), height);
+}
+
 void Mempool::on_block_disconnect(const Block& b, const UTXOView& utxo, uint32_t height){
     std::lock_guard<std::recursive_mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
     // Try to re-accept all non-coinbase txs in block order

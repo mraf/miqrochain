@@ -1824,8 +1824,8 @@ std::string RpcService::handle(const std::string& body){
                 return err(std::string("submitblock: rejected: ")+e);
             }
 
-            // CRITICAL FIX: Notify mempool to remove confirmed transactions
-            mempool_.on_block_connect(b);
+            // CRITICAL FIX: Notify mempool and promote orphan TXs
+            mempool_.on_block_connect(b, chain_.utxo(), (uint32_t)chain_.height());
 
             // CRITICAL FIX: Notify TUI about the new locally-mined block
             // This ensures Recent Blocks and Recent TXIDs update for local mining

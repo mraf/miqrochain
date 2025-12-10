@@ -3768,7 +3768,8 @@ void P2P::process_pending_blocks() {
                 if (chain_.have_block(b.block_hash())) {
                     blocks_processed++;
                     if (mempool_) {
-                        mempool_->on_block_connect(b);
+                        // CRITICAL FIX: Use overload that promotes orphan TXs
+                        mempool_->on_block_connect(b, chain_.utxo(), (uint32_t)chain_.height());
                     }
                     broadcast_inv_block(it->second.hash);
                     g_last_progress_ms = now_ms();
@@ -3807,7 +3808,8 @@ void P2P::process_pending_blocks() {
 
             // Notify mempool
             if (mempool_) {
-                mempool_->on_block_connect(b);
+                // CRITICAL FIX: Use overload that promotes orphan TXs
+                mempool_->on_block_connect(b, chain_.utxo(), (uint32_t)chain_.height());
             }
 
             // Broadcast to peers
@@ -4172,9 +4174,9 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
 
         std::string err;
         if (chain_.submit_block(ob, err)) {
-            // CRITICAL FIX: Notify mempool to remove confirmed transactions
+            // CRITICAL FIX: Notify mempool and promote orphan TXs
             if (mempool_) {
-                mempool_->on_block_connect(ob);
+                mempool_->on_block_connect(ob, chain_.utxo(), (uint32_t)chain_.height());
             }
             const std::string miner = miq_miner_from_block(ob);
             log_info("P2P: accepted orphan as block height=" + std::to_string(chain_.height())

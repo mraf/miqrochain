@@ -113,6 +113,9 @@ public:
 
     // When a block connects: remove its transactions and any conflicts.
     void on_block_connect(const Block& b);
+    // CRITICAL FIX: Overload that also promotes orphans whose parent was in the block
+    void on_block_connect(const Block& b, const UTXOView& utxo, uint32_t height);
+    void on_block_connect(const Block& b, const UTXOSet& utxo, uint32_t height);
 
     // When a block disconnects (reorg): try re-adding its non-coinbase txs.
     void on_block_disconnect(const Block& b, const UTXOView& utxo, uint32_t height);
