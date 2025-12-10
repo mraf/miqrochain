@@ -280,11 +280,14 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
 #define MIQ_HEADERS_EMPTY_LIMIT 8
 #endif
 
+// ULTRA-FAST PROPAGATION: Increased rate limits for sub-second block relay
+// Block rate: 10MB/s (was 1MB/s) - allows instant block push to all peers
+// Burst: 20MB (was 2MB) - handles block storms without throttling
 #ifndef MIQ_RATE_BLOCK_BPS
-#define MIQ_RATE_BLOCK_BPS (1024u * 1024u)
+#define MIQ_RATE_BLOCK_BPS (10u * 1024u * 1024u)
 #endif
 #ifndef MIQ_RATE_TX_BPS
-#define MIQ_RATE_TX_BPS    (256u * 1024u)
+#define MIQ_RATE_TX_BPS    (1024u * 1024u)
 #endif
 #ifndef MIQ_RATE_BLOCK_BURST
 #define MIQ_RATE_BLOCK_BURST (MIQ_RATE_BLOCK_BPS * 2u)
@@ -2916,13 +2919,13 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
 }
 
 void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
-    // CRITICAL OPTIMIZATION: Send full block directly to peers for instant propagation
-    // This eliminates the invb→getb→block round-trip that causes fork opportunities
-    // Similar to how broadcast_inv_tx sends both inv and full tx
+    // ULTRA-FAST BLOCK PROPAGATION: Push full block to ALL peers immediately
+    // Goal: Sub-1-second network-wide propagation
+    // Strategy: Collect peer sockets under lock, then send OUTSIDE lock for parallelism
 
     if (h.size() != 32) return;
 
-    // Read the block from chain
+    // Read the block from chain (outside lock)
     std::vector<uint8_t> raw_block;
     {
         Block b;
@@ -2931,44 +2934,44 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
         }
     }
 
-    // Send to all connected peers
+    // Prepare messages once (outside lock)
+    auto invb_msg = encode_msg("invb", h);
+    std::vector<uint8_t> block_msg;
+    if (!raw_block.empty() && raw_block.size() < 4 * 1024 * 1024) {  // Increased limit to 4MB
+        block_msg = encode_msg("block", raw_block);
+    }
+
+    // Collect peer sockets under lock (fast)
+    std::vector<Sock> all_sockets;
     {
         std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
-        auto invb_msg = encode_msg("invb", h);
-        std::vector<uint8_t> block_msg;
-        if (!raw_block.empty() && raw_block.size() < 2 * 1024 * 1024) {  // Only direct-send blocks under 2MB
-            block_msg = encode_msg("block", raw_block);
-        }
-
-        int inv_sent = 0;
-        int block_sent = 0;
+        all_sockets.reserve(peers_.size());
         for (auto& kv : peers_) {
             if (kv.second.verack_ok) {
-                // Always send invb first (lightweight notification)
-                if (send_or_close(kv.first, invb_msg)) {
-                    inv_sent++;
-                }
-                // CRITICAL: Also send full block directly to high-bandwidth/fast peers
-                // This bypasses the invb→getb→block round-trip entirely
-                // Only send to peers that support high-bandwidth relay or have good health
-                if (!block_msg.empty()) {
-                    // Send to: 1) compact block high-bandwidth peers, 2) fast peers, 3) first 8 peers
-                    // Increased from 4 to 8 for faster network-wide propagation
-                    bool should_send_direct = kv.second.compact_high_bandwidth ||
-                                              kv.second.health_score > 0.5 ||  // Lowered threshold from 0.7
-                                              block_sent < 8;  // Always send to at least 8 peers (was 4)
-                    if (should_send_direct) {
-                        if (send_or_close(kv.first, block_msg)) {
-                            block_sent++;
-                        }
-                    }
-                }
+                all_sockets.push_back(kv.first);
             }
         }
-        if (inv_sent > 0 || block_sent > 0) {
-            MIQ_LOG_DEBUG(miq::LogCategory::NET, "broadcast_inv_block: sent invb to " +
-                std::to_string(inv_sent) + " peers, block directly to " + std::to_string(block_sent) + " peers");
+    }
+
+    // Send to ALL peers OUTSIDE lock - no blocking under mutex
+    // This allows maximum parallelism and prevents lock contention
+    int block_sent = 0;
+    for (Sock s : all_sockets) {
+        // Send full block to ALL peers for fastest propagation
+        // No inv→getdata round-trip delay - push model
+        if (!block_msg.empty()) {
+            if (send_or_close(s, block_msg)) {
+                block_sent++;
+            }
+        } else {
+            // Fallback to invb only if block too large
+            (void)send_or_close(s, invb_msg);
         }
+    }
+
+    if (block_sent > 0) {
+        MIQ_LOG_DEBUG(miq::LogCategory::NET, "broadcast_inv_block: pushed block to " +
+            std::to_string(block_sent) + "/" + std::to_string(all_sockets.size()) + " peers");
     }
 
     // Also queue for async processing (handles late-connecting peers)
@@ -3952,58 +3955,64 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
 
     const auto bh = b.block_hash();
 
-    // CRITICAL OPTIMIZATION: Optimistic relay after PoW check
-    // Verify PoW immediately (fast) and relay to peers before full validation
-    // This dramatically reduces block propagation time and fork opportunities
+    // ULTRA-FAST OPTIMISTIC RELAY: Push to ALL peers after PoW check only
+    // Goal: Sub-1-second network propagation before full validation
+    // Strategy: Collect sockets under lock, send outside lock for parallelism
     static std::unordered_map<std::string, int64_t> recently_relayed;  // block hash -> timestamp
     static std::mutex relay_mu;
     std::string bh_key = hexkey(bh);
     const int64_t tnow = now_ms();
 
+    bool should_relay = false;
     {
         std::lock_guard<std::mutex> lk(relay_mu);
-        // Only relay if we haven't recently relayed this block
         if (recently_relayed.find(bh_key) == recently_relayed.end()) {
             // Fast PoW check - only hash comparison, no full validation
             if (miq::verify_block_pow(b)) {
-                // Valid PoW - relay immediately to all peers (except sender)
-                auto block_msg = encode_msg("block", raw);
-                auto invb_msg = encode_msg("invb", bh);
-
-                std::lock_guard<std::recursive_mutex> peers_lk(g_peers_mu);
-                int relayed = 0;
-                for (auto& kv : peers_) {
-                    if (kv.first != sock && kv.second.verack_ok) {
-                        // Send to fast/high-bandwidth peers directly
-                        // Increased from 3 to 6 for faster propagation
-                        if (kv.second.compact_high_bandwidth || kv.second.health_score > 0.5 || relayed < 6) {
-                            if (send_or_close(kv.first, block_msg)) {
-                                relayed++;
-                            }
-                        } else {
-                            // Send just inv to other peers
-                            (void)send_or_close(kv.first, invb_msg);
-                        }
-                    }
-                }
                 recently_relayed[bh_key] = tnow;
+                should_relay = true;
 
                 // Time-based cleanup: remove entries older than 60 seconds
-                // This prevents memory growth while preserving recent dedup tracking
                 if (recently_relayed.size() > 50) {
                     for (auto it = recently_relayed.begin(); it != recently_relayed.end(); ) {
-                        if (tnow - it->second > 60000) {  // 60 second TTL
+                        if (tnow - it->second > 60000) {
                             it = recently_relayed.erase(it);
                         } else {
                             ++it;
                         }
                     }
                 }
-
-                MIQ_LOG_DEBUG(miq::LogCategory::NET, "Optimistic relay: block " + bh_key.substr(0, 16) +
-                              " relayed to " + std::to_string(relayed) + " peers before validation");
             }
         }
+    }
+
+    if (should_relay) {
+        // Prepare message once (outside all locks)
+        auto block_msg = encode_msg("block", raw);
+
+        // Collect peer sockets under lock (fast)
+        std::vector<Sock> relay_sockets;
+        {
+            std::lock_guard<std::recursive_mutex> peers_lk(g_peers_mu);
+            relay_sockets.reserve(peers_.size());
+            for (auto& kv : peers_) {
+                if (kv.first != sock && kv.second.verack_ok) {
+                    relay_sockets.push_back(kv.first);
+                }
+            }
+        }
+
+        // Send to ALL peers OUTSIDE lock - maximum parallelism
+        int relayed = 0;
+        for (Sock s : relay_sockets) {
+            if (send_or_close(s, block_msg)) {
+                relayed++;
+            }
+        }
+
+        MIQ_LOG_DEBUG(miq::LogCategory::NET, "Optimistic relay: block " + bh_key.substr(0, 16) +
+                      " pushed to " + std::to_string(relayed) + "/" +
+                      std::to_string(relay_sockets.size()) + " peers before validation");
     }
 
     // CRITICAL FIX: Don't skip blocks that might have incomplete processing
@@ -5543,13 +5552,13 @@ void P2P::loop(){
 #endif
         }
 
-        // OPTIMIZATION: Reduced poll timeout from 200ms to 50ms for faster response
-        // This significantly improves latency for localhost/same-machine wallet connections
-        // while still allowing efficient batching of network events
+        // OPTIMIZATION: Aggressive 10ms poll timeout for sub-second block propagation
+        // Critical for ensuring blocks propagate across network in <1 second
+        // Trade-off: Slightly higher CPU usage for dramatically lower latency
 #ifdef _WIN32
-        int rc = WSAPoll(fds.data(), (ULONG)fds.size(), 50);
+        int rc = WSAPoll(fds.data(), (ULONG)fds.size(), 10);
 #else
-        int rc = poll(fds.data(), (nfds_t)fds.size(), 50);
+        int rc = poll(fds.data(), (nfds_t)fds.size(), 10);
 #endif
 
         // Tight loop detection - less aggressive to avoid hurting localhost performance
@@ -8299,22 +8308,58 @@ void P2P::handle_filterclear(PeerState& ps) {
 }
 
 // =============================================================================
-// CRITICAL FIX: Local block notification for TUI display
+// ULTRA-FAST LOCAL BLOCK PROPAGATION
+// For locally mined blocks - highest priority, immediate push to ALL peers
 // =============================================================================
 void P2P::notify_local_block(const Block& b, uint64_t height, uint64_t subsidy, const std::string& miner_addr) {
+    auto bh = b.block_hash();
+    std::string hash_hex;
+    hash_hex.reserve(64);
+    static const char hex[] = "0123456789abcdef";
+    for (uint8_t byte : bh) {
+        hash_hex.push_back(hex[byte >> 4]);
+        hash_hex.push_back(hex[byte & 0xf]);
+    }
+
+    // PRIORITY 1: Immediate broadcast to ALL peers (before callbacks)
+    // For locally mined blocks, we serialize directly - no chain read needed
+    // This saves ~1-5ms of disk I/O latency
+    {
+        auto raw_block = ser_block(b);
+        if (!raw_block.empty() && raw_block.size() < 4 * 1024 * 1024) {
+            auto block_msg = encode_msg("block", raw_block);
+
+            // Collect peer sockets under lock (fast)
+            std::vector<Sock> all_sockets;
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+                all_sockets.reserve(peers_.size());
+                for (auto& kv : peers_) {
+                    if (kv.second.verack_ok) {
+                        all_sockets.push_back(kv.first);
+                    }
+                }
+            }
+
+            // Send to ALL peers OUTSIDE lock - maximum speed
+            int sent = 0;
+            for (Sock s : all_sockets) {
+                if (send_or_close(s, block_msg)) {
+                    sent++;
+                }
+            }
+
+            MIQ_LOG_INFO(miq::LogCategory::NET, "LOCAL BLOCK " + hash_hex.substr(0, 16) +
+                         " at height " + std::to_string(height) +
+                         " pushed to " + std::to_string(sent) + "/" +
+                         std::to_string(all_sockets.size()) + " peers IMMEDIATELY");
+        }
+    }
+
+    // PRIORITY 2: TUI callback (non-blocking)
     if (block_callback_) {
         P2PBlockInfo info;
         info.height = height;
-
-        // Build hash hex
-        auto bh = b.block_hash();
-        std::string hash_hex;
-        hash_hex.reserve(64);
-        static const char hex[] = "0123456789abcdef";
-        for (uint8_t byte : bh) {
-            hash_hex.push_back(hex[byte >> 4]);
-            hash_hex.push_back(hex[byte & 0xf]);
-        }
         info.hash_hex = hash_hex;
         info.tx_count = static_cast<uint32_t>(b.txs.size());
         info.miner = miner_addr;
@@ -8331,11 +8376,10 @@ void P2P::notify_local_block(const Block& b, uint64_t height, uint64_t subsidy, 
         block_callback_(info);
     }
 
-    // Also notify about transactions in this block
+    // PRIORITY 3: Notify about transactions in this block
     if (txids_callback_ && b.txs.size() > 1) {
         std::vector<std::string> txids;
         txids.reserve(b.txs.size() - 1);
-        static const char hex[] = "0123456789abcdef";
         for (size_t i = 1; i < b.txs.size(); ++i) {
             auto tid = b.txs[i].txid();
             std::string key;
@@ -8349,8 +8393,8 @@ void P2P::notify_local_block(const Block& b, uint64_t height, uint64_t subsidy, 
         txids_callback_(txids);
     }
 
-    // Broadcast the block to peers
-    broadcast_inv_block(b.block_hash());
+    // Queue for late-connecting peers (async)
+    announce_block_async(bh);
 }
 
 }
