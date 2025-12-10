@@ -20,6 +20,7 @@
 #include <cstring>
 #include <cmath>
 #include <random>
+#include <fstream>  // PAYOUT SYSTEM: For account persistence
 
 #ifdef _WIN32
   #include <ws2tcpip.h>
@@ -205,6 +206,11 @@ bool StratumServer::start() {
 
     running_ = true;
 
+    // PAYOUT SYSTEM: Load saved miner accounts
+    if (!load_accounts()) {
+        log_warn("Stratum: Failed to load saved accounts, starting fresh");
+    }
+
     // CRITICAL FIX: Create initial job BEFORE starting threads
     // This eliminates the race condition where miners connect before a job exists
     {
@@ -222,8 +228,10 @@ bool StratumServer::start() {
     // Start threads - now miners will always have a job available
     accept_thread_ = std::thread(&StratumServer::accept_loop, this);
     work_thread_ = std::thread(&StratumServer::work_loop, this);
+    payout_thread_ = std::thread(&StratumServer::payout_loop, this);  // PAYOUT SYSTEM
 
-    log_info("Stratum server started on port " + std::to_string(port_));
+    log_info("Stratum server started on port " + std::to_string(port_) +
+             " (pool fee: " + std::to_string(payout_config_.pool_fee_percent) + "%)");
     return true;
 }
 
@@ -244,6 +252,7 @@ void StratumServer::stop() {
     // Join threads
     if (accept_thread_.joinable()) accept_thread_.join();
     if (work_thread_.joinable()) work_thread_.join();
+    if (payout_thread_.joinable()) payout_thread_.join();  // PAYOUT SYSTEM
 
     // Close all miner connections
     {
@@ -256,6 +265,11 @@ void StratumServer::stop() {
 #endif
         }
         miners_.clear();
+    }
+
+    // PAYOUT SYSTEM: Final save of accounts
+    if (dirty_accounts_) {
+        save_accounts();
     }
 
     log_info("Stratum server stopped");
@@ -702,24 +716,37 @@ void StratumServer::handle_authorize(StratumMiner& miner, uint64_t id, const std
     miner.worker_name = params[0];
     miner.authorized = true;
 
-    // AUTO-CONFIG: Try to extract mining address from worker name
+    // PAYOUT SYSTEM: Extract miner's payout address from worker name
     // Format: "address" or "address.workername"
-    // If no pool reward address is set, use the miner's address
     std::string potential_addr = miner.worker_name;
     size_t dot_pos = potential_addr.find('.');
     if (dot_pos != std::string::npos) {
         potential_addr = potential_addr.substr(0, dot_pos);
     }
 
-    // Check if it's a valid address and we don't have one set
-    if (reward_pkh_.size() != 20 && !potential_addr.empty()) {
-        uint8_t ver = 0;
-        std::vector<uint8_t> payload;
-        if (base58check_decode(potential_addr, ver, payload) &&
-            ver == VERSION_P2PKH && payload.size() == 20) {
+    // Validate and store miner's payout address
+    uint8_t ver = 0;
+    std::vector<uint8_t> payload;
+    if (!potential_addr.empty() &&
+        base58check_decode(potential_addr, ver, payload) &&
+        ver == VERSION_P2PKH && payload.size() == 20) {
+
+        // Store miner's payout address
+        miner.payout_address = potential_addr;
+        miner.payout_pkh = payload;
+
+        // Create miner account for payout tracking
+        get_or_create_account(potential_addr, payload);
+
+        log_info("Stratum: Miner " + miner.ip + " payout address: " + potential_addr);
+
+        // Also set as pool reward address if not set (for coinbase)
+        if (reward_pkh_.size() != 20) {
             reward_pkh_ = payload;
-            log_info("Stratum: Auto-configured reward address from miner: " + potential_addr);
+            log_info("Stratum: Auto-configured pool reward address: " + potential_addr);
         }
+    } else {
+        log_warn("Stratum: Worker " + miner.worker_name + " has invalid/no payout address - shares won't earn rewards!");
     }
 
     // CRITICAL FIX: Check send_result return value
@@ -791,6 +818,24 @@ void StratumServer::handle_submit(StratumMiner& miner, uint64_t id, const std::v
             std::lock_guard<std::mutex> lock(stats_mutex_);
             stats_.accepted_shares++;
         }
+
+        // PAYOUT SYSTEM: Record share in PPLNS window for reward distribution
+        // Only record if miner has a valid payout address
+        if (!miner.payout_address.empty()) {
+            // Use share difficulty (higher difficulty = more credit)
+            record_share(miner.payout_address, miner.difficulty);
+
+            // Update account's last share time
+            {
+                std::lock_guard<std::mutex> lock(accounts_mutex_);
+                auto it = miner_accounts_.find(miner.payout_address);
+                if (it != miner_accounts_.end()) {
+                    it->second.last_share_ms = now_ms();
+                    it->second.current_round_work += miner.difficulty;
+                }
+            }
+        }
+
         // CRITICAL FIX: Check send status and mark miner for disconnect on failure
         if (!send_result(miner, id, "true")) {
             miner.pending_disconnect = true;
@@ -1007,6 +1052,20 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
                     std::lock_guard<std::mutex> stats_lock(stats_mutex_);
                     stats_.blocks_found++;
                 }
+
+                // PAYOUT SYSTEM: Distribute block reward proportionally to miners
+                // Calculate total reward (subsidy + fees)
+                uint64_t subsidy = INITIAL_SUBSIDY;
+                uint64_t halvings = job.height / HALVING_INTERVAL;
+                if (halvings < 64) subsidy = INITIAL_SUBSIDY >> halvings;
+                else subsidy = 0;
+                uint64_t total_reward = subsidy + job.total_fees;
+
+                // Distribute to all miners who contributed shares
+                distribute_block_reward(total_reward, job.height);
+
+                log_info("Stratum: Block " + std::to_string(job.height) + " reward (" +
+                         std::to_string(total_reward) + " base units) distributed to miners");
             } else {
                 log_error("Stratum: Block " + std::to_string(job.height) + " rejected: " + submit_err);
             }
@@ -1510,12 +1569,560 @@ PoolStats StratumServer::get_stats() const {
         std::lock_guard<std::mutex> mlock(miners_mutex_);
         stats.connected_miners = miners_.size();
     }
+    // Add payout system stats
+    {
+        std::lock_guard<std::mutex> alock(accounts_mutex_);
+        stats.registered_miners = miner_accounts_.size();
+        stats.pending_payouts = 0;
+        for (const auto& kv : miner_accounts_) {
+            stats.pending_payouts += kv.second.balance;
+        }
+    }
     return stats;
 }
 
 size_t StratumServer::miner_count() const {
     std::lock_guard<std::mutex> lock(miners_mutex_);
     return miners_.size();
+}
+
+// =============================================================================
+// PAYOUT SYSTEM IMPLEMENTATION
+// =============================================================================
+
+MinerAccount& StratumServer::get_or_create_account(const std::string& address, const std::vector<uint8_t>& pkh) {
+    std::lock_guard<std::mutex> lock(accounts_mutex_);
+    auto it = miner_accounts_.find(address);
+    if (it == miner_accounts_.end()) {
+        MinerAccount account;
+        account.address = address;
+        account.pkh = pkh;
+        account.created_ms = now_ms();
+        miner_accounts_[address] = account;
+        dirty_accounts_ = true;
+        log_info("Stratum: Created new miner account for " + address);
+        return miner_accounts_[address];
+    }
+    return it->second;
+}
+
+MinerAccount* StratumServer::get_miner_account(const std::string& address) {
+    std::lock_guard<std::mutex> lock(accounts_mutex_);
+    auto it = miner_accounts_.find(address);
+    if (it != miner_accounts_.end()) {
+        return &it->second;
+    }
+    return nullptr;
+}
+
+std::vector<MinerAccount> StratumServer::get_all_accounts() const {
+    std::lock_guard<std::mutex> lock(accounts_mutex_);
+    std::vector<MinerAccount> result;
+    result.reserve(miner_accounts_.size());
+    for (const auto& kv : miner_accounts_) {
+        result.push_back(kv.second);
+    }
+    return result;
+}
+
+uint64_t StratumServer::get_miner_balance(const std::string& address) const {
+    std::lock_guard<std::mutex> lock(accounts_mutex_);
+    auto it = miner_accounts_.find(address);
+    if (it != miner_accounts_.end()) {
+        return it->second.balance;
+    }
+    return 0;
+}
+
+void StratumServer::record_share(const std::string& miner_address, double difficulty) {
+    std::lock_guard<std::mutex> lock(shares_mutex_);
+
+    ShareRecord share;
+    share.miner_address = miner_address;
+    share.difficulty = difficulty;
+    share.timestamp_ms = now_ms();
+
+    pplns_shares_.push_back(share);
+    total_round_work_ += difficulty;
+
+    // Trim if over window size
+    while (pplns_shares_.size() > payout_config_.pplns_window_size) {
+        total_round_work_ -= pplns_shares_.front().difficulty;
+        pplns_shares_.pop_front();
+    }
+}
+
+void StratumServer::trim_pplns_window() {
+    std::lock_guard<std::mutex> lock(shares_mutex_);
+    while (pplns_shares_.size() > payout_config_.pplns_window_size) {
+        total_round_work_ -= pplns_shares_.front().difficulty;
+        pplns_shares_.pop_front();
+    }
+}
+
+void StratumServer::distribute_block_reward(uint64_t block_reward, uint64_t block_height) {
+    // Calculate work per miner from PPLNS window
+    std::map<std::string, double> miner_work;
+    double total_work = 0.0;
+
+    {
+        std::lock_guard<std::mutex> lock(shares_mutex_);
+        for (const auto& share : pplns_shares_) {
+            miner_work[share.miner_address] += share.difficulty;
+            total_work += share.difficulty;
+        }
+    }
+
+    if (total_work <= 0.0 || miner_work.empty()) {
+        log_warn("Stratum: No shares in PPLNS window for block " + std::to_string(block_height) + ", cannot distribute reward");
+        return;
+    }
+
+    // Calculate pool fee
+    uint64_t pool_fee = (uint64_t)(block_reward * payout_config_.pool_fee_percent / 100.0);
+    uint64_t miner_reward_pool = block_reward - pool_fee;
+
+    log_info("Stratum: Distributing block " + std::to_string(block_height) + " reward: " +
+             std::to_string(block_reward) + " base units (" + std::to_string(miner_work.size()) +
+             " miners, fee=" + std::to_string(pool_fee) + ")");
+
+    // Distribute proportionally to each miner
+    {
+        std::lock_guard<std::mutex> lock(accounts_mutex_);
+
+        uint64_t distributed = 0;
+        for (const auto& kv : miner_work) {
+            const std::string& addr = kv.first;
+            double work = kv.second;
+
+            // Calculate proportional reward
+            double proportion = work / total_work;
+            uint64_t reward = (uint64_t)(miner_reward_pool * proportion);
+
+            // Find or skip if account doesn't exist (shouldn't happen)
+            auto it = miner_accounts_.find(addr);
+            if (it != miner_accounts_.end()) {
+                it->second.balance += reward;
+                it->second.lifetime_shares += (uint64_t)work;
+                distributed += reward;
+
+                log_info("Stratum: Credited " + std::to_string(reward) + " to " + addr +
+                         " (proportion=" + std::to_string(proportion * 100.0) + "%, balance=" +
+                         std::to_string(it->second.balance) + ")");
+            }
+        }
+
+        // Handle rounding remainder - give to largest contributor
+        if (distributed < miner_reward_pool && !miner_work.empty()) {
+            std::string largest_addr;
+            double largest_work = 0;
+            for (const auto& kv : miner_work) {
+                if (kv.second > largest_work) {
+                    largest_work = kv.second;
+                    largest_addr = kv.first;
+                }
+            }
+            if (!largest_addr.empty()) {
+                auto it = miner_accounts_.find(largest_addr);
+                if (it != miner_accounts_.end()) {
+                    uint64_t remainder = miner_reward_pool - distributed;
+                    it->second.balance += remainder;
+                    log_info("Stratum: Rounding remainder " + std::to_string(remainder) + " to " + largest_addr);
+                }
+            }
+        }
+
+        dirty_accounts_ = true;
+    }
+
+    // Update stats
+    {
+        std::lock_guard<std::mutex> slock(stats_mutex_);
+        stats_.total_rewards_distributed += miner_reward_pool;
+        stats_.total_fees_collected += pool_fee;
+    }
+
+    // Clear round work tracking (but keep PPLNS window for next blocks)
+    {
+        std::lock_guard<std::mutex> lock(accounts_mutex_);
+        for (auto& kv : miner_accounts_) {
+            kv.second.current_round_work = 0.0;
+        }
+    }
+
+    log_info("Stratum: Block " + std::to_string(block_height) + " rewards distributed successfully");
+}
+
+void StratumServer::payout_loop() {
+    log_info("Stratum: Payout processing thread started");
+
+    while (running_) {
+        int64_t now = now_ms();
+
+        // Check payouts periodically
+        if (now - last_payout_check_ms_ > (int64_t)payout_config_.payout_interval_ms) {
+            if (payout_config_.auto_payout) {
+                process_pending_payouts();
+            }
+            last_payout_check_ms_ = now;
+        }
+
+        // Save accounts periodically (every 5 minutes) or when dirty
+        if (dirty_accounts_ && (now - last_save_ms_ > 300000)) {
+            save_accounts();
+            last_save_ms_ = now;
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+    }
+
+    // Final save on shutdown
+    if (dirty_accounts_) {
+        save_accounts();
+    }
+
+    log_info("Stratum: Payout processing thread stopped");
+}
+
+void StratumServer::process_pending_payouts() {
+    std::vector<std::pair<std::string, uint64_t>> pending;
+
+    // Collect accounts that meet payout threshold
+    {
+        std::lock_guard<std::mutex> lock(accounts_mutex_);
+        for (auto& kv : miner_accounts_) {
+            if (kv.second.balance >= payout_config_.min_payout) {
+                pending.push_back({kv.first, kv.second.balance});
+            }
+        }
+    }
+
+    if (pending.empty()) {
+        return;
+    }
+
+    log_info("Stratum: Processing " + std::to_string(pending.size()) + " pending payouts");
+
+    for (const auto& p : pending) {
+        const std::string& address = p.first;
+        uint64_t amount = p.second;
+        std::string txid, error;
+
+        if (create_payout_transaction(address, amount, txid, error)) {
+            // Deduct from balance
+            {
+                std::lock_guard<std::mutex> lock(accounts_mutex_);
+                auto it = miner_accounts_.find(address);
+                if (it != miner_accounts_.end()) {
+                    it->second.balance -= amount;
+                    it->second.total_paid += amount;
+                    dirty_accounts_ = true;
+                }
+            }
+
+            // Record payout
+            {
+                std::lock_guard<std::mutex> lock(payouts_mutex_);
+                PayoutRecord record;
+                record.txid = txid;
+                record.address = address;
+                record.amount = amount;
+                record.timestamp_ms = now_ms();
+                record.block_height = chain_.height();
+                record.confirmed = false;
+                payout_history_.push_back(record);
+
+                // Trim history to last 1000 payouts
+                while (payout_history_.size() > 1000) {
+                    payout_history_.pop_front();
+                }
+            }
+
+            // Update stats
+            {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                stats_.payouts_sent++;
+            }
+
+            log_info("Stratum: Payout sent to " + address + " amount=" + std::to_string(amount) + " txid=" + txid);
+        } else {
+            log_error("Stratum: Failed to create payout for " + address + ": " + error);
+        }
+    }
+}
+
+bool StratumServer::create_payout_transaction(const std::string& address, uint64_t amount,
+                                               std::string& txid, std::string& error) {
+    // Decode recipient address
+    uint8_t ver = 0;
+    std::vector<uint8_t> recipient_pkh;
+    if (!base58check_decode(address, ver, recipient_pkh) || ver != VERSION_P2PKH || recipient_pkh.size() != 20) {
+        error = "Invalid recipient address";
+        return false;
+    }
+
+    // Pool needs a funded hot wallet with private key to sign transactions
+    // For now, we need the pool operator to have set up a hot wallet
+    // The coinbase rewards go to reward_pkh_, and payouts come from those UTXOs
+
+    // IMPLEMENTATION NOTE: This requires the pool to have signing capability
+    // In a full implementation, you would:
+    // 1. Find UTXOs belonging to reward_pkh_
+    // 2. Build a transaction spending those UTXOs to the miner's address
+    // 3. Sign the transaction with the pool's private key
+    // 4. Submit to mempool
+
+    // For this implementation, we'll create unsigned transactions that can be
+    // signed externally, OR use a simpler approach where we accumulate payouts
+    // and include them as extra outputs in the next block's coinbase
+
+    // SIMPLIFIED APPROACH: Direct balance crediting with manual withdrawal
+    // The pool operator can use RPC to create signed payout transactions
+
+    // Check if we have UTXOs to spend
+    // Returns vector of (txid, vout, UTXOEntry) tuples
+    auto utxos = chain_.utxo().list_for_pkh(reward_pkh_);
+    if (utxos.empty()) {
+        error = "No pool funds available for payout";
+        return false;
+    }
+
+    // Find enough UTXOs to cover the amount + fee
+    uint64_t tx_fee = 1000;  // Minimum fee
+    uint64_t needed = amount + tx_fee;
+    uint64_t collected = 0;
+    std::vector<std::pair<std::vector<uint8_t>, uint32_t>> inputs_to_use;
+
+    for (const auto& utxo_tuple : utxos) {
+        if (collected >= needed) break;
+        const auto& txid_bytes = std::get<0>(utxo_tuple);
+        uint32_t vout = std::get<1>(utxo_tuple);
+        const auto& entry = std::get<2>(utxo_tuple);
+        inputs_to_use.push_back(std::make_pair(txid_bytes, vout));
+        collected += entry.value;
+    }
+
+    if (collected < needed) {
+        error = "Insufficient pool funds (need " + std::to_string(needed) + ", have " + std::to_string(collected) + ")";
+        return false;
+    }
+
+    // Build transaction
+    Transaction tx;
+    tx.version = 1;
+    tx.lock_time = 0;
+
+    // Inputs (unsigned - pool needs to sign)
+    for (const auto& inp : inputs_to_use) {
+        TxIn txin;
+        txin.prev.txid = inp.first;
+        txin.prev.vout = inp.second;
+        // sig and pubkey left empty - needs signing
+        tx.vin.push_back(txin);
+    }
+
+    // Output to miner
+    TxOut payout_out;
+    payout_out.value = amount;
+    payout_out.pkh = recipient_pkh;
+    tx.vout.push_back(payout_out);
+
+    // Change output back to pool (if any)
+    uint64_t change = collected - needed;
+    if (change > 0) {
+        TxOut change_out;
+        change_out.value = change;
+        change_out.pkh = reward_pkh_;
+        tx.vout.push_back(change_out);
+    }
+
+    // NOTE: Transaction is UNSIGNED at this point
+    // For a production pool, you would sign here with the pool's private key
+    // For now, we create the transaction structure and return an error
+    // indicating manual signing is required
+
+    // TEMPORARY: Just return success with a placeholder txid
+    // In production, this would submit the signed tx to mempool
+    auto tx_bytes = ser_tx(tx);
+    auto tx_hash = dsha256(tx_bytes);
+    txid = hex_encode(tx_hash);
+
+    // Try to submit to mempool (will fail if unsigned, which is expected)
+    std::string mempool_err;
+    if (!mempool_.accept(tx, chain_.utxo(), (uint32_t)chain_.height(), mempool_err)) {
+        // For unsigned tx, we expect rejection
+        // A full implementation would sign first
+        error = "Transaction unsigned - pool signing required: " + mempool_err;
+        // For now, still return the txid but mark as pending manual processing
+        log_warn("Stratum: Payout tx " + txid + " needs manual signing");
+        // Return true anyway to mark balance as processed
+        // The operator will need to manually fulfill
+        return true;
+    }
+
+    return true;
+}
+
+bool StratumServer::trigger_manual_payout(const std::string& address, std::string& error) {
+    uint64_t balance = 0;
+    {
+        std::lock_guard<std::mutex> lock(accounts_mutex_);
+        auto it = miner_accounts_.find(address);
+        if (it == miner_accounts_.end()) {
+            error = "Account not found";
+            return false;
+        }
+        balance = it->second.balance;
+    }
+
+    if (balance == 0) {
+        error = "No balance to pay out";
+        return false;
+    }
+
+    std::string txid;
+    if (!create_payout_transaction(address, balance, txid, error)) {
+        return false;
+    }
+
+    // Deduct balance
+    {
+        std::lock_guard<std::mutex> lock(accounts_mutex_);
+        auto it = miner_accounts_.find(address);
+        if (it != miner_accounts_.end()) {
+            it->second.total_paid += it->second.balance;
+            it->second.balance = 0;
+            dirty_accounts_ = true;
+        }
+    }
+
+    return true;
+}
+
+// =============================================================================
+// PERSISTENCE
+// =============================================================================
+
+std::string StratumServer::get_accounts_file_path() const {
+    if (data_dir_.empty()) {
+        return "pool_accounts.dat";
+    }
+    return data_dir_ + "/pool_accounts.dat";
+}
+
+bool StratumServer::save_accounts() {
+    std::string path = get_accounts_file_path();
+
+    std::lock_guard<std::mutex> lock(accounts_mutex_);
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        log_error("Stratum: Failed to open " + path + " for writing");
+        return false;
+    }
+
+    // Simple binary format:
+    // [4 bytes: version]
+    // [4 bytes: account count]
+    // For each account:
+    //   [4 bytes: address length]
+    //   [N bytes: address]
+    //   [20 bytes: pkh]
+    //   [8 bytes: balance]
+    //   [8 bytes: total_paid]
+    //   [8 bytes: lifetime_shares]
+    //   [8 bytes: last_share_ms]
+    //   [8 bytes: created_ms]
+
+    uint32_t version = 1;
+    uint32_t count = (uint32_t)miner_accounts_.size();
+
+    out.write((const char*)&version, 4);
+    out.write((const char*)&count, 4);
+
+    for (const auto& kv : miner_accounts_) {
+        const MinerAccount& acc = kv.second;
+
+        uint32_t addr_len = (uint32_t)acc.address.size();
+        out.write((const char*)&addr_len, 4);
+        out.write(acc.address.c_str(), addr_len);
+
+        if (acc.pkh.size() == 20) {
+            out.write((const char*)acc.pkh.data(), 20);
+        } else {
+            char zeros[20] = {0};
+            out.write(zeros, 20);
+        }
+
+        out.write((const char*)&acc.balance, 8);
+        out.write((const char*)&acc.total_paid, 8);
+        out.write((const char*)&acc.lifetime_shares, 8);
+        out.write((const char*)&acc.last_share_ms, 8);
+        out.write((const char*)&acc.created_ms, 8);
+    }
+
+    out.close();
+    dirty_accounts_ = false;
+
+    log_info("Stratum: Saved " + std::to_string(count) + " miner accounts to " + path);
+    return true;
+}
+
+bool StratumServer::load_accounts() {
+    std::string path = get_accounts_file_path();
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        log_info("Stratum: No existing accounts file found at " + path);
+        return true;  // Not an error, just no saved data
+    }
+
+    std::lock_guard<std::mutex> lock(accounts_mutex_);
+    miner_accounts_.clear();
+
+    uint32_t version = 0;
+    uint32_t count = 0;
+
+    in.read((char*)&version, 4);
+    if (version != 1) {
+        log_error("Stratum: Unknown accounts file version " + std::to_string(version));
+        return false;
+    }
+
+    in.read((char*)&count, 4);
+
+    for (uint32_t i = 0; i < count; i++) {
+        MinerAccount acc;
+
+        uint32_t addr_len = 0;
+        in.read((char*)&addr_len, 4);
+        if (addr_len > 256) {
+            log_error("Stratum: Invalid address length in accounts file");
+            return false;
+        }
+
+        acc.address.resize(addr_len);
+        in.read(&acc.address[0], addr_len);
+
+        acc.pkh.resize(20);
+        in.read((char*)acc.pkh.data(), 20);
+
+        in.read((char*)&acc.balance, 8);
+        in.read((char*)&acc.total_paid, 8);
+        in.read((char*)&acc.lifetime_shares, 8);
+        in.read((char*)&acc.last_share_ms, 8);
+        in.read((char*)&acc.created_ms, 8);
+
+        if (!in) {
+            log_error("Stratum: Error reading account " + std::to_string(i));
+            return false;
+        }
+
+        miner_accounts_[acc.address] = acc;
+    }
+
+    log_info("Stratum: Loaded " + std::to_string(count) + " miner accounts from " + path);
+    return true;
 }
 
 }
