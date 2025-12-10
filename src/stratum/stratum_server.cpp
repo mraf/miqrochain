@@ -1281,7 +1281,9 @@ StratumJob StratumServer::create_job() {
     put_u32_le(coinb2_bytes, 0);  // pubkey length (no pubkey for coinbase)
 
     // ==========================================================================
-    // DIRECT COINBASE PAYOUTS - Calculate miner shares and build multi-output coinbase
+    // DIRECT COINBASE PAYOUTS - Multi-output coinbase for proportional rewards
+    // Each contributing miner gets paid directly in the coinbase transaction.
+    // This is trustless - no pool wallet signing required.
     // ==========================================================================
     uint64_t total_reward = subsidy + job.total_fees;
     job.total_reward = total_reward;
@@ -1376,12 +1378,11 @@ StratumJob StratumServer::create_job() {
             job.coinbase_outputs.push_back(fee_out);
         }
 
-        log_info("Stratum: Job " + job.job_id + " - Direct coinbase payouts to " +
+        log_info("Stratum: Job " + job.job_id + " - Multi-output coinbase to " +
                  std::to_string(miner_work.size()) + " miners (reward=" +
                  std::to_string(total_reward) + ", fee=" + std::to_string(pool_fee) + ")");
     } else {
-        // No PPLNS shares - fall back to single output to pool address
-        // This happens at pool startup or when no miners have submitted shares yet
+        // No PPLNS shares - single output to pool address
         CoinbaseOutput out;
         out.address = "pool";
         out.pkh = reward_pkh_.size() == 20 ? reward_pkh_ : std::vector<uint8_t>(20, 0);
@@ -1389,10 +1390,10 @@ StratumJob StratumServer::create_job() {
         out.is_pool_fee = false;
         job.coinbase_outputs.push_back(out);
 
-        log_info("Stratum: Job " + job.job_id + " - No PPLNS shares, reward to pool address");
+        log_info("Stratum: Job " + job.job_id + " - No PPLNS shares, single output to pool");
     }
 
-    // Build coinbase outputs
+    // Build coinbase outputs (supports multi-output)
     put_u32_le(coinb2_bytes, (uint32_t)job.coinbase_outputs.size());  // output count
 
     for (const auto& out : job.coinbase_outputs) {
