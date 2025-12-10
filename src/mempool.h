@@ -256,6 +256,11 @@ private:
     // their parent tx (and thus fee) is unknown until the parent arrives
     std::deque<Key> orphan_order_;
 
+    // CRITICAL FIX: Track orphan insertion time for expiration
+    // Orphans from forks will never have their parent arrive, so they must expire
+    std::unordered_map<Key, int64_t> orphan_added_ms_;
+    static constexpr int64_t ORPHAN_EXPIRY_MS = 30 * 60 * 1000;  // 30 minutes
+
     // CRITICAL FIX: Orphan pool limits
     static constexpr size_t MAX_ORPHANS = 10000;  // Production: 10x more
     static constexpr size_t MAX_ORPHAN_BYTES = 64 * 1024 * 1024; // 64 MiB production

@@ -531,6 +531,7 @@ void Mempool::add_orphan(const Transaction& tx){
             }
         }
         orphan_bytes_ -= old_size;
+        orphan_added_ms_.erase(oldest_key);  // Clean up timestamp
         orphans_.erase(it);
         return true;
     };
@@ -553,6 +554,7 @@ void Mempool::add_orphan(const Transaction& tx){
     orphans_.emplace(ck, tx);
     orphan_bytes_ += tx_size;
     orphan_order_.push_back(ck);  // FIX: Track insertion order for FIFO eviction
+    orphan_added_ms_[ck] = now_ms();  // Track insertion time for expiration
 
     for (const auto& in : tx.vin){
         Key pk = k(in.prev.txid);
@@ -581,6 +583,7 @@ void Mempool::remove_orphan(const Key& ck){
         }
     }
     orphans_.erase(it);
+    orphan_added_ms_.erase(ck);  // Clean up timestamp
 
     // FIX: Remove from FIFO order tracking
     // Note: This is O(n) scan but acceptable since orphan removal is infrequent
@@ -673,8 +676,10 @@ void Mempool::trim_to_size(size_t max_bytes){
 
 void Mempool::maintenance(){
     std::lock_guard<std::recursive_mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
-    // Expire very old entries
-    int64_t cutoff = now_ms() - (int64_t)MIQ_MEMPOOL_TX_EXPIRY_SECS * 1000;
+    int64_t tnow = now_ms();
+
+    // Expire very old mempool entries (14 days)
+    int64_t cutoff = tnow - (int64_t)MIQ_MEMPOOL_TX_EXPIRY_SECS * 1000;
     std::vector<Key> expired;
     for (const auto& kv : map_) {
         if (kv.second.added_ms < cutoff) expired.push_back(kv.first);
@@ -686,6 +691,24 @@ void Mempool::maintenance(){
             remove_with_descendants(kx);
         }
     }
+
+    // CRITICAL FIX: Expire old orphan TXs (30 minutes)
+    // Orphans from forks will never have their parent arrive, so they must expire
+    // This follows Bitcoin's approach of ~20 minute orphan expiration
+    int64_t orphan_cutoff = tnow - ORPHAN_EXPIRY_MS;
+    std::vector<Key> expired_orphans;
+    for (const auto& kv : orphan_added_ms_) {
+        if (kv.second < orphan_cutoff) {
+            expired_orphans.push_back(kv.first);
+        }
+    }
+    for (const auto& ok : expired_orphans) {
+        if (orphans_.find(ok) != orphans_.end()) {
+            MIQ_LOG_DEBUG(LogCategory::MEMPOOL, "Expiring orphan TX after 30 minutes");
+            remove_orphan(ok);
+        }
+    }
+
     // Trim to size (in case)
     evict_lowest_feerate_until(MIQ_MEMPOOL_MAX_BYTES);
 }
