@@ -5303,14 +5303,15 @@ void P2P::loop(){
                         update_adaptive_batch_size(pps);
 
                         // Use peer_tip_height if known, otherwise fall back to header height
-                        // CRITICAL: Never request beyond header height
+                        // CRITICAL FIX: Don't cap at header height when peer claims to have more blocks!
+                        // Headers from competing chains may be rejected, but blocks should still be requested
+                        // to trigger reorg evaluation
                         uint64_t best_hdr = chain_.best_header_height();
                         uint64_t peer_tip = (pps.peer_tip_height > 0) ? pps.peer_tip_height : best_hdr;
 
-                        // Cap at header height - can't have more blocks than headers
-                        if (best_hdr > 0 && peer_tip > best_hdr) {
-                            peer_tip = best_hdr;
-                        }
+                        // REMOVED: Don't cap at header height - this prevents syncing with competing chains
+                        // If peer claims to have height X, we should try to get blocks up to X
+                        // The blocks will be validated and trigger reorg if valid
 
                         // If no info at all, use a conservative default
                         if (peer_tip == 0) {
