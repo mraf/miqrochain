@@ -37,6 +37,7 @@ namespace p2p_stats {
 #include <mutex>
 #include <type_traits>
 #include <thread>
+#include <future>
 #include <cerrno>
 #include <cstdint>
 #include <climits>
@@ -835,7 +836,9 @@ static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
     }
 #endif
     size_t sent = 0;
-    const int kMaxSpinMs = 2000; // upper bound total wait per call
+    // ULTRA-FAST: Reduced from 2000ms to 200ms for sub-second block propagation
+    // If a peer can't accept data in 200ms, skip them - don't block other peers
+    const int kMaxSpinMs = 200;
     int waited_ms = 0;
 
 
@@ -906,6 +909,70 @@ static inline bool send_or_close(Sock s, const std::vector<uint8_t>& v){
   }
   schedule_close(s);
   return false;
+}
+
+// =============================================================================
+// PARALLEL BLOCK BROADCAST - TRUE CONCURRENT SENDS TO ALL PEERS
+// This is critical for sub-1-second propagation: sends happen simultaneously
+// instead of sequentially. With 20 peers, this reduces latency from 20*100ms
+// to just ~100ms (the slowest single peer).
+// =============================================================================
+static inline int parallel_send_to_peers(
+    const std::vector<Sock>& sockets,
+    const std::vector<uint8_t>& message,
+    int max_parallel = 32)  // Limit concurrent threads to avoid resource exhaustion
+{
+    if (sockets.empty() || message.empty()) return 0;
+
+    // For small peer counts, use std::async for true parallelism
+    // For large peer counts, batch to avoid thread explosion
+    const size_t batch_size = std::min<size_t>(sockets.size(), max_parallel);
+
+    std::vector<std::future<bool>> futures;
+    futures.reserve(batch_size);
+
+    int total_sent = 0;
+    size_t idx = 0;
+
+    while (idx < sockets.size()) {
+        futures.clear();
+
+        // Launch parallel sends for this batch
+        size_t batch_end = std::min(idx + batch_size, sockets.size());
+        for (size_t i = idx; i < batch_end; ++i) {
+            Sock s = sockets[i];
+            // Use std::async with launch::async to force parallel execution
+            futures.push_back(std::async(std::launch::async, [s, &message]() {
+                return miq_send(s, message);
+            }));
+        }
+
+        // Wait for all sends in this batch to complete (with 500ms total timeout)
+        for (size_t i = 0; i < futures.size(); ++i) {
+            try {
+                // Wait with timeout - don't let slow peers delay everything
+                auto status = futures[i].wait_for(std::chrono::milliseconds(500));
+                if (status == std::future_status::ready) {
+                    if (futures[i].get()) {
+                        total_sent++;
+                    } else {
+                        // Send failed - schedule close
+                        schedule_close(sockets[idx + i]);
+                    }
+                } else {
+                    // Timeout - peer too slow, close connection
+                    schedule_close(sockets[idx + i]);
+                }
+            } catch (...) {
+                // Exception in async task - close socket
+                schedule_close(sockets[idx + i]);
+            }
+        }
+
+        idx = batch_end;
+    }
+
+    return total_sent;
 }
 
 // Return values:
@@ -2953,25 +3020,19 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
         }
     }
 
-    // Send to ALL peers OUTSIDE lock - no blocking under mutex
-    // This allows maximum parallelism and prevents lock contention
+    // PARALLEL BROADCAST: Send to ALL peers simultaneously using thread pool
+    // This is the key to sub-1-second propagation - all sends happen at once
     int block_sent = 0;
-    for (Sock s : all_sockets) {
-        // Send full block to ALL peers for fastest propagation
-        // No inv→getdata round-trip delay - push model
-        if (!block_msg.empty()) {
-            if (send_or_close(s, block_msg)) {
-                block_sent++;
-            }
-        } else {
-            // Fallback to invb only if block too large
-            (void)send_or_close(s, invb_msg);
-        }
+    if (!block_msg.empty()) {
+        block_sent = parallel_send_to_peers(all_sockets, block_msg);
+    } else {
+        // Fallback to invb only if block too large - still parallel
+        block_sent = parallel_send_to_peers(all_sockets, invb_msg);
     }
 
     if (block_sent > 0) {
-        MIQ_LOG_DEBUG(miq::LogCategory::NET, "broadcast_inv_block: pushed block to " +
-            std::to_string(block_sent) + "/" + std::to_string(all_sockets.size()) + " peers");
+        MIQ_LOG_INFO(miq::LogCategory::NET, "PARALLEL broadcast_inv_block: pushed to " +
+            std::to_string(block_sent) + "/" + std::to_string(all_sockets.size()) + " peers simultaneously");
     }
 
     // Also queue for async processing (handles late-connecting peers)
@@ -4002,17 +4063,13 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             }
         }
 
-        // Send to ALL peers OUTSIDE lock - maximum parallelism
-        int relayed = 0;
-        for (Sock s : relay_sockets) {
-            if (send_or_close(s, block_msg)) {
-                relayed++;
-            }
-        }
+        // PARALLEL OPTIMISTIC RELAY: Send to ALL peers simultaneously
+        // This is the fastest possible path - PoW verified, now blast to everyone
+        int relayed = parallel_send_to_peers(relay_sockets, block_msg);
 
-        MIQ_LOG_DEBUG(miq::LogCategory::NET, "Optimistic relay: block " + bh_key.substr(0, 16) +
-                      " pushed to " + std::to_string(relayed) + "/" +
-                      std::to_string(relay_sockets.size()) + " peers before validation");
+        MIQ_LOG_INFO(miq::LogCategory::NET, "PARALLEL optimistic relay: block " + bh_key.substr(0, 16) +
+                     " pushed to " + std::to_string(relayed) + "/" +
+                     std::to_string(relay_sockets.size()) + " peers SIMULTANEOUSLY");
     }
 
     // CRITICAL FIX: Don't skip blocks that might have incomplete processing
@@ -8321,9 +8378,10 @@ void P2P::notify_local_block(const Block& b, uint64_t height, uint64_t subsidy, 
         hash_hex.push_back(hex[byte & 0xf]);
     }
 
-    // PRIORITY 1: Immediate broadcast to ALL peers (before callbacks)
+    // PRIORITY 1: INSTANT PARALLEL BROADCAST to ALL peers (before anything else!)
     // For locally mined blocks, we serialize directly - no chain read needed
     // This saves ~1-5ms of disk I/O latency
+    // CRITICAL: Uses parallel threads for simultaneous sends to all peers
     {
         auto raw_block = ser_block(b);
         if (!raw_block.empty() && raw_block.size() < 4 * 1024 * 1024) {
@@ -8341,18 +8399,14 @@ void P2P::notify_local_block(const Block& b, uint64_t height, uint64_t subsidy, 
                 }
             }
 
-            // Send to ALL peers OUTSIDE lock - maximum speed
-            int sent = 0;
-            for (Sock s : all_sockets) {
-                if (send_or_close(s, block_msg)) {
-                    sent++;
-                }
-            }
+            // PARALLEL BROADCAST: Send to ALL peers SIMULTANEOUSLY
+            // This is the HIGHEST PRIORITY path - our own mined block!
+            int sent = parallel_send_to_peers(all_sockets, block_msg);
 
-            MIQ_LOG_INFO(miq::LogCategory::NET, "LOCAL BLOCK " + hash_hex.substr(0, 16) +
+            MIQ_LOG_INFO(miq::LogCategory::NET, "*** LOCAL BLOCK MINED *** " + hash_hex.substr(0, 16) +
                          " at height " + std::to_string(height) +
-                         " pushed to " + std::to_string(sent) + "/" +
-                         std::to_string(all_sockets.size()) + " peers IMMEDIATELY");
+                         " PARALLEL pushed to " + std::to_string(sent) + "/" +
+                         std::to_string(all_sockets.size()) + " peers");
         }
     }
 
