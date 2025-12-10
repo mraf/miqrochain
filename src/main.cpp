@@ -1441,18 +1441,20 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
             }
         }
 
-        // If no peers have reported their tip yet, check header height as fallback
+        // If no peers have reported their tip yet, check if we can proceed anyway
         // This handles the case where peers are connected but haven't sent their tip yet
         if (peers_with_tip == 0) {
-            uint64_t header_height = chain.best_header_height();
-            // If we have headers from peers, use that as the sync target
-            if (header_height > 0 && h >= header_height) {
-                // We're at or past header height - check tip freshness
-                auto tip = chain.tip();
-                uint64_t tsec = hdr_time(tip);
-                uint64_t now_time = (uint64_t)std::time(nullptr);
-                uint64_t tip_age = (now_time > tsec) ? (now_time - tsec) : 0;
-                if (tip_age < 8 * 60) {  // 8 minutes = 1 block time
+            auto tip = chain.tip();
+            uint64_t tsec = hdr_time(tip);
+            uint64_t now_time = (uint64_t)std::time(nullptr);
+            uint64_t tip_age = (now_time > tsec) ? (now_time - tsec) : 0;
+
+            // If tip is fresh (< 8 min) and we have blocks, consider synced
+            // Don't wait forever for peers to report tips
+            if (tip_age < 8 * 60 && h > 0) {
+                uint64_t header_height = chain.best_header_height();
+                // Either no headers yet (header_height==0) or we're caught up
+                if (header_height == 0 || h >= header_height) {
                     why_out.clear();
                     return true;
                 }
