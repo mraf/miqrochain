@@ -2910,7 +2910,62 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
 }
 
 void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
-   announce_block_async(h);
+    // CRITICAL OPTIMIZATION: Send full block directly to peers for instant propagation
+    // This eliminates the invb→getb→block round-trip that causes fork opportunities
+    // Similar to how broadcast_inv_tx sends both inv and full tx
+
+    if (h.size() != 32) return;
+
+    // Read the block from chain
+    std::vector<uint8_t> raw_block;
+    {
+        Block b;
+        if (chain_.read_block_any(h, b)) {
+            raw_block = ser_block(b);
+        }
+    }
+
+    // Send to all connected peers
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+        auto invb_msg = encode_msg("invb", h);
+        std::vector<uint8_t> block_msg;
+        if (!raw_block.empty() && raw_block.size() < 2 * 1024 * 1024) {  // Only direct-send blocks under 2MB
+            block_msg = encode_msg("block", raw_block);
+        }
+
+        int inv_sent = 0;
+        int block_sent = 0;
+        for (auto& kv : peers_) {
+            if (kv.second.verack_ok) {
+                // Always send invb first (lightweight notification)
+                if (send_or_close(kv.first, invb_msg)) {
+                    inv_sent++;
+                }
+                // CRITICAL: Also send full block directly to high-bandwidth/fast peers
+                // This bypasses the invb→getb→block round-trip entirely
+                // Only send to peers that support high-bandwidth relay or have good health
+                if (!block_msg.empty()) {
+                    // Send to: 1) compact block high-bandwidth peers, 2) fast peers, 3) first 4 peers
+                    bool should_send_direct = kv.second.compact_high_bandwidth ||
+                                              kv.second.health_score > 0.7 ||
+                                              block_sent < 4;  // Always send to at least 4 peers
+                    if (should_send_direct) {
+                        if (send_or_close(kv.first, block_msg)) {
+                            block_sent++;
+                        }
+                    }
+                }
+            }
+        }
+        if (inv_sent > 0 || block_sent > 0) {
+            MIQ_LOG_DEBUG(miq::LogCategory::NET, "broadcast_inv_block: sent invb to " +
+                std::to_string(inv_sent) + " peers, block directly to " + std::to_string(block_sent) + " peers");
+        }
+    }
+
+    // Also queue for async processing (handles late-connecting peers)
+    announce_block_async(h);
 }
 
 void P2P::announce_block_async(const std::vector<uint8_t>& h) {
@@ -3700,17 +3755,41 @@ void P2P::process_pending_blocks() {
         // Verify this block extends current tip
         const auto current_tip = chain_.tip_hash();
         if (b.header.prev_hash != current_tip) {
-            // Block doesn't extend tip - might be on wrong chain or tip changed
-            // Log and skip for now
-            int64_t now_log = now_ms();
-            if (now_log - last_pending_log_ms > 5000) {
-                last_pending_log_ms = now_log;
-                log_warn("P2P: pending block at height " + std::to_string(next_height) +
-                         " doesn't extend current tip - skipping");
+            // Block doesn't extend tip - might be competing chain that needs reorg
+            // CRITICAL FIX: Try accept_block_for_reorg to handle potential chain reorganization
+            // This was previously just discarding the block, causing nodes to get stuck
+            std::string reorg_err;
+            if (chain_.accept_block_for_reorg(b, reorg_err)) {
+                // Reorg manager accepted the block - it may trigger a reorg if this chain has more work
+                log_info("P2P: pending block at height " + std::to_string(next_height) +
+                         " submitted for reorg evaluation");
+
+                // Check if a reorg happened and this block is now on the main chain
+                if (chain_.have_block(b.block_hash())) {
+                    blocks_processed++;
+                    if (mempool_) {
+                        mempool_->on_block_connect(b);
+                    }
+                    broadcast_inv_block(it->second.hash);
+                    g_last_progress_ms = now_ms();
+                    g_last_progress_height = chain_.height();
+
+                    // Update heights for next iteration
+                    current_height = chain_.height();
+                    next_height = current_height + 1;
+                }
+            } else {
+                int64_t now_log = now_ms();
+                if (now_log - last_pending_log_ms > 5000) {
+                    last_pending_log_ms = now_log;
+                    log_warn("P2P: pending block at height " + std::to_string(next_height) +
+                             " rejected for reorg: " + reorg_err);
+                }
             }
             pending_blocks_bytes_ -= it->second.raw.size();
             pending_blocks_.erase(it);
-            break;
+            // Don't break - continue checking other pending blocks
+            continue;
         }
 
         // Submit the block
@@ -3854,7 +3933,12 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             // Let it through to submit_block() which will detect and recover
             log_warn("P2P: have block that extends tip - checking for incomplete processing");
         } else {
-            // Block doesn't extend tip - truly already processed or on different chain
+            // CRITICAL FIX: Even if we have this block, it might be part of a competing
+            // chain with more work. Try accept_block_for_reorg to evaluate reorg potential.
+            std::string reorg_err;
+            if (!chain_.accept_block_for_reorg(b, reorg_err)) {
+                // Failed to process for reorg - likely truly duplicate or invalid
+            }
             return;
         }
     }

@@ -18,6 +18,9 @@
 #include "difficulty.h"    // MIQ_RETARGET_INTERVAL & epoch_next_bits
 #include "txindex.h"       // Fast transaction lookup by txid
 
+// External mining address for wallet balance inclusion
+extern std::string g_miner_address_b58;
+
 #include <sstream>
 #include <array>
 #include <string_view>
@@ -593,12 +596,41 @@ std::string RpcService::handle(const std::string& body){
             collect_pkh_for_range(false, meta.next_recv, pkhs);
             collect_pkh_for_range(true,  meta.next_change, pkhs);
 
+            // CRITICAL FIX: Also include configured mining address if set
+            // This ensures mined coins show up even if using a non-HD mining address
+            std::array<uint8_t,20> mining_pkh{};
+            bool have_mining_addr = false;
+            if (!g_miner_address_b58.empty()) {
+                uint8_t ver = 0;
+                std::vector<uint8_t> payload;
+                if (base58check_decode(g_miner_address_b58, ver, payload) &&
+                    ver == VERSION_P2PKH && payload.size() == 20) {
+                    std::copy(payload.begin(), payload.end(), mining_pkh.begin());
+                    // Check if mining address is already in HD wallet addresses
+                    bool already_included = false;
+                    for (const auto& pkh : pkhs) {
+                        if (pkh == mining_pkh) {
+                            already_included = true;
+                            break;
+                        }
+                    }
+                    if (!already_included) {
+                        pkhs.push_back(mining_pkh);
+                        have_mining_addr = true;
+                    }
+                }
+            }
+
             uint64_t sum = 0;
+            uint64_t mining_sum = 0;  // Track mining address balance separately
             for (const auto& pkh : pkhs){
                 auto lst = chain_.utxo().list_for_pkh(std::vector<uint8_t>(pkh.begin(), pkh.end()));
                 for (const auto& t : lst){
                     const auto& e2 = std::get<2>(t);
                     sum += e2.value;
+                    if (have_mining_addr && pkh == mining_pkh) {
+                        mining_sum += e2.value;
+                    }
                 }
             }
 
@@ -607,6 +639,12 @@ std::string RpcService::handle(const std::string& body){
             // string MIQ for pretty print
             std::ostringstream s; s << (sum/COIN) << "." << std::setw(8) << std::setfill('0') << (sum%COIN);
             o["miq"] = jstr(s.str());
+            // Include mining address balance if separate
+            if (have_mining_addr && mining_sum > 0) {
+                std::ostringstream ms; ms << (mining_sum/COIN) << "." << std::setw(8) << std::setfill('0') << (mining_sum%COIN);
+                o["mining_balance_miq"] = jstr(ms.str());
+                o["mining_address"] = jstr(g_miner_address_b58);
+            }
 
             JNode out; out.v = o; return json_dump(out);
         }
