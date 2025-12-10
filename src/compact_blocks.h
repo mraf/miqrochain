@@ -669,6 +669,12 @@ public:
         }
     }
 
+    // Access mutex for external locking (for cleanup with fallback)
+    std::mutex& mtx() { return mtx_; }
+
+    // Access pending map (caller must hold mtx())
+    std::unordered_map<std::string, PendingCompactBlock>& pending_map() { return pending_; }
+
 private:
     mutable std::mutex mtx_;
     std::unordered_map<std::string, PendingCompactBlock> pending_;

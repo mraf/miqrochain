@@ -7915,6 +7915,53 @@ void P2P::loop(){
             }
         }
 
+        // BIP152: COMPACT BLOCK TIMEOUT FALLBACK
+        // If we've been waiting too long for blocktxn, request full block instead
+        // This prevents stalls when peers don't respond with missing transactions
+        {
+            static int64_t last_compact_cleanup_ms = 0;
+            constexpr int64_t COMPACT_CLEANUP_INTERVAL_MS = 5000;   // Check every 5 seconds
+            constexpr int64_t COMPACT_TIMEOUT_MS = 10000;           // 10 second timeout
+
+            if (current_time - last_compact_cleanup_ms >= COMPACT_CLEANUP_INTERVAL_MS) {
+                last_compact_cleanup_ms = current_time;
+
+                // Get list of timed-out pending compact blocks
+                std::vector<std::pair<std::string, std::vector<uint8_t>>> timed_out;
+                {
+                    // Check all pending compact blocks
+                    std::lock_guard<std::mutex> pcb_lk(pending_compact_blocks_.mtx());
+                    auto& pending = pending_compact_blocks_.pending_map();
+                    for (auto it = pending.begin(); it != pending.end(); ) {
+                        if (current_time - it->second.received_ms > COMPACT_TIMEOUT_MS) {
+                            // Timed out - need to request full block
+                            timed_out.push_back({it->first, it->second.cb.block_hash});
+                            it = pending.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                }
+
+                // Request full blocks for timed-out compact blocks
+                for (const auto& timeout_pair : timed_out) {
+                    const std::string& hash_hex = timeout_pair.first;
+                    const std::vector<uint8_t>& block_hash = timeout_pair.second;
+
+                    MIQ_LOG_WARN(miq::LogCategory::NET, "COMPACT BLOCK " + hash_hex.substr(0, 16) +
+                                 " timed out waiting for blocktxn, requesting full block");
+
+                    // Request full block from any connected peer
+                    for (auto& kv : peers_) {
+                        if (kv.second.verack_ok) {
+                            request_block_hash(kv.second, block_hash);
+                            break;  // Only need to request from one peer
+                        }
+                    }
+                }
+            }
+        }
+
         trickle_flush();
 
         {
@@ -8407,21 +8454,35 @@ void P2P::send_getblocktxn(PeerState& ps, const std::vector<uint8_t>& block_hash
     // Format: block_hash (32 bytes) + indexes_length (varint) + indexes (differentially encoded)
 
     if (block_hash.size() != 32) return;
+    if (indexes.empty()) return;
 
     std::vector<uint8_t> payload;
-    payload.reserve(32 + 1 + indexes.size() * 2);
+    payload.reserve(32 + 3 + indexes.size() * 3);
 
     // Block hash
     payload.insert(payload.end(), block_hash.begin(), block_hash.end());
 
-    // Indexes count (simplified - assuming < 253 txs)
-    payload.push_back(static_cast<uint8_t>(indexes.size() & 0xFF));
+    // Indexes count (proper varint encoding for any count)
+    uint64_t count = indexes.size();
+    if (count < 0xFD) {
+        payload.push_back(static_cast<uint8_t>(count));
+    } else if (count <= 0xFFFF) {
+        payload.push_back(0xFD);
+        payload.push_back(static_cast<uint8_t>(count & 0xFF));
+        payload.push_back(static_cast<uint8_t>((count >> 8) & 0xFF));
+    } else {
+        payload.push_back(0xFE);
+        payload.push_back(static_cast<uint8_t>(count & 0xFF));
+        payload.push_back(static_cast<uint8_t>((count >> 8) & 0xFF));
+        payload.push_back(static_cast<uint8_t>((count >> 16) & 0xFF));
+        payload.push_back(static_cast<uint8_t>((count >> 24) & 0xFF));
+    }
 
     // Differential encoding of indexes
     uint16_t prev = 0;
     for (uint16_t idx : indexes) {
         uint16_t diff = idx - prev;
-        // Simplified varint encoding for small values
+        // Proper varint encoding
         if (diff < 0xFD) {
             payload.push_back(static_cast<uint8_t>(diff));
         } else {
