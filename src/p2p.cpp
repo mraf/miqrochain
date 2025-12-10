@@ -2910,7 +2910,62 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
 }
 
 void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
-   announce_block_async(h);
+    // CRITICAL OPTIMIZATION: Send full block directly to peers for instant propagation
+    // This eliminates the invb→getb→block round-trip that causes fork opportunities
+    // Similar to how broadcast_inv_tx sends both inv and full tx
+
+    if (h.size() != 32) return;
+
+    // Read the block from chain
+    std::vector<uint8_t> raw_block;
+    {
+        Block b;
+        if (chain_.read_block_any(h, b)) {
+            raw_block = ser_block(b);
+        }
+    }
+
+    // Send to all connected peers
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+        auto invb_msg = encode_msg("invb", h);
+        std::vector<uint8_t> block_msg;
+        if (!raw_block.empty() && raw_block.size() < 2 * 1024 * 1024) {  // Only direct-send blocks under 2MB
+            block_msg = encode_msg("block", raw_block);
+        }
+
+        int inv_sent = 0;
+        int block_sent = 0;
+        for (auto& kv : peers_) {
+            if (kv.second.verack_ok) {
+                // Always send invb first (lightweight notification)
+                if (send_or_close(kv.first, invb_msg)) {
+                    inv_sent++;
+                }
+                // CRITICAL: Also send full block directly to high-bandwidth/fast peers
+                // This bypasses the invb→getb→block round-trip entirely
+                // Only send to peers that support high-bandwidth relay or have good health
+                if (!block_msg.empty()) {
+                    // Send to: 1) compact block high-bandwidth peers, 2) fast peers, 3) first 4 peers
+                    bool should_send_direct = kv.second.compact_high_bandwidth ||
+                                              kv.second.health_score > 0.7 ||
+                                              block_sent < 4;  // Always send to at least 4 peers
+                    if (should_send_direct) {
+                        if (send_or_close(kv.first, block_msg)) {
+                            block_sent++;
+                        }
+                    }
+                }
+            }
+        }
+        if (inv_sent > 0 || block_sent > 0) {
+            MIQ_LOG_DEBUG(miq::LogCategory::NET, "broadcast_inv_block: sent invb to " +
+                std::to_string(inv_sent) + " peers, block directly to " + std::to_string(block_sent) + " peers");
+        }
+    }
+
+    // Also queue for async processing (handles late-connecting peers)
+    announce_block_async(h);
 }
 
 void P2P::announce_block_async(const std::vector<uint8_t>& h) {
