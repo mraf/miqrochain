@@ -7944,6 +7944,8 @@ void P2P::loop(){
                 }
 
                 // Request full blocks for timed-out compact blocks
+                // NOTE: peers_ is accessed by the main loop thread which owns it
+                // No lock needed as we're already in the main loop context
                 for (const auto& timeout_pair : timed_out) {
                     const std::string& hash_hex = timeout_pair.first;
                     const std::vector<uint8_t>& block_hash = timeout_pair.second;
@@ -7952,11 +7954,17 @@ void P2P::loop(){
                                  " timed out waiting for blocktxn, requesting full block");
 
                     // Request full block from any connected peer
+                    bool requested = false;
                     for (auto& kv : peers_) {
                         if (kv.second.verack_ok) {
                             request_block_hash(kv.second, block_hash);
+                            requested = true;
                             break;  // Only need to request from one peer
                         }
+                    }
+                    if (!requested) {
+                        MIQ_LOG_WARN(miq::LogCategory::NET, "COMPACT BLOCK " + hash_hex.substr(0, 16) +
+                                     " timeout: no peers available to request full block");
                     }
                 }
             }
