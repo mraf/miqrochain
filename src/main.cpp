@@ -1495,6 +1495,13 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
         }
     }
 
+    // CRITICAL: Must have at least one connected peer before declaring synced
+    // (unless we're a seed node, which is handled above)
+    if (verack_peers == 0) {
+        why_out = "waiting for peer connection";
+        return false;
+    }
+
     auto tip = chain.tip();
     uint64_t tsec = hdr_time(tip);
     if (tsec == 0) {
