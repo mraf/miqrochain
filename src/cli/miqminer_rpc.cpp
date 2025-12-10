@@ -3952,8 +3952,33 @@ int main(int argc, char** argv){
                 std::string current_job_id;
                 uint32_t current_extranonce2 = 0;
 
-                // Wait for initial job
-                std::fprintf(stderr, "[pool] Waiting for mining job from pool...\n");
+                // CRITICAL FIX: Check if job was already received during subscribe/authorize
+                // If so, update UI and counter here (the waiting loop below would be skipped)
+                if (stratum.has_job.load()) {
+                    StratumJob job = stratum.get_job();
+                    ui.pool_jobs_received.fetch_add(1);
+                    current_job_id = job.job_id;
+                    {
+                        std::lock_guard<std::mutex> lk(ui.pool_mtx);
+                        ui.current_job_id = job.job_id;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(ui.mtx);
+                        ui.cand.height = ui.pool_jobs_received.load();
+                        ui.cand.bits = job.bits;
+                        ui.cand.time = job.time;
+                        if (!job.prev_hash.empty()) {
+                            ui.cand.prev_hex = to_hex_s(job.prev_hash);
+                        }
+                    }
+                    std::fprintf(stderr, "[pool] Job already received during connect: %s (diff: %.2f)\n",
+                                job.job_id.c_str(), difficulty_from_bits(job.bits));
+                }
+
+                // Wait for initial job (skip if already received during subscribe/authorize)
+                if (!stratum.has_job.load()) {
+                    std::fprintf(stderr, "[pool] Waiting for mining job from pool...\n");
+                }
                 int wait_count = 0;
                 while (!stratum.has_job.load() && stratum.connected.load() && ui.running.load()) {
                     std::string line = stratum.recv_line(1000);
