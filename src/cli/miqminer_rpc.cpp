@@ -2439,14 +2439,26 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
             store_u64_le(nonce_ptr, n7); { auto hv = salted_header_hash(hdr); std::memcpy(h[7], hv.data(), 32); }
         #endif
 
-            if(meets_target_be_raw(h[0], bits)){ b.header.nonce=n0; *out_block=b; found->store(true); break; }
-            if(meets_target_be_raw(h[1], bits)){ b.header.nonce=n1; *out_block=b; found->store(true); break; }
-            if(meets_target_be_raw(h[2], bits)){ b.header.nonce=n2; *out_block=b; found->store(true); break; }
-            if(meets_target_be_raw(h[3], bits)){ b.header.nonce=n3; *out_block=b; found->store(true); break; }
-            if(meets_target_be_raw(h[4], bits)){ b.header.nonce=n4; *out_block=b; found->store(true); break; }
-            if(meets_target_be_raw(h[5], bits)){ b.header.nonce=n5; *out_block=b; found->store(true); break; }
-            if(meets_target_be_raw(h[6], bits)){ b.header.nonce=n6; *out_block=b; found->store(true); break; }
-            if(meets_target_be_raw(h[7], bits)){ b.header.nonce=n7; *out_block=b; found->store(true); break; }
+            // CRITICAL FIX: Use compare_exchange to ensure only ONE thread writes to out_block
+            // This prevents race conditions where multiple threads find solutions simultaneously
+            #define TRY_SOLUTION(nonce_val, hash_idx) \
+                if(meets_target_be_raw(h[hash_idx], bits)){ \
+                    bool expected = false; \
+                    if(found->compare_exchange_strong(expected, true)) { \
+                        b.header.nonce = nonce_val; \
+                        *out_block = b; \
+                    } \
+                    break; \
+                }
+            TRY_SOLUTION(n0, 0)
+            TRY_SOLUTION(n1, 1)
+            TRY_SOLUTION(n2, 2)
+            TRY_SOLUTION(n3, 3)
+            TRY_SOLUTION(n4, 4)
+            TRY_SOLUTION(n5, 5)
+            TRY_SOLUTION(n6, 6)
+            TRY_SOLUTION(n7, 7)
+            #undef TRY_SOLUTION
 
             if((local_hashes & ((1u<<10)-1)) == 0){
                 int pick = (int)((n0 ^ n3 ^ n7) & 7u);
@@ -4239,8 +4251,11 @@ int main(int argc, char** argv){
 
                                     // Check if hash meets share target
                                     if (meets_target_be_raw(hash, share_bits)) {
-                                        found_nonce.store(nonce);
-                                        found_share.store(true);
+                                        // CRITICAL FIX: Use compare_exchange to prevent race
+                                        bool expected = false;
+                                        if (found_share.compare_exchange_strong(expected, true)) {
+                                            found_nonce.store(nonce);
+                                        }
                                         break;
                                     }
 
@@ -4516,7 +4531,10 @@ int main(int argc, char** argv){
             std::atomic<bool> found{false};
             std::atomic<bool> abort_round{false};
             std::vector<std::thread> thv;
-            Block found_block;
+            // CRITICAL: Initialize found_block with template for validation
+            // This ensures found_block.prev_hash matches tpl.prev_hash if no solution found
+            // (though in that case found==false so we'd skip anyway)
+            Block found_block = b;
 
             for (unsigned tid = 0; tid < threads; ++tid) {
                 thv.emplace_back(
@@ -4584,9 +4602,13 @@ int main(int argc, char** argv){
                             g_ui->gpu_hps_smooth.store(gpu.ema_smooth);
 
                             if (ok) {
-                                found_block = b;
-                                found_block.header.nonce = n;
-                                found.store(true);
+                                // CRITICAL FIX: Use compare_exchange to prevent GPU/CPU race
+                                // Only one thread (GPU or CPU) should write to found_block
+                                bool expected = false;
+                                if (found.compare_exchange_strong(expected, true)) {
+                                    found_block = b;
+                                    found_block.header.nonce = n;
+                                }
                                 break;
                             }
                             base_nonce += (uint64_t)gpu.gws * (uint64_t)gpu_npi;
@@ -4701,6 +4723,16 @@ int main(int argc, char** argv){
 
             if(!found.load()) { continue; }
 
+            // CRITICAL FIX: Verify found_block was actually written (race protection)
+            // If compare_exchange failed, the block might not be valid
+            if (found_block.header.prev_hash != tpl.prev_hash) {
+                std::lock_guard<std::mutex> lk(ui.mtx);
+                ui.last_submit_msg = "internal: found_block mismatch (race condition avoided)";
+                ui.last_submit_when = std::chrono::steady_clock::now();
+                log_line("internal: found_block.prev_hash doesn't match template - skipping");
+                continue;
+            }
+
             // Check staleness vs tip
             // CRITICAL FIX: Use fast variant for quick staleness check before submission
             TipInfo tip_now{};
@@ -4787,6 +4819,9 @@ int main(int argc, char** argv){
                     }
                     ui.last_submit_when = std::chrono::steady_clock::now();
                 }
+                // CRITICAL: Mandatory cooldown after successful submission
+                // This prevents finding another block too quickly while network propagates
+                for(int i = 0; i < 20 && ui.running.load(); ++i) miq_sleep_ms(100);  // 2 second cooldown
             } else {
                 // Submission failed - log and add delay before retrying
                 {
