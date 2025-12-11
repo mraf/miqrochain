@@ -871,6 +871,17 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
         return false;
     }
 
+    // CRITICAL FIX: Reject shares from stale jobs (different parent than current tip)
+    // This prevents double-mining on same parent block
+    // Check BEFORE taking reference to job to avoid use-after-free
+    auto current_tip = chain_.tip_hash();
+    if (it->second.prev_hash != current_tip) {
+        error = "Stale job (parent block changed)";
+        // Remove this stale job to prevent future submissions
+        jobs_.erase(it);
+        return false;
+    }
+
     const StratumJob& job = it->second;
 
     // Validate extranonce2 length
@@ -1044,10 +1055,23 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
             // Submit to chain
             std::string submit_err;
             if (chain_.submit_block(block, submit_err)) {
+                // CRITICAL FIX: Immediately invalidate old job and create new one
+                // This prevents other miners from submitting blocks with same parent!
+                {
+                    std::lock_guard<std::mutex> lock(jobs_mutex_);
+                    // Remove the job that was just used to prevent double-mining
+                    jobs_.erase(job_id);
+                }
+
                 // CRITICAL FIX: Notify mempool and promote orphan TXs
                 mempool_.on_block_connect(block, chain_.utxo(), (uint32_t)chain_.height());
                 log_info("Stratum: Block " + std::to_string(job.height) + " accepted with " +
                          std::to_string(block.txs.size() - 1) + " transactions!");
+
+                // CRITICAL FIX: Immediately create new job and broadcast to all miners
+                // This ensures miners switch to new block immediately
+                notify_new_block();
+
                 {
                     std::lock_guard<std::mutex> stats_lock(stats_mutex_);
                     stats_.blocks_found++;
