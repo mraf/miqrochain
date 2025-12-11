@@ -6782,7 +6782,8 @@ void P2P::loop(){
                                     }
                                 }
 
-                                // If we found a match in this peer's tracking, clean it up
+                                // Try to clear the identified index from per-peer tracking
+                                bool cleared = false;
                                 if (found_in_peer) {
                                     g_inflight_index_ts[(Sock)s].erase(delivered_idx);
                                     auto& dq_idx = g_inflight_index_order[(Sock)s];
@@ -6790,23 +6791,30 @@ void P2P::loop(){
                                     if (dq_it != dq_idx.end()) {
                                         dq_idx.erase(dq_it);
                                     }
-                                    ps.inflight_index--;
-                                    g_index_timeouts[(Sock)s] = 0;
-                                } else if (new_height > old_height) {
-                                    // Chain grew but we couldn't match to this peer's tracking
-                                    // Still decrement inflight_index since SOMETHING was delivered
-                                    // and try to clear the oldest entry from this peer
-                                    if (!g_inflight_index_order[(Sock)s].empty()) {
-                                        uint64_t oldest = g_inflight_index_order[(Sock)s].front();
-                                        // Only clear if this oldest is now in chain (was delivered)
-                                        if (oldest <= new_height) {
-                                            g_inflight_index_order[(Sock)s].pop_front();
-                                            g_inflight_index_ts[(Sock)s].erase(oldest);
-                                            ps.inflight_index--;
-                                        }
+                                    cleared = true;
+                                }
+
+                                // If we couldn't clear specific index, clear the oldest one
+                                // This keeps per-peer tracking roughly accurate
+                                if (!cleared && !g_inflight_index_order[(Sock)s].empty()) {
+                                    uint64_t oldest = g_inflight_index_order[(Sock)s].front();
+                                    g_inflight_index_order[(Sock)s].pop_front();
+                                    g_inflight_index_ts[(Sock)s].erase(oldest);
+                                    // Also clear from global if it's now in chain
+                                    if (oldest <= new_height) {
+                                        InflightLock lk(g_inflight_lock);
+                                        g_global_requested_indices.erase(oldest);
                                     }
                                 }
-                                // Always try to refill pipeline
+
+                                // CRITICAL: ALWAYS decrement inflight_index when we receive a block.
+                                // The peer sent us data, so they fulfilled ONE request.
+                                // Whether the block was accepted, orphaned, or rejected doesn't matter.
+                                // Without this, orphaned blocks keep inflight_index high and we stall!
+                                ps.inflight_index--;
+                                g_index_timeouts[(Sock)s] = 0;
+
+                                // Refill pipeline immediately
                                 fill_index_pipeline(ps);
                             } else {
                                 // SAFETY NET: Even if inflight_index was 0, try to refill pipeline
