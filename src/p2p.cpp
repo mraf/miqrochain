@@ -5202,6 +5202,33 @@ void P2P::loop(){
                   }
               }
           }
+
+          // CRITICAL FIX: Recovery mechanism for transient notfound errors
+          // If peer_tip_height was reduced due to notfound but peer originally announced
+          // higher, periodically reset to allow retry (peer may have had transient issue)
+          {
+              const int64_t tnow = now_ms();
+              const int64_t PEER_TIP_RECOVERY_MS = 30000;  // 30 seconds cooldown
+              for (auto& kvp : peers_) {
+                  PeerState& ps = kvp.second;
+                  if (!ps.verack_ok) continue;
+                  // If peer_tip was reduced and enough time has passed, restore it
+                  if (ps.peer_tip_reduced_ms > 0 &&
+                      ps.peer_tip_height < ps.announced_tip_height &&
+                      (tnow - ps.peer_tip_reduced_ms > PEER_TIP_RECOVERY_MS)) {
+                      log_info("P2P: Recovering peer_tip_height for " + ps.ip +
+                               " from " + std::to_string(ps.peer_tip_height) +
+                               " to " + std::to_string(ps.announced_tip_height) +
+                               " (retry after transient failure)");
+                      ps.peer_tip_height = ps.announced_tip_height;
+                      ps.peer_tip_reduced_ms = 0;  // Reset recovery timer
+                      // Trigger immediate pipeline refill to retry the blocks
+                      if (ps.syncing && peer_is_index_capable((Sock)ps.sock)) {
+                          fill_index_pipeline(ps);
+                      }
+                  }
+              }
+          }
         }
 
         // CRITICAL FIX: Inflight transaction request timeout cleanup
@@ -6362,6 +6389,7 @@ void P2P::loop(){
                                 announced_height |= (uint32_t)m.payload[pos + ua_size + 2] << 16;
                                 announced_height |= (uint32_t)m.payload[pos + ua_size + 3] << 24;
                                 ps.peer_tip_height = announced_height;
+                                ps.announced_tip_height = announced_height;  // Save original for recovery
 
                                 // CRITICAL FIX: Trigger immediate sync if peer has higher tip
                                 // This prevents falling behind when new blocks are announced
@@ -6624,8 +6652,10 @@ void P2P::loop(){
 
                             // CRITICAL FIX: Update peer_tip_height - peer doesn't have this block
                             // If peer says they don't have block N, set their tip to N-1 (or 0)
+                            // Track when this happened so we can retry later (transient errors)
                             if (idx64 > 0 && idx64 <= ps.peer_tip_height) {
                                 ps.peer_tip_height = idx64 - 1;
+                                ps.peer_tip_reduced_ms = now_ms();  // Track for recovery
                                 log_info("P2P: Peer " + ps.ip + " doesn't have block " + std::to_string(idx64) +
                                          ", updated peer_tip_height to " + std::to_string(ps.peer_tip_height));
                             }
