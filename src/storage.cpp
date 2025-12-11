@@ -12,15 +12,22 @@
 #if defined(_WIN32)
   #include <windows.h>
   static inline void flush_path(const std::string& p){
-      // CRITICAL FIX: Retry file open on Windows as files may be temporarily locked
-      // by antivirus, indexing, or other processes - common on Windows 11
+      // CRITICAL FIX: Aggressive retry for Windows file locks
+      // Windows antivirus (Defender), indexing services, and cloud sync (OneDrive)
+      // can hold file locks for 500ms+ - must retry aggressively!
+      // Increased from 3 retries (150ms max) to 10 retries (1000ms max)
       HANDLE h = INVALID_HANDLE_VALUE;
-      for (int retry = 0; retry < 3 && h == INVALID_HANDLE_VALUE; ++retry) {
+      static constexpr int MAX_RETRIES = 10;        // Was 3
+      static constexpr int RETRY_DELAY_MS = 100;    // Was 50ms
+
+      for (int retry = 0; retry < MAX_RETRIES && h == INVALID_HANDLE_VALUE; ++retry) {
           h = CreateFileA(p.c_str(), GENERIC_WRITE,
-                          FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
+                          FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL,
                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-          if (h == INVALID_HANDLE_VALUE && retry < 2) {
-              Sleep(50);  // Wait 50ms before retry
+          if (h == INVALID_HANDLE_VALUE && retry < MAX_RETRIES - 1) {
+              // Use SleepEx with alertable=FALSE to avoid APC issues
+              // Exponential backoff: 100ms, 100ms, 100ms... (capped at RETRY_DELAY_MS)
+              Sleep(RETRY_DELAY_MS);
           }
       }
       if (h != INVALID_HANDLE_VALUE) {
@@ -32,9 +39,26 @@
           }
           CloseHandle(h);
       } else {
+          // WINDOWS FIX: Reduced logging frequency - file lock failures are common
+          // during IBD on Windows and flooding the log makes debugging harder
+          static std::atomic<int64_t> last_log_ms{0};
+          static std::atomic<int> suppressed_count{0};
           DWORD err = GetLastError();
-          miq::log_warn("Storage: CreateFileA failed for flush " + p +
-                  " error=" + std::to_string(err));
+          int64_t now = GetTickCount64();
+          if (now - last_log_ms.load() > 30000) { // Log at most every 30 seconds
+              int suppressed = suppressed_count.exchange(0);
+              if (suppressed > 0) {
+                  miq::log_warn("Storage: CreateFileA failed for flush " + p +
+                          " error=" + std::to_string(err) +
+                          " (suppressed " + std::to_string(suppressed) + " similar)");
+              } else {
+                  miq::log_warn("Storage: CreateFileA failed for flush " + p +
+                          " error=" + std::to_string(err));
+              }
+              last_log_ms.store(now);
+          } else {
+              suppressed_count.fetch_add(1);
+          }
       }
   }
 #else

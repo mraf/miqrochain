@@ -843,16 +843,26 @@ namespace {
 // Hardened: loop on partial sends
 static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
     if (!data || len == 0) return true;
-#ifndef _WIN32
+    // WINDOWS FIX: Enable TCP_NODELAY on ALL platforms including Windows
+    // This was only being set on non-Windows, causing send delays on Windows nodes
     {
         int flag = 1;
+#ifdef _WIN32
+        (void)setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&flag, sizeof(flag));
+#else
         (void)setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-    }
 #endif
+    }
     size_t sent = 0;
-    // ULTRA-FAST: Reduced from 2000ms to 200ms for sub-second block propagation
-    // If a peer can't accept data in 200ms, skip them - don't block other peers
-    const int kMaxSpinMs = 200;
+    // WINDOWS FIX: Increased from 200ms to 500ms for Windows
+    // Windows antivirus scanning, Defender, and higher syscall overhead means
+    // 200ms is often not enough - peers timeout prematurely on Windows seeds
+    // 500ms is still fast enough for sub-second propagation (most sends complete in <50ms)
+#ifdef _WIN32
+    const int kMaxSpinMs = 500;   // Windows: more generous timeout
+#else
+    const int kMaxSpinMs = 200;   // Linux/macOS: keep fast timeout
+#endif
     int waited_ms = 0;
 
 
@@ -863,9 +873,11 @@ static inline bool miq_send(Sock s, const uint8_t* data, size_t len) {
         if (n == SOCKET_ERROR) {
             int e = WSAGetLastError();
             if (e == WSAEWOULDBLOCK) {
+                // WINDOWS FIX: Use 15ms poll timeout to align with Windows timer granularity
+                // Using 10ms results in actual ~15ms sleeps, causing timing drift
                 WSAPOLLFD pfd{}; pfd.fd = s; pfd.events = POLLWRNORM; pfd.revents = 0;
-                int rc = WSAPoll(&pfd, 1, 10);
-                if (rc <= 0 && (waited_ms += 10) >= kMaxSpinMs) return false;
+                int rc = WSAPoll(&pfd, 1, 15);
+                if (rc <= 0 && (waited_ms += 15) >= kMaxSpinMs) return false;
                 continue;
             }
             // CRITICAL FIX: Rate-limit error logging to prevent log flooding
@@ -958,10 +970,16 @@ static inline int parallel_send_to_peers(
     size_t idx = 0;
 
     // Track start time for cumulative timeout
-    // CRITICAL FIX: Reduced from 800ms to 100ms for fast block propagation
-    // 800ms was causing massive delays - each hop added 800ms to propagation time
+    // WINDOWS FIX: Increased timeout for Windows due to higher syscall overhead
+    // Windows antivirus, Defender, and WSAPoll overhead requires more time
     const auto batch_start = std::chrono::steady_clock::now();
-    const auto max_total_time = std::chrono::milliseconds(100);  // 100ms total max (was 800ms)
+#ifdef _WIN32
+    // Windows: 250ms allows for antivirus delays while still being fast
+    const auto max_total_time = std::chrono::milliseconds(250);
+#else
+    // Linux/macOS: Keep aggressive 100ms for fast propagation
+    const auto max_total_time = std::chrono::milliseconds(100);
+#endif
 
     while (idx < sockets.size()) {
         futures.clear();
@@ -5878,17 +5896,21 @@ void P2P::loop(){
 #endif
         }
 
-        // OPTIMIZATION: Aggressive 10ms poll timeout for sub-second block propagation
-        // Critical for ensuring blocks propagate across network in <1 second
-        // Trade-off: Slightly higher CPU usage for dramatically lower latency
+        // OPTIMIZATION: Poll timeout tuned for platform
+        // Windows has higher timer resolution overhead (~15ms min), so use larger timeout
+        // to reduce unnecessary wakeups while still maintaining good responsiveness
 #ifdef _WIN32
-        int rc = WSAPoll(fds.data(), (ULONG)fds.size(), 10);
+        // WINDOWS FIX: Use 15ms timeout to match Windows timer granularity
+        // Using 10ms on Windows results in actual ~15ms sleeps due to scheduler quantum
+        // This wastes CPU as the poll returns immediately but sleep adds ~15ms anyway
+        int rc = WSAPoll(fds.data(), (ULONG)fds.size(), 15);
 #else
+        // Linux/macOS: Keep aggressive 10ms for sub-second propagation
         int rc = poll(fds.data(), (nfds_t)fds.size(), 10);
 #endif
 
-        // Tight loop detection - less aggressive to avoid hurting localhost performance
-        // Only throttle if we're burning CPU with no actual work being done
+        // WINDOWS FIX: Improved tight loop detection with platform-specific thresholds
+        // Windows has ~15ms minimum sleep granularity, so we need larger sleeps to be effective
         static int64_t last_poll_time = 0;
         static int tight_loop_count = 0;
         int64_t poll_now = now_ms();
@@ -5899,7 +5921,13 @@ void P2P::loop(){
             // Only sleep if we've been spinning for a while with no work
             // Increased threshold to 500 iterations to avoid hurting legitimate traffic
             if (tight_loop_count > 500) {
+#ifdef _WIN32
+                // WINDOWS FIX: Use 15ms to align with Windows timer quantum
+                // 10ms sleep on Windows actually sleeps ~15ms anyway due to scheduler
+                std::this_thread::sleep_for(std::chrono::milliseconds(15));
+#else
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
+#endif
                 tight_loop_count = 0;
             }
         } else {
