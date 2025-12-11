@@ -8,6 +8,7 @@
 #include "hex.h"
 #include "log.h"
 #include "hash160.h"
+#include "assume_valid.h"  // For is_ibd_mode()
 
 #include <cstring>
 #include <filesystem>
@@ -172,6 +173,11 @@ bool AddressIndex::index_block(const Block& block, uint64_t height) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
 
     if (!enabled_) return false;
+
+    // CRITICAL PERFORMANCE: Skip address indexing during IBD
+    // Address index does file I/O for every transaction which is very slow
+    // Explorer features are not needed during sync - reindex after IBD if needed
+    if (miq::is_ibd_mode()) return true;
 
     int64_t timestamp = block.header.time;
     uint32_t tx_pos = 0;
