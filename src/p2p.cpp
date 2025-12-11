@@ -5513,8 +5513,9 @@ void P2P::loop(){
                     last_stale_log = now;
                     log_warn("[SYNC] Tip is stale (" + std::to_string(tip_age_sec/60) + "m old) - forcing block requests from all peers");
                 }
-            } else if (g_sequential_sync && (now - last_refetch_time > 200)) {
-                // Proactive pipeline - keep requesting the next batch of blocks
+            } else if ((now - last_refetch_time > 200) && (g_sequential_sync || !headers_done || current_height < chain_.best_header_height())) {
+                // CRITICAL FIX: Proactive pipeline during IBD - always run when behind header tip
+                // This ensures continuous block downloads without waiting for stall detection
                 should_refetch = true;
                 // Rate-limit log to once per 30 seconds
                 if (now - last_proactive_log > 30000) {
