@@ -2424,8 +2424,8 @@ bool Chain::submit_block(const Block& b, std::string& err){
     for (size_t i = 0; i < b.txs.size(); ++i) {
         txindex_.add(b.txs[i].txid(), new_height, static_cast<uint32_t>(i));
     }
-    // Periodically flush TxIndex to disk (every 100 blocks)
-    if (new_height % 100 == 0) {
+    // Periodically flush TxIndex to disk (every 10 blocks for durability)
+    if (new_height % 10 == 0) {
         txindex_.flush();
     }
 

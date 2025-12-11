@@ -8,6 +8,29 @@
 #include <filesystem>
 #include <algorithm>
 
+#if defined(_WIN32)
+  #include <windows.h>
+#else
+  #include <unistd.h>
+  #include <fcntl.h>
+#endif
+
+// DURABILITY: Platform-specific fsync
+static inline void fsync_path(const std::string& p) {
+#if defined(_WIN32)
+    HANDLE h = CreateFileA(p.c_str(), GENERIC_WRITE,
+                           FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+#else
+    int fd = ::open(p.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd >= 0) { ::fsync(fd); ::close(fd); }
+#endif
+}
+
 namespace miq {
 
 static const uint32_t TXINDEX_MAGIC = 0x54584958;  // "TXIX"
@@ -178,6 +201,9 @@ bool TxIndex::save_to_disk() const {
 
         f.flush();
         f.close();
+
+        // DURABILITY: fsync before rename to ensure data is on disk
+        fsync_path(temp_path);
 
         // Atomic rename
         std::filesystem::rename(temp_path, path_);

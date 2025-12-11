@@ -5,7 +5,30 @@
 #include <sstream>
 #include <unordered_map>
 
+#if defined(_WIN32)
+  #include <windows.h>
+#else
+  #include <unistd.h>
+  #include <fcntl.h>
+#endif
+
 namespace fs = std::filesystem;
+
+// DURABILITY: Platform-specific fsync for UTXO log
+static inline void fsync_file(const std::string& path) {
+#if defined(_WIN32)
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_WRITE,
+                           FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+#else
+    int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd >= 0) { ::fsync(fd); ::close(fd); }
+#endif
+}
 
 namespace miq {
 
@@ -42,13 +65,14 @@ bool UTXOSet::append_log(char op, const std::vector<uint8_t>& txid, uint32_t vou
     // CRITICAL FIX: Check write success before flush
     if (!f.good()) return false;
 
-    // CRITICAL FIX: Flush and sync to disk for durability
+    // DURABILITY: Flush stream buffer to OS
     f.flush();
     if (!f.good()) return false;
+    f.close();
 
-    // Note: std::ofstream doesn't expose fsync directly, but flush() with
-    // good() check ensures buffer is written. For true fsync, would need
-    // to use POSIX file descriptors. This is acceptable for most use cases.
+    // DURABILITY: Actually fsync to disk for true persistence
+    // Without this, data could be lost on power failure even after flush()
+    fsync_file(log_path_);
 
     return true;
 }
