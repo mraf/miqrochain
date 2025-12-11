@@ -4746,6 +4746,25 @@ int main(int argc, char** argv){
         }
         if (can_tui) { tui.mark_step_ok("Load & validate genesis"); tui.mark_step_ok("Genesis OK"); }
 
+        // CRITICAL PERFORMANCE FIX: Initialize assume-valid with highest checkpoint
+        // This dramatically speeds up IBD by skipping signature verification for
+        // historical blocks that have already been verified by the network.
+        // The checkpoint hash is verified, so we know these blocks are valid.
+        {
+            uint64_t av_height = miq::get_highest_checkpoint_height();
+            if (av_height > 0) {
+                // Get the checkpoint hash at that height
+                for (const auto& cp : miq::get_checkpoints()) {
+                    if (cp.height == av_height) {
+                        if (miq::init_assume_valid_hex(cp.hash_hex, av_height)) {
+                            log_info("Assume-valid enabled: skipping signatures for blocks 0-" + std::to_string(av_height));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
         if (can_tui) tui.mark_step_started("Reindex UTXO (full scan)");
 #if MIQ_CAN_PROBE_UTXO_REINDEX
         {

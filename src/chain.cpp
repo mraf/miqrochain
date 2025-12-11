@@ -1807,17 +1807,28 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
 
     // Merkle + duplicate guard
     if (b.txs.empty()){ err="no coinbase"; return false; }
+
+    // Calculate block height for assume-valid check (used later for signature skipping)
+    const uint64_t block_height = tip_.height + 1;
+    const auto block_hash = b.block_hash();
+
+    // CHECKPOINT VALIDATION: Reject blocks that don't match checkpoints
+    // This prevents nodes from following forked chains
+    if (!miq::check_checkpoint(block_height, block_hash)) {
+        err = "block hash does not match checkpoint at height " + std::to_string(block_height);
+        return false;
+    }
+
+    // CRITICAL PERFORMANCE: Check if we should skip signature verification
+    // For blocks below the assume-valid checkpoint, signatures have already
+    // been verified by the network. We still validate UTXO, amounts, etc.
+    const bool skip_sigs = !miq::should_validate_signatures(block_hash, block_height);
+    if (skip_sigs) {
+        MIQ_LOG_DEBUG(miq::LogCategory::VALIDATION,
+            "Assume-valid: skipping signatures for block " + std::to_string(block_height));
+    }
+
     {
-        // Calculate block height for assume-valid check
-        uint64_t block_height = tip_.height + 1;
-
-        // CHECKPOINT VALIDATION: Reject blocks that don't match checkpoints
-        // This prevents nodes from following forked chains
-        if (!miq::check_checkpoint(block_height, b.block_hash())) {
-            err = "block hash does not match checkpoint at height " + std::to_string(block_height);
-            return false;
-        }
-
         std::unordered_set<std::string> seen;
         std::vector<std::vector<uint8_t>> txids;
         txids.reserve(b.txs.size());
@@ -2038,10 +2049,16 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
             // Example: coinbase at 100, maturity 100 -> spendable at 201
             if(e.coinbase && tip_.height+1 <= e.height + COINBASE_MATURITY){ err="immature coinbase"; return false; }
             if(hash160(inx.pubkey)!=e.pkh){ err="pkh mismatch"; return false; }
-            if(!crypto::ECDSA::verify(inx.pubkey, hash, inx.sig)){ err="bad signature"; return false; }
-        #if MIQ_RULE_ENFORCE_LOW_S
-            if (!is_low_s64(inx.sig)) { err = "high-S signature"; return false; }
-        #endif
+            // CRITICAL PERFORMANCE: Skip signature verification for assume-valid blocks
+            // This dramatically speeds up IBD (Initial Block Download) by skipping
+            // expensive ECDSA verification for blocks that have already been
+            // verified by the network. We still validate UTXO, amounts, pkh, etc.
+            if (!skip_sigs) {
+                if(!crypto::ECDSA::verify(inx.pubkey, hash, inx.sig)){ err="bad signature"; return false; }
+            #if MIQ_RULE_ENFORCE_LOW_S
+                if (!is_low_s64(inx.sig)) { err = "high-S signature"; return false; }
+            #endif
+            }
             // Sum input values (after signature check to avoid expensive crypto on invalid tx)
             if (!leq_max_money(e.value)) { err = "utxo>MAX_MONEY"; return false; }
             if (!add_u64_safe(in, e.value, tmp)) { err = "tx in overflow"; return false; }
