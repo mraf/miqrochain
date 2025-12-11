@@ -1319,6 +1319,12 @@ static int64_t g_stall_retry_ms = MIQ_P2P_STALL_RETRY_MS;
 // which wastes bandwidth and can create duplicate orphans causing sync issues.
 static std::unordered_set<uint64_t> g_global_requested_indices;
 
+// CRITICAL FIX: Single best peer for sync to prevent forks from multi-peer sync
+// Only the peer with highest tip should be used for block downloads
+static std::atomic<Sock> g_best_sync_peer{MIQ_INVALID_SOCK};
+static std::atomic<uint64_t> g_best_sync_peer_height{0};
+static std::atomic<int64_t> g_best_sync_peer_updated_ms{0};
+
 // CRITICAL FIX: Track inflight tx request timestamps for timeout cleanup
 // Without this, inflight_tx can grow forever, eventually blocking all new tx requests
 static std::unordered_map<Sock, std::unordered_map<std::string,int64_t>> g_inflight_tx_ts;
@@ -1392,6 +1398,36 @@ static inline bool peer_is_index_capable(Sock s) {
     // This ensures proper sync order: headers first, then blocks
     if (it == g_peer_index_capable.end()) return false;
     return it->second;
+}
+
+// CRITICAL FIX: Check if we should sync from this peer
+// Allow sync from any peer that is ahead of us or at same height
+// Only block peers that are significantly behind (they can't help us)
+static inline bool should_sync_from_peer(Sock s, uint64_t peer_tip, uint64_t our_height) {
+    // Track the best peer for reference
+    uint64_t current_best_height = g_best_sync_peer_height.load();
+    if (peer_tip > current_best_height) {
+        g_best_sync_peer.store(s);
+        g_best_sync_peer_height.store(peer_tip);
+        g_best_sync_peer_updated_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
+    // Allow sync from peers that are ahead of us or at similar height
+    if (peer_tip == 0) return true;  // Unknown tip - allow (will timeout if no blocks)
+    if (peer_tip >= our_height) return true;  // Peer is ahead or same - good
+    if (peer_tip + 10 >= our_height) return true;  // Peer is slightly behind - still useful
+
+    // Peer is significantly behind us - don't waste time requesting from them
+    return false;
+}
+
+// Clear best sync peer (call when peer disconnects)
+static inline void clear_best_sync_peer_if_match(Sock s) {
+    if (g_best_sync_peer.load() == s) {
+        g_best_sync_peer.store(MIQ_INVALID_SOCK);
+        g_best_sync_peer_height.store(0);
+    }
 }
 
 static inline int64_t adaptive_index_timeout_ms(const miq::PeerState& ps){
@@ -1674,6 +1710,8 @@ static inline void gate_set_loopback(Sock fd, bool is_lb){
 static inline void gate_on_close(Sock fd){
     // Thread-safe cleanup of all inflight tracking for this socket
     clear_all_inflight_for_sock(fd);
+    // CRITICAL FIX: Clear best sync peer if this was it
+    clear_best_sync_peer_if_match(fd);
     g_gate.erase(fd);
     g_trickle_q.erase(fd);
     g_trickle_last_ms.erase(fd);
@@ -3470,6 +3508,13 @@ void P2P::fill_index_pipeline(PeerState& ps){
 
     // SYNC STATE FIX: Ensure next_index is consistent with current chain height
     const uint64_t current_height = chain_.height();
+
+    // CRITICAL FIX: Only sync from peers that can help us (ahead or at same height)
+    // Don't waste time on peers that are behind us
+    uint64_t peer_tip = ps.peer_tip_height > 0 ? ps.peer_tip_height : chain_.best_header_height();
+    if (!should_sync_from_peer((Sock)ps.sock, peer_tip, current_height)) {
+        return;
+    }
     if (ps.next_index <= current_height) {
         ps.next_index = current_height + 1;
         P2P_TRACE("DEBUG: Sync state corrected - next_index updated from " +
@@ -5071,6 +5116,11 @@ void P2P::loop(){
                 expired_idx.push_back({s, idx, ts});
                 dq.pop_front();
                 g_inflight_index_ts[s].erase(idx);
+                // CRITICAL FIX: Remove from global set so it can be re-requested immediately
+                {
+                    InflightLock lk(g_inflight_lock);
+                    g_global_requested_indices.erase(idx);
+                }
                 if (ps.inflight_index > 0) ps.inflight_index--; // free a slot on original peer
               } else {
                 break; // front is still within timeout window
@@ -7905,8 +7955,8 @@ void P2P::loop(){
         // CRITICAL FIX: Much faster cleanup to prevent sync stalls and forks
         {
             static int64_t last_idx_cleanup_ms = 0;
-            constexpr int64_t IDX_CLEANUP_INTERVAL_MS = 5000;   // CRITICAL: Every 5 seconds (was 60s)
-            constexpr int64_t IDX_STALE_THRESHOLD_MS = 15000;   // CRITICAL: 15 seconds stale (was 5 min)
+            constexpr int64_t IDX_CLEANUP_INTERVAL_MS = 2000;   // CRITICAL: Every 2 seconds for fast recovery
+            constexpr int64_t IDX_STALE_THRESHOLD_MS = 10000;   // CRITICAL: 10 seconds stale threshold
 
             if (current_time - last_idx_cleanup_ms >= IDX_CLEANUP_INTERVAL_MS) {
                 last_idx_cleanup_ms = current_time;
