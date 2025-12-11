@@ -4469,6 +4469,21 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                                       "complete", seed_host_cstr(), true);
             }
             mark_ibd_complete();  // Enable full durability now that sync is complete
+
+            // CRITICAL: Rebuild AddressIndex after IBD completes
+            // During IBD, address indexing was skipped for performance
+            // Now rebuild so wallet shows correct balance
+            if (chain.addressindex().is_enabled() && chain.addressindex().address_count() == 0) {
+                log_info("IBD complete - rebuilding AddressIndex for wallet functionality...");
+                chain.reindex_addresses([&](uint64_t cur, uint64_t total) {
+                    if (cur % 500 == 0 && tui && can_tui) {
+                        tui->set_banner("Rebuilding address index: " + std::to_string(cur) + "/" + std::to_string(total));
+                    }
+                    return !global::shutdown_requested.load();
+                });
+                if (tui && can_tui) tui->set_banner("");
+            }
+
             return true;
         }
 
