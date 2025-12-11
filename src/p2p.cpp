@@ -6459,6 +6459,26 @@ void P2P::loop(){
                         g_peer_last_fetch_ms[(Sock)ps.sock] = now_ms();
                         g_last_hdr_ok_ms[(Sock)ps.sock]     = now_ms();
                         if (ps.inflight_hdr_batches > 0) ps.inflight_hdr_batches--;
+
+                        // CRITICAL PERFORMANCE FIX: Request blocks IMMEDIATELY after accepting headers!
+                        // This is essential for fast block propagation - when a peer announces a new
+                        // block via headers, we must request it right away, not wait for a later cycle.
+                        if (accepted > 0) {
+                            std::vector<std::vector<uint8_t>> want_blocks;
+                            chain_.next_block_fetch_targets(want_blocks, 64);
+                            for (const auto& bh : want_blocks) {
+                                const std::string key = hexkey(bh);
+                                if (g_global_inflight_blocks.count(key) || orphans_.count(key))
+                                    continue;
+                                // Request from this peer since they just announced the header
+                                request_block_hash(ps, bh);
+                            }
+                            // Also trigger index-based sync if active
+                            if (ps.syncing) {
+                                fill_index_pipeline(ps);
+                            }
+                        }
+
                         if (hs.empty()) {
                             // Empty batch => likely tip reached for this peer.
                             maybe_mark_headers_done(true);
