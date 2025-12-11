@@ -5,6 +5,7 @@
 #include "txindex.h"
 #include "hex.h"
 #include "log.h"
+#include "assume_valid.h"  // For is_ibd_mode()
 #include <filesystem>
 #include <algorithm>
 
@@ -16,7 +17,11 @@
 #endif
 
 // Fast sync mode - skip fsync during IBD for speed
+// CRITICAL FIX: Use is_ibd_mode() to automatically skip fsync during IBD
 static bool fast_sync_enabled() {
+    // Always skip fsync during IBD for 10-100x faster sync
+    if (miq::is_ibd_mode()) return true;
+    // Manual override via environment variable
     const char* e = std::getenv("MIQ_FAST_SYNC");
     return e && (e[0]=='1' || e[0]=='t' || e[0]=='T' || e[0]=='y' || e[0]=='Y');
 }
