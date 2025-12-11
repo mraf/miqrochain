@@ -9,6 +9,7 @@
 #include <vector>
 #include <mutex>
 #include <fstream>
+#include "assume_valid.h"  // For is_ibd_mode()
 
 #ifdef _WIN32
   #include <direct.h>
@@ -72,6 +73,11 @@ public:
         hashes_[height]  = to_arr32(block_hash_le);
         headers_[height] = hdr;
         filters_[height] = filter_bytes;
+
+        // CRITICAL PERFORMANCE: Skip disk write during IBD
+        // Filter data is kept in memory, will be persisted after IBD completes
+        // This prevents 5000+ file operations during sync
+        if (miq::is_ibd_mode()) return true;
 
         return persist_append(height, hashes_[height], headers_[height], filters_[height]);
     }
