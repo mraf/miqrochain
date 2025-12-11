@@ -288,6 +288,8 @@ struct PeerState {
 
     // Track peer's block availability
     uint64_t peer_tip_height{0};
+    uint64_t announced_tip_height{0};     // Original tip from version message (for recovery)
+    int64_t peer_tip_reduced_ms{0};       // When peer_tip was reduced due to notfound
     int64_t connection_attempt_count{0};
     int64_t successful_responses{0};
     int64_t failed_responses{0};

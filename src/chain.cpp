@@ -1828,9 +1828,10 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
             "Assume-valid: skipping signatures for block " + std::to_string(block_height));
     }
 
+    // PERF: Compute txids once and reuse for duplicate check, merkle, and BIP30
+    std::vector<std::vector<uint8_t>> txids;
     {
         std::unordered_set<std::string> seen;
-        std::vector<std::vector<uint8_t>> txids;
         txids.reserve(b.txs.size());
         for (const auto& tx : b.txs) {
             auto id = tx.txid();
@@ -1869,11 +1870,12 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
     if (cb.vin[0].prev.vout != 0) { err="bad coinbase vout"; return false; }
 
     // === BIP30: reject if any txid already has ANY unspent outputs (ALWAYS on) ===
+    // PERF: Use pre-computed txids from earlier loop instead of recomputing
     {
         UTXOEntry dummy;
-        for (const auto& tx : b.txs) {
-            const auto id = tx.txid();
-            for (uint32_t v = 0; v < (uint32_t)tx.vout.size(); ++v) {
+        for (size_t i = 0; i < b.txs.size(); ++i) {
+            const auto& id = txids[i];  // Use cached txid
+            for (uint32_t v = 0; v < (uint32_t)b.txs[i].vout.size(); ++v) {
                 if (utxo_.get(id, v, dummy)) {
                     err = "BIP30 duplicate txid";
                     return false;
@@ -1937,8 +1939,8 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         }
     }
 
-    // POW
-    if (!meets_target_be(b.block_hash(), b.header.bits)) { err = "bad pow"; return false; }
+    // POW - use cached block_hash instead of recomputing
+    if (!meets_target_be(block_hash, b.header.bits)) { err = "bad pow"; return false; }
 
     // Block raw size cap
     if (ser_block(b).size() > MAX_BLOCK_SIZE_LOCAL) { err = "oversize block"; return false; }

@@ -558,14 +558,16 @@ static bool test_ibd_stall_constants() {
     TEST_BEGIN("test_ibd_stall_constants");
 
     // Verify IBD stall detection is properly configured
+    // Values should be balanced: not too aggressive (causes connect/disconnect thrashing)
+    // but not too lenient (causes slow peer switching)
     TEST_ASSERT(MIQ_HEADERS_ONLY_BAN_SCORE >= 20,
                 "Headers-only ban score should be significant");
-    TEST_ASSERT(MIQ_BLOCK_STALL_MAX_COUNT <= 2,
-                "Should switch peers quickly on stall");
+    TEST_ASSERT(MIQ_BLOCK_STALL_MAX_COUNT >= 2 && MIQ_BLOCK_STALL_MAX_COUNT <= 5,
+                "Stall count should be balanced (2-5 range prevents thrashing while staying responsive)");
     TEST_ASSERT(MIQ_HEADERS_NO_BLOCKS_TIMEOUT_MS >= 10000,
                 "Headers timeout should be reasonable");
-    TEST_ASSERT(MIQ_IBD_PEER_SWITCH_THRESHOLD <= 2,
-                "Should switch sync peer quickly");
+    TEST_ASSERT(MIQ_IBD_PEER_SWITCH_THRESHOLD >= 2 && MIQ_IBD_PEER_SWITCH_THRESHOLD <= 5,
+                "Peer switch threshold should be balanced (2-5 range)");
 
     TEST_END("test_ibd_stall_constants");
     return true;

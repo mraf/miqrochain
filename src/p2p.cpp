@@ -332,8 +332,11 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
 #ifndef MIQ_OUTBOUND_TARGET
 #define MIQ_OUTBOUND_TARGET 8
 #endif
+// CRITICAL FIX: Increased dial interval from 5s to 15s to prevent rapid reconnect loops
+// When a peer disconnects, we were immediately trying to reconnect, causing
+// connect/disconnect cycling. 15 seconds gives time for network issues to resolve.
 #ifndef MIQ_DIAL_INTERVAL_MS
-#define MIQ_DIAL_INTERVAL_MS 5000
+#define MIQ_DIAL_INTERVAL_MS 15000
 #endif
 
 #ifndef MIQ_ORPHAN_MAX_BYTES
@@ -373,8 +376,9 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
   #ifndef MIQ_P2P_INV_WINDOW_CAP
   #define MIQ_P2P_INV_WINDOW_CAP 300
   #endif
+  // CRITICAL FIX: Reduced trickle delay from 250ms to 50ms for faster propagation
   #ifndef MIQ_P2P_TRICKLE_MS
-  #define MIQ_P2P_TRICKLE_MS 250
+  #define MIQ_P2P_TRICKLE_MS 50   // Was 250ms - each 250ms added to propagation time
   #endif
   #ifndef MIQ_P2P_TRICKLE_BATCH
   #define MIQ_P2P_TRICKLE_BATCH 48
@@ -392,8 +396,9 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
   #ifndef MIQ_P2P_INV_WINDOW_CAP
   #define MIQ_P2P_INV_WINDOW_CAP 500
   #endif
+  // CRITICAL FIX: Reduced trickle delay from 200ms to 50ms for faster propagation
   #ifndef MIQ_P2P_TRICKLE_MS
-  #define MIQ_P2P_TRICKLE_MS 200
+  #define MIQ_P2P_TRICKLE_MS 50   // Was 200ms - each 200ms added to propagation time
   #endif
   #ifndef MIQ_P2P_TRICKLE_BATCH
   #define MIQ_P2P_TRICKLE_BATCH 64
@@ -451,6 +456,12 @@ std::atomic<bool> g_sync_wants_active{false};
 namespace {
     static std::mutex g_peer_stalls_mu;
     static std::unordered_map<std::uintptr_t, int> g_peer_stalls;
+
+    // CRITICAL FIX: Per-IP reconnection backoff to prevent rapid connect/disconnect cycles
+    // When a peer disconnects, we record the time. We won't reconnect until backoff expires.
+    static std::mutex g_reconnect_backoff_mu;
+    static std::unordered_map<std::string, int64_t> g_reconnect_backoff_until;  // IP -> earliest reconnect time
+    static constexpr int64_t RECONNECT_BACKOFF_MS = 30000;  // 30 second backoff after disconnect
 
     // Single authoritative monotonic ms clock used by rate limiters / stall guards / snapshots.
     static inline int64_t now_ms() {
@@ -947,8 +958,10 @@ static inline int parallel_send_to_peers(
     size_t idx = 0;
 
     // Track start time for cumulative timeout
+    // CRITICAL FIX: Reduced from 800ms to 100ms for fast block propagation
+    // 800ms was causing massive delays - each hop added 800ms to propagation time
     const auto batch_start = std::chrono::steady_clock::now();
-    const auto max_total_time = std::chrono::milliseconds(800);  // 800ms total max
+    const auto max_total_time = std::chrono::milliseconds(100);  // 100ms total max (was 800ms)
 
     while (idx < sockets.size()) {
         futures.clear();
@@ -3532,9 +3545,15 @@ void P2P::fill_index_pipeline(PeerState& ps){
             }
         }
 
-        ps.next_index++;
+        // CRITICAL FIX: Only increment next_index AFTER successful request
+        // If send fails, we must NOT skip this index - retry on next fill_index_pipeline call
         if (request_block_index(ps, idx)) {
+            ps.next_index++;
             ps.inflight_index++;
+        } else {
+            // Send failed - don't increment next_index, exit loop
+            // On next call we'll retry this same index
+            break;
         }
     }
 }
@@ -4462,7 +4481,21 @@ void P2P::loop(){
                          for (auto& kv : peers_) if (kv.second.ip == dotted) { connected = true; break; }
                      }
                      if (connected) { g_addrman.mark_attempt(*cand); continue; }
- 
+
+                     // CRITICAL FIX: Check reconnection backoff to prevent rapid connect/disconnect
+                     {
+                         std::lock_guard<std::mutex> lk_backoff(g_reconnect_backoff_mu);
+                         auto it = g_reconnect_backoff_until.find(dotted);
+                         if (it != g_reconnect_backoff_until.end() && tnow < it->second) {
+                             // Still in backoff period, skip this IP
+                             continue;
+                         }
+                         // Clean up expired backoffs while we're here
+                         if (it != g_reconnect_backoff_until.end()) {
+                             g_reconnect_backoff_until.erase(it);
+                         }
+                     }
+
                      Sock s = MIQ_INVALID_SOCK;
                      std::string ip_txt;
                      bool allow_loopback = std::getenv("MIQ_FORCE_CLIENT") != nullptr;
@@ -5202,6 +5235,33 @@ void P2P::loop(){
                   }
               }
           }
+
+          // CRITICAL FIX: Recovery mechanism for transient notfound errors
+          // If peer_tip_height was reduced due to notfound but peer originally announced
+          // higher, periodically reset to allow retry (peer may have had transient issue)
+          {
+              const int64_t tnow = now_ms();
+              const int64_t PEER_TIP_RECOVERY_MS = 30000;  // 30 seconds cooldown
+              for (auto& kvp : peers_) {
+                  PeerState& ps = kvp.second;
+                  if (!ps.verack_ok) continue;
+                  // If peer_tip was reduced and enough time has passed, restore it
+                  if (ps.peer_tip_reduced_ms > 0 &&
+                      ps.peer_tip_height < ps.announced_tip_height &&
+                      (tnow - ps.peer_tip_reduced_ms > PEER_TIP_RECOVERY_MS)) {
+                      log_info("P2P: Recovering peer_tip_height for " + ps.ip +
+                               " from " + std::to_string(ps.peer_tip_height) +
+                               " to " + std::to_string(ps.announced_tip_height) +
+                               " (retry after transient failure)");
+                      ps.peer_tip_height = ps.announced_tip_height;
+                      ps.peer_tip_reduced_ms = 0;  // Reset recovery timer
+                      // Trigger immediate pipeline refill to retry the blocks
+                      if (ps.syncing && peer_is_index_capable((Sock)ps.sock)) {
+                          fill_index_pipeline(ps);
+                      }
+                  }
+              }
+          }
         }
 
         // CRITICAL FIX: Inflight transaction request timeout cleanup
@@ -5257,7 +5317,8 @@ void P2P::loop(){
                 }
                 int64_t hard_timeout = (int64_t)MIQ_P2P_PONG_TIMEOUT_MS;
                 const bool sync_active = ibd_or_fetch_active(ps, tnow);
-                if (sync_active) hard_timeout *= 4; // 4x window while syncing
+                // CRITICAL FIX: Use 6x multiplier consistently (was 4x here, 6x elsewhere - race condition)
+                if (sync_active) hard_timeout *= 6; // 6x window while syncing
 
                 if (ps.awaiting_pong) {
                     const int64_t waited = tnow - ps.last_ping_ms;
@@ -6007,6 +6068,12 @@ void P2P::loop(){
                 // Log peer disconnection
                 log_info("Peer: disconnected ← " + ps_old.ip + " (remaining_peers=" + std::to_string(peers_.size() - 1) + ")");
 
+                // CRITICAL FIX: Record backoff time to prevent rapid reconnection
+                {
+                    std::lock_guard<std::mutex> lk_backoff(g_reconnect_backoff_mu);
+                    g_reconnect_backoff_until[ps_old.ip] = now_ms() + RECONNECT_BACKOFF_MS;
+                }
+
                 // Finally, close & erase the dead peer.
                 gate_on_close(s_dead);
                 CLOSESOCK(s_dead);
@@ -6362,6 +6429,7 @@ void P2P::loop(){
                                 announced_height |= (uint32_t)m.payload[pos + ua_size + 2] << 16;
                                 announced_height |= (uint32_t)m.payload[pos + ua_size + 3] << 24;
                                 ps.peer_tip_height = announced_height;
+                                ps.announced_tip_height = announced_height;  // Save original for recovery
 
                                 // CRITICAL FIX: Trigger immediate sync if peer has higher tip
                                 // This prevents falling behind when new blocks are announced
@@ -6624,8 +6692,10 @@ void P2P::loop(){
 
                             // CRITICAL FIX: Update peer_tip_height - peer doesn't have this block
                             // If peer says they don't have block N, set their tip to N-1 (or 0)
+                            // Track when this happened so we can retry later (transient errors)
                             if (idx64 > 0 && idx64 <= ps.peer_tip_height) {
                                 ps.peer_tip_height = idx64 - 1;
+                                ps.peer_tip_reduced_ms = now_ms();  // Track for recovery
                                 log_info("P2P: Peer " + ps.ip + " doesn't have block " + std::to_string(idx64) +
                                          ", updated peer_tip_height to " + std::to_string(ps.peer_tip_height));
                             }
