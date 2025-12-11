@@ -1395,16 +1395,17 @@ static inline bool peer_is_index_capable(Sock s) {
 }
 
 static inline int64_t adaptive_index_timeout_ms(const miq::PeerState& ps){
-    // Base on observed block delivery; halve it for indices (headers+lookup are lighter).
-    int64_t base = std::max<int64_t>(5000, ps.avg_block_delivery_ms / 2);
+    // CRITICAL FIX: Reduced timeouts for faster recovery during sync stalls
+    // Previous 120s IBD timeout was way too long - peer could be stuck for 2 minutes
+    int64_t base = std::max<int64_t>(2000, ps.avg_block_delivery_ms / 2);
     // Healthier peers get tighter timeouts, weaker peers looser.
     double health = std::min(1.0, std::max(0.0, ps.health_score)); // clamp
     double health_mul = 2.0 - health; // 1.0..2.0
     // During IBD or explicit index sync, allow more slack.
-    double ibd_mul = (!g_logged_headers_done || ps.syncing) ? 2.0 : 1.2;
+    double ibd_mul = (!g_logged_headers_done || ps.syncing) ? 1.5 : 1.2;
     int64_t t = (int64_t)(base * health_mul * ibd_mul);
-    int64_t max_t = (!g_logged_headers_done || ps.syncing) ? 120000 : 30000; // 120s IBD, 30s steady
-    return std::max<int64_t>(5000, std::min<int64_t>(t, max_t));
+    int64_t max_t = (!g_logged_headers_done || ps.syncing) ? 15000 : 10000; // 15s IBD, 10s steady (was 120s/30s)
+    return std::max<int64_t>(2000, std::min<int64_t>(t, max_t));
 }
 
 // ============================================================================
@@ -5474,7 +5475,8 @@ void P2P::loop(){
             }
 
             // Implement aggressive refetch when stalled OR proactive pipeline during IBD
-            int64_t refetch_interval = headers_done ? 5000 : 10000;  // 5s after headers, 10s before
+            // CRITICAL FIX: Reduced intervals for faster sync recovery
+            int64_t refetch_interval = headers_done ? 2000 : 3000;  // 2s after headers, 3s before (was 5s/10s)
 
             // CRITICAL FIX: Aggressive stale tip detection to prevent forks
             uint64_t tip_age_sec = 0;
