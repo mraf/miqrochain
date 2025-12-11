@@ -6830,13 +6830,16 @@ void P2P::loop(){
                                     // CRITICAL FIX: Reset timeout counter on successful delivery
                                     // This prevents peers from being demoted after transient timeouts
                                     g_index_timeouts[(Sock)s] = 0;
+
+                                    // CRITICAL FIX: Only decrement inflight_index when we successfully
+                                    // identify and clear the index. If we decrement without clearing,
+                                    // inflight_index gets out of sync with g_global_requested_indices,
+                                    // causing fill_index_pipeline to skip all "already requested" indices
+                                    // and eventually stall.
+                                    ps.inflight_index--;
                                 }
-                                ps.inflight_index--;
-                                // CRITICAL FIX: Always refill index pipeline after receiving a block
-                                // Without this, duplicate/rejected/orphaned blocks don't trigger new requests
-                                // and the pipeline depletes over time causing sync slowdown or stall.
-                                // This is essential for maintaining consistent sync progress regardless
-                                // of whether blocks are accepted, orphaned, or rejected.
+                                // Always try to refill pipeline - either we cleared a slot, or
+                                // timeout will eventually clear stuck entries
                                 fill_index_pipeline(ps);
                             } else {
                                 // SAFETY NET: Even if inflight_index was 0, try to refill pipeline
