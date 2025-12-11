@@ -3482,15 +3482,16 @@ void P2P::fill_index_pipeline(PeerState& ps){
     uint64_t max_index = current_height + max_ahead;
 
     // Determine the limit for block requests from this peer
-    // CRITICAL FIX: When peer_tip_height is unknown, don't block requests
-    // This was causing sync stalls when peer didn't announce height in version message
+    // PERFORMANCE FIX: During IBD, don't cap at header height - let blocks request ahead
+    // Block validation happens when they arrive, so we can safely request beyond headers
     const uint64_t best_hdr = chain_.best_header_height();
     uint64_t peer_limit;
     if (ps.peer_tip_height > 0) {
         // Use peer's announced tip - this is what they claim to have
         peer_limit = ps.peer_tip_height;
-        // Cap at header height if we have headers
-        if (best_hdr > 0 && peer_limit > best_hdr) {
+        // PERFORMANCE: Only cap at header height AFTER headers are done
+        // During IBD, allow requesting ahead - blocks will wait in orphan pool
+        if (g_logged_headers_done && best_hdr > 0 && peer_limit > best_hdr) {
             peer_limit = best_hdr;
         }
         // If peer is significantly behind us, don't request from them
@@ -3500,14 +3501,14 @@ void P2P::fill_index_pipeline(PeerState& ps){
                       " our_height=" + std::to_string(current_height));
             return;
         }
-    } else if (best_hdr > 0) {
-        // Fallback to header height if peer_tip not yet known
+    } else if (g_logged_headers_done && best_hdr > 0) {
+        // After headers done, fallback to header height if peer_tip not yet known
         peer_limit = best_hdr;
     } else {
-        // CRITICAL FIX: No peer_tip and no headers - allow aggressive sync
+        // PERFORMANCE FIX: During IBD or no headers - allow aggressive sync
         // Let requests go through and timeout naturally if peer doesn't have blocks
-        // This enables sync to start even when peer height is unknown
-        peer_limit = current_height + max_ahead;  // Use full window, not just 100
+        // This enables parallel header+block sync for much faster IBD
+        peer_limit = current_height + max_ahead;  // Use full window
     }
     max_index = std::min(max_index, peer_limit);
 
@@ -3539,10 +3540,11 @@ void P2P::fill_index_pipeline(PeerState& ps){
 }
 
 bool P2P::request_block_index(PeerState& ps, uint64_t index){
-    // ULTIMATE SAFETY NET: Never request blocks beyond header height
-    // This is the last line of defense against corrupted state
+    // PERFORMANCE: During IBD, allow requesting beyond header height for parallel sync
+    // Blocks will be validated when headers catch up - they wait in orphan pool
+    // Only enforce header cap AFTER headers phase is complete
     const uint64_t hdr_height = chain_.best_header_height();
-    if (hdr_height > 0 && index > hdr_height) {
+    if (g_logged_headers_done && hdr_height > 0 && index > hdr_height) {
         P2P_TRACE("BLOCKED: request_block_index(" + std::to_string(index) +
                   ") exceeds header height " + std::to_string(hdr_height));
         return false;
@@ -6457,6 +6459,26 @@ void P2P::loop(){
                         g_peer_last_fetch_ms[(Sock)ps.sock] = now_ms();
                         g_last_hdr_ok_ms[(Sock)ps.sock]     = now_ms();
                         if (ps.inflight_hdr_batches > 0) ps.inflight_hdr_batches--;
+
+                        // CRITICAL PERFORMANCE FIX: Request blocks IMMEDIATELY after accepting headers!
+                        // This is essential for fast block propagation - when a peer announces a new
+                        // block via headers, we must request it right away, not wait for a later cycle.
+                        if (accepted > 0) {
+                            std::vector<std::vector<uint8_t>> want_blocks;
+                            chain_.next_block_fetch_targets(want_blocks, 64);
+                            for (const auto& bh : want_blocks) {
+                                const std::string key = hexkey(bh);
+                                if (g_global_inflight_blocks.count(key) || orphans_.count(key))
+                                    continue;
+                                // Request from this peer since they just announced the header
+                                request_block_hash(ps, bh);
+                            }
+                            // Also trigger index-based sync if active
+                            if (ps.syncing) {
+                                fill_index_pipeline(ps);
+                            }
+                        }
+
                         if (hs.empty()) {
                             // Empty batch => likely tip reached for this peer.
                             maybe_mark_headers_done(true);
