@@ -5576,41 +5576,15 @@ void P2P::loop(){
 
                     // For peers that support index-based sync, use getbi
                     if (peer_is_index_capable((Sock)pps.sock)) {
-                        // Update peer reputation and adaptive batch size
-                        update_peer_reputation(pps);
-                        update_adaptive_batch_size(pps);
-
-                        // Use peer_tip_height if known, otherwise fall back to header height
-                        // CRITICAL FIX: Don't cap at header height when peer claims to have more blocks!
-                        // Headers from competing chains may be rejected, but blocks should still be requested
-                        // to trigger reorg evaluation
-                        uint64_t best_hdr = chain_.best_header_height();
-                        uint64_t peer_tip = (pps.peer_tip_height > 0) ? pps.peer_tip_height : best_hdr;
-
-                        // REMOVED: Don't cap at header height - this prevents syncing with competing chains
-                        // If peer claims to have height X, we should try to get blocks up to X
-                        // The blocks will be validated and trigger reorg if valid
-
-                        // If no info at all, or tip is stale, try requesting blocks speculatively
-                        // This helps discover blocks from peers that didn't announce their height
-                        if (peer_tip == 0 || peer_tip <= current_height) {
-                            // CRITICAL FIX: When tip is stale and peer_tip unknown, be more aggressive
-                            // Request up to 50 blocks ahead to discover if peer has more
-                            peer_tip = current_height + (tip_is_stale ? 50 : 10);
+                        // CRITICAL FIX: Just call fill_index_pipeline instead of manually requesting
+                        // The old code called request_block_index directly without tracking inflight_index,
+                        // causing the stop-start sync pattern
+                        if (!pps.syncing) {
+                            pps.syncing = true;
+                            pps.inflight_index = 0;
+                            pps.next_index = current_height + 1;
                         }
-
-                        // Request blocks up to peer_tip (capped by batch size)
-                        uint64_t max_height = std::min(peer_tip, current_height + pps.adaptive_batch_size);
-                        uint64_t batch_end = std::min<uint64_t>(max_height, peer_tip);
-
-                        for (uint64_t h = current_height + 1; h <= batch_end; h++) {
-                            request_block_index(pps, (uint64_t)h);
-                            if (h == current_height + 1 || h == batch_end) {
-                                log_info("TX " + pps.ip + " cmd=getbi height=" + std::to_string(h) +
-                                        " (adaptive batch=" + std::to_string(pps.adaptive_batch_size) +
-                                        ", rep=" + std::to_string(pps.reputation_score) + ")");
-                            }
-                        }
+                        fill_index_pipeline(pps);
                         refetch_sent = true;
                     } else {
                         // For peers that don't support index-based sync, use hash-based sync (getb)
