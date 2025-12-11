@@ -7356,8 +7356,10 @@ void P2P::loop(){
                                     log_warn("[IBD] headers overall progress timeout; switching to index fallback");
                                     ps.syncing = true;
                                     ps.next_index = chain_.height() + 1;
-                                    request_block_index(ps, ps.next_index);
-                                    ps.inflight_index++;
+                                    // CRITICAL FIX: Only increment inflight_index if request succeeded
+                                    if (request_block_index(ps, ps.next_index)) {
+                                        ps.inflight_index++;
+                                    }
                                 }
                                 g_zero_hdr_batches[s] = 0;
                             }
@@ -7639,8 +7641,10 @@ void P2P::loop(){
                     ps.sent_getheaders = false;
                     ps.syncing = true;
                     ps.next_index = chain_.height() + 1;
-                    request_block_index(ps, ps.next_index);
-                    ps.inflight_index++;
+                    // CRITICAL FIX: Only increment inflight_index if request succeeded
+                    if (request_block_index(ps, ps.next_index)) {
+                        ps.inflight_index++;
+                    }
                 }
             }
 #endif
