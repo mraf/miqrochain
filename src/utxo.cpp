@@ -57,6 +57,12 @@ std::string UTXOSet::key(const std::vector<uint8_t>& txid, uint32_t vout) const 
 }
 
 bool UTXOSet::append_log(char op, const std::vector<uint8_t>& txid, uint32_t vout, const UTXOEntry* e){
+    // CRITICAL PERFORMANCE: Skip log writes during IBD
+    // UTXO state is kept in memory (map_), log is only for crash recovery
+    // During IBD, we can rebuild from blocks if crash occurs - no need to log
+    // This prevents 200,000+ file operations during sync!
+    if (fast_sync_enabled()) return true;
+
     // CRITICAL FIX: Open in binary append mode with explicit sync
     std::ofstream f(log_path_, std::ios::app|std::ios::binary);
     if(!f) return false;

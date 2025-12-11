@@ -198,7 +198,8 @@ bool miq::Storage::append_block(const std::vector<uint8_t>& raw,
         std::ofstream idxf(path_index_, std::ios::app|std::ios::binary);
         idxf.write((const char*)&off, sizeof(off));
         idxf.flush();
-        flush_path(path_index_);
+        // CRITICAL FIX: Skip fsync during IBD - was causing 2x slowdown!
+        if (!fast_sync_enabled()) { flush_path(path_index_); }
     }
     {
         std::ofstream hm(path_hashmap_, std::ios::app|std::ios::binary);
@@ -257,7 +258,9 @@ bool miq::Storage::write_state(const std::vector<uint8_t>& b){
     f.write((const char*)b.data(), b.size());
     f.flush();
     f.close();
-    flush_path(temp_path);
+    // CRITICAL FIX: Skip fsync during IBD for much faster sync
+    // State can be rebuilt from blocks if crash during IBD
+    if (!fast_sync_enabled()) { flush_path(temp_path); }
     // Atomic rename - either old state or new state, never partial
     try {
         std::filesystem::rename(temp_path, path_state_);
