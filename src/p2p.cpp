@@ -6753,7 +6753,7 @@ void P2P::loop(){
                                 // This caused sync stalls because indices were never cleared from g_global_requested_indices.
                                 //
                                 // New approach: Use get_header_height(prev_hash) + 1 which works even for blocks
-                                // not yet in our chain, as long as we have the parent header (which we do during sync).
+                                // not yet in our chain, as long as we have the parent header.
                                 uint64_t delivered_idx = 0;
 
                                 // Method 1: Calculate from parent header height (works for out-of-order blocks)
@@ -6762,7 +6762,24 @@ void P2P::loop(){
                                     delivered_idx = (uint64_t)(parent_height + 1);
                                 }
 
-                                // Method 2: Fallback to chain height if it grew (handles some edge cases)
+                                // Method 2: If parent header not found, check if prev_hash is a block we have
+                                // This handles pure index sync where headers might not be ahead of blocks
+                                if (delivered_idx == 0 && chain_.have_block(hb.header.prev_hash)) {
+                                    // Parent is in chain, so this block's height = chain height + 1
+                                    // But we need the parent's height, not current tip
+                                    // Use the fact that if we have the parent, its height is at most chain_.height()
+                                    uint64_t newHeight = chain_.height();
+                                    if (newHeight >= old_height) {
+                                        // Chain might have grown, or parent was already tip
+                                        // The delivered block is for height = parent_height + 1
+                                        // Since parent is in chain, check if chain grew
+                                        if (newHeight > old_height) {
+                                            delivered_idx = newHeight; // Block was just added at this height
+                                        }
+                                    }
+                                }
+
+                                // Method 3: Fallback to chain height if it grew (handles sequential delivery)
                                 if (delivered_idx == 0) {
                                     uint64_t newHeight = chain_.height();
                                     if (newHeight > old_height) {
@@ -6770,12 +6787,16 @@ void P2P::loop(){
                                     }
                                 }
 
-                                // Method 3: If all else fails and we have inflight indices, clear the oldest one
-                                // This prevents indefinite accumulation of stale indices
-                                if (delivered_idx == 0 && !g_inflight_index_order[(Sock)s].empty()) {
-                                    delivered_idx = g_inflight_index_order[(Sock)s].front();
-                                    P2P_TRACE("DEBUG: Using oldest inflight index " + std::to_string(delivered_idx) +
-                                              " as fallback for unidentified block from " + ps.ip);
+                                // IMPORTANT: If we still can't identify the block, check if it's in our inflight set
+                                // by verifying the calculated index is actually one we requested
+                                if (delivered_idx != 0) {
+                                    // Verify this index is actually in our inflight tracking
+                                    auto it_verify = g_inflight_index_ts[(Sock)s].find(delivered_idx);
+                                    if (it_verify == g_inflight_index_ts[(Sock)s].end()) {
+                                        // We didn't request this index - don't clear anything
+                                        // This can happen with unsolicited blocks or misidentification
+                                        delivered_idx = 0;
+                                    }
                                 }
                                 if (delivered_idx != 0) {
                                     // CRITICAL FIX: Update peer_tip_height based on delivered block index
@@ -6809,13 +6830,16 @@ void P2P::loop(){
                                     // CRITICAL FIX: Reset timeout counter on successful delivery
                                     // This prevents peers from being demoted after transient timeouts
                                     g_index_timeouts[(Sock)s] = 0;
+
+                                    // CRITICAL FIX: Only decrement inflight_index when we successfully
+                                    // identify and clear the index. If we decrement without clearing,
+                                    // inflight_index gets out of sync with g_global_requested_indices,
+                                    // causing fill_index_pipeline to skip all "already requested" indices
+                                    // and eventually stall.
+                                    ps.inflight_index--;
                                 }
-                                ps.inflight_index--;
-                                // CRITICAL FIX: Always refill index pipeline after receiving a block
-                                // Without this, duplicate/rejected/orphaned blocks don't trigger new requests
-                                // and the pipeline depletes over time causing sync slowdown or stall.
-                                // This is essential for maintaining consistent sync progress regardless
-                                // of whether blocks are accepted, orphaned, or rejected.
+                                // Always try to refill pipeline - either we cleared a slot, or
+                                // timeout will eventually clear stuck entries
                                 fill_index_pipeline(ps);
                             } else {
                                 // SAFETY NET: Even if inflight_index was 0, try to refill pipeline
@@ -6836,18 +6860,9 @@ void P2P::loop(){
                             chain_.next_block_fetch_targets(want3, /*cap=*/1);
                             g_sync_wants_active.store(!want3.empty());
                             if (!want3.empty()) request_block_hash(ps, want3[0]);
-                        // CRITICAL FIX: Clear oldest inflight index on malformed/oversized block
-                        // The old code tried to use get_hash_by_index which doesn't work for pending blocks
-                        if (!g_inflight_index_order[(Sock)s].empty()) {
-                            uint64_t oldest_idx = g_inflight_index_order[(Sock)s].front();
-                            g_inflight_index_order[(Sock)s].pop_front();
-                            g_inflight_index_ts[(Sock)s].erase(oldest_idx);
-                            {
-                                InflightLock lk(g_inflight_lock);
-                                g_global_requested_indices.erase(oldest_idx);
-                            }
-                            if (ps.inflight_index > 0) ps.inflight_index--;
-                        }
+                        // For malformed/oversized blocks, we can't identify which index it was for
+                        // Don't clear anything - let timeout mechanism handle cleanup
+                        // Clearing the wrong index would break sync entirely
                           
              }
          // =====================================================================
