@@ -241,6 +241,13 @@ bool miq::Storage::read_block_by_hash(const std::vector<uint8_t>& hash,
     return read_block_by_index(it->second, out);
 }
 
+// CRITICAL PERFORMANCE FIX: Check block existence without disk I/O
+// The old have_block() was reading entire blocks from disk just to check existence!
+// This caused massive slowdown during sync - 5000+ disk reads per sync!
+bool miq::Storage::has_block(const std::vector<uint8_t>& hash) const {
+    return hash_to_index_.find(miq::to_hex(hash)) != hash_to_index_.end();
+}
+
 bool miq::Storage::write_state(const std::vector<uint8_t>& b){
     // DURABILITY: Atomic write - write to .tmp then rename
     // This prevents corruption if crash occurs during write

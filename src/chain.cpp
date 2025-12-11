@@ -2569,8 +2569,10 @@ bool Chain::get_block_by_hash(const std::vector<uint8_t>& h, Block& out) const{
 
 bool Chain::have_block(const std::vector<uint8_t>& h) const{
     MIQ_CHAIN_GUARD();
-    std::vector<uint8_t> raw;
-    return storage_.read_block_by_hash(h, raw);
+    // CRITICAL PERFORMANCE FIX: Use O(1) hash lookup instead of disk read!
+    // The old code was reading entire blocks from disk just to check existence,
+    // causing massive slowdown during sync (5000+ unnecessary disk reads).
+    return storage_.has_block(h);
 }
 
 long double Chain::work_from_bits_public(uint32_t bits) {
