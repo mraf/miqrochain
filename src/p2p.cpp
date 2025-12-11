@@ -5989,6 +5989,11 @@ void P2P::loop(){
                             if (send_or_close(target, msg)) {
                                 g_inflight_index_ts[target][idx] = now_ms();
                                 g_inflight_index_order[target].push_back(idx);
+                                // BUG FIX: Re-add to global tracking to prevent duplicate requests
+                                {
+                                    InflightLock lk(g_inflight_lock);
+                                    g_global_requested_indices.insert(idx);
+                                }
                                 itT->second.inflight_index++;
                             }
                         }
@@ -7556,6 +7561,16 @@ void P2P::loop(){
                     if (best_hdr > 0 && oldest_inflight > best_hdr) {
                         P2P_TRACE("DEBUG: Clearing corrupted inflight - idx " + std::to_string(oldest_inflight) +
                                   " exceeds header height " + std::to_string(best_hdr));
+                        // BUG FIX: Clear from global tracking before erasing peer's inflight
+                        {
+                            InflightLock lk(g_inflight_lock);
+                            auto idx_it = g_inflight_index_ts.find((Sock)s);
+                            if (idx_it != g_inflight_index_ts.end()) {
+                                for (const auto& kv : idx_it->second) {
+                                    g_global_requested_indices.erase(kv.first);
+                                }
+                            }
+                        }
                         // Clear this peer's inflight tracking and restart
                         g_inflight_index_ts.erase((Sock)s);
                         g_inflight_index_order.erase((Sock)s);
