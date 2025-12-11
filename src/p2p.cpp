@@ -6747,99 +6747,66 @@ void P2P::loop(){
                             ps.total_blocks_received++;
                             ps.total_block_bytes_received += m.payload.size();
 
+                            // BULLETPROOF SYNC FIX: When chain grows, ALWAYS clear those indices from global tracking
+                            // This is the most reliable way to keep sync moving - if chain accepted blocks,
+                            // those indices are done and should be cleared regardless of identification.
+                            if (new_height > old_height) {
+                                InflightLock lk(g_inflight_lock);
+                                for (uint64_t idx = old_height + 1; idx <= new_height; idx++) {
+                                    g_global_requested_indices.erase(idx);
+                                }
+                            }
+
                             if (ps.inflight_index > 0) {
-                                // CRITICAL FIX: Identify delivered block index using header height lookup
-                                // The old code used get_hash_by_index which ONLY works for blocks already in our chain!
-                                // This caused sync stalls because indices were never cleared from g_global_requested_indices.
-                                //
-                                // New approach: Use get_header_height(prev_hash) + 1 which works even for blocks
-                                // not yet in our chain, as long as we have the parent header.
+                                // Try to identify which specific index this peer delivered
+                                // so we can update per-peer tracking accurately
                                 uint64_t delivered_idx = 0;
 
-                                // Method 1: Calculate from parent header height (works for out-of-order blocks)
+                                // Method 1: Calculate from parent header height
                                 int64_t parent_height = chain_.get_header_height(hb.header.prev_hash);
                                 if (parent_height >= 0) {
                                     delivered_idx = (uint64_t)(parent_height + 1);
                                 }
 
-                                // Method 2: If parent header not found, check if prev_hash is a block we have
-                                // This handles pure index sync where headers might not be ahead of blocks
-                                if (delivered_idx == 0 && chain_.have_block(hb.header.prev_hash)) {
-                                    // Parent is in chain, so this block's height = chain height + 1
-                                    // But we need the parent's height, not current tip
-                                    // Use the fact that if we have the parent, its height is at most chain_.height()
-                                    uint64_t newHeight = chain_.height();
-                                    if (newHeight >= old_height) {
-                                        // Chain might have grown, or parent was already tip
-                                        // The delivered block is for height = parent_height + 1
-                                        // Since parent is in chain, check if chain grew
-                                        if (newHeight > old_height) {
-                                            delivered_idx = newHeight; // Block was just added at this height
-                                        }
-                                    }
+                                // Method 2: Use chain growth
+                                if (delivered_idx == 0 && new_height > old_height) {
+                                    delivered_idx = new_height;
                                 }
 
-                                // Method 3: Fallback to chain height if it grew (handles sequential delivery)
-                                if (delivered_idx == 0) {
-                                    uint64_t newHeight = chain_.height();
-                                    if (newHeight > old_height) {
-                                        delivered_idx = old_height + 1;
-                                    }
-                                }
-
-                                // IMPORTANT: If we still can't identify the block, check if it's in our inflight set
-                                // by verifying the calculated index is actually one we requested
+                                // Verify this index is in THIS peer's inflight tracking
+                                bool found_in_peer = false;
                                 if (delivered_idx != 0) {
-                                    // Verify this index is actually in our inflight tracking
                                     auto it_verify = g_inflight_index_ts[(Sock)s].find(delivered_idx);
-                                    if (it_verify == g_inflight_index_ts[(Sock)s].end()) {
-                                        // We didn't request this index - don't clear anything
-                                        // This can happen with unsolicited blocks or misidentification
-                                        delivered_idx = 0;
+                                    if (it_verify != g_inflight_index_ts[(Sock)s].end()) {
+                                        found_in_peer = true;
                                     }
                                 }
-                                if (delivered_idx != 0) {
-                                    // CRITICAL FIX: Update peer_tip_height based on delivered block index
-                                    // If peer delivered block N, they have at least N blocks.
-                                    // BUT: Never set peer_tip_height above header height - that's impossible
-                                    uint64_t header_tip = chain_.best_header_height();
-                                    if (header_tip > 0 && delivered_idx > header_tip) {
-                                        // Can't have more blocks than headers - don't update
-                                        P2P_TRACE("DEBUG: Ignoring delivered_idx " + std::to_string(delivered_idx) +
-                                                  " from " + ps.ip + " (exceeds header height " + std::to_string(header_tip) + ")");
-                                    } else if (delivered_idx > ps.peer_tip_height) {
-                                        ps.peer_tip_height = delivered_idx;
-                                        P2P_TRACE("DEBUG: Updated peer " + ps.ip + " tip_height to " +
-                                                  std::to_string(delivered_idx) + " (from delivered block)");
-                                    }
 
-                                    auto it_idx = g_inflight_index_ts[(Sock)s].find(delivered_idx);
-                                    if (it_idx != g_inflight_index_ts[(Sock)s].end()) {
-                                        g_inflight_index_ts[(Sock)s].erase(it_idx);
-                                    }
+                                // If we found a match in this peer's tracking, clean it up
+                                if (found_in_peer) {
+                                    g_inflight_index_ts[(Sock)s].erase(delivered_idx);
                                     auto& dq_idx = g_inflight_index_order[(Sock)s];
                                     auto dq_it = std::find(dq_idx.begin(), dq_idx.end(), delivered_idx);
                                     if (dq_it != dq_idx.end()) {
                                         dq_idx.erase(dq_it);
                                     }
-                                    // BULLETPROOF SYNC: Clear from global index tracking on successful delivery
-                                    {
-                                        InflightLock lk(g_inflight_lock);
-                                        g_global_requested_indices.erase(delivered_idx);
-                                    }
-                                    // CRITICAL FIX: Reset timeout counter on successful delivery
-                                    // This prevents peers from being demoted after transient timeouts
-                                    g_index_timeouts[(Sock)s] = 0;
-
-                                    // CRITICAL FIX: Only decrement inflight_index when we successfully
-                                    // identify and clear the index. If we decrement without clearing,
-                                    // inflight_index gets out of sync with g_global_requested_indices,
-                                    // causing fill_index_pipeline to skip all "already requested" indices
-                                    // and eventually stall.
                                     ps.inflight_index--;
+                                    g_index_timeouts[(Sock)s] = 0;
+                                } else if (new_height > old_height) {
+                                    // Chain grew but we couldn't match to this peer's tracking
+                                    // Still decrement inflight_index since SOMETHING was delivered
+                                    // and try to clear the oldest entry from this peer
+                                    if (!g_inflight_index_order[(Sock)s].empty()) {
+                                        uint64_t oldest = g_inflight_index_order[(Sock)s].front();
+                                        // Only clear if this oldest is now in chain (was delivered)
+                                        if (oldest <= new_height) {
+                                            g_inflight_index_order[(Sock)s].pop_front();
+                                            g_inflight_index_ts[(Sock)s].erase(oldest);
+                                            ps.inflight_index--;
+                                        }
+                                    }
                                 }
-                                // Always try to refill pipeline - either we cleared a slot, or
-                                // timeout will eventually clear stuck entries
+                                // Always try to refill pipeline
                                 fill_index_pipeline(ps);
                             } else {
                                 // SAFETY NET: Even if inflight_index was 0, try to refill pipeline
