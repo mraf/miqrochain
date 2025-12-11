@@ -7473,31 +7473,20 @@ void P2P::loop(){
                     // extend the timer for localhost tools/wallets
                     itg->second.hs_last_ms = tnow;
                 } else {
-                    P2P_TRACE("close verack-timeout");
-                    dead.push_back(s);
-                    continue;
-                }
-            }
-
-            if (ps.verack_ok) {
-                if (!ps.awaiting_pong && (tnow - ps.last_ping_ms) > MIQ_P2P_PING_EVERY_MS) {
-                    auto ping = encode_msg("ping", {});
-                    (void)send_or_close(s, ping);
-                    ps.last_ping_ms = tnow;
-                    ps.awaiting_pong = true;
-                } else if (ps.awaiting_pong) {
-                    int64_t eff_pong_timeout = MIQ_P2P_PONG_TIMEOUT_MS *
-                                               ((ps.syncing || !g_logged_headers_done) ? 6 : 1);
-                    if ((tnow - ps.last_ping_ms) > eff_pong_timeout) {
-                        if (!is_lb) {
-                            P2P_TRACE("close pong-timeout");
-                            dead.push_back(s);
-                            continue;
-                        } else {
-                            ps.awaiting_pong = false;
-                            // Extend the ping timer for localhost tools
-                            ps.last_ping_ms = tnow + 5000;
-                        }
+                    // CRITICAL FIX: Don't disconnect our only peer on verack timeout!
+                    size_t active_peers = 0;
+                    for (const auto& kvp : peers_) {
+                        if (kvp.second.verack_ok) active_peers++;
+                    }
+                    if (active_peers > 0) {
+                        // We have other peers with verack, safe to disconnect this slow one
+                        P2P_TRACE("close verack-timeout");
+                        dead.push_back(s);
+                        continue;
+                    } else {
+                        // This is potentially our only peer - extend timer
+                        P2P_TRACE("verack-timeout but only peer - extending timer");
+                        itg->second.hs_last_ms = tnow;
                     }
                 }
             }
@@ -7513,18 +7502,31 @@ void P2P::loop(){
                                                ((ps.syncing || !g_logged_headers_done) ? 6 : 1);
                     if ((tnow - ps.last_ping_ms) > eff_pong_timeout) {
                         if (!is_lb) {
-                            P2P_TRACE("close pong-timeout");
-                            dead.push_back(s);
-                            continue; // proceed to close handling for this peer
+                            // CRITICAL FIX: Don't disconnect our only peer on pong timeout!
+                            size_t active_peers = 0;
+                            for (const auto& kvp : peers_) {
+                                if (kvp.second.verack_ok) active_peers++;
+                            }
+                            if (active_peers > 1) {
+                                // We have other peers, safe to disconnect this slow one
+                                P2P_TRACE("close pong-timeout");
+                                dead.push_back(s);
+                                continue;
+                            } else {
+                                // Only peer - don't disconnect, just reset ping cycle
+                                P2P_TRACE("pong-timeout but only peer - resetting ping cycle");
+                                ps.awaiting_pong = false;
+                                ps.last_ping_ms = tnow + 5000;
+                            }
                         } else {
-                            // Lenient path for localhost tools/wallets: don't drop, just reset the ping cycle.
+                            // Lenient path for localhost tools/wallets
                             ps.awaiting_pong = false;
-                            // Small backoff to avoid hammering busy peers.
                             ps.last_ping_ms = tnow + 5000;
                         }
                     }
                 }
-              if (!ps.syncing && !g_logged_headers_done) {
+                // Header stall detection (only when not syncing and headers not done)
+                if (!ps.syncing && !g_logged_headers_done) {
                     int64_t last_ok = g_last_hdr_ok_ms.count(s) ? g_last_hdr_ok_ms[s] : 0;
                     if (last_ok && (tnow - last_ok) > (int64_t)(g_stall_retry_ms * 4) && !is_lb) {
                         log_warn("P2P: deprioritizing header-stalled peer " + ps.ip);
