@@ -5071,6 +5071,11 @@ void P2P::loop(){
                 expired_idx.push_back({s, idx, ts});
                 dq.pop_front();
                 g_inflight_index_ts[s].erase(idx);
+                // CRITICAL FIX: Remove from global set so it can be re-requested immediately
+                {
+                    InflightLock lk(g_inflight_lock);
+                    g_global_requested_indices.erase(idx);
+                }
                 if (ps.inflight_index > 0) ps.inflight_index--; // free a slot on original peer
               } else {
                 break; // front is still within timeout window
@@ -7905,8 +7910,8 @@ void P2P::loop(){
         // CRITICAL FIX: Much faster cleanup to prevent sync stalls and forks
         {
             static int64_t last_idx_cleanup_ms = 0;
-            constexpr int64_t IDX_CLEANUP_INTERVAL_MS = 5000;   // CRITICAL: Every 5 seconds (was 60s)
-            constexpr int64_t IDX_STALE_THRESHOLD_MS = 15000;   // CRITICAL: 15 seconds stale (was 5 min)
+            constexpr int64_t IDX_CLEANUP_INTERVAL_MS = 2000;   // CRITICAL: Every 2 seconds for fast recovery
+            constexpr int64_t IDX_STALE_THRESHOLD_MS = 10000;   // CRITICAL: 10 seconds stale threshold
 
             if (current_time - last_idx_cleanup_ms >= IDX_CLEANUP_INTERVAL_MS) {
                 last_idx_cleanup_ms = current_time;
