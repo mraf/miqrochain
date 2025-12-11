@@ -1319,6 +1319,12 @@ static int64_t g_stall_retry_ms = MIQ_P2P_STALL_RETRY_MS;
 // which wastes bandwidth and can create duplicate orphans causing sync issues.
 static std::unordered_set<uint64_t> g_global_requested_indices;
 
+// CRITICAL FIX: Single best peer for sync to prevent forks from multi-peer sync
+// Only the peer with highest tip should be used for block downloads
+static std::atomic<Sock> g_best_sync_peer{MIQ_INVALID_SOCK};
+static std::atomic<uint64_t> g_best_sync_peer_height{0};
+static std::atomic<int64_t> g_best_sync_peer_updated_ms{0};
+
 // CRITICAL FIX: Track inflight tx request timestamps for timeout cleanup
 // Without this, inflight_tx can grow forever, eventually blocking all new tx requests
 static std::unordered_map<Sock, std::unordered_map<std::string,int64_t>> g_inflight_tx_ts;
@@ -1392,6 +1398,40 @@ static inline bool peer_is_index_capable(Sock s) {
     // This ensures proper sync order: headers first, then blocks
     if (it == g_peer_index_capable.end()) return false;
     return it->second;
+}
+
+// CRITICAL FIX: Check if this peer is the best sync peer (highest tip)
+// Only the best peer should be used for block downloads to prevent forks
+static inline bool is_best_sync_peer(Sock s, uint64_t peer_tip) {
+    Sock current_best = g_best_sync_peer.load();
+    uint64_t current_best_height = g_best_sync_peer_height.load();
+    int64_t last_updated = g_best_sync_peer_updated_ms.load();
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    // Re-evaluate best peer every 5 seconds or if current best is invalid
+    bool should_update = (current_best == MIQ_INVALID_SOCK) ||
+                         (now - last_updated > 5000) ||
+                         (peer_tip > current_best_height + 10);  // Much better peer found
+
+    if (should_update && peer_tip > 0) {
+        if (peer_tip >= current_best_height || current_best == MIQ_INVALID_SOCK) {
+            g_best_sync_peer.store(s);
+            g_best_sync_peer_height.store(peer_tip);
+            g_best_sync_peer_updated_ms.store(now);
+            return true;
+        }
+    }
+
+    return (s == current_best);
+}
+
+// Clear best sync peer (call when peer disconnects)
+static inline void clear_best_sync_peer_if_match(Sock s) {
+    if (g_best_sync_peer.load() == s) {
+        g_best_sync_peer.store(MIQ_INVALID_SOCK);
+        g_best_sync_peer_height.store(0);
+    }
 }
 
 static inline int64_t adaptive_index_timeout_ms(const miq::PeerState& ps){
@@ -1674,6 +1714,8 @@ static inline void gate_set_loopback(Sock fd, bool is_lb){
 static inline void gate_on_close(Sock fd){
     // Thread-safe cleanup of all inflight tracking for this socket
     clear_all_inflight_for_sock(fd);
+    // CRITICAL FIX: Clear best sync peer if this was it
+    clear_best_sync_peer_if_match(fd);
     g_gate.erase(fd);
     g_trickle_q.erase(fd);
     g_trickle_last_ms.erase(fd);
@@ -3467,6 +3509,14 @@ void P2P::fill_index_pipeline(PeerState& ps){
 
     // peer_is_index_capable is set by start_sync_with_peer
     if (!peer_is_index_capable((Sock)ps.sock)) return;
+
+    // CRITICAL FIX: Only sync from the best peer (highest tip) to prevent forks
+    // This prevents multiple peers at different heights from causing chain splits
+    uint64_t peer_tip = ps.peer_tip_height > 0 ? ps.peer_tip_height : chain_.best_header_height();
+    if (!is_best_sync_peer((Sock)ps.sock, peer_tip)) {
+        // Not the best peer - don't request blocks from this peer
+        return;
+    }
 
     // SYNC STATE FIX: Ensure next_index is consistent with current chain height
     const uint64_t current_height = chain_.height();
