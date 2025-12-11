@@ -6748,23 +6748,34 @@ void P2P::loop(){
                             ps.total_block_bytes_received += m.payload.size();
 
                             if (ps.inflight_index > 0) {
-                                // Identify delivered block index if possible
-                                auto block_hash_vec = hb.block_hash();
+                                // CRITICAL FIX: Identify delivered block index using header height lookup
+                                // The old code used get_hash_by_index which ONLY works for blocks already in our chain!
+                                // This caused sync stalls because indices were never cleared from g_global_requested_indices.
+                                //
+                                // New approach: Use get_header_height(prev_hash) + 1 which works even for blocks
+                                // not yet in our chain, as long as we have the parent header (which we do during sync).
                                 uint64_t delivered_idx = 0;
-                                std::vector<uint8_t> idx_hash;
-                                for (auto it2 = g_inflight_index_ts[(Sock)s].begin(); it2 != g_inflight_index_ts[(Sock)s].end(); ++it2) {
-                                    if (chain_.get_hash_by_index(it2->first, idx_hash) && idx_hash == block_hash_vec) {
-                                        delivered_idx = it2->first;
-                                        break;
-                                    }
+
+                                // Method 1: Calculate from parent header height (works for out-of-order blocks)
+                                int64_t parent_height = chain_.get_header_height(hb.header.prev_hash);
+                                if (parent_height >= 0) {
+                                    delivered_idx = (uint64_t)(parent_height + 1);
                                 }
-                                    if (delivered_idx == 0) {
+
+                                // Method 2: Fallback to chain height if it grew (handles some edge cases)
+                                if (delivered_idx == 0) {
                                     uint64_t newHeight = chain_.height();
                                     if (newHeight > old_height) {
                                         delivered_idx = old_height + 1;
                                     }
-                                    // NOTE: Don't use next_index as fallback - it can be arbitrarily high
-                                    // If we can't identify the block, just don't update peer_tip_height
+                                }
+
+                                // Method 3: If all else fails and we have inflight indices, clear the oldest one
+                                // This prevents indefinite accumulation of stale indices
+                                if (delivered_idx == 0 && !g_inflight_index_order[(Sock)s].empty()) {
+                                    delivered_idx = g_inflight_index_order[(Sock)s].front();
+                                    P2P_TRACE("DEBUG: Using oldest inflight index " + std::to_string(delivered_idx) +
+                                              " as fallback for unidentified block from " + ps.ip);
                                 }
                                 if (delivered_idx != 0) {
                                     // CRITICAL FIX: Update peer_tip_height based on delivered block index
@@ -6825,15 +6836,17 @@ void P2P::loop(){
                             chain_.next_block_fetch_targets(want3, /*cap=*/1);
                             g_sync_wants_active.store(!want3.empty());
                             if (!want3.empty()) request_block_hash(ps, want3[0]);
-                        std::vector<uint8_t> idx_hash2;
-                        if (!want3.empty()) {
-                            auto missing_hash = want3[0];
-                            for (auto it2 = g_inflight_index_ts[(Sock)s].begin(); it2 != g_inflight_index_ts[(Sock)s].end(); ++it2) {
-                                if (chain_.get_hash_by_index(it2->first, idx_hash2) && idx_hash2 == missing_hash) {
-                                    g_inflight_index_ts[(Sock)s].erase(it2);
-                                    break;
-                                }
+                        // CRITICAL FIX: Clear oldest inflight index on malformed/oversized block
+                        // The old code tried to use get_hash_by_index which doesn't work for pending blocks
+                        if (!g_inflight_index_order[(Sock)s].empty()) {
+                            uint64_t oldest_idx = g_inflight_index_order[(Sock)s].front();
+                            g_inflight_index_order[(Sock)s].pop_front();
+                            g_inflight_index_ts[(Sock)s].erase(oldest_idx);
+                            {
+                                InflightLock lk(g_inflight_lock);
+                                g_global_requested_indices.erase(oldest_idx);
                             }
+                            if (ps.inflight_index > 0) ps.inflight_index--;
                         }
                           
              }
