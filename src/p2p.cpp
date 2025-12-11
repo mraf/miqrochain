@@ -3545,9 +3545,15 @@ void P2P::fill_index_pipeline(PeerState& ps){
             }
         }
 
-        ps.next_index++;
+        // CRITICAL FIX: Only increment next_index AFTER successful request
+        // If send fails, we must NOT skip this index - retry on next fill_index_pipeline call
         if (request_block_index(ps, idx)) {
+            ps.next_index++;
             ps.inflight_index++;
+        } else {
+            // Send failed - don't increment next_index, exit loop
+            // On next call we'll retry this same index
+            break;
         }
     }
 }
