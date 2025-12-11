@@ -5166,7 +5166,18 @@ void P2P::loop(){
               itT->second.inflight_index++;
             }
           }
-            for (auto &kvp : peers_){
+
+          // CRITICAL FIX: Refill pipelines for all syncing peers after timeout handling
+          // Timeout handling frees slots (inflight_index--) but doesn't refill
+          // Without this, peers with partially empty pipelines stall until a block arrives
+          for (auto &kvp : peers_) {
+              if (!kvp.second.syncing) continue;
+              if (!peer_is_index_capable(kvp.first)) continue;
+              if (kvp.second.inflight_index == 0) continue; // Will be handled by activation loop
+              fill_index_pipeline(kvp.second);
+          }
+
+          for (auto &kvp : peers_){
             Sock s = kvp.first;
             if (g_index_timeouts[s] >= 3 && g_peer_index_capable[s]) {
               // demote
