@@ -5284,6 +5284,59 @@ void P2P::loop(){
               }
           }
 
+          // CRITICAL FIX: Stall recovery - if no progress for 30s and not fully synced, force re-enable ALL peers
+          // This handles cases where all peers got demoted or stuck in invalid states
+          {
+              const int64_t tnow = now_ms();
+              const int64_t STALL_RECOVERY_MS = 30000;  // 30 seconds no progress = stalled
+              const uint64_t chain_height = chain_.height();
+              const uint64_t target_height = chain_.best_header_height();
+
+              // Check if we're stalled: no progress, not fully synced, have peers
+              if (!peers_.empty() &&
+                  target_height > 0 &&
+                  chain_height < target_height &&
+                  (tnow - g_last_progress_ms) > STALL_RECOVERY_MS) {
+
+                  log_warn("P2P: Sync stalled for 30s at height " + std::to_string(chain_height) +
+                           "/" + std::to_string(target_height) + " - forcing recovery");
+
+                  // Force re-enable ALL peers for sync
+                  for (auto& kvp : peers_) {
+                      if (!kvp.second.verack_ok) continue;
+                      Sock s = kvp.first;
+
+                      // Re-enable index capability
+                      g_peer_index_capable[s] = true;
+                      g_index_timeouts[s] = 0;
+
+                      // Reset sync state
+                      kvp.second.syncing = true;
+                      kvp.second.inflight_index = 0;
+                      kvp.second.next_index = chain_height + 1;
+
+                      // Clear any stale inflight tracking for this peer
+                      {
+                          InflightLock lk(g_inflight_lock);
+                          auto idx_it = g_inflight_index_ts.find(s);
+                          if (idx_it != g_inflight_index_ts.end()) {
+                              for (const auto& kv : idx_it->second) {
+                                  g_global_requested_indices.erase(kv.first);
+                              }
+                          }
+                      }
+                      g_inflight_index_ts.erase(s);
+                      g_inflight_index_order.erase(s);
+
+                      // Fill pipeline
+                      fill_index_pipeline(kvp.second);
+                  }
+
+                  // Reset progress timer to avoid immediate re-trigger
+                  g_last_progress_ms = tnow;
+              }
+          }
+
           // CRITICAL FIX: Recovery mechanism for transient notfound errors
           // If peer_tip_height was reduced due to notfound but peer originally announced
           // higher, periodically reset to allow retry (peer may have had transient issue)
