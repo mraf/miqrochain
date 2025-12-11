@@ -406,13 +406,13 @@ static constexpr uint32_t MIN_PEER_PROTO_VERSION = 70015;  // Minimum supported
 #define MIQ_HEADERS_ONLY_BAN_SCORE 50  // Ban score for headers-only peer (high penalty)
 #endif
 #ifndef MIQ_BLOCK_STALL_MAX_COUNT
-#define MIQ_BLOCK_STALL_MAX_COUNT 1  // Switch peers after 1 stall (not 3)
+#define MIQ_BLOCK_STALL_MAX_COUNT 3  // Switch peers after 3 stalls (was 1 - too aggressive, caused rapid connect/disconnect)
 #endif
 #ifndef MIQ_HEADERS_NO_BLOCKS_TIMEOUT_MS
 #define MIQ_HEADERS_NO_BLOCKS_TIMEOUT_MS 30000  // 30s timeout for headers-only stall
 #endif
 #ifndef MIQ_IBD_PEER_SWITCH_THRESHOLD
-#define MIQ_IBD_PEER_SWITCH_THRESHOLD 1  // Switch sync peer after 1 stall
+#define MIQ_IBD_PEER_SWITCH_THRESHOLD 3  // Switch sync peer after 3 stalls (was 1 - too aggressive)
 #endif
 
 // Health monitoring
