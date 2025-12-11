@@ -3610,15 +3610,38 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
 void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     if (h.size()!=32) return;
 
+    const std::string key = hexkey(h);
+    // Already being fetched globally - skip
+    if (g_global_inflight_blocks.count(key)) return;
+
     size_t base_default = g_sequential_sync ? (size_t)1 : (size_t)256;
     const size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : base_default;
-    if (ps.inflight_blocks.size() >= max_inflight_blocks) return;
-    const std::string key = hexkey(h);
-    if (g_global_inflight_blocks.count(key)) return;
+
+    // CRITICAL FIX: If this peer's queue is full, try another peer instead of dropping
+    if (ps.inflight_blocks.size() >= max_inflight_blocks) {
+        // Find another peer with available capacity
+        for (auto& kvp : peers_) {
+            if (kvp.first == (Sock)ps.sock) continue;
+            if (!kvp.second.verack_ok) continue;
+            if (kvp.second.inflight_blocks.size() >= max_inflight_blocks) continue;
+            // Found a peer with capacity - request from them instead
+            auto msg = encode_msg("getb", h);
+            if (send_or_close(kvp.first, msg)) {
+                kvp.second.inflight_blocks.insert(key);
+                mark_block_inflight(key, kvp.first);
+                P2P_TRACE_IF(true, "Requested block " + key.substr(0, 16) + "... from alternate peer (original full)");
+                return;
+            }
+        }
+        // No peer available - block request is dropped (unavoidable)
+        P2P_TRACE("WARNING: Block request dropped - all peers at capacity: " + key.substr(0, 16));
+        return;
+    }
+
     auto msg = encode_msg("getb", h);
     if (send_or_close(ps.sock, msg)) {
         ps.inflight_blocks.insert(key);
-        mark_block_inflight(key, (Sock)ps.sock);  // Thread-safe inflight tracking
+        mark_block_inflight(key, (Sock)ps.sock);
         P2P_TRACE_IF(true, "Requested block " + key.substr(0, 16) + "... from peer");
     }
 }
@@ -5167,13 +5190,16 @@ void P2P::loop(){
             }
           }
 
-          // CRITICAL FIX: Refill pipelines for all syncing peers after timeout handling
-          // Timeout handling frees slots (inflight_index--) but doesn't refill
-          // Without this, peers with partially empty pipelines stall until a block arrives
+          // CRITICAL FIX: Refill pipelines for ALL syncing peers after timeout handling
+          // This handles multiple cases:
+          // 1. Timeout handling freed slots (inflight_index--) but didn't refill
+          // 2. Peers marked syncing but with inflight_index == 0 (idle)
+          // 3. Activation loops may not trigger due to various conditions
+          // Without this, peers stall until a block arrives or specific triggers fire
           for (auto &kvp : peers_) {
               if (!kvp.second.syncing) continue;
               if (!peer_is_index_capable(kvp.first)) continue;
-              if (kvp.second.inflight_index == 0) continue; // Will be handled by activation loop
+              // Refill ALL syncing peers - don't skip inflight_index == 0
               fill_index_pipeline(kvp.second);
           }
 
@@ -6598,14 +6624,10 @@ void P2P::loop(){
 #endif
 
                     } else if (cmd == "invb") {
-                        // During IBD, allow higher rate of invb messages (don't rate limit)
-                        bool is_ibd = ibd_or_fetch_active(ps, now_ms());
-                        if (!is_ibd && !check_rate(ps, "inv", 0.5, now_ms())) {
-                            // Rate-limited: only log occasionally to avoid log spam
-                            P2P_TRACE_RATE("invb rate-limited from " + ps.ip);
-                            bump_ban(ps, ps.ip, "inv-flood", now_ms());
-                            continue;
-                        }
+                        // CRITICAL FIX: NEVER rate-limit block announcements
+                        // Blocks are critical - we MUST process every announcement immediately
+                        // Rate-limiting here caused 3+ minute delays in block propagation
+                        // Only rate-limit transaction announcements, not blocks
                         if (m.payload.size() == 32) {
                             if (!inv_tick(1)) {
                                 P2P_TRACE_RATE("invb inv_tick failed from " + ps.ip);
@@ -7477,11 +7499,10 @@ void P2P::loop(){
                                 if (!g_logged_headers_done && (now_ms() - g_last_progress_ms) > (int64_t)MIQ_IBD_FALLBACK_AFTER_MS) {
                                     log_warn("[IBD] headers overall progress timeout; switching to index fallback");
                                     ps.syncing = true;
+                                    ps.inflight_index = 0;
                                     ps.next_index = chain_.height() + 1;
-                                    // CRITICAL FIX: Only increment inflight_index if request succeeded
-                                    if (request_block_index(ps, ps.next_index)) {
-                                        ps.inflight_index++;
-                                    }
+                                    // CRITICAL FIX: Fill the entire pipeline, not just one request
+                                    fill_index_pipeline(ps);
                                 }
                                 g_zero_hdr_batches[s] = 0;
                             }
@@ -7774,11 +7795,10 @@ void P2P::loop(){
                     ps.inflight_hdr_batches = 0;
                     ps.sent_getheaders = false;
                     ps.syncing = true;
+                    ps.inflight_index = 0;
                     ps.next_index = chain_.height() + 1;
-                    // CRITICAL FIX: Only increment inflight_index if request succeeded
-                    if (request_block_index(ps, ps.next_index)) {
-                        ps.inflight_index++;
-                    }
+                    // CRITICAL FIX: Fill the entire pipeline, not just one request
+                    fill_index_pipeline(ps);
                 }
             }
 #endif
