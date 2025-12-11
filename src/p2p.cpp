@@ -1403,7 +1403,7 @@ static inline int64_t adaptive_index_timeout_ms(const miq::PeerState& ps){
     // During IBD or explicit index sync, allow more slack.
     double ibd_mul = (!g_logged_headers_done || ps.syncing) ? 2.0 : 1.2;
     int64_t t = (int64_t)(base * health_mul * ibd_mul);
-    int64_t max_t = (!g_logged_headers_done || ps.syncing) ? 120000 : 30000; // 120s IBD, 30s steady
+    int64_t max_t = (!g_logged_headers_done || ps.syncing) ? 15000 : 10000; // 15s IBD, 10s steady - must match IDX_STALE_THRESHOLD_MS
     return std::max<int64_t>(5000, std::min<int64_t>(t, max_t));
 }
 
@@ -5070,6 +5070,11 @@ void P2P::loop(){
                 expired_idx.push_back({s, idx, ts});
                 dq.pop_front();
                 g_inflight_index_ts[s].erase(idx);
+                // Clear from global tracking immediately on timeout - allows other peers to try
+                {
+                    InflightLock lk(g_inflight_lock);
+                    g_global_requested_indices.erase(idx);
+                }
                 if (ps.inflight_index > 0) ps.inflight_index--; // free a slot on original peer
               } else {
                 break; // front is still within timeout window
@@ -5107,6 +5112,11 @@ void P2P::loop(){
             if (send_or_close(target, msg)){
               g_inflight_index_ts[target][e.idx] = now_ms();
               g_inflight_index_order[target].push_back(e.idx);
+              // Re-add to global tracking for the new peer
+              {
+                  InflightLock lk(g_inflight_lock);
+                  g_global_requested_indices.insert(e.idx);
+              }
               itT->second.inflight_index++;
             }
           }
@@ -5454,7 +5464,7 @@ void P2P::loop(){
 
             // Check for height progress stall - be more aggressive after headers phase
             bool height_stalled = false;
-            int64_t stall_threshold = headers_done ? 10000 : 30000;  // 10s after headers, 30s before
+            int64_t stall_threshold = headers_done ? 5000 : 15000;  // 5s after headers, 15s before - fast recovery
 
             if (current_height != last_height_check) {
                 last_height_check = current_height;
@@ -5474,7 +5484,7 @@ void P2P::loop(){
             }
 
             // Implement aggressive refetch when stalled OR proactive pipeline during IBD
-            int64_t refetch_interval = headers_done ? 5000 : 10000;  // 5s after headers, 10s before
+            int64_t refetch_interval = headers_done ? 3000 : 5000;  // 3s after headers, 5s before - fast recovery
 
             // CRITICAL FIX: Aggressive stale tip detection to prevent forks
             uint64_t tip_age_sec = 0;
