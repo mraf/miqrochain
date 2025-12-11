@@ -545,7 +545,7 @@ std::string RpcService::handle(const std::string& body){
             static const char* k[] = {
                 "help","version","ping","uptime",
                 "getnetworkinfo","getblockchaininfo","getblockcount","getbestblockhash",
-                "getblock","getblockhash","getcoinbaserecipient",
+                "getblock","getblockhash","getcoinbaserecipient","invalidateblock",
                 "getrawmempool","getmempoolinfo","gettxout","getrawtransaction",
                 "validateaddress","decodeaddress","decoderawtx",
                 "getminerstats","setminerstats","getminingaddress","setminingaddress", // Mining
@@ -717,6 +717,23 @@ std::string RpcService::handle(const std::string& body){
 
         if(method=="getbestblockhash"){
             return ok_str(to_hex(chain_.tip().hash));
+        }
+
+        // invalidateblock - remove the current tip block and revert to previous
+        if(method=="invalidateblock"){
+            auto tip_before = chain_.tip();
+            std::string pop_err;
+            if(!chain_.disconnect_tip_once(pop_err)){
+                return err("invalidateblock failed: " + pop_err);
+            }
+            auto tip_after = chain_.tip();
+            std::map<std::string, JNode> result;
+            result["success"] = jbool(true);
+            result["removed_height"] = jnum((double)tip_before.height);
+            result["removed_hash"] = jstr(to_hex(tip_before.hash));
+            result["new_height"] = jnum((double)tip_after.height);
+            result["new_hash"] = jstr(to_hex(tip_after.hash));
+            JNode out; out.v = result; return json_dump(out);
         }
 
         if(method=="getblockhash"){
