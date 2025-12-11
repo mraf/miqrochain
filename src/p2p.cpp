@@ -1400,30 +1400,26 @@ static inline bool peer_is_index_capable(Sock s) {
     return it->second;
 }
 
-// CRITICAL FIX: Check if this peer is the best sync peer (highest tip)
-// Only the best peer should be used for block downloads to prevent forks
-static inline bool is_best_sync_peer(Sock s, uint64_t peer_tip) {
-    Sock current_best = g_best_sync_peer.load();
+// CRITICAL FIX: Check if we should sync from this peer
+// Allow sync from any peer that is ahead of us or at same height
+// Only block peers that are significantly behind (they can't help us)
+static inline bool should_sync_from_peer(Sock s, uint64_t peer_tip, uint64_t our_height) {
+    // Track the best peer for reference
     uint64_t current_best_height = g_best_sync_peer_height.load();
-    int64_t last_updated = g_best_sync_peer_updated_ms.load();
-    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-
-    // Re-evaluate best peer every 5 seconds or if current best is invalid
-    bool should_update = (current_best == MIQ_INVALID_SOCK) ||
-                         (now - last_updated > 5000) ||
-                         (peer_tip > current_best_height + 10);  // Much better peer found
-
-    if (should_update && peer_tip > 0) {
-        if (peer_tip >= current_best_height || current_best == MIQ_INVALID_SOCK) {
-            g_best_sync_peer.store(s);
-            g_best_sync_peer_height.store(peer_tip);
-            g_best_sync_peer_updated_ms.store(now);
-            return true;
-        }
+    if (peer_tip > current_best_height) {
+        g_best_sync_peer.store(s);
+        g_best_sync_peer_height.store(peer_tip);
+        g_best_sync_peer_updated_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
     }
 
-    return (s == current_best);
+    // Allow sync from peers that are ahead of us or at similar height
+    if (peer_tip == 0) return true;  // Unknown tip - allow (will timeout if no blocks)
+    if (peer_tip >= our_height) return true;  // Peer is ahead or same - good
+    if (peer_tip + 10 >= our_height) return true;  // Peer is slightly behind - still useful
+
+    // Peer is significantly behind us - don't waste time requesting from them
+    return false;
 }
 
 // Clear best sync peer (call when peer disconnects)
@@ -3510,16 +3506,15 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // peer_is_index_capable is set by start_sync_with_peer
     if (!peer_is_index_capable((Sock)ps.sock)) return;
 
-    // CRITICAL FIX: Only sync from the best peer (highest tip) to prevent forks
-    // This prevents multiple peers at different heights from causing chain splits
-    uint64_t peer_tip = ps.peer_tip_height > 0 ? ps.peer_tip_height : chain_.best_header_height();
-    if (!is_best_sync_peer((Sock)ps.sock, peer_tip)) {
-        // Not the best peer - don't request blocks from this peer
-        return;
-    }
-
     // SYNC STATE FIX: Ensure next_index is consistent with current chain height
     const uint64_t current_height = chain_.height();
+
+    // CRITICAL FIX: Only sync from peers that can help us (ahead or at same height)
+    // Don't waste time on peers that are behind us
+    uint64_t peer_tip = ps.peer_tip_height > 0 ? ps.peer_tip_height : chain_.best_header_height();
+    if (!should_sync_from_peer((Sock)ps.sock, peer_tip, current_height)) {
+        return;
+    }
     if (ps.next_index <= current_height) {
         ps.next_index = current_height + 1;
         P2P_TRACE("DEBUG: Sync state corrected - next_index updated from " +
