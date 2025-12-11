@@ -3046,8 +3046,9 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
     // ULTRA-FAST BLOCK PROPAGATION with BIP152 COMPACT BLOCKS
     // Goal: Sub-1-second network-wide propagation
     // Strategy:
-    //   - High-bandwidth compact block peers: Send compact block (~1-2KB)
-    //   - Other peers: Send full block for maximum compatibility
+    //   1. FIRST: Broadcast header (88 bytes) to ALL peers instantly
+    //   2. THEN: Send compact block to BIP152 peers, full block to legacy
+    //   - Header-first lets peers verify PoW and relay immediately
     //   - All sends happen in parallel outside locks
 
     if (h.size() != 32) return;
@@ -3068,33 +3069,18 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
         return;
     }
 
-    // Build compact block for BIP152 peers (dramatically smaller)
-    std::vector<uint8_t> compact_msg;
-    if (mempool_) {
-        miq::CompactBlock cb = miq::CompactBlockBuilder::create(blk, *mempool_);
-        auto compact_payload = miq::serialize_compact_block(cb);
-        compact_msg = encode_msg("cmpctblock", compact_payload);
-        MIQ_LOG_DEBUG(miq::LogCategory::NET, "broadcast_inv_block: compact block size=" +
-                     std::to_string(compact_payload.size()) + " bytes (" +
-                     std::to_string(cb.short_ids.size()) + " short_ids)");
-    }
-
-    // Prepare full block message for legacy peers
-    auto invb_msg = encode_msg("invb", h);
-    std::vector<uint8_t> block_msg;
-    if (!raw_block.empty() && raw_block.size() < 4 * 1024 * 1024) {
-        block_msg = encode_msg("block", raw_block);
-    }
-
-    // Collect peer sockets under lock, separated by compact block support
-    std::vector<Sock> compact_sockets;   // Peers supporting high-bandwidth compact blocks
-    std::vector<Sock> legacy_sockets;    // Peers needing full blocks
+    // Collect ALL peer sockets under lock (fast)
+    std::vector<Sock> all_sockets;
+    std::vector<Sock> compact_sockets;
+    std::vector<Sock> legacy_sockets;
     {
         std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+        all_sockets.reserve(peers_.size());
         compact_sockets.reserve(peers_.size());
         legacy_sockets.reserve(peers_.size());
         for (auto& kv : peers_) {
             if (kv.second.verack_ok) {
+                all_sockets.push_back(kv.first);
                 if (kv.second.compact_blocks_enabled && kv.second.compact_high_bandwidth) {
                     compact_sockets.push_back(kv.first);
                 } else {
@@ -3102,6 +3088,50 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
                 }
             }
         }
+    }
+
+    // PHASE 1: INSTANT HEADER BROADCAST (88 bytes - fastest possible)
+    // This lets ALL peers verify PoW and start relaying immediately
+    // Serialize just the header
+    std::vector<uint8_t> header_data;
+    header_data.reserve(88);
+    // Version (4 bytes LE)
+    uint32_t ver = blk.header.version;
+    header_data.push_back(ver & 0xff);
+    header_data.push_back((ver >> 8) & 0xff);
+    header_data.push_back((ver >> 16) & 0xff);
+    header_data.push_back((ver >> 24) & 0xff);
+    // Prev hash (32 bytes)
+    header_data.insert(header_data.end(), blk.header.prev_hash.begin(), blk.header.prev_hash.end());
+    // Merkle root (32 bytes)
+    header_data.insert(header_data.end(), blk.header.merkle_root.begin(), blk.header.merkle_root.end());
+    // Time (8 bytes LE)
+    for (int i = 0; i < 8; ++i) header_data.push_back((blk.header.time >> (i * 8)) & 0xff);
+    // Bits (4 bytes LE)
+    header_data.push_back(blk.header.bits & 0xff);
+    header_data.push_back((blk.header.bits >> 8) & 0xff);
+    header_data.push_back((blk.header.bits >> 16) & 0xff);
+    header_data.push_back((blk.header.bits >> 24) & 0xff);
+    // Nonce (8 bytes LE)
+    for (int i = 0; i < 8; ++i) header_data.push_back((blk.header.nonce >> (i * 8)) & 0xff);
+
+    auto headers_msg = encode_msg("headers", header_data);
+    int headers_sent = parallel_send_to_peers(all_sockets, headers_msg);
+
+    // PHASE 2: Build and send full block data
+    // Build compact block for BIP152 peers (dramatically smaller)
+    std::vector<uint8_t> compact_msg;
+    if (mempool_) {
+        miq::CompactBlock cb = miq::CompactBlockBuilder::create(blk, *mempool_);
+        auto compact_payload = miq::serialize_compact_block(cb);
+        compact_msg = encode_msg("cmpctblock", compact_payload);
+    }
+
+    // Prepare full block message for legacy peers
+    auto invb_msg = encode_msg("invb", h);
+    std::vector<uint8_t> block_msg;
+    if (!raw_block.empty() && raw_block.size() < 4 * 1024 * 1024) {
+        block_msg = encode_msg("block", raw_block);
     }
 
     // PARALLEL BROADCAST to both groups simultaneously
@@ -3121,11 +3151,9 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
         legacy_sent = parallel_send_to_peers(legacy_sockets, invb_msg);
     }
 
-    if (compact_sent > 0 || legacy_sent > 0) {
-        MIQ_LOG_INFO(miq::LogCategory::NET, "PARALLEL broadcast_inv_block: compact=" +
-            std::to_string(compact_sent) + " legacy=" + std::to_string(legacy_sent) +
-            " total=" + std::to_string(compact_sent + legacy_sent) + " peers");
-    }
+    MIQ_LOG_INFO(miq::LogCategory::NET, "ULTRA-FAST broadcast: headers=" +
+        std::to_string(headers_sent) + " compact=" + std::to_string(compact_sent) +
+        " legacy=" + std::to_string(legacy_sent) + " peers");
 
     // Also queue for async processing (handles late-connecting peers)
     announce_block_async(h);

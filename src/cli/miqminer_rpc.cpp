@@ -53,6 +53,7 @@
   #include <ws2tcpip.h>
   #include <windows.h>
   #include <direct.h>
+  #include <conio.h>        // For _kbhit() and _getch() keyboard input
   #pragma comment(lib, "Ws2_32.lib")
   using socklen_t = int;
   using socket_t = SOCKET;
@@ -79,6 +80,7 @@
   #include <sys/ioctl.h>
   #include <netinet/tcp.h>  // For TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT
   #include <poll.h>         // For poll() in stratum recv_line
+  #include <termios.h>      // For non-blocking keyboard input
   using socket_t = int;
   #define miq_closesocket ::close
   static void miq_sleep_ms(unsigned ms){ usleep(ms*1000); }
@@ -1605,11 +1607,15 @@ struct UIState {
 
     // GPU telemetry
     std::atomic<bool>   gpu_available{false};
+    std::atomic<bool>   gpu_paused{false};    // Runtime toggle: pause GPU mining
     std::string         gpu_platform;
     std::string         gpu_device;
     std::string         gpu_driver;
     std::atomic<double> gpu_hps_now{0.0};
     std::atomic<double> gpu_hps_smooth{0.0};
+
+    // CPU mining control
+    std::atomic<bool>   cpu_paused{false};    // Runtime toggle: pause CPU mining
 
     // node sync/health
     std::atomic<bool>   node_reachable{false};
@@ -2391,6 +2397,12 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
     uint64_t local_hashes = 0;
 
     while(!found->load(std::memory_order_relaxed) && !abort_round->load(std::memory_order_relaxed)){
+        // RUNTIME TOGGLE: Check if CPU mining is paused
+        if (g_ui && g_ui->cpu_paused.load(std::memory_order_relaxed)) {
+            miq_sleep_ms(100);
+            continue;
+        }
+
         uint64_t todo = BATCH;
         while(todo && !found->load(std::memory_order_relaxed) && !abort_round->load(std::memory_order_relaxed)){
             const uint64_t n0 = nonce; nonce += step;
@@ -2427,14 +2439,26 @@ static void mine_worker_optimized(const BlockHeader hdr_base,
             store_u64_le(nonce_ptr, n7); { auto hv = salted_header_hash(hdr); std::memcpy(h[7], hv.data(), 32); }
         #endif
 
-            if(meets_target_be_raw(h[0], bits)){ b.header.nonce=n0; *out_block=b; found->store(true); break; }
-            if(meets_target_be_raw(h[1], bits)){ b.header.nonce=n1; *out_block=b; found->store(true); break; }
-            if(meets_target_be_raw(h[2], bits)){ b.header.nonce=n2; *out_block=b; found->store(true); break; }
-            if(meets_target_be_raw(h[3], bits)){ b.header.nonce=n3; *out_block=b; found->store(true); break; }
-            if(meets_target_be_raw(h[4], bits)){ b.header.nonce=n4; *out_block=b; found->store(true); break; }
-            if(meets_target_be_raw(h[5], bits)){ b.header.nonce=n5; *out_block=b; found->store(true); break; }
-            if(meets_target_be_raw(h[6], bits)){ b.header.nonce=n6; *out_block=b; found->store(true); break; }
-            if(meets_target_be_raw(h[7], bits)){ b.header.nonce=n7; *out_block=b; found->store(true); break; }
+            // CRITICAL FIX: Use compare_exchange to ensure only ONE thread writes to out_block
+            // This prevents race conditions where multiple threads find solutions simultaneously
+            #define TRY_SOLUTION(nonce_val, hash_idx) \
+                if(meets_target_be_raw(h[hash_idx], bits)){ \
+                    bool expected = false; \
+                    if(found->compare_exchange_strong(expected, true)) { \
+                        b.header.nonce = nonce_val; \
+                        *out_block = b; \
+                    } \
+                    break; \
+                }
+            TRY_SOLUTION(n0, 0)
+            TRY_SOLUTION(n1, 1)
+            TRY_SOLUTION(n2, 2)
+            TRY_SOLUTION(n3, 3)
+            TRY_SOLUTION(n4, 4)
+            TRY_SOLUTION(n5, 5)
+            TRY_SOLUTION(n6, 6)
+            TRY_SOLUTION(n7, 7)
+            #undef TRY_SOLUTION
 
             if((local_hashes & ((1u<<10)-1)) == 0){
                 int pick = (int)((n0 ^ n3 ^ n7) & 7u);
@@ -3384,6 +3408,53 @@ int main(int argc, char** argv){
             }
         }
 
+        // ===== Keyboard input thread (runtime controls)
+        // Press 'g' to toggle GPU mining, 'c' to toggle CPU mining
+        std::thread input_th([&](){
+#if defined(_WIN32)
+            // Windows: Use _kbhit() and _getch() for non-blocking keyboard input
+            while(ui.running.load(std::memory_order_relaxed)){
+                if(_kbhit()){
+                    int ch = _getch();
+                    if(ch == 'g' || ch == 'G'){
+                        bool was = ui.gpu_paused.load();
+                        ui.gpu_paused.store(!was);
+                    } else if(ch == 'c' || ch == 'C'){
+                        bool was = ui.cpu_paused.load();
+                        ui.cpu_paused.store(!was);
+                    }
+                }
+                miq_sleep_ms(50);
+            }
+#else
+            // Unix: Use termios for non-blocking input
+            struct termios old_tio, new_tio;
+            tcgetattr(STDIN_FILENO, &old_tio);
+            new_tio = old_tio;
+            new_tio.c_lflag &= ~(ICANON | ECHO);  // Disable canonical mode and echo
+            new_tio.c_cc[VMIN] = 0;   // Non-blocking
+            new_tio.c_cc[VTIME] = 0;
+            tcsetattr(STDIN_FILENO, TCSANOW, &new_tio);
+
+            while(ui.running.load(std::memory_order_relaxed)){
+                char ch;
+                if(read(STDIN_FILENO, &ch, 1) > 0){
+                    if(ch == 'g' || ch == 'G'){
+                        bool was = ui.gpu_paused.load();
+                        ui.gpu_paused.store(!was);
+                    } else if(ch == 'c' || ch == 'C'){
+                        bool was = ui.cpu_paused.load();
+                        ui.cpu_paused.store(!was);
+                    }
+                }
+                miq_sleep_ms(50);
+            }
+
+            // Restore terminal settings
+            tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
+#endif
+        });
+
         // ===== UI thread (animated dashboard)
         std::thread ui_th([&](){
             using clock = std::chrono::steady_clock;
@@ -3680,6 +3751,12 @@ int main(int argc, char** argv){
                 if (hours > 0) out << hours << "h ";
                 out << mins << "m " << secs << "s\n";
                 out << "  " << C("2") << "Press " << C("1") << "Ctrl+C" << R() << C("2") << " to stop mining gracefully" << R() << "\n";
+                // Keyboard shortcuts for toggling GPU/CPU
+                out << "  " << C("2") << "Press " << C("1") << "'g'" << R() << C("2") << " to toggle GPU ("
+                    << (ui.gpu_paused.load() ? (C("33") + "PAUSED" + R()) : (C("32") + "ACTIVE" + R()))
+                    << C("2") << "), " << C("1") << "'c'" << R() << C("2") << " to toggle CPU ("
+                    << (ui.cpu_paused.load() ? (C("33") + "PAUSED" + R()) : (C("32") + "ACTIVE" + R()))
+                    << C("2") << ")" << R() << "\n";
 
                 ++spin_idx;
                 std::cout << out.str() << std::flush;
@@ -3687,6 +3764,7 @@ int main(int argc, char** argv){
             }
         });
         ui_th.detach();
+        input_th.detach();
 
         // ===== watcher thread (sync, tip, stats, wallet-ish)
         std::thread watch([&](){
@@ -4173,8 +4251,11 @@ int main(int argc, char** argv){
 
                                     // Check if hash meets share target
                                     if (meets_target_be_raw(hash, share_bits)) {
-                                        found_nonce.store(nonce);
-                                        found_share.store(true);
+                                        // CRITICAL FIX: Use compare_exchange to prevent race
+                                        bool expected = false;
+                                        if (found_share.compare_exchange_strong(expected, true)) {
+                                            found_nonce.store(nonce);
+                                        }
                                         break;
                                     }
 
@@ -4310,6 +4391,9 @@ int main(int argc, char** argv){
             std::fprintf(stderr, "[miner] starting solo mining loop (one job per tip; clean shutdown).\n");
 
             std::string last_job_prev_hex;
+            // CRITICAL FIX: Track the prev_hash we just mined on to prevent double-mining
+            // After finding a block, we must wait for the node to update before mining again
+            std::string last_mined_prev_hex;  // The prev_hash of the block we just submitted
             bool was_disconnected = false;
             int reconnect_backoff_ms = 2000;  // Start with 2 second backoff
             const int kMinBackoffMs = 2000;
@@ -4365,6 +4449,23 @@ int main(int argc, char** argv){
                 for(int i=0;i<10 && ui.running.load(); ++i) miq_sleep_ms(100);
                 continue;
             }
+
+            // CRITICAL FIX: Prevent double-mining on the same parent
+            // If we just submitted a block building on prev_hash X, we must NOT mine
+            // another block on X. Wait for the node to update to our new block.
+            const std::string cur_prev_hex = to_hex_s(tpl.prev_hash);
+            if (!last_mined_prev_hex.empty() && cur_prev_hex == last_mined_prev_hex) {
+                // Node hasn't processed our block yet - wait and retry
+                {
+                    std::lock_guard<std::mutex> lk(ui.mtx);
+                    ui.last_submit_msg = "Waiting for node to process submitted block...";
+                    ui.last_submit_when = std::chrono::steady_clock::now();
+                }
+                for(int i=0; i<10 && ui.running.load(); ++i) miq_sleep_ms(100);
+                continue;
+            }
+            // Clear the flag once we get a new template (node has caught up)
+            last_mined_prev_hex.clear();
 
             // Build coinbase & txs
             Transaction dummy_cb = make_coinbase(tpl.height, 0, pkh);
@@ -4430,7 +4531,10 @@ int main(int argc, char** argv){
             std::atomic<bool> found{false};
             std::atomic<bool> abort_round{false};
             std::vector<std::thread> thv;
-            Block found_block;
+            // CRITICAL: Initialize found_block with template for validation
+            // This ensures found_block.prev_hash matches tpl.prev_hash if no solution found
+            // (though in that case found==false so we'd skip anyway)
+            Block found_block = b;
 
             for (unsigned tid = 0; tid < threads; ++tid) {
                 thv.emplace_back(
@@ -4480,6 +4584,14 @@ int main(int argc, char** argv){
                         uint64_t base_nonce =
                             (static_cast<uint64_t>(time(nullptr)) << 32) ^ 0x9e3779b97f4a7c15ull ^ 0xa5a5a5a5ULL;
                         while (!found.load(std::memory_order_relaxed) && !abort_round.load(std::memory_order_relaxed) && ui.running.load()) {
+                            // RUNTIME TOGGLE: Check if GPU mining is paused
+                            if (g_ui->gpu_paused.load(std::memory_order_relaxed)) {
+                                g_ui->gpu_hps_now.store(0.0);
+                                g_ui->gpu_hps_smooth.store(0.0);
+                                miq_sleep_ms(100);
+                                continue;
+                            }
+
                             uint64_t n = 0; bool ok = false; double ghps = 0.0;
                             if (!gpu.run_round(base_nonce, gpu_npi, n, ok, ghps, 0.25, 2.0)) {
                                 std::fprintf(stderr, "[GPU] run_round failed.\n");
@@ -4490,9 +4602,13 @@ int main(int argc, char** argv){
                             g_ui->gpu_hps_smooth.store(gpu.ema_smooth);
 
                             if (ok) {
-                                found_block = b;
-                                found_block.header.nonce = n;
-                                found.store(true);
+                                // CRITICAL FIX: Use compare_exchange to prevent GPU/CPU race
+                                // Only one thread (GPU or CPU) should write to found_block
+                                bool expected = false;
+                                if (found.compare_exchange_strong(expected, true)) {
+                                    found_block = b;
+                                    found_block.header.nonce = n;
+                                }
                                 break;
                             }
                             base_nonce += (uint64_t)gpu.gws * (uint64_t)gpu_npi;
@@ -4607,6 +4723,16 @@ int main(int argc, char** argv){
 
             if(!found.load()) { continue; }
 
+            // CRITICAL FIX: Verify found_block was actually written (race protection)
+            // If compare_exchange failed, the block might not be valid
+            if (found_block.header.prev_hash != tpl.prev_hash) {
+                std::lock_guard<std::mutex> lk(ui.mtx);
+                ui.last_submit_msg = "internal: found_block mismatch (race condition avoided)";
+                ui.last_submit_when = std::chrono::steady_clock::now();
+                log_line("internal: found_block.prev_hash doesn't match template - skipping");
+                continue;
+            }
+
             // Check staleness vs tip
             // CRITICAL FIX: Use fast variant for quick staleness check before submission
             TipInfo tip_now{};
@@ -4636,6 +4762,11 @@ int main(int argc, char** argv){
 
             std::string ok_body, err_body;
             bool ok = rpc_submitblock_any(rpc_host, rpc_port, token, ok_body, err_body, hexblk);
+
+            // CRITICAL FIX: Mark the prev_hash we just mined on to prevent double-mining
+            // We must NOT start another block on the same parent, even if submission fails
+            // (in case it actually succeeded but network returned an error)
+            last_mined_prev_hex = to_hex_s(tpl.prev_hash);
 
             if (ok) {
                 // Try confirm acceptance
@@ -4688,6 +4819,9 @@ int main(int argc, char** argv){
                     }
                     ui.last_submit_when = std::chrono::steady_clock::now();
                 }
+                // CRITICAL: Mandatory cooldown after successful submission
+                // This prevents finding another block too quickly while network propagates
+                for(int i = 0; i < 20 && ui.running.load(); ++i) miq_sleep_ms(100);  // 2 second cooldown
             } else {
                 // Submission failed - log and add delay before retrying
                 {

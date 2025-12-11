@@ -49,12 +49,11 @@
 namespace fs = std::filesystem;
 namespace miq {
 
-// PERFORMANCE: Skip fsync during IBD for much faster block processing
-// Automatically enabled during IBD, or can be forced with MIQ_FAST_SYNC=1
+// DURABILITY: Only skip fsync if explicitly requested via environment variable
+// Previous default (skip during IBD) was risky - power loss during sync could corrupt data
+// For production systems, always fsync. Fast sync is opt-in only now.
 static bool fast_sync_enabled() {
-    // Always skip fsync during IBD for 10-100x faster sync
-    if (miq::is_ibd_mode()) return true;
-    // Manual override via environment variable
+    // Only skip fsync if explicitly requested - never by default
     const char* e = std::getenv("MIQ_FAST_SYNC");
     return e && (e[0]=='1' || e[0]=='t' || e[0]=='T' || e[0]=='y' || e[0]=='Y');
 }
@@ -241,11 +240,21 @@ bool miq::Storage::read_block_by_hash(const std::vector<uint8_t>& hash,
 }
 
 bool miq::Storage::write_state(const std::vector<uint8_t>& b){
-    std::ofstream f(path_state_, std::ios::binary|std::ios::trunc);
+    // DURABILITY: Atomic write - write to .tmp then rename
+    // This prevents corruption if crash occurs during write
+    std::string temp_path = path_state_ + ".tmp";
+    std::ofstream f(temp_path, std::ios::binary|std::ios::trunc);
     if(!f) return false;
     f.write((const char*)b.data(), b.size());
     f.flush();
-    flush_path(path_state_);
+    f.close();
+    flush_path(temp_path);
+    // Atomic rename - either old state or new state, never partial
+    try {
+        std::filesystem::rename(temp_path, path_state_);
+    } catch (...) {
+        return false;
+    }
     return true;
 }
 
