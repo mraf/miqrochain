@@ -174,10 +174,9 @@ bool AddressIndex::index_block(const Block& block, uint64_t height) {
 
     if (!enabled_) return false;
 
-    // CRITICAL PERFORMANCE: Skip address indexing during IBD
-    // Address index does file I/O for every transaction which is very slow
-    // Explorer features are not needed during sync - reindex after IBD if needed
-    if (miq::is_ibd_mode()) return true;
+    // NOTE: We no longer skip during IBD - address indexing is required for wallet functionality
+    // The previous skip caused 0 balance after sync because no addresses were indexed
+    // Performance impact is acceptable since we batch writes and only flush periodically
 
     int64_t timestamp = block.header.time;
     uint32_t tx_pos = 0;
