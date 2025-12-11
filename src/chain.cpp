@@ -2114,7 +2114,7 @@ static bool utxo_apply_ops(DB& db, const std::vector<UtxoOp>& ops, std::string& 
             else           batch.spend(op.txid, op.vout);
         }
         std::string kv_err;
-        if (!batch.commit(/*sync=*/true, &kv_err)) {
+        if (!batch.commit(/*sync=*/!fast_sync_enabled(), &kv_err)) {
             err = kv_err.empty() ? "utxo batch commit failed" : kv_err;
             return false;
         }

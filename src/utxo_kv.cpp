@@ -1,5 +1,12 @@
 #include "utxo_kv.h"
 #include <cstring>
+#include <cstdlib>
+
+// Fast sync mode - skip fsync during IBD for speed
+static bool fast_sync_enabled() {
+    const char* e = std::getenv("MIQ_FAST_SYNC");
+    return e && (e[0]=='1' || e[0]=='t' || e[0]=='T' || e[0]=='y' || e[0]=='Y');
+}
 
 namespace miq {
 
@@ -67,11 +74,11 @@ bool UTXOKV::get(const std::vector<uint8_t>& txid, uint32_t vout, UTXOEntry& out
 }
 
 bool UTXOKV::add(const std::vector<uint8_t>& txid, uint32_t vout, const UTXOEntry& e, std::string* err){
-    return db_.put(k_utxo(txid, vout), ser_entry(e), /*sync=*/true, err);
+    return db_.put(k_utxo(txid, vout), ser_entry(e), /*sync=*/!fast_sync_enabled(), err);
 }
 
 bool UTXOKV::spend(const std::vector<uint8_t>& txid, uint32_t vout, std::string* err){
-    return db_.del(k_utxo(txid, vout), /*sync=*/true, err);
+    return db_.del(k_utxo(txid, vout), /*sync=*/!fast_sync_enabled(), err);
 }
 
 void UTXOKV::Batch::add(const std::vector<uint8_t>& txid, uint32_t vout, const UTXOEntry& e){

@@ -14,8 +14,15 @@
 
 namespace fs = std::filesystem;
 
+// Fast sync mode - skip fsync during IBD for speed
+static bool fast_sync_enabled() {
+    const char* e = std::getenv("MIQ_FAST_SYNC");
+    return e && (e[0]=='1' || e[0]=='t' || e[0]=='T' || e[0]=='y' || e[0]=='Y');
+}
+
 // DURABILITY: Platform-specific fsync for UTXO log
 static inline void fsync_file(const std::string& path) {
+    if (fast_sync_enabled()) return;  // Skip in fast sync mode
 #if defined(_WIN32)
     HANDLE h = CreateFileA(path.c_str(), GENERIC_WRITE,
                            FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,

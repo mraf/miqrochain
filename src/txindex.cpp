@@ -15,8 +15,15 @@
   #include <fcntl.h>
 #endif
 
+// Fast sync mode - skip fsync during IBD for speed
+static bool fast_sync_enabled() {
+    const char* e = std::getenv("MIQ_FAST_SYNC");
+    return e && (e[0]=='1' || e[0]=='t' || e[0]=='T' || e[0]=='y' || e[0]=='Y');
+}
+
 // DURABILITY: Platform-specific fsync
 static inline void fsync_path(const std::string& p) {
+    if (fast_sync_enabled()) return;  // Skip in fast sync mode
 #if defined(_WIN32)
     HANDLE h = CreateFileA(p.c_str(), GENERIC_WRITE,
                            FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
