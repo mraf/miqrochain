@@ -3545,14 +3545,25 @@ void P2P::fill_index_pipeline(PeerState& ps){
             }
         }
 
-        // CRITICAL FIX: Only increment next_index AFTER successful request
-        // If send fails, we must NOT skip this index - retry on next fill_index_pipeline call
+        // Check if we should skip this index (already have it or exceeds limits)
+        // These are NOT errors - just skip to next index
+        const uint64_t hdr_height = chain_.best_header_height();
+        if (g_logged_headers_done && hdr_height > 0 && idx > hdr_height) {
+            // Beyond header height - stop requesting (not an error, just done)
+            break;
+        }
+        if (idx <= chain_.height()) {
+            // Already have this block - skip to next
+            ps.next_index++;
+            continue;
+        }
+
+        // Actually send the request
         if (request_block_index(ps, idx)) {
             ps.next_index++;
             ps.inflight_index++;
         } else {
-            // Send failed - don't increment next_index, exit loop
-            // On next call we'll retry this same index
+            // Send failed - stop requesting from this peer (socket issue)
             break;
         }
     }
