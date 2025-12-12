@@ -246,8 +246,10 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
 #define MIQ_INDEX_PIPELINE 128  // PERFORMANCE: Increased from 64 for faster block download
 #endif
 
+// CRITICAL: Header pipeline size - how many header requests in flight
+// Increased from 1 to 4 for faster header sync during IBD
 #ifndef MIQ_HDR_PIPELINE
-#define MIQ_HDR_PIPELINE 1
+#define MIQ_HDR_PIPELINE 4
 #endif
 #ifndef MIQ_SYNC_SEQUENTIAL_DEFAULT
 #define MIQ_SYNC_SEQUENTIAL_DEFAULT 0
@@ -3527,20 +3529,21 @@ void P2P::fill_index_pipeline(PeerState& ps){
     uint64_t max_index = current_height + max_ahead;
 
     // Determine the limit for block requests from this peer
-    // PROPER HEADERS-FIRST: Block sync only runs AFTER headers complete
-    // So we always have best_header_height available as the definitive limit
+    // CRITICAL FIX: During IBD, DON'T cap at header height!
+    // Headers and blocks download in parallel - blocks waiting in orphan pool is OK.
+    // Only cap at header height AFTER headers phase is complete.
     const uint64_t best_hdr = chain_.best_header_height();
     uint64_t peer_limit;
 
-    // Headers-first means we ALWAYS have headers before blocks
-    // Use header height as the primary limit - it's the canonical chain
-    if (best_hdr > 0) {
-        peer_limit = best_hdr;  // Request up to header height
+    if (g_logged_headers_done && best_hdr > 0) {
+        // After headers done, use header height as definitive limit
+        peer_limit = best_hdr;
     } else if (ps.peer_tip_height > 0) {
-        // Fallback: use peer's announced tip (shouldn't happen with proper headers-first)
+        // During IBD: use peer's announced tip - let blocks download ahead of headers!
+        // This is the KEY fix - blocks will wait in orphan pool until headers catch up
         peer_limit = ps.peer_tip_height;
     } else {
-        // No header height and no peer tip - use reasonable default
+        // No peer tip - use aggressive window for fast IBD
         peer_limit = current_height + max_ahead;
     }
 
@@ -3999,8 +4002,18 @@ void P2P::evict_pending_blocks_if_needed() {
     // If still too large, remove the highest blocks first (furthest from being processable)
     while (pending_blocks_bytes_ > MAX_PENDING_BLOCKS_BYTES && !pending_blocks_.empty()) {
         auto last = std::prev(pending_blocks_.end());
+        uint64_t evicted_height = last->first;
         pending_blocks_bytes_ -= last->second.raw.size();
         pending_blocks_.erase(last);
+
+        // CRITICAL FIX: Clear evicted index from global tracking!
+        // Without this, the index stays in g_global_requested_indices forever,
+        // and will NEVER be re-requested when the node catches up to that height.
+        // This was the ROOT CAUSE of random stall heights (1100, 3054, etc.)
+        {
+            InflightLock lk(g_inflight_lock);
+            g_global_requested_indices.erase(evicted_height);
+        }
     }
 }
 
@@ -4024,6 +4037,11 @@ void P2P::process_pending_blocks() {
             log_warn("P2P: failed to deserialize pending block at height " + std::to_string(next_height));
             pending_blocks_bytes_ -= it->second.raw.size();
             pending_blocks_.erase(it);
+            // CRITICAL FIX: Clear from global tracking so we can re-request from another peer
+            {
+                InflightLock lk(g_inflight_lock);
+                g_global_requested_indices.erase(next_height);
+            }
             continue;
         }
 
