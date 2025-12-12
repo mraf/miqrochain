@@ -4336,33 +4336,43 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             uint64_t discovered = (cur >= height_at_seed_connect) ? (cur - height_at_seed_connect) : 0;
             const char* stage = (cur == 0 ? "headers" : "blocks");
 
-            // CRITICAL FIX: Get actual network height from peers for proper progress display
-            // Previously this passed (cur, cur) which made the splash screen think sync was complete
-            //
-            // IMPORTANT: Only count peers that have:
-            // 1. Completed handshake (verack_ok) - otherwise they haven't told us their height
-            // 2. Reported a valid tip (peer_tip > 0) - 0 means they haven't sent version yet
-            // This matches the logic in compute_sync_gate() to prevent premature sync completion
-            uint64_t network_height = 0;  // Start at 0, will be updated by valid peers
-            bool found_valid_peer = false;
+            // CRITICAL FIX: Track MAXIMUM network height ever seen
+            // This prevents the progress bar from jumping around when peers disconnect/reconnect
+            // The target height should only INCREASE, never decrease, until sync is complete
+            static uint64_t max_seen_network_height = 0;
+
+            // Get current max from connected peers
+            uint64_t current_peer_max = 0;
             auto peer_snapshot = p2p->snapshot_peers();
             for (const auto& pr : peer_snapshot) {
-                // Only consider peers that have completed handshake AND reported their tip
                 if (pr.verack_ok && pr.peer_tip > 0) {
-                    if (pr.peer_tip > network_height) {
-                        network_height = pr.peer_tip;
+                    if (pr.peer_tip > current_peer_max) {
+                        current_peer_max = pr.peer_tip;
                     }
-                    found_valid_peer = true;
                 }
             }
 
-            // If no valid peers found, use checkpoint height as minimum target to prevent
-            // premature sync completion when peers disconnect or haven't reported tips yet
-            if (!found_valid_peer) {
-                // CRITICAL FIX: Use dynamic checkpoint height instead of hardcoded value
-                // This ensures sync won't complete prematurely before reaching the latest checkpoint
+            // Also check header height - headers might know more than current peers
+            uint64_t header_height = chain.best_header_height();
+
+            // Use MAXIMUM of: previous max, current peer max, header height
+            uint64_t network_height = max_seen_network_height;
+            if (current_peer_max > network_height) {
+                network_height = current_peer_max;
+            }
+            if (header_height > network_height) {
+                network_height = header_height;
+            }
+
+            // If no valid source, use checkpoint height as minimum
+            if (network_height == 0) {
                 uint64_t checkpoint_height = miq::get_highest_checkpoint_height();
                 network_height = std::max(cur + 1, checkpoint_height);
+            }
+
+            // Update persistent max (never decrease)
+            if (network_height > max_seen_network_height) {
+                max_seen_network_height = network_height;
             }
 
             if (tui && can_tui) {

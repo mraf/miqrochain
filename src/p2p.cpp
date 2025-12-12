@@ -342,11 +342,14 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
 #ifndef MIQ_OUTBOUND_TARGET
 #define MIQ_OUTBOUND_TARGET 8
 #endif
-// CRITICAL FIX: Increased dial interval from 5s to 15s to prevent rapid reconnect loops
-// When a peer disconnects, we were immediately trying to reconnect, causing
-// connect/disconnect cycling. 15 seconds gives time for network issues to resolve.
+// Dial interval for new connections
+// During IBD: aggressive reconnection is needed to maintain sync
+// After IBD: more conservative to prevent rapid cycling
 #ifndef MIQ_DIAL_INTERVAL_MS
-#define MIQ_DIAL_INTERVAL_MS 15000
+#define MIQ_DIAL_INTERVAL_MS 5000  // 5 seconds - faster during IBD
+#endif
+#ifndef MIQ_DIAL_INTERVAL_STEADY_MS
+#define MIQ_DIAL_INTERVAL_STEADY_MS 15000  // 15 seconds after sync complete
 #endif
 
 #ifndef MIQ_ORPHAN_MAX_BYTES
@@ -467,11 +470,13 @@ namespace {
     static std::mutex g_peer_stalls_mu;
     static std::unordered_map<std::uintptr_t, int> g_peer_stalls;
 
-    // CRITICAL FIX: Per-IP reconnection backoff to prevent rapid connect/disconnect cycles
-    // When a peer disconnects, we record the time. We won't reconnect until backoff expires.
+    // Per-IP reconnection backoff - adaptive based on sync state
+    // During IBD: short backoff to maintain sync progress
+    // After IBD: longer backoff to prevent rapid cycling
     static std::mutex g_reconnect_backoff_mu;
     static std::unordered_map<std::string, int64_t> g_reconnect_backoff_until;  // IP -> earliest reconnect time
-    static constexpr int64_t RECONNECT_BACKOFF_MS = 30000;  // 30 second backoff after disconnect
+    static constexpr int64_t RECONNECT_BACKOFF_IBD_MS = 5000;    // 5 second backoff during IBD
+    static constexpr int64_t RECONNECT_BACKOFF_STEADY_MS = 30000; // 30 second backoff after sync
 
     // Single authoritative monotonic ms clock used by rate limiters / stall guards / snapshots.
     static inline int64_t now_ms() {
@@ -1198,6 +1203,10 @@ static bool g_seed_mode = false;
 static std::atomic<bool> g_sequential_sync{(MIQ_SYNC_SEQUENTIAL_DEFAULT != 0)};
 static inline int miq_outbound_target(){
     return g_seed_mode ? MIQ_SEED_MODE_OUTBOUND_TARGET : MIQ_OUTBOUND_TARGET;
+}
+// Adaptive dial interval - faster during IBD for quick recovery
+static inline int64_t miq_dial_interval_ms() {
+    return g_logged_headers_done ? MIQ_DIAL_INTERVAL_STEADY_MS : MIQ_DIAL_INTERVAL_MS;
 }
 
 static inline bool hostname_is_seed(){
@@ -4592,7 +4601,7 @@ void P2P::loop(){
     while (running_) {
         if ((int)outbound_count() < miq_outbound_target() && g_listen_port != 0) {
             int64_t tnow = now_ms();
-            if (tnow - last_dial_ms > MIQ_DIAL_INTERVAL_MS) {
+            if (tnow - last_dial_ms > miq_dial_interval_ms()) {
                 last_dial_ms = tnow;
 
 #if MIQ_ENABLE_ADDRMAN
@@ -5514,6 +5523,42 @@ void P2P::loop(){
           }
 
           // ========================================================================
+          // CRITICAL: Clean up ALL stale state when no peers connected
+          // This prevents stale global indices from blocking new connections
+          // ========================================================================
+          {
+              static int64_t last_empty_cleanup_ms = 0;
+              const int64_t tnow = now_ms();
+
+              // Count verack_ok peers
+              size_t active_peers = 0;
+              for (const auto& kvp : peers_) {
+                  if (kvp.second.verack_ok) active_peers++;
+              }
+
+              // If no active peers, clean up all stale state
+              if (active_peers == 0 && tnow - last_empty_cleanup_ms > 1000) {
+                  last_empty_cleanup_ms = tnow;
+
+                  // Clear all global request tracking
+                  {
+                      InflightLock lk(g_inflight_lock);
+                      if (!g_global_requested_indices.empty()) {
+                          log_warn("P2P: Clearing " + std::to_string(g_global_requested_indices.size()) +
+                                   " stale global indices (no active peers)");
+                          g_global_requested_indices.clear();
+                      }
+                  }
+
+                  // Clear per-peer tracking maps
+                  g_inflight_index_ts.clear();
+                  g_inflight_index_order.clear();
+                  g_inflight_block_ts.clear();
+                  g_global_inflight_blocks.clear();
+              }
+          }
+
+          // ========================================================================
           // NUCLEAR SAFETY NET: Unconditional sync recovery every 500ms
           // This is the ultimate failsafe - if sync is behind and we have peers,
           // FORCE re-enable and refill ALL peers regardless of their state.
@@ -5552,9 +5597,36 @@ void P2P::loop(){
                       global_inflight = g_global_requested_indices.size();
                   }
 
-                  // If nothing in flight and we're behind, FORCE recovery
-                  if (!any_active && total_inflight == 0 && global_inflight == 0) {
+                  // AGGRESSIVE RECOVERY: If we're behind and nothing is in flight,
+                  // OR if we have stale global indices (peers disconnected mid-sync),
+                  // force restart ALL peers
+                  bool needs_recovery = (!any_active && total_inflight == 0 && global_inflight == 0);
+
+                  // Also recover if we have global indices but no peer tracking them
+                  // (indicates stale state from disconnected peers)
+                  if (!needs_recovery && global_inflight > 0) {
+                      size_t tracked_by_peers = 0;
+                      for (const auto& kv : g_inflight_index_ts) {
+                          tracked_by_peers += kv.second.size();
+                      }
+                      if (tracked_by_peers == 0) {
+                          needs_recovery = true;
+                          log_warn("P2P: Stale global indices detected (" +
+                                   std::to_string(global_inflight) + " global, 0 tracked)");
+                      }
+                  }
+
+                  if (needs_recovery) {
                       log_warn("P2P: NUCLEAR RECOVERY - no active sync, forcing all peers to restart");
+
+                      // Clear stale global state first
+                      {
+                          InflightLock lk(g_inflight_lock);
+                          g_global_requested_indices.clear();
+                      }
+                      g_inflight_index_ts.clear();
+                      g_inflight_index_order.clear();
+
                       for (auto& kvp : peers_) {
                           if (!kvp.second.verack_ok) continue;
                           Sock s = kvp.first;
@@ -5564,9 +5636,6 @@ void P2P::loop(){
                           kvp.second.syncing = true;
                           kvp.second.inflight_index = 0;
                           kvp.second.next_index = chain_height + 1;
-                          // Clear per-peer tracking
-                          g_inflight_index_ts.erase(s);
-                          g_inflight_index_order.erase(s);
                           // Fill pipeline
                           fill_index_pipeline(kvp.second);
                       }
@@ -6609,7 +6678,9 @@ void P2P::loop(){
                 // CRITICAL FIX: Record backoff time to prevent rapid reconnection
                 {
                     std::lock_guard<std::mutex> lk_backoff(g_reconnect_backoff_mu);
-                    g_reconnect_backoff_until[ps_old.ip] = now_ms() + RECONNECT_BACKOFF_MS;
+                    // Adaptive backoff: shorter during IBD for faster recovery
+                    int64_t backoff = g_logged_headers_done ? RECONNECT_BACKOFF_STEADY_MS : RECONNECT_BACKOFF_IBD_MS;
+                    g_reconnect_backoff_until[ps_old.ip] = now_ms() + backoff;
                 }
 
                 // Finally, close & erase the dead peer.
