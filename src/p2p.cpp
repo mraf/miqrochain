@@ -21,6 +21,7 @@ namespace p2p_stats {
 #include "stratum/stratum_server.h"  // For stratum block notifications
 #include "compact_blocks.h" // BIP152 compact block relay
 #include "mempool.h"        // For compact block reconstruction
+#include "assume_valid.h"   // Checkpoint verification for fork detection
 
 #include <chrono>
 #include <deque>
@@ -3571,6 +3572,13 @@ void P2P::fill_index_pipeline(PeerState& ps){
         return;
     }
 
+    // CRITICAL: Don't sync from peers pending fork verification!
+    // We must verify they're on the same chain before downloading blocks
+    if (ps.fork_verification_pending) {
+        P2P_TRACE("Skipping fill_index_pipeline - fork verification pending for " + ps.ip);
+        return;
+    }
+
     // SYNC STATE FIX: Ensure next_index is consistent with current chain height
     const uint64_t current_height = chain_.height();
     if (ps.next_index <= current_height) {
@@ -4861,6 +4869,36 @@ void P2P::loop(){
         {
             int64_t tnow = now_ms();
             size_t h = chain_.height();
+
+            // ================================================================
+            // FORK VERIFICATION TIMEOUT - disconnect peers that don't respond
+            // ================================================================
+            constexpr int64_t FORK_VERIFY_TIMEOUT_MS = 10000;  // 10 second timeout
+            std::vector<Sock> verify_timeout_peers;
+            for (auto& kv : peers_) {
+                auto& pps = kv.second;
+                if (pps.fork_verification_pending &&
+                    pps.fork_verification_sent_ms > 0 &&
+                    (tnow - pps.fork_verification_sent_ms) > FORK_VERIFY_TIMEOUT_MS) {
+                    log_warn("P2P: FORK VERIFICATION TIMEOUT - peer " + pps.ip +
+                            " did not respond within " + std::to_string(FORK_VERIFY_TIMEOUT_MS/1000) + "s");
+                    // Mark as forked (suspicious - why no response?)
+                    pps.fork_verification_pending = false;
+                    pps.fork_detected = true;
+                    pps.syncing = false;
+                    g_peer_index_capable[kv.first] = false;
+                    verify_timeout_peers.push_back(kv.first);
+                }
+            }
+            // Disconnect timed out peers
+            for (Sock sd : verify_timeout_peers) {
+                auto it = peers_.find(sd);
+                if (it != peers_.end()) {
+                    log_warn("P2P: Disconnecting unresponsive peer " + it->second.ip);
+                    schedule_close(sd);  // Schedule for cleanup in the next loop iteration
+                }
+            }
+
             if (h > g_last_progress_height) {
                 g_last_progress_height = h;
                 g_last_progress_ms = tnow;
@@ -6888,13 +6926,65 @@ void P2P::loop(){
                         // The handshake is complete at this point
 
                         ps.verack_ok = true;
-                        // CRITICAL: Mark peer as index-capable so block sync can start
-                        g_peer_index_capable[(Sock)s] = true;
                         g_index_timeouts[(Sock)s] = 0;
-                        ps.syncing = true;
-                        ps.next_index = chain_.height() + 1;
-                        // Start requesting blocks immediately
-                        fill_index_pipeline(ps);
+
+                        // ================================================================
+                        // BULLETPROOF FORK VERIFICATION
+                        // Before syncing, verify peer is on the same chain by checking
+                        // if they have the same block at a checkpoint height we've synced
+                        // ================================================================
+                        const uint64_t our_height = chain_.height();
+                        uint64_t verify_height = 0;
+                        std::vector<uint8_t> verify_hash;
+
+                        // Find a checkpoint height we've already synced that we can verify
+                        const auto& checkpoints = miq::get_checkpoints();
+                        for (auto it = checkpoints.rbegin(); it != checkpoints.rend(); ++it) {
+                            if (it->height > 0 && it->height <= our_height) {
+                                // We have this checkpoint block - use it for verification
+                                verify_height = it->height;
+                                verify_hash = miq::checkpoint_hash_to_bytes(it->hash_hex);
+                                break;
+                            }
+                        }
+
+                        if (verify_height > 0 && !verify_hash.empty()) {
+                            // We have checkpoint blocks - REQUIRE verification before sync
+                            ps.fork_verification_pending = true;
+                            ps.fork_verification_sent_ms = now_ms();
+                            ps.fork_verification_height = verify_height;
+                            ps.syncing = false;  // Don't sync until verified
+                            g_peer_index_capable[(Sock)s] = false;  // Block sync until verified
+
+                            // Send getheaders request starting from checkpoint hash
+                            // If peer is on same chain, they'll return headers building on this
+                            // If peer is on fork, their response won't connect to our checkpoint
+                            std::vector<std::vector<uint8_t>> locator;
+                            locator.push_back(verify_hash);
+
+                            // Check if we need to flip endianness for this peer
+                            if (g_hdr_flip[(Sock)s]) {
+                                std::reverse(locator[0].begin(), locator[0].end());
+                            }
+
+                            std::vector<uint8_t> stop_hash(32, 0);
+                            auto payload = build_getheaders_payload(locator, stop_hash);
+                            auto msg = encode_msg("getheaders", payload);
+                            if (send_or_close(s, msg)) {
+                                log_info("P2P: FORK VERIFICATION - requesting headers from checkpoint " +
+                                        std::to_string(verify_height) + " for peer " + ps.ip);
+                            }
+                        } else {
+                            // No checkpoint blocks yet (initial sync) - allow sync without verification
+                            // Once we sync past checkpoints, new peers will be verified
+                            ps.fork_verified = true;  // Trust during initial sync
+                            g_peer_index_capable[(Sock)s] = true;
+                            ps.syncing = true;
+                            ps.next_index = our_height + 1;
+                            fill_index_pipeline(ps);
+                            log_info("P2P: Initial sync - skipping fork verification for " + ps.ip +
+                                    " (no checkpoint blocks yet)");
+                        }
 
                         const int64_t hs_ms = now_ms() - gg.t_conn_ms;
                         log_info(std::string("P2P: handshake complete with ")+ps.ip+" in "+std::to_string(hs_ms)+" ms");
@@ -7099,6 +7189,90 @@ void P2P::loop(){
                         if (!parse_headers_payload(m.payload, hs)) {
                             if (++ps.mis > 10) { dead.push_back(s); break; }
                             continue;
+                        }
+
+                        // ================================================================
+                        // FORK VERIFICATION RESPONSE HANDLER
+                        // If we're waiting for verification, check if headers connect to our checkpoint
+                        // ================================================================
+                        if (ps.fork_verification_pending) {
+                            ps.fork_verification_pending = false;  // Clear pending state
+
+                            // Get the checkpoint hash we're verifying against
+                            std::vector<uint8_t> expected_prev_hash;
+                            for (const auto& cp : miq::get_checkpoints()) {
+                                if (cp.height == ps.fork_verification_height) {
+                                    expected_prev_hash = miq::checkpoint_hash_to_bytes(cp.hash_hex);
+                                    break;
+                                }
+                            }
+
+                            bool verification_passed = false;
+                            if (!hs.empty() && !expected_prev_hash.empty()) {
+                                // Check if first header's prev_hash matches our checkpoint
+                                // This proves peer has the same block at checkpoint height
+                                std::vector<uint8_t> first_prev = hs[0].prev_hash;
+
+                                // Handle endianness
+                                if (g_hdr_flip[(Sock)s]) {
+                                    std::reverse(first_prev.begin(), first_prev.end());
+                                }
+
+                                if (first_prev == expected_prev_hash) {
+                                    verification_passed = true;
+                                    log_info("P2P: FORK VERIFICATION PASSED - peer " + ps.ip +
+                                            " has same chain at checkpoint " + std::to_string(ps.fork_verification_height));
+                                } else {
+                                    log_warn("P2P: FORK VERIFICATION FAILED - peer " + ps.ip +
+                                            " has DIFFERENT block at checkpoint " + std::to_string(ps.fork_verification_height) +
+                                            " (FORKED CHAIN!)");
+                                }
+                            } else if (hs.empty()) {
+                                // Empty response could mean:
+                                // 1. Peer doesn't have blocks past checkpoint (shorter chain) - OK to sync
+                                // 2. Peer doesn't recognize our checkpoint (fork) - BAD
+                                // We're conservative: if peer's tip is <= our checkpoint, they're OK
+                                if (ps.peer_tip_height <= ps.fork_verification_height) {
+                                    verification_passed = true;
+                                    log_info("P2P: FORK VERIFICATION PASSED (empty response) - peer " + ps.ip +
+                                            " has shorter chain, will sync when they extend");
+                                } else {
+                                    log_warn("P2P: FORK VERIFICATION FAILED - peer " + ps.ip +
+                                            " claims tip " + std::to_string(ps.peer_tip_height) +
+                                            " but doesn't have checkpoint " + std::to_string(ps.fork_verification_height) +
+                                            " (FORKED CHAIN!)");
+                                }
+                            }
+
+                            if (verification_passed) {
+                                // Enable sync from this peer
+                                ps.fork_verified = true;
+                                ps.fork_detected = false;
+                                ps.fork_check_height = ps.fork_verification_height;
+                                g_peer_index_capable[(Sock)s] = true;
+                                ps.syncing = true;
+                                ps.next_index = chain_.height() + 1;
+                                fill_index_pipeline(ps);
+                            } else {
+                                // Mark peer as forked - never sync from them
+                                ps.fork_detected = true;
+                                ps.fork_verified = false;
+                                ps.syncing = false;
+                                g_peer_index_capable[(Sock)s] = false;
+
+                                // Add ban score for being on fork
+                                ps.banscore += 50;
+                                if (ps.banscore >= 100) {
+                                    log_warn("P2P: Banning forked peer " + ps.ip);
+                                    dead.push_back(s);
+                                    continue;
+                                }
+                            }
+
+                            // If verification passed and we got headers, process them normally below
+                            if (!verification_passed || hs.empty()) {
+                                continue;  // Don't process headers from forked peer
+                            }
                         }
 
                         // ACCEPT HEADERS INTO CHAIN

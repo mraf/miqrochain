@@ -219,6 +219,11 @@ struct PeerState {
     uint64_t    fork_check_height{0};       // Height where we verified chain compatibility
     std::vector<uint8_t> fork_check_hash;   // Block hash at fork_check_height
 
+    // Proactive fork verification on connect
+    bool        fork_verification_pending{false};  // Waiting for verification response
+    int64_t     fork_verification_sent_ms{0};      // When we sent verification request
+    uint64_t    fork_verification_height{0};       // Checkpoint height we're verifying
+
     // per-peer RX buffer & liveness
     std::vector<uint8_t> rx;
     bool        verack_ok{false};
