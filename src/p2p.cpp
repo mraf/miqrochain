@@ -5887,12 +5887,21 @@ void P2P::loop(){
                 chain_.next_block_fetch_targets(want_chk, (size_t)1);
                 any_want = !want_chk.empty();
             }
+            // CRITICAL FIX: Check ALL inflight sources, including g_global_requested_indices!
+            // Without this, sync was marked complete when index-based requests were pending
             bool any_inflight = !g_global_inflight_blocks.empty();
+            if (!any_inflight) {
+                // Check index-based requests
+                InflightLock lk(g_inflight_lock);
+                any_inflight = !g_global_requested_indices.empty();
+            }
             if (!any_inflight) {
                 for (auto &kvp : peers_) {
                     if (!kvp.second.inflight_blocks.empty()) { any_inflight = true; break; }
                     if (kvp.second.inflight_index > 0)      { any_inflight = true; break; }
                     if (kvp.second.inflight_hdr_batches > 0){ any_inflight = true; break; }
+                    // Also check if peer is actively syncing
+                    if (kvp.second.syncing && kvp.second.verack_ok) { any_inflight = true; break; }
                 }
             }
             const bool headers_done = g_logged_headers_done;
@@ -5926,14 +5935,11 @@ void P2P::loop(){
                  debug_logged = true;
             }
             #endif
-            if (!any_want && !any_inflight && headers_done && !g_sync_green_logged) {
-                 g_sync_green_logged = true;
-                 log_warn("Sync: complete ✓ height=" + std::to_string(chain_.height()));
-                 for (auto &kvp : peers_) {
-                     kvp.second.syncing = false;
-                     kvp.second.inflight_index = 0;
-                 }
-            }
+            // CRITICAL FIX: Don't mark sync complete or stop peers here!
+            // This aggressive check caused premature sync completion and stalls.
+            // The more thorough check below (truly_complete) handles sync completion properly
+            // with height_too_low protection and other safety checks.
+            // REMOVED: The old code stopped ALL peers when any_want was empty, which was wrong!
             // Improved sync completion logic: check if we have exhausted all sync methods
             const size_t current_height = chain_.height();
             bool can_try_index_sync = false;
