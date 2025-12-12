@@ -1055,6 +1055,13 @@ bool StratumServer::validate_share(StratumMiner& miner, const std::string& job_i
             // Submit to chain
             std::string submit_err;
             if (chain_.submit_block(block, submit_err)) {
+                // LIVENESS FIX: IMMEDIATELY relay block to P2P network
+                // This is the MOST CRITICAL step for sub-1-second propagation
+                // Must happen BEFORE any other processing to minimize latency
+                if (block_relay_callback_) {
+                    block_relay_callback_(block, job.height);
+                }
+
                 // CRITICAL FIX: Immediately invalidate old job and create new one
                 // This prevents other miners from submitting blocks with same parent!
                 {
