@@ -7374,11 +7374,13 @@ void P2P::loop(){
                                     }
                                 }
 
-                                // CRITICAL: ALWAYS decrement inflight_index when we receive a block.
+                                // CRITICAL: Decrement inflight_index when we receive a block.
                                 // The peer sent us data, so they fulfilled ONE request.
-                                // Whether the block was accepted, orphaned, or rejected doesn't matter.
-                                // Without this, orphaned blocks keep inflight_index high and we stall!
-                                ps.inflight_index--;
+                                // CRITICAL FIX: Must check > 0 to avoid uint32_t underflow!
+                                // If inflight_index wraps to 4 billion, fill_index_pipeline never sends requests
+                                if (ps.inflight_index > 0) {
+                                    ps.inflight_index--;
+                                }
                                 g_index_timeouts[(Sock)s] = 0;
 
                                 // Refill pipeline immediately
