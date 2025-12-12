@@ -71,8 +71,12 @@ namespace miq {
 #ifndef MIQ_SEED_MODE_ENV
 #define MIQ_SEED_MODE_ENV "MIQ_IS_SEED"
 #endif
+// CRITICAL FIX: Removed MIQ_SEED_MODE_OUTBOUND_TARGET override here
+// It was set to 1, overriding constants.h value of 4, causing seed nodes
+// to only have 1 outbound connection and stalling when that peer was slow.
+// Now using constants.h value (4) for more reliable seed node syncing.
 #ifndef MIQ_SEED_MODE_OUTBOUND_TARGET
-#define MIQ_SEED_MODE_OUTBOUND_TARGET 1
+#define MIQ_SEED_MODE_OUTBOUND_TARGET 4  // Match constants.h
 #endif
 #ifndef MIQ_IBD_FALLBACK_AFTER_MS
 #define MIQ_IBD_FALLBACK_AFTER_MS (5 * 60 * 1000)
@@ -5302,11 +5306,12 @@ void P2P::loop(){
               }
           }
 
-          // CRITICAL FIX: Stall recovery - if no progress for 30s and not fully synced, force re-enable ALL peers
+          // CRITICAL FIX: Stall recovery - if no progress for N seconds, force re-enable ALL peers
           // This handles cases where all peers got demoted or stuck in invalid states
+          // Reduced from 30s to 10s for ALL platforms - faster recovery is always better
           {
               const int64_t tnow = now_ms();
-              const int64_t STALL_RECOVERY_MS = 30000;  // 30 seconds no progress = stalled
+              const int64_t STALL_RECOVERY_MS = 10000;  // 10 seconds - aggressive but necessary
               const uint64_t chain_height = chain_.height();
               const uint64_t target_height = chain_.best_header_height();
 
@@ -5377,6 +5382,158 @@ void P2P::loop(){
                       // Trigger immediate pipeline refill to retry the blocks
                       if (ps.syncing && peer_is_index_capable((Sock)ps.sock)) {
                           fill_index_pipeline(ps);
+                      }
+                  }
+              }
+          }
+
+          // ========================================================================
+          // CRITICAL FIX: Orphaned Index Cleanup
+          // Indices can get "orphaned" in g_global_requested_indices when:
+          // 1. Peer disconnects without cleanup
+          // 2. Race condition between timeout and disconnect
+          // 3. Index removed from peer tracking but not global tracking
+          // This causes sync to stall because fill_index_pipeline skips these indices
+          // Run every 5 seconds to clean up orphaned indices
+          // ========================================================================
+          {
+              static int64_t last_orphan_cleanup_ms = 0;
+              const int64_t tnow = now_ms();
+              if (tnow - last_orphan_cleanup_ms > 5000) {  // Every 5 seconds
+                  last_orphan_cleanup_ms = tnow;
+
+                  // Build set of ALL indices currently tracked by ANY peer
+                  std::unordered_set<uint64_t> peer_tracked_indices;
+                  for (const auto& kv : g_inflight_index_ts) {
+                      for (const auto& idx_kv : kv.second) {
+                          peer_tracked_indices.insert(idx_kv.first);
+                      }
+                  }
+
+                  // Find orphaned indices (in global but not tracked by any peer)
+                  std::vector<uint64_t> orphaned;
+                  {
+                      InflightLock lk(g_inflight_lock);
+                      for (uint64_t idx : g_global_requested_indices) {
+                          if (peer_tracked_indices.find(idx) == peer_tracked_indices.end()) {
+                              orphaned.push_back(idx);
+                          }
+                      }
+                      // Remove orphaned indices from global tracking
+                      for (uint64_t idx : orphaned) {
+                          g_global_requested_indices.erase(idx);
+                      }
+                  }
+
+                  if (!orphaned.empty()) {
+                      log_warn("P2P: Cleaned " + std::to_string(orphaned.size()) +
+                               " orphaned indices from global tracking (first: " +
+                               std::to_string(orphaned[0]) + ")");
+
+                      // Re-request orphaned indices from available peers
+                      for (uint64_t idx : orphaned) {
+                          // Find best peer to request from
+                          Sock target = MIQ_INVALID_SOCK;
+                          double best_score = -1.0;
+                          for (auto& kvp : peers_) {
+                              if (!kvp.second.verack_ok) continue;
+                              if (!peer_is_index_capable(kvp.first)) continue;
+                              if (kvp.second.health_score > best_score) {
+                                  best_score = kvp.second.health_score;
+                                  target = kvp.first;
+                              }
+                          }
+                          if (target != MIQ_INVALID_SOCK) {
+                              auto itT = peers_.find(target);
+                              if (itT != peers_.end()) {
+                                  uint8_t p8[8];
+                                  for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((idx >> (8 * i)) & 0xFF);
+                                  auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
+                                  if (send_or_close(target, msg)) {
+                                      g_inflight_index_ts[target][idx] = tnow;
+                                      g_inflight_index_order[target].push_back(idx);
+                                      {
+                                          InflightLock lk(g_inflight_lock);
+                                          g_global_requested_indices.insert(idx);
+                                      }
+                                      itT->second.inflight_index++;
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          // ========================================================================
+          // CRITICAL FIX: Gap Detection and Re-request
+          // If we have blocks at height N+2, N+3 but not N+1, detect and re-request N+1
+          // This handles cases where a block request was lost or peer disconnected
+          // Run every 3 seconds
+          // ========================================================================
+          {
+              static int64_t last_gap_check_ms = 0;
+              const int64_t tnow = now_ms();
+              if (tnow - last_gap_check_ms > 3000) {  // Every 3 seconds
+                  last_gap_check_ms = tnow;
+
+                  const uint64_t current_height = chain_.height();
+                  const uint64_t next_needed = current_height + 1;
+
+                  // Check if we're missing the next block but have later blocks
+                  if (pending_blocks_.find(next_needed) == pending_blocks_.end()) {
+                      // Check if we have any blocks after the gap
+                      bool have_later_blocks = false;
+                      for (const auto& pb : pending_blocks_) {
+                          if (pb.first > next_needed) {
+                              have_later_blocks = true;
+                              break;
+                          }
+                      }
+
+                      if (have_later_blocks) {
+                          // We have a gap - check if the missing index is being requested
+                          bool is_requested = false;
+                          {
+                              InflightLock lk(g_inflight_lock);
+                              is_requested = g_global_requested_indices.count(next_needed) > 0;
+                          }
+
+                          if (!is_requested) {
+                              log_warn("P2P: Gap detected at index " + std::to_string(next_needed) +
+                                       " - forcing re-request");
+
+                              // Find best peer and request the missing block
+                              Sock target = MIQ_INVALID_SOCK;
+                              double best_score = -1.0;
+                              for (auto& kvp : peers_) {
+                                  if (!kvp.second.verack_ok) continue;
+                                  if (!peer_is_index_capable(kvp.first)) continue;
+                                  if (kvp.second.health_score > best_score) {
+                                      best_score = kvp.second.health_score;
+                                      target = kvp.first;
+                                  }
+                              }
+                              if (target != MIQ_INVALID_SOCK) {
+                                  auto itT = peers_.find(target);
+                                  if (itT != peers_.end()) {
+                                      uint8_t p8[8];
+                                      for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
+                                      auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
+                                      if (send_or_close(target, msg)) {
+                                          g_inflight_index_ts[target][next_needed] = tnow;
+                                          g_inflight_index_order[target].push_back(next_needed);
+                                          {
+                                              InflightLock lk(g_inflight_lock);
+                                              g_global_requested_indices.insert(next_needed);
+                                          }
+                                          itT->second.inflight_index++;
+                                          log_info("P2P: Re-requested gap block " + std::to_string(next_needed) +
+                                                   " from " + itT->second.ip);
+                                      }
+                                  }
+                              }
+                          }
                       }
                   }
               }

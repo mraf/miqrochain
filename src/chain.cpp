@@ -1184,15 +1184,20 @@ bool Chain::open(const std::string& dir){
         log_info("Block hash index built with " + std::to_string(hashindex_.size()) + " entries");
     }
 
-    // Rebuild Address Index if empty but we have blocks
-    if (addrindex_.is_enabled() && addrindex_.address_count() == 0 && tip_.height > 0) {
-        log_info("AddressIndex empty, triggering rebuild...");
-        reindex_addresses([](uint64_t cur, uint64_t total) {
-            if (cur % 1000 == 0) {
-                log_info("AddressIndex rebuild: " + std::to_string(cur) + "/" + std::to_string(total));
-            }
-            return true;
-        });
+    // Rebuild Address Index if it's behind the chain tip
+    // This handles: empty index, interrupted reindex, or corrupted state
+    if (addrindex_.is_enabled() && tip_.height > 0) {
+        uint64_t indexed_height = addrindex_.best_indexed_height();
+        if (indexed_height < tip_.height) {
+            log_info("AddressIndex behind chain (indexed=" + std::to_string(indexed_height) +
+                     " chain=" + std::to_string(tip_.height) + "), triggering rebuild...");
+            reindex_addresses([](uint64_t cur, uint64_t total) {
+                if (cur % 1000 == 0) {
+                    log_info("AddressIndex rebuild: " + std::to_string(cur) + "/" + std::to_string(total));
+                }
+                return true;  // Non-interruptible
+            });
+        }
     }
 
     // CRITICAL FIX: Auto-detect and rebuild corrupted UTXO set
