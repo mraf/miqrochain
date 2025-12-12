@@ -394,7 +394,61 @@ void StratumServer::work_loop() {
     while (running_) {
         int64_t now = now_ms();
 
-        // Create periodic job update (every 30 seconds) or when tip changes
+        // ====================================================================
+        // MINING JOB COMPLETENESS INVARIANT (LEVEL-TRIGGERED)
+        // Rule 1: If tip changed and miner has old job → send new job NOW
+        //
+        // This check runs EVERY loop iteration (10ms). It is:
+        // - Unconditional (no time gates)
+        // - Independent of edge-triggered notify_new_block() calls
+        // - Guarantees miners get new jobs within ~10ms of tip change
+        //
+        // Without this, if edge-triggered notify_new_block() is missed,
+        // miners could mine on stale jobs for up to 30 seconds.
+        // ====================================================================
+        {
+            auto current_tip = chain_.tip_hash();
+            if (!current_tip.empty()) {
+                bool needs_update = false;
+                {
+                    std::lock_guard<std::mutex> lock(jobs_mutex_);
+                    if (!current_job_id_.empty()) {
+                        auto it = jobs_.find(current_job_id_);
+                        if (it != jobs_.end()) {
+                            // Check if current job's parent matches chain tip
+                            if (it->second.prev_hash != current_tip) {
+                                needs_update = true;
+                            }
+                        } else {
+                            // No current job - need to create one
+                            needs_update = true;
+                        }
+                    } else {
+                        // No current job ID - need to create one
+                        needs_update = true;
+                    }
+                }
+                if (needs_update) {
+                    // TIP CHANGED - miners have stale job
+                    // Create and broadcast new job immediately
+                    auto job = create_job();
+                    job.clean_jobs = true;  // Signal miners to drop old work
+                    {
+                        std::lock_guard<std::mutex> lock(jobs_mutex_);
+                        jobs_[job.job_id] = job;
+                        job_order_.push_back(job.job_id);
+                        current_job_id_ = job.job_id;
+                    }
+                    log_info("Stratum: [LEVEL-TRIGGERED] Tip changed, broadcasting new job " +
+                             job.job_id + " height=" + std::to_string(job.height));
+                    broadcast_job(job);
+                    last_job_time = now;  // Reset periodic timer
+                }
+            }
+        }
+
+        // Create periodic job update (every 30 seconds) for mempool refresh
+        // Note: Tip changes are handled above by level-triggered check
         if (now - last_job_time > 30000) {
             auto job = create_job();
             {
@@ -461,6 +515,50 @@ void StratumServer::work_loop() {
                 update_vardiff(it->second);
             }
         }
+
+        // ====================================================================
+        // DEBUG-ONLY INVARIANT ASSERTION: "miner idle while tip changed"
+        // If level-triggered check is working, this should never trigger.
+        // ====================================================================
+        #ifndef NDEBUG
+        {
+            static int64_t s_last_assert_ms = 0;
+            if (now - s_last_assert_ms > 1000) {  // Check every 1s
+                s_last_assert_ms = now;
+                auto current_tip = chain_.tip_hash();
+                std::string current_parent;
+                {
+                    std::lock_guard<std::mutex> lock(jobs_mutex_);
+                    if (!current_job_id_.empty()) {
+                        auto it = jobs_.find(current_job_id_);
+                        if (it != jobs_.end()) {
+                            // Convert prev_hash to hex for comparison
+                            std::string hex;
+                            for (uint8_t b : it->second.prev_hash) {
+                                static const char* h = "0123456789abcdef";
+                                hex.push_back(h[b >> 4]);
+                                hex.push_back(h[b & 0xf]);
+                            }
+                            current_parent = hex;
+                        }
+                    }
+                }
+                std::string tip_hex;
+                for (uint8_t b : current_tip) {
+                    static const char* h = "0123456789abcdef";
+                    tip_hex.push_back(h[b >> 4]);
+                    tip_hex.push_back(h[b & 0xf]);
+                }
+                if (!current_tip.empty() && !current_parent.empty() &&
+                    tip_hex != current_parent) {
+                    log_warn("INVARIANT: miner job parent mismatch! tip=" +
+                             tip_hex.substr(0, 16) + " job_parent=" +
+                             current_parent.substr(0, 16) +
+                             " - level-triggered check should have fixed this");
+                }
+            }
+        }
+        #endif
 
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }

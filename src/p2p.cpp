@@ -9281,6 +9281,64 @@ void P2P::loop(){
             }
         }
 
+        // ========================================================================
+        // DEBUG-ONLY INVARIANT ASSERTIONS
+        // These log violations for debugging but do NOT change behavior.
+        // Bitcoin Core catches bugs before users do because of this.
+        // ========================================================================
+        #ifndef NDEBUG
+        {
+            static int64_t s_last_invariant_check_ms = 0;
+            const int64_t tnow = now_ms();
+            // Check every 1 second to avoid log spam
+            if (tnow - s_last_invariant_check_ms > 1000) {
+                s_last_invariant_check_ms = tnow;
+                const uint64_t our_height = chain_.height();
+
+                // ASSERTION 1: "peer connected but missing recent block"
+                // If peer is connected for >5s and still behind our tip, log it
+                for (const auto& kv : peers_) {
+                    const PeerState& ps = kv.second;
+                    if (!ps.verack_ok) continue;
+                    if (ps.peer_tip_height > 0 && ps.peer_tip_height < our_height) {
+                        // Peer is behind - check how long they've been connected
+                        if (ps.connected_ms > 0 && (tnow - ps.connected_ms) > 5000) {
+                            MIQ_LOG_DEBUG(miq::LogCategory::NET,
+                                "INVARIANT: peer " + ps.ip + " connected " +
+                                std::to_string((tnow - ps.connected_ms) / 1000) +
+                                "s but still behind (peer=" + std::to_string(ps.peer_tip_height) +
+                                " us=" + std::to_string(our_height) + ")");
+                        }
+                    }
+                }
+
+                // ASSERTION 2: "relay blocked >1s"
+                // Check if any block at our tip has been pending relay for >1s
+                // (This would indicate level-triggered relay is failing)
+                static uint64_t s_last_logged_height = 0;
+                static int64_t s_height_first_seen_ms = 0;
+                if (our_height != s_last_logged_height) {
+                    s_last_logged_height = our_height;
+                    s_height_first_seen_ms = tnow;
+                } else if (s_height_first_seen_ms > 0 && (tnow - s_height_first_seen_ms) > 1000) {
+                    // Check if any peer still doesn't have this block after 1s
+                    size_t behind_count = 0;
+                    for (const auto& kv : peers_) {
+                        if (kv.second.verack_ok && kv.second.peer_tip_height < our_height) {
+                            behind_count++;
+                        }
+                    }
+                    if (behind_count > 0) {
+                        MIQ_LOG_DEBUG(miq::LogCategory::NET,
+                            "INVARIANT: block at height " + std::to_string(our_height) +
+                            " validated " + std::to_string((tnow - s_height_first_seen_ms) / 1000) +
+                            "s ago but " + std::to_string(behind_count) + " peers still behind");
+                    }
+                }
+            }
+        }
+        #endif
+
         if (now_ms() - last_addr_save_ms > MIQ_ADDR_SAVE_INTERVAL_MS) {
             last_addr_save_ms = now_ms();
             save_addrs_to_disk(datadir_, addrv4_);
