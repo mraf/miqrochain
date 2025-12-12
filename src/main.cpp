@@ -4454,14 +4454,37 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             }
 
             // ========================================================================
-            // CRITICAL: Verify UTXO integrity after IBD
-            // UTXO log was skipped during IBD for performance - verify it's complete
+            // CRITICAL: Rebuild UTXO after IBD if needed
+            // UTXO log was skipped during IBD for performance - must rebuild now!
+            // Without this, wallet will show 0 balance after node restart.
             // ========================================================================
             {
                 size_t utxo_count = chain.utxo().size();
-                if (utxo_count == 0 && chain.height() > 0) {
-                    log_warn("UTXO set is empty after IBD - wallet will show 0 balance!");
-                    log_warn("Run with --reindex-utxo flag to rebuild UTXO from blocks");
+                uint64_t chain_height = chain.height();
+
+                // UTXO count should be at least 10% of block count for a healthy chain
+                // (each block creates at least one coinbase output)
+                bool needs_rebuild = (utxo_count == 0 && chain_height > 0) ||
+                                    (utxo_count < chain_height / 10 && chain_height > 100);
+
+                if (needs_rebuild) {
+                    log_info("=== REBUILDING UTXO SET AFTER IBD ===");
+                    log_info("UTXO count (" + std::to_string(utxo_count) + ") is too low for " +
+                             std::to_string(chain_height) + " blocks - rebuilding...");
+
+                    if (tui && can_tui) {
+                        tui->set_banner("Rebuilding UTXO set... (DO NOT INTERRUPT)");
+                    }
+
+                    if (chain.rebuild_utxo_from_blocks()) {
+                        log_info("UTXO rebuild complete - wallet balance should now be correct");
+                    } else {
+                        log_error("UTXO rebuild failed - wallet may show incorrect balance");
+                    }
+
+                    if (tui && can_tui) {
+                        tui->set_banner("");
+                    }
                 }
             }
 

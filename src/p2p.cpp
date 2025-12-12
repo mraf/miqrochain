@@ -7060,13 +7060,37 @@ void P2P::loop(){
                             // the seed connection logic from triggering.
                             // Update the stall probe timer but NOT g_last_progress_ms
                             g_next_stall_probe_ms = now_ms() + MIQ_P2P_STALL_RETRY_MS;
-                            // CRITICAL FIX: Do NOT update peer_tip_height from header height!
-                            // Headers can be far ahead of actual blocks, causing premature sync.
-                            // peer_tip_height should only come from:
-                            // 1. Version message announced_height (what peer claims to have)
-                            // 2. Actual blocks received from this peer
-                            // The old code here caused nodes to think they were synced when
-                            // headers caught up but blocks hadn't been downloaded yet.
+
+                            // CRITICAL FIX: Update g_max_known_peer_tip when headers extend beyond!
+                            // This handles the case where new blocks are mined AFTER we connected.
+                            // Without this, we'd think we're "caught up" at the old version height
+                            // and stop syncing before reaching the actual tip.
+                            uint64_t new_header_height = chain_.best_header_height();
+                            uint64_t old_max = g_max_known_peer_tip.load();
+                            while (new_header_height > old_max) {
+                                if (g_max_known_peer_tip.compare_exchange_weak(old_max, new_header_height)) {
+                                    log_info("P2P: Updated max peer tip from headers: " + std::to_string(new_header_height) +
+                                             " (was " + std::to_string(old_max) + ")");
+                                    // Also update this peer's announced tip if headers show higher
+                                    if (new_header_height > ps.announced_tip_height) {
+                                        ps.announced_tip_height = new_header_height;
+                                        ps.peer_tip_height = new_header_height;
+                                    }
+
+                                    // CRITICAL FIX: Re-enable peer and restart sync when headers extend!
+                                    // This peer just sent us headers proving they have more blocks.
+                                    // If they were demoted before, they should be re-enabled now.
+                                    g_peer_index_capable[(Sock)s] = true;
+                                    g_index_timeouts[(Sock)s] = 0;  // Reset timeout counter
+                                    if (!ps.syncing) {
+                                        ps.syncing = true;
+                                        ps.inflight_index = 0;
+                                        ps.next_index = chain_.height() + 1;
+                                        log_info("P2P: Re-enabled sync on " + ps.ip + " after receiving extended headers");
+                                    }
+                                    break;
+                                }
+                            }
                         } else if (hs.size() > 0) {
                             log_warn("P2P: Headers REJECTED from " + ps.ip + " n=" + std::to_string(hs.size()) +
                                     " accepted=0 error=" + herr);
@@ -7089,10 +7113,21 @@ void P2P::loop(){
                                 // Request from this peer since they just announced the header
                                 request_block_hash(ps, bh);
                             }
-                            // Also trigger index-based sync if active
-                            if (ps.syncing) {
-                                fill_index_pipeline(ps);
+
+                            // CRITICAL FIX: ALWAYS ensure index sync is active after accepting headers
+                            // This ensures we sync to the new header tip even if peer was demoted
+                            if (!peer_is_index_capable((Sock)s)) {
+                                g_peer_index_capable[(Sock)s] = true;
+                                g_index_timeouts[(Sock)s] = 0;
+                                log_info("P2P: Re-enabled index capability on " + ps.ip + " after accepting " +
+                                        std::to_string(accepted) + " headers");
                             }
+                            if (!ps.syncing) {
+                                ps.syncing = true;
+                                ps.inflight_index = 0;
+                                ps.next_index = chain_.height() + 1;
+                            }
+                            fill_index_pipeline(ps);
                         }
 
                         if (hs.empty()) {
