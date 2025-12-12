@@ -5480,7 +5480,6 @@ void P2P::loop(){
           // ========================================================================
           {
               static int64_t last_gap_check_ms = 0;
-              static int64_t last_gap_request_ms = 0;
               static uint64_t last_gap_index = 0;
               static int gap_request_count = 0;
               const int64_t tnow = now_ms();
