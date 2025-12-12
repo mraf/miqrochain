@@ -1284,8 +1284,9 @@ static inline void mark_index_timeout(Sock s){
     // With 512 in-flight requests, normal network latency can easily cause 3 timeouts
     // This disabled peers and caused stop-start sync behavior
     // During IBD: Allow 50 timeouts before disabling (pipeline is 512)
-    // After IBD: Allow 10 timeouts (pipeline is smaller)
-    int threshold = !g_logged_headers_done ? 50 : 10;
+    // After IBD: Allow 30 timeouts - still generous to avoid stop-start
+    // NOTE: 10 was too aggressive, causing rapid demotion/re-enablement cycles
+    int threshold = !g_logged_headers_done ? 50 : 30;
     if (++c >= threshold) {
         g_peer_index_capable[s] = false;
     }
@@ -5314,7 +5315,8 @@ void P2P::loop(){
             Sock s = kvp.first;
             // CRITICAL FIX: Use same threshold as mark_index_timeout()
             // 3 was way too aggressive - caused stop-start sync behavior
-            int threshold = !g_logged_headers_done ? 50 : 10;
+            // 10 was still too aggressive after headers - increased to 30
+            int threshold = !g_logged_headers_done ? 50 : 30;
             if (g_index_timeouts[s] >= threshold && g_peer_index_capable[s]) {
               // demote
               g_peer_index_capable[s] = false;
@@ -5952,7 +5954,10 @@ void P2P::loop(){
                 if (!peer_is_index_capable((Sock)pps.sock)) continue;
 
                 can_try_index_sync = true;
-                if (pps.syncing && pps.inflight_index > 0) {
+                // CRITICAL FIX: Don't require inflight_index > 0!
+                // inflight_index can be 0 temporarily while still actively syncing
+                // (e.g., just processed a block, about to request more)
+                if (pps.syncing) {
                     has_active_index_sync = true;
                     break;
                 }
