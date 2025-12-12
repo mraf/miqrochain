@@ -246,6 +246,7 @@ struct PeerState {
     std::unordered_set<std::string> inflight_blocks;
     int                              inflight_hdr_batches{0};
     int64_t                          last_hdr_batch_done_ms{0};
+    size_t                           hdr_stall_count{0};  // Track header stalls for peer rotation
 
     // version/features gating & whitelist flags
     uint32_t    version{0};
