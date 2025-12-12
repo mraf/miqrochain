@@ -8777,9 +8777,69 @@ void P2P::loop(){
                 }
                 // CRITICAL FIX: Also clear tx inflight tracking on disconnect
                 g_inflight_tx_ts.erase(s);
-                // CRITICAL FIX: Also clear index inflight tracking on disconnect
-                // Missing this caused stale entries and potential use-after-free crashes
-                g_inflight_index_ts.erase(s);
+
+                // CRITICAL FIX: Clear index tracking AND global requested indices
+                // BUG: Previously this code only cleared per-peer tracking but NOT
+                // g_global_requested_indices, causing indices to get stuck forever.
+                // Those stuck indices could never be requested by any other peer,
+                // causing permanent sync stalls at specific heights.
+                auto it_idx = g_inflight_index_ts.find(s);
+                if (it_idx != g_inflight_index_ts.end()) {
+                    // Collect indices to re-issue to other peers
+                    std::vector<uint64_t> orphaned_indices;
+                    orphaned_indices.reserve(it_idx->second.size());
+                    for (const auto& kv : it_idx->second) {
+                        orphaned_indices.push_back(kv.first);
+                    }
+
+                    // Clear from global tracking FIRST (under lock)
+                    {
+                        InflightLock lk(g_inflight_lock);
+                        for (uint64_t idx : orphaned_indices) {
+                            g_global_requested_indices.erase(idx);
+                        }
+                    }
+
+                    // Re-issue requests to other peers (similar to first cleanup loop)
+                    if (!orphaned_indices.empty()) {
+                        // Build candidate list sorted by health score
+                        std::vector<std::pair<Sock, double>> scored_peers;
+                        for (const auto& kv2 : peers_) {
+                            if (kv2.first == s) continue;
+                            if (!kv2.second.verack_ok) continue;
+                            scored_peers.emplace_back(kv2.first, kv2.second.health_score);
+                        }
+                        std::sort(scored_peers.begin(), scored_peers.end(),
+                                  [](const auto& a, const auto& b) { return a.second > b.second; });
+
+                        std::vector<Sock> cand_socks;
+                        cand_socks.reserve(scored_peers.size());
+                        for (auto& p : scored_peers) cand_socks.push_back(p.first);
+
+                        // Re-issue each orphaned index request
+                        for (uint64_t idx : orphaned_indices) {
+                            if (cand_socks.empty()) break;
+                            Sock target = rr_pick_peer_for_key(miq_idx_key(idx), cand_socks);
+                            auto itT = peers_.find(target);
+                            if (itT != peers_.end()) {
+                                uint8_t p8[8];
+                                for (int j = 0; j < 8; j++) p8[j] = (uint8_t)((idx >> (8 * j)) & 0xFF);
+                                auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
+                                if (send_or_close(target, msg)) {
+                                    g_inflight_index_ts[target][idx] = now_ms();
+                                    g_inflight_index_order[target].push_back(idx);
+                                    {
+                                        InflightLock lk(g_inflight_lock);
+                                        g_global_requested_indices.insert(idx);
+                                    }
+                                    itT->second.inflight_index++;
+                                }
+                            }
+                        }
+                    }
+
+                    g_inflight_index_ts.erase(it_idx);
+                }
                 g_inflight_index_order.erase(s);
             }
         }
