@@ -1279,17 +1279,14 @@ static void remove_file_scope_inflight(const std::string& hash) {
 
 static std::unordered_map<Sock,int> g_index_timeouts;
 static inline void mark_index_timeout(Sock s){
-    int &c = g_index_timeouts[s];
-    // CRITICAL FIX: 3 timeouts was way too aggressive!
-    // With 512 in-flight requests, normal network latency can easily cause 3 timeouts
-    // This disabled peers and caused stop-start sync behavior
-    // During IBD: Allow 50 timeouts before disabling (pipeline is 512)
-    // After IBD: Allow 30 timeouts - still generous to avoid stop-start
-    // NOTE: 10 was too aggressive, causing rapid demotion/re-enablement cycles
-    int threshold = !g_logged_headers_done ? 50 : 30;
-    if (++c >= threshold) {
-        g_peer_index_capable[s] = false;
-    }
+    // CRITICAL FIX: Only increment the counter here, don't set g_peer_index_capable!
+    // The demotion should happen ONLY in the dedicated demotion loop (line ~5305)
+    // where ALL state (syncing, inflight_index, etc.) is updated atomically.
+    // Setting g_peer_index_capable here caused race conditions where:
+    //   - g_peer_index_capable = false (set here)
+    //   - syncing = true (not updated yet)
+    //   - has_active_index_sync returns true but no requests sent!
+    g_index_timeouts[s]++;
 }
 
 // ---- NEW: pre-verack safe allow-list & counters ----------------------------
@@ -5298,18 +5295,9 @@ void P2P::loop(){
             }
           }
 
-          // CRITICAL FIX: Refill pipelines for ALL syncing peers after timeout handling
-          // This handles multiple cases:
-          // 1. Timeout handling freed slots (inflight_index--) but didn't refill
-          // 2. Peers marked syncing but with inflight_index == 0 (idle)
-          // 3. Activation loops may not trigger due to various conditions
-          // Without this, peers stall until a block arrives or specific triggers fire
-          for (auto &kvp : peers_) {
-              if (!kvp.second.syncing) continue;
-              if (!peer_is_index_capable(kvp.first)) continue;
-              // Refill ALL syncing peers - don't skip inflight_index == 0
-              fill_index_pipeline(kvp.second);
-          }
+          // CRITICAL FIX: Track if ANY peer gets demoted this tick
+          // If so, we MUST refill remaining peers after demotion completes
+          bool any_peer_demoted = false;
 
           for (auto &kvp : peers_){
             Sock s = kvp.first;
@@ -5319,6 +5307,7 @@ void P2P::loop(){
             int threshold = !g_logged_headers_done ? 50 : 30;
             if (g_index_timeouts[s] >= threshold && g_peer_index_capable[s]) {
               // demote
+              any_peer_demoted = true;
               g_peer_index_capable[s] = false;
               auto &ps = kvp.second;
               ps.syncing = false;
@@ -5393,15 +5382,48 @@ void P2P::loop(){
                           fill_index_pipeline(kvp.second);
                       }
                   }
+                  any_peer_demoted = false;  // Already handled all peers
+              }
+          }
+
+          // CRITICAL FIX: Refill pipelines for ALL syncing peers after timeout/demotion handling
+          // This handles multiple cases:
+          // 1. Timeout handling freed slots (inflight_index--) but didn't refill
+          // 2. Peers marked syncing but with inflight_index == 0 (idle)
+          // 3. Activation loops may not trigger due to various conditions
+          // 4. CRITICAL: If ANY peer was demoted, remaining peers MUST refill to take over!
+          // Without this, peers stall until a block arrives or specific triggers fire
+          // NOTE: This MUST run AFTER demotion check, not before!
+          for (auto &kvp : peers_) {
+              if (!kvp.second.syncing) continue;
+              if (!peer_is_index_capable(kvp.first)) continue;
+              // Refill ALL syncing peers - don't skip inflight_index == 0
+              fill_index_pipeline(kvp.second);
+          }
+
+          // CRITICAL FIX: If any peer was demoted but not all, we need to ensure remaining
+          // peers actually pick up the slack. The indices were cleared from global tracking,
+          // so remaining peers can now request them. Force another refill pass.
+          if (any_peer_demoted) {
+              for (auto &kvp : peers_) {
+                  if (!kvp.second.verack_ok) continue;
+                  if (!peer_is_index_capable(kvp.first)) continue;
+                  // Force activate and refill for all capable peers
+                  if (!kvp.second.syncing) {
+                      kvp.second.syncing = true;
+                      kvp.second.inflight_index = 0;
+                      kvp.second.next_index = chain_.height() + 1;
+                  }
+                  fill_index_pipeline(kvp.second);
               }
           }
 
           // CRITICAL FIX: Stall recovery - if no progress for N seconds, force re-enable ALL peers
           // This handles cases where all peers got demoted or stuck in invalid states
-          // Reduced from 30s to 5s for AGGRESSIVE recovery
+          // Reduced from 30s to 2s for INSTANT recovery - stop-start must be eliminated!
           {
               const int64_t tnow = now_ms();
-              const int64_t STALL_RECOVERY_MS = 5000;  // 5 seconds - very aggressive
+              const int64_t STALL_RECOVERY_MS = 2000;  // 2 seconds - INSTANT recovery
               const uint64_t chain_height = chain_.height();
               // CRITICAL FIX: Use MAX of header height and known peer tip
               // During IBD, header height may be 0 or incomplete
@@ -5415,8 +5437,8 @@ void P2P::loop(){
                   chain_height < target_height &&
                   (tnow - g_last_progress_ms) > STALL_RECOVERY_MS) {
 
-                  log_warn("P2P: Sync stalled for " + std::to_string(STALL_RECOVERY_MS/1000) + "s at height " + std::to_string(chain_height) +
-                           "/" + std::to_string(target_height) + " - forcing recovery");
+                  log_warn("P2P: Sync stalled for 2s at height " + std::to_string(chain_height) +
+                           "/" + std::to_string(target_height) + " - forcing INSTANT recovery");
 
                   // CRITICAL FIX: Clear ALL global requested indices above current height
                   // This handles orphaned indices that got stuck without per-peer tracking
@@ -5469,7 +5491,7 @@ void P2P::loop(){
           // higher, periodically reset to allow retry (peer may have had transient issue)
           {
               const int64_t tnow = now_ms();
-              const int64_t PEER_TIP_RECOVERY_MS = 30000;  // 30 seconds cooldown
+              const int64_t PEER_TIP_RECOVERY_MS = 5000;  // 5 seconds - fast recovery for stop-start prevention
               for (auto& kvp : peers_) {
                   PeerState& ps = kvp.second;
                   if (!ps.verack_ok) continue;
@@ -5498,12 +5520,12 @@ void P2P::loop(){
           // 2. Race condition between timeout and disconnect
           // 3. Index removed from peer tracking but not global tracking
           // This causes sync to stall because fill_index_pipeline skips these indices
-          // Run every 1 second (was 5s) for faster recovery from stalls!
+          // Run every 200ms for INSTANT recovery from stalls!
           // ========================================================================
           {
               static int64_t last_orphan_cleanup_ms = 0;
               const int64_t tnow = now_ms();
-              if (tnow - last_orphan_cleanup_ms > 1000) {  // Every 1 second - FAST RECOVERY
+              if (tnow - last_orphan_cleanup_ms > 200) {  // Every 200ms - INSTANT RECOVERY
                   last_orphan_cleanup_ms = tnow;
 
                   // Build set of ALL indices currently tracked by ANY peer
@@ -5972,7 +5994,7 @@ void P2P::loop(){
 
             // Check for height progress stall - be more aggressive after headers phase
             bool height_stalled = false;
-            int64_t stall_threshold = headers_done ? 5000 : 15000;  // 5s after headers, 15s before - fast recovery
+            int64_t stall_threshold = headers_done ? 2000 : 10000;  // 2s after headers, 10s before - INSTANT recovery
 
             if (current_height != last_height_check) {
                 last_height_check = current_height;
@@ -5992,7 +6014,7 @@ void P2P::loop(){
             }
 
             // Implement aggressive refetch when stalled OR proactive pipeline during IBD
-            int64_t refetch_interval = headers_done ? 3000 : 5000;  // 3s after headers, 5s before - fast recovery
+            int64_t refetch_interval = headers_done ? 1000 : 3000;  // 1s after headers, 3s before - INSTANT recovery
 
             // CRITICAL FIX: Aggressive stale tip detection to prevent forks
             uint64_t tip_age_sec = 0;
