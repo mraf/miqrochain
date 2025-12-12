@@ -204,94 +204,28 @@ bool UTXOSet::get(const std::vector<uint8_t>& txid, uint32_t vout, UTXOEntry& ou
     return true;
 }
 
-// Reconstruct live set from the append-only log and filter by PKH.
+// CRITICAL FIX: Use in-memory map_ instead of log file
+// During IBD/sync, UTXOs are added to map_ but NOT written to utxo.log
+// (for performance - see append_log() which skips writes during fast_sync)
+// Reading from log file would return empty results after sync!
 std::vector<std::tuple<std::vector<uint8_t>, uint32_t, UTXOEntry>>
 UTXOSet::list_for_pkh(const std::vector<uint8_t>& pkh) const {
-    std::lock_guard<std::mutex> lk(mtx_);  // CRITICAL FIX: Thread safety
-
-    struct K {
-        std::vector<uint8_t> txid; uint32_t vout;
-        bool operator==(const K& o) const { return vout==o.vout && txid==o.txid; }
-    };
-    struct KH {
-        size_t operator()(const K& k) const noexcept {
-            size_t h = k.vout * 1315423911u;
-            if(!k.txid.empty()){
-                h ^= (size_t)k.txid.front() * 2654435761u;
-                h ^= (size_t)k.txid.back()  * 2246822519u;
-            }
-            return h;
-        }
-    };
-
-    std::unordered_map<K, UTXOEntry, KH> live;
-
-    std::ifstream f(log_path_, std::ios::binary);
-    if(!f) return {};
-
-    while(f){
-        char op;
-        f.read(&op,1);
-        if(!f) break;
-
-        uint32_t n=0;
-        f.read((char*)&n,sizeof(n));
-        if(!f) break;
-
-        // CRITICAL FIX: Bounds check to prevent buffer overflow
-        if (n > MAX_TXID_SIZE) break;
-
-        std::vector<uint8_t> txid(n);
-        if (n > 0) {
-            f.read((char*)txid.data(), n);
-            if(!f) break;
-        }
-
-        uint32_t vout=0;
-        f.read((char*)&vout,sizeof(vout));
-        if(!f) break;
-
-        K k{std::move(txid), vout};
-        if(op=='A'){
-            UTXOEntry e;
-            uint32_t ph=0;
-            char cb=0;
-
-            f.read((char*)&e.value,sizeof(e.value));
-            if(!f) break;
-
-            f.read((char*)&e.height,sizeof(e.height));
-            if(!f) break;
-
-            f.read(&cb,1);
-            if(!f) break;
-            e.coinbase=(cb!=0);
-
-            f.read((char*)&ph,sizeof(ph));
-            if(!f) break;
-
-            // CRITICAL FIX: Bounds check to prevent buffer overflow
-            if (ph > MAX_PKH_SIZE) break;
-
-            e.pkh.resize(ph);
-            if (ph > 0) {
-                f.read((char*)e.pkh.data(), ph);
-                if(!f) break;
-            }
-
-            live[std::move(k)] = e;
-        } else if(op=='S'){
-            live.erase(k);
-        } else {
-            break;
-        }
-    }
+    std::lock_guard<std::mutex> lk(mtx_);  // Thread safety
 
     std::vector<std::tuple<std::vector<uint8_t>, uint32_t, UTXOEntry>> out;
-    out.reserve(live.size());
-    for(auto& kv : live){
-        if(kv.second.pkh == pkh){
-            out.emplace_back(kv.first.txid, kv.first.vout, kv.second);
+    out.reserve(map_.size() / 10);  // Estimate ~10% of UTXOs match a given pkh
+
+    for (const auto& kv : map_) {
+        if (kv.second.pkh == pkh) {
+            // Parse key format: "hex_txid:vout"
+            const std::string& k = kv.first;
+            size_t colon = k.rfind(':');
+            if (colon == std::string::npos) continue;  // Malformed key, skip
+
+            std::vector<uint8_t> txid = from_hex(k.substr(0, colon));
+            uint32_t vout = static_cast<uint32_t>(std::stoul(k.substr(colon + 1)));
+
+            out.emplace_back(std::move(txid), vout, kv.second);
         }
     }
     return out;
