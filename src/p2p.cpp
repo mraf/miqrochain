@@ -1422,10 +1422,15 @@ static inline void clear_all_inflight_for_sock(Sock sock) {
 
 static inline bool peer_is_index_capable(Sock s) {
     auto it = g_peer_index_capable.find(s);
-    // BULLETPROOF SYNC: Default to FALSE - always start with headers-first
-    // Index-by-height is only enabled as a fallback after headers timeout
-    // This ensures proper sync order: headers first, then blocks
-    if (it == g_peer_index_capable.end()) return false;
+    // CRITICAL FIX: Default to TRUE during IBD so sync doesn't stall
+    // Without this, new peers connecting during IBD won't serve blocks,
+    // causing sync to stall at 1-3k blocks until capability is explicitly set.
+    // Headers-first is still preferred but shouldn't block progress.
+    if (it == g_peer_index_capable.end()) {
+        // During IBD, assume all peers are capable - sync will error out if not
+        // After IBD, default to false to prefer header-based sync
+        return !g_logged_headers_done;  // TRUE during IBD, FALSE after
+    }
     return it->second;
 }
 
@@ -3521,6 +3526,22 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // Block validation happens when they arrive, so we can safely request beyond headers
     const uint64_t best_hdr = chain_.best_header_height();
     uint64_t peer_limit;
+
+    // CRITICAL FIX: Recover peer_tip_height if it was reduced more than 30 seconds ago
+    // This prevents permanent stalls when peer_tip was incorrectly reduced by notfound
+    const int64_t tnow = now_ms();
+    if (ps.peer_tip_reduced_ms > 0 && tnow - ps.peer_tip_reduced_ms > 30000) {
+        // Reset peer_tip to allow retrying this peer
+        // Next version message or successful block will set it correctly
+        if (ps.peer_tip_height < best_hdr && best_hdr > 0) {
+            P2P_TRACE("P2P: Resetting peer_tip for " + ps.ip + " from " +
+                      std::to_string(ps.peer_tip_height) + " to header height " +
+                      std::to_string(best_hdr) + " (recovery after 30s)");
+            ps.peer_tip_height = best_hdr;  // Assume peer has caught up to headers
+            ps.peer_tip_reduced_ms = 0;
+        }
+    }
+
     if (ps.peer_tip_height > 0) {
         // Use peer's announced tip - this is what they claim to have
         peer_limit = ps.peer_tip_height;
@@ -3540,11 +3561,19 @@ void P2P::fill_index_pipeline(PeerState& ps){
         // After headers done, fallback to header height if peer_tip not yet known
         peer_limit = best_hdr;
     } else {
-        // PERFORMANCE FIX: During IBD or no headers - allow aggressive sync
-        // Let requests go through and timeout naturally if peer doesn't have blocks
-        // This enables parallel header+block sync for much faster IBD
+        // CRITICAL FIX: During IBD when peer_tip is 0, use aggressive sync window
+        // This fixes stalls at 1-3k blocks when peer_tip isn't set yet
+        // Requests will timeout naturally if peer doesn't have blocks
         peer_limit = current_height + max_ahead;  // Use full window
     }
+
+    // CRITICAL FIX: During IBD, don't let peer_limit cap below our needed blocks
+    // If peer_limit is less than or equal to current_height, we can't request anything!
+    if (!g_logged_headers_done && peer_limit <= current_height) {
+        peer_limit = current_height + max_ahead;  // Use full window during IBD
+        P2P_TRACE("P2P: peer_limit was <= current_height, using max window for " + ps.ip);
+    }
+
     max_index = std::min(max_index, peer_limit);
 
     while (ps.inflight_index < pipe) {
@@ -4980,8 +5009,12 @@ void P2P::loop(){
                 bool found_capable_peer = false;
                 for (const auto& kvp : peers_) {
                     if (!kvp.second.verack_ok) continue;
-                    // Peer is capable if their tip is ahead of our height
-                    if (kvp.second.peer_tip_height > our_height + 1) {
+                    // CRITICAL FIX: Peer is capable if their tip is >= the next block we need
+                    // Was: > our_height + 1 (requires +2 ahead - too strict!)
+                    // Fix: > our_height (requires +1 ahead - correct!)
+                    // Also: During IBD, be lenient - peer_tip might not be set yet
+                    if (kvp.second.peer_tip_height > our_height ||
+                        (kvp.second.peer_tip_height == 0 && !g_logged_headers_done)) {
                         found_capable_peer = true;
                         break;
                     }
@@ -7009,14 +7042,30 @@ void P2P::loop(){
 
                             P2P_TRACE("DEBUG: Received notfound for index " + std::to_string(idx64) + " from " + ps.ip);
 
-                            // CRITICAL FIX: Update peer_tip_height - peer doesn't have this block
-                            // If peer says they don't have block N, set their tip to N-1 (or 0)
-                            // Track when this happened so we can retry later (transient errors)
-                            if (idx64 > 0 && idx64 <= ps.peer_tip_height) {
+                            // CRITICAL FIX: Don't aggressively reduce peer_tip_height on notfound!
+                            // The old code would set peer_tip = idx-1 on every notfound, causing a cascade:
+                            // - Peer says "don't have block 1000" -> set peer_tip to 999
+                            // - Now we only request up to 999 from this peer
+                            // - But peer might actually have 5000 blocks, just not THIS specific one
+                            //
+                            // This caused sync stalls at 1-3k blocks because peer_tip kept getting reduced
+                            // and fill_index_pipeline would cap requests at peer_limit.
+                            //
+                            // NEW APPROACH: Only reduce if peer_tip is EXACTLY at this index (indicating
+                            // we reached their actual tip), otherwise just mark this block as failed for
+                            // THIS peer and let another peer handle it.
+                            if (idx64 > 0 && ps.peer_tip_height > 0 && idx64 == ps.peer_tip_height) {
+                                // Peer tip was exactly at this block - likely their actual tip
                                 ps.peer_tip_height = idx64 - 1;
-                                ps.peer_tip_reduced_ms = now_ms();  // Track for recovery
-                                log_info("P2P: Peer " + ps.ip + " doesn't have block " + std::to_string(idx64) +
-                                         ", updated peer_tip_height to " + std::to_string(ps.peer_tip_height));
+                                ps.peer_tip_reduced_ms = now_ms();
+                                P2P_TRACE("P2P: Peer " + ps.ip + " tip reduced to " + std::to_string(ps.peer_tip_height) +
+                                          " (was at exact tip)");
+                            } else {
+                                // Don't reduce - peer just doesn't have this specific block
+                                // Track that we asked and failed, so we don't ask again immediately
+                                ps.peer_tip_reduced_ms = now_ms();  // Track for gap recovery retry
+                                P2P_TRACE("P2P: Peer " + ps.ip + " doesn't have block " + std::to_string(idx64) +
+                                          " but peer_tip (" + std::to_string(ps.peer_tip_height) + ") not reduced");
                             }
 
                             // Clear this index from inflight tracking for this peer
