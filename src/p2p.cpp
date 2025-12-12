@@ -246,8 +246,10 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
 #define MIQ_INDEX_PIPELINE 128  // PERFORMANCE: Increased from 64 for faster block download
 #endif
 
+// CRITICAL: Header pipeline size - how many header requests in flight
+// Increased from 1 to 4 for faster header sync during IBD
 #ifndef MIQ_HDR_PIPELINE
-#define MIQ_HDR_PIPELINE 1
+#define MIQ_HDR_PIPELINE 4
 #endif
 #ifndef MIQ_SYNC_SEQUENTIAL_DEFAULT
 #define MIQ_SYNC_SEQUENTIAL_DEFAULT 0
@@ -3527,20 +3529,21 @@ void P2P::fill_index_pipeline(PeerState& ps){
     uint64_t max_index = current_height + max_ahead;
 
     // Determine the limit for block requests from this peer
-    // PROPER HEADERS-FIRST: Block sync only runs AFTER headers complete
-    // So we always have best_header_height available as the definitive limit
+    // CRITICAL FIX: During IBD, DON'T cap at header height!
+    // Headers and blocks download in parallel - blocks waiting in orphan pool is OK.
+    // Only cap at header height AFTER headers phase is complete.
     const uint64_t best_hdr = chain_.best_header_height();
     uint64_t peer_limit;
 
-    // Headers-first means we ALWAYS have headers before blocks
-    // Use header height as the primary limit - it's the canonical chain
-    if (best_hdr > 0) {
-        peer_limit = best_hdr;  // Request up to header height
+    if (g_logged_headers_done && best_hdr > 0) {
+        // After headers done, use header height as definitive limit
+        peer_limit = best_hdr;
     } else if (ps.peer_tip_height > 0) {
-        // Fallback: use peer's announced tip (shouldn't happen with proper headers-first)
+        // During IBD: use peer's announced tip - let blocks download ahead of headers!
+        // This is the KEY fix - blocks will wait in orphan pool until headers catch up
         peer_limit = ps.peer_tip_height;
     } else {
-        // No header height and no peer tip - use reasonable default
+        // No peer tip - use aggressive window for fast IBD
         peer_limit = current_height + max_ahead;
     }
 
