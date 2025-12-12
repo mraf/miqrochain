@@ -33,6 +33,7 @@ namespace miq {
 #include <map>
 #include <exception>
 #include <chrono>
+#include <thread>   // std::this_thread::sleep_for (BIP22 longpoll)
 #include <algorithm>
 #include <tuple>
 #include <cmath>
@@ -836,10 +837,10 @@ std::string RpcService::handle(const std::string& body){
         // ---------- BIP22 GETBLOCKTEMPLATE (for pool mining) ----------
         if (method == "getblocktemplate") {
             // BIP22 compliant getblocktemplate implementation
-            auto tip = chain_.tip();
 
             // Parse optional params for capabilities/mode
-            [[maybe_unused]] bool longpoll = false;
+            bool longpoll = false;
+            std::string longpollid;
             std::string mode = "template";
             if (!params.empty() && std::holds_alternative<std::map<std::string, JNode>>(params[0].v)) {
                 auto& p = std::get<std::map<std::string, JNode>>(params[0].v);
@@ -848,6 +849,7 @@ std::string RpcService::handle(const std::string& body){
                 }
                 if (p.count("longpollid") && std::holds_alternative<std::string>(p.at("longpollid").v)) {
                     longpoll = true;
+                    longpollid = std::get<std::string>(p.at("longpollid").v);
                 }
             }
 
@@ -855,6 +857,40 @@ std::string RpcService::handle(const std::string& body){
             if (mode == "submit") {
                 return err("use submitblock RPC for block submission");
             }
+
+            // ================================================================
+            // INVARIANT D FIX: BIP22 LONGPOLL IMPLEMENTATION
+            // If longpollid is provided and matches current tip, wait for tip change.
+            // This is LEVEL-TRIGGERED: we poll until state changes.
+            // Solo miners get immediate notification when tip changes.
+            // ================================================================
+            if (longpoll && !longpollid.empty()) {
+                // longpollid format from our response: "<hash><height>" (64 hex chars + digits)
+                // Extract the hash (first 64 characters if present)
+                std::string expected_hash = longpollid;
+                if (longpollid.size() > 64) {
+                    expected_hash = longpollid.substr(0, 64);
+                }
+
+                // Wait for tip to change (max 30 seconds with 100ms polling)
+                // This is level-triggered: check tip, if same as expected, wait and retry
+                constexpr int LONGPOLL_TIMEOUT_MS = 30000;
+                constexpr int LONGPOLL_POLL_MS = 100;
+                int waited_ms = 0;
+
+                while (waited_ms < LONGPOLL_TIMEOUT_MS) {
+                    auto current_tip_hash = to_hex(chain_.tip_hash());
+                    if (current_tip_hash != expected_hash) {
+                        // Tip changed! Return new template immediately
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(LONGPOLL_POLL_MS));
+                    waited_ms += LONGPOLL_POLL_MS;
+                }
+                // Proceed to return new template (either tip changed or timeout)
+            }
+
+            auto tip = chain_.tip();
 
             // Compute the next block's bits (retarget-aware)
             uint32_t next_bits = tip.bits;

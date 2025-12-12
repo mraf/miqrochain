@@ -486,6 +486,50 @@ void StratumServer::work_loop() {
             }
         }
 
+        // ====================================================================
+        // DEBUG-ONLY INVARIANT ASSERTION: "miner idle while tip changed"
+        // If level-triggered check is working, this should never trigger.
+        // ====================================================================
+        #ifndef NDEBUG
+        {
+            static int64_t s_last_assert_ms = 0;
+            if (now - s_last_assert_ms > 1000) {  // Check every 1s
+                s_last_assert_ms = now;
+                auto current_tip = chain_.tip_hash();
+                std::string current_parent;
+                {
+                    std::lock_guard<std::mutex> lock(jobs_mutex_);
+                    if (!current_job_id_.empty()) {
+                        auto it = jobs_.find(current_job_id_);
+                        if (it != jobs_.end()) {
+                            // Convert prev_hash to hex for comparison
+                            std::string hex;
+                            for (uint8_t b : it->second.prev_hash) {
+                                static const char* h = "0123456789abcdef";
+                                hex.push_back(h[b >> 4]);
+                                hex.push_back(h[b & 0xf]);
+                            }
+                            current_parent = hex;
+                        }
+                    }
+                }
+                std::string tip_hex;
+                for (uint8_t b : current_tip) {
+                    static const char* h = "0123456789abcdef";
+                    tip_hex.push_back(h[b >> 4]);
+                    tip_hex.push_back(h[b & 0xf]);
+                }
+                if (!current_tip.empty() && !current_parent.empty() &&
+                    tip_hex != current_parent) {
+                    log_warn("INVARIANT: miner job parent mismatch! tip=" +
+                             tip_hex.substr(0, 16) + " job_parent=" +
+                             current_parent.substr(0, 16) +
+                             " - level-triggered check should have fixed this");
+                }
+            }
+        }
+        #endif
+
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
