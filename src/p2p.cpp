@@ -5514,6 +5514,67 @@ void P2P::loop(){
           }
 
           // ========================================================================
+          // NUCLEAR SAFETY NET: Unconditional sync recovery every 500ms
+          // This is the ultimate failsafe - if sync is behind and we have peers,
+          // FORCE re-enable and refill ALL peers regardless of their state.
+          // This ensures sync can NEVER get permanently stuck.
+          // ========================================================================
+          {
+              static int64_t last_nuclear_check_ms = 0;
+              const int64_t tnow = now_ms();
+              const uint64_t chain_height = chain_.height();
+              const uint64_t max_peer = g_max_known_peer_tip.load();
+              const uint64_t header_height = chain_.best_header_height();
+              const uint64_t target_height = std::max(header_height, max_peer);
+
+              // Run every 500ms when we're behind
+              if ((tnow - last_nuclear_check_ms > 500) &&
+                  !peers_.empty() &&
+                  target_height > 0 &&
+                  chain_height < target_height) {
+
+                  last_nuclear_check_ms = tnow;
+
+                  // Check if ANY peer is actively making progress
+                  bool any_active = false;
+                  size_t total_inflight = 0;
+                  for (const auto& kvp : peers_) {
+                      if (kvp.second.syncing && kvp.second.inflight_index > 0) {
+                          any_active = true;
+                      }
+                      total_inflight += kvp.second.inflight_index;
+                  }
+
+                  // Also check global requested indices
+                  size_t global_inflight = 0;
+                  {
+                      InflightLock lk(g_inflight_lock);
+                      global_inflight = g_global_requested_indices.size();
+                  }
+
+                  // If nothing in flight and we're behind, FORCE recovery
+                  if (!any_active && total_inflight == 0 && global_inflight == 0) {
+                      log_warn("P2P: NUCLEAR RECOVERY - no active sync, forcing all peers to restart");
+                      for (auto& kvp : peers_) {
+                          if (!kvp.second.verack_ok) continue;
+                          Sock s = kvp.first;
+                          // Force re-enable EVERYTHING
+                          g_peer_index_capable[s] = true;
+                          g_index_timeouts[s] = 0;
+                          kvp.second.syncing = true;
+                          kvp.second.inflight_index = 0;
+                          kvp.second.next_index = chain_height + 1;
+                          // Clear per-peer tracking
+                          g_inflight_index_ts.erase(s);
+                          g_inflight_index_order.erase(s);
+                          // Fill pipeline
+                          fill_index_pipeline(kvp.second);
+                      }
+                  }
+              }
+          }
+
+          // ========================================================================
           // CRITICAL FIX: Orphaned Index Cleanup
           // Indices can get "orphaned" in g_global_requested_indices when:
           // 1. Peer disconnects without cleanup
@@ -7414,13 +7475,29 @@ void P2P::loop(){
                                 if (ps.inflight_index > 0) {
                                     ps.inflight_index--;
                                 }
+
+                                // CRITICAL FIX: Reset timeout counter AND re-enable the peer!
+                                // The peer just successfully delivered a block, proving it works.
+                                // Previously we reset timeout but left peer demoted, causing deadlock!
                                 g_index_timeouts[(Sock)s] = 0;
+                                if (!g_peer_index_capable[(Sock)s]) {
+                                    g_peer_index_capable[(Sock)s] = true;
+                                    ps.syncing = true;
+                                    ps.next_index = chain_.height() + 1;
+                                }
 
                                 // Refill pipeline immediately
                                 fill_index_pipeline(ps);
                             } else {
                                 // SAFETY NET: Even if inflight_index was 0, try to refill pipeline
                                 // This handles edge cases where tracking got out of sync
+                                // CRITICAL FIX: Also re-enable peer - they just delivered a block!
+                                g_index_timeouts[(Sock)s] = 0;
+                                if (!g_peer_index_capable[(Sock)s]) {
+                                    g_peer_index_capable[(Sock)s] = true;
+                                    ps.syncing = true;
+                                    ps.next_index = chain_.height() + 1;
+                                }
                                 fill_index_pipeline(ps);
                             }
 
