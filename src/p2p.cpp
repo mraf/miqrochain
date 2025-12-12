@@ -3529,21 +3529,23 @@ void P2P::fill_index_pipeline(PeerState& ps){
     uint64_t max_index = current_height + max_ahead;
 
     // Determine the limit for block requests from this peer
-    // CRITICAL FIX: During IBD, DON'T cap at header height!
-    // Headers and blocks download in parallel - blocks waiting in orphan pool is OK.
-    // Only cap at header height AFTER headers phase is complete.
+    // CRITICAL FIX: Use the MAXIMUM of header height and peer_tip_height!
+    // Headers reveal the true chain height even if peer announced a lower tip.
     const uint64_t best_hdr = chain_.best_header_height();
     uint64_t peer_limit;
 
-    if (g_logged_headers_done && best_hdr > 0) {
-        // After headers done, use header height as definitive limit
+    if (best_hdr > 0) {
+        // Headers tell us the true chain height - use it as primary limit
         peer_limit = best_hdr;
+        // But if peer announced higher (speculative), use that during early IBD
+        if (!g_logged_headers_done && ps.peer_tip_height > peer_limit) {
+            peer_limit = ps.peer_tip_height;
+        }
     } else if (ps.peer_tip_height > 0) {
-        // During IBD: use peer's announced tip - let blocks download ahead of headers!
-        // This is the KEY fix - blocks will wait in orphan pool until headers catch up
+        // No headers yet - use peer's announced tip
         peer_limit = ps.peer_tip_height;
     } else {
-        // No peer tip - use aggressive window for fast IBD
+        // No peer tip and no headers - use aggressive window for fast IBD
         peer_limit = current_height + max_ahead;
     }
 

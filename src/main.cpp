@@ -1910,6 +1910,11 @@ private:
                             network_height = peer.peer_tip;
                         }
                     }
+                    // CRITICAL FIX: Use header height if higher than peer tips!
+                    // Peers may announce low heights but headers reveal true chain height
+                    if (cached.best_header_height > network_height) {
+                        network_height = cached.best_header_height;
+                    }
                     if (network_height > 0) {
                         sync_network_height_ = network_height;
                     }
@@ -1931,6 +1936,10 @@ private:
                     if (peer.verack_ok && peer.peer_tip > 0 && peer.peer_tip > network_height) {
                         network_height = peer.peer_tip;
                     }
+                }
+                // CRITICAL FIX: Use header height if higher than peer tips!
+                if (cached.best_header_height > network_height) {
+                    network_height = cached.best_header_height;
                 }
                 if (network_height > 0) {
                     update_sync_stats(cached.height, network_height, static_cast<uint64_t>(cached.time));
