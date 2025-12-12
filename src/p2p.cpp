@@ -5469,46 +5469,62 @@ void P2P::loop(){
           // CRITICAL FIX: Gap Detection and Re-request
           // If we have blocks at height N+2, N+3 but not N+1, detect and re-request N+1
           // This handles cases where a block request was lost or peer disconnected
-          // Run every 3 seconds
+          // Run every 2 seconds for faster recovery
           // ========================================================================
           {
               static int64_t last_gap_check_ms = 0;
+              static int64_t last_gap_request_ms = 0;
+              static uint64_t last_gap_index = 0;
+              static int gap_request_count = 0;
               const int64_t tnow = now_ms();
-              if (tnow - last_gap_check_ms > 3000) {  // Every 3 seconds
+
+              if (tnow - last_gap_check_ms > 2000) {  // Every 2 seconds
                   last_gap_check_ms = tnow;
 
                   const uint64_t current_height = chain_.height();
                   const uint64_t next_needed = current_height + 1;
+                  const uint64_t header_height = chain_.best_header_height();
 
-                  // Check if we're missing the next block but have later blocks
-                  if (pending_blocks_.find(next_needed) == pending_blocks_.end()) {
-                      // Check if we have any blocks after the gap
-                      bool have_later_blocks = false;
-                      for (const auto& pb : pending_blocks_) {
-                          if (pb.first > next_needed) {
-                              have_later_blocks = true;
-                              break;
+                  // Only check for gaps if we're behind header tip
+                  if (header_height > 0 && current_height < header_height) {
+                      // Check if we're missing the next block
+                      bool have_next = pending_blocks_.find(next_needed) != pending_blocks_.end();
+
+                      if (!have_next) {
+                          // Reset counter if gap index changed
+                          if (next_needed != last_gap_index) {
+                              last_gap_index = next_needed;
+                              gap_request_count = 0;
                           }
-                      }
 
-                      if (have_later_blocks) {
-                          // We have a gap - check if the missing index is being requested
-                          bool is_requested = false;
+                          // AGGRESSIVE: Clear global tracking and force re-request
+                          // After 3 failed attempts (6 seconds), request from ALL peers
+                          gap_request_count++;
+
+                          // Clear from global tracking to allow fresh request
                           {
                               InflightLock lk(g_inflight_lock);
-                              is_requested = g_global_requested_indices.count(next_needed) > 0;
+                              g_global_requested_indices.erase(next_needed);
                           }
 
-                          if (!is_requested) {
-                              log_warn("P2P: Gap detected at index " + std::to_string(next_needed) +
-                                       " - forcing re-request");
+                          // Also clear from all peer tracking
+                          for (auto& kv : g_inflight_index_ts) {
+                              kv.second.erase(next_needed);
+                          }
+                          for (auto& kv : g_inflight_index_order) {
+                              auto& dq = kv.second;
+                              dq.erase(std::remove(dq.begin(), dq.end(), next_needed), dq.end());
+                          }
 
-                              // Find best peer and request the missing block
+                          if (gap_request_count <= 3) {
+                              // First 3 attempts: request from best peer
+                              log_warn("P2P: Gap at index " + std::to_string(next_needed) +
+                                       " (attempt " + std::to_string(gap_request_count) + "/3)");
+
                               Sock target = MIQ_INVALID_SOCK;
                               double best_score = -1.0;
                               for (auto& kvp : peers_) {
                                   if (!kvp.second.verack_ok) continue;
-                                  if (!peer_is_index_capable(kvp.first)) continue;
                                   if (kvp.second.health_score > best_score) {
                                       best_score = kvp.second.health_score;
                                       target = kvp.first;
@@ -5533,6 +5549,27 @@ void P2P::loop(){
                                       }
                                   }
                               }
+                          } else {
+                              // After 3 attempts: BROADCAST to ALL peers
+                              log_warn("P2P: Gap at index " + std::to_string(next_needed) +
+                                       " - broadcasting to ALL peers!");
+
+                              int sent_count = 0;
+                              for (auto& kvp : peers_) {
+                                  if (!kvp.second.verack_ok) continue;
+
+                                  uint8_t p8[8];
+                                  for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
+                                  auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
+                                  if (send_or_close(kvp.first, msg)) {
+                                      sent_count++;
+                                  }
+                              }
+                              log_info("P2P: Broadcast getbi(" + std::to_string(next_needed) +
+                                       ") to " + std::to_string(sent_count) + " peers");
+
+                              // Reset counter to avoid spamming
+                              gap_request_count = 0;
                           }
                       }
                   }

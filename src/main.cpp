@@ -1423,9 +1423,41 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
         return false;
     }
 
-    // For seed nodes (solo or with peers), allow serving blocks even with stale tips
-    // This is necessary to bootstrap the chain and serve historical blocks to peers
+    // For seed nodes, we need special handling:
+    // - MUST still sync if we're behind our header tip
+    // - Only allow "synced" status if we're caught up with our own headers
+    // - This prevents showing "RUNNING" when seed is still syncing
     if (we_are_seed) {
+        uint64_t block_height = h;
+        uint64_t header_height = chain.best_header_height();
+
+        // CRITICAL FIX: Seed nodes MUST sync to their header tip before declaring synced
+        // Previous bug: seed nodes always returned true, causing premature "RUNNING" status
+        if (header_height > 0 && block_height < header_height) {
+            // Still downloading blocks - NOT synced yet
+            why_out = "seed syncing blocks (" + std::to_string(block_height) +
+                     "/" + std::to_string(header_height) + ")";
+            return false;
+        }
+
+        // Check tip freshness for seed nodes too
+        auto tip = chain.tip();
+        uint64_t tsec = hdr_time(tip);
+        uint64_t now_time = (uint64_t)std::time(nullptr);
+        uint64_t tip_age = (now_time > tsec) ? (now_time - tsec) : 0;
+
+        // Allow genesis seeds to proceed (bootstrapping new chain)
+        if (h == 0 && seed_solo) {
+            why_out.clear();
+            return true;
+        }
+
+        // Seed must have reasonably fresh tip (< 10 min) unless it's genesis
+        if (tip_age > 10 * 60 && h > 0) {
+            why_out = "seed tip too old (" + std::to_string(tip_age / 60) + "m)";
+            return false;
+        }
+
         why_out.clear();
         return true;
     }
@@ -3215,28 +3247,16 @@ private:
         if (rows < 38) rows = 38;
 
         // Check if sync is complete to transition from Splash to Main
-        // Transition when either:
+        // CRITICAL: Only transition when BOTH conditions are met:
         // 1. ibd_done_ is true AND node state is Running (normal completion)
-        // 2. OR blocks are 100% synced (ibd_cur_ >= ibd_target_) - handles peer disconnect case
+        // 2. AND we're caught up with header height (not just peer-reported height)
         bool sync_complete = ibd_done_ && (nstate_ == NodeState::Running);
 
-        // FIXED: Also transition when blocks are 100% synced even if ibd_done_ isn't set
-        // This handles the case where peers disconnect after all blocks are downloaded,
-        // which prevents compute_sync_gate() from returning true and leaves us stuck
-        // NOTE: ibd_target_ > 0 ensures we have a known network height before transitioning
-        if (!sync_complete && ibd_target_ > 0 && ibd_cur_ >= ibd_target_) {
-            // We've downloaded all known blocks - treat as successful sync
-            // Set the internal state to match so the main screen shows correct info
-            if (!ibd_done_) {
-                ibd_done_ = true;
-                // PERFORMANCE: Mark IBD complete to enable full durability (fsync on every block)
-                miq::mark_ibd_complete();
-            }
-            if (nstate_ != NodeState::Running) {
-                nstate_ = NodeState::Running;
-            }
-            sync_complete = true;
-        }
+        // REMOVED: The old fallback logic was causing premature transitions
+        // when ibd_cur_ >= ibd_target_ but we weren't actually synced.
+        // The ibd_target_ could be stale or from a peer with incomplete data.
+        // Now we ONLY transition when compute_sync_gate() returns true,
+        // which properly checks header height vs block height.
 
         if (sync_complete && view_mode_ == ViewMode::Splash) {
             // FIXED: Delay transition for 20+ frames (~2 seconds) to show "100%" completion
