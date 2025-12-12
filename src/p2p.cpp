@@ -78,10 +78,10 @@ namespace miq {
 #ifndef MIQ_SEED_MODE_OUTBOUND_TARGET
 #define MIQ_SEED_MODE_OUTBOUND_TARGET 4  // Match constants.h
 #endif
-// CRITICAL: Use fast fallback - if headers stall for 3s, switch to index sync
-// This was 5 minutes which caused massive delays!
+// CRITICAL: Use FAST fallback - if headers stall for 1s, switch to index sync
+// Headers should arrive almost instantly for small chains
 #ifndef MIQ_IBD_FALLBACK_AFTER_MS
-#define MIQ_IBD_FALLBACK_AFTER_MS (3 * 1000)  // 3 seconds - matches constants.h
+#define MIQ_IBD_FALLBACK_AFTER_MS (1 * 1000)  // 1 second - aggressive fallback
 #endif
 // ============================================================================
 // PERFORMANCE OPTIMIZATION: P2P Trace disabled by default
@@ -243,13 +243,13 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
 #endif
 
 #ifndef MIQ_INDEX_PIPELINE
-#define MIQ_INDEX_PIPELINE 128  // PERFORMANCE: Increased from 64 for faster block download
+#define MIQ_INDEX_PIPELINE 512  // AGGRESSIVE: Maximum parallel block requests
 #endif
 
 // CRITICAL: Header pipeline size - how many header requests in flight
-// Increased from 1 to 4 for faster header sync during IBD
+// For small chains, headers should download almost instantly
 #ifndef MIQ_HDR_PIPELINE
-#define MIQ_HDR_PIPELINE 4
+#define MIQ_HDR_PIPELINE 16  // Allow many header batches in flight
 #endif
 #ifndef MIQ_SYNC_SEQUENTIAL_DEFAULT
 #define MIQ_SYNC_SEQUENTIAL_DEFAULT 0
@@ -1491,28 +1491,31 @@ static inline void update_peer_reputation(miq::PeerState& ps) {
 
 // Calculate adaptive batch size based on peer reputation and network conditions
 static inline uint32_t calculate_adaptive_batch_size(const miq::PeerState& ps) {
-    // PERFORMANCE FIX: Increased batch sizes for faster block download
-    // Excellent peers (0.9+): 64 blocks
-    // Good peers (0.7-0.9): 48 blocks
-    // Average peers (0.5-0.7): 32 blocks
-    // Poor peers (<0.5): 16 blocks
+    // AGGRESSIVE: Much larger batch sizes for FAST sync
+    // For small chains (5-10k blocks), sync should be nearly instant
 
     double rep = ps.reputation_score;
     uint32_t batch_size;
 
-    if (rep >= 0.9) {
-        batch_size = 64;
-    } else if (rep >= 0.7) {
-        batch_size = 48;
-    } else if (rep >= 0.5) {
-        batch_size = 32;
+    // During IBD: MAXIMUM AGGRESSION - request as many blocks as possible
+    if (!g_logged_headers_done) {
+        // IBD mode: huge batches for fast sync
+        if (rep >= 0.5) {
+            batch_size = 256;  // Request 256 blocks at once during IBD
+        } else {
+            batch_size = 128;  // Even poor peers get large batches during IBD
+        }
     } else {
-        batch_size = 16;
-    }
-
-    // During IBD (before headers done), allow even larger batches for faster sync
-    if (!g_logged_headers_done && rep >= 0.8) {
-        batch_size = std::min(128u, batch_size * 2);
+        // Post-IBD: normal operation with reasonable batches
+        if (rep >= 0.9) {
+            batch_size = 64;
+        } else if (rep >= 0.7) {
+            batch_size = 48;
+        } else if (rep >= 0.5) {
+            batch_size = 32;
+        } else {
+            batch_size = 16;
+        }
     }
 
     return batch_size;
@@ -6931,8 +6934,9 @@ void P2P::loop(){
                             std::vector<uint8_t> stop(32, 0);
                             auto pl2 = build_getheaders_payload(locator, stop);
                             auto m2  = encode_msg("getheaders", pl2);
+                            // AGGRESSIVE: During IBD, don't rate-limit headers!
+                            // For small chains this should be instant
                             while (can_accept_hdr_batch(ps, now_ms()) &&
-                                   check_rate(ps, "hdr", 1.0, now_ms()) &&
                                    pushed < MIQ_HDR_PIPELINE) {
                                 ps.sent_getheaders = true;
                                 (void)send_or_close(s, m2);
