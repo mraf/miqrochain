@@ -1279,7 +1279,16 @@ static void remove_file_scope_inflight(const std::string& hash) {
 
 static std::unordered_map<Sock,int> g_index_timeouts;
 static inline void mark_index_timeout(Sock s){
-    int &c = g_index_timeouts[s]; if (++c >= 3) g_peer_index_capable[s] = false;
+    int &c = g_index_timeouts[s];
+    // CRITICAL FIX: 3 timeouts was way too aggressive!
+    // With 512 in-flight requests, normal network latency can easily cause 3 timeouts
+    // This disabled peers and caused stop-start sync behavior
+    // During IBD: Allow 50 timeouts before disabling (pipeline is 512)
+    // After IBD: Allow 10 timeouts (pipeline is smaller)
+    int threshold = !g_logged_headers_done ? 50 : 10;
+    if (++c >= threshold) {
+        g_peer_index_capable[s] = false;
+    }
 }
 
 // ---- NEW: pre-verack safe allow-list & counters ----------------------------
@@ -5288,7 +5297,10 @@ void P2P::loop(){
 
           for (auto &kvp : peers_){
             Sock s = kvp.first;
-            if (g_index_timeouts[s] >= 3 && g_peer_index_capable[s]) {
+            // CRITICAL FIX: Use same threshold as mark_index_timeout()
+            // 3 was way too aggressive - caused stop-start sync behavior
+            int threshold = !g_logged_headers_done ? 50 : 10;
+            if (g_index_timeouts[s] >= threshold && g_peer_index_capable[s]) {
               // demote
               g_peer_index_capable[s] = false;
               auto &ps = kvp.second;
@@ -5369,12 +5381,16 @@ void P2P::loop(){
 
           // CRITICAL FIX: Stall recovery - if no progress for N seconds, force re-enable ALL peers
           // This handles cases where all peers got demoted or stuck in invalid states
-          // Reduced from 30s to 10s for ALL platforms - faster recovery is always better
+          // Reduced from 30s to 5s for AGGRESSIVE recovery
           {
               const int64_t tnow = now_ms();
-              const int64_t STALL_RECOVERY_MS = 10000;  // 10 seconds - aggressive but necessary
+              const int64_t STALL_RECOVERY_MS = 5000;  // 5 seconds - very aggressive
               const uint64_t chain_height = chain_.height();
-              const uint64_t target_height = chain_.best_header_height();
+              // CRITICAL FIX: Use MAX of header height and known peer tip
+              // During IBD, header height may be 0 or incomplete
+              const uint64_t header_height = chain_.best_header_height();
+              const uint64_t max_peer = g_max_known_peer_tip.load();
+              const uint64_t target_height = std::max(header_height, max_peer);
 
               // Check if we're stalled: no progress, not fully synced, have peers
               if (!peers_.empty() &&
@@ -5382,7 +5398,7 @@ void P2P::loop(){
                   chain_height < target_height &&
                   (tnow - g_last_progress_ms) > STALL_RECOVERY_MS) {
 
-                  log_warn("P2P: Sync stalled for 30s at height " + std::to_string(chain_height) +
+                  log_warn("P2P: Sync stalled for " + std::to_string(STALL_RECOVERY_MS/1000) + "s at height " + std::to_string(chain_height) +
                            "/" + std::to_string(target_height) + " - forcing recovery");
 
                   // Force re-enable ALL peers for sync
