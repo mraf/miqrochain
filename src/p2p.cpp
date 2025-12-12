@@ -5732,9 +5732,11 @@ void P2P::loop(){
                     for (auto &kvp : peers_) {
                         auto &pps = kvp.second;
                         if (!pps.verack_ok) continue;
-                        if (!peer_is_index_capable((Sock)pps.sock)) continue;
                         if (pps.syncing && pps.inflight_index > 0) continue; // Already syncing by index
 
+                        // CRITICAL: Mark peer as index-capable for fallback activation
+                        // This is needed because proper headers-first defaults to NOT capable
+                        g_peer_index_capable[(Sock)pps.sock] = true;
                         pps.syncing = true;
                         pps.inflight_index = 0;
                         pps.next_index = chain_.height() + 1;
@@ -7744,15 +7746,14 @@ void P2P::loop(){
                             if (++zero_count >= MIQ_HEADERS_EMPTY_LIMIT) {
                                 zero_count = 0;
                                 g_hdr_flip[s] = !g_hdr_flip[s]; // try the other orientation next
-                                // If peer supports index-by-height, kick that pipeline too.
-                                if (peer_is_index_capable(s)) {
-                                    ps.syncing = true;
-                                    ps.inflight_index = 0;
-                                    ps.next_index = chain_.height() + 1;
-                                    fill_index_pipeline(ps);
-                                    log_warn("P2P: headers made no progress repeatedly from " + ps.ip +
-                                             " → enabling index-by-height fallback");
-                                }
+                                // CRITICAL: Mark peer as index-capable and enable fallback
+                                g_peer_index_capable[(Sock)s] = true;
+                                ps.syncing = true;
+                                ps.inflight_index = 0;
+                                ps.next_index = chain_.height() + 1;
+                                fill_index_pipeline(ps);
+                                log_warn("P2P: headers made no progress repeatedly from " + ps.ip +
+                                         " → enabling index-by-height fallback");
                             }
                         } else {
                             g_zero_hdr_batches[s] = 0;
@@ -7783,6 +7784,8 @@ void P2P::loop(){
                                 if (zero_count >= MIQ_HEADERS_EMPTY_LIMIT) {
                                     log_warn("P2P: no headers progress after 3 full batches; falling back to by-index sync");
                                     ps.banscore = std::min(ps.banscore + 1, MIQ_P2P_MAX_BANSCORE);
+                                    // CRITICAL: Mark peer as index-capable for fallback to work
+                                    g_peer_index_capable[(Sock)s] = true;
                                     ps.syncing = true;
                                     ps.inflight_index = 0;
                                     ps.next_index = chain_.height() + 1;
@@ -7811,10 +7814,12 @@ void P2P::loop(){
                                 // If we are in headers and have not advanced for a long time overall, fallback globally.
                                 if (!g_logged_headers_done && (now_ms() - g_last_progress_ms) > (int64_t)MIQ_IBD_FALLBACK_AFTER_MS) {
                                     log_warn("[IBD] headers overall progress timeout; switching to index fallback");
+                                    // CRITICAL: Must mark peer as index-capable BEFORE calling fill_index_pipeline
+                                    // Otherwise fill_index_pipeline returns early and fallback doesn't work!
+                                    g_peer_index_capable[(Sock)ps.sock] = true;
                                     ps.syncing = true;
                                     ps.inflight_index = 0;
                                     ps.next_index = chain_.height() + 1;
-                                    // CRITICAL FIX: Fill the entire pipeline, not just one request
                                     fill_index_pipeline(ps);
                                 }
                                 g_zero_hdr_batches[s] = 0;
@@ -8107,10 +8112,11 @@ void P2P::loop(){
                     // fall back to by-index sync for this peer.
                     ps.inflight_hdr_batches = 0;
                     ps.sent_getheaders = false;
+                    // CRITICAL: Mark peer as index-capable for fallback to work
+                    g_peer_index_capable[(Sock)s] = true;
                     ps.syncing = true;
                     ps.inflight_index = 0;
                     ps.next_index = chain_.height() + 1;
-                    // CRITICAL FIX: Fill the entire pipeline, not just one request
                     fill_index_pipeline(ps);
                 }
             }
