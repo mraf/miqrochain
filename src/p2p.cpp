@@ -71,8 +71,12 @@ namespace miq {
 #ifndef MIQ_SEED_MODE_ENV
 #define MIQ_SEED_MODE_ENV "MIQ_IS_SEED"
 #endif
+// CRITICAL FIX: Removed MIQ_SEED_MODE_OUTBOUND_TARGET override here
+// It was set to 1, overriding constants.h value of 4, causing seed nodes
+// to only have 1 outbound connection and stalling when that peer was slow.
+// Now using constants.h value (4) for more reliable seed node syncing.
 #ifndef MIQ_SEED_MODE_OUTBOUND_TARGET
-#define MIQ_SEED_MODE_OUTBOUND_TARGET 1
+#define MIQ_SEED_MODE_OUTBOUND_TARGET 4  // Match constants.h
 #endif
 #ifndef MIQ_IBD_FALLBACK_AFTER_MS
 #define MIQ_IBD_FALLBACK_AFTER_MS (5 * 60 * 1000)
@@ -5302,11 +5306,17 @@ void P2P::loop(){
               }
           }
 
-          // CRITICAL FIX: Stall recovery - if no progress for 30s and not fully synced, force re-enable ALL peers
+          // CRITICAL FIX: Stall recovery - if no progress for N seconds, force re-enable ALL peers
           // This handles cases where all peers got demoted or stuck in invalid states
+          // WINDOWS FIX: Use shorter timeout on Windows where syscall overhead is higher
           {
               const int64_t tnow = now_ms();
+#ifdef _WIN32
+              // Windows: More aggressive 15s stall recovery (antivirus/Defender delays)
+              const int64_t STALL_RECOVERY_MS = 15000;
+#else
               const int64_t STALL_RECOVERY_MS = 30000;  // 30 seconds no progress = stalled
+#endif
               const uint64_t chain_height = chain_.height();
               const uint64_t target_height = chain_.best_header_height();
 
