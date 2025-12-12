@@ -5468,9 +5468,11 @@ void P2P::loop(){
 
                   // INVARIANT ENFORCEMENT: If behind with capable peers but insufficient requests
                   // This is the CORE liveness fix - unconditional, no time gates
+                  // syncing_peers is used to verify invariant: if behind, at least one peer should be syncing
                   const size_t min_inflight_threshold = std::max((size_t)1, capable_peers);
+                  const bool sync_invariant_violated = (syncing_peers == 0 && capable_peers > 0);
 
-                  if (capable_peers > 0 && total_inflight < min_inflight_threshold) {
+                  if (capable_peers > 0 && (total_inflight < min_inflight_threshold || sync_invariant_violated)) {
                       // VIOLATION: We're behind but not requesting enough
                       // Force re-enable ALL peers and fill their pipelines
                       for (auto& kvp : peers_) {
@@ -9197,6 +9199,84 @@ void P2P::loop(){
                 }
                 for (auto s : sockets) {
                     (void)send_or_close(s, m);
+                }
+            }
+        }
+
+        // ========================================================================
+        // BUG 11 FIX: LEVEL-TRIGGERED RELAY COMPLETENESS INVARIANT (P0)
+        // This is the CRITICAL structural fix for deterministic sub-second relay.
+        //
+        // INVARIANT: For every connected peer, if that peer does not have a
+        // validated block at our tip height, relay MUST be attempted NOW.
+        //
+        // This check is:
+        // - Level-triggered (runs EVERY loop iteration)
+        // - Unconditional (no time gates, no sync state dependencies)
+        // - Independent of: timeouts, stall recovery, peer demotion, inflight counters
+        //
+        // Without this, a valid execution exists where:
+        // 1. Block is validated
+        // 2. Relay attempt is skipped (peer joins after, network issue, etc.)
+        // 3. System waits for timeout/stall recovery instead of proactive relay
+        // This violates deterministic sub-second relay requirements.
+        // ========================================================================
+        {
+            const uint64_t our_height = chain_.height();
+            if (our_height > 0) {
+                // Get our current tip hash for relay
+                const auto our_tip_hash = chain_.tip_hash();
+                if (!our_tip_hash.empty()) {
+                    // Track recently relayed to avoid flooding (level-triggered but bounded)
+                    // This map is local to the loop, reset each iteration for simplicity
+                    static std::unordered_map<std::string, int64_t> s_relay_completeness_last_ms;
+                    const int64_t tnow = now_ms();
+                    constexpr int64_t RELAY_COMPLETENESS_INTERVAL_MS = 100;  // Max relay attempt per peer every 100ms
+
+                    for (auto& kv : peers_) {
+                        PeerState& ps = kv.second;
+                        if (!ps.verack_ok) continue;
+
+                        // P0 CHECK: Does peer lack our tip?
+                        // Use peer_tip_height as proxy for block knowledge
+                        // If peer_tip_height < our_height, they need our tip
+                        if (ps.peer_tip_height < our_height) {
+                            // Rate limit per-peer to avoid flooding
+                            const std::string peer_key = ps.ip + ":" + std::to_string(our_height);
+                            auto it = s_relay_completeness_last_ms.find(peer_key);
+                            if (it == s_relay_completeness_last_ms.end() ||
+                                (tnow - it->second) >= RELAY_COMPLETENESS_INTERVAL_MS) {
+
+                                s_relay_completeness_last_ms[peer_key] = tnow;
+
+                                // LEVEL-TRIGGERED RELAY: Send inv for our tip
+                                // This ensures relay happens even if edge-triggered paths failed
+                                auto inv_msg = encode_msg("invb", our_tip_hash);
+                                if (!inv_msg.empty()) {
+                                    // Non-blocking send - skip slow peers (P3)
+                                    if (ps.send_queue_bytes < PeerState::MAX_SEND_QUEUE_BYTES / 2) {
+                                        (void)send_or_close(kv.first, inv_msg);
+                                        ps.blocks_sent++;
+                                    }
+                                    // If peer's send queue is backed up, skip but don't disconnect (P3)
+                                }
+                            }
+                        }
+                    }
+
+                    // Periodic cleanup of rate limit map (every 10 seconds)
+                    static int64_t s_last_relay_map_cleanup_ms = 0;
+                    if (tnow - s_last_relay_map_cleanup_ms > 10000) {
+                        s_last_relay_map_cleanup_ms = tnow;
+                        for (auto it = s_relay_completeness_last_ms.begin();
+                             it != s_relay_completeness_last_ms.end(); ) {
+                            if (tnow - it->second > 60000) {
+                                it = s_relay_completeness_last_ms.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                    }
                 }
             }
         }
