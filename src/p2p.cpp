@@ -5401,12 +5401,12 @@ void P2P::loop(){
           // 2. Race condition between timeout and disconnect
           // 3. Index removed from peer tracking but not global tracking
           // This causes sync to stall because fill_index_pipeline skips these indices
-          // Run every 5 seconds to clean up orphaned indices
+          // Run every 1 second (was 5s) for faster recovery from stalls!
           // ========================================================================
           {
               static int64_t last_orphan_cleanup_ms = 0;
               const int64_t tnow = now_ms();
-              if (tnow - last_orphan_cleanup_ms > 5000) {  // Every 5 seconds
+              if (tnow - last_orphan_cleanup_ms > 1000) {  // Every 1 second - FAST RECOVERY
                   last_orphan_cleanup_ms = tnow;
 
                   // Build set of ALL indices currently tracked by ANY peer
@@ -5476,7 +5476,7 @@ void P2P::loop(){
           // CRITICAL FIX: Gap Detection and Re-request
           // If we have blocks at height N+2, N+3 but not N+1, detect and re-request N+1
           // This handles cases where a block request was lost or peer disconnected
-          // Run every 2 seconds for faster recovery
+          // Run every 500ms (was 2s) for FAST recovery from stalls!
           // ========================================================================
           {
               static int64_t last_gap_check_ms = 0;
@@ -5484,7 +5484,7 @@ void P2P::loop(){
               static int gap_request_count = 0;
               const int64_t tnow = now_ms();
 
-              if (tnow - last_gap_check_ms > 2000) {  // Every 2 seconds
+              if (tnow - last_gap_check_ms > 500) {  // Every 500ms - FAST GAP RECOVERY
                   last_gap_check_ms = tnow;
 
                   const uint64_t current_height = chain_.height();
@@ -7244,6 +7244,12 @@ void P2P::loop(){
                                     if (dq_it != dq_idx.end()) {
                                         dq_idx.erase(dq_it);
                                     }
+                                    // CRITICAL FIX: Also clear from global tracking!
+                                    // This was missing - indices stayed in global forever!
+                                    {
+                                        InflightLock lk(g_inflight_lock);
+                                        g_global_requested_indices.erase(delivered_idx);
+                                    }
                                     cleared = true;
                                 }
 
@@ -7253,8 +7259,10 @@ void P2P::loop(){
                                     uint64_t oldest = g_inflight_index_order[(Sock)s].front();
                                     g_inflight_index_order[(Sock)s].pop_front();
                                     g_inflight_index_ts[(Sock)s].erase(oldest);
-                                    // Also clear from global if it's now in chain
-                                    if (oldest <= new_height) {
+                                    // CRITICAL FIX: ALWAYS clear from global when clearing from peer
+                                    // The old code only cleared if oldest <= new_height, which fails for orphans!
+                                    // If we received a block, we don't need this index in global anymore.
+                                    {
                                         InflightLock lk(g_inflight_lock);
                                         g_global_requested_indices.erase(oldest);
                                     }
