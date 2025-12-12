@@ -5440,18 +5440,67 @@ void P2P::loop(){
               }
           }
 
-          // CRITICAL FIX: Refill pipelines for ALL syncing peers after timeout/demotion handling
-          // This handles multiple cases:
-          // 1. Timeout handling freed slots (inflight_index--) but didn't refill
-          // 2. Peers marked syncing but with inflight_index == 0 (idle)
-          // 3. Activation loops may not trigger due to various conditions
-          // 4. CRITICAL: If ANY peer was demoted, remaining peers MUST refill to take over!
-          // Without this, peers stall until a block arrives or specific triggers fire
-          // NOTE: This MUST run AFTER demotion check, not before!
+          // ========================================================================
+          // LIVENESS INVARIANT A: DEMAND-DRIVEN SYNC (UNCONDITIONAL LEVEL CHECK)
+          // If local_tip < best_known_tip, we MUST have requests in flight.
+          // This runs EVERY iteration with NO time gates.
+          // ========================================================================
+          {
+              const uint64_t chain_height = chain_.height();
+              const uint64_t header_height = chain_.best_header_height();
+              const uint64_t max_peer_tip = g_max_known_peer_tip.load();
+              const uint64_t target_height = std::max(header_height, max_peer_tip);
+
+              // INVARIANT CHECK: Are we behind?
+              const bool behind = (target_height > 0 && chain_height < target_height);
+
+              if (behind) {
+                  // Count total inflight requests across ALL peers
+                  size_t total_inflight = 0;
+                  size_t capable_peers = 0;
+                  size_t syncing_peers = 0;
+                  for (const auto& kvp : peers_) {
+                      if (!kvp.second.verack_ok) continue;
+                      capable_peers++;
+                      if (kvp.second.syncing) syncing_peers++;
+                      total_inflight += kvp.second.inflight_index;
+                  }
+
+                  // INVARIANT ENFORCEMENT: If behind with capable peers but insufficient requests
+                  // This is the CORE liveness fix - unconditional, no time gates
+                  const size_t min_inflight_threshold = std::max((size_t)1, capable_peers);
+
+                  if (capable_peers > 0 && total_inflight < min_inflight_threshold) {
+                      // VIOLATION: We're behind but not requesting enough
+                      // Force re-enable ALL peers and fill their pipelines
+                      for (auto& kvp : peers_) {
+                          if (!kvp.second.verack_ok) continue;
+                          Sock s = kvp.first;
+
+                          // Re-enable peer if it was demoted (regardless of timeout count)
+                          if (!g_peer_index_capable[s]) {
+                              g_peer_index_capable[s] = true;
+                              g_index_timeouts[s] = 0;
+                          }
+
+                          // Ensure peer is syncing
+                          if (!kvp.second.syncing) {
+                              kvp.second.syncing = true;
+                              kvp.second.inflight_index = 0;
+                              kvp.second.next_index = chain_height + 1;
+                          }
+
+                          // Fill pipeline (this is idempotent if already full)
+                          fill_index_pipeline(kvp.second);
+                      }
+                  }
+              }
+          }
+
+          // Refill pipelines for ALL syncing peers (complements the invariant check above)
           for (auto &kvp : peers_) {
               if (!kvp.second.syncing) continue;
               if (!peer_is_index_capable(kvp.first)) continue;
-              // Refill ALL syncing peers - don't skip inflight_index == 0
               fill_index_pipeline(kvp.second);
           }
 
@@ -5988,6 +6037,45 @@ void P2P::loop(){
                 }
             }
 
+            // ========================================================================
+            // LIVENESS INVARIANT: HEADER SYNC (UNCONDITIONAL LEVEL CHECK)
+            // If headers not done AND best_header_height < max_peer_tip AND no inflight headers,
+            // we MUST request headers. No time gates.
+            // ========================================================================
+            if (!g_logged_headers_done) {
+                const uint64_t hdr_height = chain_.best_header_height();
+                const uint64_t max_peer = g_max_known_peer_tip.load();
+
+                // Check if ANY peer has headers in flight
+                size_t total_hdr_inflight = 0;
+                for (const auto& kvp : peers_) {
+                    total_hdr_inflight += kvp.second.inflight_hdr_batches;
+                }
+
+                // INVARIANT: If we're behind on headers and nothing in flight, request now
+                if (max_peer > 0 && hdr_height < max_peer && total_hdr_inflight == 0) {
+                    for (auto& kv : peers_) {
+                        auto& ps = kv.second;
+                        if (!ps.verack_ok) continue;
+                        if (!can_accept_hdr_batch(ps, now_ms())) continue;
+
+                        std::vector<std::vector<uint8_t>> locator;
+                        chain_.build_locator(locator);
+                        if (g_hdr_flip[(Sock)ps.sock]) {
+                            for (auto& h : locator) std::reverse(h.begin(), h.end());
+                        }
+                        std::vector<uint8_t> stop(32, 0);
+                        auto pl = build_getheaders_payload(locator, stop);
+                        auto msg = encode_msg("getheaders", pl);
+                        if (send_or_close(ps.sock, msg)) {
+                            ps.sent_getheaders = true;
+                            ps.inflight_hdr_batches++;
+                            g_last_hdr_req_ms[(Sock)ps.sock] = now_ms();
+                        }
+                    }
+                }
+            }
+
             // Debug logging for sync issues
             if (want.empty() && !g_logged_headers_done) {
                 static int64_t last_fallback_activation = 0;
@@ -5996,7 +6084,7 @@ void P2P::loop(){
                 // For seed nodes with existing blocks, this is normal - reduce log spam
                 bool we_are_seed = std::getenv("MIQ_FORCE_SEED") != nullptr;
 
-                // Enhanced fallback: request headers from all connected peers
+                // Enhanced fallback: request headers from all connected peers (TIME-GATED BACKUP)
                 if (!we_are_seed && now - last_fallback_activation > MIQ_IBD_FALLBACK_AFTER_MS) {
                     last_fallback_activation = now;
                     log_info("[SYNC] Activating enhanced synchronization fallback");
@@ -6218,9 +6306,10 @@ void P2P::loop(){
                     last_stale_log = now;
                     log_warn("[SYNC] Tip is stale (" + std::to_string(tip_age_sec/60) + "m old) - forcing block requests from all peers");
                 }
-            } else if ((now - last_refetch_time > 200) && (g_sequential_sync || !headers_done || current_height < chain_.best_header_height())) {
-                // CRITICAL FIX: Proactive pipeline during IBD - always run when behind header tip
+            } else if ((now - last_refetch_time > 200) && (g_sequential_sync || !headers_done || current_height < chain_.best_header_height() || current_height < g_max_known_peer_tip.load())) {
+                // CRITICAL FIX: Proactive pipeline during IBD - always run when behind ANY known tip
                 // This ensures continuous block downloads without waiting for stall detection
+                // LIVENESS FIX: Also check g_max_known_peer_tip - peers may know higher tip than headers
                 should_refetch = true;
                 // Rate-limit log to once per 30 seconds
                 if (now - last_proactive_log > 30000) {
@@ -6248,16 +6337,19 @@ void P2P::loop(){
                     for (auto& kvp : peers_) {
                         auto& pps = kvp.second;
                         if (!pps.verack_ok) continue;
-                        if (!peer_is_index_capable((Sock)pps.sock)) continue;
-                        
+
+                        // LIVENESS FIX: Re-enable demoted peers instead of skipping
+                        Sock s = (Sock)pps.sock;
+                        if (!g_peer_index_capable[s]) {
+                            g_peer_index_capable[s] = true;
+                            g_index_timeouts[s] = 0;
+                        }
+
                         if (!pps.syncing) {
                             pps.syncing = true;
                             pps.inflight_index = 0;
                             pps.next_index = current_height + 1;
                             fill_index_pipeline(pps);
-                            log_info("[SYNC] Activated index sync on " + pps.ip + 
-                                   " to catch up to header tip (current=" + std::to_string(current_height) + 
-                                   " header_tip=" + std::to_string(chain_.best_header_height()) + ")");
                         }
                     }
                 }
@@ -6279,8 +6371,16 @@ void P2P::loop(){
                     auto& pps = kvp.second;
                     if (!pps.verack_ok) continue;
 
+                    // LIVENESS FIX: Re-enable demoted peers in refetch path
+                    // This ensures demoted peers get another chance during catch-up
+                    Sock peer_sock = (Sock)pps.sock;
+                    if (!g_peer_index_capable[peer_sock]) {
+                        g_peer_index_capable[peer_sock] = true;
+                        g_index_timeouts[peer_sock] = 0;
+                    }
+
                     // For peers that support index-based sync, use getbi
-                    if (peer_is_index_capable((Sock)pps.sock)) {
+                    if (peer_is_index_capable(peer_sock)) {
                         // CRITICAL FIX: Just call fill_index_pipeline instead of manually requesting
                         // The old code called request_block_index directly without tracking inflight_index,
                         // causing the stop-start sync pattern
@@ -6339,37 +6439,32 @@ void P2P::loop(){
                 debug_logged = false; // Reset debug flag when not in sync
                 #endif
 
-                // If we think we're done but could still try index sync, activate it
+                // LIVENESS: If we think we're done but could still try index sync, activate it
+                // CRITICAL FIX: No time gate - this is level-triggered!
+                // Also re-enable demoted peers since they might have recovered
                 if (!any_want && !any_inflight && headers_done && can_try_index_sync && !has_active_index_sync) {
-                    static int64_t last_index_activation = 0;
-                    if (now - last_index_activation > 15000) { // Try every 15 seconds
-                        log_warn("[SYNC] Hash-based sync exhausted at height=" + std::to_string(current_height) +
-                                ", activating index-by-height sync as final attempt");
+                    // Activate index sync on ALL peers (re-enable demoted ones too)
+                    int activated_peers = 0;
+                    for (auto &kvp : peers_) {
+                        auto &pps = kvp.second;
+                        if (!pps.verack_ok) continue;
 
-                        // Activate index sync on ALL capable peers for maximum throughput
-                        int activated_peers = 0;
-                        for (auto &kvp : peers_) {
-                            auto &pps = kvp.second;
-                            if (!pps.verack_ok) continue;
-                            if (!peer_is_index_capable((Sock)pps.sock)) continue;
-
-                            // Always reset and reactivate to ensure fresh sync
-                            pps.syncing = true;
-                            pps.inflight_index = 0;
-                            pps.next_index = chain_.height() + 1;
-                            fill_index_pipeline(pps);
-                            log_info("[SYNC] Activated aggressive index sync for peer " + pps.ip +
-                                    " starting at height " + std::to_string(pps.next_index));
-                            activated_peers++;
+                        // LIVENESS FIX: Re-enable demoted peers instead of skipping them
+                        Sock s = kvp.first;
+                        if (!g_peer_index_capable[s]) {
+                            g_peer_index_capable[s] = true;
+                            g_index_timeouts[s] = 0;
                         }
 
-                        if (activated_peers > 0) {
-                            log_info("[SYNC] Activated index sync on " + std::to_string(activated_peers) + " peers");
-                        } else {
-                            log_warn("[SYNC] No index-capable peers available for sync activation");
-                        }
+                        // Always reset and reactivate to ensure fresh sync
+                        pps.syncing = true;
+                        pps.inflight_index = 0;
+                        pps.next_index = chain_.height() + 1;
+                        fill_index_pipeline(pps);
+                        activated_peers++;
+                    }
 
-                        last_index_activation = now;
+                    if (activated_peers > 0) {
                         g_sync_wants_active.store(true);
                     }
                 }
@@ -8777,9 +8872,69 @@ void P2P::loop(){
                 }
                 // CRITICAL FIX: Also clear tx inflight tracking on disconnect
                 g_inflight_tx_ts.erase(s);
-                // CRITICAL FIX: Also clear index inflight tracking on disconnect
-                // Missing this caused stale entries and potential use-after-free crashes
-                g_inflight_index_ts.erase(s);
+
+                // CRITICAL FIX: Clear index tracking AND global requested indices
+                // BUG: Previously this code only cleared per-peer tracking but NOT
+                // g_global_requested_indices, causing indices to get stuck forever.
+                // Those stuck indices could never be requested by any other peer,
+                // causing permanent sync stalls at specific heights.
+                auto it_idx = g_inflight_index_ts.find(s);
+                if (it_idx != g_inflight_index_ts.end()) {
+                    // Collect indices to re-issue to other peers
+                    std::vector<uint64_t> orphaned_indices;
+                    orphaned_indices.reserve(it_idx->second.size());
+                    for (const auto& kv : it_idx->second) {
+                        orphaned_indices.push_back(kv.first);
+                    }
+
+                    // Clear from global tracking FIRST (under lock)
+                    {
+                        InflightLock lk(g_inflight_lock);
+                        for (uint64_t idx : orphaned_indices) {
+                            g_global_requested_indices.erase(idx);
+                        }
+                    }
+
+                    // Re-issue requests to other peers (similar to first cleanup loop)
+                    if (!orphaned_indices.empty()) {
+                        // Build candidate list sorted by health score
+                        std::vector<std::pair<Sock, double>> scored_peers;
+                        for (const auto& kv2 : peers_) {
+                            if (kv2.first == s) continue;
+                            if (!kv2.second.verack_ok) continue;
+                            scored_peers.emplace_back(kv2.first, kv2.second.health_score);
+                        }
+                        std::sort(scored_peers.begin(), scored_peers.end(),
+                                  [](const auto& a, const auto& b) { return a.second > b.second; });
+
+                        std::vector<Sock> cand_socks;
+                        cand_socks.reserve(scored_peers.size());
+                        for (auto& p : scored_peers) cand_socks.push_back(p.first);
+
+                        // Re-issue each orphaned index request
+                        for (uint64_t idx : orphaned_indices) {
+                            if (cand_socks.empty()) break;
+                            Sock target = rr_pick_peer_for_key(miq_idx_key(idx), cand_socks);
+                            auto itT = peers_.find(target);
+                            if (itT != peers_.end()) {
+                                uint8_t p8[8];
+                                for (int j = 0; j < 8; j++) p8[j] = (uint8_t)((idx >> (8 * j)) & 0xFF);
+                                auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
+                                if (send_or_close(target, msg)) {
+                                    g_inflight_index_ts[target][idx] = now_ms();
+                                    g_inflight_index_order[target].push_back(idx);
+                                    {
+                                        InflightLock lk(g_inflight_lock);
+                                        g_global_requested_indices.insert(idx);
+                                    }
+                                    itT->second.inflight_index++;
+                                }
+                            }
+                        }
+                    }
+
+                    g_inflight_index_ts.erase(it_idx);
+                }
                 g_inflight_index_order.erase(s);
             }
         }

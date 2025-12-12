@@ -5078,6 +5078,24 @@ int main(int argc, char** argv){
                 }
             }
 
+            // LIVENESS FIX: Register P2P relay callback for immediate block propagation
+            // This ensures stratum-mined blocks are relayed to all peers within milliseconds
+            if (!cfg.no_p2p) {
+                stratum_server->set_block_relay_callback([&p2p, &chain](const Block& block, uint64_t height) {
+                    // Calculate subsidy for notify_local_block
+                    uint64_t subsidy = chain.subsidy_for_height(height);
+                    std::string miner_addr;
+                    if (!block.txs.empty() && !block.txs[0].vout.empty()) {
+                        const auto& pkh = block.txs[0].vout[0].pkh;
+                        if (pkh.size() == 20) {
+                            miner_addr = base58check_encode(VERSION_P2PKH, pkh);
+                        }
+                    }
+                    // This broadcasts to ALL peers immediately
+                    p2p.notify_local_block(block, height, subsidy, miner_addr);
+                });
+            }
+
             if (stratum_server->start()) {
                 g_stratum_server.store(stratum_server.get());
                 log_info("Stratum pool server listening on port " + std::to_string(cfg.stratum_port));

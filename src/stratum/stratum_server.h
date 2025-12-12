@@ -27,6 +27,7 @@ namespace miq {
 
 class Chain;
 class Mempool;
+struct Block;  // Forward declaration for relay callback
 
 // =============================================================================
 // STRATUM V1 SERVER FOR POOL MINING WITH PROPORTIONAL PAYOUTS
@@ -186,6 +187,11 @@ public:
     void set_pplns_window(size_t shares) { payout_config_.pplns_window_size = shares; }
     void set_data_dir(const std::string& dir) { data_dir_ = dir; }
 
+    // LIVENESS FIX: Block relay callback - called immediately after mining a block
+    // This ensures sub-1-second propagation without depending on P2P layer discovery
+    using BlockRelayCallback = std::function<void(const Block& block, uint64_t height)>;
+    void set_block_relay_callback(BlockRelayCallback cb) { block_relay_callback_ = std::move(cb); }
+
     // Control
     bool start();
     void stop();
@@ -221,6 +227,9 @@ private:
 
     // Payout configuration
     PoolPayoutConfig payout_config_;
+
+    // LIVENESS FIX: Block relay callback for immediate propagation
+    BlockRelayCallback block_relay_callback_;
 
     // Connection limits
     static constexpr size_t MAX_MINERS = 10000;
