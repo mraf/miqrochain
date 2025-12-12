@@ -4002,8 +4002,18 @@ void P2P::evict_pending_blocks_if_needed() {
     // If still too large, remove the highest blocks first (furthest from being processable)
     while (pending_blocks_bytes_ > MAX_PENDING_BLOCKS_BYTES && !pending_blocks_.empty()) {
         auto last = std::prev(pending_blocks_.end());
+        uint64_t evicted_height = last->first;
         pending_blocks_bytes_ -= last->second.raw.size();
         pending_blocks_.erase(last);
+
+        // CRITICAL FIX: Clear evicted index from global tracking!
+        // Without this, the index stays in g_global_requested_indices forever,
+        // and will NEVER be re-requested when the node catches up to that height.
+        // This was the ROOT CAUSE of random stall heights (1100, 3054, etc.)
+        {
+            InflightLock lk(g_inflight_lock);
+            g_global_requested_indices.erase(evicted_height);
+        }
     }
 }
 
@@ -4027,6 +4037,11 @@ void P2P::process_pending_blocks() {
             log_warn("P2P: failed to deserialize pending block at height " + std::to_string(next_height));
             pending_blocks_bytes_ -= it->second.raw.size();
             pending_blocks_.erase(it);
+            // CRITICAL FIX: Clear from global tracking so we can re-request from another peer
+            {
+                InflightLock lk(g_inflight_lock);
+                g_global_requested_indices.erase(next_height);
+            }
             continue;
         }
 
