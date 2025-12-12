@@ -4470,18 +4470,47 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             }
             mark_ibd_complete();  // Enable full durability now that sync is complete
 
+            // ========================================================================
             // CRITICAL: Rebuild AddressIndex after IBD completes
             // During IBD, address indexing was skipped for performance
             // Now rebuild so wallet shows correct balance
-            if (chain.addressindex().is_enabled() && chain.addressindex().address_count() == 0) {
-                log_info("IBD complete - rebuilding AddressIndex for wallet functionality...");
-                chain.reindex_addresses([&](uint64_t cur, uint64_t total) {
-                    if (cur % 500 == 0 && tui && can_tui) {
-                        tui->set_banner("Rebuilding address index: " + std::to_string(cur) + "/" + std::to_string(total));
-                    }
-                    return !global::shutdown_requested.load();
-                });
-                if (tui && can_tui) tui->set_banner("");
+            // IMPORTANT: This reindex is NON-INTERRUPTIBLE to prevent partial state
+            // ========================================================================
+            if (chain.addressindex().is_enabled()) {
+                // ALWAYS check if reindex is needed, not just address_count == 0
+                // This handles cases where previous reindex was interrupted
+                uint64_t indexed_height = chain.addressindex().best_indexed_height();
+                uint64_t chain_height = chain.height();
+
+                if (indexed_height < chain_height) {
+                    log_info("IBD complete - rebuilding AddressIndex (indexed=" +
+                             std::to_string(indexed_height) + " chain=" + std::to_string(chain_height) + ")");
+
+                    // NON-INTERRUPTIBLE: Always return true to prevent abort
+                    // Users MUST wait for reindex to complete for correct wallet balance
+                    chain.reindex_addresses([&](uint64_t cur, uint64_t total) {
+                        if (cur % 500 == 0 && tui && can_tui) {
+                            tui->set_banner("Rebuilding address index: " + std::to_string(cur) + "/" + std::to_string(total) + " (DO NOT INTERRUPT)");
+                        }
+                        // CRITICAL: Always return true - do NOT allow interruption
+                        // Partial address index = incorrect wallet balance
+                        return true;
+                    });
+                    if (tui && can_tui) tui->set_banner("");
+                    log_info("AddressIndex rebuild complete - wallet balance should now be correct");
+                }
+            }
+
+            // ========================================================================
+            // CRITICAL: Verify UTXO integrity after IBD
+            // UTXO log was skipped during IBD for performance - verify it's complete
+            // ========================================================================
+            {
+                size_t utxo_count = chain.utxo().size();
+                if (utxo_count == 0 && chain.height() > 0) {
+                    log_warn("UTXO set is empty after IBD - wallet will show 0 balance!");
+                    log_warn("Run with --reindex-utxo flag to rebuild UTXO from blocks");
+                }
             }
 
             return true;
