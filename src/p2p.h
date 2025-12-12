@@ -213,6 +213,12 @@ struct PeerState {
     uint64_t    next_index{0};
     uint32_t    inflight_index{0};
 
+    // Fork detection - track if peer is on a different chain
+    bool        fork_detected{false};       // True if peer is on incompatible fork
+    bool        fork_verified{false};       // True if we've verified peer is on same chain
+    uint64_t    fork_check_height{0};       // Height where we verified chain compatibility
+    std::vector<uint8_t> fork_check_hash;   // Block hash at fork_check_height
+
     // per-peer RX buffer & liveness
     std::vector<uint8_t> rx;
     bool        verack_ok{false};
@@ -365,6 +371,8 @@ struct PeerSnapshot {
     uint32_t     network_group;
     uint64_t     services;
     bool         is_manual;
+    bool         fork_detected{false};  // True if peer is on different chain
+    bool         fork_verified{false};  // True if verified on same chain
 };
 
 // Block info passed to telemetry callbacks

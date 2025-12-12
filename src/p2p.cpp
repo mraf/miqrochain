@@ -342,11 +342,14 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
 #ifndef MIQ_OUTBOUND_TARGET
 #define MIQ_OUTBOUND_TARGET 8
 #endif
-// CRITICAL FIX: Increased dial interval from 5s to 15s to prevent rapid reconnect loops
-// When a peer disconnects, we were immediately trying to reconnect, causing
-// connect/disconnect cycling. 15 seconds gives time for network issues to resolve.
+// Dial interval for new connections
+// During IBD: aggressive reconnection is needed to maintain sync
+// After IBD: more conservative to prevent rapid cycling
 #ifndef MIQ_DIAL_INTERVAL_MS
-#define MIQ_DIAL_INTERVAL_MS 15000
+#define MIQ_DIAL_INTERVAL_MS 5000  // 5 seconds - faster during IBD
+#endif
+#ifndef MIQ_DIAL_INTERVAL_STEADY_MS
+#define MIQ_DIAL_INTERVAL_STEADY_MS 15000  // 15 seconds after sync complete
 #endif
 
 #ifndef MIQ_ORPHAN_MAX_BYTES
@@ -467,11 +470,13 @@ namespace {
     static std::mutex g_peer_stalls_mu;
     static std::unordered_map<std::uintptr_t, int> g_peer_stalls;
 
-    // CRITICAL FIX: Per-IP reconnection backoff to prevent rapid connect/disconnect cycles
-    // When a peer disconnects, we record the time. We won't reconnect until backoff expires.
+    // Per-IP reconnection backoff - adaptive based on sync state
+    // During IBD: short backoff to maintain sync progress
+    // After IBD: longer backoff to prevent rapid cycling
     static std::mutex g_reconnect_backoff_mu;
     static std::unordered_map<std::string, int64_t> g_reconnect_backoff_until;  // IP -> earliest reconnect time
-    static constexpr int64_t RECONNECT_BACKOFF_MS = 30000;  // 30 second backoff after disconnect
+    static constexpr int64_t RECONNECT_BACKOFF_IBD_MS = 5000;    // 5 second backoff during IBD
+    static constexpr int64_t RECONNECT_BACKOFF_STEADY_MS = 30000; // 30 second backoff after sync
 
     // Single authoritative monotonic ms clock used by rate limiters / stall guards / snapshots.
     static inline int64_t now_ms() {
@@ -1198,6 +1203,10 @@ static bool g_seed_mode = false;
 static std::atomic<bool> g_sequential_sync{(MIQ_SYNC_SEQUENTIAL_DEFAULT != 0)};
 static inline int miq_outbound_target(){
     return g_seed_mode ? MIQ_SEED_MODE_OUTBOUND_TARGET : MIQ_OUTBOUND_TARGET;
+}
+// Adaptive dial interval - faster during IBD for quick recovery
+static inline int64_t miq_dial_interval_ms() {
+    return g_logged_headers_done ? MIQ_DIAL_INTERVAL_STEADY_MS : MIQ_DIAL_INTERVAL_MS;
 }
 
 static inline bool hostname_is_seed(){
@@ -3555,6 +3564,13 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // peer_is_index_capable is set by start_sync_with_peer
     if (!peer_is_index_capable((Sock)ps.sock)) return;
 
+    // CRITICAL: Don't sync from peers on a different fork!
+    // This prevents wasting bandwidth and getting confused by fork blocks
+    if (ps.fork_detected) {
+        P2P_TRACE("Skipping fill_index_pipeline for forked peer " + ps.ip);
+        return;
+    }
+
     // SYNC STATE FIX: Ensure next_index is consistent with current chain height
     const uint64_t current_height = chain_.height();
     if (ps.next_index <= current_height) {
@@ -4592,7 +4608,7 @@ void P2P::loop(){
     while (running_) {
         if ((int)outbound_count() < miq_outbound_target() && g_listen_port != 0) {
             int64_t tnow = now_ms();
-            if (tnow - last_dial_ms > MIQ_DIAL_INTERVAL_MS) {
+            if (tnow - last_dial_ms > miq_dial_interval_ms()) {
                 last_dial_ms = tnow;
 
 #if MIQ_ENABLE_ADDRMAN
@@ -5508,6 +5524,127 @@ void P2P::loop(){
                       // Trigger immediate pipeline refill to retry the blocks
                       if (ps.syncing && peer_is_index_capable((Sock)ps.sock)) {
                           fill_index_pipeline(ps);
+                      }
+                  }
+              }
+          }
+
+          // ========================================================================
+          // CRITICAL: Clean up ALL stale state when no peers connected
+          // This prevents stale global indices from blocking new connections
+          // ========================================================================
+          {
+              static int64_t last_empty_cleanup_ms = 0;
+              const int64_t tnow = now_ms();
+
+              // Count verack_ok peers
+              size_t active_peers = 0;
+              for (const auto& kvp : peers_) {
+                  if (kvp.second.verack_ok) active_peers++;
+              }
+
+              // If no active peers, clean up all stale state
+              if (active_peers == 0 && tnow - last_empty_cleanup_ms > 1000) {
+                  last_empty_cleanup_ms = tnow;
+
+                  // Clear all global request tracking
+                  {
+                      InflightLock lk(g_inflight_lock);
+                      if (!g_global_requested_indices.empty()) {
+                          log_warn("P2P: Clearing " + std::to_string(g_global_requested_indices.size()) +
+                                   " stale global indices (no active peers)");
+                          g_global_requested_indices.clear();
+                      }
+                  }
+
+                  // Clear per-peer tracking maps
+                  g_inflight_index_ts.clear();
+                  g_inflight_index_order.clear();
+                  g_inflight_block_ts.clear();
+                  g_global_inflight_blocks.clear();
+              }
+          }
+
+          // ========================================================================
+          // NUCLEAR SAFETY NET: Unconditional sync recovery every 500ms
+          // This is the ultimate failsafe - if sync is behind and we have peers,
+          // FORCE re-enable and refill ALL peers regardless of their state.
+          // This ensures sync can NEVER get permanently stuck.
+          // ========================================================================
+          {
+              static int64_t last_nuclear_check_ms = 0;
+              const int64_t tnow = now_ms();
+              const uint64_t chain_height = chain_.height();
+              const uint64_t max_peer = g_max_known_peer_tip.load();
+              const uint64_t header_height = chain_.best_header_height();
+              const uint64_t target_height = std::max(header_height, max_peer);
+
+              // Run every 500ms when we're behind
+              if ((tnow - last_nuclear_check_ms > 500) &&
+                  !peers_.empty() &&
+                  target_height > 0 &&
+                  chain_height < target_height) {
+
+                  last_nuclear_check_ms = tnow;
+
+                  // Check if ANY peer is actively making progress
+                  bool any_active = false;
+                  size_t total_inflight = 0;
+                  for (const auto& kvp : peers_) {
+                      if (kvp.second.syncing && kvp.second.inflight_index > 0) {
+                          any_active = true;
+                      }
+                      total_inflight += kvp.second.inflight_index;
+                  }
+
+                  // Also check global requested indices
+                  size_t global_inflight = 0;
+                  {
+                      InflightLock lk(g_inflight_lock);
+                      global_inflight = g_global_requested_indices.size();
+                  }
+
+                  // AGGRESSIVE RECOVERY: If we're behind and nothing is in flight,
+                  // OR if we have stale global indices (peers disconnected mid-sync),
+                  // force restart ALL peers
+                  bool needs_recovery = (!any_active && total_inflight == 0 && global_inflight == 0);
+
+                  // Also recover if we have global indices but no peer tracking them
+                  // (indicates stale state from disconnected peers)
+                  if (!needs_recovery && global_inflight > 0) {
+                      size_t tracked_by_peers = 0;
+                      for (const auto& kv : g_inflight_index_ts) {
+                          tracked_by_peers += kv.second.size();
+                      }
+                      if (tracked_by_peers == 0) {
+                          needs_recovery = true;
+                          log_warn("P2P: Stale global indices detected (" +
+                                   std::to_string(global_inflight) + " global, 0 tracked)");
+                      }
+                  }
+
+                  if (needs_recovery) {
+                      log_warn("P2P: NUCLEAR RECOVERY - no active sync, forcing all peers to restart");
+
+                      // Clear stale global state first
+                      {
+                          InflightLock lk(g_inflight_lock);
+                          g_global_requested_indices.clear();
+                      }
+                      g_inflight_index_ts.clear();
+                      g_inflight_index_order.clear();
+
+                      for (auto& kvp : peers_) {
+                          if (!kvp.second.verack_ok) continue;
+                          Sock s = kvp.first;
+                          // Force re-enable EVERYTHING
+                          g_peer_index_capable[s] = true;
+                          g_index_timeouts[s] = 0;
+                          kvp.second.syncing = true;
+                          kvp.second.inflight_index = 0;
+                          kvp.second.next_index = chain_height + 1;
+                          // Fill pipeline
+                          fill_index_pipeline(kvp.second);
                       }
                   }
               }
@@ -6548,7 +6685,9 @@ void P2P::loop(){
                 // CRITICAL FIX: Record backoff time to prevent rapid reconnection
                 {
                     std::lock_guard<std::mutex> lk_backoff(g_reconnect_backoff_mu);
-                    g_reconnect_backoff_until[ps_old.ip] = now_ms() + RECONNECT_BACKOFF_MS;
+                    // Adaptive backoff: shorter during IBD for faster recovery
+                    int64_t backoff = g_logged_headers_done ? RECONNECT_BACKOFF_STEADY_MS : RECONNECT_BACKOFF_IBD_MS;
+                    g_reconnect_backoff_until[ps_old.ip] = now_ms() + backoff;
                 }
 
                 // Finally, close & erase the dead peer.
@@ -6999,13 +7138,37 @@ void P2P::loop(){
                             // the seed connection logic from triggering.
                             // Update the stall probe timer but NOT g_last_progress_ms
                             g_next_stall_probe_ms = now_ms() + MIQ_P2P_STALL_RETRY_MS;
-                            // CRITICAL FIX: Do NOT update peer_tip_height from header height!
-                            // Headers can be far ahead of actual blocks, causing premature sync.
-                            // peer_tip_height should only come from:
-                            // 1. Version message announced_height (what peer claims to have)
-                            // 2. Actual blocks received from this peer
-                            // The old code here caused nodes to think they were synced when
-                            // headers caught up but blocks hadn't been downloaded yet.
+
+                            // CRITICAL FIX: Update g_max_known_peer_tip when headers extend beyond!
+                            // This handles the case where new blocks are mined AFTER we connected.
+                            // Without this, we'd think we're "caught up" at the old version height
+                            // and stop syncing before reaching the actual tip.
+                            uint64_t new_header_height = chain_.best_header_height();
+                            uint64_t old_max = g_max_known_peer_tip.load();
+                            while (new_header_height > old_max) {
+                                if (g_max_known_peer_tip.compare_exchange_weak(old_max, new_header_height)) {
+                                    log_info("P2P: Updated max peer tip from headers: " + std::to_string(new_header_height) +
+                                             " (was " + std::to_string(old_max) + ")");
+                                    // Also update this peer's announced tip if headers show higher
+                                    if (new_header_height > ps.announced_tip_height) {
+                                        ps.announced_tip_height = new_header_height;
+                                        ps.peer_tip_height = new_header_height;
+                                    }
+
+                                    // CRITICAL FIX: Re-enable peer and restart sync when headers extend!
+                                    // This peer just sent us headers proving they have more blocks.
+                                    // If they were demoted before, they should be re-enabled now.
+                                    g_peer_index_capable[(Sock)s] = true;
+                                    g_index_timeouts[(Sock)s] = 0;  // Reset timeout counter
+                                    if (!ps.syncing) {
+                                        ps.syncing = true;
+                                        ps.inflight_index = 0;
+                                        ps.next_index = chain_.height() + 1;
+                                        log_info("P2P: Re-enabled sync on " + ps.ip + " after receiving extended headers");
+                                    }
+                                    break;
+                                }
+                            }
                         } else if (hs.size() > 0) {
                             log_warn("P2P: Headers REJECTED from " + ps.ip + " n=" + std::to_string(hs.size()) +
                                     " accepted=0 error=" + herr);
@@ -7028,10 +7191,21 @@ void P2P::loop(){
                                 // Request from this peer since they just announced the header
                                 request_block_hash(ps, bh);
                             }
-                            // Also trigger index-based sync if active
-                            if (ps.syncing) {
-                                fill_index_pipeline(ps);
+
+                            // CRITICAL FIX: ALWAYS ensure index sync is active after accepting headers
+                            // This ensures we sync to the new header tip even if peer was demoted
+                            if (!peer_is_index_capable((Sock)s)) {
+                                g_peer_index_capable[(Sock)s] = true;
+                                g_index_timeouts[(Sock)s] = 0;
+                                log_info("P2P: Re-enabled index capability on " + ps.ip + " after accepting " +
+                                        std::to_string(accepted) + " headers");
                             }
+                            if (!ps.syncing) {
+                                ps.syncing = true;
+                                ps.inflight_index = 0;
+                                ps.next_index = chain_.height() + 1;
+                            }
+                            fill_index_pipeline(ps);
                         }
 
                         if (hs.empty()) {
@@ -7302,6 +7476,50 @@ void P2P::loop(){
                             clear_block_inflight(bh, (Sock)s);
                             P2P_TRACE_IF(true, "Received block " + bh.substr(0, 16) + "... from peer");
 
+                            // ================================================================
+                            // FORK DETECTION: Check if this block is on our chain
+                            // If peer sends a block with prev_hash that doesn't match our
+                            // chain at that height, they're on a different fork.
+                            // ================================================================
+                            {
+                                // Get expected height for this block from its prev_hash
+                                int64_t parent_height = chain_.get_header_height(hb.header.prev_hash);
+                                uint64_t expected_height = (parent_height >= 0) ? (uint64_t)(parent_height + 1) : 0;
+
+                                if (expected_height > 0 && expected_height <= chain_.height()) {
+                                    // We already have a block at this height - check if it matches
+                                    Block our_block;
+                                    if (chain_.get_block_by_index(expected_height, our_block)) {
+                                        auto received_hash = hb.block_hash();
+                                        auto our_hash = our_block.block_hash();
+                                        if (our_hash != received_hash) {
+                                            // FORK DETECTED: Peer sent a different block for same height
+                                            if (!ps.fork_detected) {
+                                                log_warn("P2P: FORK DETECTED - peer " + ps.ip +
+                                                        " sent different block at height " + std::to_string(expected_height) +
+                                                        " (they are on a different chain)");
+                                                ps.fork_detected = true;
+                                                ps.fork_check_height = expected_height;
+                                                ps.fork_check_hash = received_hash;
+                                                // Stop syncing from this forked peer
+                                                ps.syncing = false;
+                                                g_peer_index_capable[(Sock)s] = false;
+                                            }
+                                            continue;  // Don't process blocks from forked peers
+                                        }
+                                    }
+                                } else if (!ps.fork_verified && parent_height >= 0 && chain_.height() > 0) {
+                                    // Block extends tip or is for a height we don't have yet
+                                    // If it connects to our chain, peer is verified on same chain
+                                    if (chain_.have_block(hb.header.prev_hash)) {
+                                        ps.fork_verified = true;
+                                        ps.fork_check_height = (uint64_t)parent_height;
+                                        log_info("P2P: Verified peer " + ps.ip + " is on same chain (height " +
+                                                std::to_string(parent_height) + ")");
+                                    }
+                                }
+                            }
+
                             // FIX: Update peer_tip_height when we receive blocks via index fetch.
                             // This is critical for correct sync completion detection.
                             // When we request block at index N and receive it, peer has at least N blocks.
@@ -7414,13 +7632,29 @@ void P2P::loop(){
                                 if (ps.inflight_index > 0) {
                                     ps.inflight_index--;
                                 }
+
+                                // CRITICAL FIX: Reset timeout counter AND re-enable the peer!
+                                // The peer just successfully delivered a block, proving it works.
+                                // Previously we reset timeout but left peer demoted, causing deadlock!
                                 g_index_timeouts[(Sock)s] = 0;
+                                if (!g_peer_index_capable[(Sock)s]) {
+                                    g_peer_index_capable[(Sock)s] = true;
+                                    ps.syncing = true;
+                                    ps.next_index = chain_.height() + 1;
+                                }
 
                                 // Refill pipeline immediately
                                 fill_index_pipeline(ps);
                             } else {
                                 // SAFETY NET: Even if inflight_index was 0, try to refill pipeline
                                 // This handles edge cases where tracking got out of sync
+                                // CRITICAL FIX: Also re-enable peer - they just delivered a block!
+                                g_index_timeouts[(Sock)s] = 0;
+                                if (!g_peer_index_capable[(Sock)s]) {
+                                    g_peer_index_capable[(Sock)s] = true;
+                                    ps.syncing = true;
+                                    ps.next_index = chain_.height() + 1;
+                                }
                                 fill_index_pipeline(ps);
                             }
 
@@ -8681,6 +8915,8 @@ std::vector<PeerSnapshot> P2P::snapshot_peers() const {
         s.rx_buf        = ps.rx.size();
         s.inflight      = ps.inflight_tx.size();
         s.peer_tip      = ps.peer_tip_height;
+        s.fork_detected = ps.fork_detected;
+        s.fork_verified = ps.fork_verified;
         out.push_back(std::move(s));
     }
     return out;
