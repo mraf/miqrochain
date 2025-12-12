@@ -3572,28 +3572,30 @@ void P2P::fill_index_pipeline(PeerState& ps){
     uint64_t max_index = current_height + max_ahead;
 
     // Determine the limit for block requests from this peer
-    // CRITICAL FIX: Use the MAXIMUM of header height and peer_tip_height!
-    // Headers reveal the true chain height even if peer announced a lower tip.
+    // CRITICAL FIX: Use the MAXIMUM of ALL known chain heights!
+    // This prevents stalls when any single source has a low/wrong value
     const uint64_t best_hdr = chain_.best_header_height();
+    const uint64_t max_peer = g_max_known_peer_tip.load();
     uint64_t peer_limit;
 
-    if (best_hdr > 0) {
-        // Headers tell us the true chain height - use it as primary limit
-        peer_limit = best_hdr;
-        // But if peer announced higher (speculative), use that during early IBD
-        if (!g_logged_headers_done && ps.peer_tip_height > peer_limit) {
-            peer_limit = ps.peer_tip_height;
-        }
-    } else if (ps.peer_tip_height > 0) {
-        // No headers yet - use peer's announced tip
+    // Use MAX of: header height, this peer's tip, global max peer tip
+    // This ensures we NEVER artificially limit requests due to one bad value
+    peer_limit = best_hdr;
+    if (ps.peer_tip_height > peer_limit) {
         peer_limit = ps.peer_tip_height;
-    } else {
-        // No peer tip and no headers - use aggressive window for fast IBD
+    }
+    if (max_peer > peer_limit) {
+        peer_limit = max_peer;
+    }
+
+    // Fallback if all sources are 0 - use aggressive window
+    if (peer_limit == 0) {
         peer_limit = current_height + max_ahead;
     }
 
-    // Don't request from peers that are behind us
-    if (peer_limit + 16 < current_height) {
+    // Don't request from peers that are clearly behind us
+    // But use a generous margin - peer might still have some blocks
+    if (peer_limit + 100 < current_height) {
         P2P_TRACE("DEBUG: Skipping block requests from " + ps.ip +
                   " - peer_limit=" + std::to_string(peer_limit) +
                   " our_height=" + std::to_string(current_height));
@@ -3624,10 +3626,17 @@ void P2P::fill_index_pipeline(PeerState& ps){
 
         // Check if we should skip this index (already have it or exceeds limits)
         // These are NOT errors - just skip to next index
+        // CRITICAL FIX: Only stop at header height if we're TRULY done with headers
+        // Use g_max_known_peer_tip as a sanity check to avoid stopping too early
         const uint64_t hdr_height = chain_.best_header_height();
+        const uint64_t max_tip = g_max_known_peer_tip.load();
         if (g_logged_headers_done && hdr_height > 0 && idx > hdr_height) {
-            // Beyond header height - stop requesting (not an error, just done)
-            break;
+            // Only stop if header height >= max peer tip (we're truly at the tip)
+            // Otherwise, headers might not have fully synced yet
+            if (max_tip == 0 || hdr_height >= max_tip) {
+                break;
+            }
+            // Headers not fully synced - continue requesting up to max_tip
         }
         if (idx <= chain_.height()) {
             // Already have this block - skip to next
@@ -3651,10 +3660,16 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
     // Blocks will be validated when headers catch up - they wait in orphan pool
     // Only enforce header cap AFTER headers phase is complete
     const uint64_t hdr_height = chain_.best_header_height();
+    const uint64_t max_tip = g_max_known_peer_tip.load();
     if (g_logged_headers_done && hdr_height > 0 && index > hdr_height) {
-        P2P_TRACE("BLOCKED: request_block_index(" + std::to_string(index) +
-                  ") exceeds header height " + std::to_string(hdr_height));
-        return false;
+        // CRITICAL FIX: Only block if headers are truly complete
+        // If max_peer_tip > hdr_height, headers haven't fully synced yet
+        if (max_tip == 0 || hdr_height >= max_tip) {
+            P2P_TRACE("BLOCKED: request_block_index(" + std::to_string(index) +
+                      ") exceeds header height " + std::to_string(hdr_height));
+            return false;
+        }
+        // Allow request - headers are incomplete
     }
 
     // Also don't request blocks we already have
@@ -5401,6 +5416,25 @@ void P2P::loop(){
                   log_warn("P2P: Sync stalled for " + std::to_string(STALL_RECOVERY_MS/1000) + "s at height " + std::to_string(chain_height) +
                            "/" + std::to_string(target_height) + " - forcing recovery");
 
+                  // CRITICAL FIX: Clear ALL global requested indices above current height
+                  // This handles orphaned indices that got stuck without per-peer tracking
+                  // Without this, fill_index_pipeline skips them forever!
+                  {
+                      InflightLock lk(g_inflight_lock);
+                      size_t cleared = 0;
+                      for (auto it = g_global_requested_indices.begin(); it != g_global_requested_indices.end(); ) {
+                          if (*it > chain_height) {
+                              it = g_global_requested_indices.erase(it);
+                              cleared++;
+                          } else {
+                              ++it;
+                          }
+                      }
+                      if (cleared > 0) {
+                          log_info("P2P: Cleared " + std::to_string(cleared) + " orphaned indices from global tracking");
+                      }
+                  }
+
                   // Force re-enable ALL peers for sync
                   for (auto& kvp : peers_) {
                       if (!kvp.second.verack_ok) continue;
@@ -5415,16 +5449,7 @@ void P2P::loop(){
                       kvp.second.inflight_index = 0;
                       kvp.second.next_index = chain_height + 1;
 
-                      // Clear any stale inflight tracking for this peer
-                      {
-                          InflightLock lk(g_inflight_lock);
-                          auto idx_it = g_inflight_index_ts.find(s);
-                          if (idx_it != g_inflight_index_ts.end()) {
-                              for (const auto& kv : idx_it->second) {
-                                  g_global_requested_indices.erase(kv.first);
-                              }
-                          }
-                      }
+                      // Clear per-peer inflight tracking
                       g_inflight_index_ts.erase(s);
                       g_inflight_index_order.erase(s);
 
@@ -7349,11 +7374,13 @@ void P2P::loop(){
                                     }
                                 }
 
-                                // CRITICAL: ALWAYS decrement inflight_index when we receive a block.
+                                // CRITICAL: Decrement inflight_index when we receive a block.
                                 // The peer sent us data, so they fulfilled ONE request.
-                                // Whether the block was accepted, orphaned, or rejected doesn't matter.
-                                // Without this, orphaned blocks keep inflight_index high and we stall!
-                                ps.inflight_index--;
+                                // CRITICAL FIX: Must check > 0 to avoid uint32_t underflow!
+                                // If inflight_index wraps to 4 billion, fill_index_pipeline never sends requests
+                                if (ps.inflight_index > 0) {
+                                    ps.inflight_index--;
+                                }
                                 g_index_timeouts[(Sock)s] = 0;
 
                                 // Refill pipeline immediately
