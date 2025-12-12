@@ -2188,12 +2188,16 @@ static inline std::vector<uint8_t> miq_build_version_payload(uint32_t start_heig
 
 // Small helper to throttle header pipelining safely.
 [[maybe_unused]] static inline bool can_accept_hdr_batch(miq::PeerState& ps, int64_t now) {
-    const int      kMaxInflight = 16;   // wider header pipeline
-    const int64_t  kMinGapMs    = 10; // keep tiny gap to avoid tight spins
+    // AGGRESSIVE: Use MIQ_HDR_PIPELINE for consistency
+    const int      kMaxInflight = MIQ_HDR_PIPELINE;
+    // CRITICAL FIX: During IBD, no gap between requests - blast them all!
+    const int64_t  kMinGapMs    = g_logged_headers_done ? 10 : 0;
     if (static_cast<uint32_t>(ps.inflight_hdr_batches) >= static_cast<uint32_t>(kMaxInflight)) return false;
-    auto it = g_last_hdr_req_ms.find((Sock)ps.sock);
-    int64_t last_req = (it == g_last_hdr_req_ms.end()) ? 0 : it->second;
-    if (last_req && (now - last_req) < kMinGapMs) return false;
+    if (kMinGapMs > 0) {
+        auto it = g_last_hdr_req_ms.find((Sock)ps.sock);
+        int64_t last_req = (it == g_last_hdr_req_ms.end()) ? 0 : it->second;
+        if (last_req && (now - last_req) < kMinGapMs) return false;
+    }
     return true;
 }
 static inline std::string miq_idx_key(uint64_t idx) {
@@ -2235,6 +2239,14 @@ bool P2P::check_rate(PeerState& ps, const char* family, double cost, int64_t tno
     if (!family) family = "misc";
     if (cost < 0) cost = 0;
     const std::string fam(family);
+
+    // CRITICAL FIX: During IBD, don't rate-limit headers or blocks!
+    // Rate limiting during sync causes extremely slow downloads
+    if (!g_logged_headers_done) {
+        if (fam == "hdr" || fam == "get" || fam == "blk") {
+            return true;  // Allow unlimited during IBD
+        }
+    }
 
     // Look up per-family config: default if missing.
     double per_sec = 10.0;
@@ -3487,9 +3499,9 @@ void P2P::start_sync_with_peer(PeerState& ps){
         auto pl2 = build_getheaders_payload(locator, stop);
         auto m2  = encode_msg("getheaders", pl2);
         int pushed = 0;
+        // AGGRESSIVE: No rate limiting on headers during IBD - blast them all!
         while (can_accept_hdr_batch(ps, now_ms()) &&
-               check_rate(ps, "hdr", 1.0, now_ms()) &&
-               pushed < 4) {
+               pushed < MIQ_HDR_PIPELINE) {
             ps.sent_getheaders = true;
             (void)send_or_close(ps.sock, m2);
             ps.inflight_hdr_batches++;
