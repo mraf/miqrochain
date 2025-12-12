@@ -78,8 +78,10 @@ namespace miq {
 #ifndef MIQ_SEED_MODE_OUTBOUND_TARGET
 #define MIQ_SEED_MODE_OUTBOUND_TARGET 4  // Match constants.h
 #endif
+// CRITICAL: Use fast fallback - if headers stall for 3s, switch to index sync
+// This was 5 minutes which caused massive delays!
 #ifndef MIQ_IBD_FALLBACK_AFTER_MS
-#define MIQ_IBD_FALLBACK_AFTER_MS (5 * 60 * 1000)
+#define MIQ_IBD_FALLBACK_AFTER_MS (3 * 1000)  // 3 seconds - matches constants.h
 #endif
 // ============================================================================
 // PERFORMANCE OPTIMIZATION: P2P Trace disabled by default
@@ -284,8 +286,10 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
 // When a peer stalls (sends headers but no blocks), switch immediately
 #define MIQ_P2P_BAD_PEER_MAX_STALLS MIQ_BLOCK_STALL_MAX_COUNT
 #endif
+// CRITICAL: Fast fallback on empty headers - 3 batches, not 8!
+// 8 empty batches was causing massive delays
 #ifndef MIQ_HEADERS_EMPTY_LIMIT
-#define MIQ_HEADERS_EMPTY_LIMIT 8
+#define MIQ_HEADERS_EMPTY_LIMIT 3  // Matches constants.h
 #endif
 
 // ULTRA-FAST PROPAGATION: Increased rate limits for sub-second block relay
@@ -3438,18 +3442,18 @@ void P2P::send_tx(Sock sock, const std::vector<uint8_t>& raw){
 }
 
 void P2P::start_sync_with_peer(PeerState& ps){
-    // PROPER HEADERS-FIRST SYNC
+    // FAST PARALLEL SYNC with header-height safety
     //
-    // Strategy: Headers complete FIRST, then blocks
+    // Strategy: Headers AND blocks download in PARALLEL for speed
     // 1. Request headers to build the header chain
-    // 2. When headers are done (g_logged_headers_done=true), start block downloads
-    // 3. Blocks are validated against the complete header chain
+    // 2. ALSO start block sync immediately (limited by header height)
+    // 3. fill_index_pipeline caps at best_header_height for safety
     //
-    // This ensures proper chain validation and prevents stalls.
+    // This gives us SPEED (parallel) + SAFETY (header-limited blocks)
 
 #if MIQ_ENABLE_HEADERS_FIRST
     if (!g_logged_headers_done) {
-        // PHASE 1: Headers sync - request headers from peer
+        // Request headers from peer
         std::vector<std::vector<uint8_t>> locator;
         chain_.build_locator(locator);
         if (g_hdr_flip[(Sock)ps.sock]) {
@@ -3471,16 +3475,15 @@ void P2P::start_sync_with_peer(PeerState& ps){
         }
         if (!g_logged_headers_started) {
             g_logged_headers_started = true;
-            log_info("[IBD] headers phase started - blocks will download after headers complete");
+            log_info("[IBD] headers phase started - blocks downloading in parallel");
             if (!g_ibd_headers_started_ms) g_ibd_headers_started_ms = now_ms();
         }
-        // DON'T start block sync yet - wait for headers to complete
-        return;
+        // DON'T return - fall through to also start block sync!
     }
 #endif
 
-    // PHASE 2: Headers are done - now start block downloads
-    // This only runs AFTER g_logged_headers_done is true
+    // Start block sync (runs in parallel with headers)
+    // fill_index_pipeline will cap at best_header_height for safety
     g_peer_index_capable[(Sock)ps.sock] = true;
     ps.syncing = true;
     if (ps.inflight_index == 0) {
