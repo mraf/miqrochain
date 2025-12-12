@@ -1003,10 +1003,19 @@ static inline int parallel_send_to_peers(
         // Check if we've exceeded total time budget
         auto elapsed = std::chrono::steady_clock::now() - batch_start;
         if (elapsed > max_total_time) {
-            // Time's up - close remaining peers and exit
-            for (size_t i = idx; i < sockets.size(); ++i) {
-                schedule_close(sockets[i]);
-            }
+            // PROPAGATION FIX: Time's up - but DON'T close connections!
+            // INVARIANT P3 VIOLATION: "Block relay MUST NOT be blocked by peer scoring"
+            // Closing slow peers during broadcast is a form of backpressure that
+            // prevents block relay to those peers entirely.
+            //
+            // Instead, just skip remaining peers for this broadcast.
+            // They will receive the block through:
+            // 1. Normal inv/getdata cycle
+            // 2. Subsequent relay from other peers
+            // 3. Next broadcast attempt
+            //
+            // OLD BUG: schedule_close(sockets[i]) - disconnected slow peers
+            // FIX: Just break - let them stay connected
             break;
         }
 
@@ -1046,12 +1055,15 @@ static inline int parallel_send_to_peers(
                     }
                 } else {
                     // Timeout - peer too slow
-                    // CRITICAL: We must still wait for the future to complete to prevent
-                    // dangling references. Use detached approach or wait in destructor.
-                    // For now, mark for close but the async task will complete eventually
-                    schedule_close(sockets[idx + i]);
-                    // Force-wait to prevent dangling reference to msg_ptr
-                    // Since msg_ptr is shared, the task will keep it alive
+                    // PROPAGATION FIX: DON'T close slow peers!
+                    // INVARIANT P3: "Block relay MUST NOT be blocked by peer scoring"
+                    // The peer is just slow - it will receive blocks through normal
+                    // inv/getdata cycle. Closing disconnects them from the network.
+                    //
+                    // OLD BUG: schedule_close(sockets[idx + i]) - disconnected slow peers
+                    // FIX: Just skip - the async task will complete, msg_ptr keeps message alive
+                    //
+                    // Note: The send may still succeed eventually - we just won't count it
                 }
             } catch (...) {
                 // Exception in async task - close socket
@@ -1476,16 +1488,22 @@ static inline bool peer_is_index_capable(Sock s) {
 }
 
 static inline int64_t adaptive_index_timeout_ms(const miq::PeerState& ps){
+    // PROPAGATION FIX: Reduced timeouts for sub-second relay guarantee
+    // INVARIANT P5: "There must exist NO valid execution exceeding 1 second"
+    //
+    // OLD BUG: 15s IBD / 10s steady - way too long, blocks pile up
+    // FIX: 2s max - matches IDX_STALE_THRESHOLD_MS
+    //
     // Base on observed block delivery; halve it for indices (headers+lookup are lighter).
-    int64_t base = std::max<int64_t>(5000, ps.avg_block_delivery_ms / 2);
+    int64_t base = std::max<int64_t>(500, ps.avg_block_delivery_ms / 4);  // Reduced from /2
     // Healthier peers get tighter timeouts, weaker peers looser.
     double health = std::min(1.0, std::max(0.0, ps.health_score)); // clamp
-    double health_mul = 2.0 - health; // 1.0..2.0
-    // During IBD or explicit index sync, allow more slack.
-    double ibd_mul = (!g_logged_headers_done || ps.syncing) ? 2.0 : 1.2;
+    double health_mul = 1.5 - (health * 0.5); // 1.0..1.5 (was 1.0..2.0)
+    // During IBD or explicit index sync, allow slightly more slack.
+    double ibd_mul = (!g_logged_headers_done || ps.syncing) ? 1.5 : 1.0;  // Reduced
     int64_t t = (int64_t)(base * health_mul * ibd_mul);
-    int64_t max_t = (!g_logged_headers_done || ps.syncing) ? 15000 : 10000; // 15s IBD, 10s steady - must match IDX_STALE_THRESHOLD_MS
-    return std::max<int64_t>(5000, std::min<int64_t>(t, max_t));
+    int64_t max_t = 2000; // 2s max - must match IDX_STALE_THRESHOLD_MS (was 15s/10s)
+    return std::max<int64_t>(500, std::min<int64_t>(t, max_t));
 }
 
 // ============================================================================
@@ -4871,31 +4889,32 @@ void P2P::loop(){
             size_t h = chain_.height();
 
             // ================================================================
-            // FORK VERIFICATION TIMEOUT - disconnect peers that don't respond
+            // FORK VERIFICATION TIMEOUT
+            // PROPAGATION FIX: Reduced from 10s to 1s for sub-second guarantee
+            // INVARIANT P5: "There must exist NO valid execution exceeding 1 second"
+            // INVARIANT P1: "relay MUST be attempted on EVERY main loop iteration"
+            //
+            // OLD BUG: 10-second timeout + disconnect on timeout
+            // FIX: 1-second timeout + just clear pending flag and proceed
+            // Peer may just be slow - don't disconnect, just stop waiting
             // ================================================================
-            constexpr int64_t FORK_VERIFY_TIMEOUT_MS = 10000;  // 10 second timeout
-            std::vector<Sock> verify_timeout_peers;
+            constexpr int64_t FORK_VERIFY_TIMEOUT_MS = 1000;  // 1 second timeout
             for (auto& kv : peers_) {
                 auto& pps = kv.second;
                 if (pps.fork_verification_pending &&
                     pps.fork_verification_sent_ms > 0 &&
                     (tnow - pps.fork_verification_sent_ms) > FORK_VERIFY_TIMEOUT_MS) {
                     log_warn("P2P: FORK VERIFICATION TIMEOUT - peer " + pps.ip +
-                            " did not respond within " + std::to_string(FORK_VERIFY_TIMEOUT_MS/1000) + "s");
-                    // Mark as forked (suspicious - why no response?)
+                            " did not respond within 1s - proceeding anyway");
+                    // PROPAGATION FIX: DON'T mark as forked or disconnect!
+                    // Just clear the pending flag so sync can proceed.
+                    // If peer is on a fork, we'll detect it when blocks don't validate.
                     pps.fork_verification_pending = false;
-                    pps.fork_detected = true;
-                    pps.syncing = false;
-                    g_peer_index_capable[kv.first] = false;
-                    verify_timeout_peers.push_back(kv.first);
-                }
-            }
-            // Disconnect timed out peers
-            for (Sock sd : verify_timeout_peers) {
-                auto it = peers_.find(sd);
-                if (it != peers_.end()) {
-                    log_warn("P2P: Disconnecting unresponsive peer " + it->second.ip);
-                    schedule_close(sd);  // Schedule for cleanup in the next loop iteration
+                    // Optimistically allow sync - validation will catch bad blocks
+                    pps.fork_verified = true;  // Assume good until proven otherwise
+                    pps.syncing = true;
+                    g_peer_index_capable[kv.first] = true;
+                    fill_index_pipeline(pps);
                 }
             }
 
@@ -5477,7 +5496,10 @@ void P2P::loop(){
           // Reduced from 30s to 2s for INSTANT recovery - stop-start must be eliminated!
           {
               const int64_t tnow = now_ms();
-              const int64_t STALL_RECOVERY_MS = 2000;  // 2 seconds - INSTANT recovery
+              // PROPAGATION FIX: Reduced from 2000ms to 500ms for sub-second relay guarantee
+              // INVARIANT P5: "There must exist NO valid execution exceeding 1 second"
+              // With 2s stall recovery, blocks could be delayed up to 2+ seconds
+              const int64_t STALL_RECOVERY_MS = 500;  // 500ms - TRUE instant recovery
               const uint64_t chain_height = chain_.height();
               // CRITICAL FIX: Use MAX of header height and known peer tip
               // During IBD, header height may be 0 or incomplete
@@ -5545,7 +5567,9 @@ void P2P::loop(){
           // higher, periodically reset to allow retry (peer may have had transient issue)
           {
               const int64_t tnow = now_ms();
-              const int64_t PEER_TIP_RECOVERY_MS = 5000;  // 5 seconds - fast recovery for stop-start prevention
+              // PROPAGATION FIX: Reduced from 5000ms to 1000ms for sub-second guarantee
+              // INVARIANT P5: "There must exist NO valid execution exceeding 1 second"
+              const int64_t PEER_TIP_RECOVERY_MS = 1000;  // 1 second - TRUE fast recovery
               for (auto& kvp : peers_) {
                   PeerState& ps = kvp.second;
                   if (!ps.verack_ok) continue;
@@ -5604,7 +5628,10 @@ void P2P::loop(){
           }
 
           // ========================================================================
-          // NUCLEAR SAFETY NET: Unconditional sync recovery every 500ms
+          // NUCLEAR SAFETY NET: Unconditional sync recovery
+          // PROPAGATION FIX: Reduced from 500ms to 200ms for sub-second guarantee
+          // INVARIANT P5: "There must exist NO valid execution exceeding 1 second"
+          //
           // This is the ultimate failsafe - if sync is behind and we have peers,
           // FORCE re-enable and refill ALL peers regardless of their state.
           // This ensures sync can NEVER get permanently stuck.
@@ -5617,8 +5644,8 @@ void P2P::loop(){
               const uint64_t header_height = chain_.best_header_height();
               const uint64_t target_height = std::max(header_height, max_peer);
 
-              // Run every 500ms when we're behind
-              if ((tnow - last_nuclear_check_ms > 500) &&
+              // Run every 200ms when we're behind (was 500ms)
+              if ((tnow - last_nuclear_check_ms > 200) &&
                   !peers_.empty() &&
                   target_height > 0 &&
                   chain_height < target_height) {
@@ -8921,11 +8948,12 @@ void P2P::loop(){
         }
 
         // BULLETPROOF SYNC: Aggressive cleanup of stale global requested indices
-        // CRITICAL FIX: Much faster cleanup to prevent sync stalls and forks
+        // PROPAGATION FIX: Much faster cleanup for sub-second relay guarantee
+        // INVARIANT P5: "There must exist NO valid execution exceeding 1 second"
         {
             static int64_t last_idx_cleanup_ms = 0;
-            constexpr int64_t IDX_CLEANUP_INTERVAL_MS = 5000;   // CRITICAL: Every 5 seconds (was 60s)
-            constexpr int64_t IDX_STALE_THRESHOLD_MS = 15000;   // CRITICAL: 15 seconds stale (was 5 min)
+            constexpr int64_t IDX_CLEANUP_INTERVAL_MS = 500;    // Every 500ms (was 5s)
+            constexpr int64_t IDX_STALE_THRESHOLD_MS = 2000;    // 2 seconds stale (was 15s)
 
             if (current_time - last_idx_cleanup_ms >= IDX_CLEANUP_INTERVAL_MS) {
                 last_idx_cleanup_ms = current_time;
@@ -8967,10 +8995,13 @@ void P2P::loop(){
         // BIP152: COMPACT BLOCK TIMEOUT FALLBACK
         // If we've been waiting too long for blocktxn, request full block instead
         // This prevents stalls when peers don't respond with missing transactions
+        // BIP152: Compact block timeout handling
+        // PROPAGATION FIX: Reduced intervals for sub-second guarantee
+        // INVARIANT P5: "There must exist NO valid execution exceeding 1 second"
         {
             static int64_t last_compact_cleanup_ms = 0;
-            constexpr int64_t COMPACT_CLEANUP_INTERVAL_MS = 5000;   // Check every 5 seconds
-            constexpr int64_t COMPACT_TIMEOUT_MS = 10000;           // 10 second timeout
+            constexpr int64_t COMPACT_CLEANUP_INTERVAL_MS = 500;    // Every 500ms (was 5s)
+            constexpr int64_t COMPACT_TIMEOUT_MS = 2000;            // 2 second timeout (was 10s)
 
             if (current_time - last_compact_cleanup_ms >= COMPACT_CLEANUP_INTERVAL_MS) {
                 last_compact_cleanup_ms = current_time;

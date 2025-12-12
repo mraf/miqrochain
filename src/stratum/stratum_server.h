@@ -228,6 +228,7 @@ private:
 
     // State
     std::atomic<bool> running_{false};
+    std::atomic<bool> new_block_pending_{false};  // PROPAGATION FIX: Async notification flag
     StratumSock listen_sock_{STRATUM_INVALID_SOCKET};
     std::thread accept_thread_;
     std::thread work_thread_;
