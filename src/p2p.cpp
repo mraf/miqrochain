@@ -78,10 +78,10 @@ namespace miq {
 #ifndef MIQ_SEED_MODE_OUTBOUND_TARGET
 #define MIQ_SEED_MODE_OUTBOUND_TARGET 4  // Match constants.h
 #endif
-// CRITICAL: Use fast fallback - if headers stall for 3s, switch to index sync
-// This was 5 minutes which caused massive delays!
+// CRITICAL: Use FAST fallback - if headers stall for 1s, switch to index sync
+// Headers should arrive almost instantly for small chains
 #ifndef MIQ_IBD_FALLBACK_AFTER_MS
-#define MIQ_IBD_FALLBACK_AFTER_MS (3 * 1000)  // 3 seconds - matches constants.h
+#define MIQ_IBD_FALLBACK_AFTER_MS (1 * 1000)  // 1 second - aggressive fallback
 #endif
 // ============================================================================
 // PERFORMANCE OPTIMIZATION: P2P Trace disabled by default
@@ -243,13 +243,13 @@ static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
 #endif
 
 #ifndef MIQ_INDEX_PIPELINE
-#define MIQ_INDEX_PIPELINE 128  // PERFORMANCE: Increased from 64 for faster block download
+#define MIQ_INDEX_PIPELINE 512  // AGGRESSIVE: Maximum parallel block requests
 #endif
 
 // CRITICAL: Header pipeline size - how many header requests in flight
-// Increased from 1 to 4 for faster header sync during IBD
+// For small chains, headers should download almost instantly
 #ifndef MIQ_HDR_PIPELINE
-#define MIQ_HDR_PIPELINE 4
+#define MIQ_HDR_PIPELINE 16  // Allow many header batches in flight
 #endif
 #ifndef MIQ_SYNC_SEQUENTIAL_DEFAULT
 #define MIQ_SYNC_SEQUENTIAL_DEFAULT 0
@@ -1215,6 +1215,9 @@ static int g_headers_tip_confirmed = 0;   // consecutive confirmations of "at ti
 // Flag to trigger immediate block sync when headers complete
 static std::atomic<bool> g_headers_just_done{false};
 
+// Global max peer tip - updated whenever we learn of higher tips
+static std::atomic<uint64_t> g_max_known_peer_tip{0};
+
 static inline void maybe_mark_headers_done(bool at_tip) {
     if (g_logged_headers_done) return;
     if (!g_logged_headers_started) {
@@ -1222,14 +1225,28 @@ static inline void maybe_mark_headers_done(bool at_tip) {
         return;
     }
 
-    // When we're at tip (receiving empty headers), always allow the confirmation logic to run
-    // This is essential for chains of any size - we need to confirm we're truly at the tip
+    // CRITICAL FIX: Don't mark headers done just because ONE peer sent empty headers!
+    // We must verify our header height is >= the maximum known peer tip.
+    // Otherwise we'll prematurely think we're synced and show wrong progress.
     if (at_tip) {
+        // Double-check: is our header height actually >= max peer tip?
+        uint64_t hdr_height = g_chain_ptr ? g_chain_ptr->best_header_height() : 0;
+        uint64_t max_peer_tip = g_max_known_peer_tip.load();
+
+        // Only consider headers done if we actually have headers up to max peer tip
+        // (or very close - allow 10 block margin for timing)
+        if (max_peer_tip > 0 && hdr_height + 10 < max_peer_tip) {
+            // NOT at real tip - peers know of higher chain!
+            // Don't increment confirmation counter, and reset to avoid false positives
+            g_headers_tip_confirmed = 0;
+            return;
+        }
+
         if (++g_headers_tip_confirmed >= 3) {
             g_logged_headers_done = true;
             g_headers_just_done.store(true);  // Signal to start block downloads NOW
-            uint64_t hdr_height = g_chain_ptr ? g_chain_ptr->best_header_height() : 0;
             miq::log_info("[IBD] headers phase COMPLETE (height=" + std::to_string(hdr_height) +
+                         ", max_peer_tip=" + std::to_string(max_peer_tip) +
                          ") — IMMEDIATELY starting block downloads!");
         }
     } else {
@@ -1262,7 +1279,16 @@ static void remove_file_scope_inflight(const std::string& hash) {
 
 static std::unordered_map<Sock,int> g_index_timeouts;
 static inline void mark_index_timeout(Sock s){
-    int &c = g_index_timeouts[s]; if (++c >= 3) g_peer_index_capable[s] = false;
+    int &c = g_index_timeouts[s];
+    // CRITICAL FIX: 3 timeouts was way too aggressive!
+    // With 512 in-flight requests, normal network latency can easily cause 3 timeouts
+    // This disabled peers and caused stop-start sync behavior
+    // During IBD: Allow 50 timeouts before disabling (pipeline is 512)
+    // After IBD: Allow 10 timeouts (pipeline is smaller)
+    int threshold = !g_logged_headers_done ? 50 : 10;
+    if (++c >= threshold) {
+        g_peer_index_capable[s] = false;
+    }
 }
 
 // ---- NEW: pre-verack safe allow-list & counters ----------------------------
@@ -1491,28 +1517,31 @@ static inline void update_peer_reputation(miq::PeerState& ps) {
 
 // Calculate adaptive batch size based on peer reputation and network conditions
 static inline uint32_t calculate_adaptive_batch_size(const miq::PeerState& ps) {
-    // PERFORMANCE FIX: Increased batch sizes for faster block download
-    // Excellent peers (0.9+): 64 blocks
-    // Good peers (0.7-0.9): 48 blocks
-    // Average peers (0.5-0.7): 32 blocks
-    // Poor peers (<0.5): 16 blocks
+    // AGGRESSIVE: Much larger batch sizes for FAST sync
+    // For small chains (5-10k blocks), sync should be nearly instant
 
     double rep = ps.reputation_score;
     uint32_t batch_size;
 
-    if (rep >= 0.9) {
-        batch_size = 64;
-    } else if (rep >= 0.7) {
-        batch_size = 48;
-    } else if (rep >= 0.5) {
-        batch_size = 32;
+    // During IBD: MAXIMUM AGGRESSION - request as many blocks as possible
+    if (!g_logged_headers_done) {
+        // IBD mode: huge batches for fast sync
+        if (rep >= 0.5) {
+            batch_size = 256;  // Request 256 blocks at once during IBD
+        } else {
+            batch_size = 128;  // Even poor peers get large batches during IBD
+        }
     } else {
-        batch_size = 16;
-    }
-
-    // During IBD (before headers done), allow even larger batches for faster sync
-    if (!g_logged_headers_done && rep >= 0.8) {
-        batch_size = std::min(128u, batch_size * 2);
+        // Post-IBD: normal operation with reasonable batches
+        if (rep >= 0.9) {
+            batch_size = 64;
+        } else if (rep >= 0.7) {
+            batch_size = 48;
+        } else if (rep >= 0.5) {
+            batch_size = 32;
+        } else {
+            batch_size = 16;
+        }
     }
 
     return batch_size;
@@ -2168,12 +2197,16 @@ static inline std::vector<uint8_t> miq_build_version_payload(uint32_t start_heig
 
 // Small helper to throttle header pipelining safely.
 [[maybe_unused]] static inline bool can_accept_hdr_batch(miq::PeerState& ps, int64_t now) {
-    const int      kMaxInflight = 16;   // wider header pipeline
-    const int64_t  kMinGapMs    = 10; // keep tiny gap to avoid tight spins
+    // AGGRESSIVE: Use MIQ_HDR_PIPELINE for consistency
+    const int      kMaxInflight = MIQ_HDR_PIPELINE;
+    // CRITICAL FIX: During IBD, no gap between requests - blast them all!
+    const int64_t  kMinGapMs    = g_logged_headers_done ? 10 : 0;
     if (static_cast<uint32_t>(ps.inflight_hdr_batches) >= static_cast<uint32_t>(kMaxInflight)) return false;
-    auto it = g_last_hdr_req_ms.find((Sock)ps.sock);
-    int64_t last_req = (it == g_last_hdr_req_ms.end()) ? 0 : it->second;
-    if (last_req && (now - last_req) < kMinGapMs) return false;
+    if (kMinGapMs > 0) {
+        auto it = g_last_hdr_req_ms.find((Sock)ps.sock);
+        int64_t last_req = (it == g_last_hdr_req_ms.end()) ? 0 : it->second;
+        if (last_req && (now - last_req) < kMinGapMs) return false;
+    }
     return true;
 }
 static inline std::string miq_idx_key(uint64_t idx) {
@@ -2215,6 +2248,14 @@ bool P2P::check_rate(PeerState& ps, const char* family, double cost, int64_t tno
     if (!family) family = "misc";
     if (cost < 0) cost = 0;
     const std::string fam(family);
+
+    // CRITICAL FIX: During IBD, don't rate-limit headers or blocks!
+    // Rate limiting during sync causes extremely slow downloads
+    if (!g_logged_headers_done) {
+        if (fam == "hdr" || fam == "get" || fam == "blk") {
+            return true;  // Allow unlimited during IBD
+        }
+    }
 
     // Look up per-family config: default if missing.
     double per_sec = 10.0;
@@ -2587,6 +2628,8 @@ bool P2P::start(uint16_t port){
     
     g_logged_headers_started = false;
     g_logged_headers_done    = false;
+    g_max_known_peer_tip.store(0);  // Reset max peer tip on start
+    g_headers_tip_confirmed = 0;
     g_global_inflight_blocks.clear();
     g_inflight_block_ts.clear();
     g_rr_next_idx.clear();
@@ -3465,9 +3508,9 @@ void P2P::start_sync_with_peer(PeerState& ps){
         auto pl2 = build_getheaders_payload(locator, stop);
         auto m2  = encode_msg("getheaders", pl2);
         int pushed = 0;
+        // AGGRESSIVE: No rate limiting on headers during IBD - blast them all!
         while (can_accept_hdr_batch(ps, now_ms()) &&
-               check_rate(ps, "hdr", 1.0, now_ms()) &&
-               pushed < 4) {
+               pushed < MIQ_HDR_PIPELINE) {
             ps.sent_getheaders = true;
             (void)send_or_close(ps.sock, m2);
             ps.inflight_hdr_batches++;
@@ -3529,21 +3572,23 @@ void P2P::fill_index_pipeline(PeerState& ps){
     uint64_t max_index = current_height + max_ahead;
 
     // Determine the limit for block requests from this peer
-    // CRITICAL FIX: During IBD, DON'T cap at header height!
-    // Headers and blocks download in parallel - blocks waiting in orphan pool is OK.
-    // Only cap at header height AFTER headers phase is complete.
+    // CRITICAL FIX: Use the MAXIMUM of header height and peer_tip_height!
+    // Headers reveal the true chain height even if peer announced a lower tip.
     const uint64_t best_hdr = chain_.best_header_height();
     uint64_t peer_limit;
 
-    if (g_logged_headers_done && best_hdr > 0) {
-        // After headers done, use header height as definitive limit
+    if (best_hdr > 0) {
+        // Headers tell us the true chain height - use it as primary limit
         peer_limit = best_hdr;
+        // But if peer announced higher (speculative), use that during early IBD
+        if (!g_logged_headers_done && ps.peer_tip_height > peer_limit) {
+            peer_limit = ps.peer_tip_height;
+        }
     } else if (ps.peer_tip_height > 0) {
-        // During IBD: use peer's announced tip - let blocks download ahead of headers!
-        // This is the KEY fix - blocks will wait in orphan pool until headers catch up
+        // No headers yet - use peer's announced tip
         peer_limit = ps.peer_tip_height;
     } else {
-        // No peer tip - use aggressive window for fast IBD
+        // No peer tip and no headers - use aggressive window for fast IBD
         peer_limit = current_height + max_ahead;
     }
 
@@ -5252,7 +5297,10 @@ void P2P::loop(){
 
           for (auto &kvp : peers_){
             Sock s = kvp.first;
-            if (g_index_timeouts[s] >= 3 && g_peer_index_capable[s]) {
+            // CRITICAL FIX: Use same threshold as mark_index_timeout()
+            // 3 was way too aggressive - caused stop-start sync behavior
+            int threshold = !g_logged_headers_done ? 50 : 10;
+            if (g_index_timeouts[s] >= threshold && g_peer_index_capable[s]) {
               // demote
               g_peer_index_capable[s] = false;
               auto &ps = kvp.second;
@@ -5333,12 +5381,16 @@ void P2P::loop(){
 
           // CRITICAL FIX: Stall recovery - if no progress for N seconds, force re-enable ALL peers
           // This handles cases where all peers got demoted or stuck in invalid states
-          // Reduced from 30s to 10s for ALL platforms - faster recovery is always better
+          // Reduced from 30s to 5s for AGGRESSIVE recovery
           {
               const int64_t tnow = now_ms();
-              const int64_t STALL_RECOVERY_MS = 10000;  // 10 seconds - aggressive but necessary
+              const int64_t STALL_RECOVERY_MS = 5000;  // 5 seconds - very aggressive
               const uint64_t chain_height = chain_.height();
-              const uint64_t target_height = chain_.best_header_height();
+              // CRITICAL FIX: Use MAX of header height and known peer tip
+              // During IBD, header height may be 0 or incomplete
+              const uint64_t header_height = chain_.best_header_height();
+              const uint64_t max_peer = g_max_known_peer_tip.load();
+              const uint64_t target_height = std::max(header_height, max_peer);
 
               // Check if we're stalled: no progress, not fully synced, have peers
               if (!peers_.empty() &&
@@ -5346,7 +5398,7 @@ void P2P::loop(){
                   chain_height < target_height &&
                   (tnow - g_last_progress_ms) > STALL_RECOVERY_MS) {
 
-                  log_warn("P2P: Sync stalled for 30s at height " + std::to_string(chain_height) +
+                  log_warn("P2P: Sync stalled for " + std::to_string(STALL_RECOVERY_MS/1000) + "s at height " + std::to_string(chain_height) +
                            "/" + std::to_string(target_height) + " - forcing recovery");
 
                   // Force re-enable ALL peers for sync
@@ -6798,6 +6850,16 @@ void P2P::loop(){
                                 ps.peer_tip_height = announced_height;
                                 ps.announced_tip_height = announced_height;  // Save original for recovery
 
+                                // CRITICAL FIX: Track maximum known peer tip globally
+                                // This prevents premature "headers done" when peers know of higher chain
+                                uint64_t old_max = g_max_known_peer_tip.load();
+                                while (announced_height > old_max) {
+                                    if (g_max_known_peer_tip.compare_exchange_weak(old_max, announced_height)) {
+                                        log_info("P2P: New max peer tip discovered: " + std::to_string(announced_height));
+                                        break;
+                                    }
+                                }
+
                                 // CRITICAL FIX: Trigger immediate sync if peer has higher tip
                                 // This prevents falling behind when new blocks are announced
                                 const uint64_t our_height = chain_.height();
@@ -6929,8 +6991,9 @@ void P2P::loop(){
                             std::vector<uint8_t> stop(32, 0);
                             auto pl2 = build_getheaders_payload(locator, stop);
                             auto m2  = encode_msg("getheaders", pl2);
+                            // AGGRESSIVE: During IBD, don't rate-limit headers!
+                            // For small chains this should be instant
                             while (can_accept_hdr_batch(ps, now_ms()) &&
-                                   check_rate(ps, "hdr", 1.0, now_ms()) &&
                                    pushed < MIQ_HDR_PIPELINE) {
                                 ps.sent_getheaders = true;
                                 (void)send_or_close(s, m2);
