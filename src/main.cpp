@@ -1395,136 +1395,91 @@ static inline std::string spark_ascii(const std::vector<double>& v){
 }
 
 // Sync gate helper (used both in TUI texts and IBD logic)
+// SIMPLIFIED: ALL nodes use IDENTICAL logic - no seed node special cases
 static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
-    // CRITICAL FIX: Only count peers that have completed handshake (verack_ok)
-    // Otherwise we might think we're synced when peer hasn't told us their height yet
+    uint64_t block_height = chain.height();
+    uint64_t header_height = chain.best_header_height();
+
+    // ========================================================================
+    // RULE 1: Must be caught up with headers
+    // This is the PRIMARY check - blocks must match or exceed header height
+    // ========================================================================
+    if (header_height > 0 && block_height < header_height) {
+        why_out = "syncing (" + std::to_string(block_height) + "/" + std::to_string(header_height) + ")";
+        return false;
+    }
+
+    // ========================================================================
+    // RULE 2: Must have at least one peer OR be at genesis for new chain
+    // ========================================================================
     size_t verack_peers = 0;
     auto all_peers = p2p ? p2p->snapshot_peers() : std::vector<PeerSnapshot>{};
     for (const auto& pr : all_peers) {
         if (pr.verack_ok) verack_peers++;
     }
 
-    const bool we_are_seed = compute_seed_role().we_are_seed;
-    const bool seed_solo = we_are_seed && verack_peers == 0;
-
-    if (!seed_solo && verack_peers == 0) {
+    // Special case: Genesis node bootstrapping a new chain (no peers, no blocks)
+    if (block_height == 0 && verack_peers == 0) {
+        // Allow genesis mining only if we have no headers either (truly new chain)
+        if (header_height == 0) {
+            why_out.clear();
+            return true;  // Allow starting new chain
+        }
         why_out = "no peers";
         return false;
     }
 
-    uint64_t h = chain.height();
-
-    if (h == 0) {
-        if (seed_solo) {
-            why_out.clear();
-            return true; // allow solo mining from genesis regardless of timestamp
-        }
-        why_out = "headers syncing";
+    // Must have at least one peer if we have blocks
+    if (block_height > 0 && verack_peers == 0) {
+        why_out = "no peers";
         return false;
     }
 
-    // For seed nodes (solo or with peers), allow serving blocks even with stale tips
-    // This is necessary to bootstrap the chain and serve historical blocks to peers
-    if (we_are_seed) {
-        why_out.clear();
-        return true;
-    }
-
-    // For peer nodes that have successfully synced blocks from a seed, also allow stale tips
-    // This handles the case where we've synced historical blocks that are legitimately old
-    if (verack_peers > 0) {
-        // Only finish sync once we've reached all known blocks from peers
-        // CRITICAL: Only consider peers with verack_ok AND valid peer_tip
-        uint64_t max_peer_tip = 0;
-        size_t peers_with_tip = 0;
-        for (const auto& pr : all_peers) {
-            if (pr.verack_ok && pr.peer_tip > 0) {
-                max_peer_tip = std::max(max_peer_tip, pr.peer_tip);
-                peers_with_tip++;
-            }
-        }
-
-        // If no peers have reported their tip yet, check if we can proceed anyway
-        // This handles the case where peers are connected but haven't sent their tip yet
-        if (peers_with_tip == 0) {
-            auto tip = chain.tip();
-            uint64_t tsec = hdr_time(tip);
-            uint64_t now_time = (uint64_t)std::time(nullptr);
-            uint64_t tip_age = (now_time > tsec) ? (now_time - tsec) : 0;
-
-            // If tip is fresh (< 8 min) and we have blocks, consider synced
-            // Don't wait forever for peers to report tips
-            if (tip_age < 8 * 60 && h > 0) {
-                uint64_t header_height = chain.best_header_height();
-                // Either no headers yet (header_height==0) or we're caught up
-                if (header_height == 0 || h >= header_height) {
-                    why_out.clear();
-                    return true;
-                }
-            }
-            why_out = "waiting for peer tip heights";
-            return false;
-        }
-
-        // CRITICAL FIX: Verify that blocks are actually validated, not just headers
-        // best_header_height can be far ahead of height() during header-first sync
-        uint64_t block_height = h;
-        uint64_t header_height = chain.best_header_height();
-
-        // If headers are significantly ahead of blocks, we're still downloading blocks
-        // Allow up to 10 block difference for normal operation
-        if (header_height > block_height + 10) {
-            why_out = "blocks behind headers (blocks=" + std::to_string(block_height) +
-                     " headers=" + std::to_string(header_height) + ")";
-            return false;
-        }
-
-        if (h >= max_peer_tip) {
-            // CRITICAL FIX: Also verify the tip is reasonably fresh
-            // This prevents declaring sync complete on a stale chain
-            auto tip = chain.tip();
-            uint64_t tsec = hdr_time(tip);
-            uint64_t now = (uint64_t)std::time(nullptr);
-            uint64_t age = (now > tsec) ? (now - tsec) : 0;
-            // Allow up to 8 minutes (1 block time)
-            const uint64_t max_age = 8 * 60;
-            if (age > max_age) {
-                why_out = "tip timestamp too old (" + std::to_string(age) + "s)";
-                return false;
-            }
-            why_out.clear();
-            return true;
-        } else {
-            why_out = "syncing blocks (" + std::to_string(h) + "/" + std::to_string(max_peer_tip) + ")";
-            return false;
-        }
-    }
-
-    // CRITICAL: Must have at least one connected peer before declaring synced
-    // (unless we're a seed node, which is handled above)
-    if (verack_peers == 0) {
-        why_out = "waiting for peer connection";
-        return false;
-    }
-
+    // ========================================================================
+    // RULE 3: Tip must not be too old (prevents stale chain)
+    // Allow 15 minutes for slow networks, but not hours old
+    // ========================================================================
     auto tip = chain.tip();
-    uint64_t tsec = hdr_time(tip);
-    if (tsec == 0) {
-        why_out = "waiting for headers time";
-        return false;
-    }
-    uint64_t now = (uint64_t)std::time(nullptr);
-    uint64_t age = (now > tsec) ? (now - tsec) : 0;
-    const uint64_t fresh = 8 * 60;  // 8 minutes = 1 block time
+    uint64_t tip_time = hdr_time(tip);
+    uint64_t now_time = (uint64_t)std::time(nullptr);
+    uint64_t tip_age = (now_time > tip_time) ? (now_time - tip_time) : 0;
 
-    if (age > fresh) {
-        why_out = "tip too old";
+    // If we have blocks but tip is ancient, something is wrong
+    if (block_height > 0 && tip_age > 15 * 60) {  // 15 minutes
+        why_out = "tip too old (" + std::to_string(tip_age / 60) + "m)";
         return false;
     }
 
+    // ========================================================================
+    // RULE 4: Check peer-reported heights (if available)
+    // We should be at or above the highest reported peer tip
+    // ========================================================================
+    uint64_t max_peer_tip = 0;
+    for (const auto& pr : all_peers) {
+        if (pr.verack_ok && pr.peer_tip > 0) {
+            max_peer_tip = std::max(max_peer_tip, pr.peer_tip);
+        }
+    }
+
+    if (max_peer_tip > 0 && block_height < max_peer_tip) {
+        why_out = "syncing (" + std::to_string(block_height) + "/" + std::to_string(max_peer_tip) + ")";
+        return false;
+    }
+
+    // ========================================================================
+    // ALL CHECKS PASSED - Node is synced
+    // ========================================================================
     why_out.clear();
     return true;
 }
+
+// Legacy compatibility - keeping old signature but simplified
+[[maybe_unused]] static bool compute_sync_gate_legacy(Chain& chain, [[maybe_unused]] P2P* p2p, std::string& why_out) {
+    // This is just the old function signature for any code that might call it
+    return compute_sync_gate(chain, p2p, why_out);
+}
+
+// Old complex sync gate code removed - all nodes now use identical simple logic
 
 static bool any_verack_peer(P2P* p2p){
     if (!p2p) return false;
@@ -3215,28 +3170,16 @@ private:
         if (rows < 38) rows = 38;
 
         // Check if sync is complete to transition from Splash to Main
-        // Transition when either:
+        // CRITICAL: Only transition when BOTH conditions are met:
         // 1. ibd_done_ is true AND node state is Running (normal completion)
-        // 2. OR blocks are 100% synced (ibd_cur_ >= ibd_target_) - handles peer disconnect case
+        // 2. AND we're caught up with header height (not just peer-reported height)
         bool sync_complete = ibd_done_ && (nstate_ == NodeState::Running);
 
-        // FIXED: Also transition when blocks are 100% synced even if ibd_done_ isn't set
-        // This handles the case where peers disconnect after all blocks are downloaded,
-        // which prevents compute_sync_gate() from returning true and leaves us stuck
-        // NOTE: ibd_target_ > 0 ensures we have a known network height before transitioning
-        if (!sync_complete && ibd_target_ > 0 && ibd_cur_ >= ibd_target_) {
-            // We've downloaded all known blocks - treat as successful sync
-            // Set the internal state to match so the main screen shows correct info
-            if (!ibd_done_) {
-                ibd_done_ = true;
-                // PERFORMANCE: Mark IBD complete to enable full durability (fsync on every block)
-                miq::mark_ibd_complete();
-            }
-            if (nstate_ != NodeState::Running) {
-                nstate_ = NodeState::Running;
-            }
-            sync_complete = true;
-        }
+        // REMOVED: The old fallback logic was causing premature transitions
+        // when ibd_cur_ >= ibd_target_ but we weren't actually synced.
+        // The ibd_target_ could be stale or from a peer with incomplete data.
+        // Now we ONLY transition when compute_sync_gate() returns true,
+        // which properly checks header height vs block height.
 
         if (sync_complete && view_mode_ == ViewMode::Splash) {
             // FIXED: Delay transition for 20+ frames (~2 seconds) to show "100%" completion
