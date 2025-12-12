@@ -3564,6 +3564,13 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // peer_is_index_capable is set by start_sync_with_peer
     if (!peer_is_index_capable((Sock)ps.sock)) return;
 
+    // CRITICAL: Don't sync from peers on a different fork!
+    // This prevents wasting bandwidth and getting confused by fork blocks
+    if (ps.fork_detected) {
+        P2P_TRACE("Skipping fill_index_pipeline for forked peer " + ps.ip);
+        return;
+    }
+
     // SYNC STATE FIX: Ensure next_index is consistent with current chain height
     const uint64_t current_height = chain_.height();
     if (ps.next_index <= current_height) {
@@ -7469,6 +7476,50 @@ void P2P::loop(){
                             clear_block_inflight(bh, (Sock)s);
                             P2P_TRACE_IF(true, "Received block " + bh.substr(0, 16) + "... from peer");
 
+                            // ================================================================
+                            // FORK DETECTION: Check if this block is on our chain
+                            // If peer sends a block with prev_hash that doesn't match our
+                            // chain at that height, they're on a different fork.
+                            // ================================================================
+                            {
+                                // Get expected height for this block from its prev_hash
+                                int64_t parent_height = chain_.get_header_height(hb.header.prev_hash);
+                                uint64_t expected_height = (parent_height >= 0) ? (uint64_t)(parent_height + 1) : 0;
+
+                                if (expected_height > 0 && expected_height <= chain_.height()) {
+                                    // We already have a block at this height - check if it matches
+                                    Block our_block;
+                                    if (chain_.get_block_by_index(expected_height, our_block)) {
+                                        auto received_hash = hb.block_hash();
+                                        auto our_hash = our_block.block_hash();
+                                        if (our_hash != received_hash) {
+                                            // FORK DETECTED: Peer sent a different block for same height
+                                            if (!ps.fork_detected) {
+                                                log_warn("P2P: FORK DETECTED - peer " + ps.ip +
+                                                        " sent different block at height " + std::to_string(expected_height) +
+                                                        " (they are on a different chain)");
+                                                ps.fork_detected = true;
+                                                ps.fork_check_height = expected_height;
+                                                ps.fork_check_hash = received_hash;
+                                                // Stop syncing from this forked peer
+                                                ps.syncing = false;
+                                                g_peer_index_capable[(Sock)s] = false;
+                                            }
+                                            continue;  // Don't process blocks from forked peers
+                                        }
+                                    }
+                                } else if (!ps.fork_verified && parent_height >= 0 && chain_.height() > 0) {
+                                    // Block extends tip or is for a height we don't have yet
+                                    // If it connects to our chain, peer is verified on same chain
+                                    if (chain_.have_block(hb.header.prev_hash)) {
+                                        ps.fork_verified = true;
+                                        ps.fork_check_height = (uint64_t)parent_height;
+                                        log_info("P2P: Verified peer " + ps.ip + " is on same chain (height " +
+                                                std::to_string(parent_height) + ")");
+                                    }
+                                }
+                            }
+
                             // FIX: Update peer_tip_height when we receive blocks via index fetch.
                             // This is critical for correct sync completion detection.
                             // When we request block at index N and receive it, peer has at least N blocks.
@@ -8864,6 +8915,8 @@ std::vector<PeerSnapshot> P2P::snapshot_peers() const {
         s.rx_buf        = ps.rx.size();
         s.inflight      = ps.inflight_tx.size();
         s.peer_tip      = ps.peer_tip_height;
+        s.fork_detected = ps.fork_detected;
+        s.fork_verified = ps.fork_verified;
         out.push_back(std::move(s));
     }
     return out;

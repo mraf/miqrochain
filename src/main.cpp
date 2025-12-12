@@ -4345,6 +4345,8 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             uint64_t current_peer_max = 0;
             auto peer_snapshot = p2p->snapshot_peers();
             for (const auto& pr : peer_snapshot) {
+                // CRITICAL: Skip forked peers - don't let them affect our target height!
+                if (pr.fork_detected) continue;
                 if (pr.verack_ok && pr.peer_tip > 0) {
                     if (pr.peer_tip > current_peer_max) {
                         current_peer_max = pr.peer_tip;
