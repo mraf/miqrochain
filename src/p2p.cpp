@@ -1215,6 +1215,9 @@ static int g_headers_tip_confirmed = 0;   // consecutive confirmations of "at ti
 // Flag to trigger immediate block sync when headers complete
 static std::atomic<bool> g_headers_just_done{false};
 
+// Global max peer tip - updated whenever we learn of higher tips
+static std::atomic<uint64_t> g_max_known_peer_tip{0};
+
 static inline void maybe_mark_headers_done(bool at_tip) {
     if (g_logged_headers_done) return;
     if (!g_logged_headers_started) {
@@ -1222,14 +1225,28 @@ static inline void maybe_mark_headers_done(bool at_tip) {
         return;
     }
 
-    // When we're at tip (receiving empty headers), always allow the confirmation logic to run
-    // This is essential for chains of any size - we need to confirm we're truly at the tip
+    // CRITICAL FIX: Don't mark headers done just because ONE peer sent empty headers!
+    // We must verify our header height is >= the maximum known peer tip.
+    // Otherwise we'll prematurely think we're synced and show wrong progress.
     if (at_tip) {
+        // Double-check: is our header height actually >= max peer tip?
+        uint64_t hdr_height = g_chain_ptr ? g_chain_ptr->best_header_height() : 0;
+        uint64_t max_peer_tip = g_max_known_peer_tip.load();
+
+        // Only consider headers done if we actually have headers up to max peer tip
+        // (or very close - allow 10 block margin for timing)
+        if (max_peer_tip > 0 && hdr_height + 10 < max_peer_tip) {
+            // NOT at real tip - peers know of higher chain!
+            // Don't increment confirmation counter, and reset to avoid false positives
+            g_headers_tip_confirmed = 0;
+            return;
+        }
+
         if (++g_headers_tip_confirmed >= 3) {
             g_logged_headers_done = true;
             g_headers_just_done.store(true);  // Signal to start block downloads NOW
-            uint64_t hdr_height = g_chain_ptr ? g_chain_ptr->best_header_height() : 0;
             miq::log_info("[IBD] headers phase COMPLETE (height=" + std::to_string(hdr_height) +
+                         ", max_peer_tip=" + std::to_string(max_peer_tip) +
                          ") — IMMEDIATELY starting block downloads!");
         }
     } else {
@@ -2590,6 +2607,8 @@ bool P2P::start(uint16_t port){
     
     g_logged_headers_started = false;
     g_logged_headers_done    = false;
+    g_max_known_peer_tip.store(0);  // Reset max peer tip on start
+    g_headers_tip_confirmed = 0;
     g_global_inflight_blocks.clear();
     g_inflight_block_ts.clear();
     g_rr_next_idx.clear();
@@ -6802,6 +6821,16 @@ void P2P::loop(){
                                 announced_height |= (uint32_t)m.payload[pos + ua_size + 3] << 24;
                                 ps.peer_tip_height = announced_height;
                                 ps.announced_tip_height = announced_height;  // Save original for recovery
+
+                                // CRITICAL FIX: Track maximum known peer tip globally
+                                // This prevents premature "headers done" when peers know of higher chain
+                                uint64_t old_max = g_max_known_peer_tip.load();
+                                while (announced_height > old_max) {
+                                    if (g_max_known_peer_tip.compare_exchange_weak(old_max, announced_height)) {
+                                        log_info("P2P: New max peer tip discovered: " + std::to_string(announced_height));
+                                        break;
+                                    }
+                                }
 
                                 // CRITICAL FIX: Trigger immediate sync if peer has higher tip
                                 // This prevents falling behind when new blocks are announced
