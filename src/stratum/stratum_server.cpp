@@ -394,8 +394,32 @@ void StratumServer::work_loop() {
     while (running_) {
         int64_t now = now_ms();
 
-        // Create periodic job update (every 30 seconds) or when tip changes
-        if (now - last_job_time > 30000) {
+        // PROPAGATION FIX: Check for async new block notification FIRST
+        // This ensures miners get new jobs within 10ms of block validation
+        // The flag is set by notify_new_block() which is called from P2P thread
+        if (new_block_pending_.exchange(false, std::memory_order_acq_rel)) {
+            auto job = create_job();
+            job.clean_jobs = true;  // New block = clean jobs
+            {
+                std::lock_guard<std::mutex> lock(jobs_mutex_);
+                jobs_[job.job_id] = job;
+                job_order_.push_back(job.job_id);
+                current_job_id_ = job.job_id;
+            }
+            size_t subscribed_count = 0;
+            {
+                std::lock_guard<std::mutex> lock(miners_mutex_);
+                for (const auto& kv : miners_) {
+                    if (kv.second.subscribed) subscribed_count++;
+                }
+            }
+            log_info("Stratum: NEW BLOCK job " + job.job_id + " height=" + std::to_string(job.height) +
+                     " broadcasting to " + std::to_string(subscribed_count) + " miners");
+            broadcast_job(job);
+            last_job_time = now;  // Reset periodic timer
+        }
+        // Create periodic job update (every 30 seconds)
+        else if (now - last_job_time > 30000) {
             auto job = create_job();
             {
                 std::lock_guard<std::mutex> lock(jobs_mutex_);
@@ -1716,15 +1740,17 @@ std::string StratumServer::generate_job_id() {
 }
 
 void StratumServer::notify_new_block() {
-    auto job = create_job();
-    job.clean_jobs = true;
-    {
-        std::lock_guard<std::mutex> lock(jobs_mutex_);
-        jobs_[job.job_id] = job;
-        job_order_.push_back(job.job_id);
-        current_job_id_ = job.job_id;
-    }
-    broadcast_job(job);
+    // PROPAGATION FIX: Make notification ASYNCHRONOUS
+    // This function is called from the P2P relay thread during block validation.
+    // Previously, it would synchronously create jobs and broadcast to all miners,
+    // blocking the relay thread for potentially hundreds of milliseconds.
+    //
+    // INVARIANT P2 VIOLATION: "Validation MUST NOT trigger network I/O"
+    // INVARIANT P4 VIOLATION: "Relay MUST NOT share locks/queues with mining"
+    //
+    // FIX: Just set a flag. The work_loop thread will see it and handle job creation
+    // on its next iteration (within 10ms). This decouples validation from mining.
+    new_block_pending_.store(true, std::memory_order_release);
 }
 
 PoolStats StratumServer::get_stats() const {
