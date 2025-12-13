@@ -5869,6 +5869,73 @@ void P2P::loop(){
           }
 
           // ========================================================================
+          // RUNTIME PROOF: Scheduling Invariant Assertions (STEP 6)
+          // These assertions verify that the level-triggered scheduling invariants
+          // hold at runtime. They log warnings (not crashes) to prove correctness.
+          // ========================================================================
+          #if MIQ_TIMING_INSTRUMENTATION
+          {
+              static int64_t last_invariant_check_ms = 0;
+              const int64_t tnow = now_ms();
+
+              // Check every 100ms
+              if (tnow - last_invariant_check_ms > 100) {
+                  last_invariant_check_ms = tnow;
+
+                  const uint64_t chain_height = chain_.height();
+                  const uint64_t max_peer = g_max_known_peer_tip.load();
+                  const uint64_t header_height = chain_.best_header_height();
+                  const uint64_t target_height = std::max(header_height, max_peer);
+                  const bool force_mode = g_force_completion_mode.load(std::memory_order_relaxed);
+
+                  // INVARIANT 1: If behind AND force_mode AND peers available → must have inflight
+                  if (chain_height < target_height && force_mode) {
+                      size_t total_inflight = 0;
+                      size_t capable_peers = 0;
+                      for (const auto& kvp : peers_) {
+                          if (!kvp.second.verack_ok) continue;
+                          if (!g_peer_index_capable[(Sock)kvp.first]) continue;
+                          capable_peers++;
+                          total_inflight += kvp.second.inflight_index;
+                      }
+
+                      if (capable_peers > 0 && total_inflight == 0) {
+                          log_warn("[INVARIANT VIOLATION] Behind tip with force_mode and " +
+                                  std::to_string(capable_peers) + " capable peers but 0 inflight");
+                      }
+                  }
+
+                  // INVARIANT 2: If force_mode → at least 2 peers should be requesting same indices
+                  // (This is the whole point of force_mode - duplicate requests)
+                  if (force_mode && chain_height < target_height) {
+                      size_t requesting_peers = 0;
+                      for (const auto& kvp : peers_) {
+                          if (!kvp.second.verack_ok) continue;
+                          if (kvp.second.inflight_index > 0) requesting_peers++;
+                      }
+
+                      if (requesting_peers < 2 && peers_.size() >= 2) {
+                          // Only warn if we have multiple peers but only one is requesting
+                          size_t verack_peers = 0;
+                          for (const auto& kvp : peers_) {
+                              if (kvp.second.verack_ok) verack_peers++;
+                          }
+                          if (verack_peers >= 2) {
+                              static int64_t last_dup_warn = 0;
+                              if (tnow - last_dup_warn > 1000) {
+                                  last_dup_warn = tnow;
+                                  log_warn("[INVARIANT SOFT] force_mode but only " +
+                                          std::to_string(requesting_peers) + " of " +
+                                          std::to_string(verack_peers) + " peers requesting");
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          #endif
+
+          // ========================================================================
           // CRITICAL FIX: Orphaned Index Cleanup
           // Indices can get "orphaned" in g_global_requested_indices when:
           // 1. Peer disconnects without cleanup
@@ -7861,6 +7928,35 @@ void P2P::loop(){
                                 ps.next_index = chain_.height() + 1;
                             }
                             fill_index_pipeline(ps);
+
+                            // ================================================================
+                            // LEVEL-TRIGGERED FIX 5: Headers extended while already in force_mode
+                            // ================================================================
+                            // When headers extend and we're already in force_mode, ALL peers
+                            // must be triggered to request the new heights immediately.
+                            // Without this, only THIS peer requests new blocks, causing variance.
+                            // ================================================================
+                            if (g_force_completion_mode.load(std::memory_order_relaxed)) {
+                                #if MIQ_TIMING_INSTRUMENTATION
+                                int triggered_count = 0;
+                                #endif
+                                for (auto& other_kvp : peers_) {
+                                    auto& other_ps = other_kvp.second;
+                                    if (!other_ps.verack_ok) continue;
+                                    if (other_kvp.first == s) continue;  // Already handled above
+                                    if (!peer_is_index_capable(other_kvp.first)) continue;
+                                    fill_index_pipeline(other_ps);
+                                    #if MIQ_TIMING_INSTRUMENTATION
+                                    triggered_count++;
+                                    #endif
+                                }
+                                #if MIQ_TIMING_INSTRUMENTATION
+                                if (triggered_count > 0) {
+                                    log_info("[TIMING] FIX5: headers extended in force_mode, triggered " +
+                                            std::to_string(triggered_count) + " other peers");
+                                }
+                                #endif
+                            }
                         }
 
                         if (hs.empty()) {
