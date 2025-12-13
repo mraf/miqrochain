@@ -3236,6 +3236,18 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
     //   - Header-first lets peers verify PoW and relay immediately
     //   - All sends happen in parallel outside locks
 
+    // TIMING: Record relay time and log latency from block receive
+    #if MIQ_TIMING_INSTRUMENTATION
+    g_timing_last_relay_ms.store(now_ms(), std::memory_order_relaxed);
+    int64_t recv_time = g_timing_last_block_recv_ms.load(std::memory_order_relaxed);
+    if (recv_time > 0) {
+        int64_t relay_latency = now_ms() - recv_time;
+        if (relay_latency < 5000) {  // Only log reasonable latencies
+            log_info("[TIMING] Block recv→relay latency: " + std::to_string(relay_latency) + "ms");
+        }
+    }
+    #endif
+
     if (h.size() != 32) return;
 
     // Read the block from chain (outside lock)
@@ -3800,6 +3812,16 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
         g_inflight_index_ts[(Sock)ps.sock][index] = now_ms();
         g_inflight_index_order[(Sock)ps.sock].push_back(index);
 
+        // TIMING: Record first block request after force_mode
+        #if MIQ_TIMING_INSTRUMENTATION
+        if (g_force_completion_mode.load(std::memory_order_relaxed)) {
+            int64_t first_req = g_timing_first_block_req_ms.load(std::memory_order_relaxed);
+            if (first_req == 0) {
+                g_timing_first_block_req_ms.store(now_ms(), std::memory_order_relaxed);
+            }
+        }
+        #endif
+
         // BULLETPROOF SYNC: Mark this index as globally requested
         {
             InflightLock lk(g_inflight_lock);
@@ -4292,6 +4314,12 @@ void P2P::process_pending_blocks() {
 
         if (accepted) {
             blocks_processed++;
+
+            // TIMING: Record block receive time for recv→relay latency calculation
+            #if MIQ_TIMING_INSTRUMENTATION
+            g_timing_last_block_recv_ms.store(now_ms(), std::memory_order_relaxed);
+            g_timing_peers_triggered_count.fetch_add(1, std::memory_order_relaxed);
+            #endif
 
             // Notify mempool
             if (mempool_) {
