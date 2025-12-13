@@ -3666,6 +3666,12 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // BULLETPROOF SYNC: Fast parallel block downloads
     // Security is maintained through block hash validation in handle_incoming_block()
 
+    // IBD DIAGNOSTICS: Track early gate returns
+    static int64_t last_diag_ms = 0;
+    static uint64_t fill_calls = 0;
+    static uint64_t requests_sent = 0;
+    fill_calls++;
+
     // Use adaptive pipeline size based on peer reputation
     uint32_t pipe;
     if (g_sequential_sync) {
@@ -3680,7 +3686,17 @@ void P2P::fill_index_pipeline(PeerState& ps){
     }
 
     // peer_is_index_capable is set by start_sync_with_peer
-    if (!peer_is_index_capable((Sock)ps.sock)) return;
+    if (!peer_is_index_capable((Sock)ps.sock)) {
+        // IBD DIAG: Log why we're returning early
+        int64_t now_diag = now_ms();
+        if (now_diag - last_diag_ms > 2000) {
+            last_diag_ms = now_diag;
+            log_info("[IBD-DIAG] fill_index_pipeline BLOCKED: peer " + ps.ip +
+                    " not index_capable (fill_calls=" + std::to_string(fill_calls) +
+                    " requests_sent=" + std::to_string(requests_sent) + ")");
+        }
+        return;
+    }
 
     // CRITICAL: Don't sync from peers on a different fork!
     // This prevents wasting bandwidth and getting confused by fork blocks
@@ -3743,12 +3759,27 @@ void P2P::fill_index_pipeline(PeerState& ps){
 
     max_index = std::min(max_index, peer_limit);
 
+    // IBD DIAG: Track fill loop stats
+    uint32_t loop_requests = 0;
+
     while (ps.inflight_index < pipe) {
         uint64_t idx = ps.next_index;
 
         // Backpressure: Stop if we're too far ahead of the tip or beyond header height
         if (idx > max_index) {
             // Don't request more - wait for chain/headers to catch up
+            // IBD DIAG: Log if we're blocked by max_index early
+            if (loop_requests == 0 && !g_logged_headers_done) {
+                int64_t now_diag = now_ms();
+                if (now_diag - last_diag_ms > 2000) {
+                    last_diag_ms = now_diag;
+                    log_info("[IBD-DIAG] fill STOPPED at idx " + std::to_string(idx) +
+                            " > max_index " + std::to_string(max_index) +
+                            " (peer_limit=" + std::to_string(peer_limit) +
+                            " hdr=" + std::to_string(chain_.best_header_height()) +
+                            " tip=" + std::to_string(chain_.height()) + ")");
+                }
+            }
             break;
         }
 
@@ -3789,6 +3820,8 @@ void P2P::fill_index_pipeline(PeerState& ps){
         if (request_block_index(ps, idx)) {
             ps.next_index++;
             ps.inflight_index++;
+            requests_sent++;  // IBD DIAG: Track total requests
+            loop_requests++;  // IBD DIAG: Track this fill's requests
 
             // IBD DIAGNOSTICS: Log progress periodically
             #if MIQ_TIMING_INSTRUMENTATION
@@ -3808,6 +3841,21 @@ void P2P::fill_index_pipeline(PeerState& ps){
         } else {
             // Send failed - stop requesting from this peer (socket issue)
             break;
+        }
+    }
+
+    // IBD DIAG: Periodic summary of fill status (every 5 seconds during early IBD)
+    if (!g_logged_headers_done && chain_.height() < 100) {
+        int64_t now_diag = now_ms();
+        if (now_diag - last_diag_ms > 5000) {
+            last_diag_ms = now_diag;
+            log_info("[IBD-DIAG] fill summary: peer=" + ps.ip +
+                    " sent=" + std::to_string(loop_requests) +
+                    " inflight=" + std::to_string(ps.inflight_index) +
+                    " pipe=" + std::to_string(pipe) +
+                    " next_idx=" + std::to_string(ps.next_index) +
+                    " height=" + std::to_string(chain_.height()) +
+                    " hdr=" + std::to_string(chain_.best_header_height()));
         }
     }
 }
