@@ -6575,32 +6575,40 @@ void P2P::loop(){
                     }
                     
                     // ================================================================
-                    // INVARIANT D FIX: Hash-Based Fetch Only
+                    // INVARIANT D FIX: Hash-Based Fetch Preferred
                     // ================================================================
-                    // REMOVED: Index-by-height fallback (getbi) which is UNRELIABLE
-                    // The getbi protocol has no guaranteed delivery - gaps can cause
-                    // permanent stalls (as seen in logs: block 786 NEVER resolved).
-                    //
-                    // Instead: Request headers more aggressively. Hash-based fetch
-                    // is the ONLY reliable mechanism for block requests.
+                    // Hash-based fetch is PREFERRED because getbi is unreliable.
+                    // However, we need a TIME-GATED FALLBACK for bootstrap:
+                    // - If headers haven't arrived after 30s, enable getbi as last resort
+                    // - This allows cold-start bootstrap while preferring hash-based
                     // ================================================================
                     static int64_t last_empty_targets_log = 0;
-                    if (now - last_empty_targets_log > 5000) {  // Log every 5s
-                        last_empty_targets_log = now;
-                        log_info("[IBD] Waiting for headers (hash-based fetch only) - "
-                                "chain_height=" + std::to_string(chain_.height()) +
-                                " header_height=" + std::to_string(chain_.best_header_height()));
+                    static int64_t headers_wait_start_ms = 0;
+                    const int64_t HEADERS_FALLBACK_TIMEOUT_MS = 30000;  // 30 seconds
+
+                    // Track when we started waiting for headers
+                    if (headers_wait_start_ms == 0) {
+                        headers_wait_start_ms = now;
                     }
 
-                    // Request headers from MORE peers more aggressively
+                    // Log progress
+                    if (now - last_empty_targets_log > 5000) {
+                        last_empty_targets_log = now;
+                        int64_t waiting_ms = now - headers_wait_start_ms;
+                        log_info("[IBD] Waiting for headers (hash-based fetch preferred) - "
+                                "chain_height=" + std::to_string(chain_.height()) +
+                                " header_height=" + std::to_string(chain_.best_header_height()) +
+                                " waited=" + std::to_string(waiting_ms/1000) + "s");
+                    }
+
+                    // Request headers aggressively
                     static int64_t last_aggressive_headers_ms = 0;
-                    if (now - last_aggressive_headers_ms > 1000) {  // Every 1 second
+                    if (now - last_aggressive_headers_ms > 1000) {
                         last_aggressive_headers_ms = now;
                         for (auto& kvp : peers_) {
                             auto& pps = kvp.second;
                             if (!pps.verack_ok) continue;
 
-                            // Request headers from each peer
                             std::vector<std::vector<uint8_t>> locator;
                             chain_.build_locator(locator);
                             std::vector<uint8_t> stop(32, 0);
@@ -6611,7 +6619,38 @@ void P2P::loop(){
                             }
                         }
                     }
-                    g_sync_wants_active.store(true);  // Keep sync active
+
+                    // TIME-GATED FALLBACK: After 30s with no headers, enable getbi
+                    // This is a LAST RESORT for bootstrap when headers are unavailable
+                    int64_t waiting_ms = now - headers_wait_start_ms;
+                    if (waiting_ms > HEADERS_FALLBACK_TIMEOUT_MS && chain_.best_header_height() == 0) {
+                        static int64_t last_fallback_log_ms = 0;
+                        if (now - last_fallback_log_ms > 10000) {
+                            last_fallback_log_ms = now;
+                            log_warn("[IBD] Headers timeout after " + std::to_string(waiting_ms/1000) +
+                                    "s - activating index-by-height fallback for bootstrap");
+                        }
+
+                        // Activate index-based sync for peers that support it
+                        for (auto& kvp : peers_) {
+                            auto& pps = kvp.second;
+                            if (!pps.verack_ok) continue;
+                            if (pps.syncing && pps.inflight_index > 0) continue;
+
+                            g_peer_index_capable[(Sock)pps.sock] = true;
+                            pps.syncing = true;
+                            pps.inflight_index = 0;
+                            pps.next_index = chain_.height() + 1;
+                            fill_index_pipeline(pps);
+                        }
+                    }
+
+                    g_sync_wants_active.store(true);
+
+                    // Reset wait timer when headers arrive
+                    if (chain_.best_header_height() > 0) {
+                        headers_wait_start_ms = 0;  // Reset - we got headers
+                    }
                 }
             }
 
