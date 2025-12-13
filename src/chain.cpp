@@ -689,6 +689,48 @@ uint64_t Chain::best_header_height() const {
     return it->second.height;
 }
 
+bool Chain::get_header_hash_at_height(uint64_t target_height, std::vector<uint8_t>& out) const {
+    MIQ_CHAIN_GUARD();
+
+    // Quick check: if height is at or below our block tip, use block chain
+    if (target_height <= tip_.height && tip_.height > 0) {
+        Block b;
+        if (get_block_by_index((size_t)target_height, b)) {
+            out = b.block_hash();
+            return true;
+        }
+    }
+
+    // Otherwise, walk header chain from best_header down to target height
+    if (best_header_key_.empty()) return false;
+
+    auto best_it = header_index_.find(best_header_key_);
+    if (best_it == header_index_.end()) return false;
+
+    // If target height is beyond best header, fail
+    if (target_height > best_it->second.height) return false;
+
+    // Walk backwards from best header to find target height
+    std::vector<uint8_t> current_hash = best_it->second.hash;
+    uint64_t current_height = best_it->second.height;
+
+    while (current_height > target_height) {
+        auto it = header_index_.find(hk(current_hash));
+        if (it == header_index_.end()) return false;
+
+        current_hash = it->second.prev;
+        current_height--;
+    }
+
+    // Verify we found the right height
+    auto final_it = header_index_.find(hk(current_hash));
+    if (final_it == header_index_.end()) return false;
+    if (final_it->second.height != target_height) return false;
+
+    out = current_hash;
+    return true;
+}
+
 bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     MIQ_CHAIN_GUARD();
     

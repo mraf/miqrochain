@@ -3884,6 +3884,53 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
         return false;
     }
 
+    // ================================================================
+    // INVARIANT D: PREFER HASH-BASED REQUESTS
+    // ================================================================
+    // When we have the header for this index, use hash-based request (getb)
+    // instead of index-based request (getbi). Hash-based is more reliable:
+    // - Works across forks (same hash = same block)
+    // - Peer can't lie about having a block at an index
+    // - Falls back to getbi ONLY when header is unavailable
+    // ================================================================
+    if (index <= hdr_height && hdr_height > 0) {
+        // We have the header - get the block hash and use hash-based request
+        std::vector<uint8_t> block_hash;
+        if (chain_.get_header_hash_at_height(index, block_hash)) {
+            // Use hash-based request - much more reliable
+            const std::string key = hexkey(block_hash);
+            const bool force_mode = g_force_completion_mode.load(std::memory_order_relaxed);
+
+            // Track as global request (by index for dedup)
+            {
+                InflightLock lk(g_inflight_lock);
+                if (!force_mode && g_global_requested_indices.count(index)) {
+                    return false;  // Already being requested
+                }
+                g_global_requested_indices.insert(index);
+            }
+
+            // Use hash-based request
+            auto msg = encode_msg("getb", block_hash);
+            if (send_or_close(ps.sock, msg)) {
+                ps.inflight_blocks.insert(key);
+                g_global_inflight_blocks.insert(key);
+                g_inflight_index_ts[(Sock)ps.sock][index] = now_ms();
+                g_inflight_index_order[(Sock)ps.sock].push_back(index);
+                P2P_TRACE("TX " + ps.ip + " getb (hash-based) for index " + std::to_string(index));
+                return true;
+            }
+            // Send failed - remove from tracking
+            {
+                InflightLock lk(g_inflight_lock);
+                g_global_requested_indices.erase(index);
+            }
+            return false;
+        }
+    }
+
+    // FALLBACK: No header available - use getbi (index-based)
+    // This should be rare after headers are synced
     uint8_t p[8];
     for (int i = 0; i < 8; i++) {
         p[i] = (uint8_t)((index >> (8 * i)) & 0xFF);
@@ -6527,33 +6574,44 @@ void P2P::loop(){
                         }
                     }
                     
-                    // Rate-limit this warning to once per 60 seconds
+                    // ================================================================
+                    // INVARIANT D FIX: Hash-Based Fetch Only
+                    // ================================================================
+                    // REMOVED: Index-by-height fallback (getbi) which is UNRELIABLE
+                    // The getbi protocol has no guaranteed delivery - gaps can cause
+                    // permanent stalls (as seen in logs: block 786 NEVER resolved).
+                    //
+                    // Instead: Request headers more aggressively. Hash-based fetch
+                    // is the ONLY reliable mechanism for block requests.
+                    // ================================================================
                     static int64_t last_empty_targets_log = 0;
-                    if (now - last_empty_targets_log > 60000) {
+                    if (now - last_empty_targets_log > 5000) {  // Log every 5s
                         last_empty_targets_log = now;
-                        log_info("[IBD] next_block_fetch_targets empty - activating aggressive index-by-height fallback");
+                        log_info("[IBD] Waiting for headers (hash-based fetch only) - "
+                                "chain_height=" + std::to_string(chain_.height()) +
+                                " header_height=" + std::to_string(chain_.best_header_height()));
                     }
-                    bool activated_any = false;
-                    for (auto &kvp : peers_) {
-                        auto &pps = kvp.second;
-                        if (!pps.verack_ok) continue;
-                        if (pps.syncing && pps.inflight_index > 0) continue; // Already syncing by index
 
-                        // CRITICAL: Mark peer as index-capable for fallback activation
-                        // This is needed because proper headers-first defaults to NOT capable
-                        g_peer_index_capable[(Sock)pps.sock] = true;
-                        pps.syncing = true;
-                        pps.inflight_index = 0;
-                        pps.next_index = chain_.height() + 1;
-                        fill_index_pipeline(pps);
-                        activated_any = true;
-                        log_info("[IBD] activated index-by-height sync for peer " + pps.ip +
-                                " starting at height " + std::to_string(pps.next_index));
+                    // Request headers from MORE peers more aggressively
+                    static int64_t last_aggressive_headers_ms = 0;
+                    if (now - last_aggressive_headers_ms > 1000) {  // Every 1 second
+                        last_aggressive_headers_ms = now;
+                        for (auto& kvp : peers_) {
+                            auto& pps = kvp.second;
+                            if (!pps.verack_ok) continue;
+
+                            // Request headers from each peer
+                            std::vector<std::vector<uint8_t>> locator;
+                            chain_.build_locator(locator);
+                            std::vector<uint8_t> stop(32, 0);
+                            auto pl = build_getheaders_payload(locator, stop);
+                            auto msg = encode_msg("getheaders", pl);
+                            if (send_or_close(pps.sock, msg)) {
+                                pps.sent_getheaders = true;
+                            }
+                        }
                     }
-                    if (activated_any) {
-                        last_fallback_activation = now;
-                        g_sync_wants_active.store(true); // Force sync to continue
-                    }
+                    g_sync_wants_active.store(true);  // Keep sync active
                 }
             }
 
@@ -7852,7 +7910,28 @@ void P2P::loop(){
 #endif
                         ps.whitelisted = is_loopback(ps.ip) || is_whitelisted_ip(ps.ip);
                         try_finish_handshake();
-                      
+
+                    // ================================================================
+                    // HANDSHAKE FIREWALL (INVARIANT A)
+                    // ================================================================
+                    // No protocol command except version/verack/ping/pong is processed
+                    // before handshake completion. This prevents:
+                    // 1. Resource exhaustion from malicious pre-handshake requests
+                    // 2. Processing data from unverified peers
+                    // 3. IBD stalls from premature block/header requests
+                    // ================================================================
+                    } else if (!ps.verack_ok &&
+                               cmd != "ping" && cmd != "pong") {
+                        // Reject ALL commands before handshake except ping/pong
+                        // (ping/pong are allowed for keepalive during slow handshakes)
+                        P2P_TRACE("FIREWALL: Rejecting cmd=" + cmd + " from " + ps.ip + " - handshake not complete");
+                        if (++ps.mis > 5) {
+                            log_warn("P2P: FIREWALL: Too many pre-handshake commands from " + ps.ip + " - disconnecting");
+                            dead.push_back(s);
+                            break;
+                        }
+                        continue;
+
                     } else if (cmd == "ping") {
                         auto pong = encode_msg("pong", m.payload);
                         (void)send_or_close(s, pong);
