@@ -1557,21 +1557,37 @@ static inline bool peer_is_index_capable(Sock s) {
 }
 
 static inline int64_t adaptive_index_timeout_ms(const miq::PeerState& ps){
-    // PROPAGATION FIX: Reduced timeouts for sub-second relay guarantee
-    // INVARIANT P5: "There must exist NO valid execution exceeding 1 second"
+    // PROPAGATION FIX: Balanced timeouts for both IBD and near-tip performance
     //
-    // OLD BUG: 15s IBD / 10s steady - way too long, blocks pile up
-    // FIX: 2s max - matches IDX_STALE_THRESHOLD_MS
+    // IBD: Need longer timeouts to avoid premature re-requests that waste bandwidth
+    //      and slow down sync when seeds are under load
+    // Near-tip: Need shorter timeouts for sub-second block propagation
     //
     // Base on observed block delivery; halve it for indices (headers+lookup are lighter).
-    int64_t base = std::max<int64_t>(500, ps.avg_block_delivery_ms / 4);  // Reduced from /2
+    int64_t base = std::max<int64_t>(500, ps.avg_block_delivery_ms / 4);
+
     // Healthier peers get tighter timeouts, weaker peers looser.
     double health = std::min(1.0, std::max(0.0, ps.health_score)); // clamp
-    double health_mul = 1.5 - (health * 0.5); // 1.0..1.5 (was 1.0..2.0)
-    // During IBD or explicit index sync, allow slightly more slack.
-    double ibd_mul = (!g_logged_headers_done || ps.syncing) ? 1.5 : 1.0;  // Reduced
+    double health_mul = 1.5 - (health * 0.5); // 1.0..1.5
+
+    // IBD vs near-tip: very different timeout needs
+    int64_t max_t;
+    double ibd_mul;
+    if (!g_logged_headers_done) {
+        // IBD mode: Be patient - seeds may be under load, avoid duplicate requests
+        ibd_mul = 3.0;  // More slack during IBD
+        max_t = 10000;  // 10s max during IBD - avoid re-request storms
+    } else if (ps.syncing) {
+        // Active sync but past headers: moderate timeout
+        ibd_mul = 2.0;
+        max_t = 5000;  // 5s max during active sync
+    } else {
+        // Near-tip steady state: aggressive timeout for fast propagation
+        ibd_mul = 1.0;
+        max_t = 2000;  // 2s max near tip
+    }
+
     int64_t t = (int64_t)(base * health_mul * ibd_mul);
-    int64_t max_t = 2000; // 2s max - must match IDX_STALE_THRESHOLD_MS (was 15s/10s)
     return std::max<int64_t>(500, std::min<int64_t>(t, max_t));
 }
 
@@ -3771,6 +3787,22 @@ void P2P::fill_index_pipeline(PeerState& ps){
         if (request_block_index(ps, idx)) {
             ps.next_index++;
             ps.inflight_index++;
+
+            // IBD DIAGNOSTICS: Log progress periodically
+            #if MIQ_TIMING_INSTRUMENTATION
+            static std::atomic<int64_t> last_ibd_diag_ms{0};
+            int64_t diag_now = now_ms();
+            if (!g_logged_headers_done && diag_now - last_ibd_diag_ms.load(std::memory_order_relaxed) > 5000) {
+                last_ibd_diag_ms.store(diag_now, std::memory_order_relaxed);
+                size_t total_inflight = 0;
+                for (auto& kvp : peers_) {
+                    total_inflight += kvp.second.inflight_index;
+                }
+                log_info("[IBD] Diagnostics: total_inflight=" + std::to_string(total_inflight) +
+                        " this_peer=" + ps.ip + " peer_inflight=" + std::to_string(ps.inflight_index) +
+                        " pipe=" + std::to_string(pipe) + " chain_height=" + std::to_string(current_height));
+            }
+            #endif
         } else {
             // Send failed - stop requesting from this peer (socket issue)
             break;
