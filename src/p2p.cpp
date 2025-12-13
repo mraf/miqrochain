@@ -4244,6 +4244,14 @@ void P2P::process_pending_blocks() {
             // Broadcast to peers
             broadcast_inv_block(it->second.hash);
 
+            // PERF: Log end-to-end timing when in near-tip mode
+            if (miq::is_near_tip_mode()) {
+                int64_t t_relay = now_ms();
+                int64_t total_ms = t_relay - it->second.received_ms;
+                log_info("[PERF] Block " + std::to_string(new_height) +
+                         " recv->relay total=" + std::to_string(total_ms) + "ms");
+            }
+
             // Update tracking
             g_last_progress_ms = now_ms();
             g_last_progress_height = new_height;
