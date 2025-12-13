@@ -226,6 +226,7 @@ set(MIQ_CORE_SOURCES_NO_NAT
     src/mtp.h
     src/mtp.cpp
     src/ibd_monitor.h src/ibd_monitor.cpp
+    src/ibd_state.h src/ibd_state.cpp
     src/wallet_encryptor.cpp
     src/crypto/secure_random.cpp
     src/stratum/stratum_server.h src/stratum/stratum_server.cpp

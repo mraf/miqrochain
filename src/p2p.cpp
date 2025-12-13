@@ -22,6 +22,7 @@ namespace p2p_stats {
 #include "compact_blocks.h" // BIP152 compact block relay
 #include "mempool.h"        // For compact block reconstruction
 #include "assume_valid.h"   // Checkpoint verification for fork detection
+#include "ibd_state.h"      // Bitcoin Core-aligned IBD state machine
 
 #include <chrono>
 #include <deque>
@@ -1338,6 +1339,12 @@ static inline void maybe_mark_headers_done(bool at_tip) {
             g_headers_just_done.store(true);  // Signal to start block downloads NOW
             // IBD PERF: Set header height for signature skip optimization
             miq::set_best_header_height(hdr_height);
+
+            // State machine transition: HEADERS → BLOCKS
+            // Bitcoin Core principle: once headers complete, NEVER restart headers phase
+            miq::ibd::IBDState::instance().set_header_height(hdr_height);
+            miq::ibd::IBDState::instance().transition_to(miq::ibd::SyncState::BLOCKS);
+
             miq::log_info("[IBD] headers phase COMPLETE (height=" + std::to_string(hdr_height) +
                          ", max_peer_tip=" + std::to_string(max_peer_tip) +
                          ") — IMMEDIATELY starting block downloads!");
@@ -3647,6 +3654,9 @@ void P2P::start_sync_with_peer(PeerState& ps){
             g_logged_headers_started = true;
             log_info("[IBD] headers phase started - blocks downloading in parallel");
             if (!g_ibd_headers_started_ms) g_ibd_headers_started_ms = now_ms();
+
+            // State machine transition: CONNECTING → HEADERS
+            miq::ibd::IBDState::instance().transition_to(miq::ibd::SyncState::HEADERS);
         }
         // DON'T return - fall through to also start block sync!
     }
@@ -7819,6 +7829,9 @@ void P2P::loop(){
                                 g_logged_headers_started = true;
                                 log_info("[IBD] headers phase started");
                                 if (!g_ibd_headers_started_ms) g_ibd_headers_started_ms = now_ms();
+
+                                // State machine transition: CONNECTING → HEADERS
+                                miq::ibd::IBDState::instance().transition_to(miq::ibd::SyncState::HEADERS);
                             }
                         } else
 #endif
@@ -8014,24 +8027,32 @@ void P2P::loop(){
                         try_finish_handshake();
 
                     // ================================================================
-                    // HANDSHAKE FIREWALL (INVARIANT A)
+                    // HANDSHAKE FIREWALL (Bitcoin Core-aligned)
                     // ================================================================
                     // No protocol command except version/verack/ping/pong is processed
-                    // before handshake completion. This prevents:
-                    // 1. Resource exhaustion from malicious pre-handshake requests
-                    // 2. Processing data from unverified peers
-                    // 3. IBD stalls from premature block/header requests
+                    // before handshake completion.
+                    //
+                    // CRITICAL: During IBD, NEVER disconnect for pre-handshake messages!
+                    // Bitcoin Core principle: be tolerant during sync, strict at tip.
+                    // Disconnecting peers during IBD risks losing our only block sources.
                     // ================================================================
                     } else if (!ps.verack_ok &&
                                cmd != "ping" && cmd != "pong") {
                         // Reject ALL commands before handshake except ping/pong
-                        // (ping/pong are allowed for keepalive during slow handshakes)
                         P2P_TRACE("FIREWALL: Rejecting cmd=" + cmd + " from " + ps.ip + " - handshake not complete");
-                        if (++ps.mis > 5) {
-                            log_warn("P2P: FIREWALL: Too many pre-handshake commands from " + ps.ip + " - disconnecting");
-                            dead.push_back(s);
-                            break;
+
+                        // Bitcoin Core principle: During IBD, be tolerant of eager peers
+                        // Only disconnect after IBD is complete (near-tip)
+                        auto ibd_state = miq::ibd::IBDState::instance().current_state();
+                        if (ibd_state >= miq::ibd::SyncState::DONE) {
+                            // Post-IBD: strict enforcement
+                            if (++ps.mis > 5) {
+                                log_warn("P2P: FIREWALL: Too many pre-handshake commands from " + ps.ip + " - disconnecting");
+                                dead.push_back(s);
+                                break;
+                            }
                         }
+                        // During IBD: log but don't count toward disconnection
                         continue;
 
                     } else if (cmd == "ping") {
