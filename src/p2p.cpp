@@ -1336,6 +1336,8 @@ static inline void maybe_mark_headers_done(bool at_tip) {
         if (++g_headers_tip_confirmed >= 3) {
             g_logged_headers_done = true;
             g_headers_just_done.store(true);  // Signal to start block downloads NOW
+            // IBD PERF: Set header height for signature skip optimization
+            miq::set_best_header_height(hdr_height);
             miq::log_info("[IBD] headers phase COMPLETE (height=" + std::to_string(hdr_height) +
                          ", max_peer_tip=" + std::to_string(max_peer_tip) +
                          ") — IMMEDIATELY starting block downloads!");
@@ -3664,6 +3666,12 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // BULLETPROOF SYNC: Fast parallel block downloads
     // Security is maintained through block hash validation in handle_incoming_block()
 
+    // IBD DIAGNOSTICS: Track early gate returns
+    static int64_t last_diag_ms = 0;
+    static uint64_t fill_calls = 0;
+    static uint64_t requests_sent = 0;
+    fill_calls++;
+
     // Use adaptive pipeline size based on peer reputation
     uint32_t pipe;
     if (g_sequential_sync) {
@@ -3678,7 +3686,17 @@ void P2P::fill_index_pipeline(PeerState& ps){
     }
 
     // peer_is_index_capable is set by start_sync_with_peer
-    if (!peer_is_index_capable((Sock)ps.sock)) return;
+    if (!peer_is_index_capable((Sock)ps.sock)) {
+        // IBD DIAG: Log why we're returning early
+        int64_t now_diag = now_ms();
+        if (now_diag - last_diag_ms > 2000) {
+            last_diag_ms = now_diag;
+            log_info("[IBD-DIAG] fill_index_pipeline BLOCKED: peer " + ps.ip +
+                    " not index_capable (fill_calls=" + std::to_string(fill_calls) +
+                    " requests_sent=" + std::to_string(requests_sent) + ")");
+        }
+        return;
+    }
 
     // CRITICAL: Don't sync from peers on a different fork!
     // This prevents wasting bandwidth and getting confused by fork blocks
@@ -3741,12 +3759,27 @@ void P2P::fill_index_pipeline(PeerState& ps){
 
     max_index = std::min(max_index, peer_limit);
 
+    // IBD DIAG: Track fill loop stats
+    uint32_t loop_requests = 0;
+
     while (ps.inflight_index < pipe) {
         uint64_t idx = ps.next_index;
 
         // Backpressure: Stop if we're too far ahead of the tip or beyond header height
         if (idx > max_index) {
             // Don't request more - wait for chain/headers to catch up
+            // IBD DIAG: Log if we're blocked by max_index early
+            if (loop_requests == 0 && !g_logged_headers_done) {
+                int64_t now_diag = now_ms();
+                if (now_diag - last_diag_ms > 2000) {
+                    last_diag_ms = now_diag;
+                    log_info("[IBD-DIAG] fill STOPPED at idx " + std::to_string(idx) +
+                            " > max_index " + std::to_string(max_index) +
+                            " (peer_limit=" + std::to_string(peer_limit) +
+                            " hdr=" + std::to_string(chain_.best_header_height()) +
+                            " tip=" + std::to_string(chain_.height()) + ")");
+                }
+            }
             break;
         }
 
@@ -3787,6 +3820,8 @@ void P2P::fill_index_pipeline(PeerState& ps){
         if (request_block_index(ps, idx)) {
             ps.next_index++;
             ps.inflight_index++;
+            requests_sent++;  // IBD DIAG: Track total requests
+            loop_requests++;  // IBD DIAG: Track this fill's requests
 
             // IBD DIAGNOSTICS: Log progress periodically
             #if MIQ_TIMING_INSTRUMENTATION
@@ -3806,6 +3841,21 @@ void P2P::fill_index_pipeline(PeerState& ps){
         } else {
             // Send failed - stop requesting from this peer (socket issue)
             break;
+        }
+    }
+
+    // IBD DIAG: Periodic summary of fill status (every 5 seconds during early IBD)
+    if (!g_logged_headers_done && chain_.height() < 100) {
+        int64_t now_diag = now_ms();
+        if (now_diag - last_diag_ms > 5000) {
+            last_diag_ms = now_diag;
+            log_info("[IBD-DIAG] fill summary: peer=" + ps.ip +
+                    " sent=" + std::to_string(loop_requests) +
+                    " inflight=" + std::to_string(ps.inflight_index) +
+                    " pipe=" + std::to_string(pipe) +
+                    " next_idx=" + std::to_string(ps.next_index) +
+                    " height=" + std::to_string(chain_.height()) +
+                    " hdr=" + std::to_string(chain_.best_header_height()));
         }
     }
 }
@@ -3834,6 +3884,53 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
         return false;
     }
 
+    // ================================================================
+    // INVARIANT D: PREFER HASH-BASED REQUESTS
+    // ================================================================
+    // When we have the header for this index, use hash-based request (getb)
+    // instead of index-based request (getbi). Hash-based is more reliable:
+    // - Works across forks (same hash = same block)
+    // - Peer can't lie about having a block at an index
+    // - Falls back to getbi ONLY when header is unavailable
+    // ================================================================
+    if (index <= hdr_height && hdr_height > 0) {
+        // We have the header - get the block hash and use hash-based request
+        std::vector<uint8_t> block_hash;
+        if (chain_.get_header_hash_at_height(index, block_hash)) {
+            // Use hash-based request - much more reliable
+            const std::string key = hexkey(block_hash);
+            const bool force_mode = g_force_completion_mode.load(std::memory_order_relaxed);
+
+            // Track as global request (by index for dedup)
+            {
+                InflightLock lk(g_inflight_lock);
+                if (!force_mode && g_global_requested_indices.count(index)) {
+                    return false;  // Already being requested
+                }
+                g_global_requested_indices.insert(index);
+            }
+
+            // Use hash-based request
+            auto msg = encode_msg("getb", block_hash);
+            if (send_or_close(ps.sock, msg)) {
+                ps.inflight_blocks.insert(key);
+                g_global_inflight_blocks.insert(key);
+                g_inflight_index_ts[(Sock)ps.sock][index] = now_ms();
+                g_inflight_index_order[(Sock)ps.sock].push_back(index);
+                P2P_TRACE("TX " + ps.ip + " getb (hash-based) for index " + std::to_string(index));
+                return true;
+            }
+            // Send failed - remove from tracking
+            {
+                InflightLock lk(g_inflight_lock);
+                g_global_requested_indices.erase(index);
+            }
+            return false;
+        }
+    }
+
+    // FALLBACK: No header available - use getbi (index-based)
+    // This should be rare after headers are synced
     uint8_t p[8];
     for (int i = 0; i < 8; i++) {
         p[i] = (uint8_t)((index >> (8 * i)) & 0xFF);
@@ -4500,13 +4597,17 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
     // ULTRA-FAST OPTIMISTIC RELAY: Push to ALL peers after PoW check only
     // Goal: Sub-1-second network propagation before full validation
     // Strategy: Collect sockets under lock, send outside lock for parallelism
+    //
+    // IBD FIX: SKIP relay entirely during IBD - focus 100% on downloading blocks
+    // Relaying during IBD wastes bandwidth and CPU that should be used for sync
     static std::unordered_map<std::string, int64_t> recently_relayed;  // block hash -> timestamp
     static std::mutex relay_mu;
     std::string bh_key = hexkey(bh);
     const int64_t tnow = now_ms();
 
+    // IBD FIX: Don't relay blocks during initial sync
     bool should_relay = false;
-    {
+    if (!miq::is_ibd_mode()) {
         std::lock_guard<std::mutex> lk(relay_mu);
         if (recently_relayed.find(bh_key) == recently_relayed.end()) {
             // Fast PoW check - only hash comparison, no full validation
@@ -5706,13 +5807,18 @@ void P2P::loop(){
 
           // CRITICAL FIX: Stall recovery - if no progress for N seconds, force re-enable ALL peers
           // This handles cases where all peers got demoted or stuck in invalid states
-          // Reduced from 30s to 2s for INSTANT recovery - stop-start must be eliminated!
+          //
+          // IBD FIX: The original 500ms/2s recovery was WAY too aggressive!
+          // It caused constant "NUCLEAR RECOVERY" which cancelled inflight requests
+          // and created a chaotic feedback loop. IBD needs PATIENCE:
+          // - Blocks download in parallel and arrive out of order
+          // - A single missing block can stall the chain for seconds while it arrives
+          // - Aggressive recovery makes things WORSE by cancelling good requests
+          //
+          // Near-tip: Keep aggressive 2s recovery for fast propagation
+          // During IBD: Use 30s recovery - let the pipeline work!
           {
               const int64_t tnow = now_ms();
-              // PROPAGATION FIX: Reduced from 2000ms to 500ms for sub-second relay guarantee
-              // INVARIANT P5: "There must exist NO valid execution exceeding 1 second"
-              // With 2s stall recovery, blocks could be delayed up to 2+ seconds
-              const int64_t STALL_RECOVERY_MS = 500;  // 500ms - TRUE instant recovery
               const uint64_t chain_height = chain_.height();
               // CRITICAL FIX: Use MAX of header height and known peer tip
               // During IBD, header height may be 0 or incomplete
@@ -5720,14 +5826,20 @@ void P2P::loop(){
               const uint64_t max_peer = g_max_known_peer_tip.load();
               const uint64_t target_height = std::max(header_height, max_peer);
 
+              // IBD FIX: Use different recovery thresholds for IBD vs near-tip
+              // IBD: 30 seconds - be patient, blocks are downloading in parallel
+              // Near-tip: 2 seconds - fast recovery for propagation latency
+              const int64_t STALL_RECOVERY_MS = miq::is_ibd_mode() ? 30000 : 2000;
+
               // Check if we're stalled: no progress, not fully synced, have peers
               if (!peers_.empty() &&
                   target_height > 0 &&
                   chain_height < target_height &&
                   (tnow - g_last_progress_ms) > STALL_RECOVERY_MS) {
 
-                  log_warn("P2P: Sync stalled for 2s at height " + std::to_string(chain_height) +
-                           "/" + std::to_string(target_height) + " - forcing INSTANT recovery");
+                  log_warn("P2P: Sync stalled for " + std::to_string(STALL_RECOVERY_MS/1000) +
+                           "s at height " + std::to_string(chain_height) +
+                           "/" + std::to_string(target_height) + " - forcing recovery");
 
                   // CRITICAL FIX: Clear ALL global requested indices above current height
                   // This handles orphaned indices that got stuck without per-peer tracking
@@ -5799,6 +5911,56 @@ void P2P::loop(){
                       // Trigger immediate pipeline refill to retry the blocks
                       if (ps.syncing && peer_is_index_capable((Sock)ps.sock)) {
                           fill_index_pipeline(ps);
+                      }
+                  }
+              }
+          }
+
+          // ========================================================================
+          // IBD FIX: Disconnect non-delivering peers during IBD
+          // Peers that occupy inflight slots but deliver zero blocks waste resources
+          // and slow down sync. Give them 60s to deliver, then disconnect.
+          // ========================================================================
+          if (miq::is_ibd_mode()) {
+              static int64_t last_non_deliver_check_ms = 0;
+              const int64_t tnow = now_ms();
+              const int64_t NON_DELIVER_TIMEOUT_MS = 60000;  // 60 seconds
+
+              if (tnow - last_non_deliver_check_ms > 10000) {  // Check every 10s
+                  last_non_deliver_check_ms = tnow;
+
+                  for (auto& kvp : peers_) {
+                      PeerState& ps = kvp.second;
+                      if (!ps.verack_ok) continue;
+
+                      // Check if peer has had time to deliver but hasn't
+                      int64_t connection_duration = (ps.connected_ms > 0) ? (tnow - ps.connected_ms) : 0;
+                      if (connection_duration > NON_DELIVER_TIMEOUT_MS &&
+                          ps.total_blocks_received == 0 &&
+                          ps.peer_tip_height > 0) {
+                          // Peer claims to have blocks but delivered zero in 60s
+                          log_warn("P2P: Disconnecting non-delivering peer " + ps.ip +
+                                   " (connected " + std::to_string(connection_duration/1000) + "s" +
+                                   ", claims tip=" + std::to_string(ps.peer_tip_height) +
+                                   ", delivered=0 blocks)");
+
+                          // Clear inflight tracking for this peer
+                          Sock s = kvp.first;
+                          {
+                              InflightLock lk(g_inflight_lock);
+                              auto idx_it = g_inflight_index_ts.find(s);
+                              if (idx_it != g_inflight_index_ts.end()) {
+                                  for (const auto& kv : idx_it->second) {
+                                      g_global_requested_indices.erase(kv.first);
+                                  }
+                              }
+                          }
+                          g_inflight_index_ts.erase(s);
+                          g_inflight_index_order.erase(s);
+                          g_peer_index_capable.erase(s);
+
+                          // Mark for disconnection
+                          schedule_close(s);
                       }
                   }
               }
@@ -6412,33 +6574,44 @@ void P2P::loop(){
                         }
                     }
                     
-                    // Rate-limit this warning to once per 60 seconds
+                    // ================================================================
+                    // INVARIANT D FIX: Hash-Based Fetch Only
+                    // ================================================================
+                    // REMOVED: Index-by-height fallback (getbi) which is UNRELIABLE
+                    // The getbi protocol has no guaranteed delivery - gaps can cause
+                    // permanent stalls (as seen in logs: block 786 NEVER resolved).
+                    //
+                    // Instead: Request headers more aggressively. Hash-based fetch
+                    // is the ONLY reliable mechanism for block requests.
+                    // ================================================================
                     static int64_t last_empty_targets_log = 0;
-                    if (now - last_empty_targets_log > 60000) {
+                    if (now - last_empty_targets_log > 5000) {  // Log every 5s
                         last_empty_targets_log = now;
-                        log_info("[IBD] next_block_fetch_targets empty - activating aggressive index-by-height fallback");
+                        log_info("[IBD] Waiting for headers (hash-based fetch only) - "
+                                "chain_height=" + std::to_string(chain_.height()) +
+                                " header_height=" + std::to_string(chain_.best_header_height()));
                     }
-                    bool activated_any = false;
-                    for (auto &kvp : peers_) {
-                        auto &pps = kvp.second;
-                        if (!pps.verack_ok) continue;
-                        if (pps.syncing && pps.inflight_index > 0) continue; // Already syncing by index
 
-                        // CRITICAL: Mark peer as index-capable for fallback activation
-                        // This is needed because proper headers-first defaults to NOT capable
-                        g_peer_index_capable[(Sock)pps.sock] = true;
-                        pps.syncing = true;
-                        pps.inflight_index = 0;
-                        pps.next_index = chain_.height() + 1;
-                        fill_index_pipeline(pps);
-                        activated_any = true;
-                        log_info("[IBD] activated index-by-height sync for peer " + pps.ip +
-                                " starting at height " + std::to_string(pps.next_index));
+                    // Request headers from MORE peers more aggressively
+                    static int64_t last_aggressive_headers_ms = 0;
+                    if (now - last_aggressive_headers_ms > 1000) {  // Every 1 second
+                        last_aggressive_headers_ms = now;
+                        for (auto& kvp : peers_) {
+                            auto& pps = kvp.second;
+                            if (!pps.verack_ok) continue;
+
+                            // Request headers from each peer
+                            std::vector<std::vector<uint8_t>> locator;
+                            chain_.build_locator(locator);
+                            std::vector<uint8_t> stop(32, 0);
+                            auto pl = build_getheaders_payload(locator, stop);
+                            auto msg = encode_msg("getheaders", pl);
+                            if (send_or_close(pps.sock, msg)) {
+                                pps.sent_getheaders = true;
+                            }
+                        }
                     }
-                    if (activated_any) {
-                        last_fallback_activation = now;
-                        g_sync_wants_active.store(true); // Force sync to continue
-                    }
+                    g_sync_wants_active.store(true);  // Keep sync active
                 }
             }
 
@@ -6614,8 +6787,11 @@ void P2P::loop(){
             int64_t now = now_ms();
 
             // Check for height progress stall - be more aggressive after headers phase
+            // IBD FIX: Increased stall thresholds to prevent chaotic recovery loops
+            // IBD: 30s - let blocks arrive, they're downloading in parallel
+            // Near-tip: 2s - fast recovery for propagation latency
             bool height_stalled = false;
-            int64_t stall_threshold = headers_done ? 2000 : 10000;  // 2s after headers, 10s before - INSTANT recovery
+            int64_t stall_threshold = miq::is_ibd_mode() ? 30000 : 2000;
 
             if (current_height != last_height_check) {
                 last_height_check = current_height;
@@ -7734,7 +7910,28 @@ void P2P::loop(){
 #endif
                         ps.whitelisted = is_loopback(ps.ip) || is_whitelisted_ip(ps.ip);
                         try_finish_handshake();
-                      
+
+                    // ================================================================
+                    // HANDSHAKE FIREWALL (INVARIANT A)
+                    // ================================================================
+                    // No protocol command except version/verack/ping/pong is processed
+                    // before handshake completion. This prevents:
+                    // 1. Resource exhaustion from malicious pre-handshake requests
+                    // 2. Processing data from unverified peers
+                    // 3. IBD stalls from premature block/header requests
+                    // ================================================================
+                    } else if (!ps.verack_ok &&
+                               cmd != "ping" && cmd != "pong") {
+                        // Reject ALL commands before handshake except ping/pong
+                        // (ping/pong are allowed for keepalive during slow handshakes)
+                        P2P_TRACE("FIREWALL: Rejecting cmd=" + cmd + " from " + ps.ip + " - handshake not complete");
+                        if (++ps.mis > 5) {
+                            log_warn("P2P: FIREWALL: Too many pre-handshake commands from " + ps.ip + " - disconnecting");
+                            dead.push_back(s);
+                            break;
+                        }
+                        continue;
+
                     } else if (cmd == "ping") {
                         auto pong = encode_msg("pong", m.payload);
                         (void)send_or_close(s, pong);
@@ -7877,6 +8074,11 @@ void P2P::loop(){
                             // Without this, we'd think we're "caught up" at the old version height
                             // and stop syncing before reaching the actual tip.
                             uint64_t new_header_height = chain_.best_header_height();
+
+                            // IBD PERF: Update global header height for signature skip optimization
+                            // This allows should_validate_signatures() to skip signatures for
+                            // deeply buried blocks during IBD
+                            miq::set_best_header_height(new_header_height);
                             uint64_t old_max = g_max_known_peer_tip.load();
                             while (new_header_height > old_max) {
                                 if (g_max_known_peer_tip.compare_exchange_weak(old_max, new_header_height)) {
@@ -8074,6 +8276,19 @@ void P2P::loop(){
                         }
 
                     } else if (cmd == "getb") {
+                        // IBD FIX: Don't serve block requests before handshake completes
+                        // This prevents peers from draining our resources during IBD
+                        if (!ps.verack_ok) {
+                            P2P_TRACE("DEBUG: Ignoring getb from " + ps.ip + " - handshake not complete");
+                            continue;
+                        }
+                        // IBD FIX: Don't serve blocks while actively syncing behind
+                        // But DO serve blocks if we're a seed (have blocks to share)
+                        // The key is checking if WE are behind, not just in IBD mode
+                        if (miq::is_ibd_mode() && chain_.height() < g_max_known_peer_tip.load()) {
+                            P2P_TRACE("DEBUG: Ignoring getb from " + ps.ip + " - actively syncing");
+                            continue;
+                        }
                         g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
                         if (m.payload.size() == 32) {
                             std::string hash_hex = hexkey(m.payload);
@@ -8096,6 +8311,17 @@ void P2P::loop(){
                         }
                     }
                     else if (cmd == "getbi") {
+                        // IBD FIX: Don't serve block requests before handshake completes
+                        if (!ps.verack_ok) {
+                            P2P_TRACE("DEBUG: Ignoring getbi from " + ps.ip + " - handshake not complete");
+                            continue;
+                        }
+                        // IBD FIX: Don't serve blocks while actively syncing behind
+                        // But DO serve blocks if we're a seed (have blocks to share)
+                        if (miq::is_ibd_mode() && chain_.height() < g_max_known_peer_tip.load()) {
+                            P2P_TRACE("DEBUG: Ignoring getbi from " + ps.ip + " - actively syncing");
+                            continue;
+                        }
                         g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
                         if (m.payload.size() == 8) {
                             uint64_t idx64 = 0;

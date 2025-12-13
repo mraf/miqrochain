@@ -100,6 +100,10 @@ public:
     uint64_t best_header_height() const;  // Height of best known header (may be ahead of tip)
     uint64_t subsidy_for_height(uint64_t height) const;
 
+    // Get block hash at height from header chain (for hash-based IBD fetch)
+    // This works even for heights beyond our block tip (uses header index)
+    bool get_header_hash_at_height(uint64_t height, std::vector<uint8_t>& out) const;
+
     bool get_block_by_index(size_t idx, Block& out) const;
     bool get_block_by_hash(const std::vector<uint8_t>& h, Block& out) const;
     bool have_block(const std::vector<uint8_t>& h) const;
