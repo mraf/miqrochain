@@ -1563,24 +1563,67 @@ StratumJob StratumServer::create_job() {
 }
 
 void StratumServer::broadcast_job(const StratumJob& job) {
-    // CRITICAL FIX: Track miners with failed sends to disconnect them after iteration
-    // This prevents a single broken miner from blocking broadcasts to others
-    std::vector<StratumSock> failed_miners;
+    // CRITICAL FIX: Don't hold miners_mutex_ during I/O (send_json can block 2s)
+    // This prevents a single slow miner from blocking all other miners
+    // Pattern: Build message + collect targets under lock, send OUTSIDE lock
 
+    // Build the JSON message ONCE (identical for all miners)
+    std::string json_msg;
+    {
+        std::ostringstream ss;
+        ss << "{\"id\":null,\"method\":\"mining.notify\",\"params\":[";
+        ss << "\"" << job.job_id << "\",";
+        ss << "\"" << reverse_hex(hex_encode(job.prev_hash)) << "\",";
+        ss << "\"" << job.coinb1 << "\",";
+        ss << "\"" << job.coinb2 << "\",";
+        ss << "[";
+        for (size_t i = 0; i < job.merkle_branches.size(); i++) {
+            if (i > 0) ss << ",";
+            ss << "\"" << job.merkle_branches[i] << "\"";
+        }
+        ss << "],";
+        ss << "\"" << std::hex << std::setw(8) << std::setfill('0') << job.version << "\",";
+        ss << "\"" << std::hex << std::setw(8) << std::setfill('0') << job.bits << "\",";
+        ss << "\"" << std::hex << std::setw(8) << std::setfill('0') << (uint32_t)(job.time & 0xFFFFFFFF) << "\",";
+        ss << (job.clean_jobs ? "true" : "false");
+        ss << "]}\n";
+        json_msg = ss.str();
+    }
+
+    // Collect miner info under lock (quick operation - no I/O)
+    struct MinerTarget {
+        StratumSock sock;
+        std::string ip;
+    };
+    std::vector<MinerTarget> targets;
     {
         std::lock_guard<std::mutex> lock(miners_mutex_);
+        targets.reserve(miners_.size());
         for (auto& kv : miners_) {
             if (kv.second.subscribed) {
-                if (!send_job_to_miner(kv.second, job)) {
-                    failed_miners.push_back(kv.first);
-                }
+                targets.push_back({kv.first, kv.second.ip});
             }
         }
     }
+    // Lock released - now safe to do blocking I/O
 
-    // Disconnect failed miners outside of the loop to avoid iterator invalidation
+    // Send to all miners OUTSIDE the lock (this is the slow part)
+    std::vector<StratumSock> failed_miners;
+    for (const auto& target : targets) {
+        bool send_ok = send_json_to_socket(target.sock, target.ip, json_msg);
+        if (!send_ok) {
+            failed_miners.push_back(target.sock);
+        }
+    }
+
+    // Disconnect failed miners
     for (StratumSock sock : failed_miners) {
         disconnect_miner(sock, "broadcast send failed");
+    }
+
+    if (!targets.empty()) {
+        log_info("Stratum: Broadcast mining.notify to " + std::to_string(targets.size()) +
+                 " miners (" + std::to_string(json_msg.size()) + " bytes each)");
     }
 }
 
@@ -1682,77 +1725,77 @@ void StratumServer::disconnect_miner(StratumSock sock, const std::string& reason
     }
 }
 
-bool StratumServer::send_json(StratumMiner& miner, const std::string& json) {
+// Lock-free version for broadcast_job - takes raw socket and IP
+// CRITICAL: This function does blocking I/O and must be called WITHOUT holding miners_mutex_
+bool StratumServer::send_json_to_socket(StratumSock sock, const std::string& ip, const std::string& json) {
     size_t total_sent = 0;
     size_t remaining = json.size();
     const char* data = json.c_str();
 
-    // CRITICAL FIX: Use proper socket write-readiness checking via select()
-    // instead of blind retries. This is more robust on Windows.
     static constexpr int MAX_SEND_TIMEOUT_MS = 2000;  // 2 second total timeout
     auto start_time = std::chrono::steady_clock::now();
 
     while (remaining > 0) {
-        // Check if we've exceeded timeout
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
         if (elapsed > MAX_SEND_TIMEOUT_MS) {
-            log_warn("Stratum: send_json timeout after " + std::to_string(elapsed) + "ms to " + miner.ip);
+            log_warn("Stratum: send_json_to_socket timeout after " + std::to_string(elapsed) + "ms to " + ip);
             return false;
         }
 
 #ifdef _WIN32
-        int sent = send(miner.sock, data + total_sent, (int)remaining, 0);
+        int sent = send(sock, data + total_sent, (int)remaining, 0);
         if (sent == SOCKET_ERROR) {
             int err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK) {
-                // Use select() to wait for socket to be writable
                 fd_set write_fds;
                 FD_ZERO(&write_fds);
-                FD_SET(miner.sock, &write_fds);
+                FD_SET(sock, &write_fds);
                 struct timeval tv;
                 tv.tv_sec = 0;
-                tv.tv_usec = 50000;  // 50ms wait
+                tv.tv_usec = 50000;
                 int sel_result = select(0, nullptr, &write_fds, nullptr, &tv);
                 if (sel_result < 0) {
-                    log_warn("Stratum: select failed for " + miner.ip + " WSA error=" + std::to_string(WSAGetLastError()));
+                    log_warn("Stratum: select failed for " + ip + " WSA error=" + std::to_string(WSAGetLastError()));
                     return false;
                 }
-                // If select returned 0 (timeout) or >0 (ready), retry send
                 continue;
             }
-            log_warn("Stratum: send_json failed to " + miner.ip + " WSA error=" + std::to_string(err));
+            log_warn("Stratum: send_json_to_socket failed to " + ip + " WSA error=" + std::to_string(err));
             return false;
         }
 #else
-        ssize_t sent = send(miner.sock, data + total_sent, remaining, 0);
+        ssize_t sent = send(sock, data + total_sent, remaining, 0);
         if (sent < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Use poll() to wait for socket to be writable
                 struct pollfd pfd;
-                pfd.fd = miner.sock;
+                pfd.fd = sock;
                 pfd.events = POLLOUT;
-                int poll_result = poll(&pfd, 1, 50);  // 50ms wait
+                int poll_result = poll(&pfd, 1, 50);
                 if (poll_result < 0) {
-                    log_warn("Stratum: poll failed for " + miner.ip + " errno=" + std::to_string(errno));
+                    log_warn("Stratum: poll failed for " + ip + " errno=" + std::to_string(errno));
                     return false;
                 }
-                // If poll returned 0 (timeout) or >0 (ready), retry send
                 continue;
             }
-            log_warn("Stratum: send_json failed to " + miner.ip + " errno=" + std::to_string(errno) +
+            log_warn("Stratum: send_json_to_socket failed to " + ip + " errno=" + std::to_string(errno) +
                      " (" + std::string(strerror(errno)) + ")");
             return false;
         }
 #endif
         if (sent == 0) {
-            log_warn("Stratum: send_json connection closed by " + miner.ip);
+            log_warn("Stratum: send_json_to_socket connection closed by " + ip);
             return false;
         }
         total_sent += sent;
         remaining -= sent;
     }
     return true;
+}
+
+bool StratumServer::send_json(StratumMiner& miner, const std::string& json) {
+    // Delegate to socket version
+    return send_json_to_socket(miner.sock, miner.ip, json);
 }
 
 bool StratumServer::send_result(StratumMiner& miner, uint64_t id, const std::string& result) {

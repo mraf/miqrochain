@@ -2278,7 +2278,7 @@ bool Chain::disconnect_tip_once(std::string& err){
     return true;
 }
 
-bool Chain::submit_block(const Block& b, std::string& err){
+bool Chain::submit_block(const Block& b, std::string& err, uint64_t* out_height){
     MIQ_CHAIN_GUARD();
 
     // Ensure header is in index before block validation
@@ -2497,6 +2497,10 @@ bool Chain::submit_block(const Block& b, std::string& err){
     g_reorg.on_validated_header(hv);
 
     save_state();
+
+    // Output new height atomically under lock (prevents race with concurrent submissions)
+    if (out_height) *out_height = tip_.height;
+
     return true;
 }
 
