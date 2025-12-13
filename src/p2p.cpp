@@ -1240,6 +1240,11 @@ static std::atomic<bool> g_headers_just_done{false};
 // Global max peer tip - updated whenever we learn of higher tips
 static std::atomic<uint64_t> g_max_known_peer_tip{0};
 
+// FORCE-COMPLETION MODE: When we're ≤16 blocks from tip, enable aggressive completion
+// In this mode: allow duplicate requests, relax limits, ignore peer penalties
+static std::atomic<bool> g_force_completion_mode{false};
+constexpr uint64_t FORCE_COMPLETION_THRESHOLD = 16;  // Enable when ≤16 blocks behind
+
 static inline void maybe_mark_headers_done(bool at_tip) {
     if (g_logged_headers_done) return;
     if (!g_logged_headers_started) {
@@ -3655,9 +3660,11 @@ void P2P::fill_index_pipeline(PeerState& ps){
 
         // BULLETPROOF SYNC: Skip if this index is already being requested by another peer
         // This prevents duplicate requests that waste bandwidth and create duplicate orphans
+        // FORCE-COMPLETION: In force mode, allow duplicate requests for faster completion
         {
             InflightLock lk(g_inflight_lock);
-            if (g_global_requested_indices.count(idx)) {
+            const bool force_mode = g_force_completion_mode.load(std::memory_order_relaxed);
+            if (!force_mode && g_global_requested_indices.count(idx)) {
                 // Another peer is already fetching this index, skip to next
                 ps.next_index++;
                 continue;
@@ -3743,11 +3750,16 @@ void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     if (h.size()!=32) return;
 
     const std::string key = hexkey(h);
-    // Already being fetched globally - skip
-    if (g_global_inflight_blocks.count(key)) return;
+    const bool force_mode = g_force_completion_mode.load(std::memory_order_relaxed);
 
+    // FORCE-COMPLETION: In force mode, allow duplicate requests to multiple peers
+    // Otherwise, skip if already being fetched globally
+    if (!force_mode && g_global_inflight_blocks.count(key)) return;
+
+    // FORCE-COMPLETION: In force mode, double the inflight limit
     size_t base_default = g_sequential_sync ? (size_t)1 : (size_t)256;
-    const size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : base_default;
+    size_t max_inflight_blocks = caps_.max_blocks ? caps_.max_blocks : base_default;
+    if (force_mode) max_inflight_blocks *= 2;
 
     // CRITICAL FIX: If this peer's queue is full, try another peer instead of dropping
     if (ps.inflight_blocks.size() >= max_inflight_blocks) {
@@ -3755,13 +3767,25 @@ void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
         for (auto& kvp : peers_) {
             if (kvp.first == (Sock)ps.sock) continue;
             if (!kvp.second.verack_ok) continue;
-            if (kvp.second.inflight_blocks.size() >= max_inflight_blocks) continue;
-            // Found a peer with capacity - request from them instead
+            // FORCE-COMPLETION: In force mode, request even from peers at capacity
+            if (!force_mode && kvp.second.inflight_blocks.size() >= max_inflight_blocks) continue;
+            // Found a peer - request from them
             auto msg = encode_msg("getb", h);
             if (send_or_close(kvp.first, msg)) {
                 kvp.second.inflight_blocks.insert(key);
                 mark_block_inflight(key, kvp.first);
-                P2P_TRACE_IF(true, "Requested block " + key.substr(0, 16) + "... from alternate peer (original full)");
+                P2P_TRACE_IF(true, "Requested block " + key.substr(0, 16) + "... from alternate peer" +
+                            (force_mode ? " (force-completion)" : " (original full)"));
+                return;
+            }
+        }
+        // FORCE-COMPLETION: In force mode, proceed anyway even if peer is at capacity
+        if (force_mode) {
+            auto msg = encode_msg("getb", h);
+            if (send_or_close(ps.sock, msg)) {
+                ps.inflight_blocks.insert(key);
+                mark_block_inflight(key, (Sock)ps.sock);
+                P2P_TRACE("FORCE-COMPLETION: Requested block " + key.substr(0, 16) + "... despite capacity");
                 return;
             }
         }
@@ -4198,7 +4222,9 @@ void P2P::process_pending_blocks() {
 
         // Submit the block
         std::string err;
-        bool accepted = chain_.submit_block(b, err);
+        uint64_t new_height = 0;
+        // RACE FIX: Capture height atomically during submit (under chain lock)
+        bool accepted = chain_.submit_block(b, err, &new_height);
 
         if (accepted) {
             blocks_processed++;
@@ -4206,7 +4232,8 @@ void P2P::process_pending_blocks() {
             // Notify mempool
             if (mempool_) {
                 // CRITICAL FIX: Use overload that promotes orphan TXs
-                mempool_->on_block_connect(b, chain_.utxo(), (uint32_t)chain_.height());
+                // RACE FIX: Use captured height, not chain_.height() which could race
+                mempool_->on_block_connect(b, chain_.utxo(), (uint32_t)new_height);
             }
 
             // CRITICAL FIX: Notify stratum server immediately on new block
@@ -4219,7 +4246,7 @@ void P2P::process_pending_blocks() {
 
             // Update tracking
             g_last_progress_ms = now_ms();
-            g_last_progress_height = chain_.height();
+            g_last_progress_height = new_height;
 
             // TELEMETRY: Notify main.cpp about received blocks for UI display
             if (block_callback_) {
@@ -4587,17 +4614,20 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
         }
 
         std::string err;
-        if (chain_.submit_block(ob, err)) {
+        uint64_t orphan_height = 0;
+        // RACE FIX: Capture height atomically during submit (under chain lock)
+        if (chain_.submit_block(ob, err, &orphan_height)) {
             // CRITICAL FIX: Notify mempool and promote orphan TXs
+            // RACE FIX: Use captured height, not chain_.height() which could race
             if (mempool_) {
-                mempool_->on_block_connect(ob, chain_.utxo(), (uint32_t)chain_.height());
+                mempool_->on_block_connect(ob, chain_.utxo(), (uint32_t)orphan_height);
             }
             // CRITICAL FIX: Notify stratum server immediately on new block
             if (auto* ss = miq::g_stratum_server.load()) {
                 ss->notify_new_block();
             }
             const std::string miner = miq_miner_from_block(ob);
-            log_info("P2P: accepted orphan as block height=" + std::to_string(chain_.height())
+            log_info("P2P: accepted orphan as block height=" + std::to_string(orphan_height)
                      + " miner=" + miner
                      + " (remaining_orphans=" + std::to_string(orphans_.size() - 1) + ")");
 
@@ -4612,7 +4642,7 @@ void P2P::try_connect_orphans(const std::string& parent_hex){
                 orphan_children_.erase(cit);
             }
             g_last_progress_ms = now_ms();
-            g_last_progress_height = chain_.height();
+            g_last_progress_height = orphan_height;
 
             // After connecting orphan, try to process pending blocks that may now be ready
             process_pending_blocks();
@@ -6308,6 +6338,26 @@ void P2P::loop(){
             const size_t current_height = chain_.height();
             bool can_try_index_sync = false;
             bool has_active_index_sync = false;
+
+            // FORCE-COMPLETION MODE: Enable when ≤16 blocks from known tip
+            // This ensures warm datadir sync completes in <1 second
+            {
+                const uint64_t target = g_max_known_peer_tip.load(std::memory_order_relaxed);
+                const uint64_t best_hdr = chain_.best_header_height();
+                const uint64_t sync_target = std::max(target, best_hdr);
+                const bool should_force = (sync_target > current_height) &&
+                                         ((sync_target - current_height) <= FORCE_COMPLETION_THRESHOLD);
+                const bool was_force = g_force_completion_mode.load(std::memory_order_relaxed);
+                if (should_force != was_force) {
+                    g_force_completion_mode.store(should_force, std::memory_order_release);
+                    if (should_force) {
+                        log_info("[SYNC] FORCE-COMPLETION MODE ENABLED: " + std::to_string(sync_target - current_height) +
+                                " blocks remaining - relaxing limits, allowing duplicate requests");
+                    } else {
+                        log_info("[SYNC] Force-completion mode disabled");
+                    }
+                }
+            }
 
             // Check if we have index-capable peers that could provide more blocks
             for (auto &kvp : peers_) {

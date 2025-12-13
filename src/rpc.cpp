@@ -1880,12 +1880,15 @@ std::string RpcService::handle(const std::string& body){
             if(!deser_block(raw, b)) return err("submitblock: cannot deserialize block");
 
             std::string e;
-            if(!chain_.submit_block(b, e)){
+            uint64_t block_height = 0;
+            // RACE FIX: Capture height atomically during submit (under chain lock)
+            if(!chain_.submit_block(b, e, &block_height)){
                 return err(std::string("submitblock: rejected: ")+e);
             }
 
             // CRITICAL FIX: Notify mempool and promote orphan TXs
-            mempool_.on_block_connect(b, chain_.utxo(), (uint32_t)chain_.height());
+            // RACE FIX: Use captured height, not chain_.height() which could race
+            mempool_.on_block_connect(b, chain_.utxo(), (uint32_t)block_height);
 
             // CRITICAL FIX: Notify stratum server immediately on new block
             if (auto* ss = miq::g_stratum_server.load()) {
@@ -1895,7 +1898,6 @@ std::string RpcService::handle(const std::string& body){
             // CRITICAL FIX: Notify TUI about the new locally-mined block
             // This ensures Recent Blocks and Recent TXIDs update for local mining
             if(p2p_) {
-                uint64_t block_height = chain_.tip().height;
 
                 // Calculate subsidy for this block height
                 uint64_t subsidy = INITIAL_SUBSIDY;

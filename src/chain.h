@@ -81,7 +81,9 @@ public:
     bool open(const std::string& dir);
     bool init_genesis(const Block& genesis);
     bool verify_block(const Block& b, std::string& err) const;
-    bool submit_block(const Block& b, std::string& err);
+    // Submit block and optionally return new height (atomically under lock)
+    // new_height output prevents race condition with concurrent submissions
+    bool submit_block(const Block& b, std::string& err, uint64_t* new_height = nullptr);
 
     // Access tip safely (locks internally)
     Tip tip() const;

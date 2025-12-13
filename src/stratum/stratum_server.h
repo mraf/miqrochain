@@ -351,6 +351,8 @@ private:
     // COMMUNICATION
     // ==========================================================================
     bool send_json(StratumMiner& miner, const std::string& json);
+    // Lock-free version for broadcast_job - must be called WITHOUT holding miners_mutex_
+    bool send_json_to_socket(StratumSock sock, const std::string& ip, const std::string& json);
     bool send_result(StratumMiner& miner, uint64_t id, const std::string& result);
     bool send_error(StratumMiner& miner, uint64_t id, int code, const std::string& message);
 
