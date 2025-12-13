@@ -1336,6 +1336,8 @@ static inline void maybe_mark_headers_done(bool at_tip) {
         if (++g_headers_tip_confirmed >= 3) {
             g_logged_headers_done = true;
             g_headers_just_done.store(true);  // Signal to start block downloads NOW
+            // IBD PERF: Set header height for signature skip optimization
+            miq::set_best_header_height(hdr_height);
             miq::log_info("[IBD] headers phase COMPLETE (height=" + std::to_string(hdr_height) +
                          ", max_peer_tip=" + std::to_string(max_peer_tip) +
                          ") — IMMEDIATELY starting block downloads!");
@@ -7877,6 +7879,11 @@ void P2P::loop(){
                             // Without this, we'd think we're "caught up" at the old version height
                             // and stop syncing before reaching the actual tip.
                             uint64_t new_header_height = chain_.best_header_height();
+
+                            // IBD PERF: Update global header height for signature skip optimization
+                            // This allows should_validate_signatures() to skip signatures for
+                            // deeply buried blocks during IBD
+                            miq::set_best_header_height(new_header_height);
                             uint64_t old_max = g_max_known_peer_tip.load();
                             while (new_header_height > old_max) {
                                 if (g_max_known_peer_tip.compare_exchange_weak(old_max, new_header_height)) {

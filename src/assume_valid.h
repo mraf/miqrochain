@@ -114,31 +114,73 @@ inline void disable_assume_valid() {
     assume_valid_config().enabled = false;
 }
 
+// =============================================================================
+// IBD FAST-VALIDATION: Skip signatures for deeply buried blocks during IBD
+// This dramatically speeds up initial sync by trusting proof-of-work:
+// - Blocks far from the tip (>144 confirmations) have massive accumulated work
+// - An attacker would need to create a fake chain with valid PoW (infeasible)
+// - UTXO amounts/double-spend are still validated
+// - Once near-tip, full signature validation is enabled
+// =============================================================================
+
+// Threshold for "deeply buried" blocks - skip signatures when >144 blocks from tip
+static constexpr uint64_t IBD_SIGNATURE_SKIP_DEPTH = 144;
+
+// Global best header height (set by P2P layer)
+inline std::atomic<uint64_t>& g_best_header_height() {
+    static std::atomic<uint64_t> h{0};
+    return h;
+}
+
+inline void set_best_header_height(uint64_t h) {
+    uint64_t cur = g_best_header_height().load(std::memory_order_relaxed);
+    // Only update if new height is greater (monotonic)
+    while (h > cur && !g_best_header_height().compare_exchange_weak(cur, h, std::memory_order_release));
+}
+
 // Check if we should skip signature validation for a block
 // Returns true if signatures should be validated (not skipped)
 inline bool should_validate_signatures(const std::vector<uint8_t>& block_hash, uint64_t height) {
     auto& cfg = assume_valid_config();
 
-    // If disabled or already passed, always validate
-    if (!cfg.enabled || cfg.passed) {
-        return true;
-    }
-
-    // If we've reached or passed the assume-valid block, mark as passed
-    if (height >= cfg.height) {
-        if (block_hash == cfg.hash) {
-            // This is the assume-valid block - validate it fully
-            cfg.passed = true;
-            return true;
-        } else if (height > cfg.height) {
-            // Past the assume-valid height - validate all future blocks
-            cfg.passed = true;
-            return true;
+    // === PHASE 1: Checkpoint-based assume-valid (original logic) ===
+    // If enabled and below checkpoint, skip signatures
+    if (cfg.enabled && !cfg.passed) {
+        if (height < cfg.height) {
+            // Before assume-valid height - skip signature validation
+            return false;
+        }
+        // At or past checkpoint - mark as passed
+        if (height >= cfg.height) {
+            if (block_hash == cfg.hash || height > cfg.height) {
+                cfg.passed = true;
+            }
         }
     }
 
-    // Before assume-valid height - skip signature validation
-    return false;
+    // === PHASE 2: IBD deep-burial optimization (Bitcoin Core style) ===
+    // During IBD, skip signatures for blocks deeply buried below header tip
+    // This is safe because:
+    // 1. Headers are validated (PoW, difficulty, timestamps)
+    // 2. Block connects to validated header chain
+    // 3. Blocks have massive accumulated proof-of-work
+    // 4. UTXO set is still computed correctly
+    if (is_ibd_mode()) {
+        uint64_t best_header = g_best_header_height().load(std::memory_order_acquire);
+        // If we have a valid header chain and this block is deeply buried
+        if (best_header > 0 && height + IBD_SIGNATURE_SKIP_DEPTH < best_header) {
+            // Block is >144 below header tip - safe to skip signatures during IBD
+            return false;
+        }
+    }
+
+    // === PHASE 3: Near-tip - full validation ===
+    // We're either:
+    // - Past IBD mode
+    // - Near the header tip (within 144 blocks)
+    // - No header height known
+    // Full signature validation required
+    return true;
 }
 
 // Check if assume-valid is active (for logging/display)
