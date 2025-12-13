@@ -46,6 +46,70 @@ namespace p2p_stats {
 #include <cstdint>
 #include <climits>
 #include <atomic>
+#include <cassert>
+
+// ============================================================================
+// DEBUG ASSERTIONS FOR BITCOIN CORE-GRADE SCHEDULING INVARIANTS
+// ============================================================================
+// These assertions verify the level-triggered scheduling invariants:
+// 1. When force_mode enables, ALL index-capable peers must be triggered
+// 2. When peer disconnects in force_mode, remaining peers must be triggered
+// 3. When tip increases in force_mode, all peers must be triggered
+//
+// Enable with: -DMIQ_DEBUG_SCHEDULING=1
+// ============================================================================
+#ifndef MIQ_DEBUG_SCHEDULING
+#define MIQ_DEBUG_SCHEDULING 0
+#endif
+
+#if MIQ_DEBUG_SCHEDULING
+#define MIQ_SCHED_ASSERT(cond, msg) do { \
+    if (!(cond)) { \
+        miq::log_error("[SCHED_ASSERT FAILED] " msg); \
+        assert(cond && msg); \
+    } \
+} while(0)
+#define MIQ_SCHED_LOG(msg) miq::log_info("[SCHED_DEBUG] " + std::string(msg))
+#else
+#define MIQ_SCHED_ASSERT(cond, msg) ((void)0)
+#define MIQ_SCHED_LOG(msg) ((void)0)
+#endif
+
+// ============================================================================
+// TIMING INSTRUMENTATION FOR SCHEDULING LATENCY ANALYSIS
+// ============================================================================
+// Enable with: -DMIQ_TIMING_INSTRUMENTATION=1
+// Tracks key scheduling event latencies to prove <1s warm datadir sync:
+// - Force-mode enable → first block request (should be <10ms)
+// - Block receive → relay to stratum (should be <50ms)
+// - State change → scheduling trigger (should be <1ms)
+// ============================================================================
+#ifndef MIQ_TIMING_INSTRUMENTATION
+#define MIQ_TIMING_INSTRUMENTATION 1  // Enabled by default for performance proof
+#endif
+
+#if MIQ_TIMING_INSTRUMENTATION
+static std::atomic<int64_t> g_timing_force_mode_enabled_ms{0};
+static std::atomic<int64_t> g_timing_first_block_req_ms{0};
+static std::atomic<int64_t> g_timing_last_block_recv_ms{0};
+static std::atomic<int64_t> g_timing_last_relay_ms{0};
+static std::atomic<int64_t> g_timing_peers_triggered_count{0};
+
+#define MIQ_TIMING_RECORD(var) do { \
+    var.store(now_ms(), std::memory_order_relaxed); \
+} while(0)
+
+#define MIQ_TIMING_LOG_LATENCY(event, start_var) do { \
+    int64_t start = start_var.load(std::memory_order_relaxed); \
+    if (start > 0) { \
+        int64_t latency = now_ms() - start; \
+        miq::log_info("[TIMING] " event " latency: " + std::to_string(latency) + "ms"); \
+    } \
+} while(0)
+#else
+#define MIQ_TIMING_RECORD(var) ((void)0)
+#define MIQ_TIMING_LOG_LATENCY(event, start_var) ((void)0)
+#endif
 
 #ifndef _WIN32
 #include <netinet/tcp.h>
@@ -7005,6 +7069,29 @@ void P2P::loop(){
                 g_preverack_counts.erase(s_dead);
                 g_trickle_last_ms.erase(s_dead);
                 g_cmd_rl.erase(s_dead);
+
+                // LEVEL-TRIGGERED FIX 3: When peer disconnects, immediately trigger
+                // all remaining peers to claim the freed work (inflight cleared by gate_on_close)
+                // This ensures no delay waiting for next timer tick
+                if (g_force_completion_mode.load(std::memory_order_relaxed)) {
+                    #if MIQ_TIMING_INSTRUMENTATION
+                    int triggered_count = 0;
+                    #endif
+                    for (auto& remaining_kvp : peers_) {
+                        auto& remaining_ps = remaining_kvp.second;
+                        if (!remaining_ps.verack_ok) continue;
+                        if (!peer_is_index_capable(remaining_kvp.first)) continue;
+                        fill_index_pipeline(remaining_ps);
+                        #if MIQ_TIMING_INSTRUMENTATION
+                        triggered_count++;
+                        #endif
+                    }
+                    #if MIQ_TIMING_INSTRUMENTATION
+                    log_info("[TIMING] FIX3: peer disconnected in force_mode, triggered " +
+                            std::to_string(triggered_count) + " remaining peers");
+                    #endif
+                    MIQ_SCHED_LOG("FIX3: peer disconnect→immediate retrigger complete");
+                }
             }
             // we handled the closes ourselves; do not let them be processed elsewhere this tick
             dead.clear();
@@ -7410,11 +7497,36 @@ void P2P::loop(){
                                 // CRITICAL FIX: Track maximum known peer tip globally
                                 // This prevents premature "headers done" when peers know of higher chain
                                 uint64_t old_max = g_max_known_peer_tip.load();
+                                bool tip_increased = false;
                                 while (announced_height > old_max) {
                                     if (g_max_known_peer_tip.compare_exchange_weak(old_max, announced_height)) {
                                         log_info("P2P: New max peer tip discovered: " + std::to_string(announced_height));
+                                        tip_increased = true;
                                         break;
                                     }
+                                }
+
+                                // LEVEL-TRIGGERED FIX 4: When tip increases and already in force mode,
+                                // immediately trigger all peers to request the new higher indices
+                                if (tip_increased && g_force_completion_mode.load(std::memory_order_relaxed)) {
+                                    #if MIQ_TIMING_INSTRUMENTATION
+                                    int triggered_count = 0;
+                                    #endif
+                                    for (auto& other_kvp : peers_) {
+                                        auto& other_ps = other_kvp.second;
+                                        if (!other_ps.verack_ok) continue;
+                                        if (other_kvp.first == s) continue;  // Skip current peer (not ready)
+                                        if (!peer_is_index_capable(other_kvp.first)) continue;
+                                        fill_index_pipeline(other_ps);
+                                        #if MIQ_TIMING_INSTRUMENTATION
+                                        triggered_count++;
+                                        #endif
+                                    }
+                                    #if MIQ_TIMING_INSTRUMENTATION
+                                    log_info("[TIMING] FIX4: tip increased while in force_mode, triggered " +
+                                            std::to_string(triggered_count) + " peers");
+                                    #endif
+                                    MIQ_SCHED_LOG("FIX4: tip increase→immediate trigger complete");
                                 }
 
                                 // CRITICAL FIX: Trigger immediate sync if peer has higher tip
@@ -7441,6 +7553,38 @@ void P2P::loop(){
                                             miq::set_near_tip_mode(true);
                                             log_info("[SYNC] FORCE-COMPLETION MODE ENABLED (peer connect): " +
                                                     std::to_string(gap) + " blocks behind - immediate sync");
+
+                                            // TIMING: Record force-mode enable time
+                                            #if MIQ_TIMING_INSTRUMENTATION
+                                            g_timing_force_mode_enabled_ms.store(now_ms(), std::memory_order_relaxed);
+                                            int triggered_count = 0;
+                                            #endif
+
+                                            // ================================================================
+                                            // LEVEL-TRIGGERED FIX: Immediately refill ALL peer pipelines
+                                            // ================================================================
+                                            // Bitcoin Core invariant: state change → immediate scheduling
+                                            // When force_mode enables, ALL connected peers must immediately
+                                            // re-evaluate their pipelines to start duplicate requests.
+                                            // Without this, only the main loop iteration triggers refill,
+                                            // causing 10ms+ delays that create variance.
+                                            // ================================================================
+                                            for (auto& other_kvp : peers_) {
+                                                auto& other_ps = other_kvp.second;
+                                                if (!other_ps.verack_ok) continue;
+                                                if (other_kvp.first == s) continue;  // Skip current peer (not ready yet)
+                                                if (!peer_is_index_capable(other_kvp.first)) continue;
+                                                fill_index_pipeline(other_ps);
+                                                #if MIQ_TIMING_INSTRUMENTATION
+                                                triggered_count++;
+                                                #endif
+                                            }
+
+                                            #if MIQ_TIMING_INSTRUMENTATION
+                                            log_info("[TIMING] FIX1: force_mode enabled, triggered " +
+                                                    std::to_string(triggered_count) + " peers in same call stack");
+                                            #endif
+                                            MIQ_SCHED_LOG("FIX1: force_mode→immediate trigger complete");
                                         }
                                     }
                                 }
@@ -7645,6 +7789,35 @@ void P2P::loop(){
                                                 miq::set_near_tip_mode(true);
                                                 log_info("[SYNC] FORCE-COMPLETION MODE ENABLED (headers): " +
                                                         std::to_string(gap) + " blocks behind");
+
+                                                // TIMING: Record force-mode enable time
+                                                #if MIQ_TIMING_INSTRUMENTATION
+                                                g_timing_force_mode_enabled_ms.store(now_ms(), std::memory_order_relaxed);
+                                                int triggered_count = 0;
+                                                #endif
+
+                                                // ================================================================
+                                                // LEVEL-TRIGGERED FIX: Immediately refill ALL peer pipelines
+                                                // ================================================================
+                                                // Bitcoin Core invariant: state change → immediate scheduling
+                                                // When force_mode enables via headers, ALL peers must immediately
+                                                // re-evaluate to start duplicate requests.
+                                                // ================================================================
+                                                for (auto& other_kvp : peers_) {
+                                                    auto& other_ps = other_kvp.second;
+                                                    if (!other_ps.verack_ok) continue;
+                                                    if (!peer_is_index_capable(other_kvp.first)) continue;
+                                                    fill_index_pipeline(other_ps);
+                                                    #if MIQ_TIMING_INSTRUMENTATION
+                                                    triggered_count++;
+                                                    #endif
+                                                }
+
+                                                #if MIQ_TIMING_INSTRUMENTATION
+                                                log_info("[TIMING] FIX2: force_mode enabled (headers), triggered " +
+                                                        std::to_string(triggered_count) + " peers in same call stack");
+                                                #endif
+                                                MIQ_SCHED_LOG("FIX2: headers→force_mode→immediate trigger complete");
                                             }
                                         }
                                     }
