@@ -6341,6 +6341,7 @@ void P2P::loop(){
 
             // FORCE-COMPLETION MODE: Enable when ≤16 blocks from known tip
             // This ensures warm datadir sync completes in <1 second
+            // CRITICAL: Also enables near-tip mode to skip fsync for fast block processing
             {
                 const uint64_t target = g_max_known_peer_tip.load(std::memory_order_relaxed);
                 const uint64_t best_hdr = chain_.best_header_height();
@@ -6350,11 +6351,14 @@ void P2P::loop(){
                 const bool was_force = g_force_completion_mode.load(std::memory_order_relaxed);
                 if (should_force != was_force) {
                     g_force_completion_mode.store(should_force, std::memory_order_release);
+                    // CRITICAL FIX: Also set near-tip mode to skip fsync during fast sync
+                    // This is the key enabler for <1s warm datadir completion
+                    miq::set_near_tip_mode(should_force);
                     if (should_force) {
                         log_info("[SYNC] FORCE-COMPLETION MODE ENABLED: " + std::to_string(sync_target - current_height) +
-                                " blocks remaining - relaxing limits, allowing duplicate requests");
+                                " blocks remaining - relaxing limits, skipping fsync for fast sync");
                     } else {
-                        log_info("[SYNC] Force-completion mode disabled");
+                        log_info("[SYNC] Force-completion mode disabled - full durability restored");
                     }
                 }
             }
