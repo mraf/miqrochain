@@ -33,6 +33,25 @@ inline bool is_ibd_mode() {
 }
 
 // =============================================================================
+// NEAR-TIP MODE: When ≤16 blocks from tip, skip fsync for fast completion
+// This is SEPARATE from IBD - enables fast sync even after IBD is done
+// Used for warm datadir scenarios where we're only a few blocks behind
+// =============================================================================
+
+inline std::atomic<bool>& near_tip_mode_active() {
+    static std::atomic<bool> g_near_tip{false};
+    return g_near_tip;
+}
+
+inline void set_near_tip_mode(bool enabled) {
+    near_tip_mode_active().store(enabled, std::memory_order_release);
+}
+
+inline bool is_near_tip_mode() {
+    return near_tip_mode_active().load(std::memory_order_acquire);
+}
+
+// =============================================================================
 // ASSUME-VALID OPTIMIZATION
 // Dramatically speeds up initial block download by skipping signature
 // verification for blocks that are known to be valid (below a checkpoint).

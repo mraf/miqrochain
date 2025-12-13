@@ -174,10 +174,10 @@ bool AddressIndex::index_block(const Block& block, uint64_t height) {
 
     if (!enabled_) return false;
 
-    // PERFORMANCE: Skip address indexing during IBD for 10-100x faster sync
+    // PERFORMANCE: Skip address indexing during IBD or near-tip for faster sync
     // Address index will be rebuilt automatically after IBD completes (see chain.cpp:1188)
-    // This is safe because wallet functionality isn't needed during initial sync
-    if (miq::is_ibd_mode()) return true;
+    // Near-tip: OK to skip since it's only a few blocks and will catch up quickly
+    if (miq::is_ibd_mode() || miq::is_near_tip_mode()) return true;
 
     int64_t timestamp = block.header.time;
     uint32_t tx_pos = 0;
