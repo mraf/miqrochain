@@ -22,9 +22,14 @@ inline std::atomic<bool>& ibd_mode_active() {
     return g_ibd_active;
 }
 
+// Forward declaration for IBD state machine
+namespace ibd { class IBDState; }
+
 // Call this when sync is complete to enable full durability
 inline void mark_ibd_complete() {
     ibd_mode_active().store(false, std::memory_order_release);
+    // Note: IBD state machine transition to DONE is handled separately
+    // in ibd_state.cpp to avoid circular includes
 }
 
 // Check if we're in IBD mode (for skipping fsync, etc.)

@@ -19,6 +19,7 @@
 #include "config.h"
 #include "log.h"
 #include "assume_valid.h"  // For mark_ibd_complete()
+#include "ibd_state.h"     // For IBD state machine
 #include "chain.h"
 #include "mempool.h"
 #include "rpc.h"
@@ -4263,6 +4264,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                     // SOLO-SEED: allow the node to proceed without peers so it can mine the first blocks.
                     log_warn("IBD: seed mode handshake timed out — entering SOLO-SEED mode (no peers yet).");
                     miq::mark_ibd_complete();  // Enable full durability
+                    miq::ibd::IBDState::instance().transition_to(miq::ibd::SyncState::DONE);
                     if (tui && can_tui) {
                         tui->mark_step_ok("Peer handshake (verack)");
                         tui->set_banner("Seed solo mode: no peers yet — mining unlocked.");
@@ -4433,6 +4435,7 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
                                       "complete", seed_host_cstr(), true);
             }
             mark_ibd_complete();  // Enable full durability now that sync is complete
+            miq::ibd::IBDState::instance().transition_to(miq::ibd::SyncState::DONE);
 
             // ========================================================================
             // CRITICAL: Rebuild AddressIndex after IBD completes
@@ -4552,6 +4555,7 @@ private:
                     log_info("IBDGuard: node resynced.");
                     backoff_ms = 2'000;
                     miq::mark_ibd_complete();  // Enable full durability (fsync on every block)
+                    miq::ibd::IBDState::instance().transition_to(miq::ibd::SyncState::DONE);
                     if (tui && can_tui) {
                         // CRITICAL FIX: Must set ibd_done_ to true for splash screen transition!
                         // Without this, the splash screen stays stuck even though IBDGuard succeeded
@@ -5010,6 +5014,7 @@ int main(int argc, char** argv){
         bool ibd_ok = perform_ibd_sync(chain, cfg.no_p2p ? nullptr : &p2p, cfg.datadir, can_tui, &tui, ibd_err);
         if (ibd_ok) {
             miq::mark_ibd_complete();  // Enable full durability (fsync on every block)
+            miq::ibd::IBDState::instance().transition_to(miq::ibd::SyncState::DONE);
             if (can_tui) {
                 tui.mark_step_ok("IBD sync phase");
                 tui.set_banner("Synced");
@@ -5024,6 +5029,7 @@ int main(int argc, char** argv){
             if (solo_seed_mode(cfg.no_p2p ? nullptr : &p2p)) {
                 // Bootstrap solo: treat as OK so local mining can proceed.
                 miq::mark_ibd_complete();  // Enable full durability
+                miq::ibd::IBDState::instance().transition_to(miq::ibd::SyncState::DONE);
                 if (can_tui) {
                     tui.mark_step_ok("IBD sync phase");
                     tui.set_banner("Seed solo mode — no peers yet. Mining enabled.");

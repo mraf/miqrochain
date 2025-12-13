@@ -22,6 +22,7 @@ namespace p2p_stats {
 #include "compact_blocks.h" // BIP152 compact block relay
 #include "mempool.h"        // For compact block reconstruction
 #include "assume_valid.h"   // Checkpoint verification for fork detection
+#include "ibd_state.h"      // Bitcoin Core-aligned IBD state machine
 
 #include <chrono>
 #include <deque>
@@ -1338,6 +1339,12 @@ static inline void maybe_mark_headers_done(bool at_tip) {
             g_headers_just_done.store(true);  // Signal to start block downloads NOW
             // IBD PERF: Set header height for signature skip optimization
             miq::set_best_header_height(hdr_height);
+
+            // State machine transition: HEADERS → BLOCKS
+            // Bitcoin Core principle: once headers complete, NEVER restart headers phase
+            miq::ibd::IBDState::instance().set_header_height(hdr_height);
+            miq::ibd::IBDState::instance().transition_to(miq::ibd::SyncState::BLOCKS);
+
             miq::log_info("[IBD] headers phase COMPLETE (height=" + std::to_string(hdr_height) +
                          ", max_peer_tip=" + std::to_string(max_peer_tip) +
                          ") — IMMEDIATELY starting block downloads!");
@@ -3647,6 +3654,9 @@ void P2P::start_sync_with_peer(PeerState& ps){
             g_logged_headers_started = true;
             log_info("[IBD] headers phase started - blocks downloading in parallel");
             if (!g_ibd_headers_started_ms) g_ibd_headers_started_ms = now_ms();
+
+            // State machine transition: CONNECTING → HEADERS
+            miq::ibd::IBDState::instance().transition_to(miq::ibd::SyncState::HEADERS);
         }
         // DON'T return - fall through to also start block sync!
     }
@@ -5917,16 +5927,18 @@ void P2P::loop(){
           }
 
           // ========================================================================
-          // IBD FIX: Disconnect non-delivering peers during IBD
-          // Peers that occupy inflight slots but deliver zero blocks waste resources
-          // and slow down sync. Give them 60s to deliver, then disconnect.
+          // PEER ACCOUNTABILITY: Disconnect non-delivering peers quickly
+          // ========================================================================
+          // Peers that occupy inflight slots but deliver zero blocks waste resources.
+          // AGGRESSIVE: Only give them 30s to prove they can deliver.
+          // Also penalize peers that request impossible blocks from us.
           // ========================================================================
           if (miq::is_ibd_mode()) {
               static int64_t last_non_deliver_check_ms = 0;
               const int64_t tnow = now_ms();
-              const int64_t NON_DELIVER_TIMEOUT_MS = 60000;  // 60 seconds
+              const int64_t NON_DELIVER_TIMEOUT_MS = 30000;  // 30 seconds (was 60s)
 
-              if (tnow - last_non_deliver_check_ms > 10000) {  // Check every 10s
+              if (tnow - last_non_deliver_check_ms > 5000) {  // Check every 5s (was 10s)
                   last_non_deliver_check_ms = tnow;
 
                   for (auto& kvp : peers_) {
@@ -5938,7 +5950,7 @@ void P2P::loop(){
                       if (connection_duration > NON_DELIVER_TIMEOUT_MS &&
                           ps.total_blocks_received == 0 &&
                           ps.peer_tip_height > 0) {
-                          // Peer claims to have blocks but delivered zero in 60s
+                          // Peer claims to have blocks but delivered zero
                           log_warn("P2P: Disconnecting non-delivering peer " + ps.ip +
                                    " (connected " + std::to_string(connection_duration/1000) + "s" +
                                    ", claims tip=" + std::to_string(ps.peer_tip_height) +
@@ -6004,12 +6016,10 @@ void P2P::loop(){
 
           // ========================================================================
           // NUCLEAR SAFETY NET: Unconditional sync recovery
-          // PROPAGATION FIX: Reduced from 500ms to 200ms for sub-second guarantee
-          // INVARIANT P5: "There must exist NO valid execution exceeding 1 second"
-          //
-          // This is the ultimate failsafe - if sync is behind and we have peers,
-          // FORCE re-enable and refill ALL peers regardless of their state.
-          // This ensures sync can NEVER get permanently stuck.
+          // ========================================================================
+          // This is the ultimate failsafe when sync is completely stuck.
+          // PATIENT during IBD: Only trigger after 10 seconds of no activity
+          // Near-tip: 200ms for fast propagation (sub-second guarantee)
           // ========================================================================
           {
               static int64_t last_nuclear_check_ms = 0;
@@ -6019,8 +6029,11 @@ void P2P::loop(){
               const uint64_t header_height = chain_.best_header_height();
               const uint64_t target_height = std::max(header_height, max_peer);
 
-              // Run every 200ms when we're behind (was 500ms)
-              if ((tnow - last_nuclear_check_ms > 200) &&
+              // PATIENT during IBD: Check every 10s (not 200ms!) to avoid chaotic recovery
+              // Near-tip: Check every 200ms for sub-second block propagation
+              const int64_t nuclear_interval = miq::is_ibd_mode() ? 10000 : 200;
+
+              if ((tnow - last_nuclear_check_ms > nuclear_interval) &&
                   !peers_.empty() &&
                   target_height > 0 &&
                   chain_height < target_height) {
@@ -6236,10 +6249,11 @@ void P2P::loop(){
           }
 
           // ========================================================================
-          // CRITICAL FIX: Gap Detection and Re-request
+          // GAP DETECTION WITH HASH-BASED FALLBACK
+          // ========================================================================
           // If we have blocks at height N+2, N+3 but not N+1, detect and re-request N+1
-          // This handles cases where a block request was lost or peer disconnected
-          // Run every 500ms (was 2s) for FAST recovery from stalls!
+          // Uses hash-based requests (getb) when headers are available, falls back to getbi
+          // PATIENT: Run every 2s during IBD to avoid chaotic recovery loops
           // ========================================================================
           {
               static int64_t last_gap_check_ms = 0;
@@ -6247,7 +6261,10 @@ void P2P::loop(){
               static int gap_request_count = 0;
               const int64_t tnow = now_ms();
 
-              if (tnow - last_gap_check_ms > 500) {  // Every 500ms - FAST GAP RECOVERY
+              // PATIENT: Check every 2s during IBD, every 500ms near-tip
+              const int64_t gap_check_interval = miq::is_ibd_mode() ? 2000 : 500;
+
+              if (tnow - last_gap_check_ms > gap_check_interval) {
                   last_gap_check_ms = tnow;
 
                   const uint64_t current_height = chain_.height();
@@ -6260,14 +6277,12 @@ void P2P::loop(){
                       bool have_next = pending_blocks_.find(next_needed) != pending_blocks_.end();
 
                       if (!have_next) {
-                          // Reset counter if gap index changed
+                          // Reset counter if gap index changed (progress was made)
                           if (next_needed != last_gap_index) {
                               last_gap_index = next_needed;
                               gap_request_count = 0;
                           }
 
-                          // AGGRESSIVE: Clear global tracking and force re-request
-                          // After 3 failed attempts (6 seconds), request from ALL peers
                           gap_request_count++;
 
                           // Clear from global tracking to allow fresh request
@@ -6285,60 +6300,118 @@ void P2P::loop(){
                               dq.erase(std::remove(dq.begin(), dq.end(), next_needed), dq.end());
                           }
 
-                          if (gap_request_count <= 3) {
-                              // First 3 attempts: request from best peer
-                              log_warn("P2P: Gap at index " + std::to_string(next_needed) +
-                                       " (attempt " + std::to_string(gap_request_count) + "/3)");
+                          // ============================================================
+                          // HASH-BASED FALLBACK: Prefer getb (by hash) over getbi
+                          // ============================================================
+                          // Try to get the block hash from our header chain
+                          std::vector<uint8_t> block_hash;
+                          bool have_hash = chain_.get_header_hash_at_height(next_needed, block_hash);
 
-                              Sock target = MIQ_INVALID_SOCK;
-                              double best_score = -1.0;
-                              for (auto& kvp : peers_) {
-                                  if (!kvp.second.verack_ok) continue;
-                                  if (kvp.second.health_score > best_score) {
-                                      best_score = kvp.second.health_score;
-                                      target = kvp.first;
-                                  }
+                          // Find best peer
+                          Sock target = MIQ_INVALID_SOCK;
+                          double best_score = -1.0;
+                          for (auto& kvp : peers_) {
+                              if (!kvp.second.verack_ok) continue;
+                              if (kvp.second.health_score > best_score) {
+                                  best_score = kvp.second.health_score;
+                                  target = kvp.first;
                               }
+                          }
+
+                          if (gap_request_count <= 10) {
+                              // First 10 attempts (20 seconds): request from best peer
+                              if (gap_request_count == 1 || gap_request_count == 5 || gap_request_count == 10) {
+                                  log_info("P2P: Gap at index " + std::to_string(next_needed) +
+                                           " (attempt " + std::to_string(gap_request_count) + "/10)" +
+                                           (have_hash ? " [using hash]" : " [using index]"));
+                              }
+
                               if (target != MIQ_INVALID_SOCK) {
                                   auto itT = peers_.find(target);
                                   if (itT != peers_.end()) {
-                                      uint8_t p8[8];
-                                      for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
-                                      auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
-                                      if (send_or_close(target, msg)) {
-                                          g_inflight_index_ts[target][next_needed] = tnow;
-                                          g_inflight_index_order[target].push_back(next_needed);
-                                          {
-                                              InflightLock lk(g_inflight_lock);
-                                              g_global_requested_indices.insert(next_needed);
+                                      bool sent = false;
+
+                                      // PREFER hash-based request when we have the hash
+                                      if (have_hash) {
+                                          auto msg = encode_msg("getb", block_hash);
+                                          if (send_or_close(target, msg)) {
+                                              const std::string key = hexkey(block_hash);
+                                              itT->second.inflight_blocks.insert(key);
+                                              g_global_inflight_blocks.insert(key);
+                                              sent = true;
                                           }
-                                          itT->second.inflight_index++;
-                                          log_info("P2P: Re-requested gap block " + std::to_string(next_needed) +
-                                                   " from " + itT->second.ip);
+                                      }
+
+                                      // Fallback to index-based if hash not available or send failed
+                                      if (!sent) {
+                                          uint8_t p8[8];
+                                          for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
+                                          auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
+                                          if (send_or_close(target, msg)) {
+                                              g_inflight_index_ts[target][next_needed] = tnow;
+                                              g_inflight_index_order[target].push_back(next_needed);
+                                              {
+                                                  InflightLock lk(g_inflight_lock);
+                                                  g_global_requested_indices.insert(next_needed);
+                                              }
+                                              itT->second.inflight_index++;
+                                              sent = true;
+                                          }
                                       }
                                   }
                               }
-                          } else {
-                              // After 3 attempts: BROADCAST to ALL peers
-                              log_warn("P2P: Gap at index " + std::to_string(next_needed) +
-                                       " - broadcasting to ALL peers!");
-
-                              int sent_count = 0;
+                          } else if (gap_request_count <= 15) {
+                              // After 10 attempts (20s): try other peers one at a time
+                              static size_t peer_round_robin = 0;
+                              std::vector<Sock> peers_to_try;
                               for (auto& kvp : peers_) {
                                   if (!kvp.second.verack_ok) continue;
-
-                                  uint8_t p8[8];
-                                  for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
-                                  auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
-                                  if (send_or_close(kvp.first, msg)) {
-                                      sent_count++;
+                                  peers_to_try.push_back(kvp.first);
+                              }
+                              if (!peers_to_try.empty()) {
+                                  peer_round_robin = (peer_round_robin + 1) % peers_to_try.size();
+                                  Sock try_peer = peers_to_try[peer_round_robin];
+                                  auto itT = peers_.find(try_peer);
+                                  if (itT != peers_.end()) {
+                                      if (have_hash) {
+                                          auto msg = encode_msg("getb", block_hash);
+                                          send_or_close(try_peer, msg);
+                                      } else {
+                                          uint8_t p8[8];
+                                          for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
+                                          auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
+                                          send_or_close(try_peer, msg);
+                                      }
+                                      log_info("P2P: Gap retry " + std::to_string(next_needed) +
+                                               " from peer " + itT->second.ip);
                                   }
                               }
-                              log_info("P2P: Broadcast getbi(" + std::to_string(next_needed) +
-                                       ") to " + std::to_string(sent_count) + " peers");
+                          } else {
+                              // After 15 attempts (30s): Broadcast to ALL peers
+                              // But only do this ONCE per gap, then give up and wait
+                              if (gap_request_count == 16) {
+                                  log_warn("P2P: Gap at index " + std::to_string(next_needed) +
+                                           " - broadcasting to ALL peers (final attempt)");
 
-                              // Reset counter to avoid spamming
-                              gap_request_count = 0;
+                                  int sent_count = 0;
+                                  for (auto& kvp : peers_) {
+                                      if (!kvp.second.verack_ok) continue;
+
+                                      if (have_hash) {
+                                          auto msg = encode_msg("getb", block_hash);
+                                          if (send_or_close(kvp.first, msg)) sent_count++;
+                                      } else {
+                                          uint8_t p8[8];
+                                          for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
+                                          auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
+                                          if (send_or_close(kvp.first, msg)) sent_count++;
+                                      }
+                                  }
+                                  log_info("P2P: Broadcast gap " + std::to_string(next_needed) +
+                                           " to " + std::to_string(sent_count) + " peers");
+                              }
+                              // After broadcast, wait 30 more seconds before trying again
+                              // gap_request_count will keep incrementing but we won't spam
                           }
                       }
                   }
@@ -7756,6 +7829,9 @@ void P2P::loop(){
                                 g_logged_headers_started = true;
                                 log_info("[IBD] headers phase started");
                                 if (!g_ibd_headers_started_ms) g_ibd_headers_started_ms = now_ms();
+
+                                // State machine transition: CONNECTING → HEADERS
+                                miq::ibd::IBDState::instance().transition_to(miq::ibd::SyncState::HEADERS);
                             }
                         } else
 #endif
@@ -7951,24 +8027,32 @@ void P2P::loop(){
                         try_finish_handshake();
 
                     // ================================================================
-                    // HANDSHAKE FIREWALL (INVARIANT A)
+                    // HANDSHAKE FIREWALL (Bitcoin Core-aligned)
                     // ================================================================
                     // No protocol command except version/verack/ping/pong is processed
-                    // before handshake completion. This prevents:
-                    // 1. Resource exhaustion from malicious pre-handshake requests
-                    // 2. Processing data from unverified peers
-                    // 3. IBD stalls from premature block/header requests
+                    // before handshake completion.
+                    //
+                    // CRITICAL: During IBD, NEVER disconnect for pre-handshake messages!
+                    // Bitcoin Core principle: be tolerant during sync, strict at tip.
+                    // Disconnecting peers during IBD risks losing our only block sources.
                     // ================================================================
                     } else if (!ps.verack_ok &&
                                cmd != "ping" && cmd != "pong") {
                         // Reject ALL commands before handshake except ping/pong
-                        // (ping/pong are allowed for keepalive during slow handshakes)
                         P2P_TRACE("FIREWALL: Rejecting cmd=" + cmd + " from " + ps.ip + " - handshake not complete");
-                        if (++ps.mis > 5) {
-                            log_warn("P2P: FIREWALL: Too many pre-handshake commands from " + ps.ip + " - disconnecting");
-                            dead.push_back(s);
-                            break;
+
+                        // Bitcoin Core principle: During IBD, be tolerant of eager peers
+                        // Only disconnect after IBD is complete (near-tip)
+                        auto ibd_state = miq::ibd::IBDState::instance().current_state();
+                        if (ibd_state >= miq::ibd::SyncState::DONE) {
+                            // Post-IBD: strict enforcement
+                            if (++ps.mis > 5) {
+                                log_warn("P2P: FIREWALL: Too many pre-handshake commands from " + ps.ip + " - disconnecting");
+                                dead.push_back(s);
+                                break;
+                            }
                         }
+                        // During IBD: log but don't count toward disconnection
                         continue;
 
                     } else if (cmd == "ping") {
@@ -8315,19 +8399,42 @@ void P2P::loop(){
                         }
 
                     } else if (cmd == "getb") {
-                        // IBD FIX: Don't serve block requests before handshake completes
-                        // This prevents peers from draining our resources during IBD
+                        // ================================================================
+                        // STRICT IBD ISOLATION: Never serve blocks during IBD
+                        // ================================================================
+                        // During IBD, ALL resources must focus on downloading blocks.
+                        // Serving blocks wastes bandwidth and CPU that should be used for sync.
+                        // We only serve blocks when:
+                        // 1. Handshake is complete AND
+                        // 2. NOT in IBD mode OR we have reached our target height
+                        // ================================================================
                         if (!ps.verack_ok) {
                             P2P_TRACE("DEBUG: Ignoring getb from " + ps.ip + " - handshake not complete");
                             continue;
                         }
-                        // IBD FIX: Don't serve blocks while actively syncing behind
-                        // But DO serve blocks if we're a seed (have blocks to share)
-                        // The key is checking if WE are behind, not just in IBD mode
-                        if (miq::is_ibd_mode() && chain_.height() < g_max_known_peer_tip.load()) {
-                            P2P_TRACE("DEBUG: Ignoring getb from " + ps.ip + " - actively syncing");
-                            continue;
+
+                        // STRICT: During IBD, NEVER serve blocks unless we're at tip
+                        // The old check "height < g_max_known_peer_tip" failed when both were 0
+                        const uint64_t our_height = chain_.height();
+                        const uint64_t peer_tip = g_max_known_peer_tip.load();
+                        const uint64_t header_tip = chain_.best_header_height();
+                        const uint64_t target = std::max(peer_tip, header_tip);
+
+                        if (miq::is_ibd_mode()) {
+                            // In IBD mode, only serve if we're at or very close to target
+                            // This allows seeds to serve while not wasting resources during sync
+                            if (our_height == 0 || (target > 0 && our_height + 10 < target)) {
+                                static int64_t last_reject_log_ms = 0;
+                                if (now_ms() - last_reject_log_ms > 5000) {
+                                    last_reject_log_ms = now_ms();
+                                    log_info("P2P: IBD ISOLATION - Ignoring getb from " + ps.ip +
+                                             " (our_height=" + std::to_string(our_height) +
+                                             " target=" + std::to_string(target) + ")");
+                                }
+                                continue;
+                            }
                         }
+
                         g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
                         if (m.payload.size() == 32) {
                             std::string hash_hex = hexkey(m.payload);
@@ -8350,17 +8457,33 @@ void P2P::loop(){
                         }
                     }
                     else if (cmd == "getbi") {
-                        // IBD FIX: Don't serve block requests before handshake completes
+                        // ================================================================
+                        // STRICT IBD ISOLATION: Never serve blocks during IBD
+                        // ================================================================
                         if (!ps.verack_ok) {
                             P2P_TRACE("DEBUG: Ignoring getbi from " + ps.ip + " - handshake not complete");
                             continue;
                         }
-                        // IBD FIX: Don't serve blocks while actively syncing behind
-                        // But DO serve blocks if we're a seed (have blocks to share)
-                        if (miq::is_ibd_mode() && chain_.height() < g_max_known_peer_tip.load()) {
-                            P2P_TRACE("DEBUG: Ignoring getbi from " + ps.ip + " - actively syncing");
-                            continue;
+
+                        // STRICT: During IBD, NEVER serve blocks unless we're at tip
+                        const uint64_t our_height = chain_.height();
+                        const uint64_t peer_tip = g_max_known_peer_tip.load();
+                        const uint64_t header_tip = chain_.best_header_height();
+                        const uint64_t target = std::max(peer_tip, header_tip);
+
+                        if (miq::is_ibd_mode()) {
+                            if (our_height == 0 || (target > 0 && our_height + 10 < target)) {
+                                static int64_t last_reject_log_ms = 0;
+                                if (now_ms() - last_reject_log_ms > 5000) {
+                                    last_reject_log_ms = now_ms();
+                                    log_info("P2P: IBD ISOLATION - Ignoring getbi from " + ps.ip +
+                                             " (our_height=" + std::to_string(our_height) +
+                                             " target=" + std::to_string(target) + ")");
+                                }
+                                continue;
+                            }
                         }
+
                         g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
                         if (m.payload.size() == 8) {
                             uint64_t idx64 = 0;
